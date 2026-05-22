@@ -219,6 +219,58 @@ class TestPrepareCFGBypass:
         assert state.extra["p"].cfg_scale == 1.0
 
 
+    def test_prepare_encode_it2i_sets_do_true_cfg_false(self) -> None:
+        """IT2I path also sets do_true_cfg=False."""
+        pipeline = _make_pipeline()
+        state = _make_fake_state(cfg_scale=4.0)
+
+        parsed_p = SimpleNamespace(
+            first_prompt=[{"prompt": "edit this", "image": "fake.jpg"}],
+            prompt="edit this",
+            extra_args={},
+            image_size=IMAGE_SIZE,
+            num_steps=4,
+            cfg_scale=4.0,
+            img_cfg_scale=2.0,
+            cfg_norm="none",
+            timestep_shift=3.0,
+            cfg_interval=(0.0, 1.0),
+            batch_size=1,
+            seed=42,
+            think_mode=False,
+            t_eps=0.02,
+        )
+        ns = SimpleNamespace(
+            grid_h=TOKEN_H,
+            grid_w=TOKEN_W,
+            grid_hw=(TOKEN_H, TOKEN_W),
+            token_h=TOKEN_H,
+            token_w=TOKEN_W,
+            timesteps=torch.linspace(1.0, 0.0, 5),
+            noise_scale=1.0,
+            merge_size=1,
+            image_prediction=torch.randn(1, 3, IMAGE_SIZE[1], IMAGE_SIZE[0]),
+        )
+        caches = {
+            "cond": MagicMock(),
+            "img_cond": MagicMock(),
+            "uncond": MagicMock(),
+            "idx_cond": torch.zeros(3, NUM_TOKENS, dtype=torch.long),
+            "idx_img_cond": torch.zeros(3, NUM_TOKENS, dtype=torch.long),
+            "idx_uncond": torch.zeros(3, NUM_TOKENS, dtype=torch.long),
+        }
+
+        pipeline._parse_request_from_state = MagicMock(return_value=parsed_p)
+        pipeline._init_noise_and_schedule = MagicMock(return_value=ns)
+        pipeline._extract_input_images = MagicMock(return_value=["fake_image"])
+        pipeline._build_it2i_caches = MagicMock(return_value=caches)
+
+        pipeline.prepare_encode(state)
+
+        assert state.do_true_cfg is False
+        assert state.extra["p"].img_cfg_scale == 2.0
+
+
 class TestCFGHandledInternally:
 
     def test_batched_denoise_uses_extra_cfg_scale_not_do_true_cfg(self) -> None:

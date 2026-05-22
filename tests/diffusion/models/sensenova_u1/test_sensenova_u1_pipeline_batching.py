@@ -111,6 +111,33 @@ def _make_step_state(
     }
 
 
+def _make_it2i_step_state(
+    req_id,
+    *,
+    cfg_scale=4.0,
+    img_cfg_scale=2.0,
+    cfg_norm="none",
+    cfg_interval=(0.0, 1.0),
+    num_steps=4,
+    step_index=0,
+    prefix_len=10,
+):
+    """Build a fake _step_states entry for an IT2I request with img_cond cache."""
+    state = _make_step_state(
+        req_id,
+        cfg_scale=cfg_scale,
+        cfg_norm=cfg_norm,
+        cfg_interval=cfg_interval,
+        num_steps=num_steps,
+        step_index=step_index,
+        prefix_len=prefix_len,
+    )
+    state["p"].img_cfg_scale = img_cfg_scale
+    state["caches"]["img_cond"] = _MockDynamicCache(1, prefix_len)
+    state["caches"]["idx_img_cond"] = torch.zeros(3, NUM_TOKENS, dtype=torch.long)
+    return state
+
+
 def _make_pipeline():
     """Create a SenseNovaU1Pipeline stub without loading weights."""
     from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
@@ -515,3 +542,212 @@ class TestBatchedDenoiseStep:
         # req_b: cond only = 2
         torch.testing.assert_close(result[0], torch.ones(NUM_TOKENS, OUTPUT_DIM) * 5.0)
         torch.testing.assert_close(result[1], torch.ones(NUM_TOKENS, OUTPUT_DIM) * 2.0)
+
+    # ------------------------------------------------------------------
+    # IT2I dual CFG tests
+    # ------------------------------------------------------------------
+
+    def test_it2i_dispatches_all_three_forwards(self) -> None:
+        """IT2I with img_cfg_scale!=1 and cfg_scale!=img_cfg_scale triggers cond+uncond+img_cond."""
+        pipeline = _make_pipeline()
+        pipeline._step_states["a"] = _make_it2i_step_state("a", cfg_scale=4.0, img_cfg_scale=2.0)
+
+        pipeline._prepare_single_embeds = MagicMock(
+            side_effect=lambda extra: (
+                torch.randn(1, NUM_TOKENS, HIDDEN_DIM),
+                torch.zeros(3, NUM_TOKENS, dtype=torch.long),
+            )
+        )
+
+        predict_v_calls = []
+
+        def mock_predict_v(embeds, indexes, data, kv_key):
+            predict_v_calls.append(kv_key)
+            return [torch.randn(1, NUM_TOKENS, OUTPUT_DIM) for _ in data]
+
+        pipeline._batched_predict_v = mock_predict_v
+
+        ib = _StubInputBatch(["a"])
+        pipeline._batched_denoise_step(ib)
+
+        assert set(predict_v_calls) == {"cond", "uncond", "img_cond"}
+
+    def test_it2i_dual_cfg_combination_formula(self) -> None:
+        """Verify: v = uncond + cfg*(cond - img_cond) + img_cfg*(img_cond - uncond)."""
+        pipeline = _make_pipeline()
+        pipeline._step_states["a"] = _make_it2i_step_state("a", cfg_scale=4.0, img_cfg_scale=2.0)
+
+        cond_v = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 3.0
+        img_cond_v = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 2.0
+        uncond_v = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 1.0
+
+        def mock_predict_v(embeds, indexes, data, kv_key):
+            if kv_key == "cond":
+                return [cond_v]
+            if kv_key == "img_cond":
+                return [img_cond_v]
+            return [uncond_v]
+
+        pipeline._prepare_single_embeds = MagicMock(
+            return_value=(torch.randn(1, NUM_TOKENS, HIDDEN_DIM), torch.zeros(3, NUM_TOKENS, dtype=torch.long))
+        )
+        pipeline._batched_predict_v = mock_predict_v
+        pipeline._apply_cfg_norm = staticmethod(lambda v, c, norm: v)
+
+        ib = _StubInputBatch(["a"])
+        result = pipeline._batched_denoise_step(ib)
+
+        # v = 1 + 4*(3 - 2) + 2*(2 - 1) = 1 + 4 + 2 = 7
+        expected = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 7.0
+        torch.testing.assert_close(result, expected)
+
+    def test_it2i_img_cfg_scale_one_skips_uncond(self) -> None:
+        """img_cfg_scale=1 → only cond + img_cond, no uncond forward."""
+        pipeline = _make_pipeline()
+        pipeline._step_states["a"] = _make_it2i_step_state("a", cfg_scale=4.0, img_cfg_scale=1.0)
+
+        cond_v = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 3.0
+        img_cond_v = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 2.0
+
+        predict_v_calls = []
+
+        def mock_predict_v(embeds, indexes, data, kv_key):
+            predict_v_calls.append(kv_key)
+            if kv_key == "cond":
+                return [cond_v]
+            return [img_cond_v]
+
+        pipeline._prepare_single_embeds = MagicMock(
+            return_value=(torch.randn(1, NUM_TOKENS, HIDDEN_DIM), torch.zeros(3, NUM_TOKENS, dtype=torch.long))
+        )
+        pipeline._batched_predict_v = mock_predict_v
+        pipeline._apply_cfg_norm = staticmethod(lambda v, c, norm: v)
+
+        ib = _StubInputBatch(["a"])
+        result = pipeline._batched_denoise_step(ib)
+
+        assert "uncond" not in predict_v_calls
+        # v = img_cond + cfg*(cond - img_cond) = 2 + 4*(3-2) = 6
+        expected = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 6.0
+        torch.testing.assert_close(result, expected)
+
+    def test_it2i_no_img_cond_cache_falls_to_t2i(self) -> None:
+        """When cfg_scale==img_cfg_scale, no img_cond cache → T2I uncond path."""
+        pipeline = _make_pipeline()
+        state = _make_step_state("a", cfg_scale=4.0)
+        state["p"].img_cfg_scale = 4.0  # equal → no img_cond cache
+        pipeline._step_states["a"] = state
+
+        cond_v = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 3.0
+        uncond_v = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 1.0
+
+        predict_v_calls = []
+
+        def mock_predict_v(embeds, indexes, data, kv_key):
+            predict_v_calls.append(kv_key)
+            if kv_key == "cond":
+                return [cond_v]
+            return [uncond_v]
+
+        pipeline._prepare_single_embeds = MagicMock(
+            return_value=(torch.randn(1, NUM_TOKENS, HIDDEN_DIM), torch.zeros(3, NUM_TOKENS, dtype=torch.long))
+        )
+        pipeline._batched_predict_v = mock_predict_v
+        pipeline._apply_cfg_norm = staticmethod(lambda v, c, norm: v)
+
+        ib = _StubInputBatch(["a"])
+        result = pipeline._batched_denoise_step(ib)
+
+        assert predict_v_calls == ["cond", "uncond"]
+        # Standard T2I: uncond + cfg*(cond - uncond) = 1 + 4*(3-1) = 9
+        expected = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 9.0
+        torch.testing.assert_close(result, expected)
+
+    def test_mixed_t2i_and_it2i_in_batch(self) -> None:
+        """One T2I + one IT2I in same batch dispatches correct forwards per request."""
+        pipeline = _make_pipeline()
+        pipeline._step_states["t2i"] = _make_step_state("t2i", cfg_scale=4.0)
+        pipeline._step_states["it2i"] = _make_it2i_step_state("it2i", cfg_scale=4.0, img_cfg_scale=2.0)
+
+        pipeline._prepare_single_embeds = MagicMock(
+            side_effect=lambda extra: (
+                torch.randn(1, NUM_TOKENS, HIDDEN_DIM),
+                torch.zeros(3, NUM_TOKENS, dtype=torch.long),
+            )
+        )
+
+        predict_v_calls = []
+
+        def mock_predict_v(embeds, indexes, data, kv_key):
+            predict_v_calls.append((kv_key, len(data)))
+            return [torch.randn(1, NUM_TOKENS, OUTPUT_DIM) for _ in data]
+
+        pipeline._batched_predict_v = mock_predict_v
+
+        ib = _StubInputBatch(["t2i", "it2i"])
+        result = pipeline._batched_denoise_step(ib)
+
+        assert result.shape[0] == 2
+        keys = [c[0] for c in predict_v_calls]
+        assert "cond" in keys
+        assert "uncond" in keys
+        assert "img_cond" in keys
+
+    # ------------------------------------------------------------------
+    # cfg_zero_star tests
+    # ------------------------------------------------------------------
+
+    def test_cfg_zero_star_step_nonzero(self) -> None:
+        """cfg_zero_star at step>0 uses _optimized_scale for alpha."""
+        pipeline = _make_pipeline()
+        pipeline._step_states["a"] = _make_step_state(
+            "a", cfg_scale=4.0, cfg_norm="cfg_zero_star", step_index=1,
+        )
+
+        cond_v = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 2.0
+        uncond_v = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 1.0
+
+        def mock_predict_v(embeds, indexes, data, kv_key):
+            if kv_key == "cond":
+                return [cond_v]
+            return [uncond_v]
+
+        pipeline._prepare_single_embeds = MagicMock(
+            return_value=(torch.randn(1, NUM_TOKENS, HIDDEN_DIM), torch.zeros(3, NUM_TOKENS, dtype=torch.long))
+        )
+        pipeline._batched_predict_v = mock_predict_v
+
+        ib = _StubInputBatch(["a"])
+        result = pipeline._batched_denoise_step(ib)
+
+        # alpha = dot(cond, uncond) / ||uncond||^2
+        # cond=2, uncond=1: alpha = sum(2*1) / (sum(1^2) + 1e-8) ≈ 2.0
+        # v = uncond*alpha + cfg*(cond - uncond*alpha) = 1*2 + 4*(2 - 1*2) = 2 + 0 = 2
+        assert result.shape == (1, NUM_TOKENS, OUTPUT_DIM)
+        assert not torch.all(result == 0)
+
+    def test_cfg_zero_star_step_zero_returns_zeros(self) -> None:
+        """cfg_zero_star at step_index=0 returns all zeros (out_cond * 0.0)."""
+        pipeline = _make_pipeline()
+        pipeline._step_states["a"] = _make_step_state(
+            "a", cfg_scale=4.0, cfg_norm="cfg_zero_star", step_index=0,
+        )
+
+        cond_v = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 5.0
+        uncond_v = torch.ones(1, NUM_TOKENS, OUTPUT_DIM) * 1.0
+
+        def mock_predict_v(embeds, indexes, data, kv_key):
+            if kv_key == "cond":
+                return [cond_v]
+            return [uncond_v]
+
+        pipeline._prepare_single_embeds = MagicMock(
+            return_value=(torch.randn(1, NUM_TOKENS, HIDDEN_DIM), torch.zeros(3, NUM_TOKENS, dtype=torch.long))
+        )
+        pipeline._batched_predict_v = mock_predict_v
+
+        ib = _StubInputBatch(["a"])
+        result = pipeline._batched_denoise_step(ib)
+
+        expected = torch.zeros(1, NUM_TOKENS, OUTPUT_DIM)
+        torch.testing.assert_close(result, expected)

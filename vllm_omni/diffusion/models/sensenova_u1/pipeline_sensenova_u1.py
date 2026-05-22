@@ -1471,7 +1471,10 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
 
         indexes_image_cond = self._build_t2i_image_indexes(ns.token_h, ns.token_w, indexes_cond.shape[1], self.device)
         indexes_image_uncond = self._build_t2i_image_indexes(
-            ns.token_h, ns.token_w, indexes_uncond.shape[1], self.device
+            ns.token_h,
+            ns.token_w,
+            indexes_uncond.shape[1],
+            self.device
         )
 
         think_text = ""
@@ -1579,7 +1582,10 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
         if needs_uncond:
             past_kv_uncond, _ = self._it2i_prefix_forward(embeds_uncond, idx_uncond, mask_uncond)
             idx_image_uncond = self._build_t2i_image_indexes(
-                ns.token_h, ns.token_w, idx_uncond[0].max().item() + 1, self.device
+                ns.token_h,
+                ns.token_w,
+                idx_uncond[0].max().item() + 1,
+                self.device
             )
             caches["uncond"] = past_kv_uncond
             caches["idx_uncond"] = idx_image_uncond
@@ -1588,7 +1594,11 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
         # Expand all KV caches for batch size
         for key in ("cond", "img_cond", "uncond"):
             if key in caches and not isinstance(caches[key], dict):
-                self._expand_and_prepare_kv(caches[key], ns.token_h * ns.token_w, p.batch_size)
+                self._expand_and_prepare_kv(
+                    caches[key],
+                    ns.token_h * ns.token_w,
+                    p.batch_size
+                )
 
         return caches
 
@@ -1819,13 +1829,19 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
         self,
         input_batch: InputBatch,
     ) -> torch.Tensor:
-        """Batched denoise step using varlen attention for multiple requests."""
+        """Batched denoise step using varlen attention for multiple requests.
+
+        Supports both T2I (two-way CFG: cond + uncond) and IT2I (dual CFG:
+        cond + img_cond + uncond) requests in the same batch.
+        """
         per_req_data = []
         for req_id in input_batch.req_ids:
             extra = self._step_states.get(req_id)
             if extra is None:
                 raise ValueError(f"No step state found for request {req_id}")
             per_req_data.append(extra)
+
+        is_it2i = ["img_cond" in data["caches"] for data in per_req_data]
 
         image_embeds_list = []
         indexes_list = []
@@ -1836,31 +1852,58 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
 
         # Cond forward for all requests
         cond_out = self._batched_predict_v(
-            image_embeds_list, indexes_list, per_req_data, kv_key="cond"
+            image_embeds_list,
+            indexes_list,
+            per_req_data,
+            kv_key="cond",
         )
 
-        # Uncond forward for requests needing CFG
+        # Determine which requests need uncond and/or img_cond forwards
         needs_uncond_indices = []
+        needs_img_cond_indices = []
         for i, data in enumerate(per_req_data):
             p = data["p"]
             step_index = data.get("_current_step_index", 0)
             t = data["ns"].timesteps[step_index]
-            if p.cfg_scale > 1 and t >= p.cfg_interval[0] and t <= p.cfg_interval[1]:
-                needs_uncond_indices.append(i)
+            if is_it2i[i]:
+                use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
+                needs_cfg = not (p.cfg_scale == 1 and p.img_cfg_scale == 1)
+                if use_cfg and needs_cfg:
+                    if "img_cond" in data["caches"]:
+                        needs_img_cond_indices.append(i)
+                    if p.img_cfg_scale != 1:
+                        needs_uncond_indices.append(i)
+            else:
+                if p.cfg_scale > 1 and t >= p.cfg_interval[0] and t <= p.cfg_interval[1]:
+                    needs_uncond_indices.append(i)
 
+        # Uncond forward
         uncond_out: dict[int, torch.Tensor] = {}
         if needs_uncond_indices:
             uncond_embeds = [image_embeds_list[i] for i in needs_uncond_indices]
-            uncond_indexes_list = []
-            uncond_data = []
-            for i in needs_uncond_indices:
-                uncond_indexes_list.append(per_req_data[i]["caches"]["idx_uncond"])
-                uncond_data.append(per_req_data[i])
+            uncond_indexes_list = [
+                per_req_data[i]["caches"]["idx_uncond"] for i in needs_uncond_indices
+            ]
+            uncond_data = [per_req_data[i] for i in needs_uncond_indices]
             uncond_results = self._batched_predict_v(
-                uncond_embeds, uncond_indexes_list, uncond_data, kv_key="uncond"
+                uncond_embeds, uncond_indexes_list, uncond_data, kv_key="uncond",
             )
             for j, i in enumerate(needs_uncond_indices):
                 uncond_out[i] = uncond_results[j]
+
+        # Img_cond forward (IT2I only)
+        img_cond_out: dict[int, torch.Tensor] = {}
+        if needs_img_cond_indices:
+            img_cond_embeds = [image_embeds_list[i] for i in needs_img_cond_indices]
+            img_cond_indexes_list = [
+                per_req_data[i]["caches"]["idx_img_cond"] for i in needs_img_cond_indices
+            ]
+            img_cond_data = [per_req_data[i] for i in needs_img_cond_indices]
+            img_cond_results = self._batched_predict_v(
+                img_cond_embeds, img_cond_indexes_list, img_cond_data, kv_key="img_cond",
+            )
+            for j, i in enumerate(needs_img_cond_indices):
+                img_cond_out[i] = img_cond_results[j]
 
         # Per-request CFG combination
         batch_v_preds = []
@@ -1869,7 +1912,22 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
             p = data["p"]
             step_index = data.get("_current_step_index", 0)
 
-            if i in uncond_out:
+            if i in img_cond_out:
+                # IT2I dual CFG
+                out_img_cond = img_cond_out[i]
+                if i in uncond_out:
+                    out_uncond = uncond_out[i]
+                    v_pred = (
+                        out_uncond
+                        + p.cfg_scale * (out_cond - out_img_cond)
+                        + p.img_cfg_scale * (out_img_cond - out_uncond)
+                    )
+                else:
+                    v_pred = out_img_cond + p.cfg_scale * (out_cond - out_img_cond)
+                if p.cfg_scale > 1 or p.img_cfg_scale > 1:
+                    v_pred = self._apply_cfg_norm(v_pred, out_cond, p.cfg_norm)
+            elif i in uncond_out:
+                # T2I CFG
                 out_uncond = uncond_out[i]
                 if p.cfg_norm == "cfg_zero_star":
                     pos_flat = out_cond.view(p.batch_size, -1)

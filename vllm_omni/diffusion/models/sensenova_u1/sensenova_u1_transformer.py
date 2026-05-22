@@ -648,8 +648,16 @@ class SenseNovaU1DecoderLayer(nn.Module):
         hidden_states = self.mlp_mot_gen(self.post_attention_layernorm_mot_gen(hidden_states))
         return residual + hidden_states
 
-    def _forward_gen_varlen(self, hidden_states, indexes, prefix_kv_list,
-                            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k):
+    def _forward_gen_varlen(
+        self,
+        hidden_states,
+        indexes,
+        prefix_kv_list,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k
+    ):
         """Varlen generation forward for one decoder layer."""
         residual = hidden_states
         hidden_states = self.input_layernorm_mot_gen(hidden_states)
@@ -802,13 +810,17 @@ class SenseNovaU1Model(nn.Module):
                 prefix_kv_list.append((prefix_k, prefix_v))
 
             hidden_states = layer._forward_gen_varlen(
-                hidden_states, indexes, prefix_kv_list,
-                cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                hidden_states,
+                indexes,
+                prefix_kv_list,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
             )
 
         hidden_states = self.norm_mot_gen(hidden_states)
         return SenseNovaU1ModelOutput(last_hidden_state=hidden_states)
-
 
 # ---------------------------------------------------------------------------
 # ForCausalLM wrapper
@@ -879,8 +891,13 @@ class SenseNovaU1ForCausalLM(nn.Module):
     ):
         """Varlen generation forward — delegates to model.forward_varlen."""
         outputs = self.model.forward_varlen(
-            inputs_embeds, indexes, past_key_values_list,
-            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            inputs_embeds,
+            indexes,
+            past_key_values_list,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
         )
         return SenseNovaU1CausalLMOutput(
             hidden_states=outputs.last_hidden_state,

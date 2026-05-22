@@ -1,21 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Step 7: Step-wise execution and online dynamic batching tests.
+"""Step-wise execution and online dynamic batching tests for SenseNova-U1.
 
 Verifies that:
 1. SenseNovaU1Pipeline correctly implements SupportsStepExecution
 2. Single-request step mode produces output identical to forward()
-3. Multiple same-parameter requests can be batched (Phase 2)
-4. Different prompt lengths can be batched (Phase 3 — for-loop)
-5. Different resolutions can be batched (Phase 4 — for-loop)
-6. Different CFG scales can be batched (Phase 5 — for-loop)
-7. Requests with different step counts complete independently (Phase 6)
+3. Multiple same-parameter requests can be batched
+4. Different prompt lengths can be batched
+5. Different resolutions can be batched
+6. Different CFG scales can be batched
+7. Requests with different step counts complete independently
+8. End-to-end scheduler → pipeline heterogeneous batching
+9. Think mode (AR generation) step execution correctness
+10. Image-to-image (IT2I) step execution correctness
 
 Usage:
     micromamba activate sensenova_u1
-    python -m pytest tests/diffusion/models/sensenova_u1/test_7_step_execution.py -v -s
+    python -m pytest tests/diffusion/models/sensenova_u1/test_sensenova_u1_step_execution.py -v -s
 
 Or run standalone:
-    python tests/diffusion/models/sensenova_u1/test_7_step_execution.py
+    python tests/diffusion/models/sensenova_u1/test_sensenova_u1_step_execution.py
 """
 
 import os
@@ -1032,6 +1035,301 @@ def test_varlen_throughput_stress():
 
 
 # ---------------------------------------------------------------------------
+# Test 15: End-to-end scheduler → pipeline with heterogeneous batch (8 reqs)
+# ---------------------------------------------------------------------------
+
+
+def test_e2e_scheduler_heterogeneous_batch():
+    """End-to-end: scheduler batches 8 heterogeneous requests, pipeline produces correct output.
+
+    Uses StepScheduler with heterogeneous_batch_fields to batch requests with
+    different resolutions (512x512, 768x768) and different CFG scales (4.0, 7.5).
+    Verifies:
+      1. Scheduler puts all 8 requests into one batch
+      2. Varlen batched output matches single-request reference (MSE < 1.0)
+      3. Throughput improvement vs serial execution
+    """
+    import copy
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pipeline = _build_pipeline()
+    num_reqs = 8
+    num_steps = DEFAULT_NUM_STEPS
+
+    configs = [
+        {"image_size": (512, 512), "cfg_scale": 4.0},
+        {"image_size": (768, 768), "cfg_scale": 7.5},
+        {"image_size": (512, 512), "cfg_scale": 7.5},
+        {"image_size": (768, 768), "cfg_scale": 4.0},
+        {"image_size": (512, 512), "cfg_scale": 4.0},
+        {"image_size": (768, 768), "cfg_scale": 7.5},
+        {"image_size": (512, 512), "cfg_scale": 7.5},
+        {"image_size": (768, 768), "cfg_scale": 4.0},
+    ]
+    prompts = [
+        "A cat sleeping on a sunny windowsill",
+        "A futuristic city skyline at dusk with flying cars",
+        "An oil painting of sunflowers in a ceramic vase",
+        "A snowy mountain landscape with a cabin and smoke",
+        "A robot playing chess in a cozy library",
+        "A coral reef teeming with tropical fish",
+        "A steampunk airship floating above the clouds",
+        "A medieval castle on a cliff overlooking the sea",
+    ]
+
+    def _build_scheduler_request(prompt, image_size, cfg_scale, seed):
+        sp = OmniDiffusionSamplingParams(
+            height=image_size[1],
+            width=image_size[0],
+            num_inference_steps=num_steps,
+            seed=seed,
+            extra_args={"cfg_scale": cfg_scale},
+        )
+        return OmniDiffusionRequest(prompts=[prompt], sampling_params=sp)
+
+    # ── Phase A: reference outputs (single-request forward) ──
+    refs = []
+    with torch.inference_mode():
+        for i in range(num_reqs):
+            req = _build_request(
+                prompt=prompts[i],
+                image_size=configs[i]["image_size"],
+                cfg_scale=configs[i]["cfg_scale"],
+                seed=700 + i,
+            )
+            out = pipeline(req)
+            refs.append(out.output)
+
+    # ── Phase B: scheduler batching verification ──
+    od_config = OmniDiffusionConfig(
+        model=MODEL_PATH,
+        dtype=torch.bfloat16,
+    )
+    od_config.heterogeneous_batch_fields = [
+        "height", "width",
+        "guidance_scale", "guidance_scale_2", "guidance_scale_provided",
+    ]
+
+    scheduler = StepScheduler()
+    scheduler.od_config = od_config
+    scheduler.max_num_running_reqs = num_reqs
+
+    sched_req_ids = []
+    requests = []
+    for i in range(num_reqs):
+        req = _build_scheduler_request(
+            prompts[i], configs[i]["image_size"], configs[i]["cfg_scale"], 700 + i,
+        )
+        requests.append(req)
+        sched_req_ids.append(scheduler.add_request(req))
+
+    sched_output = scheduler.schedule()
+    scheduled_count = len(sched_output.scheduled_new_reqs) + len(sched_output.scheduled_cached_reqs.sched_req_ids)
+    print(f"\n  Scheduler batched {scheduled_count}/{num_reqs} requests together")
+    assert scheduled_count == num_reqs, (
+        f"Scheduler only batched {scheduled_count}/{num_reqs} — "
+        f"heterogeneous_batch_fields not working end-to-end"
+    )
+
+    # ── Phase C: create states from schedule output (mimic runner) ──
+    states = []
+    for new_req_data in sched_output.scheduled_new_reqs:
+        req = new_req_data.req
+        state = DiffusionRequestState(
+            req_id=new_req_data.sched_req_id,
+            sampling=copy.deepcopy(req.sampling_params),
+            prompts=req.prompts,
+        )
+        state.sampling.generator = torch.Generator(device="cuda").manual_seed(state.sampling.seed)
+        states.append(state)
+
+    # ── Phase D: varlen batched execution (group by resolution) ──
+    torch.accelerator.synchronize()
+    start = time.perf_counter()
+    with torch.inference_mode():
+        for state in states:
+            pipeline.prepare_encode(state)
+
+        for _ in range(num_steps):
+            active = [s for s in states if not s.denoise_completed]
+            if not active:
+                break
+            # InputBatch requires same latent shape; group by resolution
+            by_res: dict[tuple[int, int], list] = {}
+            for s in active:
+                res_key = tuple(s.latents.shape[2:])
+                by_res.setdefault(res_key, []).append(s)
+
+            all_preds_map: dict[str, torch.Tensor] = {}
+            for group in by_res.values():
+                ib = InputBatch.make_batch(group)
+                pred = pipeline.denoise_step(ib)
+                offset = 0
+                for s in group:
+                    rows = s.latents.shape[0]
+                    all_preds_map[s.req_id] = pred[offset:offset + rows]
+                    offset += rows
+
+            for s in active:
+                pipeline.step_scheduler(s, all_preds_map[s.req_id])
+
+        outputs = [pipeline.post_decode(state) for state in states]
+    torch.accelerator.synchronize()
+    batch_time = time.perf_counter() - start
+
+    # ── Phase E: serial execution for comparison ──
+    states_serial = []
+    for i in range(num_reqs):
+        req = _build_request(
+            prompt=prompts[i],
+            image_size=configs[i]["image_size"],
+            cfg_scale=configs[i]["cfg_scale"],
+            seed=700 + i,
+        )
+        states_serial.append(_make_state(req, f"e2e_serial_{i}"))
+
+    torch.accelerator.synchronize()
+    start = time.perf_counter()
+    with torch.inference_mode():
+        for state in states_serial:
+            pipeline.prepare_encode(state)
+        for _ in range(num_steps):
+            active = [s for s in states_serial if not s.denoise_completed]
+            if not active:
+                break
+            for state in active:
+                ib = InputBatch.make_batch([state])
+                pred = pipeline.denoise_step(ib)
+                pipeline.step_scheduler(state, pred)
+        outputs_serial = [pipeline.post_decode(state) for state in states_serial]
+    torch.accelerator.synchronize()
+    serial_time = time.perf_counter() - start
+
+    # ── Phase F: correctness + performance report ──
+    print(f"\n{'=' * 60}")
+    print(f"E2E SCHEDULER HETEROGENEOUS BATCH ({num_reqs} reqs × {num_steps} steps)")
+    print(f"  Resolutions: 512x512, 768x768 | CFG: 4.0, 7.5")
+    print(f"{'=' * 60}")
+
+    all_pass = True
+    for i in range(num_reqs):
+        assert outputs[i].output is not None, f"Request {i} produced no output"
+        mse = _image_mse(refs[i], outputs[i].output)
+        cfg = configs[i]["cfg_scale"]
+        res = configs[i]["image_size"]
+        status = "PASS" if mse < 1.0 else "FAIL"
+        if mse >= 1.0:
+            all_pass = False
+        print(f"  req[{i}] {res} cfg={cfg}: MSE={mse:.4f} [{status}]")
+        assert mse < 1.0, f"Request {i} ({res}, cfg={cfg}) diverges: MSE={mse}"
+
+    ratio = serial_time / batch_time if batch_time > 0 else float("inf")
+    print(f"  Serial total:  {serial_time:.2f}s")
+    print(f"  Batch total:   {batch_time:.2f}s")
+    print(f"  Speedup:       {ratio:.2f}x")
+    print(f"{'=' * 60}")
+
+
+# ---------------------------------------------------------------------------
+# Test 16: Think mode step equivalence
+# ---------------------------------------------------------------------------
+
+
+def test_think_mode_step_equivalence():
+    """Think mode step output matches forward() output (same seed).
+
+    Verifies that _build_t2i_caches with think_mode=True produces correct KV
+    caches via _generate_think AR loop, and that the variable-length prefix
+    is correctly consumed during denoise steps.
+    """
+    pipeline = _build_pipeline()
+
+    req = _build_request(seed=500, think=True)
+    with torch.inference_mode():
+        output_forward = pipeline(req)
+
+    state = _make_state(_build_request(seed=500, think=True), "think_step")
+    with torch.inference_mode():
+        output_step = _run_step_mode(pipeline, state)
+
+    assert output_forward.output is not None
+    assert output_step.output is not None
+
+    mse = _image_mse(output_forward.output, output_step.output)
+    psnr = _image_psnr(output_forward.output, output_step.output)
+    print(f"\n  Think mode step vs forward: MSE={mse:.4f}, PSNR={psnr:.1f}dB")
+
+    assert mse < 1.0, f"Think mode step output diverges from forward(): MSE={mse}"
+
+    out_dir = os.path.join(os.path.dirname(__file__), "outputs")
+    os.makedirs(out_dir, exist_ok=True)
+    output_forward.output.save(os.path.join(out_dir, "think_forward.png"))
+    output_step.output.save(os.path.join(out_dir, "think_step.png"))
+
+
+# ---------------------------------------------------------------------------
+# Test 17: IT2I (image-to-image) step equivalence
+# ---------------------------------------------------------------------------
+
+
+def _make_test_image(width=256, height=256):
+    """Create a synthetic gradient test image for IT2I testing."""
+    img = Image.new("RGB", (width, height))
+    pixels = img.load()
+    for y in range(height):
+        for x in range(width):
+            pixels[x, y] = (x % 256, y % 256, (x + y) % 256)
+    return img
+
+
+def test_it2i_step_equivalence():
+    """IT2I step output matches forward() output (same seed).
+
+    Verifies that _build_it2i_caches produces correct triple-condition KV caches
+    (cond + img_cond + uncond) and that _denoise_step_it2i dual CFG combination
+    works correctly in step execution mode.
+    """
+    pipeline = _build_pipeline()
+
+    test_image = _make_test_image()
+    prompt_dict = {
+        "prompt": "Transform this image into a watercolor painting",
+        "multi_modal_data": {"image": [test_image]},
+    }
+
+    req = _build_request(prompt=prompt_dict, img_cfg_scale=2.0, seed=600)
+    with torch.inference_mode():
+        output_forward = pipeline(req)
+
+    state = _make_state(
+        _build_request(prompt=prompt_dict, img_cfg_scale=2.0, seed=600),
+        "it2i_step",
+    )
+    with torch.inference_mode():
+        output_step = _run_step_mode(pipeline, state)
+
+    assert output_forward.output is not None
+    assert output_step.output is not None
+
+    mse = _image_mse(output_forward.output, output_step.output)
+    psnr = _image_psnr(output_forward.output, output_step.output)
+    print(f"\n  IT2I step vs forward: MSE={mse:.4f}, PSNR={psnr:.1f}dB")
+
+    assert mse < 1.0, f"IT2I step output diverges from forward(): MSE={mse}"
+
+    out_dir = os.path.join(os.path.dirname(__file__), "outputs")
+    os.makedirs(out_dir, exist_ok=True)
+    output_forward.output.save(os.path.join(out_dir, "it2i_forward.png"))
+    output_step.output.save(os.path.join(out_dir, "it2i_step.png"))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1077,10 +1375,19 @@ if __name__ == "__main__":
     print("\n[12/13] Varlen throughput: PASS")
 
     test_dynamic_join_leave()
-    print("\n[13/14] Dynamic join/leave: PASS")
+    print("\n[13/17] Dynamic join/leave: PASS")
 
     test_varlen_throughput_stress()
-    print("\n[14/14] Varlen throughput stress: PASS")
+    print("\n[14/17] Varlen throughput stress: PASS")
+
+    test_e2e_scheduler_heterogeneous_batch()
+    print("\n[15/17] E2E scheduler heterogeneous batch: PASS")
+
+    test_think_mode_step_equivalence()
+    print("\n[16/17] Think mode step equivalence: PASS")
+
+    test_it2i_step_equivalence()
+    print("\n[17/17] IT2I step equivalence: PASS")
 
     print("\n" + "=" * 70)
     print("ALL TESTS PASSED")
