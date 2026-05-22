@@ -101,6 +101,13 @@ Documentation = "https://vllm-omni.readthedocs.io"
 [project.scripts]
 vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 
+# Register vllm-omni's model registrations on every vllm subprocess. vllm
+# auto-loads anything advertised under `vllm.general_plugins` in its own
+# `load_general_plugins()`, so worker subprocesses spawned by vllm (which
+# only import vllm, not vllm_omni) will still pick up the omni archs.
+[project.entry-points."vllm.general_plugins"]
+vllm_omni_register_models = "vllm_omni.engine.arg_utils:register_omni_models_to_vllm"
+
 
 [tool.setuptools.packages.find]
 where = ["."]

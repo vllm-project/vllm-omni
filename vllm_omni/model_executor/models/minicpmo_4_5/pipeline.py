@@ -23,7 +23,12 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
 MINICPMO_4_5_PIPELINE = PipelineConfig(
     model_type="minicpmo_4_5",
     model_arch="MiniCPMO45OmniForConditionalGeneration",
-    hf_architectures=("MiniCPMO45OmniForConditionalGeneration",),
+    # MiniCPM-o 4.5's HF config.json reports `model_type="minicpmo"` and
+    # `architectures=["MiniCPMO"]` (shared with older MiniCPM-o 1.0 / 2.6),
+    # so we identify 4.5 via the HF arch fallback below + the "version"
+    # field. The 4.5-specific name is kept so model repos can opt into the
+    # explicit arch in the future without breaking auto-resolution today.
+    hf_architectures=("MiniCPMO", "MiniCPMO45OmniForConditionalGeneration"),
     stages=(
         StagePipelineConfig(
             stage_id=0,

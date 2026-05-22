@@ -118,14 +118,26 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if os.path.isdir(token2wav_dir):
                 if not _stepaudio2_available:
                     raise ImportError(
-                        "MiniCPM-o 4.5 token2wav stage requires the stepaudio2 package, "
-                        "which is not available on PyPI. Install it from "
-                        "https://github.com/stepfun-ai/Step-Audio2 (clone the repo and add it "
-                        "to PYTHONPATH, or `pip install -e .` inside the checkout)."
+                        "MiniCPM-o 4.5 token2wav stage requires the `stepaudio2` Python "
+                        "module (a MiniCPM-o-flavored Token2wav vocoder, NOT the upstream "
+                        "stepfun-ai/Step-Audio2 — the upstream signature does not accept "
+                        "n_timesteps and will fail at __init__). Install via either:\n"
+                        "    pip install minicpmo-utils[all]   # MiniCPM-o umbrella, recommended\n"
+                        "    pip install stepaudio2-minicpmo   # bare token2wav package\n"
+                        "Both ship the same `from stepaudio2 import Token2wav` entry point used "
+                        "by openbmb/MiniCPM-o-4_5/modeling_minicpmo.py."
                     )
                 prev_dtype2 = torch.get_default_dtype()
                 torch.set_default_dtype(torch.float32)
                 try:
+                    # NB: this must be the MiniCPM-o-flavored Token2wav from
+                    # the `stepaudio2-minicpmo` PyPI package (or the
+                    # `minicpmo-utils[all]` umbrella), not the upstream
+                    # `stepfun-ai/Step-Audio2` repo. The MiniCPM-o variant's
+                    # __init__ accepts n_timesteps; the upstream signature is
+                    # (model_path, float16=False) and will raise
+                    # TypeError on n_timesteps. See ImportError message below
+                    # for installation guidance.
                     self.audio_tokenizer = _Token2wav(token2wav_dir, float16=False, n_timesteps=10)
                 finally:
                     torch.set_default_dtype(prev_dtype2)
@@ -323,6 +335,30 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         return new_tokens[:, : t + 1 if finished else t, :]
 
+    def _dummy_hidden_states(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Shape-correct zero tensor for vllm KV cache profiling.
+
+        vllm's gpu_model_runner._dummy_run takes forward()'s return value as
+        ``hidden_states`` and does ``hidden_states[logit_indices_device]``;
+        returning None on the dummy path crashes with
+        ``TypeError: 'NoneType' object is not subscriptable``.
+        """
+        for ref in (input_ids, positions, inputs_embeds):
+            if isinstance(ref, torch.Tensor):
+                num_tokens = int(ref.shape[0]) if ref.ndim >= 1 else 1
+                device = ref.device
+                break
+        else:
+            num_tokens = 1
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        hidden_size = int(getattr(self, "_hidden_size", 768) or 768)
+        return torch.zeros((num_tokens, hidden_size), device=device, dtype=torch.bfloat16)
+
     def forward(
         self,
         input_ids=None,
@@ -342,8 +378,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             tts_text = tts_text[0] if tts_text else ""
 
         if tts_token_ids is None or tts_hidden_states is None:
-            logger.warning("4.5 Talker: missing tts_token_ids or tts_hidden_states")
-            return None, None
+            # KV cache profiling / dummy run path — no real TTS input yet.
+            logger.debug("4.5 Talker: dummy forward (missing tts_token_ids/tts_hidden_states)")
+            return self._dummy_hidden_states(input_ids, positions, inputs_embeds)
 
         logger.info("4.5 Talker: generating speech for %d tokens", tts_token_ids.shape[0])
         waveform = self.generate_speech(tts_token_ids, tts_hidden_states)

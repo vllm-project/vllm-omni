@@ -233,12 +233,12 @@ _OMNI_MODELS = {
         "minicpmo_4_5_omni",
         "MiniCPMO45OmniForConditionalGeneration",
     ),
-    "MiniCPMO45OmniLLMModel": (
+    "MiniCPMO45OmniLLMForConditionalGeneration": (
         "minicpmo_4_5",
         "minicpmo_4_5_omni_llm",
         "MiniCPMO45OmniLLMForConditionalGeneration",
     ),
-    "MiniCPMO45OmniTTSModel": (
+    "MiniCPMO45OmniTTSForConditionalGeneration": (
         "minicpmo_4_5",
         "minicpmo_4_5_omni_tts",
         "MiniCPMO45OmniTTSForConditionalGeneration",

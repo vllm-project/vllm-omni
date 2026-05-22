@@ -108,12 +108,21 @@ except ImportError:
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     ImageItem,
-    ModalityData,
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
     NestedTensors,
 )
+
+# vllm >=0.21 moved ModalityData / MultiModalDataDict from
+# vllm.multimodal.inputs to vllm.inputs (still re-exported from
+# vllm.multimodal.parse). Fall back to the old location for older vllm.
+try:
+    from vllm.inputs import ModalityData, MultiModalDataDict
+except ImportError:
+    from vllm.multimodal.inputs import (  # type: ignore[no-redef]
+        ModalityData,
+        MultiModalDataDict,
+    )
 from vllm.multimodal.parse import (
     AudioItem,
     AudioProcessorItems,
