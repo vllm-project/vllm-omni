@@ -2,9 +2,14 @@
 
 Consumed by:
 - vllm_omni.metrics.prometheus (server-side /metrics families)
+- vllm_omni.metrics.modality (audio/image/video families)
+- vllm_omni.metrics.transfer (cross-stage transfer families)
 - vllm_omni.benchmarks.metrics.metrics (bench CLI MultiModalsBenchmarkMetrics)
 
-RFC: vLLM-Omni Prometheus 多模态语义、跨 stage Transfer (G4/G5).
+RFC: https://github.com/vllm-project/vllm-omni/issues/3545 — locked set of
+23 ``vllm_omni:*`` families. Time-bearing metrics use the ``_s`` suffix
+(values in seconds), counters use ``_total`` (auto-suffixed by the
+prometheus client), sizes use ``_bytes``.
 """
 
 # vllm:omni_ avoids upstream's unregister_vllm_metrics() stripping; matches PR #3362.
@@ -19,68 +24,65 @@ AUDIO_DURATION = "audio_duration"
 AUDIO_RTF = "audio_rtf"
 AUDIO_FRAMES = "audio_frames"
 
-IMAGE_TTFP = "image_ttfp"
 IMAGE_NUM = "image_num"
-IMAGE_GENERATION_TIME = "image_generation_time"
+IMAGE_GENERATION = "image_generation"
 
 VIDEO_DURATION = "video_duration"
 VIDEO_RTF = "video_rtf"
-VIDEO_GENERATION_TIME = "video_generation_time"
+VIDEO_GENERATION = "video_generation"
 
 
 # ============================================================================
-# Pipeline-level metric families (PR #3362 + G6)
+# Pipeline-level metric families (RFC: Pipeline request counts + latency)
 # ============================================================================
 NUM_REQUESTS_RUNNING = METRIC_PREFIX + "num_requests_running"
 NUM_REQUESTS_WAITING = METRIC_PREFIX + "num_requests_waiting"
-E2E_REQUEST_LATENCY_SECONDS = METRIC_PREFIX + "e2e_request_latency_seconds"
-REQUEST_QUEUE_TIME_SECONDS = METRIC_PREFIX + "request_queue_time_seconds"
+E2E_REQUEST_LATENCY_S = METRIC_PREFIX + "e2e_request_latency_s"
 
 # G6: per-finished_reason Counter that replaces the original
-# num_requests_success / num_requests_fail pair from PR #3362. Single source
-# of completion-state counting with finished_reason ∈ {stop, length, abort, ...}
-# (aborts include the "fail" path that previously used a separate counter).
-# Counter auto-suffixes _total at exposition time; pass without _total here.
+# num_requests_success / num_requests_fail pair from PR #3362. finished_reason ∈
+# {stop, length, abort, ...}; aborts include the "fail" path that previously
+# used a separate counter. Counter auto-suffixes _total at exposition time.
 REQUESTS_SUCCESS = METRIC_PREFIX + "requests_success"
 
 
 # ============================================================================
-# Audio family (G1)
+# Audio family (RFC: Audio path)
 # ============================================================================
-AUDIO_TTFP_SECONDS = METRIC_PREFIX + AUDIO_TTFP + "_seconds"
-AUDIO_DURATION_SECONDS = METRIC_PREFIX + AUDIO_DURATION + "_seconds"
+AUDIO_TTFP_S = METRIC_PREFIX + AUDIO_TTFP + "_s"
+AUDIO_DURATION_S = METRIC_PREFIX + AUDIO_DURATION + "_s"
 AUDIO_RTF_METRIC = METRIC_PREFIX + AUDIO_RTF
 AUDIO_FRAMES_METRIC = METRIC_PREFIX + AUDIO_FRAMES
+AUDIO_UNDERRUN_S = METRIC_PREFIX + "audio_underrun_s"
+AUDIO_CONTINUITY_OK = METRIC_PREFIX + "audio_continuity_ok"
+AUDIO_SKIPPED_REQUESTS = METRIC_PREFIX + "audio_skipped_requests"
 
 
 # ============================================================================
-# Image / Video family (G2)
+# Visual family (RFC: Visual diffusion-internal + business semantics)
 # ============================================================================
-IMAGE_TTFP_SECONDS = METRIC_PREFIX + IMAGE_TTFP + "_seconds"
+# Diffusion-internal: timing decomposition of one diffusion-stage request,
+# in seconds. PromQL recipe for per-step latency:
+#   diffusion_exec_s / on(model_name, stage, replica) num_inference_steps
+DIFFUSION_PREPROCESS_S = METRIC_PREFIX + "diffusion_preprocess_s"
+DIFFUSION_EXEC_S = METRIC_PREFIX + "diffusion_exec_s"
+DIFFUSION_POSTPROCESS_S = METRIC_PREFIX + "diffusion_postprocess_s"
+
+# Business semantics: per-request stage timings + counts.
 IMAGE_NUM_METRIC = METRIC_PREFIX + IMAGE_NUM
-IMAGE_GENERATION_TIME_SECONDS = METRIC_PREFIX + IMAGE_GENERATION_TIME + "_seconds"
-
-VIDEO_DURATION_SECONDS = METRIC_PREFIX + VIDEO_DURATION + "_seconds"
+IMAGE_GENERATION_S = METRIC_PREFIX + IMAGE_GENERATION + "_s"
+VIDEO_DURATION_S = METRIC_PREFIX + VIDEO_DURATION + "_s"
 VIDEO_RTF_METRIC = METRIC_PREFIX + VIDEO_RTF
-VIDEO_GENERATION_TIME_SECONDS = METRIC_PREFIX + VIDEO_GENERATION_TIME + "_seconds"
+VIDEO_GENERATION_S = METRIC_PREFIX + VIDEO_GENERATION + "_s"
 
 
 # ============================================================================
-# Diffusion ms-level timing (PR #3362)
-# ============================================================================
-DIFFUSION_PREPROCESS_TIME_MS = METRIC_PREFIX + "diffusion_preprocess_time_ms"
-DIFFUSION_EXEC_TIME_MS = METRIC_PREFIX + "diffusion_exec_time_ms"
-DIFFUSION_POSTPROCESS_TIME_MS = METRIC_PREFIX + "diffusion_postprocess_time_ms"
-DIFFUSION_STEP_TIME_MS = METRIC_PREFIX + "diffusion_step_time_ms"
-
-
-# ============================================================================
-# Cross-stage Transfer family (G3)
+# Cross-stage Transfer family (RFC: Cross-stage transfer)
 # ============================================================================
 TRANSFER_SIZE_BYTES = METRIC_PREFIX + "transfer_size_bytes"
-TRANSFER_TX_TIME_MS = METRIC_PREFIX + "transfer_tx_time_ms"
-TRANSFER_RX_DECODE_TIME_MS = METRIC_PREFIX + "transfer_rx_decode_time_ms"
-TRANSFER_IN_FLIGHT_TIME_MS = METRIC_PREFIX + "transfer_in_flight_time_ms"
+TRANSFER_TX_S = METRIC_PREFIX + "transfer_tx_s"
+TRANSFER_RX_S = METRIC_PREFIX + "transfer_rx_s"
+TRANSFER_IN_FLIGHT_S = METRIC_PREFIX + "transfer_in_flight_s"
 
 
 # ============================================================================
@@ -94,28 +96,45 @@ SUCCESS_LABELS = ("model_name", "finished_reason")
 # `stage` + `replica`.
 STAGE_LABELS = ("model_name", "stage", "replica")
 
-# Cross-stage transfer label set (G3). Field names match TransferEdgeStats.
-# model_name is included (deviating from RFC §3.2.6 which lists only the four
-# stage/replica labels) so transfer aligns with the rest of the omni_* family
-# naming and PromQL joins on model_name work uniformly across audio/image/
-# video/transfer.
-TRANSFER_LABELS = ("model_name", "from_stage", "from_replica", "to_stage", "to_replica")
+# Audio continuity Counter carries an extra `threshold_ms` label so multiple
+# threshold buckets can be tracked simultaneously. (RFC keeps the suffix as
+# `_ms` for this label because it names a numeric threshold *value* in ms,
+# not a time-bearing metric.)
+AUDIO_CONTINUITY_LABELS = ("model_name", "stage", "replica", "threshold_ms")
+
+# Audio skipped-requests Counter carries a `reason` label so the silent-loss
+# path (e.g. code2wav rejecting malformed codec input) can be distinguished
+# from other "200 OK + empty audio" cases.
+AUDIO_SKIPPED_LABELS = ("model_name", "stage", "replica", "reason")
+
+# Cross-stage transfer label set. Each observation is one physical hop from
+# (from_stage, from_replica) to (to_stage, to_replica).
+TRANSFER_LABELS = (
+    "model_name",
+    "from_stage",
+    "from_replica",
+    "to_stage",
+    "to_replica",
+)
 
 
 # ============================================================================
 # Histogram buckets
 # ============================================================================
-# Seconds bucket for TTFP / duration / generation time families.
+# Seconds bucket for e2e / generation / TTFP-style metrics that range from
+# ~10 ms to several minutes (long video generation).
 SECONDS_BUCKETS = (
     0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0,
 )
 
-# Milliseconds bucket for transfer tx / rx / in-flight times.
-MS_BUCKETS = (
-    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
+# Seconds bucket for fine-grained metrics (transfer / diffusion-internal /
+# audio-underrun) that need millisecond-level resolution. Covers ~1 ms to 1
+# minute so diffusion stages with long executor work still fit.
+SECONDS_FAST_BUCKETS = (
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 60.0,
 )
 
-# RTF SLO red line is 1.0 (TTS must generate faster than playback).
+# RTF SLO red line is 1.0 (TTS / video gen must run faster than playback).
 RTF_BUCKETS = (
     0.1, 0.25, 0.5, 0.75, 0.9, 1.0, 1.25, 1.5, 2.0, 5.0, 10.0,
 )
@@ -125,6 +144,14 @@ BYTES_BUCKETS = (
     1024, 4096, 16384, 65536, 262144, 1048576,
     4194304, 16777216, 67108864, 268435456,
 )
+
+
+# ============================================================================
+# Audio-continuity defaults
+# ============================================================================
+# Default underrun threshold (matches PR #3618 bench-side default and the
+# commonly-cited "audible gap" threshold for streaming TTS).
+AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S = 0.1
 
 
 # ============================================================================
@@ -153,7 +180,7 @@ def compute_video_rtf(stage_gen_time_s: float, video_duration_s: float) -> float
 # Audio sample-rate resolution
 # ============================================================================
 # Most common across vllm-omni talker variants (cosyvoice3, omnivoice,
-# qwen3_tts, mimo_audio, voxcpm). voxcpm2 uses 48000, stable_audio 44100,
+# qwen3_tts, mimo_audio). voxcpm2 uses 48000, stable_audio 44100,
 # ming_flash 16000 — these models populate multimodal_output["audio_sample_rate"]
 # at runtime so this default only kicks in when the field is missing.
 DEFAULT_AUDIO_SAMPLE_RATE = 24000
@@ -165,8 +192,8 @@ def resolve_audio_sample_rate(multimodal_output: dict | None) -> int:
     """Extract audio sample_rate from a multimodal_output dict, with fallbacks.
 
     Tries the same key chain as serving_chat.py's audio response path so
-    /metrics audio_duration_seconds = audio_frames / sample_rate stays
-    consistent with what the OpenAI streaming endpoint reports back to clients.
+    /metrics audio_duration_s = audio_frames / sample_rate stays consistent
+    with what the OpenAI streaming endpoint reports back to clients.
     Returns DEFAULT_AUDIO_SAMPLE_RATE when no usable value is present.
     """
     if not multimodal_output:

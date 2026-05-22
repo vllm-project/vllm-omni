@@ -7,6 +7,7 @@ from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.modality import (
     OmniModalityMetrics,
     observe_audio_first_packet,
+    observe_audio_streaming_finalize,
     observe_modality_at_finalize,
 )
 
@@ -21,13 +22,6 @@ def mod() -> OmniModalityMetrics:
     return OmniModalityMetrics(model_name=_MODEL)
 
 
-# Each test uses a distinct (stage, replica) so counter accumulation
-# across tests doesn't couple assertions.
-_AUDIO_STAGE = ("talker", "0")
-_IMAGE_STAGE = ("diffusion", "0")
-_VIDEO_STAGE = ("diffusion", "1")
-
-
 def _sample_value(output: str, line_prefix: str) -> float | None:
     for line in output.splitlines():
         if line.startswith(line_prefix):
@@ -36,43 +30,51 @@ def _sample_value(output: str, line_prefix: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Family registration
+# Family registration — RFC §3545 locked set (7 audio + 5 visual families
+# served from modality.py; diffusion-internal *_s lives in prometheus.py)
 # ---------------------------------------------------------------------------
 
 
 _EXPECTED_FAMILIES = [
-    defs.AUDIO_TTFP_SECONDS,
-    defs.AUDIO_DURATION_SECONDS,
+    defs.AUDIO_TTFP_S,
+    defs.AUDIO_DURATION_S,
     defs.AUDIO_RTF_METRIC,
     defs.AUDIO_FRAMES_METRIC,
-    defs.IMAGE_TTFP_SECONDS,
+    defs.AUDIO_UNDERRUN_S,
+    defs.AUDIO_CONTINUITY_OK,
+    defs.AUDIO_SKIPPED_REQUESTS,
     defs.IMAGE_NUM_METRIC,
-    defs.IMAGE_GENERATION_TIME_SECONDS,
-    defs.VIDEO_GENERATION_TIME_SECONDS,
+    defs.IMAGE_GENERATION_S,
+    defs.VIDEO_DURATION_S,
+    defs.VIDEO_RTF_METRIC,
+    defs.VIDEO_GENERATION_S,
 ]
 
 
 class TestRegistration:
-    def test_all_eight_families_present(self, mod: OmniModalityMetrics) -> None:
+    def test_all_locked_families_present(self, mod: OmniModalityMetrics) -> None:
         # Trigger at least one observation per family so the registry exposes them.
         mod.observe_audio_ttfp("s", "r", 0.1)
         mod.observe_audio_duration("s", "r", 1.0)
         mod.observe_audio_rtf("s", "r", 0.5)
         mod.inc_audio_frames("s", "r", 1)
-        mod.observe_image_ttfp("s", "r", 0.2)
+        mod.observe_audio_underrun("s", "r", 0.01)
+        mod.inc_audio_continuity_ok("s", "r", 100)
+        mod.inc_audio_skipped("s", "r", "malformed_codec")
         mod.inc_image_num("s", "r", 1)
-        mod.observe_image_generation_time("s", "r", 0.5)
-        mod.observe_video_generation_time("s", "r", 1.0)
+        mod.observe_image_generation("s", "r", 0.5)
+        mod.observe_video_duration("s", "r", 2.0)
+        mod.observe_video_rtf("s", "r", 0.6)
+        mod.observe_video_generation("s", "r", 1.0)
 
         out = generate_latest(REGISTRY).decode()
         for name in _EXPECTED_FAMILIES:
             assert f"# HELP {name}" in out, f"missing family: {name}"
 
-    def test_video_duration_and_rtf_intentionally_absent(self) -> None:
-        # Phase 3 deliberately drops these — see modality.py docstring.
+    def test_image_ttfp_intentionally_dropped(self) -> None:
+        # RFC removed image_ttfp_s (image is non-streaming).
         out = generate_latest(REGISTRY).decode()
-        assert defs.VIDEO_DURATION_SECONDS not in out
-        assert defs.VIDEO_RTF_METRIC not in out
+        assert "vllm:omni_image_ttfp" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -85,14 +87,14 @@ class TestAudio:
         stage, replica = "talker_ttfp", "0"
         mod.observe_audio_ttfp(stage, replica, 0.42)
         out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.AUDIO_TTFP_SECONDS}_count{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        prefix = f'{defs.AUDIO_TTFP_S}_count{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
         assert _sample_value(out, prefix) == 1.0
 
     def test_audio_duration_observed(self, mod: OmniModalityMetrics) -> None:
         stage, replica = "talker_dur", "0"
         mod.observe_audio_duration(stage, replica, 3.5)
         out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.AUDIO_DURATION_SECONDS}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        prefix = f'{defs.AUDIO_DURATION_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
         assert _sample_value(out, prefix) == 3.5
 
     def test_audio_rtf_observed(self, mod: OmniModalityMetrics) -> None:
@@ -107,7 +109,6 @@ class TestAudio:
         mod.inc_audio_frames(stage, replica, 240)
         mod.inc_audio_frames(stage, replica, 60)
         out = generate_latest(REGISTRY).decode()
-        # Counter family auto-suffixes with _total in the exposed name.
         prefix = f'{defs.AUDIO_FRAMES_METRIC}_total{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
         assert _sample_value(out, prefix) == 300.0
 
@@ -115,10 +116,60 @@ class TestAudio:
         stage, replica = "talker_zero", "0"
         mod.inc_audio_frames(stage, replica, 0)
         mod.inc_audio_frames(stage, replica, -5)
-        # No observation → no series exposed for this (stage, replica) yet.
         out = generate_latest(REGISTRY).decode()
         prefix = f'{defs.AUDIO_FRAMES_METRIC}_total{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
         assert _sample_value(out, prefix) is None
+
+    def test_audio_underrun_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "talker_under", "0"
+        mod.observe_audio_underrun(stage, replica, 0.05)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.AUDIO_UNDERRUN_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == 0.05
+
+    def test_audio_underrun_negative_clamped_to_zero(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "talker_under_neg", "0"
+        mod.observe_audio_underrun(stage, replica, -0.1)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.AUDIO_UNDERRUN_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == 0.0
+
+    def test_audio_continuity_ok_carries_threshold_label(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "talker_cont", "0"
+        mod.inc_audio_continuity_ok(stage, replica, threshold_ms=100)
+        mod.inc_audio_continuity_ok(stage, replica, threshold_ms=200)
+        out = generate_latest(REGISTRY).decode()
+        # Counter family auto-suffixes _total at exposition.
+        v100 = _sample_value(
+            out,
+            f'{defs.AUDIO_CONTINUITY_OK}_total{{model_name="{_MODEL}",'
+            f'replica="{replica}",stage="{stage}",threshold_ms="100"}}',
+        )
+        v200 = _sample_value(
+            out,
+            f'{defs.AUDIO_CONTINUITY_OK}_total{{model_name="{_MODEL}",'
+            f'replica="{replica}",stage="{stage}",threshold_ms="200"}}',
+        )
+        assert v100 == 1.0
+        assert v200 == 1.0
+
+    def test_audio_skipped_carries_reason_label(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "talker_skip", "0"
+        mod.inc_audio_skipped(stage, replica, "malformed_codec")
+        mod.inc_audio_skipped(stage, replica, "")  # → "unknown"
+        out = generate_latest(REGISTRY).decode()
+        good = _sample_value(
+            out,
+            f'{defs.AUDIO_SKIPPED_REQUESTS}_total{{model_name="{_MODEL}",'
+            f'reason="malformed_codec",replica="{replica}",stage="{stage}"}}',
+        )
+        unknown = _sample_value(
+            out,
+            f'{defs.AUDIO_SKIPPED_REQUESTS}_total{{model_name="{_MODEL}",'
+            f'reason="unknown",replica="{replica}",stage="{stage}"}}',
+        )
+        assert good == 1.0
+        assert unknown == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -127,13 +178,6 @@ class TestAudio:
 
 
 class TestImage:
-    def test_image_ttfp_observed(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "diffusion_ttfp", "0"
-        mod.observe_image_ttfp(stage, replica, 1.5)
-        out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.IMAGE_TTFP_SECONDS}_count{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
-        assert _sample_value(out, prefix) == 1.0
-
     def test_image_num_inc(self, mod: OmniModalityMetrics) -> None:
         stage, replica = "diffusion_num", "0"
         mod.inc_image_num(stage, replica, 4)
@@ -141,11 +185,11 @@ class TestImage:
         prefix = f'{defs.IMAGE_NUM_METRIC}_total{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
         assert _sample_value(out, prefix) == 4.0
 
-    def test_image_generation_time_observed(self, mod: OmniModalityMetrics) -> None:
+    def test_image_generation_observed(self, mod: OmniModalityMetrics) -> None:
         stage, replica = "diffusion_gen", "0"
-        mod.observe_image_generation_time(stage, replica, 2.7)
+        mod.observe_image_generation(stage, replica, 2.7)
         out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.IMAGE_GENERATION_TIME_SECONDS}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        prefix = f'{defs.IMAGE_GENERATION_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
         assert _sample_value(out, prefix) == 2.7
 
 
@@ -155,22 +199,34 @@ class TestImage:
 
 
 class TestVideo:
-    def test_video_generation_time_observed(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "diffusion_video", "0"
-        mod.observe_video_generation_time(stage, replica, 5.2)
+    def test_video_generation_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "diffusion_video_gen", "0"
+        mod.observe_video_generation(stage, replica, 5.2)
         out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.VIDEO_GENERATION_TIME_SECONDS}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        prefix = f'{defs.VIDEO_GENERATION_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
         assert _sample_value(out, prefix) == 5.2
+
+    def test_video_duration_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "diffusion_video_dur", "0"
+        mod.observe_video_duration(stage, replica, 4.0)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.VIDEO_DURATION_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == 4.0
+
+    def test_video_rtf_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "diffusion_video_rtf", "0"
+        mod.observe_video_rtf(stage, replica, 0.7)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.VIDEO_RTF_METRIC}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == 0.7
 
 
 # ---------------------------------------------------------------------------
-# Bucket selection (RTF uses RTF_BUCKETS, others use SECONDS_BUCKETS)
+# Stub-driven routing tests for the finalize / streaming helpers.
 # ---------------------------------------------------------------------------
 
 
 class _StubModMetrics:
-    """Records every observe/inc call so the routing logic can be asserted."""
-
     def __init__(self):
         self.calls: list[tuple] = []
 
@@ -183,22 +239,29 @@ class _StubModMetrics:
     def observe_audio_rtf(self, s, r, rtf):
         self.calls.append(("observe_audio_rtf", s, r, rtf))
 
+    def observe_audio_underrun(self, s, r, u):
+        self.calls.append(("observe_audio_underrun", s, r, u))
+
+    def inc_audio_continuity_ok(self, s, r, threshold_ms):
+        self.calls.append(("inc_audio_continuity_ok", s, r, threshold_ms))
+
     def inc_image_num(self, s, r, n):
         self.calls.append(("inc_image_num", s, r, n))
 
-    def observe_image_generation_time(self, s, r, t):
-        self.calls.append(("observe_image_generation_time", s, r, t))
+    def observe_image_generation(self, s, r, t):
+        self.calls.append(("observe_image_generation", s, r, t))
 
-    def observe_image_ttfp(self, s, r, t):
-        self.calls.append(("observe_image_ttfp", s, r, t))
+    def observe_video_generation(self, s, r, t):
+        self.calls.append(("observe_video_generation", s, r, t))
 
-    def observe_video_generation_time(self, s, r, t):
-        self.calls.append(("observe_video_generation_time", s, r, t))
+    def observe_video_duration(self, s, r, d):
+        self.calls.append(("observe_video_duration", s, r, d))
+
+    def observe_video_rtf(self, s, r, rtf):
+        self.calls.append(("observe_video_rtf", s, r, rtf))
 
 
 class _Bag:
-    """Tiny attribute bag for stage_metrics / engine_outputs stubs."""
-
     def __init__(self, **kw):
         self.__dict__.update(kw)
 
@@ -223,6 +286,10 @@ class TestObserveModalityAtFinalize:
         assert ("inc_audio_frames", "1", "0", 24000) in stub.calls
         assert ("observe_audio_duration", "1", "0", 1.0) in stub.calls
         assert ("observe_audio_rtf", "1", "0", 0.5) in stub.calls
+        # Continuity/underrun NOT emitted from finalize — they come from the
+        # streaming hook because they need the per-chunk arrival timeline.
+        assert not any(c[0] == "observe_audio_underrun" for c in stub.calls)
+        assert not any(c[0] == "inc_audio_continuity_ok" for c in stub.calls)
 
     def test_audio_path_zero_frames_skips_duration_and_rtf(self):
         stub = _StubModMetrics()
@@ -236,15 +303,12 @@ class TestObserveModalityAtFinalize:
             request_arrival_ts=100.0,
             finalize_ts=100.3,
         )
-        # inc with 0 still called (Counter side gates internally to no-op)
         assert ("inc_audio_frames", "1", "0", 0) in stub.calls
-        # but no duration / rtf because duration_s == 0
         assert not any(c[0] == "observe_audio_duration" for c in stub.calls)
         assert not any(c[0] == "observe_audio_rtf" for c in stub.calls)
 
     def test_audio_uses_resolved_sample_rate_from_multimodal_output(self):
         stub = _StubModMetrics()
-        # Non-default 16 kHz from talker config
         observe_modality_at_finalize(
             stub,
             output_type="audio",
@@ -255,10 +319,9 @@ class TestObserveModalityAtFinalize:
             request_arrival_ts=0.0,
             finalize_ts=1.0,
         )
-        # 16000 / 16000 = 1.0s
         assert ("observe_audio_duration", "1", "0", 1.0) in stub.calls
 
-    def test_image_path_uses_finalize_minus_arrival_for_ttfp(self):
+    def test_image_path_no_ttfp_no_clock_skew_lookup(self):
         stub = _StubModMetrics()
         observe_modality_at_finalize(
             stub,
@@ -271,24 +334,11 @@ class TestObserveModalityAtFinalize:
             finalize_ts=12.5,
         )
         assert ("inc_image_num", "2", "1", 3) in stub.calls
-        assert ("observe_image_generation_time", "2", "1", 2.0) in stub.calls
-        assert ("observe_image_ttfp", "2", "1", 2.5) in stub.calls
+        assert ("observe_image_generation", "2", "1", 2.0) in stub.calls
+        # RFC dropped image_ttfp_s — finalize must not emit it.
+        assert not any(c[0].startswith("observe_image_ttfp") for c in stub.calls)
 
-    def test_image_ttfp_clamped_to_zero_on_clock_skew(self):
-        stub = _StubModMetrics()
-        observe_modality_at_finalize(
-            stub,
-            output_type="image",
-            stage_id=2,
-            replica_id=0,
-            stage_metrics=_Bag(stage_gen_time_ms=1000.0),
-            engine_outputs=_Bag(images=["img"]),
-            request_arrival_ts=100.0,
-            finalize_ts=99.5,  # finalize earlier than arrival (impossible but defensive)
-        )
-        assert ("observe_image_ttfp", "2", "0", 0.0) in stub.calls
-
-    def test_video_path_only_emits_generation_time(self):
+    def test_video_path_only_generation_when_no_duration(self):
         stub = _StubModMetrics()
         observe_modality_at_finalize(
             stub,
@@ -300,7 +350,24 @@ class TestObserveModalityAtFinalize:
             request_arrival_ts=0.0,
             finalize_ts=5.3,
         )
-        assert stub.calls == [("observe_video_generation_time", "2", "0", 5.2)]
+        assert stub.calls == [("observe_video_generation", "2", "0", 5.2)]
+
+    def test_video_path_emits_duration_and_rtf_when_num_frames_and_fps_present(self):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="video",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=_Bag(stage_gen_time_ms=2000.0),
+            engine_outputs=_Bag(multimodal_output={"video": {"num_frames": 48, "fps": 24}}),
+            request_arrival_ts=0.0,
+            finalize_ts=2.0,
+        )
+        # 48 / 24 = 2.0s; gen 2.0s → rtf 1.0
+        assert ("observe_video_generation", "2", "0", 2.0) in stub.calls
+        assert ("observe_video_duration", "2", "0", 2.0) in stub.calls
+        assert ("observe_video_rtf", "2", "0", 1.0) in stub.calls
 
     def test_text_path_no_calls(self):
         stub = _StubModMetrics()
@@ -322,7 +389,7 @@ class TestObserveModalityAtFinalize:
             stub,
             output_type="audio",
             stage_id=1,
-            replica_id=None,  # error path: orchestrator emitted without replica_id
+            replica_id=None,
             stage_metrics=_Bag(stage_gen_time_ms=500.0, audio_generated_frames=240),
             engine_outputs=_Bag(multimodal_output={}),
             request_arrival_ts=0.0,
@@ -348,7 +415,6 @@ class TestObserveModalityAtFinalize:
 class TestObserveAudioFirstPacket:
     def test_observes_with_valid_inputs(self):
         stub = _StubModMetrics()
-        # Patch in audio_ttfp to the stub for routing assertion.
         stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
 
         observe_audio_first_packet(
@@ -369,9 +435,6 @@ class TestObserveAudioFirstPacket:
         assert stub.calls == []
 
     def test_arrival_ts_zero_skipped(self):
-        # Defensive: req_state.request_arrival_ts == 0.0 means async_omni
-        # never populated it (e.g. some fast path). Skip rather than emit
-        # garbage TTFP measured against epoch.
         stub = _StubModMetrics()
         stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
         observe_audio_first_packet(
@@ -388,13 +451,75 @@ class TestObserveAudioFirstPacket:
         assert stub.calls == [("observe_audio_ttfp", "1", "0", 0.0)]
 
 
+class TestObserveAudioStreamingFinalize:
+    def test_continuous_run_emits_underrun_and_continuity_ok(self):
+        stub = _StubModMetrics()
+        # Three back-to-back chunks of 0.5s each at 24 kHz s16le mono:
+        # 24000 Hz * 2 bytes * 0.5s = 24000 bytes per chunk.
+        arrivals = [0.5, 1.0, 1.5]
+        bytes_ = [24000, 24000, 24000]
+        observe_audio_streaming_finalize(
+            stub,
+            stage_id=1,
+            replica_id=0,
+            chunk_arrival_times_s=arrivals,
+            chunk_bytes=bytes_,
+            sample_rate=24000,
+            threshold_s=0.1,
+        )
+        # 0 underrun -> observe with 0.0, continuity_ok incremented at threshold 100.
+        assert ("observe_audio_underrun", "1", "0", 0.0) in stub.calls
+        assert ("inc_audio_continuity_ok", "1", "0", 100) in stub.calls
+
+    def test_late_chunk_emits_nonzero_underrun_and_no_continuity_inc(self):
+        stub = _StubModMetrics()
+        # Two chunks but second arrives 1s late; underrun > 0.1s threshold.
+        arrivals = [0.0, 2.0]
+        bytes_ = [24000, 24000]
+        observe_audio_streaming_finalize(
+            stub,
+            stage_id=1,
+            replica_id=0,
+            chunk_arrival_times_s=arrivals,
+            chunk_bytes=bytes_,
+            sample_rate=24000,
+            threshold_s=0.1,
+        )
+        underrun_calls = [c for c in stub.calls if c[0] == "observe_audio_underrun"]
+        assert underrun_calls
+        assert underrun_calls[0][-1] > 0.1
+        assert not any(c[0] == "inc_audio_continuity_ok" for c in stub.calls)
+
+    def test_empty_arrivals_skipped(self):
+        stub = _StubModMetrics()
+        observe_audio_streaming_finalize(
+            stub,
+            stage_id=1,
+            replica_id=0,
+            chunk_arrival_times_s=[],
+            chunk_bytes=[],
+            sample_rate=24000,
+        )
+        assert stub.calls == []
+
+    def test_replica_none_skipped(self):
+        stub = _StubModMetrics()
+        observe_audio_streaming_finalize(
+            stub,
+            stage_id=1,
+            replica_id=None,
+            chunk_arrival_times_s=[0.5],
+            chunk_bytes=[24000],
+            sample_rate=24000,
+        )
+        assert stub.calls == []
+
+
 class TestBucketSelection:
     def test_audio_rtf_uses_rtf_buckets(self, mod: OmniModalityMetrics) -> None:
         stage, replica = "talker_buckets", "0"
         mod.observe_audio_rtf(stage, replica, 0.5)
         out = generate_latest(REGISTRY).decode()
-        # RTF_BUCKETS includes 0.9 and 1.25 — distinctive boundaries vs SECONDS_BUCKETS.
-        # Check that at least one RTF-distinctive bucket label appears.
         rtf_marker = f'{defs.AUDIO_RTF_METRIC}_bucket{{le="0.9"'
         assert rtf_marker in out, "audio_rtf should use RTF_BUCKETS containing le=0.9"
 
@@ -402,6 +527,15 @@ class TestBucketSelection:
         stage, replica = "talker_seconds", "0"
         mod.observe_audio_ttfp(stage, replica, 0.1)
         out = generate_latest(REGISTRY).decode()
-        # SECONDS_BUCKETS includes 0.05 — not in RTF_BUCKETS.
-        sec_marker = f'{defs.AUDIO_TTFP_SECONDS}_bucket{{le="0.05"'
+        sec_marker = f'{defs.AUDIO_TTFP_S}_bucket{{le="0.05"'
         assert sec_marker in out, "audio_ttfp should use SECONDS_BUCKETS containing le=0.05"
+
+    def test_audio_underrun_uses_seconds_fast_buckets(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "talker_fast", "0"
+        mod.observe_audio_underrun(stage, replica, 0.005)
+        out = generate_latest(REGISTRY).decode()
+        # SECONDS_FAST_BUCKETS includes le=0.001 which is absent from SECONDS_BUCKETS.
+        fast_marker = f'{defs.AUDIO_UNDERRUN_S}_bucket{{le="0.001"'
+        assert fast_marker in out, (
+            "audio_underrun_s should use SECONDS_FAST_BUCKETS containing le=0.001"
+        )

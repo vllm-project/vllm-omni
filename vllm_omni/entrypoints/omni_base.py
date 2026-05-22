@@ -450,10 +450,6 @@ class OmniBase(PDDisaggregationMixin):
                     req_start_ts.get(req_id, wall_start_ts),
                 )
                 e2e_seconds = now - req_start_ts.get(req_id, wall_start_ts)
-                _fin_m = result.metrics
-                _pt = getattr(_fin_m, "pipeline_timings", None) or {}
-                queue_ms = _pt.get("queue_wait_ms")
-                queue_seconds = queue_ms / 1000.0 if queue_ms is not None else None
                 # G6: extract finished_reason from upstream CompletionOutput
                 # so the per-reason completion Counter is labelled correctly.
                 completion_outputs = getattr(engine_outputs, "outputs", None) or []
@@ -463,7 +459,7 @@ class OmniBase(PDDisaggregationMixin):
                     else None
                 ) or "stop"
                 self.prom_metrics.request_succeeded(
-                    e2e_seconds, queue_seconds=queue_seconds, finished_reason=fr,
+                    e2e_seconds, finished_reason=fr,
                 )
 
                 # Modality observe (Phase 3.2). Inside the same finalize guard so
@@ -488,7 +484,10 @@ class OmniBase(PDDisaggregationMixin):
 
         diffusion_metrics = getattr(engine_outputs, "metrics", None)
         if finished and isinstance(diffusion_metrics, dict) and diffusion_metrics:
-            self.prom_metrics.observe_diffusion_metrics(stage_id, diffusion_metrics)
+            replica_for_diffusion = result.replica_id if result.replica_id is not None else 0
+            self.prom_metrics.observe_diffusion_metrics(
+                stage_id, replica_for_diffusion, diffusion_metrics,
+            )
 
         images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         return OmniRequestOutput(

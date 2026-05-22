@@ -279,7 +279,9 @@ class OrchestratorAggregator:
             return
         from_r, to_r = replicas
         self._transfer_emitter.observe_size(from_stage, from_r, to_stage, to_r, size_bytes)
-        self._transfer_emitter.observe_tx_time(from_stage, from_r, to_stage, to_r, tx_time_ms)
+        self._transfer_emitter.observe_tx_time(
+            from_stage, from_r, to_stage, to_r, tx_time_ms / 1000.0
+        )
 
     def _emit_transfer_rx(
         self,
@@ -296,11 +298,11 @@ class OrchestratorAggregator:
         if replicas is None:
             return
         from_r, to_r = replicas
-        self._transfer_emitter.observe_rx_decode_time(
-            from_stage, from_r, to_stage, to_r, rx_decode_time_ms
+        self._transfer_emitter.observe_rx_time(
+            from_stage, from_r, to_stage, to_r, rx_decode_time_ms / 1000.0
         )
         self._transfer_emitter.observe_in_flight_time(
-            from_stage, from_r, to_stage, to_r, in_flight_time_ms
+            from_stage, from_r, to_stage, to_r, in_flight_time_ms / 1000.0
         )
 
     def record_audio_generated_frames(

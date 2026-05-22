@@ -1,19 +1,15 @@
 """OmniTransferMetrics — cross-stage transfer Prometheus families (RFC G3).
 
-Four Histogram families with ``{model_name, from_stage, from_replica,
-to_stage, to_replica}`` labels. Each ``.observe_*()`` call corresponds to one
-physical transfer event (one chunk hop from a sender replica to a receiver
-replica), not the per-request accumulated total — so the Histogram tracks
-the distribution of physical transfers, not request-aggregated sums.
+Four families with ``{model_name, from_stage, from_replica, to_stage,
+to_replica}`` labels. Each ``observe_*()`` call corresponds to one physical
+transfer event (one chunk hop from a sender replica to a receiver replica),
+so the Histogram tracks the distribution of physical transfers, not
+request-aggregated sums.
 
 Data source: ``vllm_omni.metrics.stats.TransferEdgeStats`` accumulators in
 ``OrchestratorAggregator.record_transfer_tx`` / ``record_transfer_rx``. The
 emit hook lives in stats.py; this module only registers the families and
 exposes the typed observe API.
-
-Note on label deviation from RFC §3.2.6: the RFC lists only the four
-stage/replica labels. We add ``model_name`` so transfer aligns with the rest
-of the omni_* family naming and PromQL can join on model_name uniformly.
 """
 
 from __future__ import annotations
@@ -34,28 +30,28 @@ _transfer_size_bytes_family = Histogram(
     labelnames=_labelnames,
     buckets=defs.BYTES_BUCKETS,
 )
-_transfer_tx_time_ms_family = Histogram(
-    defs.TRANSFER_TX_TIME_MS,
-    "Sender-side time in milliseconds (serialize + submit to connector).",
+_transfer_tx_family = Histogram(
+    defs.TRANSFER_TX_S,
+    "Sender-side time in seconds (serialize + submit to connector).",
     labelnames=_labelnames,
-    buckets=defs.MS_BUCKETS,
+    buckets=defs.SECONDS_FAST_BUCKETS,
 )
 
 
 # ----------------------------------------------------------------------------
 # RX-side families (observed when record_transfer_rx fires)
 # ----------------------------------------------------------------------------
-_transfer_rx_decode_time_ms_family = Histogram(
-    defs.TRANSFER_RX_DECODE_TIME_MS,
-    "Receiver-side time in milliseconds (recv + deserialize).",
+_transfer_rx_family = Histogram(
+    defs.TRANSFER_RX_S,
+    "Receiver-side time in seconds (recv + deserialize).",
     labelnames=_labelnames,
-    buckets=defs.MS_BUCKETS,
+    buckets=defs.SECONDS_FAST_BUCKETS,
 )
-_transfer_in_flight_time_ms_family = Histogram(
-    defs.TRANSFER_IN_FLIGHT_TIME_MS,
-    "Network in-flight time in milliseconds (TX done -> RX recv start).",
+_transfer_in_flight_family = Histogram(
+    defs.TRANSFER_IN_FLIGHT_S,
+    "Network in-flight time in seconds (TX done -> RX recv start).",
     labelnames=_labelnames,
-    buckets=defs.MS_BUCKETS,
+    buckets=defs.SECONDS_FAST_BUCKETS,
 )
 
 
@@ -95,33 +91,33 @@ class OmniTransferMetrics:
         from_replica: int,
         to_stage: int,
         to_replica: int,
-        tx_time_ms: float,
+        tx_time_s: float,
     ) -> None:
-        _transfer_tx_time_ms_family.labels(
+        _transfer_tx_family.labels(
             model_name=self._model_name,
             from_stage=str(from_stage),
             from_replica=str(from_replica),
             to_stage=str(to_stage),
             to_replica=str(to_replica),
-        ).observe(tx_time_ms)
+        ).observe(tx_time_s)
 
     # ---- RX side (record_transfer_rx hook) -------------------------------
 
-    def observe_rx_decode_time(
+    def observe_rx_time(
         self,
         from_stage: int,
         from_replica: int,
         to_stage: int,
         to_replica: int,
-        rx_decode_time_ms: float,
+        rx_time_s: float,
     ) -> None:
-        _transfer_rx_decode_time_ms_family.labels(
+        _transfer_rx_family.labels(
             model_name=self._model_name,
             from_stage=str(from_stage),
             from_replica=str(from_replica),
             to_stage=str(to_stage),
             to_replica=str(to_replica),
-        ).observe(rx_decode_time_ms)
+        ).observe(rx_time_s)
 
     def observe_in_flight_time(
         self,
@@ -129,12 +125,12 @@ class OmniTransferMetrics:
         from_replica: int,
         to_stage: int,
         to_replica: int,
-        in_flight_time_ms: float,
+        in_flight_time_s: float,
     ) -> None:
-        _transfer_in_flight_time_ms_family.labels(
+        _transfer_in_flight_family.labels(
             model_name=self._model_name,
             from_stage=str(from_stage),
             from_replica=str(from_replica),
             to_stage=str(to_stage),
             to_replica=str(to_replica),
-        ).observe(in_flight_time_ms)
+        ).observe(in_flight_time_s)

@@ -16,7 +16,11 @@ from pydantic import TypeAdapter
 
 from vllm_omni.diffusion.diffusion_engine import get_extra_body_params, get_extra_output_params
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.metrics.modality import observe_audio_first_packet
+from vllm_omni.metrics import definitions as _metric_defs
+from vllm_omni.metrics.modality import (
+    observe_audio_first_packet,
+    observe_audio_streaming_finalize,
+)
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -106,6 +110,42 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _audio_chunk_pcm_bytes(omni_res: OmniRequestOutput) -> int:
+    """Best-effort PCM byte count of the last audio chunk in ``omni_res``.
+
+    Used by the audio-streaming continuity tracker to size the player buffer.
+    Returns 0 when the chunk shape can't be interpreted — caller drops the
+    sample rather than recording a wrong byte count.
+    """
+    try:
+        final_res = omni_res.request_output
+        mm_output = final_res.outputs[0].multimodal_output
+        audio_data = mm_output.get("audio")
+        if isinstance(audio_data, list):
+            if not audio_data:
+                return 0
+            audio_tensor = audio_data[-1]
+        else:
+            audio_tensor = audio_data
+        if audio_tensor is None:
+            return 0
+        n_samples = int(audio_tensor.numel() if hasattr(audio_tensor, "numel") else audio_tensor.size)
+        # PCM s16le mono → 2 bytes per sample. This matches what
+        # _create_audio_choice serialises via CreateAudio (response_format="wav").
+        return max(n_samples, 0) * 2
+    except Exception:
+        return 0
+
+
+def _audio_chunk_sample_rate(omni_res: OmniRequestOutput) -> int:
+    """Resolve audio sample rate for the request's audio stream."""
+    try:
+        mm_output = omni_res.request_output.outputs[0].multimodal_output
+    except Exception:
+        return _metric_defs.DEFAULT_AUDIO_SAMPLE_RATE
+    return _metric_defs.resolve_audio_sample_rate(mm_output)
 
 
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
@@ -1561,11 +1601,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         yield f"data: {data}\n\n"
 
                 elif final_output_type == "audio":
-                    # Phase 3.3: observe audio_ttfp_seconds on first audio packet
-                    # for this request_id (once-per-request guard via first_audio_ts).
+                    # Observe audio_ttfp_s on first audio packet for this request_id
+                    # (once-per-request guard via first_audio_ts). The same hook
+                    # also captures (stage, replica) for the streaming-continuity
+                    # emit at request finalize.
                     req_state = self.engine_client.request_states.get(request_id)
+                    now_ts = time.time()
                     if req_state is not None and req_state.first_audio_ts is None:
-                        now_ts = time.time()
                         req_state.first_audio_ts = now_ts
                         stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
                         replica_id = (
@@ -1573,6 +1615,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             if stage_pools is not None and 0 <= omni_res.stage_id < len(stage_pools)
                             else None
                         )
+                        req_state.audio_emit_stage_id = omni_res.stage_id
+                        req_state.audio_emit_replica_id = replica_id
                         observe_audio_first_packet(
                             self.engine_client.mod_metrics,
                             stage_id=omni_res.stage_id,
@@ -1583,6 +1627,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                     role = self.get_chat_request_role(request)
                     choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
+                    # Record per-chunk PCM byte count + arrival timestamp for
+                    # audio_underrun_s / audio_continuity_ok_total at finalize.
+                    if req_state is not None and req_state.request_arrival_ts > 0:
+                        chunk_bytes = _audio_chunk_pcm_bytes(omni_res)
+                        if chunk_bytes > 0:
+                            req_state.audio_chunk_arrivals_s.append(
+                                max(now_ts - req_state.request_arrival_ts, 0.0)
+                            )
+                            req_state.audio_chunk_bytes.append(chunk_bytes)
+                            if req_state.audio_sample_rate is None:
+                                req_state.audio_sample_rate = _audio_chunk_sample_rate(omni_res)
                     chunk = OmniChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,
@@ -1602,6 +1657,26 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 else:
                     logger.warning(f"Unsupported streaming final output type: {final_output_type}")
                     continue
+
+            # Emit audio_underrun_s + audio_continuity_ok_total once per
+            # request after the audio chunk stream is exhausted.
+            req_state_audio = self.engine_client.request_states.get(request_id)
+            if (
+                req_state_audio is not None
+                and req_state_audio.audio_chunk_arrivals_s
+                and req_state_audio.audio_emit_replica_id is not None
+            ):
+                observe_audio_streaming_finalize(
+                    self.engine_client.mod_metrics,
+                    stage_id=req_state_audio.audio_emit_stage_id or 0,
+                    replica_id=req_state_audio.audio_emit_replica_id,
+                    chunk_arrival_times_s=req_state_audio.audio_chunk_arrivals_s,
+                    chunk_bytes=req_state_audio.audio_chunk_bytes,
+                    sample_rate=(
+                        req_state_audio.audio_sample_rate
+                        or _metric_defs.DEFAULT_AUDIO_SAMPLE_RATE
+                    ),
+                )
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage

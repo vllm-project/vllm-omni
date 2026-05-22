@@ -3,27 +3,24 @@ from prometheus_client import Counter, Gauge, Histogram
 from vllm_omni.metrics import definitions as defs
 
 _labelnames = list(defs.PIPELINE_LABELS)
-_diffusion_labelnames = ["model_name", "engine"]
+_diffusion_labelnames = list(defs.STAGE_LABELS)
 
-# Mapping from stage-emitted metric key (engine internal name) to the
-# (prometheus family name, help text) we expose. Keys must match what the
-# diffusion engine puts into its per-request metrics dict.
+# Map from stage-emitted metric key (engine internal name, in milliseconds) to
+# (prometheus family name, help text). The Prometheus side exposes seconds;
+# observe_diffusion_metrics divides by 1000 at emit time.
 _DIFFUSION_METRIC_DEFS: dict[str, tuple[str, str]] = {
     "preprocess_time_ms": (
-        defs.DIFFUSION_PREPROCESS_TIME_MS,
-        "Diffusion preprocess time per request in milliseconds.",
+        defs.DIFFUSION_PREPROCESS_S,
+        "Diffusion preprocess time per request in seconds "
+        "(tokenizer + text_encoder + vae.encode).",
     ),
     "diffusion_engine_exec_time_ms": (
-        defs.DIFFUSION_EXEC_TIME_MS,
-        "Diffusion model execution time per request in milliseconds.",
+        defs.DIFFUSION_EXEC_S,
+        "Diffusion executor work time per request in seconds.",
     ),
     "postprocess_time_ms": (
-        defs.DIFFUSION_POSTPROCESS_TIME_MS,
-        "Diffusion postprocess time per request in milliseconds.",
-    ),
-    "diffusion_engine_total_time_ms": (
-        defs.DIFFUSION_STEP_TIME_MS,
-        "Total diffusion step time per request in milliseconds.",
+        defs.DIFFUSION_POSTPROCESS_S,
+        "Diffusion postprocess time per request in seconds (vae.decode).",
     ),
 }
 
@@ -45,17 +42,16 @@ _completion_family = Counter(
     labelnames=list(defs.SUCCESS_LABELS),
 )
 _e2e_latency_family = Histogram(
-    defs.E2E_REQUEST_LATENCY_SECONDS,
-    "Histogram of end-to-end request latency in seconds.",
+    defs.E2E_REQUEST_LATENCY_S,
+    "Pipeline-global end-to-end request latency in seconds "
+    "(user arrival to complete response).",
     labelnames=_labelnames,
-)
-_queue_time_family = Histogram(
-    defs.REQUEST_QUEUE_TIME_SECONDS,
-    "Histogram of request queue wait time in seconds.",
-    labelnames=_labelnames,
+    buckets=defs.SECONDS_BUCKETS,
 )
 _diffusion_families: dict[str, Histogram] = {
-    key: Histogram(metric_name, desc, labelnames=_diffusion_labelnames)
+    key: Histogram(
+        metric_name, desc, labelnames=_diffusion_labelnames, buckets=defs.SECONDS_FAST_BUCKETS
+    )
     for key, (metric_name, desc) in _DIFFUSION_METRIC_DEFS.items()
 }
 
@@ -73,8 +69,10 @@ class OmniPrometheusMetrics:
         self._running = _running_family.labels(model_name=model_name)
         self._waiting = _waiting_family.labels(model_name=model_name)
         self._e2e_latency = _e2e_latency_family.labels(model_name=model_name)
-        self._queue_time = _queue_time_family.labels(model_name=model_name)
-        self._diffusion_by_stage: dict[tuple[str, int], Histogram] = {}
+        # Cache per (metric_key, stage, replica) bound child so .labels() is
+        # only paid once per replica even though observe_diffusion_metrics()
+        # is invoked per finished diffusion request.
+        self._diffusion_by_replica: dict[tuple[str, int, int], Histogram] = {}
 
     def set_running(self, n: int) -> None:
         self._running.set(n)
@@ -85,7 +83,6 @@ class OmniPrometheusMetrics:
     def request_succeeded(
         self,
         e2e_seconds: float,
-        queue_seconds: float | None = None,
         finished_reason: str = "stop",
     ) -> None:
         _completion_family.labels(
@@ -93,8 +90,6 @@ class OmniPrometheusMetrics:
             finished_reason=finished_reason,
         ).inc()
         self._e2e_latency.observe(e2e_seconds)
-        if queue_seconds is not None:
-            self._queue_time.observe(queue_seconds)
 
     def request_failed(self) -> None:
         # Pipeline-level "fail" maps to the upstream FinishReason.ABORT bucket;
@@ -104,19 +99,28 @@ class OmniPrometheusMetrics:
             finished_reason="abort",
         ).inc()
 
-    def observe_diffusion_metrics(self, stage_id: int, metrics: dict[str, float]) -> None:
+    def observe_diffusion_metrics(
+        self,
+        stage_id: int,
+        replica_id: int,
+        metrics: dict[str, float],
+    ) -> None:
         for key, parent in _diffusion_families.items():
             value = metrics.get(key)
             if value is None:
                 continue
-            bound = self._diffusion_by_stage.get((key, stage_id))
+            cache_key = (key, stage_id, replica_id)
+            bound = self._diffusion_by_replica.get(cache_key)
             if bound is None:
                 bound = parent.labels(
                     model_name=self._model_name,
-                    engine=str(stage_id),
+                    stage=str(stage_id),
+                    replica=str(replica_id),
                 )
-                self._diffusion_by_stage[(key, stage_id)] = bound
-            bound.observe(value)
+                self._diffusion_by_replica[cache_key] = bound
+            # Source values are in milliseconds (legacy engine_outputs dict
+            # keys); RFC families expose seconds.
+            bound.observe(float(value) / 1000.0)
 
 
 class OmniRequestCounter:
