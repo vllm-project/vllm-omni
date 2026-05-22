@@ -150,12 +150,6 @@ _OMNI_MODELS = {
         "fish_speech_dac_decoder",
         "FishSpeechDACDecoder",
     ),
-    ## VoxCPM
-    "VoxCPMForConditionalGeneration": (
-        "voxcpm",
-        "voxcpm",
-        "VoxCPMForConditionalGeneration",
-    ),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",
@@ -174,6 +168,32 @@ _OMNI_MODELS = {
         "VoxtralTTSAudioGenerationForConditionalGeneration",
     ),
     "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
+    ## covo_audio
+    "CovoAudioForCausalLM": (
+        "covo_audio",
+        "covo_audio",
+        "CovoAudioForConditionalGeneration",
+    ),
+    "CovoAudioForConditionalGeneration": (
+        "covo_audio",
+        "covo_audio",
+        "CovoAudioForConditionalGeneration",
+    ),
+    "CovoAudioModel": (
+        "covo_audio",
+        "covo_audio",
+        "CovoAudioForConditionalGeneration",
+    ),
+    "CovoAudioLLMModel": (
+        "covo_audio",
+        "covo_audio_llm",
+        "CovoAudioLLMForConditionalGeneration",
+    ),
+    "CovoAudioCode2WavModel": (
+        "covo_audio",
+        "covo_audio_code2wav",
+        "CovoAudioCode2WavForConditionalGeneration",
+    ),
     ## MOSS-TTS-Nano
     "MossTTSNanoForCausalLM": (
         "moss_tts_nano",

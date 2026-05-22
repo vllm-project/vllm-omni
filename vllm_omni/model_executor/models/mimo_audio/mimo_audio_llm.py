@@ -542,8 +542,20 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         )
 
         self.device = current_omni_platform.get_torch_device()
+        # global_sampler MUST stay greedy (do_sample=False) so its token decision
+        # matches vLLM's external sampler (SamplingParams temperature=0.0).  Both
+        # run argmax on the same logits, so they always agree on whether the next
+        # token is <|empty|> (audio step) or a real text token.  Enabling
+        # do_sample=True here without also routing vLLM's sampled token back into
+        # this gate check would cause the two to diverge and corrupt KV-cache state.
         self.global_sampler = MiMoSampler(do_sample=False, temperature=0.6, top_p=0.95)
-        self.local_sampler = MiMoSampler(do_sample=False, temperature=0.9, top_p=0.95)
+        # local_sampler drives audio-code generation inside local_forward.  It is
+        # entirely internal and NOT subject to vLLM's SamplingParams, so stochastic
+        # sampling is safe here and is required to produce natural, varied speech.
+        # Setting do_sample=True also disables the CUDA-graph path (use_cg gate in
+        # local_forward checks `do_sample is False`), preventing MiMoLocalSamplerTensor
+        # from silently forcing argmax even when temperature > 0.
+        self.local_sampler = MiMoSampler(do_sample=True, temperature=0.9, top_p=0.95)
         self.removed_tokens = None
 
         self.speech_vocab_sizes = config.parsed_speech_vocab_sizes()
@@ -806,7 +818,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             device=tokens_device,
         )
         if local_sampler is None:
-            local_sampler = MiMoSampler(do_sample=False, temperature=0.6, top_p=0.9)
+            local_sampler = MiMoSampler(do_sample=True, temperature=0.9, top_p=0.95)
 
         past_key_values = DynamicCache()
         for t in range(delay_iters):
@@ -852,7 +864,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_sampler: MiMoSampler | None = None,
     ):
         if local_sampler is None:
-            local_sampler = MiMoSampler(do_sample=False, temperature=0.6, top_p=0.9)
+            local_sampler = MiMoSampler(do_sample=True, temperature=0.9, top_p=0.95)
 
         b = int(local_embeds.shape[0])
         use_cg = (local_sampler.do_sample is None or local_sampler.do_sample is False) and bool(

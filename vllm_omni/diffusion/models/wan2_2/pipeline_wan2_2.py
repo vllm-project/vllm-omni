@@ -15,12 +15,16 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -117,9 +121,11 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return {}
 
 
-def create_transformer_from_config(config: dict) -> WanTransformer3DModel:
+def create_transformer_from_config(
+    config: dict, quant_config: QuantizationConfig | None = None, prefix: str = ""
+) -> WanTransformer3DModel:
     """Create WanTransformer3DModel from config dict."""
-    kwargs = {}
+    kwargs: dict = {}
 
     if "patch_size" in config:
         kwargs["patch_size"] = tuple(config["patch_size"])
@@ -151,6 +157,16 @@ def create_transformer_from_config(config: dict) -> WanTransformer3DModel:
         kwargs["rope_max_seq_len"] = config["rope_max_seq_len"]
     if "pos_embed_seq_len" in config:
         kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
+
+    if "quantization_config" in config:
+        from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+        quant_config = resolve_quant_config_from_disk(quant_config, config["quantization_config"])
+
+    if quant_config is not None:
+        kwargs["quant_config"] = quant_config
+    if prefix:
+        kwargs["prefix"] = prefix
 
     return WanTransformer3DModel(**kwargs)
 
@@ -240,7 +256,9 @@ def get_wan22_pre_process_func(
     return pre_process_func
 
 
-class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin):
+class Wan22Pipeline(
+    nn.Module, PipelineParallelMixin, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin
+):
     def __init__(
         self,
         *,
@@ -370,8 +388,9 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         )
 
     def _create_transformer(self, config: dict) -> WanTransformer3DModel:
-        """Create a transformer from a config dict. Subclasses may override."""
-        return create_transformer_from_config(config)
+        """Create a transformer from a config dict. Respects od_config.quantization_config."""
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        return create_transformer_from_config(config, quant_config=quant_config)
 
     @property
     def guidance_scale(self):
@@ -402,10 +421,13 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         attention_kwargs: dict[str, Any],
         latent_condition: torch.Tensor | None = None,
         first_frame_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AsyncLatents:
+        if attention_kwargs is None:
+            attention_kwargs = {}
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
+            for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
+                set_forward_context_denoise_step_idx(step_idx)
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
@@ -797,7 +819,11 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
         )
 
-    def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
+    def predict_noise(
+        self,
+        current_model: nn.Module | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | IntermediateTensors:
         """
         Forward pass through transformer to predict noise.
 
@@ -806,11 +832,12 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             **kwargs: Arguments to pass to the transformer
 
         Returns:
-            Predicted noise tensor
+            Predicted noise tensor or IntermediateTensors on non-last PP stages.
         """
         if current_model is None:
             current_model = self.transformer
-        return current_model(**kwargs)[0]
+        result = current_model(**kwargs)
+        return result if isinstance(result, IntermediateTensors) else result[0]
 
     def encode_prompt(
         self,

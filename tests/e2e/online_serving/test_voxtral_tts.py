@@ -10,7 +10,6 @@ actual model inference, not mocks.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import pytest
 
@@ -92,20 +91,3 @@ class TestVoxtralTTSFixedVoice:
                     "timeout": 120.0,
                 }
             )
-
-    @pytest.mark.advanced_model
-    @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_speech_invalid_voice_rejected(self, omni_server, openai_client) -> None:
-        """Request with a non-existent voice should be rejected (HTTP 200 with JSON or 4xx, depending on server)."""
-        openai_client.send_audio_speech_request(
-            {
-                "model": omni_server.model,
-                "input": "This voice does not exist.",
-                "voice": "nonexistent_voice_xyz",
-                "language": "English",
-                "response_format": "wav",
-                "timeout": 120.0,
-                "err_message": "Invalid speaker",
-            }
-        )

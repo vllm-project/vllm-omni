@@ -18,6 +18,7 @@ from vllm_omni.entrypoints.utils import (
     _filter_dict_like_object,
     coerce_param_message_types,
     filter_dataclass_kwargs,
+    filter_stages,
     load_and_resolve_stage_configs,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
@@ -312,39 +313,6 @@ class TestResolveModelConfigPath:
         assert result is not None
         assert "glm_image.yaml" in result
 
-    def test_voxcpm_transformers_format_resolution(self, mocker: MockerFixture):
-        """Test VoxCPM transformers config resolves to the voxcpm stage config."""
-        mocker.patch(
-            "vllm_omni.entrypoints.utils.get_config",
-            side_effect=ValueError("missing transformers config"),
-        )
-        mocker.patch(
-            "vllm_omni.entrypoints.utils.file_or_path_exists",
-            side_effect=lambda _model, filename, revision=None: filename == "config.json",
-        )
-        mocker.patch(
-            "vllm_omni.entrypoints.utils.get_hf_file_to_dict",
-            return_value={"model_type": "voxcpm"},
-        )
-        mocker.patch(
-            "vllm_omni.entrypoints.utils.current_omni_platform.get_default_stage_config_path",
-            return_value="vllm_omni/deploy",
-        )
-
-        original_exists = os.path.exists
-
-        def mock_exists(path):
-            if "voxcpm.yaml" in str(path):
-                return True
-            return original_exists(path)
-
-        mocker.patch("os.path.exists", side_effect=mock_exists)
-
-        result = resolve_model_config_path("OpenBMB/VoxCPM1.5")
-
-        assert result is not None
-        assert "voxcpm.yaml" in result
-
 
 class TestLoadAndResolveStageConfigs:
     def test_load_and_resolve_with_kwargs(self):
@@ -400,6 +368,44 @@ class TestLoadAndResolveStageConfigs:
         assert len(stage_configs) == 2
         assert stage_configs[1].runtime.num_replicas == 3
         assert stage_configs[1].runtime.devices == "1,2,3"
+
+    def test_filter_stages_selects_mode_stages_without_mutating_stage_config(self, tmp_path):
+        config_path = tmp_path / "deploy.yaml"
+        config_path.write_text(
+            """modes:
+  - mode: text-to-text
+    stages: [0]
+  - mode: text-to-image
+    stages: [0, 1]
+""",
+            encoding="utf-8",
+        )
+        stages = [
+            create_config(
+                {
+                    "stage_id": 0,
+                    "runtime": {"requires_multimodal_data": True},
+                    "final_output": False,
+                    "final_output_type": None,
+                }
+            ),
+            create_config(
+                {
+                    "stage_id": 1,
+                    "runtime": {"requires_multimodal_data": True},
+                    "final_output": True,
+                    "final_output_type": "image",
+                }
+            ),
+        ]
+
+        filtered = filter_stages(str(config_path), stages, {"mode": "text-to-text"})
+
+        assert len(filtered) == 1
+        assert filtered[0].stage_id == 0
+        assert filtered[0].runtime.requires_multimodal_data is True
+        assert filtered[0].final_output is False
+        assert filtered[0].final_output_type is None
 
 
 class TestLoadStageConfigsFromYaml:

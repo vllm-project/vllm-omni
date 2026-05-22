@@ -51,7 +51,13 @@ def openai_client(request: pytest.FixtureRequest, run_level: str):
     from tests.helpers.runtime import OpenAIClientHandler
 
     server = request.getfixturevalue("omni_server")
-    return OpenAIClientHandler(host=server.host, port=server.port, api_key="EMPTY", run_level=run_level)
+    return OpenAIClientHandler(
+        host=server.host,
+        port=server.port,
+        api_key="EMPTY",
+        run_level=run_level,
+        log_stats=server.log_stats,
+    )
 
 
 @pytest.fixture
@@ -60,7 +66,13 @@ def openai_client_function(request: pytest.FixtureRequest, run_level: str):
     from tests.helpers.runtime import OpenAIClientHandler
 
     server = request.getfixturevalue("omni_server_function")
-    return OpenAIClientHandler(host=server.host, port=server.port, api_key="EMPTY", run_level=run_level)
+    return OpenAIClientHandler(
+        host=server.host,
+        port=server.port,
+        api_key="EMPTY",
+        run_level=run_level,
+        log_stats=server.log_stats,
+    )
 
 
 @pytest.fixture(scope="function")

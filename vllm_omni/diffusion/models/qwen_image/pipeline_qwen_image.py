@@ -27,6 +27,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage impor
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
+from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
 )
@@ -289,7 +290,22 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         )
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        ).to(self.device)
+        )
+        # Qwen2.5-VL ships a vision tower that text-to-image does not use.
+        # Drop it while the model is still on CPU, before moving to GPU, so
+        # the vision tower never consumes GPU memory. Handle both transformers
+        # layouts: newer puts visual under .model, older puts it directly on
+        # the model.
+        visual_owner = None
+        if hasattr(self.text_encoder, "model") and hasattr(self.text_encoder.model, "visual"):
+            visual_owner = self.text_encoder.model
+        elif hasattr(self.text_encoder, "visual"):
+            visual_owner = self.text_encoder
+        if visual_owner is not None:
+            del visual_owner.visual
+        else:
+            logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
+        self.text_encoder = self.text_encoder.to(self.device)
         self.vae = DistributedAutoencoderKLQwenImage.from_pretrained(
             model, subfolder="vae", local_files_only=local_files_only
         ).to(self.device)
@@ -1035,3 +1051,11 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+
+class QwenImageDMD2Pipeline(DMD2PipelineMixin, QwenImagePipeline):
+    """QwenImage pipeline for FastGen DMD2-distilled models."""
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        super().__init__(od_config=od_config, prefix=prefix)
+        self.__init_dmd2__()

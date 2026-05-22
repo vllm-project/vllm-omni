@@ -93,7 +93,7 @@ def _run_vllm_omni_qwen_image_layered(*, model: str, input_image: Image.Image, o
 
 
 def _run_diffusers_qwen_image_layered(*, model: str, input_image: Image.Image, output_dir: Path) -> list[Image.Image]:
-    run_pre_test_cleanup(enable_force=True)
+    run_pre_test_cleanup()
     pipe: DiffusionPipeline | None = None
     try:
         pipe = DiffusionPipeline.from_pretrained(
@@ -126,7 +126,7 @@ def _run_diffusers_qwen_image_layered(*, model: str, input_image: Image.Image, o
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup(enable_force=True)
+        run_post_test_cleanup()
 
 
 @pytest.mark.benchmark

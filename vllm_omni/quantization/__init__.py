@@ -15,8 +15,10 @@ from .component_config import ComponentQuantizationConfig
 from .factory import SUPPORTED_QUANTIZATION_METHODS, build_quant_config
 from .inc_config import OmniINCConfig
 
-# DiffusionGGUFConfig is NOT imported here to avoid pulling in
-# GGUF -> fused_moe -> pynvml at module load time.
+# Heavy configs (GGUF, MXFP8) are NOT imported here to avoid pulling in
+# optional dependencies (pynvml, torch_npu) at module load time.
+# Import them directly when needed:
+#   from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
 
 __all__ = [
     "build_quant_config",

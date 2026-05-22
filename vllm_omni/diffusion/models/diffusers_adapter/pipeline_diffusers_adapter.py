@@ -15,7 +15,6 @@ It does NOT support:
 
 import inspect
 import logging
-import os
 import re
 from typing import Any, cast
 
@@ -211,7 +210,8 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             logging.info("No transformer found in diffusers pipeline. Skipping attention backend setting.")
             return
 
-        attention_backend_config = self.od_config.attention_backend or os.environ.get("DIFFUSION_ATTENTION_BACKEND")
+        default_spec = self.od_config.diffusion_attention_config.default
+        attention_backend_config = default_spec.backend if default_spec is not None else None
         attention_backend_attempts: list[str] = []
         match attention_backend_config:
             case "FLASH_ATTN" | None:

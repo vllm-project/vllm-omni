@@ -61,8 +61,9 @@ class SnakeBeta(nn.Module):
             x = tl.load(x_ptr + bid * stride_b + cid * stride_c + t_off, mask=mask, other=0.0)
             ea = tl.load(exp_alpha_ptr + cid)
             ib = tl.load(inv_beta_ptr + cid)
-            sin_val = tl.sin(x * ea)
-            result = x + ib * sin_val * sin_val
+            x_float = x.to(tl.float32)
+            sin_val = tl.sin(x_float * ea)
+            result = x + (ib * sin_val * sin_val).to(x.dtype)
 
             tl.store(out_ptr + bid * stride_b + cid * stride_c + t_off, result, mask=mask)
 
