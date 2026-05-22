@@ -149,6 +149,15 @@ class VideoGenerationRequest(BaseModel):
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    pipefusion_warmup_steps: int | None = Field(
+        default=None,
+        ge=1,
+        description="Per-request PipeFusion warmup steps before async patch mode.",
+    )
+    pipefusion_split_dim: Literal["height", "temporal"] | None = Field(
+        default=None,
+        description="Per-request PipeFusion latent split dimension.",
+    )
 
     # vllm-omni extensions for post-generation frame interpolation.
     enable_frame_interpolation: bool = Field(

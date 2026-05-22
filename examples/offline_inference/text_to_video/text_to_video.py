@@ -213,6 +213,24 @@ def parse_args() -> argparse.Namespace:
         help="Number of pipeline parallel stages.",
     )
     parser.add_argument(
+        "--enable-pipefusion",
+        action="store_true",
+        help="Enable PipeFusion (patch-wise async pipeline parallel). Requires --pipeline-parallel-size > 1.",
+    )
+    parser.add_argument(
+        "--pipefusion-warmup-steps",
+        type=int,
+        default=1,
+        help="Number of warmup (sync) steps before switching to async PipeFusion patch mode (default: 1).",
+    )
+    parser.add_argument(
+        "--pipefusion-split-dim",
+        type=str,
+        default="height",
+        choices=["height", "temporal"],
+        help="Dimension along which to split latents into patches for PipeFusion (default: height).",
+    )
+    parser.add_argument(
         "--enable-expert-parallel",
         action="store_true",
         help="Enable expert parallelism for MoE layers.",
@@ -272,6 +290,7 @@ def main():
         vae_patch_parallel_size=args.vae_patch_parallel_size,
         pipeline_parallel_size=args.pipeline_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
+        enable_pipefusion=args.enable_pipefusion,
     )
 
     profiler_enabled = args.profiler_config is not None
@@ -333,6 +352,8 @@ def main():
         guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
         num_frames=args.num_frames,
+        pipefusion_warmup_steps=args.pipefusion_warmup_steps,
+        pipefusion_split_dim=args.pipefusion_split_dim,
     )
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high

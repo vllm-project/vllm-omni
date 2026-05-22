@@ -508,6 +508,13 @@ class OmniServeCommand(CLISubcommand):
             "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
             "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )
+        omni_config_group.add_argument(
+            "--enable-pipefusion",
+            action="store_true",
+            help="Enable PipeFusion (patch-wise async pipeline parallel) for diffusion models. "
+            "Requires --pipeline-parallel-size > 1. "
+            "Equivalent to setting DiffusionParallelConfig.enable_pipefusion.",
+        )
 
         # Default sampling parameters
         omni_config_group.add_argument(
