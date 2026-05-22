@@ -123,6 +123,16 @@ class GroupCoordinator:
 
         self.device = current_omni_platform.get_torch_device(local_rank)
 
+        # Per-comm-id metadata caches for the fast path of
+        # isend_tensor_dict / irecv_tensor_dict. The first call with a given
+        # comm_id performs a full Gloo metadata exchange and stores the
+        # ``metadata_list``; subsequent calls with the same comm_id skip the
+        # Gloo round-trip and only post NCCL P2P. Callers must guarantee
+        # tensor structure is stable across calls with the same comm_id; a
+        # sender-side assert catches drift.
+        self._isend_meta_cache: dict[str, list] = {}
+        self._irecv_meta_cache: dict[str, list] = {}
+
     @property
     def first_rank(self):
         """Return the global rank of the first process in the group"""
@@ -326,7 +336,9 @@ class GroupCoordinator:
         assert dst != self.rank_in_group, "Invalid destination rank. Destination rank is the same as the current rank."
 
         # Serialize object to tensor and get the size as well
-        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+        # use `bytearray` to avoid:
+        # `UserWarning: The given buffer is not writable, and PyTorch does not support non-writable tensors`
+        object_tensor = torch.frombuffer(bytearray(pickle.dumps(obj)), dtype=torch.uint8)
 
         size_tensor = torch.tensor([object_tensor.numel()], dtype=torch.long, device="cpu")
 
@@ -439,6 +451,7 @@ class GroupCoordinator:
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
         dst: int | None = None,
+        comm_id: str | None = None,
     ) -> list[torch.distributed.Work]:
         """Non-blocking send of a tensor dictionary.
 
@@ -446,6 +459,13 @@ class GroupCoordinator:
         non-blocking NCCL isend for each GPU tensor.  Returns the list of
         Work handles; the caller must call handle.wait() before the tensors
         can be safely reused or freed.
+
+        If ``comm_id`` is provided, the Gloo metadata exchange is performed
+        only on the first call with that ID; subsequent calls reuse the
+        cached metadata and skip Gloo entirely. Callers must guarantee that
+        every call with the same comm_id sends a tensor_dict with identical
+        structure (keys, shapes, dtypes, devices); a sender-side assert
+        catches drift.
 
         NOTE: `dst` is the group rank of the destination.
         """
@@ -457,7 +477,18 @@ class GroupCoordinator:
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        self.send_object(metadata_list, dst=dst)
+
+        if comm_id is not None and comm_id in self._isend_meta_cache:
+            cached = self._isend_meta_cache[comm_id]
+            if metadata_list != cached:
+                raise ValueError(
+                    f"isend_tensor_dict shape drift on comm_id={comm_id!r}: got {metadata_list}, cached {cached}. "
+                    "Cached comm_ids require stable tensor structure across calls."
+                )
+        else:
+            self.send_object(metadata_list, dst=dst)
+            if comm_id is not None:
+                self._isend_meta_cache[comm_id] = metadata_list
 
         handles: list[torch.distributed.Work] = []
         for tensor in tensor_list:
@@ -474,6 +505,7 @@ class GroupCoordinator:
     def irecv_tensor_dict(
         self,
         src: int | None = None,
+        comm_id: str | None = None,
     ) -> tuple[dict[str, torch.Tensor | Any], list[torch.distributed.Work], list]:
         """Non-blocking receive of a tensor dictionary.
 
@@ -481,6 +513,12 @@ class GroupCoordinator:
         non-blocking NCCL irecv for each GPU tensor.  Returns
         ``(tensor_dict, comm_handles, comm_postprocess)`` matching the
         interface expected by ``AsyncIntermediateTensors``.
+
+        If ``comm_id`` is provided, the Gloo metadata exchange is performed
+        only on the first call with that ID; subsequent calls reuse the
+        cached metadata, allocate fresh recv buffers, and post NCCL irecvs
+        directly. This makes pre-posting truly non-blocking on the CPU once
+        the cache is warm.
 
         NOTE: `src` is the group rank of the source.
         """
@@ -491,7 +529,13 @@ class GroupCoordinator:
             src = self.group_prev_rank
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        recv_metadata_list = self.recv_object(src=src)
+        if comm_id is not None and comm_id in self._irecv_meta_cache:
+            recv_metadata_list = self._irecv_meta_cache[comm_id]
+        else:
+            recv_metadata_list = self.recv_object(src=src)
+            if comm_id is not None:
+                self._irecv_meta_cache[comm_id] = recv_metadata_list
+
         tensor_dict: dict[str, Any] = {}
         handles: list[torch.distributed.Work] = []
 
@@ -687,6 +731,12 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         self.device = current_omni_platform.get_torch_device(local_rank)
 
+        # Per-comm-id metadata caches for the (i)send/recv_tensor_dict fast
+        # path. See ``GroupCoordinator.__init__`` for details. Re-initialized
+        # here because this subclass overrides __init__ without super().
+        self._isend_meta_cache: dict[str, list] = {}
+        self._irecv_meta_cache: dict[str, list] = {}
+
         self.recv_buffer_set: bool = False
         self.recv_tasks_queue: list[tuple[str, int]] = []
         self.receiving_tasks: list[tuple[torch.distributed.Work, str, int]] = []
@@ -734,6 +784,10 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.recv_skip_tasks_queue = []
         self.receiving_skip_tasks = []
         self.skip_tensor_recv_buffer = {}
+
+        # comm_id metadata caches are valid only within a single request
+        self._isend_meta_cache = {}
+        self._irecv_meta_cache = {}
 
     def set_config(self, dtype: torch.dtype):
         self.dtype = dtype

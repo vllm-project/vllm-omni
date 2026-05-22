@@ -13,5 +13,6 @@ This guide covers the parallelism methods in vLLM-Omni for speeding up diffusion
 | **[VAE Parallelism](vae_parallelism.md)** | Distributes VAE decode spatially across GPUs to reduce peak VAE memory                                              |
 | **[HSDP](hsdp.md)**                                | Shards full model weights via PyTorch FSDP2 to enable large-model inference on memory-constrained GPUs              |
 | **[Expert Parallelism](expert_parallel.md)**       | Shards MoE expert blocks across GPUs for MoE models (e.g. HunyuanImage3.0)                                          |
+| **[PipeFusion](pipefusion.md)**                    | Splits latents into patches and processes them asynchronously to reduce Pipeline Parallel bubbles                   |
 
 See [Supported Models](../../diffusion_features.md#supported-models) for per-model compatibility.

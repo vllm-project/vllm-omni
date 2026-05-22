@@ -271,6 +271,9 @@ class DiffusionParallelConfig:
     hsdp_replicate_size: int = 1
     """Number of replica groups for HSDP. Each replica holds a full sharded copy."""
 
+    enable_pipefusion: bool = False
+    """Enable PipeFusion (patch-wise async pipeline parallel). Requires pipeline_parallel_size > 1."""
+
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""
@@ -303,6 +306,9 @@ class DiffusionParallelConfig:
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
+
+        if self.enable_pipefusion and self.pipeline_parallel_size <= 1:
+            raise ValueError(f"PipeFusion requires pipeline_parallel_size > 1, but got {self.pipeline_parallel_size}")
 
         # Validate HSDP configuration
         if self.use_hsdp:

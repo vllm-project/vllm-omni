@@ -1,7 +1,7 @@
 import copy
 import pprint
 from dataclasses import asdict, dataclass, field
-from typing import Any, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import torch
 from typing_extensions import NotRequired, TypedDict
@@ -329,6 +329,10 @@ class OmniDiffusionSamplingParams:
     # VSA parameters
     VSA_sparsity: float = 0.0
     # perf_logger: PerformanceLogger | None = None
+
+    # PipeFusion runtime settings
+    pipefusion_warmup_steps: int | None = None
+    pipefusion_split_dim: Literal["height", "temporal"] | None = None
 
     # stage logging
     # logging_info: PipelineLoggingInfo = field(default_factory=PipelineLoggingInfo)

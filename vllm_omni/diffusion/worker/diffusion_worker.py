@@ -296,6 +296,7 @@ class DiffusionWorker:
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
                 use_hsdp=parallel_config.use_hsdp,
+                enable_pipefusion=parallel_config.enable_pipefusion,
             )
             if (
                 getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)

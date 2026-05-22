@@ -237,6 +237,15 @@ class VideoGenerationRequest(BaseModel):
         gt=0.0,
         description="Duration in seconds for model-generated audio. Defaults to the generated video duration.",
     )
+    pipefusion_warmup_steps: int | None = Field(
+        default=None,
+        ge=1,
+        description="Per-request PipeFusion warmup steps before async patch mode.",
+    )
+    pipefusion_split_dim: Literal["height", "temporal"] | None = Field(
+        default=None,
+        description="Per-request PipeFusion latent split dimension.",
+    )
 
     # vllm-omni extensions for post-generation frame interpolation.
     enable_frame_interpolation: bool = Field(
