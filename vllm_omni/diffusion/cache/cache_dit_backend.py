@@ -1413,7 +1413,7 @@ def enable_cache_for_helios(pipeline: Any, cache_config: Any) -> Callable[[int],
             params_modifiers=[
                 ParamsModifier(cache_config=db_cache_config, calibrator_config=calibrator_config),
             ],
-            has_separate_cfg=False,
+            has_separate_cfg=True,
         ),
         cache_config=db_cache_config,
         calibrator_config=calibrator_config,
