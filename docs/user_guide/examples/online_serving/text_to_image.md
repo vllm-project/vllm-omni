@@ -216,7 +216,7 @@ Wrap generation parameters inside `extra_body` in the request JSON:
     ```
 
     For details on how generation parameters are handled across different clients, see the
-    [Diffusion Chat API guide](../../../../serving/diffusion_chat_api.md).
+    [Chat Completions API guide](../../../../serving/chat_completions_api.md).
 
 ### Multimodal Input (Text + Structured Content)
 
@@ -237,7 +237,7 @@ Wrap generation parameters inside `extra_body` in the request JSON:
 
 When using `/v1/chat/completions`, pass these inside `extra_body` in the curl
 JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK (see the
-[Diffusion Chat API guide](../../../../serving/diffusion_chat_api.md)).
+[Chat Completions API guide](../../../../serving/chat_completions_api.md)).
 When using the dedicated [`/v1/images/generations`](../../../../serving/image_generation_api.md)
 endpoint, pass the supported generation controls as top-level JSON fields
 directly. For image dimensions and count, use `size` and `n` rather than

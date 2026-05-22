@@ -5,16 +5,17 @@ This runner separates two concepts:
 
 1. ``server_type``: how the serving process is started.
    Currently only ``vllm-omni`` is supported here.
-2. ``benchmark_backend``: which serving API the benchmark client calls.
-   Examples: ``vllm-omni`` for ``/v1/chat/completions`` and ``v1/videos``
-   for async video jobs.
+2. ``benchmark_endpoint``: which serving API the benchmark client calls.
+   Examples: ``/v1/chat/completions`` and ``/v1/videos``.
 
 A config JSON file is REQUIRED via --test-config-file:
   pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
+Optional: ``--assert-baseline`` compares metrics to the ``baseline`` block in each benchmark entry (default: off).
+
 All benchmark results for a session are consolidated into a single JSON file under
 BENCHMARK_RESULT_DIR (override via the DIFFUSION_BENCHMARK_DIR environment variable).
-Each entry in the file contains the test metadata (test_name, backend, benchmark_params,
+Each entry in the file contains the test metadata (test_name, endpoint, benchmark_params,
 timestamp) together with the raw metrics returned by the benchmark script.
 """
 
@@ -32,6 +33,8 @@ from typing import Any, cast
 
 import psutil
 import pytest
+
+from benchmarks.diffusion.backends import endpoint_filename_token, normalize_endpoint
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
@@ -400,7 +403,7 @@ def _unique_server_params(configs: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "model": cfg["server_params"]["model"],
                 "serve_args_dict": serve_args_dict,
                 "serve_args": _build_serve_args(serve_args_dict),
-                "benchmark_backend": cfg.get("benchmark_backend"),
+                "benchmark_endpoint": cfg.get("benchmark_endpoint", cfg.get("benchmark_backend")),
                 "server_params": cfg["server_params"],
             }
         )
@@ -482,7 +485,7 @@ def run_benchmark(
     model: str,
     params: dict[str, Any],
     test_name: str,
-    backend: str = "vllm-omni",
+    endpoint: str = "/v1/chat/completions",
     server_cfg: dict[str, Any] | None = None,
     source_file: str = "",
 ) -> dict[str, Any]:
@@ -490,18 +493,19 @@ def run_benchmark(
 
     The raw metrics are written to a temporary file by the subprocess.  After
     the run completes the metrics are merged with full metadata (test_name,
-    backend, benchmark_params, timestamp, flat reporting fields) and appended
+    endpoint, benchmark_params, timestamp, flat reporting fields) and appended
     to the session-wide aggregated JSON file (AGGREGATED_RESULT_FILE).  The
     temporary file is removed afterwards.  Subprocess stdout/stderr are tee'd
     to a .log file under BENCHMARK_RESULT_DIR/logs/; its path is stored in
     the record.
     """
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    endpoint = normalize_endpoint(endpoint)
 
     log_dir = BENCHMARK_RESULT_DIR / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    backend_label = backend.replace("/", "_")
-    log_file = log_dir / f"{test_name}_{backend_label}_{timestamp}.log"
+    endpoint_label = endpoint_filename_token(endpoint)
+    log_file = log_dir / f"{test_name}_{endpoint_label}_{timestamp}.log"
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="diffusion_bench_tmp_", delete=False) as tmp:
         tmp_result_file = Path(tmp.name)
@@ -517,8 +521,8 @@ def run_benchmark(
         str(port),
         "--model",
         model,
-        "--backend",
-        backend,
+        "--endpoint",
+        endpoint,
         "--dataset",
         params.get("dataset", "random"),
         "--task",
@@ -545,7 +549,7 @@ def run_benchmark(
     # cause truncated or out-of-order log output when stdout is piped).
     cmd = [cmd[0], "-u"] + cmd[1:]
 
-    print(f"\nRunning benchmark (backend={backend}): {' '.join(cmd)}")
+    print(f"\nRunning benchmark (endpoint={endpoint}): {' '.join(cmd)}")
     print(f"  Log file: {log_file}")
 
     # Redirect stdout + stderr directly to the log file at the OS level
@@ -597,7 +601,7 @@ def run_benchmark(
 
     record: dict[str, Any] = {
         "test_name": test_name,
-        "backend": backend,
+        "endpoint": endpoint,
         "timestamp": timestamp,
         "server_params": server_cfg.get("server_params"),
         "benchmark_params": params,
@@ -605,7 +609,7 @@ def run_benchmark(
         "log_file": str(log_file),
         "Model": model,
         "Framework": server_type,
-        "API Backend": backend,
+        "API Endpoint": endpoint,
         "Hardware": "",
         "Deployment": "",
         "Task": params.get("task", "t2i"),
@@ -650,12 +654,14 @@ def run_benchmark(
 # ---------------------------------------------------------------------------
 
 
-def assert_result(result: dict[str, Any], params: dict[str, Any]) -> None:
-    """Assert that benchmark metrics satisfy the configured baselines."""
+def assert_result(result: dict[str, Any], params: dict[str, Any], *, assert_baseline: bool) -> None:
+    """Assert request completion; optionally assert metrics against ``baseline`` in *params*."""
     num_prompts = params.get("num-prompts", 10)
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
 
+    if not assert_baseline:
+        return
     if params.get("skip-performance-assertion", False):
         print("Skipping performance assertions.")
         return
@@ -669,21 +675,21 @@ def assert_result(result: dict[str, Any], params: dict[str, Any]) -> None:
             assert current <= threshold, f"{metric}: {current:.4f} > baseline {threshold}"
 
 
-def _default_benchmark_backend_for_task(task: str) -> str:
-    """Return the default client-side benchmark backend for a diffusion task."""
+def _default_benchmark_endpoint_for_task(task: str) -> str:
+    """Return the default client-side benchmark endpoint for a diffusion task."""
     if task in {"t2v", "i2v", "ti2v"}:
-        return "v1/videos"
+        return "/v1/videos"
     if task in {"t2i", "i2i", "ti2i"}:
-        return "vllm-omni"
-    raise ValueError(f"Unsupported task for benchmark backend resolution: {task}")
+        return "/v1/chat/completions"
+    raise ValueError(f"Unsupported task for benchmark endpoint resolution: {task}")
 
 
-def _resolve_benchmark_backend(server_cfg: dict[str, Any], params: dict[str, Any]) -> str:
+def _resolve_benchmark_endpoint(server_cfg: dict[str, Any], params: dict[str, Any]) -> str:
     """Resolve which serving API the benchmark client should call."""
-    configured = server_cfg.get("benchmark_backend")
+    configured = server_cfg.get("benchmark_endpoint")
     if configured:
-        return cast(str, configured)
-    return _default_benchmark_backend_for_task(cast(str, params.get("task", "t2i")))
+        return normalize_endpoint(cast(str, configured))
+    return _default_benchmark_endpoint_for_task(cast(str, params.get("task", "t2i")))
 
 
 # ---------------------------------------------------------------------------
@@ -697,21 +703,19 @@ def _resolve_benchmark_backend(server_cfg: dict[str, Any], params: dict[str, Any
     indirect=True,
 )
 @pytest.mark.parametrize("benchmark_params", benchmark_indices, indirect=True)
-def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
-    """Run the diffusion performance benchmark and assert against baselines.
+def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, request):
+    """Run the diffusion performance benchmark and verify request completion.
 
     One server is started per unique parallel configuration (module scope).
     For each server, all benchmark parameter sets defined in the config JSON
-    are executed sequentially; results are asserted against the baselines.
+    are executed sequentially; metrics are recorded to the aggregated result file.
 
-    Tracked metrics:
-        - throughput_qps          (higher is better)
-        - latency_p50, latency_p99 (lower is better)
+    Pass ``--assert-baseline`` to compare ``throughput_qps``, ``latency_mean``, etc. to the JSON ``baseline`` block.
     """
     test_name = benchmark_params["test_name"]
     params = benchmark_params["params"]
     server_cfg = getattr(diffusion_server, "server_cfg", {})
-    backend = _resolve_benchmark_backend(server_cfg, params)
+    endpoint = _resolve_benchmark_endpoint(server_cfg, params)
 
     result = run_benchmark(
         host=diffusion_server.host,
@@ -719,13 +723,13 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
         model=diffusion_server.model,
         params=params,
         test_name=test_name,
-        backend=backend,
+        endpoint=endpoint,
         server_cfg=server_cfg,
         source_file=cast(str, CONFIG_FILE_PATH),
     )
 
     print(f"\n{'=' * 60}")
-    print(f"Results for {test_name} (server={diffusion_server.server_type}, backend={backend}):")
+    print(f"Results for {test_name} (server={diffusion_server.server_type}, endpoint={endpoint}):")
     for key in (
         "throughput_qps",
         "latency_mean",
@@ -742,4 +746,5 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
     print(f"\n  Aggregated results: {AGGREGATED_RESULT_FILE}")
     print("=" * 60)
 
-    assert_result(result, params)
+    assert_baseline = request.config.getoption("--assert-baseline", default=False)
+    assert_result(result, params, assert_baseline=assert_baseline)

@@ -17,7 +17,6 @@ list of supported architectures across all modalities, see
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
 |---|---|---|---|---|---|---|
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | — | continuation (`--ref-audio` + `--ref-text`) | 48 kHz |
-| VoxCPM | local model dir | split | ✓ | ✓ (`voxcpm_async_chunk.yaml`) | — | 24 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ (`async_chunk: true` default) | — | 22.05 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ (`--streaming`) | — | 44.1 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design (`--instruct`), language (`--lang`) | 24 kHz |
@@ -69,61 +68,6 @@ python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
 ### Notes
 - Output: 48 kHz mono WAV.
 - Stage config: `vllm_omni/model_executor/stage_configs/voxcpm2.yaml` (default).
-
----
-
-## VoxCPM
-
-Split-stage TTS. The hub example covers single TTS, single voice cloning, and streaming. Use `benchmarks/voxcpm/` for warmup, batch JSONL prompts, profiler injection, and offline TTFP / RTF measurement.
-
-### Prerequisites
-```bash
-pip install voxcpm soundfile
-# or use a local source tree:
-export VLLM_OMNI_VOXCPM_CODE_PATH=/path/to/VoxCPM/src
-```
-
-If the native VoxCPM `config.json` does not contain HF metadata such as `model_type`, prepare a persistent HF-compatible config directory and point the stage configs to it via `VLLM_OMNI_VOXCPM_HF_CONFIG_PATH`:
-
-```bash
-export VOXCPM_MODEL=/path/to/voxcpm-model
-export VLLM_OMNI_VOXCPM_HF_CONFIG_PATH=/tmp/voxcpm_hf_config
-mkdir -p "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"
-cp "$VOXCPM_MODEL/config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/config.json"
-cp "$VOXCPM_MODEL/generation_config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/generation_config.json" 2>/dev/null || true
-python3 -c 'import json, os; p=os.path.join(os.environ["VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"], "config.json"); cfg=json.load(open(p, "r", encoding="utf-8")); cfg["model_type"]="voxcpm"; cfg.setdefault("architectures", ["VoxCPMForConditionalGeneration"]); json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)'
-```
-
-### Quick start
-```bash
-python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This is a split-stage VoxCPM synthesis example running on vLLM Omni."
-```
-
-### Voice cloning
-```bash
-python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This sentence is synthesized with a cloned voice." \
-    --ref-audio /path/to/reference.wav \
-    --ref-text  "The exact transcript spoken in reference.wav."
-```
-
-### Streaming
-Pass the async-chunk stage config:
-```bash
-python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
-    --model "$VOXCPM_MODEL" \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml \
-    --text "This is a split-stage VoxCPM streaming example running on vLLM Omni."
-```
-
-### Notes
-- `voxcpm.yaml` is the default non-streaming stage config; `voxcpm_async_chunk.yaml` enables streaming.
-- Streaming is currently single-request oriented.
-- `--ref-text` must be the real transcript of `--ref-audio`; mismatched text degrades quality.
-- For online serving, see [`examples/online_serving/voxcpm`](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/voxcpm/README.md). For benchmark reporting, see [`benchmarks/voxcpm`](https://github.com/vllm-project/vllm-omni/tree/main/benchmarks/voxcpm/README.md).
 
 ---
 
@@ -380,10 +324,6 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 ??? abstract "qwen3_tts/end2end.py"
     ``````py
     --8<-- "examples/offline_inference/text_to_speech/qwen3_tts/end2end.py"
-    ``````
-??? abstract "voxcpm/end2end.py"
-    ``````py
-    --8<-- "examples/offline_inference/text_to_speech/voxcpm/end2end.py"
     ``````
 ??? abstract "voxcpm2/end2end.py"
     ``````py
