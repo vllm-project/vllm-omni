@@ -28,4 +28,4 @@ vllm serve "$MODEL" --omni \
     --boundary-ratio "$BOUNDARY_RATIO" \
     --flow-shift "$FLOW_SHIFT" \
     $CACHE_BACKEND_FLAG \
-    $(if [ "$ENABLE_CACHE_DIT_SUMMARY" != "0" ]; then echo "--enable-cache-dit-summary"; fi)
+    $(if [ "$ENABLE_CACHE_DIT_SUMMARY" != "0" ]; then echo "--enable-cache-dit-summary"; fi) "$@"
