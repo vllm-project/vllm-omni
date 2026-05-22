@@ -30,8 +30,6 @@ class ImageGenerationRequest(BaseModel):
     for advanced diffusion parameters.
     """
 
-    model_config = ConfigDict(extra="allow")
-
     # Required fields
     prompt: str = Field(..., description="Text description of the desired image(s)")
     bot_task: str | None = Field(
@@ -39,8 +37,6 @@ class ImageGenerationRequest(BaseModel):
         description="Task mode for the model (e.g., 'cot' enables chain-of-thought generation). "
         "Only supported by specific diffusion models.",
     )
-    system_prompt: str | None = Field(None, description="Custom system prompt to guide the model's behavior.")
-    use_system_prompt: bool | None = Field(None, description="Whether to apply the model's default system prompt.")
 
     # OpenAI standard fields
     model: str | None = Field(
@@ -170,7 +166,6 @@ class ImageGenerationResponse(BaseModel):
     Returns generated images with metadata.
     """
 
-    model_config = ConfigDict(extra="allow")
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[ImageData] = Field(..., description="Array of generated images")
     output_format: str = Field(None, description="The output format of the image generation")
