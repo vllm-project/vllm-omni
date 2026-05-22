@@ -53,6 +53,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", default="dreamid_output.mp4", help="Output video path.")
     parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8", "int8"],
+        help=("Online (dynamic) quantization method for the DreamID-Omni transformer. "),
+    )
+    parser.add_argument(
         "--enable-cpu-offload",
         action="store_true",
         default=False,
@@ -162,7 +169,7 @@ def main() -> None:
             "scm_steps_policy": "dynamic",
         }
 
-    omni = Omni(
+    omni_kwargs = dict(
         model=args.model,
         parallel_config=parallel_config,
         model_type=args.model_type,
@@ -171,6 +178,9 @@ def main() -> None:
         cache_backend=args.cache_backend,
         cache_config=cache_config,
     )
+    if args.quantization is not None:
+        omni_kwargs["quantization"] = args.quantization
+    omni = Omni(**omni_kwargs)
     start = time.perf_counter()
     outputs = omni.generate(prompt, sampling_params)
     elapsed = time.perf_counter() - start
