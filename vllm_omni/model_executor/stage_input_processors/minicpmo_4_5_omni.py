@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 from vllm.inputs import TextPrompt
 
@@ -5,12 +7,21 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 
 
 def llm2tts(
-    stage_list,
-    engine_input_source,
-    prompt: OmniTokensPrompt | TextPrompt = None,
+    source_outputs: list[Any],
+    prompt: OmniTokensPrompt | TextPrompt | dict | list | None = None,
     requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
 ):
     """Convert thinker stage output to talker stage input for MiniCPMO Omni.
+
+    The signature matches the framework's ``custom_process_input_func`` call
+    convention used by ``StageEngineCoreClientBase.process_engine_inputs``:
+
+        (source_outputs, prompt, requires_multimodal_data, streaming_context)
+
+    ``source_outputs`` is the already-resolved list of upstream engine
+    outputs (one entry per request), so we do not need to look anything up
+    via ``stage_list[source_stage_id].engine_outputs``.
 
     Extracts from thinker output:
       - Full hidden states (prompt + generated) for speaker embedding extraction
@@ -23,15 +34,12 @@ def llm2tts(
       3. Decode generated text and extract TTS content
       4. Run ConditionalChatTTS pipeline
     """
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
+    del streaming_context  # not used by MiniCPM-o 4.5 turn-taking pipeline
 
-    llm_outputs = stage_list[source_stage_id].engine_outputs
+    if not source_outputs:
+        raise ValueError("source_outputs cannot be empty")
+
+    llm_outputs = source_outputs
     tts_inputs = []
 
     if not isinstance(prompt, list):

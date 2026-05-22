@@ -105,6 +105,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
             MiniCPMTTS = get_class_from_dynamic_module("modeling_minicpmo.MiniCPMTTS", model_path)
 
+            # MiniCPMTTS.__init__ reads `config.top_p / top_k / repetition_penalty`
+            # directly (modeling_minicpmo.py L4112-4114), but the model repo's
+            # config.json `tts_config` block does not declare these fields and
+            # PretrainedConfig in recent transformers no longer surfaces
+            # generation-style params on `self.config`. Inject the defaults the
+            # upstream code itself ships with (modeling_minicpmo.py L2212-2214,
+            # L3132-3133) so attribute access does not raise.
+            for _attr, _default in (("top_p", 0.8), ("top_k", 100), ("repetition_penalty", 1.02)):
+                if not hasattr(self._tts_config, _attr):
+                    setattr(self._tts_config, _attr, _default)
+
             prev_dtype = torch.get_default_dtype()
             torch.set_default_dtype(torch.float32)
             try:
@@ -400,7 +411,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         for k, v in weights:
             if k.startswith("tts."):
                 tts_weights[k.replace("tts.", "", 1)] = v
-                loaded.add(k)
+                # vllm sanity-checks `loaded` against `named_parameters()`.
+                # The submodule is attached at `self.tts_obj`, not `self.tts`,
+                # so report the loaded name under the on-module path.
+                loaded.add(k.replace("tts.", "tts_obj.", 1))
 
         if tts_weights and self._tts_config is not None:
             self._lazy_init_tts()
