@@ -109,8 +109,7 @@ def talker2code2wav(
         audio_codes = audio_codes.to(torch.long)
         if audio_codes.ndim != 2:
             raise ValueError(
-                f"MiniMind talker audio codes must have shape [frames, codebooks], "
-                f"got {tuple(audio_codes.shape)}"
+                f"MiniMind talker audio codes must have shape [frames, codebooks], got {tuple(audio_codes.shape)}"
             )
         num_code_layers = int(audio_codes.shape[-1])
         if num_code_layers <= 0:
