@@ -231,10 +231,25 @@ class Wan22I2VPipeline(
         # Transformers (weights loaded via load_weights)
         # Load config from model directory or HF Hub to get correct in_channels for I2V models
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = self._create_transformer(transformer_config)
+        self.transformer = create_transformer_from_config(
+            transformer_config,
+            quant_config=od_config.quantization_config,
+        )
         if self.has_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = self._create_transformer(transformer_2_config)
+            t2_quant = transformer_2_config.get("quantization_config")
+            if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
+                from vllm_omni.quantization.factory import build_quant_config
+
+                method = t2_quant["quant_method"]
+                kwargs = {k: v for k, v in t2_quant.items() if k != "quant_method"}
+                t2_quant = build_quant_config(method, **kwargs)
+            else:
+                t2_quant = None
+            self.transformer_2 = create_transformer_from_config(
+                transformer_2_config,
+                quant_config=t2_quant,
+            )
         else:
             self.transformer_2 = None
 
