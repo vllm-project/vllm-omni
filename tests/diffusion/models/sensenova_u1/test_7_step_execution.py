@@ -1,0 +1,608 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Step 7: Step-wise execution and online dynamic batching tests.
+
+Verifies that:
+1. SenseNovaU1Pipeline correctly implements SupportsStepExecution
+2. Single-request step mode produces output identical to forward()
+3. Multiple same-parameter requests can be batched (Phase 2)
+4. Different prompt lengths can be batched (Phase 3 — for-loop)
+5. Different resolutions can be batched (Phase 4 — for-loop)
+6. Different CFG scales can be batched (Phase 5 — for-loop)
+7. Requests with different step counts complete independently (Phase 6)
+
+Usage:
+    micromamba activate sensenova_u1
+    python -m pytest tests/diffusion/models/sensenova_u1/test_7_step_execution.py -v -s
+
+Or run standalone:
+    python tests/diffusion/models/sensenova_u1/test_7_step_execution.py
+"""
+
+import os
+import sys
+import time
+
+import numpy as np
+import torch
+from PIL import Image
+
+sys.path.insert(
+    0,
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))),
+)
+
+from tests.diffusion.models.sensenova_u1.conftest import (
+    DEFAULT_CFG_SCALE,
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_NUM_STEPS,
+    DEFAULT_PROMPT,
+    DEFAULT_SEED,
+    MODEL_PATH,
+)
+
+
+def _init_distributed():
+    """Initialize distributed environment for single-GPU testing."""
+    import torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", world_size=1, rank=0)
+
+    from vllm.distributed.parallel_state import (
+        init_world_group,
+        initialize_model_parallel,
+    )
+    import vllm.distributed.parallel_state as vllm_ps
+
+    if vllm_ps._WORLD is None:
+        vllm_ps._WORLD = init_world_group([0], 0, "nccl")
+    initialize_model_parallel(tensor_model_parallel_size=1)
+
+
+_distributed_initialized = False
+_pipeline_singleton = None
+
+
+def _build_pipeline():
+    global _distributed_initialized, _pipeline_singleton
+    if _pipeline_singleton is not None:
+        return _pipeline_singleton
+
+    if not _distributed_initialized:
+        _init_distributed()
+        _distributed_initialized = True
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.sensenova_u1 import SenseNovaU1Pipeline
+
+    od_config = OmniDiffusionConfig(
+        model=MODEL_PATH,
+        dtype=torch.bfloat16,
+    )
+    pipeline = SenseNovaU1Pipeline(od_config=od_config)
+    pipeline = pipeline.to(device="cuda", dtype=torch.bfloat16)
+    pipeline.eval()
+    _pipeline_singleton = pipeline
+    return pipeline
+
+
+def _build_request(
+    prompt=DEFAULT_PROMPT,
+    image_size=DEFAULT_IMAGE_SIZE,
+    num_steps=DEFAULT_NUM_STEPS,
+    cfg_scale=DEFAULT_CFG_SCALE,
+    seed=DEFAULT_SEED,
+    request_id=None,
+    **extra_args,
+):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+    sampling_params = SimpleNamespace(
+        height=image_size[1],
+        width=image_size[0],
+        num_inference_steps=num_steps,
+        seed=seed,
+        generator=None,
+        generator_device=None,
+        guidance_scale=0.0,
+        guidance_scale_2=None,
+        do_classifier_free_guidance=False,
+    )
+    sampling_params.extra_args = {"cfg_scale": cfg_scale, **extra_args}
+
+    req = OmniDiffusionRequest(
+        prompts=[prompt],
+        sampling_params=sampling_params,
+    )
+    if request_id:
+        req.request_ids = [request_id]
+    return req
+
+
+def _make_state(req, req_id):
+    """Create a DiffusionRequestState from a request (mimics runner logic)."""
+    import copy
+
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+
+    return DiffusionRequestState(
+        req_id=req_id,
+        sampling=copy.deepcopy(req.sampling_params),
+        prompts=req.prompts,
+    )
+
+
+def _run_step_mode(pipeline, state):
+    """Run full step-mode pipeline on a single state, return output image."""
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+
+    # prepare_encode
+    pipeline.prepare_encode(state)
+
+    # denoising loop
+    while not state.denoise_completed:
+        input_batch = InputBatch.make_batch([state])
+        noise_pred = pipeline.denoise_step(input_batch)
+        pipeline.step_scheduler(state, noise_pred)
+
+    # post_decode
+    output = pipeline.post_decode(state)
+    return output
+
+
+def _image_mse(img1: Image.Image, img2: Image.Image) -> float:
+    """Compute per-pixel MSE between two PIL images."""
+    arr1 = np.array(img1, dtype=np.float32)
+    arr2 = np.array(img2, dtype=np.float32)
+    return float(np.mean((arr1 - arr2) ** 2))
+
+
+def _image_psnr(img1: Image.Image, img2: Image.Image) -> float:
+    """Compute PSNR between two PIL images."""
+    mse = _image_mse(img1, img2)
+    if mse == 0:
+        return float("inf")
+    return float(10 * np.log10(255.0**2 / mse))
+
+
+# ---------------------------------------------------------------------------
+# Test 1: Protocol conformance
+# ---------------------------------------------------------------------------
+
+
+def test_supports_step_execution():
+    """SenseNovaU1Pipeline correctly declares and implements SupportsStepExecution."""
+    from vllm_omni.diffusion.models.interface import supports_step_execution
+    from vllm_omni.diffusion.models.sensenova_u1 import SenseNovaU1Pipeline
+
+    assert hasattr(SenseNovaU1Pipeline, "supports_step_execution")
+    assert SenseNovaU1Pipeline.supports_step_execution is True
+
+    # Verify all required methods exist
+    for method_name in ("prepare_encode", "denoise_step", "step_scheduler", "post_decode"):
+        assert hasattr(SenseNovaU1Pipeline, method_name), f"Missing method: {method_name}"
+
+    # Check runtime protocol conformance
+    pipeline = _build_pipeline()
+    assert supports_step_execution(pipeline)
+    print("\n  SupportsStepExecution protocol: PASS")
+
+
+# ---------------------------------------------------------------------------
+# Test 2: Single-request step mode vs forward() equivalence
+# ---------------------------------------------------------------------------
+
+
+def test_step_mode_equivalence():
+    """Step-mode output matches forward() output (bit-exact with same seed)."""
+    pipeline = _build_pipeline()
+
+    # Run forward() path
+    req = _build_request(seed=123)
+    with torch.inference_mode():
+        output_forward = pipeline(req)
+
+    # Run step-mode path
+    state = _make_state(_build_request(seed=123), "test_step_eq")
+    with torch.inference_mode():
+        output_step = _run_step_mode(pipeline, state)
+
+    assert output_forward.output is not None
+    assert output_step.output is not None
+
+    mse = _image_mse(output_forward.output, output_step.output)
+    psnr = _image_psnr(output_forward.output, output_step.output)
+    print(f"\n  Step vs Forward: MSE={mse:.4f}, PSNR={psnr:.1f}dB")
+
+    # They should be identical (same seed, same compute path)
+    assert mse < 1.0, f"Step mode output diverges from forward(): MSE={mse}"
+
+    # Save outputs for visual inspection
+    out_dir = os.path.join(os.path.dirname(__file__), "outputs")
+    os.makedirs(out_dir, exist_ok=True)
+    output_forward.output.save(os.path.join(out_dir, "step_eq_forward.png"))
+    output_step.output.save(os.path.join(out_dir, "step_eq_step.png"))
+
+
+# ---------------------------------------------------------------------------
+# Test 3: Multi-request same-parameter batch (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def test_homogeneous_batch():
+    """Multiple same-parameter requests run in batch and produce correct output."""
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+
+    pipeline = _build_pipeline()
+    num_reqs = 2
+
+    # Run each request independently via forward() for reference
+    refs = []
+    for i in range(num_reqs):
+        req = _build_request(seed=100 + i)
+        with torch.inference_mode():
+            out = pipeline(req)
+        refs.append(out.output)
+
+    # Run all requests in step-mode batch
+    states = [_make_state(_build_request(seed=100 + i), f"batch_{i}") for i in range(num_reqs)]
+
+    with torch.inference_mode():
+        for state in states:
+            pipeline.prepare_encode(state)
+
+        max_steps = max(state.total_steps for state in states)
+        for _ in range(max_steps):
+            active = [s for s in states if not s.denoise_completed]
+            if not active:
+                break
+            input_batch = InputBatch.make_batch(active)
+            noise_pred = pipeline.denoise_step(input_batch)
+
+            offset = 0
+            for state in active:
+                row_num = state.latents.shape[0]
+                pipeline.step_scheduler(state, noise_pred[offset : offset + row_num])
+                offset += row_num
+
+        outputs = []
+        for state in states:
+            outputs.append(pipeline.post_decode(state))
+
+    # Compare each batch output with its reference
+    for i in range(num_reqs):
+        assert outputs[i].output is not None
+        mse = _image_mse(refs[i], outputs[i].output)
+        psnr = _image_psnr(refs[i], outputs[i].output)
+        print(f"\n  Batch req {i}: MSE={mse:.4f}, PSNR={psnr:.1f}dB")
+        assert mse < 1.0, f"Batch output {i} diverges: MSE={mse}"
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Different prompt lengths (Phase 3 — for-loop)
+# ---------------------------------------------------------------------------
+
+
+def test_heterogeneous_prompt_lengths():
+    """Requests with different prompt lengths batch correctly (for-loop mode)."""
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+
+    pipeline = _build_pipeline()
+
+    prompts = [
+        "A cat",
+        "A beautiful sunset over the ocean with golden clouds and seagulls flying in the distance",
+    ]
+
+    # Reference: individual forward()
+    refs = []
+    for i, prompt in enumerate(prompts):
+        req = _build_request(prompt=prompt, seed=200 + i)
+        with torch.inference_mode():
+            out = pipeline(req)
+        refs.append(out.output)
+
+    # Step-mode batch
+    states = [
+        _make_state(_build_request(prompt=prompt, seed=200 + i), f"prompt_{i}") for i, prompt in enumerate(prompts)
+    ]
+
+    with torch.inference_mode():
+        for state in states:
+            pipeline.prepare_encode(state)
+
+        max_steps = max(state.total_steps for state in states)
+        for _ in range(max_steps):
+            active = [s for s in states if not s.denoise_completed]
+            if not active:
+                break
+            input_batch = InputBatch.make_batch(active)
+            noise_pred = pipeline.denoise_step(input_batch)
+
+            offset = 0
+            for state in active:
+                row_num = state.latents.shape[0]
+                pipeline.step_scheduler(state, noise_pred[offset : offset + row_num])
+                offset += row_num
+
+        outputs = [pipeline.post_decode(state) for state in states]
+
+    for i in range(len(prompts)):
+        assert outputs[i].output is not None
+        mse = _image_mse(refs[i], outputs[i].output)
+        print(f"\n  Prompt len test req {i}: MSE={mse:.4f}")
+        assert mse < 1.0, f"Prompt length batch output {i} diverges: MSE={mse}"
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Different resolutions (Phase 4 — for-loop)
+# ---------------------------------------------------------------------------
+
+
+def test_heterogeneous_resolutions():
+    """Requests with different resolutions batch correctly (for-loop mode)."""
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+
+    pipeline = _build_pipeline()
+    resolutions = [(512, 512), (768, 768)]
+
+    # Reference
+    refs = []
+    for i, res in enumerate(resolutions):
+        req = _build_request(image_size=res, seed=300 + i)
+        with torch.inference_mode():
+            out = pipeline(req)
+        refs.append(out.output)
+
+    # Step-mode batch (for-loop handles different shapes)
+    states = [
+        _make_state(_build_request(image_size=res, seed=300 + i), f"res_{i}") for i, res in enumerate(resolutions)
+    ]
+
+    with torch.inference_mode():
+        for state in states:
+            pipeline.prepare_encode(state)
+
+        max_steps = max(state.total_steps for state in states)
+        for _ in range(max_steps):
+            active = [s for s in states if not s.denoise_completed]
+            if not active:
+                break
+            # Different resolutions → different latent shapes.
+            # Cannot use InputBatch.make_batch (requires same trailing shape).
+            # For-loop mode: process each request individually.
+            all_preds = []
+            for state in active:
+                input_batch = InputBatch.make_batch([state])
+                pred = pipeline.denoise_step(input_batch)
+                all_preds.append(pred)
+
+            for state, pred in zip(active, all_preds):
+                pipeline.step_scheduler(state, pred)
+
+        outputs = [pipeline.post_decode(state) for state in states]
+
+    for i in range(len(resolutions)):
+        assert outputs[i].output is not None
+        mse = _image_mse(refs[i], outputs[i].output)
+        print(f"\n  Resolution {resolutions[i]} test: MSE={mse:.4f}")
+        assert mse < 1.0, f"Resolution batch output {i} diverges: MSE={mse}"
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Different CFG scales (Phase 5 — for-loop)
+# ---------------------------------------------------------------------------
+
+
+def test_heterogeneous_cfg_scales():
+    """Requests with different CFG scales batch correctly (for-loop mode)."""
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+
+    pipeline = _build_pipeline()
+    cfg_scales = [4.0, 7.5]
+
+    # Reference
+    refs = []
+    for i, cfg in enumerate(cfg_scales):
+        req = _build_request(cfg_scale=cfg, seed=400 + i)
+        with torch.inference_mode():
+            out = pipeline(req)
+        refs.append(out.output)
+
+    # Step-mode batch
+    states = [_make_state(_build_request(cfg_scale=cfg, seed=400 + i), f"cfg_{i}") for i, cfg in enumerate(cfg_scales)]
+
+    with torch.inference_mode():
+        for state in states:
+            pipeline.prepare_encode(state)
+
+        max_steps = max(state.total_steps for state in states)
+        for _ in range(max_steps):
+            active = [s for s in states if not s.denoise_completed]
+            if not active:
+                break
+            # Per-request execution (different CFG → different uncond paths)
+            all_preds = []
+            for state in active:
+                input_batch = InputBatch.make_batch([state])
+                pred = pipeline.denoise_step(input_batch)
+                all_preds.append(pred)
+
+            for state, pred in zip(active, all_preds):
+                pipeline.step_scheduler(state, pred)
+
+        outputs = [pipeline.post_decode(state) for state in states]
+
+    for i in range(len(cfg_scales)):
+        assert outputs[i].output is not None
+        mse = _image_mse(refs[i], outputs[i].output)
+        print(f"\n  CFG={cfg_scales[i]} test: MSE={mse:.4f}")
+        assert mse < 1.0, f"CFG batch output {i} diverges: MSE={mse}"
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Different step counts — dynamic exit (Phase 6)
+# ---------------------------------------------------------------------------
+
+
+def test_dynamic_step_counts():
+    """Requests with different num_steps complete independently."""
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+
+    pipeline = _build_pipeline()
+    step_counts = [4, 8]
+
+    # Reference
+    refs = []
+    for i, steps in enumerate(step_counts):
+        req = _build_request(num_steps=steps, seed=500 + i)
+        with torch.inference_mode():
+            out = pipeline(req)
+        refs.append(out.output)
+
+    # Step-mode with mixed step counts
+    states = [
+        _make_state(_build_request(num_steps=steps, seed=500 + i), f"steps_{i}") for i, steps in enumerate(step_counts)
+    ]
+
+    with torch.inference_mode():
+        for state in states:
+            pipeline.prepare_encode(state)
+
+        completion_order = []
+        max_steps = max(state.total_steps for state in states)
+        for step in range(max_steps):
+            active = [s for s in states if not s.denoise_completed]
+            if not active:
+                break
+
+            all_preds = []
+            for state in active:
+                input_batch = InputBatch.make_batch([state])
+                pred = pipeline.denoise_step(input_batch)
+                all_preds.append(pred)
+
+            for state, pred in zip(active, all_preds):
+                pipeline.step_scheduler(state, pred)
+                if state.denoise_completed:
+                    completion_order.append(state.req_id)
+
+        outputs = [pipeline.post_decode(state) for state in states]
+
+    # The 4-step request should complete first
+    assert completion_order[0] == "steps_0", f"Expected steps_0 first, got {completion_order}"
+    print(f"\n  Completion order: {completion_order}")
+
+    for i in range(len(step_counts)):
+        assert outputs[i].output is not None
+        mse = _image_mse(refs[i], outputs[i].output)
+        print(f"  Steps={step_counts[i]} test: MSE={mse:.4f}")
+        assert mse < 1.0, f"Dynamic step output {i} diverges: MSE={mse}"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Throughput comparison (step-mode batch vs serial forward)
+# ---------------------------------------------------------------------------
+
+
+def test_throughput_improvement():
+    """Step-mode batch has reasonable per-step latency."""
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+
+    pipeline = _build_pipeline()
+    num_steps = 4
+
+    # Time serial forward() calls
+    torch.accelerator.synchronize()
+    start = time.perf_counter()
+    for i in range(2):
+        req = _build_request(num_steps=num_steps, seed=600 + i)
+        with torch.inference_mode():
+            pipeline(req)
+    torch.accelerator.synchronize()
+    serial_time = time.perf_counter() - start
+
+    # Time step-mode (for-loop batch)
+    states = [_make_state(_build_request(num_steps=num_steps, seed=600 + i), f"perf_{i}") for i in range(2)]
+
+    torch.accelerator.synchronize()
+    start = time.perf_counter()
+    with torch.inference_mode():
+        for state in states:
+            pipeline.prepare_encode(state)
+
+        for _ in range(num_steps):
+            active = [s for s in states if not s.denoise_completed]
+            if not active:
+                break
+            all_preds = []
+            for state in active:
+                input_batch = InputBatch.make_batch([state])
+                pred = pipeline.denoise_step(input_batch)
+                all_preds.append(pred)
+            for state, pred in zip(active, all_preds):
+                pipeline.step_scheduler(state, pred)
+
+        for state in states:
+            pipeline.post_decode(state)
+    torch.accelerator.synchronize()
+    batch_time = time.perf_counter() - start
+
+    ratio = serial_time / batch_time
+    print(f"\n{'=' * 60}")
+    print(f"THROUGHPUT COMPARISON (2 reqs × {num_steps} steps)")
+    print(f"{'=' * 60}")
+    print(f"  Serial forward():  {serial_time:.2f}s")
+    print(f"  Step-mode batch:   {batch_time:.2f}s")
+    print(f"  Ratio: {ratio:.2f}x")
+    print(f"{'=' * 60}")
+
+    # Step-mode should not be significantly slower than serial
+    # (Phase 1 for-loop won't be faster; just verify no major regression)
+    assert ratio > 0.5, f"Step mode is too slow: {ratio:.2f}x"
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print("SenseNova-U1 Step Execution & Online Dynamic Batching Tests")
+    print("=" * 70)
+
+    test_supports_step_execution()
+    print("\n[1/8] Protocol conformance: PASS")
+
+    test_step_mode_equivalence()
+    print("\n[2/8] Step mode equivalence: PASS")
+
+    test_homogeneous_batch()
+    print("\n[3/8] Homogeneous batch: PASS")
+
+    test_heterogeneous_prompt_lengths()
+    print("\n[4/8] Heterogeneous prompt lengths: PASS")
+
+    test_heterogeneous_resolutions()
+    print("\n[5/8] Heterogeneous resolutions: PASS")
+
+    test_heterogeneous_cfg_scales()
+    print("\n[6/8] Heterogeneous CFG scales: PASS")
+
+    test_dynamic_step_counts()
+    print("\n[7/8] Dynamic step counts: PASS")
+
+    test_throughput_improvement()
+    print("\n[8/8] Throughput comparison: PASS")
+
+    print("\n" + "=" * 70)
+    print("ALL TESTS PASSED")
+    print("=" * 70)

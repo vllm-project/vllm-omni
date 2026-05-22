@@ -22,7 +22,7 @@ import math
 import os
 from collections.abc import Iterable
 from types import SimpleNamespace
-from typing import ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -35,9 +35,13 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery, SupportsStepExecution
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 from .sensenova_u1_transformer import (
     SenseNovaU1ForCausalLM,
@@ -488,7 +492,7 @@ def _optimized_scale(positive_flat, negative_flat):
 # ---------------------------------------------------------------------------
 
 
-class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
+class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecution, DiffusionPipelineProfilerMixin):
     """SenseNova-U1 text-to-image and image-to-image pipeline for vllm-omni.
 
     Builds the full model graph internally:
@@ -535,6 +539,8 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
     _encoder_modules: ClassVar[list[str]] = ["vision_model"]
     _vae_modules: ClassVar[list[str]] = []
     _resident_modules: ClassVar[list[str]] = ["fm_modules"]
+
+    supports_step_execution: ClassVar[bool] = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -607,6 +613,10 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                 fall_back_to_pt=False,
             ),
         ]
+
+        # Per-request state cache for step-wise execution.  Maps req_id to
+        # the dict stored in state.extra during prepare_encode.
+        self._step_states: dict[str, dict[str, Any]] = {}
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
@@ -1416,6 +1426,328 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         if think_text:
             custom["think_text"] = think_text
         return DiffusionOutput(output=img, custom_output=custom)
+
+    # -----------------------------------------------------------------------
+    # Step-wise execution (SupportsStepExecution protocol)
+    # -----------------------------------------------------------------------
+
+    def _parse_request_from_state(self, state: DiffusionRequestState) -> SimpleNamespace:
+        """Build the parameter namespace from DiffusionRequestState fields."""
+        first_prompt = state.prompts[0] if state.prompts else ""
+        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+        extra_args = getattr(state.sampling, "extra_args", {}) or {}
+        height = int(state.sampling.height) if state.sampling.height else 2048
+        width = int(state.sampling.width) if state.sampling.width else 2048
+        grid_factor = self.patch_size * self.merge_size
+        if height % grid_factor or width % grid_factor:
+            height = _round_by_factor(height, grid_factor)
+            width = _round_by_factor(width, grid_factor)
+        seed = int(state.sampling.seed) if state.sampling.seed is not None else 42
+        return SimpleNamespace(
+            first_prompt=first_prompt,
+            prompt=prompt,
+            extra_args=extra_args,
+            image_size=(width, height),
+            num_steps=int(state.sampling.num_inference_steps or 50),
+            cfg_scale=float(extra_args.get("cfg_scale", 4.0)),
+            img_cfg_scale=float(extra_args.get("img_cfg_scale", 1.0)),
+            cfg_norm=str(extra_args.get("cfg_norm", "none")),
+            timestep_shift=float(extra_args.get("timestep_shift", 3.0)),
+            cfg_interval=tuple(extra_args.get("cfg_interval", (0.0, 1.0))),
+            batch_size=1,
+            seed=seed,
+            think_mode=bool(extra_args.get("think", False)),
+            t_eps=float(extra_args.get("t_eps", 0.02)),
+        )
+
+    def _build_t2i_caches(self, p: SimpleNamespace, ns: SimpleNamespace) -> dict[str, Any]:
+        """Build KV caches for text-to-image generation."""
+        think_content = "<think>\n" if p.think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
+        query_cond = _build_t2i_query(p.prompt, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
+        query_uncond = _build_t2i_query("", append_text=IMG_START_TOKEN)
+
+        input_ids_cond, indexes_cond, mask_cond = self._build_t2i_text_inputs(query_cond)
+        input_ids_uncond, indexes_uncond, mask_uncond = self._build_t2i_text_inputs(query_uncond)
+
+        indexes_image_cond = self._build_t2i_image_indexes(ns.token_h, ns.token_w, indexes_cond.shape[1], self.device)
+        indexes_image_uncond = self._build_t2i_image_indexes(
+            ns.token_h, ns.token_w, indexes_uncond.shape[1], self.device
+        )
+
+        think_text = ""
+        if p.think_mode:
+            outputs_cond = self.language_model(
+                input_ids=input_ids_cond,
+                indexes=indexes_cond,
+                attention_mask=mask_cond,
+                use_cache=True,
+            )
+            past_kv_cond = outputs_cond.past_key_values
+            t_index_cond = indexes_cond[0].max().item()
+            past_kv_cond, t_index_cond, think_text = self._generate_think(outputs_cond, past_kv_cond, t_index_cond)
+            indexes_image_cond = self._build_t2i_image_indexes(ns.token_h, ns.token_w, t_index_cond + 1, self.device)
+        else:
+            past_kv_cond, _ = self._t2i_prefix_forward(input_ids_cond, indexes_cond, mask_cond)
+
+        past_kv_uncond, _ = self._t2i_prefix_forward(input_ids_uncond, indexes_uncond, mask_uncond)
+
+        self._expand_and_prepare_kv(past_kv_cond, ns.token_h * ns.token_w, p.batch_size)
+        self._expand_and_prepare_kv(past_kv_uncond, ns.token_h * ns.token_w, p.batch_size)
+
+        return {
+            "cond": past_kv_cond,
+            "idx_cond": indexes_image_cond,
+            "mask_cond": {"full_attention": None},
+            "uncond": past_kv_uncond,
+            "idx_uncond": indexes_image_uncond,
+            "mask_uncond": {"full_attention": None},
+            "think_text": think_text,
+        }
+
+    def _build_it2i_caches(
+        self,
+        p: SimpleNamespace,
+        ns: SimpleNamespace,
+        input_images: list,
+    ) -> dict[str, Any]:
+        """Build KV caches for image-to-image (editing) generation."""
+        pixel_values, grid_hw = self._prepare_input_images(input_images)
+        images_info = {"grid_hw": grid_hw, "pixel_values": pixel_values}
+
+        needs_cfg = not (p.cfg_scale == 1 and p.img_cfg_scale == 1)
+        needs_img_cond = needs_cfg and (p.img_cfg_scale == 1 or p.cfg_scale != p.img_cfg_scale)
+        needs_uncond = needs_cfg and p.img_cfg_scale != 1
+
+        query_cond = self._build_it2i_query(p.prompt, images_info, p.think_mode)
+        embeds_cond, idx_cond, mask_cond = self._build_it2i_inputs(query_cond, pixel_values, grid_hw)
+
+        if needs_img_cond:
+            img_only_prompt = "<image>" * grid_hw.shape[0]
+            think_off = "<think>\n\n</think>\n\n" + IMG_START_TOKEN
+            query_img_cond = _build_t2i_query(img_only_prompt, append_text=think_off)
+            for i in range(grid_hw.shape[0]):
+                h, w = grid_hw[i]
+                num_patch = int(h * w * self.downsample_ratio**2)
+                tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_patch + IMG_END_TOKEN
+                query_img_cond = query_img_cond.replace("<image>", tokens, 1)
+            embeds_img_cond, idx_img_cond, mask_img_cond = self._build_it2i_inputs(
+                query_img_cond, pixel_values, grid_hw
+            )
+        else:
+            embeds_img_cond = idx_img_cond = mask_img_cond = None
+
+        if needs_uncond:
+            query_uncond = _build_t2i_query("", append_text=IMG_START_TOKEN)
+            embeds_uncond, idx_uncond, mask_uncond = self._build_it2i_inputs(query_uncond)
+        else:
+            embeds_uncond = idx_uncond = mask_uncond = None
+
+        think_text = ""
+        if p.think_mode:
+            outputs_cond = self.language_model(
+                inputs_embeds=embeds_cond,
+                indexes=idx_cond,
+                attention_mask=mask_cond,
+                use_cache=True,
+            )
+            past_kv_cond = outputs_cond.past_key_values
+            t_index_cond = idx_cond[0].max().item()
+            past_kv_cond, t_index_cond, think_text = self._generate_think(outputs_cond, past_kv_cond, t_index_cond)
+            idx_image_cond = self._build_t2i_image_indexes(ns.token_h, ns.token_w, t_index_cond + 1, self.device)
+        else:
+            past_kv_cond, _ = self._it2i_prefix_forward(embeds_cond, idx_cond, mask_cond)
+            idx_image_cond = self._build_t2i_image_indexes(
+                ns.token_h, ns.token_w, idx_cond[0].max().item() + 1, self.device
+            )
+
+        caches: dict[str, Any] = {
+            "cond": past_kv_cond,
+            "idx_cond": idx_image_cond,
+            "mask_cond": {"full_attention": None},
+            "think_text": think_text,
+        }
+
+        if needs_img_cond:
+            past_kv_img_cond, _ = self._it2i_prefix_forward(embeds_img_cond, idx_img_cond, mask_img_cond)
+            idx_image_img_cond = self._build_t2i_image_indexes(
+                ns.token_h, ns.token_w, idx_img_cond[0].max().item() + 1, self.device
+            )
+            caches["img_cond"] = past_kv_img_cond
+            caches["idx_img_cond"] = idx_image_img_cond
+            caches["mask_img_cond"] = {"full_attention": None}
+
+        if needs_uncond:
+            past_kv_uncond, _ = self._it2i_prefix_forward(embeds_uncond, idx_uncond, mask_uncond)
+            idx_image_uncond = self._build_t2i_image_indexes(
+                ns.token_h, ns.token_w, idx_uncond[0].max().item() + 1, self.device
+            )
+            caches["uncond"] = past_kv_uncond
+            caches["idx_uncond"] = idx_image_uncond
+            caches["mask_uncond"] = {"full_attention": None}
+
+        # Expand all KV caches for batch size
+        for key in ("cond", "img_cond", "uncond"):
+            if key in caches and not isinstance(caches[key], dict):
+                self._expand_and_prepare_kv(caches[key], ns.token_h * ns.token_w, p.batch_size)
+
+        return caches
+
+    def prepare_encode(
+        self,
+        state: DiffusionRequestState,
+        **kwargs: Any,
+    ) -> DiffusionRequestState:
+        """Prepare request-level inputs: AR prefill, noise init, KV cache setup."""
+        p = self._parse_request_from_state(state)
+        self.top_cfg.t_eps = p.t_eps
+
+        ns = self._init_noise_and_schedule(p)
+
+        input_images = self._extract_input_images(p.first_prompt)
+        if input_images is not None:
+            caches = self._build_it2i_caches(p, ns, input_images)
+        else:
+            caches = self._build_t2i_caches(p, ns)
+
+        # Populate state fields consumed by InputBatch / step_scheduler.
+        # timesteps[:-1] gives exactly num_steps entries so that
+        # DiffusionRequestState.total_steps == num_steps.
+        state.latents = ns.image_prediction
+        state.timesteps = ns.timesteps[:-1]
+        state.step_index = 0
+        state.do_true_cfg = p.cfg_scale > 1.0
+
+        # InputBatch requires prompt_embeds to be set. For U1 the prompt
+        # conditioning lives in KV caches, so we use a dummy 1-token embed.
+        state.prompt_embeds = torch.zeros(
+            1, self.language_model.config.hidden_size,
+            device=ns.image_prediction.device,
+            dtype=ns.image_prediction.dtype,
+        )
+
+        # Pipeline-private per-request state
+        state.extra["p"] = p
+        state.extra["ns"] = ns
+        state.extra["caches"] = caches
+        state.extra["think_text"] = caches.get("think_text", "")
+        state.extra["_image_prediction"] = ns.image_prediction
+        state.extra["_current_step_index"] = 0
+
+        # Register in pipeline's step-state cache for denoise_step lookup
+        self._step_states[state.req_id] = state.extra
+
+        return state
+
+    def _step_denoise_single(
+        self,
+        image_prediction: torch.Tensor,
+        step_index: int,
+        extra: dict[str, Any],
+    ) -> torch.Tensor:
+        """Execute one denoising step for a single request. Returns v_pred."""
+        p = extra["p"]
+        ns = extra["ns"]
+        caches = extra["caches"]
+        merge_size = ns.merge_size
+
+        t = ns.timesteps[step_index]
+
+        z = _patchify(image_prediction, self.patch_size * merge_size)
+        image_input = _patchify(image_prediction, self.patch_size, channel_first=True)
+        image_embeds = self._extract_feature(
+            image_input.view(p.batch_size * ns.grid_h * ns.grid_w, -1),
+            gen_model=True,
+            grid_hw=ns.grid_hw,
+        ).view(p.batch_size, ns.token_h * ns.token_w, -1)
+
+        t_expanded = t.expand(p.batch_size * ns.token_h * ns.token_w)
+        timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
+            p.batch_size, ns.token_h * ns.token_w, -1
+        )
+        if self.top_cfg.add_noise_scale_embedding:
+            ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.top_cfg.noise_scale_max_value)
+            ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(p.batch_size, ns.token_h * ns.token_w, -1)
+            timestep_embeddings = timestep_embeddings + ns_emb
+        image_embeds = image_embeds + timestep_embeddings
+
+        v_pred = self._denoise_step(image_prediction, ns, t, z, image_embeds, caches, p, step_index)
+        return v_pred
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        """Run one denoise step for all requests in the batch."""
+        batch_v_preds: list[torch.Tensor] = []
+
+        for req_id in input_batch.req_ids:
+            extra = self._step_states.get(req_id)
+            if extra is None:
+                raise ValueError(f"No step state found for request {req_id}")
+
+            step_index = extra.get("_current_step_index", 0)
+            image_prediction = extra["_image_prediction"]
+
+            v_pred = self._step_denoise_single(image_prediction, step_index, extra)
+            batch_v_preds.append(v_pred)
+
+        return torch.cat(batch_v_preds, dim=0)
+
+    def step_scheduler(
+        self,
+        state: DiffusionRequestState,
+        noise_pred: torch.Tensor,
+        **kwargs: Any,
+    ) -> None:
+        """Apply flow-matching step update and advance step_index."""
+        extra = self._step_states.get(state.req_id)
+        if extra is None:
+            raise ValueError(f"No step state found for request {state.req_id}")
+
+        ns = extra["ns"]
+        p = extra["p"]
+        step_index = state.step_index
+        merge_size = ns.merge_size
+
+        t = ns.timesteps[step_index]
+        t_next = ns.timesteps[step_index + 1]
+
+        image_prediction = extra["_image_prediction"]
+        z = _patchify(image_prediction, self.patch_size * merge_size)
+        z = z + (t_next - t) * noise_pred
+        image_prediction = _unpatchify(z, self.patch_size * merge_size, p.image_size[1], p.image_size[0])
+
+        # Update latents in both the state and our internal cache
+        state.latents = image_prediction
+        extra["_image_prediction"] = image_prediction
+        extra["_current_step_index"] = step_index + 1
+
+        state.step_index += 1
+
+    def post_decode(
+        self,
+        state: DiffusionRequestState,
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        """Decode final latents into a PIL image."""
+        image_prediction = state.latents
+        images = _to_pil(image_prediction)
+        img = images[0] if images else None
+
+        think_text = state.extra.get("think_text", "")
+        custom: dict[str, Any] = {}
+        if think_text:
+            custom["think_text"] = think_text
+
+        # Cleanup KV caches and step state
+        caches = state.extra.get("caches", {})
+        for key in ("cond", "uncond", "img_cond"):
+            if key in caches and not isinstance(caches[key], dict):
+                clear_flash_kv_cache(caches[key])
+        self._step_states.pop(state.req_id, None)
+
+        return DiffusionOutput(output=img, custom_output=custom if custom else None)
 
     # -----------------------------------------------------------------------
     # Weight loading
