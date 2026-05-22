@@ -457,13 +457,19 @@ def convert(
             "rank": rank,
             "precision": precision,
             "act_unsigned": False,
-            # Empty: all `quant_config != None` linears in Z-Image (to_qkv,
-            # to_out.0, feed_forward.w13, feed_forward.w2) are present in
-            # the nunchaku checkpoint. Precision-sensitive linears
+            # `lm_head` covers Qwen3's text-encoder language-modeling
+            # head, which lives at the **top level** of `Qwen3ForCausalLM`
+            # — *not* under `model.*` — so it is not caught by the
+            # `"model": None` prefix rule above. Without this substring
+            # skip it falls through to SVDQuant and hits a tied-weight
+            # `data_ptr` error on the first forward (see vllm-omni
+            # diffusers_loader handling of Qwen3 text encoder).
+            #
+            # Other precision-sensitive Z-Image DiT linears
             # (cap_embedder, x_embedder, adaLN_modulation, t_embedder,
-            # FinalLayer.linear) already pass `quant_config=None` in the
-            # model class.
-            "modules_to_not_convert": [],
+            # FinalLayer.linear) already pass `quant_config=None` in
+            # the model class itself, so they need no entry here.
+            "modules_to_not_convert": ["lm_head"],
         },
     }
     out_config_path = transformer_dir / "config.json"
