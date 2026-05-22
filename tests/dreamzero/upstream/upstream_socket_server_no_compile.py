@@ -23,7 +23,7 @@ PyTorch SDPA (`ATTENTION_BACKEND=torch`) for this subprocess only.
 
 Usage:
     PYTHONPATH="${DREAMZERO_REPO}" \\
-      .venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=1 \\
+      .venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=2 \\
       tests/dreamzero/upstream/upstream_socket_server_no_compile.py --port 18081 \\
       --model_path "${DREAMZERO_REPO}/checkpoints/dreamzero"
 """
@@ -63,6 +63,7 @@ import socket_test_optimized_AR as upstream  # noqa: E402
 import tyro  # noqa: E402
 from groot.vla.model.dreamzero.modules import attention as upstream_attention  # noqa: E402
 from groot.vla.model.dreamzero.modules import wan2_1_submodule as upstream_submodule  # noqa: E402
+from groot.vla.model.dreamzero.modules import wan_video_dit as upstream_wan_video_dit  # noqa: E402
 
 
 def _torch_varlen_flash_attention(
@@ -97,6 +98,9 @@ def _torch_varlen_flash_attention(
 
 upstream_attention.flash_attention = _torch_varlen_flash_attention
 upstream_submodule.flash_attention = _torch_varlen_flash_attention
+upstream_wan_video_dit.FLASH_ATTN_3_AVAILABLE = False
+upstream_wan_video_dit.FLASH_ATTN_2_AVAILABLE = False
+upstream_wan_video_dit.SAGE_ATTN_AVAILABLE = False
 
 
 def main(args: upstream.Args) -> None:

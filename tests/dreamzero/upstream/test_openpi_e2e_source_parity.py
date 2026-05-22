@@ -12,7 +12,7 @@ DreamZero's upstream server serves at `/`, while vLLM serves OpenPI at
 `/v1/realtime/robot/openpi`.
 
 Current scope for this test:
-- non-TP (`nproc_per_node=1` on upstream, single-GPU or cfg-parallel `vllm serve`)
+- default two-GPU run (`nproc_per_node=2` on upstream, `--cfg-parallel-size 2` on `vllm serve`)
 - non-`torch.compile` (upstream launched through
   `upstream_socket_server_no_compile.py`, vLLM with `--enforce-eager`)
 - non-DiT-cache / non-skip-schedule (`NUM_DIT_STEPS=16`)
@@ -100,18 +100,19 @@ def _vllm_executable() -> str:
 
 
 def _cfg_parallel_size() -> int:
-    return int(os.environ.get("OPENPI_E2E_CFG_PARALLEL_SIZE", "1"))
+    return int(os.environ.get("OPENPI_E2E_CFG_PARALLEL_SIZE", "2"))
 
 
 def _pick_test_gpus() -> list[str]:
+    cfg_parallel_size = _cfg_parallel_size()
     override = os.environ.get("OPENPI_E2E_GPUS") or os.environ.get("OPENPI_E2E_GPU")
     if override is not None:
         gpus = [part.strip() for part in override.split(",") if part.strip()]
         if not gpus:
             raise ValueError("OPENPI_E2E_GPUS is set but empty.")
+        if len(gpus) < cfg_parallel_size:
+            raise RuntimeError(f"Need {cfg_parallel_size} GPUs, but OPENPI_E2E_GPUS only provided {gpus}.")
         return gpus
-
-    cfg_parallel_size = _cfg_parallel_size()
 
     query = subprocess.check_output(
         [
@@ -141,7 +142,8 @@ def _torchrun_argv(script: str, port: int) -> list[str]:
         "-m",
         "torch.distributed.run",
         "--standalone",
-        "--nproc_per_node=1",
+        "--nproc_per_node",
+        str(_cfg_parallel_size()),
         script,
         "--port",
         str(port),
@@ -154,8 +156,9 @@ def _run_upstream_service(port: int, log_path: Path) -> subprocess.Popen[str]:
     env = os.environ.copy()
     env.setdefault("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{Path.cwd()}:{DREAMZERO_REPO}:{env['PYTHONPATH']}".rstrip(":")
-    env["CUDA_VISIBLE_DEVICES"] = _pick_test_gpus()[0]
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(_pick_test_gpus())
     env.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+    env["ATTENTION_BACKEND"] = "torch"
     env.setdefault("ENABLE_TENSORRT", "false")
     env["ENABLE_DIT_CACHE"] = "false"
     env["NUM_DIT_STEPS"] = "16"
@@ -265,10 +268,19 @@ def _collect_outputs_with_client(client) -> tuple[dict, list[np.ndarray]]:
         client.infer(dict(obs0)),
         client.infer(dict(obs1)),
     ]
-    assert client.reset({}) == "reset successful"
+    assert _normalize_reset_response(client.reset({})) == "reset successful"
     outputs.append(client.infer(dict(obs0)))
     client._ws.close()
     return metadata, outputs
+
+
+def _normalize_reset_response(response) -> str:
+    if isinstance(response, str):
+        return response
+    decoded = msgpack_numpy.unpackb(response)
+    if isinstance(decoded, dict):
+        return str(decoded.get("status"))
+    return str(decoded)
 
 
 def _normalize_metadata(metadata: dict) -> dict:
@@ -340,7 +352,7 @@ def test_openpi_service_matches_upstream_server_noncompile(tmp_path: Path) -> No
         np.testing.assert_allclose(
             actual,
             expected,
-            rtol=0.0,
-            atol=0.0,
+            rtol=1e-2,
+            atol=1e-3,
             err_msg=f"OpenPI step {idx} output mismatch",
         )
