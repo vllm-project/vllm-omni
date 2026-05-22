@@ -150,6 +150,42 @@ def compute_lpips_video(
     return float(np.mean(scores))
 
 
+def _gpu_memory_gib(device_index: int = 0) -> float:
+    """Total GPU memory currently used on `device_index`, in GiB.
+
+    Uses `nvidia-smi` because vllm-omni spawns model workers in separate
+    processes; `torch.cuda.memory_allocated()` from the bench driver
+    process reports 0 since the workers hold the model in their own CUDA
+    contexts. `nvidia-smi`'s `memory.used` aggregates all processes on the
+    device, which on a single-GPU benchmark gives us the right number.
+
+    Returns 0.0 if nvidia-smi is unavailable or fails — callers should
+    treat 0.0 as "unknown" (the markdown summary guards against divide-
+    by-zero in the reduction column).
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("nvidia-smi"):
+        return 0.0
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={device_index}",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        return int(out.stdout.strip()) / 1024  # MiB -> GiB
+    except (subprocess.CalledProcessError, ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
 def _build_omni_kwargs(args, quantization=None, model_override=None):
     """Build kwargs dict for Omni() constructor.
 
@@ -183,19 +219,23 @@ def _build_omni_kwargs(args, quantization=None, model_override=None):
 def _generate_image(omni, args, prompt, seed):
     """Generate a single image; returns (PIL.Image, elapsed_s, peak_gib, weights_gib, activations_gib).
 
-    `weights_gib` is `memory_allocated()` snapshotted right before the
-    generate() call (everything the engine currently holds: model
-    parameters + any persistent buffers). `peak_gib` is the high-water
-    mark observed during generate(). `activations_gib` = peak - weights
-    (transient memory the diffusion loop needed on top of the model).
+    `weights_gib` is GPU memory snapshotted right before `generate()`
+    (the engine holds model params + persistent buffers; few transient
+    activations should be live). `peak_gib` is sampled right after
+    `generate()` returns — close to but not necessarily exactly the
+    high-water mark, since the diffusion loop may have freed temporary
+    buffers before returning. `activations_gib` = peak - weights.
+
+    Uses `nvidia-smi` instead of `torch.cuda.max_memory_allocated()` so
+    we capture the worker process's memory (vllm-omni runs the model in
+    a separate spawn-mode worker). See `_gpu_memory_gib`.
     """
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
     from vllm_omni.outputs import OmniRequestOutput
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-    weights_mem = torch.accelerator.memory_allocated() / (1024**3)
-    torch.accelerator.reset_peak_memory_stats()
+    weights_mem = _gpu_memory_gib()
     start = time.perf_counter()
     outputs = omni.generate(
         {"prompt": prompt},
@@ -207,7 +247,7 @@ def _generate_image(omni, args, prompt, seed):
         ),
     )
     elapsed = time.perf_counter() - start
-    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
+    peak_mem = _gpu_memory_gib()
     activations_mem = max(peak_mem - weights_mem, 0.0)
 
     req_out = OmniRequestOutput.unwrap_result(outputs)
@@ -227,8 +267,7 @@ def _generate_video(omni, args, prompt, seed):
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-    weights_mem = torch.accelerator.memory_allocated() / (1024**3)
-    torch.accelerator.reset_peak_memory_stats()
+    weights_mem = _gpu_memory_gib()
     start = time.perf_counter()
     outputs = omni.generate(
         {"prompt": prompt, "negative_prompt": ""},
@@ -242,7 +281,7 @@ def _generate_video(omni, args, prompt, seed):
         ),
     )
     elapsed = time.perf_counter() - start
-    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
+    peak_mem = _gpu_memory_gib()
     activations_mem = max(peak_mem - weights_mem, 0.0)
 
     first = outputs[0]
@@ -322,12 +361,13 @@ def run_benchmark(args):
 
     baseline_outputs = {}  # prompt -> (output, time, peak_mem, weights_mem, activations_mem)
     for prompt in prompts:
-        print(f"  Generating: {prompt[:60]}...")
+        print(f"  Generating: {prompt[:60]}...", flush=True)
         if is_video:
             out, t, mem, weights, acts = _generate_video(omni_bl, args, prompt, seed)
         else:
             out, t, mem, weights, acts = _generate_image(omni_bl, args, prompt, seed)
         baseline_outputs[prompt] = (out, t, mem, weights, acts)
+        print(f"    -> {t:.2f}s  weights={weights:.2f}GiB peak={mem:.2f}GiB", flush=True)
 
     bl_avg_time = np.mean([v[1] for v in baseline_outputs.values()])
     # First prompt's memory snapshot is canonical (matches PR #1470 convention).
@@ -367,12 +407,13 @@ def run_benchmark(args):
 
         qt_outputs = {}
         for prompt in prompts:
-            print(f"  Generating: {prompt[:60]}...")
+            print(f"  Generating: {prompt[:60]}...", flush=True)
             if is_video:
                 out, t, mem, weights, acts = _generate_video(omni_qt, args, prompt, seed)
             else:
                 out, t, mem, weights, acts = _generate_image(omni_qt, args, prompt, seed)
             qt_outputs[prompt] = (out, t, mem, weights, acts)
+            print(f"    -> {t:.2f}s  weights={weights:.2f}GiB peak={mem:.2f}GiB", flush=True)
 
         qt_avg_time = np.mean([v[1] for v in qt_outputs.values()])
         qt_mem = qt_outputs[prompts[0]][2]
@@ -407,7 +448,7 @@ def run_benchmark(args):
 
         mean_lpips = np.mean([p["lpips"] for p in per_prompt])
         speedup = bl_avg_time / qt_avg_time if qt_avg_time > 0 else float("inf")
-        mem_reduction = (bl_mem - qt_mem) / bl_mem * 100
+        mem_reduction = (bl_mem - qt_mem) / bl_mem * 100 if bl_mem > 0 else 0.0
 
         all_results.append(
             {
