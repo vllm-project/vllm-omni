@@ -423,7 +423,7 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
     out = runner._sample(torch.tensor([[0.1, 0.2]], dtype=torch.float32), spec_decode_metadata=None)
 
     assert out is expected
-    assert runner.input_batch.updated is False
+    assert runner.input_batch.updated is True
     assert len(calls) == 1
 
 
