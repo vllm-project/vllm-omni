@@ -170,3 +170,8 @@ class ImageGenerationResponse(BaseModel):
     data: list[ImageData] = Field(..., description="Array of generated images")
     output_format: str = Field(None, description="The output format of the image generation")
     size: str = Field(None, description="The size of the image generated")
+    cot_output: str | None = Field(
+        None,
+        description="Chain-of-thought text output from the AR stage. "
+                    "Only present for image editing (IT2I) with CoT-enabled models."
+    )
