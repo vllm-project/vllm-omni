@@ -31,8 +31,8 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.dreamzero.modeling.causal_wan_model import CausalWanModel
-from vllm_omni.diffusion.models.dreamzero.modeling.image_encoder import DreamZeroImageEncoder
+from vllm_omni.diffusion.models.dreamzero.causal_wan_model import CausalWanModel
+from vllm_omni.diffusion.models.dreamzero.image_encoder import DreamZeroImageEncoder
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
 from vllm_omni.diffusion.models.dreamzero.transform import (
     DEFAULT_EMBODIMENT,

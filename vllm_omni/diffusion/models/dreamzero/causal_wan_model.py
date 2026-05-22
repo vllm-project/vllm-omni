@@ -31,7 +31,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.models.dreamzero.modeling.action_encoder import (
+from vllm_omni.diffusion.models.dreamzero.action_encoder import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
