@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 import diffusers
 import torch
 from PIL import Image
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -592,6 +592,9 @@ class OmniDiffusionConfig:
 
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
+
+    # Supplementary model specific parameters
+    extras: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def is_moe(self) -> bool:
