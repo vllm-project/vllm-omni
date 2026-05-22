@@ -53,6 +53,20 @@ Multiple quantization methods:
         --height 1024 --width 1024 \
         --num-inference-steps 50 --seed 42
 
+Offline-quantized checkpoint (SVDQuant / MXFP8 offline / ModelOpt FP4 etc.):
+    Use `--baseline-model` for the BF16 reference and `--quantization auto`
+    so the quantized run honors the on-disk `transformer/config.json
+    ["quantization_config"]` instead of overriding it.
+
+    python benchmarks/diffusion/quantization_quality.py \
+        --baseline-model Tongyi-MAI/Z-Image-Turbo \
+        --model ultranationalism/Z-Image-Turbo-SVDQuant-NVFP4 \
+        --task t2i \
+        --quantization auto \
+        --prompts "a cup of coffee on a wooden table, morning light" \
+        --height 1024 --width 1024 \
+        --num-inference-steps 20 --seed 42
+
 Output directory structure (--output-dir, default: ./quant_bench_output):
     quant_bench_output/
         baseline/           # BF16 outputs
@@ -136,8 +150,19 @@ def compute_lpips_video(
     return float(np.mean(scores))
 
 
-def _build_omni_kwargs(args, quantization=None):
-    """Build kwargs dict for Omni() constructor."""
+def _build_omni_kwargs(args, quantization=None, model_override=None):
+    """Build kwargs dict for Omni() constructor.
+
+    `model_override` lets the baseline and quantized runs target different
+    on-disk paths (offline-quantized checkpoints like SVDQuant ship their
+    own pipeline tree separate from the BF16 reference model).
+
+    `quantization="auto"` is a sentinel meaning "do not pass
+    `quantization_config` to Omni; let the on-disk
+    `transformer/config.json["quantization_config"]` drive the choice".
+    Useful for offline-quantized checkpoints where the method + per-layer
+    skip list are baked into the config file.
+    """
     from vllm_omni.diffusion.data import DiffusionParallelConfig
 
     parallel_config = DiffusionParallelConfig(
@@ -146,11 +171,11 @@ def _build_omni_kwargs(args, quantization=None):
         tensor_parallel_size=args.tensor_parallel_size,
     )
     kwargs = {
-        "model": args.model,
+        "model": model_override if model_override is not None else args.model,
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
     }
-    if quantization:
+    if quantization and quantization != "auto":
         kwargs["quantization_config"] = quantization
     return kwargs
 
@@ -288,7 +313,11 @@ def run_benchmark(args):
     print("\n" + "=" * 60)
     print("Running BF16 baseline...")
     print("=" * 60)
-    bl_kwargs = _build_omni_kwargs(args, quantization=None)
+    # `--baseline-model` lets offline-quantized methods (SVDQuant etc.)
+    # point the baseline at a separate BF16 pipeline tree, while `--model`
+    # points at the quantized checkpoint.
+    baseline_model = getattr(args, "baseline_model", None) or args.model
+    bl_kwargs = _build_omni_kwargs(args, quantization=None, model_override=baseline_model)
     omni_bl = Omni(**bl_kwargs)
 
     baseline_outputs = {}  # prompt -> (output, time, peak_mem, weights_mem, activations_mem)
@@ -491,6 +520,16 @@ def parse_args():
     )
     parser.add_argument("--model", required=True, help="Model name or local path.")
     parser.add_argument(
+        "--baseline-model",
+        default=None,
+        help=(
+            "Optional BF16 model path/name for the baseline run. Defaults to "
+            "`--model`. Use this when the quantized checkpoint is a separate "
+            "on-disk pipeline tree (e.g. SVDQuant, MXFP8 offline) rather than "
+            "an online-quantized variant of the same model."
+        ),
+    )
+    parser.add_argument(
         "--task",
         default="t2i",
         choices=["t2i", "t2v"],
@@ -500,7 +539,13 @@ def parse_args():
         "--quantization",
         nargs="+",
         required=True,
-        help="One or more quantization methods to benchmark (e.g. fp8 int8 bitsandbytes).",
+        help=(
+            "One or more quantization methods to benchmark (e.g. fp8 int8 "
+            "bitsandbytes). Use the sentinel `auto` for offline-quantized "
+            "checkpoints (SVDQuant etc.) where the method + per-layer skip "
+            "list are baked into `transformer/config.json[\"quantization_config\"]` "
+            "— the bench will not override it and the on-disk config drives the run."
+        ),
     )
     parser.add_argument(
         "--prompts",
