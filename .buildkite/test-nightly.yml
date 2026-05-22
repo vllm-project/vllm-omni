@@ -1196,7 +1196,7 @@ steps:
       - nightly-diffusion-x2iat-performance-qwen-image-layered
       - nightly-diffusion-x2v-performance
       - nightly-testcase-statistics
-    if: build.env("NIGHTLY") == "1"
+    if: build.env("NIGHTLY") == "1" && build.env("EMAIL_DISTRIBUTION") == "1"
     commands:
       - pip install openpyxl
       - export DEFAULT_INPUT_DIR=tests/dfx/perf/results
