@@ -3,9 +3,10 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    split_routed_experts,
-)
+
+# from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+#     split_routed_experts,
+# )
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
