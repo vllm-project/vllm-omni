@@ -92,82 +92,87 @@ QUANT_FP8_ENV = "HUNYUAN_IMAGE3_FP8_MODEL"
 QUANT_NVFP4_ENV = "HUNYUAN_IMAGE3_NVFP4_MODEL"
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 # fmt: off
-_BASE_CONFIG = {
-    "stage_args": [
+_DEPLOY_CONFIG = {
+    "pipeline": "hunyuan_image_3_moe",
+    "async_chunk": False,
+    "trust_remote_code": True,
+    "connectors": {
+        "shared_memory_connector": {
+            "name": "SharedMemoryConnector",
+            "extra": {"shm_threshold_bytes": 65536},
+        },
+    },
+    "stages": [
         {
-            "stage_id": 0, "stage_type": "llm",
-            "runtime": {"process": True, "devices": AR_DEVICES, "max_batch_size": 1, "requires_multimodal_data": True},
-            "engine_args": {
-                "model_stage": "AR", "model_arch": "HunyuanImage3ForCausalMM",
-                "worker_cls": "vllm_omni.worker.gpu_ar_worker.GPUARWorker",
-                "scheduler_cls": "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler",
-                "gpu_memory_utilization": 0.95, "enforce_eager": True, "trust_remote_code": True,
-                "engine_output_type": "latent", "enable_prefix_caching": False,
-                "max_num_batched_tokens": 32768, "tensor_parallel_size": AR_TP_SIZE, "pipeline_parallel_size": 1,
-                "hf_overrides": {"rope_parameters": {"mrope_section": [0, 32, 32], "rope_type": "default"}},
-            },
-            "is_comprehension": False, "final_output": True, "final_output_type": "text",
-            "default_sampling_params": {
-                "temperature": 0.0, "top_p": 1, "top_k": -1, "max_tokens": 8192,
-                "stop_token_ids": [128025], "detokenize": True, "skip_special_tokens": False,
+            "stage_id": 0,
+            "is_comprehension": False,
+            "final_output": True,
+            "final_output_type": "text",
+            "max_num_seqs": 1,
+            "gpu_memory_utilization": 0.95,
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "max_num_batched_tokens": 32768,
+            "devices": AR_DEVICES,
+            "tensor_parallel_size": AR_TP_SIZE,
+            "hf_overrides": {
+                "rope_parameters": {"mrope_section": [0, 32, 32], "rope_type": "default"},
             },
             "output_connectors": {"to_stage_1": "shared_memory_connector"},
+            "default_sampling_params": {
+                "temperature": 0.0,
+                "top_p": 1,
+                "top_k": -1,
+                "max_tokens": 8192,
+                "stop_token_ids": [128025],
+                "detokenize": True,
+                "skip_special_tokens": False,
+            },
         },
         {
-            "stage_id": 1, "stage_type": "diffusion",
-            "runtime": {"process": True, "devices": DIT_DEVICES, "max_batch_size": 1, "requires_multimodal_data": True},
-            "engine_args": {
-                "model_stage": "dit", "model_arch": "HunyuanImage3ForCausalMM",
-                "enforce_eager": True, "trust_remote_code": True, "distributed_executor_backend": "mp",
-                "parallel_config": {"tensor_parallel_size": DIT_TP_SIZE, "enable_expert_parallel": True},
-            },
-            "engine_input_source": [0],
-            "custom_process_input_func": "vllm_omni.model_executor.stage_input_processors.hunyuan_image3.ar2diffusion",
-            "final_output": True, "final_output_type": "image",
-            "default_sampling_params": {"num_inference_steps": NUM_INFERENCE_STEPS, "guidance_scale": GUIDANCE_SCALE},
+            "stage_id": 1,
+            "max_num_seqs": 1,
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "devices": DIT_DEVICES,
+            "distributed_executor_backend": "mp",
+            "parallel_config": {"tensor_parallel_size": DIT_TP_SIZE, "enable_expert_parallel": True},
             "input_connectors": {"from_stage_0": "shared_memory_connector"},
+            "default_sampling_params": {
+                "num_inference_steps": NUM_INFERENCE_STEPS,
+                "guidance_scale": GUIDANCE_SCALE,
+            },
         },
     ],
-    "runtime": {
-        "enabled": True,
-        "connectors": {"shared_memory_connector": {
-            "name": "SharedMemoryConnector",
-            "extra": {"shm_threshold_bytes": 65536}
-        }},
-        "edges": [{"from": 0, "to": 1}],
-    },
+    "edges": [{"from": 0, "to": 1}],
 }
 # fmt: on
 
 _QUANT_DIT_CONFIG = {
-    "stage_args": [
+    "pipeline": "hunyuan_image_3_moe",
+    "async_chunk": False,
+    "trust_remote_code": True,
+    "stages": [
         {
             "stage_id": 0,
-            "stage_type": "diffusion",
-            "runtime": {
-                "devices": "0,1",
-                "max_batch_size": 1,
+            "model_stage": "dit",
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "devices": "0,1",
+            "distributed_executor_backend": "mp",
+            "force_cutlass_fp8": True,
+            "moe_backend": "cutlass",
+            "parallel_config": {
+                "tensor_parallel_size": 2,
+                "enable_expert_parallel": True,
             },
-            "engine_args": {
-                "model_stage": "dit",
-                "enforce_eager": True,
-                "trust_remote_code": True,
-                "distributed_executor_backend": "mp",
-                "force_cutlass_fp8": True,
-                "moe_backend": "cutlass",
-                "parallel_config": {
-                    "tensor_parallel_size": 2,
-                    "enable_expert_parallel": True,
-                },
-                "omni_kv_config": {"need_recv_cache": True},
-            },
+            "omni_kv_config": {"need_recv_cache": True},
             "final_output": True,
             "final_output_type": "image",
             "is_comprehension": False,
             "default_sampling_params": {"seed": SEED},
         }
     ],
-    "runtime": {"enabled": True},
 }
 
 
@@ -211,9 +216,9 @@ COT_REF = ("首先，我分析所有输入图像：图像1是一个圆形的logo
 
 
 def _make_config(enable_kv_reuse: bool, path: Path) -> None:
-    config = copy.deepcopy(_BASE_CONFIG)
-    config["stage_args"][0]["engine_args"]["omni_kv_config"] = {"need_send_cache": enable_kv_reuse}
-    config["stage_args"][1]["engine_args"]["omni_kv_config"] = {"need_recv_cache": enable_kv_reuse}
+    config = copy.deepcopy(_DEPLOY_CONFIG)
+    config["stages"][0]["omni_kv_config"] = {"need_send_cache": enable_kv_reuse}
+    config["stages"][1]["omni_kv_config"] = {"need_recv_cache": enable_kv_reuse}
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
@@ -227,12 +232,12 @@ def _quant_tensor_parallel_size() -> int:
 
 def _make_quant_dit_config(path: Path) -> None:
     config = copy.deepcopy(_QUANT_DIT_CONFIG)
-    config["stage_args"][0]["runtime"]["devices"] = _quant_devices()
-    config["stage_args"][0]["engine_args"]["parallel_config"]["tensor_parallel_size"] = _quant_tensor_parallel_size()
+    config["stages"][0]["devices"] = _quant_devices()
+    config["stages"][0]["parallel_config"]["tensor_parallel_size"] = _quant_tensor_parallel_size()
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
-def _run_offline(stage_configs_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
     from transformers import AutoTokenizer
 
     from tests.helpers.runtime import OmniRunner
@@ -251,7 +256,7 @@ def _run_offline(stage_configs_path: str, output_path: Path) -> tuple[Image.Imag
     system_prompt_type = result.system_prompt_type
 
     ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
-    with OmniRunner(MODEL_PATH, stage_configs_path=stage_configs_path) as runner:
+    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path) as runner:
         params_list = list(runner.omni.default_sampling_params_list)
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
@@ -324,7 +329,7 @@ def _extract_image(outputs) -> Image.Image:
 
 def _run_dit_model(
     model: str,
-    stage_config_path: str,
+    deploy_config_path: str,
     output_path: Path,
     *,
     nvfp4_backend: str | None = None,
@@ -338,7 +343,7 @@ def _run_dit_model(
         os.environ["VLLM_NVFP4_GEMM_BACKEND"] = nvfp4_backend
 
     try:
-        with OmniRunner(model, stage_configs_path=stage_config_path, mode="text-to-image") as runner:
+        with OmniRunner(model, deploy_config=deploy_config_path, mode="text-to-image") as runner:
             generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
             params = OmniDiffusionSamplingParams(
                 height=QUANT_HEIGHT,
@@ -426,17 +431,17 @@ def test_quantized_dit_matches_bf16_accuracy(
     quant_model = os.environ[case.model_env]
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        stage_config_path = Path(tmpdir) / "hunyuan_image3_quant_dit.yaml"
-        _make_quant_dit_config(stage_config_path)
+        deploy_config_path = Path(tmpdir) / "hunyuan_image3_quant_dit.yaml"
+        _make_quant_dit_config(deploy_config_path)
 
         bf16_image, bf16_time = _run_dit_model(
             bf16_model,
-            str(stage_config_path),
+            str(deploy_config_path),
             output_dir / "bf16.png",
         )
         quant_image, quant_time = _run_dit_model(
             quant_model,
-            str(stage_config_path),
+            str(deploy_config_path),
             output_dir / f"{case.name}.png",
             nvfp4_backend=case.nvfp4_backend,
         )
