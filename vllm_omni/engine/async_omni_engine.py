@@ -1950,6 +1950,10 @@ class AsyncOmniEngine:
             "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
+            "extras": {
+                "auxiliary_text_encoder": kwargs.get("auxiliary_text_encoder", None),
+                "default_llama_model_id": kwargs.get("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
+            },
             **(
                 {
                     "profiler_config": asdict(kwargs["profiler_config"])
