@@ -1413,7 +1413,7 @@ def enable_cache_for_helios(pipeline: Any, cache_config: Any) -> Callable[[int],
             params_modifiers=[
                 ParamsModifier(cache_config=db_cache_config, calibrator_config=calibrator_config),
             ],
-            has_separate_cfg=False,
+            has_separate_cfg=True,
         ),
         cache_config=db_cache_config,
         calibrator_config=calibrator_config,
@@ -1505,7 +1505,6 @@ CUSTOM_DIT_ENABLERS.update(
     {
         "Wan22Pipeline": enable_cache_for_wan22,
         "Wan22I2VPipeline": enable_cache_for_wan22,
-        "Wan22TI2VPipeline": enable_cache_for_wan22,
         "HunyuanImage3Pipeline": enable_cache_for_hunyuan_image3,
         "FluxPipeline": enable_cache_for_flux,
         "Flux2KleinPipeline": enable_cache_for_flux2_klein,

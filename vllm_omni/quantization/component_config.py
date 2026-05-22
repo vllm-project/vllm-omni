@@ -23,10 +23,10 @@ if TYPE_CHECKING:
     )
 
 
-# Pre-quantized checkpoints (modelopt FP8/FP4/MXFP8) only quantize the
+# Pre-quantized checkpoints (modelopt FP8/FP4/MXFP8/mixed) only quantize the
 # Thinker LM.  Vision and audio encoder weights remain in BF16 with no
 # corresponding scale tensors in the checkpoint.
-PRE_QUANTIZED_METHODS: frozenset[str] = frozenset({"modelopt", "modelopt_fp4", "modelopt_mxfp8"})
+PRE_QUANTIZED_METHODS: frozenset[str] = frozenset({"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed"})
 
 
 def resolve_encoder_quant_config(

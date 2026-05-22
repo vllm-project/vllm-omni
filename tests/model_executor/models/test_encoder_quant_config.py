@@ -58,7 +58,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("method", sorted(PRE_QUANTIZED_METHODS))
 def test_pre_quantized_returns_none(method: str) -> None:
     """visual_quant_config and audio_quant_config must be None for
-    pre-quantized methods (modelopt, modelopt_fp4, modelopt_mxfp8)."""
+    pre-quantized methods (modelopt, modelopt_fp4, modelopt_mxfp8,
+    modelopt_mixed)."""
     mock_config = MagicMock()
     mock_config.get_name.return_value = method
 
@@ -100,5 +101,5 @@ def test_component_config_passed_through() -> None:
 
 def test_pre_quantized_methods_contains_expected() -> None:
     """Guard against accidental removal of a known pre-quantized method."""
-    expected = {"modelopt", "modelopt_fp4", "modelopt_mxfp8"}
+    expected = {"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed"}
     assert PRE_QUANTIZED_METHODS == expected

@@ -1,6 +1,8 @@
 # HunyuanImage-3.0-Instruct
 
-> DiT-only text-to-image serving and benchmark
+> DiT-only text-to-image serving and benchmark with FP8, tensor parallelism,
+> sequence parallelism, CFG parallelism, and ModelOpt mixed FP8/NVFP4
+> checkpoints.
 
 ## Summary
 
@@ -16,13 +18,15 @@ Use this recipe when you want to run or benchmark the HunyuanImage-3.0 DiT
 stage directly. This is the recommended first setup when validating DiT
 throughput, memory, FP8 kernels, sequence parallelism, or CFG parallelism.
 
-The recipe covers three 4-GPU configurations:
+The recipe covers three 4-GPU FP8 configurations and one 2-GPU ModelOpt mixed
+FP8/NVFP4 configuration:
 
 | Configuration | Parallelism | Notes |
 | --- | --- | --- |
 | `tp4_fp8` | TP=4 | Lowest per-GPU memory, higher communication overhead |
 | `tp2_fp8_sp2` | TP=2, SP=2, Ulysses=2 | Splits sequence work across two GPUs per TP group |
 | `tp2_fp8_cfgp2` | TP=2, CFG=2 | Runs CFG branches in parallel; fastest validated DiT setup |
+| `tp2_mixed_fp8_nvfp4` | TP=2, EP enabled | Uses FP8 dense layers and NVFP4 routed experts on B200 |
 
 ## References
 
@@ -222,3 +226,127 @@ of:
 - If you see OOM on 80GB GPUs, reduce image size, request concurrency, or use
   the TP=4 configuration before increasing batch size. GPU memory utilization
   is not a useful primary tuning knob for this DiT-only recipe.
+
+### 2x B200 ModelOpt mixed FP8/NVFP4
+
+#### Environment
+
+- OS: Linux
+- Python: 3.12
+- Driver / runtime: NVIDIA CUDA environment with two B200 GPUs
+- vLLM version: Match the vLLM-Omni checkout used for deployment
+- vLLM-Omni version or commit: Use the commit that contains ModelOpt mixed
+  FP8/NVFP4 checkpoint loading for diffusion models
+
+#### Command
+
+This configuration uses a pre-quantized ModelOpt mixed checkpoint for the
+HunyuanImage-3.0 DiT stage. Dense attention and shared dense projections use
+FP8, while routed MoE expert projections use NVFP4. Embeddings, norms,
+routers, output layers, and non-DiT components stay in BF16.
+
+Validated checkpoint:
+
+```text
+feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8
+```
+
+Start the server with CUTLASS selected from the CLI for quantized linear and
+MoE kernels:
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3 \
+vllm serve feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8 \
+  --omni \
+  --host 0.0.0.0 \
+  --port 8091 \
+  --trust-remote-code \
+  --tensor-parallel-size 2 \
+  --enable-expert-parallel \
+  --linear-backend cutlass \
+  --moe-backend cutlass \
+  --force-cutlass-fp8
+```
+
+#### Verification
+
+Run a direct image generation request after the server is ready:
+
+```bash
+curl -s http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8",
+    "messages": [
+      {"role": "user", "content": "A cinematic portrait of an Adeptus Custodes warrior standing on Terra before the Imperial Palace, ornate golden armor, guardian spear, crimson cloak, marble steps, gothic architecture, holy golden light, highly detailed, no text, no watermark"}
+    ],
+    "extra_body": {
+      "height": 1024,
+      "width": 1024,
+      "num_inference_steps": 20,
+      "guidance_scale": 4.0,
+      "true_cfg_scale": 4.0,
+      "seed": 48
+    }
+  }' | jq -r '.choices[0].message.content[0].image_url.url' \
+     | cut -d',' -f2- \
+     | base64 -d > hunyuan_image3_mixed_nvfp4.png
+```
+
+Check that:
+
+- The server responds on `http://localhost:8091/health`.
+- The response contains one generated image.
+- Logs show CUTLASS selection for ModelOpt FP8 dense layers and ModelOpt
+  NVFP4 routed expert layers.
+
+#### Benchmark
+
+The numbers below are online HTTP measurements with 16 concurrent requests.
+Each case serves 100 image-generation requests on the same 2-GPU B200 setup.
+
+```text
+Hardware: 2x B200
+Tensor parallel size: 2
+Requests: 100
+Concurrency: 16
+Resolution: 1024x1024
+Denoising steps: 20
+```
+
+| Config | Mean | P90 | P99 | Peak VRAM |
+| --- | ---: | ---: | ---: | ---: |
+| BF16 | 70.729s | 77.716s | 77.758s | 191,920 MiB |
+| ModelOpt FP8 | 58.603s | 64.435s | 64.469s | 115,816 MiB |
+| Mixed FP8/NVFP4 | 54.739s | 60.244s | 60.317s | 83,560 MiB |
+
+#### Accuracy
+
+Run the HunyuanImage-3.0 quantized DiT accuracy check with the BF16, FP8, and
+mixed FP8/NVFP4 checkpoints:
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3 \
+HUNYUAN_IMAGE3_QUANT_DEVICES=0,1 \
+HUNYUAN_IMAGE3_QUANT_TP=2 \
+HUNYUAN_IMAGE3_BF16_MODEL=/path/to/hunyuan-image3-bf16 \
+HUNYUAN_IMAGE3_FP8_MODEL=/path/to/hunyuan-image3-modelopt-fp8 \
+HUNYUAN_IMAGE3_NVFP4_MODEL=/path/to/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8 \
+PYTHONPATH=/path/to/vllm-omni:/path/to/vllm:${PYTHONPATH:-} \
+python -m pytest -s -v \
+  tests/e2e/accuracy/test_hunyuan_image3.py \
+  -k quantized_dit_matches_bf16_accuracy
+```
+
+The test compares quantized images with the BF16 image using CLIP-based image
+and text scores, plus structural SSIM / PSNR checks. The current structural
+thresholds are `SSIM >= 0.20` and `PSNR >= 10.0`.
+
+#### Notes
+
+- Use `--linear-backend cutlass` to select the validated quantized linear
+  backend from the CLI.
+- Use `--moe-backend cutlass` for the routed expert path.
+- `--force-cutlass-fp8` keeps the FP8 dense layers on the CUTLASS FP8 path.
+- The benchmark table is an online HTTP concurrency-16 result; do not compare
+  it directly with loaded-once request-level benchmarks.

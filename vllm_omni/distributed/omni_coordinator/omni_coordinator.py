@@ -11,22 +11,22 @@ from typing import Any
 
 import zmq
 
-from .messages import InstanceEvent, InstanceInfo, InstanceList, StageStatus
+from .messages import ReplicaEvent, ReplicaInfo, ReplicaList, ReplicaStatus
 
 logger = logging.getLogger(__name__)
 
 
 class OmniCoordinator:
-    """Coordinator for stage instances and hub clients.
+    """Coordinator for stage replicas and hub clients.
 
-    This service receives instance events from :class:`OmniCoordClientForStage`
-    via a ZMQ ROUTER socket and publishes active instance lists to
+    This service receives replica events from :class:`OmniCoordClientForStage`
+    via a ZMQ ROUTER socket and publishes active replica lists to
     :class:`OmniCoordClientForHub` via a PUB socket.
 
-    The coordinator maintains an in-memory registry of all known instances,
+    The coordinator maintains an in-memory registry of all known replicas,
     including their status, queue length, and heartbeat timestamps. A
     background thread periodically checks for heartbeat timeouts and marks
-    unhealthy instances as ``StageStatus.ERROR``.
+    unhealthy replicas as ``ReplicaStatus.ERROR``.
     """
 
     def __init__(
@@ -40,7 +40,7 @@ class OmniCoordinator:
         Args:
             router_zmq_addr: ZMQ address to bind the ROUTER socket.
             pub_zmq_addr: ZMQ address to bind the PUB socket.
-            heartbeat_timeout: Seconds before an instance is considered
+            heartbeat_timeout: Seconds before a replica is considered
                 unhealthy if no heartbeat / update is received.
         """
         self._router_zmq_addr = router_zmq_addr
@@ -55,7 +55,7 @@ class OmniCoordinator:
         self._pub = self._ctx.socket(zmq.PUB)
         self._pub.bind(self._pub_zmq_addr)
 
-        self._instances: dict[str, InstanceInfo] = {}
+        self._replicas: dict[str, ReplicaInfo] = {}
         self._lock = threading.Lock()
         self._pub_lock = threading.Lock()
 
@@ -75,43 +75,43 @@ class OmniCoordinator:
         self._periodic_thread = threading.Thread(target=self._periodic_loop, daemon=True)
         self._periodic_thread.start()
 
-    def get_active_instances(self) -> InstanceList:
-        """Return an :class:`InstanceList` of active (UP) instances only."""
+    def get_active_replicas(self) -> ReplicaList:
+        """Return a :class:`ReplicaList` of active (UP) replicas only."""
         with self._lock:
-            active = [inst for inst in self._instances.values() if inst.status == StageStatus.UP]
-        return InstanceList(instances=active, timestamp=time())
+            active = [rep for rep in self._replicas.values() if rep.status == ReplicaStatus.UP]
+        return ReplicaList(replicas=active, timestamp=time())
 
-    def add_new_instance(self, event: InstanceEvent) -> None:
-        """Add a new instance based on an incoming event."""
+    def add_new_replica(self, event: ReplicaEvent) -> None:
+        """Add a new replica based on an incoming event."""
         with self._lock:
-            self._add_new_instance_locked(event)
+            self._add_new_replica_locked(event)
         self._schedule_broadcast()
 
-    def update_instance_info(self, event: InstanceEvent) -> None:
-        """Update an existing instance based on an incoming event."""
+    def update_replica_info(self, event: ReplicaEvent) -> None:
+        """Update an existing replica based on an incoming event."""
         with self._lock:
-            self._update_instance_info_locked(event)
+            self._update_replica_info_locked(event)
         self._schedule_broadcast()
 
-    def remove_instance(self, event: InstanceEvent) -> None:
-        """Mark an instance as removed / down based on an incoming event.
+    def remove_replica(self, event: ReplicaEvent) -> None:
+        """Mark a replica as removed / down based on an incoming event.
 
-        This marks the instance's status as DOWN or ERROR (depending on the
+        This marks the replica's status as DOWN or ERROR (depending on the
         event) but keeps it in the internal registry. It is removed from the
-        *active* instance list published to hubs.
+        *active* replica list published to hubs.
         """
         with self._lock:
-            self._remove_instance_locked(event)
+            self._remove_replica_locked(event)
         self._schedule_broadcast()
 
-    def publish_instance_list_update(self) -> bool:
-        """Publish the current active instance list to all subscribers.
+    def publish_replica_list_update(self) -> bool:
+        """Publish the current active replica list to all subscribers.
 
         Returns:
             True if the PUB send succeeded, False if it was dropped (e.g.
             socket not ready when using ``zmq.NOBLOCK``).
         """
-        active_list = self.get_active_instances()
+        active_list = self.get_active_replicas()
         payload = asdict(active_list)
         data = json.dumps(payload).encode("utf-8")
 
@@ -133,12 +133,12 @@ class OmniCoordinator:
         with self._pending_lock:
             self._pending_broadcast = True
 
-    def _mark_instance_error_locked(self, info: InstanceInfo) -> None:
-        """Mark instance as ERROR (e.g. after heartbeat timeout)."""
-        info.status = StageStatus.ERROR
+    def _mark_replica_error_locked(self, info: ReplicaInfo) -> None:
+        """Mark replica as ERROR (e.g. after heartbeat timeout)."""
+        info.status = ReplicaStatus.ERROR
 
     def _check_heartbeat_timeouts(self) -> None:
-        """Mark instances as ERROR if their heartbeat has timed out."""
+        """Mark replicas as ERROR if their heartbeat has timed out."""
         now = time()
         timed_out = False
         gc_ttl = 600.0  # 10 minutes
@@ -146,17 +146,17 @@ class OmniCoordinator:
         with self._lock:
             to_delete: list[str] = []
 
-            for input_addr, info in self._instances.items():
-                if info.status == StageStatus.UP and now - info.last_heartbeat > self._heartbeat_timeout:
-                    self._mark_instance_error_locked(info)
+            for input_addr, info in self._replicas.items():
+                if info.status == ReplicaStatus.UP and now - info.last_heartbeat > self._heartbeat_timeout:
+                    self._mark_replica_error_locked(info)
                     timed_out = True
-                elif info.status in (StageStatus.DOWN, StageStatus.ERROR) and now - info.last_heartbeat > gc_ttl:
+                elif info.status in (ReplicaStatus.DOWN, ReplicaStatus.ERROR) and now - info.last_heartbeat > gc_ttl:
                     to_delete.append(input_addr)
 
             for input_addr in to_delete:
-                del self._instances[input_addr]
+                del self._replicas[input_addr]
         if timed_out:
-            # Instance liveness changed; request broadcast.
+            # Replica liveness changed; request broadcast.
             self._schedule_broadcast()
 
     def close(self) -> None:
@@ -187,22 +187,22 @@ class OmniCoordinator:
         except zmq.ZMQError:
             pass
 
-    def _parse_instance_event(self, data: dict[str, Any]) -> InstanceEvent | None:
-        """Parse wire payload dict into InstanceEvent. Returns None if invalid."""
+    def _parse_replica_event(self, data: dict[str, Any]) -> ReplicaEvent | None:
+        """Parse wire payload dict into ReplicaEvent. Returns None if invalid."""
         try:
-            return InstanceEvent(
+            return ReplicaEvent(
                 input_addr=str(data["input_addr"]),
                 output_addr=str(data["output_addr"]),
                 stage_id=int(data["stage_id"]),
                 event_type=str(data["event_type"]),
-                status=StageStatus(data.get("status")),
+                status=ReplicaStatus(data.get("status")),
                 queue_length=data.get("queue_length"),
             )
         except (KeyError, ValueError, TypeError):
             return None
 
     def _recv_loop(self) -> None:
-        """Background loop that receives and processes instance events."""
+        """Background loop that receives and processes replica events."""
         while self._running:
             try:
                 frames = self._router.recv_multipart()
@@ -219,12 +219,12 @@ class OmniCoordinator:
             payload = frames[-1]
             try:
                 data = json.loads(payload.decode("utf-8"))
-                event = self._parse_instance_event(data)
+                event = self._parse_replica_event(data)
             except json.JSONDecodeError as e:
-                logger.warning("Invalid JSON in instance event, dropping: %s", e)
+                logger.warning("Invalid JSON in replica event, dropping: %s", e)
                 continue
             if event is None:
-                logger.warning("Malformed instance event, dropping")
+                logger.warning("Malformed replica event, dropping")
                 continue
 
             self._handle_event(event)
@@ -234,7 +234,10 @@ class OmniCoordinator:
 
         Heartbeat timeouts are checked on their original cadence, while all
         broadcast requests are coalesced and flushed at most once per
-        ``_publish_min_interval``.
+        ``_publish_min_interval``. The heartbeat-check tick also schedules a
+        keepalive broadcast so late-joining hubs (which miss any PUB sends
+        that happened before their SUB connected) catch up within at most
+        ``heartbeat_interval`` seconds.
         """
         heartbeat_interval = max(1.0, min(self._heartbeat_timeout / 2.0, 5.0))
         loop_interval = self._publish_min_interval
@@ -245,6 +248,13 @@ class OmniCoordinator:
 
             if now - last_heartbeat_check >= heartbeat_interval:
                 self._check_heartbeat_timeouts()
+                # Keepalive broadcast: ZMQ PUB doesn't queue for late
+                # subscribers, so an OmniCoordClientForHub that connects
+                # after the initial UP events miss them entirely and would
+                # never see the current replica list otherwise. Scheduling a
+                # broadcast on every heartbeat tick caps that staleness at
+                # ``heartbeat_interval`` without flooding the wire.
+                self._schedule_broadcast()
                 last_heartbeat_check = now
 
             with self._pending_lock:
@@ -256,43 +266,51 @@ class OmniCoordinator:
                 continue
 
             # Publish outside lock. Clear pending only on success.
-            if self.publish_instance_list_update():
+            if self.publish_replica_list_update():
                 with self._pending_lock:
                     self._pending_broadcast = False
 
             if self._stop_event.wait(timeout=loop_interval):
                 break
 
-    def _handle_event(self, event: InstanceEvent) -> None:
+    def _handle_event(self, event: ReplicaEvent) -> None:
         """Dispatch an incoming event to the appropriate handler."""
         try:
             input_addr = event.input_addr
 
-            # Heartbeat: only update last_heartbeat; if previously ERROR,
-            # promote back to UP and broadcast once.
+            # Heartbeat: refresh last_heartbeat and queue_length. The stage
+            # client refreshes queue_length just-in-time via its
+            # ``_on_heartbeat`` hook, so heartbeats are the only periodic
+            # source of live load for LeastQueueLengthBalancer; failing to
+            # propagate it here would let the policy route on stale data.
+            # If previously ERROR, promote back to UP and broadcast once.
             if event.event_type == "heartbeat":
                 promote = False
+                queue_changed = False
                 with self._lock:
-                    info = self._instances.get(input_addr)
+                    info = self._replicas.get(input_addr)
                     if info is not None:
                         info.last_heartbeat = time()
-                        if info.status == StageStatus.ERROR:
-                            info.status = StageStatus.UP
+                        if event.queue_length is not None and info.queue_length != event.queue_length:
+                            info.queue_length = event.queue_length
+                            queue_changed = True
+                        if info.status == ReplicaStatus.ERROR:
+                            info.status = ReplicaStatus.UP
                             promote = True
-                if promote:
+                if promote or queue_changed:
                     self._schedule_broadcast()
                 return
 
             # Check-and-act under single lock to avoid TOCTOU race (duplicate
-            # registration when concurrent events arrive for the same instance).
+            # registration when concurrent events arrive for the same replica).
             with self._lock:
-                if input_addr not in self._instances:
-                    self._add_new_instance_locked(event)
+                if input_addr not in self._replicas:
+                    self._add_new_replica_locked(event)
                 else:
-                    if event.status == StageStatus.DOWN:
-                        self._remove_instance_locked(event)
+                    if event.status == ReplicaStatus.DOWN:
+                        self._remove_replica_locked(event)
                     else:
-                        self._update_instance_info_locked(event)
+                        self._update_replica_info_locked(event)
 
             # Any non-heartbeat state change that affects the active list
             # is coalesced and flushed via the periodic loop.
@@ -300,7 +318,7 @@ class OmniCoordinator:
         except (KeyError, ValueError, TypeError) as e:
             logger.warning("Dropping malformed event: %s", e)
 
-    def _add_new_instance_locked(self, event: InstanceEvent) -> None:
+    def _add_new_replica_locked(self, event: ReplicaEvent) -> None:
         input_addr = event.input_addr
         if not input_addr:
             raise KeyError("input_addr required")
@@ -309,7 +327,7 @@ class OmniCoordinator:
             raise KeyError("stage_id required and must be non-negative")
 
         now = time()
-        info = InstanceInfo(
+        info = ReplicaInfo(
             input_addr=input_addr,
             output_addr=event.output_addr,
             stage_id=stage_id,
@@ -318,11 +336,11 @@ class OmniCoordinator:
             last_heartbeat=now,
             registered_at=now,
         )
-        self._instances[input_addr] = info
+        self._replicas[input_addr] = info
 
-    def _update_instance_info_locked(self, event: InstanceEvent) -> None:
+    def _update_replica_info_locked(self, event: ReplicaEvent) -> None:
         input_addr = event.input_addr
-        info = self._instances[input_addr]
+        info = self._replicas[input_addr]
 
         if event.status is not None:
             info.status = event.status
@@ -330,10 +348,10 @@ class OmniCoordinator:
         if event.queue_length is not None:
             info.queue_length = event.queue_length
 
-    def _remove_instance_locked(self, event: InstanceEvent) -> None:
+    def _remove_replica_locked(self, event: ReplicaEvent) -> None:
         input_addr = event.input_addr
-        info = self._instances.get(input_addr)
+        info = self._replicas.get(input_addr)
         if info is None:
             return
 
-        info.status = StageStatus.DOWN
+        info.status = ReplicaStatus.DOWN
