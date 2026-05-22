@@ -37,16 +37,10 @@ class ImageGenerationRequest(BaseModel):
     bot_task: str | None = Field(
         None,
         description="Task mode for the model (e.g., 'cot' enables chain-of-thought generation). "
-                    "Only supported by specific diffusion models."
+        "Only supported by specific diffusion models.",
     )
-    system_prompt: str | None = Field(
-        None,
-        description="Custom system prompt to guide the model's behavior."
-    )
-    use_system_prompt: bool | None = Field(
-        None,
-        description="Whether to apply the model's default system prompt."
-    )
+    system_prompt: str | None = Field(None, description="Custom system prompt to guide the model's behavior.")
+    use_system_prompt: bool | None = Field(None, description="Whether to apply the model's default system prompt.")
 
     # OpenAI standard fields
     model: str | None = Field(
