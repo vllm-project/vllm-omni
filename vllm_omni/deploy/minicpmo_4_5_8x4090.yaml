@@ -9,10 +9,12 @@
 #                                  in-process Token2Wav vocoder that emits
 #                                  the waveform).
 #
-# max_model_len is pinned to 8192 because the upstream config.json
+# max_model_len is pinned to 4096 because the upstream config.json
 # advertises max_position_embeddings=40960 (tuned for H20 141GB); on a
 # 24 GB 4090 a 40k-token KV cache request OOMs the worker process
-# before serving the first request.
+# before serving the first request. 8192 also OOMs in practice with
+# this thinker model + vision/audio encoders + Whisper preallocation,
+# so 4096 is the empirically-verified safe ceiling.
 pipeline: minicpmo_4_5
 async_chunk: false
 
@@ -25,8 +27,8 @@ stages:
     gpu_memory_utilization: 0.85
     enforce_eager: true
     tensor_parallel_size: 4
-    max_model_len: 8192
-    max_num_batched_tokens: 8192
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
     devices: "0,1,2,3"
     limit_mm_per_prompt:
       video: 1
