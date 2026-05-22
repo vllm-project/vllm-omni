@@ -90,6 +90,7 @@ from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
 )
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.plugins import load_omni_general_plugins
 
 if TYPE_CHECKING:
     from vllm_omni.engine.arg_utils import OmniEngineArgs
@@ -246,6 +247,9 @@ class AsyncOmniEngine:
         startup_timeout = int(init_timeout)
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
+
+        # Load ``vllm_omni.general_plugins`` entry points BEFORE pipeline resolution.
+        load_omni_general_plugins()
 
         # Merge tracked engine_args fields into kwargs; explicit kwargs take priority.
         if engine_args is not None:
