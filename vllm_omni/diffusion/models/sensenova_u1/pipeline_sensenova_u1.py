@@ -1615,7 +1615,11 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
         state.latents = ns.image_prediction
         state.timesteps = ns.timesteps[:-1]
         state.step_index = 0
-        state.do_true_cfg = p.cfg_scale > 1.0
+        # U1 handles CFG internally via state.extra["p"].cfg_scale,
+        # not via InputBatch's do_true_cfg mechanism. Setting False
+        # ensures _prepare_cfg_scalars sees uniform values across
+        # heterogeneous-CFG batches.
+        state.do_true_cfg = False
 
         # InputBatch requires prompt_embeds to be set. For U1 the prompt
         # conditioning lives in KV caches, so we use a dummy 1-token embed.
@@ -1679,17 +1683,210 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
         **kwargs: Any,
     ) -> torch.Tensor | None:
         """Run one denoise step for all requests in the batch."""
-        batch_v_preds: list[torch.Tensor] = []
+        if len(input_batch.req_ids) > 1:
+            return self._batched_denoise_step(input_batch)
 
+        # Single-request fast path
+        req_id = input_batch.req_ids[0]
+        extra = self._step_states.get(req_id)
+        if extra is None:
+            raise ValueError(f"No step state found for request {req_id}")
+        step_index = extra.get("_current_step_index", 0)
+        image_prediction = extra["_image_prediction"]
+        v_pred = self._step_denoise_single(image_prediction, step_index, extra)
+        return v_pred
+
+    # ------------------------------------------------------------------
+    # Phase 3: Batched denoise with varlen attention
+    # ------------------------------------------------------------------
+
+    def _prepare_single_embeds(
+        self,
+        extra: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare image_embeds and indexes for a single request."""
+        p = extra["p"]
+        ns = extra["ns"]
+        step_index = extra.get("_current_step_index", 0)
+        image_prediction = extra["_image_prediction"]
+
+        image_input = _patchify(image_prediction, self.patch_size, channel_first=True)
+        image_embeds = self._extract_feature(
+            image_input.view(p.batch_size * ns.grid_h * ns.grid_w, -1),
+            gen_model=True,
+            grid_hw=ns.grid_hw,
+        ).view(p.batch_size, ns.token_h * ns.token_w, -1)
+
+        t = ns.timesteps[step_index]
+        t_expanded = t.expand(p.batch_size * ns.token_h * ns.token_w)
+        timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
+            p.batch_size, ns.token_h * ns.token_w, -1
+        )
+        if self.top_cfg.add_noise_scale_embedding:
+            ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.top_cfg.noise_scale_max_value)
+            ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
+                p.batch_size, ns.token_h * ns.token_w, -1
+            )
+            timestep_embeddings = timestep_embeddings + ns_emb
+        image_embeds = image_embeds + timestep_embeddings
+
+        indexes = extra["caches"]["idx_cond"]
+        return image_embeds, indexes
+
+    def _batched_predict_v(
+        self,
+        image_embeds_list: list[torch.Tensor],
+        indexes_list: list[torch.Tensor],
+        per_req_data: list[dict[str, Any]],
+        kv_key: str,
+    ) -> list[torch.Tensor]:
+        """Batched forward via language_model.forward_varlen, returns per-request v_pred."""
+        N = len(per_req_data)
+        device = image_embeds_list[0].device
+
+        packed_embeds = torch.cat(
+            [e.squeeze(0) for e in image_embeds_list], dim=0
+        ).unsqueeze(0)  # [1, total_S, D]
+        packed_indexes = torch.cat(indexes_list, dim=1)  # [3, total_S]
+
+        q_lens = [e.shape[1] for e in image_embeds_list]
+        cu_seqlens_q = torch.zeros(N + 1, dtype=torch.int32, device=device)
+        cu_seqlens_k = torch.zeros(N + 1, dtype=torch.int32, device=device)
+        for i in range(N):
+            cache = per_req_data[i]["caches"][kv_key]
+            prefix_len = cache.layers[0].flash_prefix_len
+            cu_seqlens_q[i + 1] = cu_seqlens_q[i] + q_lens[i]
+            cu_seqlens_k[i + 1] = cu_seqlens_k[i] + prefix_len + q_lens[i]
+
+        past_kv_list = [d["caches"][kv_key] for d in per_req_data]
+        max_seqlen_q = max(q_lens)
+        max_seqlen_k = max(
+            int(cu_seqlens_k[i + 1] - cu_seqlens_k[i]) for i in range(N)
+        )
+
+        outputs = self.language_model.forward_varlen(
+            inputs_embeds=packed_embeds,
+            indexes=packed_indexes,
+            past_key_values_list=past_kv_list,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+        )
+
+        hidden = outputs.hidden_states.squeeze(0)  # [total_S, D]
+        results = []
+        offset = 0
+        for i in range(N):
+            ns = per_req_data[i]["ns"]
+            p = per_req_data[i]["p"]
+            step_index = per_req_data[i].get("_current_step_index", 0)
+            h_i = hidden[offset:offset + q_lens[i]].unsqueeze(0)  # [1, S, D]
+
+            image_prediction = per_req_data[i]["_image_prediction"]
+            merge_size = ns.merge_size
+            z = _patchify(image_prediction, self.patch_size * merge_size)
+            t = ns.timesteps[step_index]
+            B, L = z.shape[0], z.shape[1]
+            image_token_num = ns.token_h * ns.token_w
+
+            if self.top_cfg.use_pixel_head:
+                token_h = p.image_size[1] // (self.patch_size * merge_size)
+                token_w = p.image_size[0] // (self.patch_size * merge_size)
+                img_reshaped = h_i[:, -image_token_num:].view(B, token_h, token_w, -1)
+                img_2d = torch.einsum("b h w c -> b c h w", img_reshaped).contiguous()
+                smoothed_img_2d = self.fm_modules["fm_head"](img_2d)
+                smoothed_reshaped = smoothed_img_2d.view(
+                    B, 3, token_h, self.patch_size * merge_size,
+                    token_w, self.patch_size * merge_size,
+                )
+                smoothed_reshaped = torch.einsum("b c h p w q -> b h w p q c", smoothed_reshaped)
+                x_pred = smoothed_reshaped.contiguous().view(
+                    B, L, self.patch_size * merge_size * self.patch_size * merge_size * 3
+                )
+            else:
+                x_pred = self.fm_modules["fm_head"](
+                    h_i[:, -image_token_num:].view(B, L, -1)
+                ).view(B, L, -1)
+
+            v_pred = (x_pred - z) / (1 - t).clamp_min(self.top_cfg.t_eps)
+            results.append(v_pred)
+            offset += q_lens[i]
+
+        return results
+
+    def _batched_denoise_step(
+        self,
+        input_batch: InputBatch,
+    ) -> torch.Tensor:
+        """Batched denoise step using varlen attention for multiple requests."""
+        per_req_data = []
         for req_id in input_batch.req_ids:
             extra = self._step_states.get(req_id)
             if extra is None:
                 raise ValueError(f"No step state found for request {req_id}")
+            per_req_data.append(extra)
 
-            step_index = extra.get("_current_step_index", 0)
-            image_prediction = extra["_image_prediction"]
+        image_embeds_list = []
+        indexes_list = []
+        for extra in per_req_data:
+            embeds, indexes = self._prepare_single_embeds(extra)
+            image_embeds_list.append(embeds)
+            indexes_list.append(indexes)
 
-            v_pred = self._step_denoise_single(image_prediction, step_index, extra)
+        # Cond forward for all requests
+        cond_out = self._batched_predict_v(
+            image_embeds_list, indexes_list, per_req_data, kv_key="cond"
+        )
+
+        # Uncond forward for requests needing CFG
+        needs_uncond_indices = []
+        for i, data in enumerate(per_req_data):
+            p = data["p"]
+            step_index = data.get("_current_step_index", 0)
+            t = data["ns"].timesteps[step_index]
+            if p.cfg_scale > 1 and t >= p.cfg_interval[0] and t <= p.cfg_interval[1]:
+                needs_uncond_indices.append(i)
+
+        uncond_out: dict[int, torch.Tensor] = {}
+        if needs_uncond_indices:
+            uncond_embeds = [image_embeds_list[i] for i in needs_uncond_indices]
+            uncond_indexes_list = []
+            uncond_data = []
+            for i in needs_uncond_indices:
+                uncond_indexes_list.append(per_req_data[i]["caches"]["idx_uncond"])
+                uncond_data.append(per_req_data[i])
+            uncond_results = self._batched_predict_v(
+                uncond_embeds, uncond_indexes_list, uncond_data, kv_key="uncond"
+            )
+            for j, i in enumerate(needs_uncond_indices):
+                uncond_out[i] = uncond_results[j]
+
+        # Per-request CFG combination
+        batch_v_preds = []
+        for i, data in enumerate(per_req_data):
+            out_cond = cond_out[i]
+            p = data["p"]
+            step_index = data.get("_current_step_index", 0)
+
+            if i in uncond_out:
+                out_uncond = uncond_out[i]
+                if p.cfg_norm == "cfg_zero_star":
+                    pos_flat = out_cond.view(p.batch_size, -1)
+                    neg_flat = out_uncond.view(p.batch_size, -1)
+                    alpha = _optimized_scale(pos_flat, neg_flat)
+                    alpha = alpha.view(p.batch_size, *([1] * (len(out_cond.shape) - 1))).to(pos_flat.dtype)
+                    v_pred = (
+                        out_cond * 0.0
+                        if step_index <= 0
+                        else (out_uncond * alpha + p.cfg_scale * (out_cond - out_uncond * alpha))
+                    )
+                else:
+                    v_pred = out_uncond + p.cfg_scale * (out_cond - out_uncond)
+                    v_pred = self._apply_cfg_norm(v_pred, out_cond, p.cfg_norm)
+            else:
+                v_pred = out_cond
+
             batch_v_preds.append(v_pred)
 
         return torch.cat(batch_v_preds, dim=0)

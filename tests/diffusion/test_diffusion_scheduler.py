@@ -965,3 +965,157 @@ class TestStepScheduler:
 
         with pytest.raises(ValueError):
             self.scheduler.add_request(request)
+
+
+class TestKeysMatchIgnoring:
+    """Tests for _BaseScheduler._keys_match_ignoring static method."""
+
+    @staticmethod
+    def _make_key(**overrides) -> "SamplingParamsKey":
+        from vllm_omni.diffusion.sched.interface import SamplingParamsKey
+
+        defaults = dict(height=512, width=512, do_classifier_free_guidance=False)
+        defaults.update(overrides)
+        return SamplingParamsKey(**defaults)
+
+    def test_identical_keys_returns_true(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
+
+        a = self._make_key(height=512, width=512)
+        b = self._make_key(height=512, width=512)
+        assert _BaseScheduler._keys_match_ignoring(a, b, ["height"]) is True
+
+    def test_different_ignored_field_returns_true(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
+
+        a = self._make_key(height=512, width=512)
+        b = self._make_key(height=768, width=512)
+        assert _BaseScheduler._keys_match_ignoring(a, b, ["height"]) is True
+
+    def test_different_non_ignored_field_returns_false(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
+
+        a = self._make_key(height=512, width=512)
+        b = self._make_key(height=512, width=768)
+        assert _BaseScheduler._keys_match_ignoring(a, b, ["height"]) is False
+
+    def test_multiple_ignored_fields(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
+
+        a = self._make_key(height=512, width=512)
+        b = self._make_key(height=768, width=1024)
+        assert _BaseScheduler._keys_match_ignoring(a, b, ["height", "width"]) is True
+
+    def test_empty_ignore_list_is_strict(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
+
+        a = self._make_key(height=512)
+        b = self._make_key(height=768)
+        assert _BaseScheduler._keys_match_ignoring(a, b, []) is False
+
+    def test_ignoring_cfg_fields(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
+
+        a = self._make_key(guidance_scale=4.0)
+        b = self._make_key(guidance_scale=7.5)
+        assert _BaseScheduler._keys_match_ignoring(a, b, ["guidance_scale"]) is True
+        assert _BaseScheduler._keys_match_ignoring(a, b, []) is False
+
+
+class TestHeterogeneousBatchScheduling:
+    """Tests for _can_schedule_waiting with heterogeneous_batch_fields."""
+
+    def _make_scheduler(self, max_num_seqs=4, heterogeneous_batch_fields=None):
+        scheduler = StepScheduler()
+        config = SimpleNamespace(max_num_seqs=max_num_seqs)
+        if heterogeneous_batch_fields is not None:
+            config.heterogeneous_batch_fields = heterogeneous_batch_fields
+        scheduler.initialize(config)
+        return scheduler
+
+    def test_allows_different_height_width_when_configured(self) -> None:
+        scheduler = self._make_scheduler(heterogeneous_batch_fields=["height", "width"])
+
+        req_a = scheduler.add_request(_make_step_request("a"))
+        req_b = scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=768,
+                    width=768,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+
+        sched_output = scheduler.schedule()
+        assert _new_ids(sched_output) == [req_a, req_b]
+        assert sched_output.num_running_reqs == 2
+
+    def test_rejects_different_keys_without_config(self) -> None:
+        scheduler = self._make_scheduler()
+
+        req_a = scheduler.add_request(_make_step_request("a"))
+        scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=768,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+
+        sched_output = scheduler.schedule()
+        assert _new_ids(sched_output) == [req_a]
+        assert sched_output.num_running_reqs == 1
+        assert sched_output.num_waiting_reqs == 1
+
+    def test_rejects_non_ignored_difference(self) -> None:
+        scheduler = self._make_scheduler(heterogeneous_batch_fields=["height"])
+
+        req_a = scheduler.add_request(_make_step_request("a"))
+        scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(
+                    width=768,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+
+        sched_output = scheduler.schedule()
+        assert _new_ids(sched_output) == [req_a]
+        assert sched_output.num_running_reqs == 1
+
+    def test_allows_different_guidance_scale_when_configured(self) -> None:
+        scheduler = self._make_scheduler(
+            heterogeneous_batch_fields=[
+                "guidance_scale", "guidance_scale_2",
+                "guidance_scale_provided",
+            ],
+        )
+
+        req_a = scheduler.add_request(
+            _make_step_request(
+                "a",
+                sampling_params=OmniDiffusionSamplingParams(
+                    guidance_scale=4.0,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        req_b = scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(
+                    guidance_scale=7.5,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+
+        sched_output = scheduler.schedule()
+        assert _new_ids(sched_output) == [req_a, req_b]
+        assert sched_output.num_running_reqs == 2

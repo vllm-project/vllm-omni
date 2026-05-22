@@ -543,6 +543,11 @@ class OmniDiffusionConfig:
     # Scheduler flow_shift for Wan2.2 (12.0 for 480p, 5.0 for 720p)
     flow_shift: float | None = None
 
+    # Fields in SamplingParamsKey to ignore when batching requests.
+    # Pipelines that handle heterogeneous batches (e.g. different resolutions)
+    # can set this to ["height", "width"] so the scheduler allows mixing.
+    heterogeneous_batch_fields: list[str] = field(default_factory=list)
+
     # Support multi-image inputs and expose any model-specific request limit
     # through a generic config field so serving code stays model-agnostic.
     supports_multimodal_inputs: bool = False
