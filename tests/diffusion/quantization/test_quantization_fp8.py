@@ -109,6 +109,85 @@ def _generate_single_stage_image(
         return images, peak_mem
 
 
+def _generate_single_stage_video(
+    model: str,
+    quantization: str | None = None,
+    height: int = 256,
+    width: int = 256,
+    num_frames: int = 25,
+    num_inference_steps: int = 8,
+    guidance_scale: float = 4.0,
+    seed: int = 42,
+    prompt: str = "A serene lakeside sunrise with mist over the water",
+    **extra_omni_kwargs: Any,
+) -> tuple[int, float]:
+    """Generate a t2v output with a single-stage diffusion model.
+
+    Returns (num_frames_produced, peak_memory_gib)
+    """
+    omni_kwargs: dict[str, Any] = dict(extra_omni_kwargs)
+    if quantization:
+        omni_kwargs["quantization"] = quantization
+
+    with OmniRunner(model, **omni_kwargs) as runner:
+        torch.accelerator.reset_peak_memory_stats()
+
+        generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
+        outputs = runner.omni.generate(
+            {"prompt": prompt, "negative_prompt": ""},
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+            ),
+        )
+
+        first = outputs[0]
+
+        # Unwrap pipeline-style outputs (multi-stage / OmniRequestOutput.request_output).
+        frames: Any = None
+        if hasattr(first, "request_output") and isinstance(first.request_output, list):
+            inner = first.request_output[0]
+            if isinstance(inner, OmniRequestOutput) and inner.images:
+                frames = inner.images[0]
+        if frames is None and hasattr(first, "images") and first.images:
+            frames = first.images[0]
+        assert frames is not None, "No video frames returned from generate()"
+
+        # LTX-2 (audio+video) may surface (video, audio) tuples or {"video": ...} dicts.
+        if isinstance(frames, dict):
+            frames = frames.get("video") or frames.get("frames")
+        elif isinstance(frames, tuple) and len(frames) == 2:
+            frames = frames[0]
+        assert frames is not None, "Could not extract video frames from output"
+
+        if isinstance(frames, torch.Tensor):
+            video = frames.detach().cpu()
+            if video.dim() == 5:
+                video = video[0]
+            if video.dim() == 4 and video.shape[0] in (3, 4):
+                video = video.permute(1, 2, 3, 0)
+            num_frames_produced = int(video.shape[0])
+        else:
+            import numpy as np
+
+            arr = np.asarray(frames)
+            if arr.ndim == 5:
+                arr = arr[0]
+            num_frames_produced = int(arr.shape[0])
+
+        peak_mem_mb = getattr(first, "peak_memory_mb", None)
+        if peak_mem_mb:
+            peak_mem = float(peak_mem_mb) / 1024.0
+        else:
+            peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
+
+        return num_frames_produced, peak_mem
+
+
 def _generate_bagel_image(
     quantization_config: str | None = None,
     num_inference_steps: int = 15,
@@ -274,6 +353,25 @@ def test_single_stage_flux_fp8_uses_less_memory():
 
     print(f"FLUX BF16 peak memory: {mem_bf16:.2f} GiB")
     print(f"FLUX FP8 peak memory:  {mem_fp8:.2f} GiB")
+    assert mem_fp8 < mem_bf16, f"FP8 ({mem_fp8:.2f} GiB) should use less memory than BF16 ({mem_bf16:.2f} GiB)"
+
+
+@hardware_test(res={"cuda": "H100"})
+def test_single_stage_ltx2_fp8_uses_less_memory():
+    """FP8 should use less peak memory than BF16 for LTX-2."""
+    _, mem_bf16 = _generate_single_stage_video(
+        model="Lightricks/LTX-2",
+        quantization=None,
+    )
+    torch.accelerator.empty_cache()
+
+    _, mem_fp8 = _generate_single_stage_video(
+        model="Lightricks/LTX-2",
+        quantization="fp8",
+    )
+
+    print(f"LTX-2 BF16 peak memory: {mem_bf16:.2f} GiB")
+    print(f"LTX-2 FP8 peak memory:  {mem_fp8:.2f} GiB")
     assert mem_fp8 < mem_bf16, f"FP8 ({mem_fp8:.2f} GiB) should use less memory than BF16 ({mem_bf16:.2f} GiB)"
 
 
