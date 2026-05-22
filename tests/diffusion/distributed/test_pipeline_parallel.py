@@ -367,6 +367,34 @@ def test_pipeline_parallel_requires_mro_before_cfg_mixin():
             pass
 
 
+@pytest.mark.cpu
+def test_predict_noise_validates_inter_comm_ids_length(monkeypatch):
+    """Sequential CFG uses two PP branches, so it requires two inter-stage labels."""
+
+    class _FakePPGroup:
+        is_first_rank = True
+        is_last_rank = False
+
+    class _LabelValidationPP(PipelineParallelMixin, CFGParallelMixin):
+        def predict_noise(self, **_kwargs):
+            return IntermediateTensors({"hidden_states": torch.ones(1, 1)})
+
+    monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(pp_module, "get_classifier_free_guidance_world_size", lambda: 1)
+    monkeypatch.setattr(pp_module, "get_pp_group", lambda: _FakePPGroup())
+
+    pipeline = _LabelValidationPP()
+    with pytest.raises(ValueError, match="inter_comm_ids has length 1 but expected 2"):
+        pipeline.predict_noise_maybe_with_cfg(
+            do_true_cfg=True,
+            true_cfg_scale=7.5,
+            positive_kwargs={},
+            negative_kwargs={},
+            cfg_normalize=False,
+            inter_comm_ids=["only-positive"],
+        )
+
+
 # ---------------------------------------------------------------------------
 # Distributed test helpers
 # ---------------------------------------------------------------------------
@@ -390,7 +418,11 @@ def init_dist(local_rank: int, world_size: int, master_port: str) -> torch.devic
 
 
 def make_pipeline_and_inputs(
-    test_config: dict, dtype: torch.dtype, device: torch.device, do_true_cfg: bool = False
+    test_config: dict,
+    dtype: torch.dtype,
+    device: torch.device,
+    do_true_cfg: bool = False,
+    pipeline: "MockPipelineParallel | None" = None,
 ) -> tuple["MockPipelineParallel", dict, dict | None]:
     """Create a MockPipelineParallel and seeded inputs from a test_config dict.
 
@@ -400,13 +432,14 @@ def make_pipeline_and_inputs(
     Returns ``(pipeline, positive_kwargs, negative_kwargs)``.
     ``negative_kwargs`` is ``None`` when ``do_true_cfg=False``.
     """
-    pipeline = MockPipelineParallel(
-        num_layers=test_config["num_layers"],
-        dim=test_config["dim"],
-        seed=test_config["model_seed"],
-        device=device,
-        dtype=dtype,
-    )
+    if pipeline is None:
+        pipeline = MockPipelineParallel(
+            num_layers=test_config["num_layers"],
+            dim=test_config["dim"],
+            seed=test_config["model_seed"],
+            device=device,
+            dtype=dtype,
+        )
 
     torch.manual_seed(test_config["input_seed"])
     if torch.cuda.is_available():
@@ -429,7 +462,7 @@ def make_pipeline_and_inputs(
 # ---------------------------------------------------------------------------
 
 
-def isend_irecv_worker(local_rank: int, world_size: int, master_port: str, result_queue):
+def isend_irecv_worker(local_rank: int, world_size: int, master_port: str, result_queue, comm_id: str | None = None):
     device = init_dist(local_rank, world_size, master_port)
     initialize_model_parallel(pipeline_parallel_size=world_size)
     pp_group = get_pp_group()
@@ -439,12 +472,12 @@ def isend_irecv_worker(local_rank: int, world_size: int, master_port: str, resul
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(77)
         tensor = torch.randn(3, 5, dtype=torch.float32, device=device)
-        handles = pp_group.isend_tensor_dict({"t": tensor})
+        handles = pp_group.isend_tensor_dict({"t": tensor}, comm_id=comm_id)
         for h in handles:
             h.wait()
         result_queue.put(("sent", tensor.cpu()))
     else:
-        received = AsyncIntermediateTensors(*pp_group.irecv_tensor_dict())
+        received = AsyncIntermediateTensors(*pp_group.irecv_tensor_dict(comm_id=comm_id))
         result_queue.put(("received", received["t"].cpu()))
 
     if torch.distributed.is_initialized():
@@ -453,21 +486,88 @@ def isend_irecv_worker(local_rank: int, world_size: int, master_port: str, resul
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs")
-@pytest.mark.parametrize("pp_size", [2])
-def test_isend_irecv_tensor_dict(pp_size: int):
+@pytest.mark.parametrize(
+    "pp_size, comm_id",
+    [
+        pytest.param(
+            2,
+            None,
+            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
+            id="unlabeled",
+        ),
+        pytest.param(
+            2,
+            "test-comm-id",
+            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
+            id="comm_id",
+        ),
+    ],
+)
+def test_isend_irecv_tensor_dict(pp_size: int, comm_id: str | None):
     """isend_tensor_dict / irecv_tensor_dict transfer a tensor dict without loss."""
     mp_context = torch.multiprocessing.get_context("spawn")
     manager = mp_context.Manager()
     q = manager.Queue()
 
     port = _find_free_port()
-    torch.multiprocessing.spawn(isend_irecv_worker, args=(pp_size, port, q), nprocs=pp_size)
+    torch.multiprocessing.spawn(isend_irecv_worker, args=(pp_size, port, q, comm_id), nprocs=pp_size)
 
     results = {label: tensor for label, tensor in [q.get(), q.get()]}
     torch.testing.assert_close(
         results["received"], results["sent"], rtol=0, atol=0, msg="isend/irecv transferred tensor incorrectly"
     )
+
+
+def labeled_shape_drift_worker(local_rank: int, world_size: int, master_port: str, result_queue):
+    device = init_dist(local_rank, world_size, master_port)
+    initialize_model_parallel(pipeline_parallel_size=world_size)
+    pp_group = get_pp_group()
+    comm_id = "test-shape-drift"
+
+    if pp_group.is_first_rank:
+        tensor = torch.randn(3, 5, dtype=torch.float32, device=device)
+        handles = pp_group.isend_tensor_dict({"t": tensor}, comm_id=comm_id)
+        for handle in handles:
+            handle.wait()
+
+        error = None
+        try:
+            pp_group.isend_tensor_dict({"t": torch.randn(4, 5, dtype=torch.float32, device=device)}, comm_id=comm_id)
+        except ValueError as exc:
+            error = str(exc)
+        result_queue.put(("sender_error", error))
+    else:
+        received = AsyncIntermediateTensors(*pp_group.irecv_tensor_dict(comm_id=comm_id))
+        result_queue.put(("received_shape", tuple(received["t"].shape)))
+
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    destroy_distributed_env()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "pp_size",
+    [
+        pytest.param(
+            2,
+            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
+        ),
+    ],
+)
+def test_labeled_comm_id_rejects_shape_drift(pp_size: int):
+    """Reusing a comm_id with a different tensor structure should fail on the sender."""
+    mp_context = torch.multiprocessing.get_context("spawn")
+    manager = mp_context.Manager()
+    q = manager.Queue()
+
+    port = _find_free_port()
+    torch.multiprocessing.spawn(labeled_shape_drift_worker, args=(pp_size, port, q), nprocs=pp_size)
+
+    results = {label: value for label, value in [q.get(), q.get()]}
+    assert results["received_shape"] == (3, 5)
+    assert results["sender_error"] is not None
+    assert "shape drift on comm_id" in results["sender_error"]
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +628,9 @@ def predict_noise_worker(
     dtype: torch.dtype,
     test_config: dict,
     result_queue,
+    num_calls: int = 1,
+    skip_sync: bool = False,
+    inter_comm_ids: list[str] | None = None,
 ):
     """Generic predict-noise worker parameterized by PP and CFG topology."""
     device = init_dist(local_rank, world_size, master_port)
@@ -536,28 +639,39 @@ def predict_noise_worker(
     pp_group = get_pp_group()
     cfg_rank = get_classifier_free_guidance_rank()
 
-    pipeline, positive_kwargs, negative_kwargs = make_pipeline_and_inputs(
-        test_config, dtype, device, do_true_cfg=do_true_cfg
-    )
-
+    pipeline = None
+    noise_preds = []
     with torch.inference_mode():
-        noise_pred = pipeline.predict_noise_maybe_with_cfg(
-            do_true_cfg=do_true_cfg,
-            true_cfg_scale=test_config["cfg_scale"],
-            positive_kwargs=positive_kwargs,
-            negative_kwargs=negative_kwargs,
-            cfg_normalize=False,
-        )
+        for call_idx in range(num_calls):
+            pipeline, positive_kwargs, negative_kwargs = make_pipeline_and_inputs(
+                {**test_config, "input_seed": test_config["input_seed"] + call_idx},
+                dtype,
+                device,
+                do_true_cfg=do_true_cfg,
+                pipeline=pipeline,
+            )
+            noise_pred = pipeline.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=test_config["cfg_scale"],
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+                skip_sync=skip_sync,
+                inter_comm_ids=inter_comm_ids,
+            )
+            if pp_group.is_last_rank:
+                assert noise_pred is not None
+                if cfg_rank == 0:
+                    noise_preds.append(noise_pred.cpu())
+            else:
+                assert noise_pred is None
+
     # This worker exercises predict_noise_maybe_with_cfg directly, bypassing diffuse().
     # Flush the non-last PP rank's async send before barrier / process teardown.
     pipeline._sync_pp_send()
 
-    if pp_group.is_last_rank:
-        assert noise_pred is not None
-        if cfg_rank == 0:
-            result_queue.put(noise_pred.cpu())
-    else:
-        assert noise_pred is None
+    if pp_group.is_last_rank and cfg_rank == 0:
+        result_queue.put(noise_preds if num_calls > 1 or inter_comm_ids is not None else noise_preds[0])
 
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -667,13 +781,107 @@ def test_predict_noise(pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_
     )
 
 
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "pp_size, cfg_size, dtype, do_true_cfg, num_calls, skip_sync, input_seed",
+    [
+        pytest.param(
+            2,
+            1,
+            torch.float32,
+            False,
+            1,
+            False,
+            700,
+            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
+            id="pp2-labeled-no_cfg",
+        ),
+        pytest.param(
+            2,
+            1,
+            torch.float32,
+            True,
+            1,
+            False,
+            800,
+            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
+            id="pp2-labeled-seq_cfg",
+        ),
+        pytest.param(
+            2,
+            1,
+            torch.float32,
+            False,
+            2,
+            True,
+            900,
+            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
+            id="pp2-labeled-skip_sync-overlap",
+        ),
+    ],
+)
+def test_predict_noise_with_labeled_inter_comm_ids(
+    pp_size, cfg_size, dtype, do_true_cfg, num_calls, skip_sync, input_seed
+):
+    """Labeled inter-stage PP communication should match the single-rank baseline."""
+    test_config = {
+        "num_layers": 4,
+        "dim": 64,
+        "batch_size": 2,
+        "cfg_scale": 7.5,
+        "model_seed": 42,
+        "input_seed": input_seed,
+    }
+    baselines = [
+        compute_single_gpu_baseline({**test_config, "input_seed": input_seed + call_idx}, dtype, do_true_cfg)
+        for call_idx in range(num_calls)
+    ]
+
+    mp_context = torch.multiprocessing.get_context("spawn")
+    manager = mp_context.Manager()
+    q = manager.Queue()
+
+    world_size = pp_size * cfg_size
+    n_branches = 2 if do_true_cfg else 1
+    inter_comm_ids = [f"test-it-{branch}" for branch in range(n_branches)]
+    port = _find_free_port()
+    torch.multiprocessing.spawn(
+        predict_noise_worker,
+        args=(
+            world_size,
+            port,
+            pp_size,
+            cfg_size,
+            do_true_cfg,
+            dtype,
+            test_config,
+            q,
+            num_calls,
+            skip_sync,
+            inter_comm_ids,
+        ),
+        nprocs=world_size,
+    )
+
+    pp_outputs = q.get()
+    assert len(pp_outputs) == num_calls
+    for pp_out, baseline in zip(pp_outputs, baselines):
+        torch.testing.assert_close(
+            pp_out,
+            baseline,
+            rtol=1e-5,
+            atol=1e-5,
+            msg="Labeled PP predict_noise output differs from single-rank baseline",
+        )
+
+
 # ---------------------------------------------------------------------------
 # 5.  scheduler_step_maybe_with_cfg
 # ---------------------------------------------------------------------------
 
 
-def compute_scheduler_step_baseline(test_config: dict, do_true_cfg: bool) -> torch.Tensor:
-    """Single-GPU reference: predict_noise + scheduler_step."""
+def compute_scheduler_step_baseline(test_config: dict, do_true_cfg: bool, steps: int = 1) -> torch.Tensor:
+    """Single-GPU reference: predict_noise + scheduler_step (``steps`` times)."""
     device = init_dist(0, 1, _find_free_port())
     initialize_model_parallel(pipeline_parallel_size=1)
 
@@ -691,12 +899,13 @@ def compute_scheduler_step_baseline(test_config: dict, do_true_cfg: bool) -> tor
             negative_kwargs=negative_kwargs,
             cfg_normalize=False,
         )
-        result = pipeline.scheduler_step_maybe_with_cfg(
-            noise_pred=noise_pred, t=t, latents=latents, do_true_cfg=do_true_cfg
-        )
+        for _ in range(steps):
+            latents = pipeline.scheduler_step_maybe_with_cfg(
+                noise_pred=noise_pred, t=t, latents=latents, do_true_cfg=do_true_cfg
+            )
 
     destroy_distributed_env()
-    return result.cpu()
+    return latents.cpu()
 
 
 def scheduler_step_worker(
@@ -708,6 +917,9 @@ def scheduler_step_worker(
     do_true_cfg: bool,
     test_config: dict,
     result_queue,
+    steps: int = 1,
+    loopback_comm_id: str | None = None,
+    seed_pending_send: bool = False,
 ):
     device = init_dist(local_rank, world_size, master_port)
     initialize_model_parallel(pipeline_parallel_size=pp_size, cfg_parallel_size=cfg_size)
@@ -721,6 +933,11 @@ def scheduler_step_worker(
     latents = positive_kwargs["x"]
     t = torch.tensor(500, device=device)
 
+    sentinel = None
+    if seed_pending_send and pp_group.is_last_rank:
+        sentinel = FakeWork()
+        pipeline._pp_send_work = [sentinel]
+
     with torch.inference_mode():
         noise_pred = pipeline.predict_noise_maybe_with_cfg(
             do_true_cfg=do_true_cfg,
@@ -729,16 +946,28 @@ def scheduler_step_worker(
             negative_kwargs=negative_kwargs,
             cfg_normalize=False,
         )
-        latents = pipeline.scheduler_step_maybe_with_cfg(
-            noise_pred=noise_pred, t=t, latents=latents, do_true_cfg=do_true_cfg
-        )
+        for _ in range(steps):
+            latents = pipeline.scheduler_step_maybe_with_cfg(
+                noise_pred=noise_pred,
+                t=t,
+                latents=latents,
+                do_true_cfg=do_true_cfg,
+                loopback_comm_id=loopback_comm_id,
+            )
+
     # This worker exercises scheduler_step_maybe_with_cfg directly, bypassing diffuse().
     # Flush the last PP rank's async latent send before barrier / process teardown.
     pipeline._sync_pp_send()
 
-    if pp_group.is_first_rank and cfg_rank == 0:
+    if seed_pending_send:
+        if pp_group.is_first_rank:
+            resolved = latents.contiguous()
+            result_queue.put(("latents", resolved.cpu()))
+        if pp_group.is_last_rank:
+            result_queue.put(("sentinel_waited", sentinel.waited))
+    elif pp_group.is_first_rank and cfg_rank == 0:
         resolved = latents.contiguous()
-        result_queue.put(resolved.cpu())
+        result_queue.put(("latents", resolved.cpu()))
 
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -747,13 +976,16 @@ def scheduler_step_worker(
 
 @pytest.mark.gpu
 @pytest.mark.parametrize(
-    "pp_size, cfg_size, do_true_cfg, input_seed",
+    "pp_size, cfg_size, do_true_cfg, input_seed, steps, loopback_comm_id, seed_pending_send",
     [
         pytest.param(
             2,
             1,
             False,
             300,
+            1,
+            None,
+            False,
             marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
             id="pp2-no_cfg",
         ),
@@ -762,13 +994,38 @@ def scheduler_step_worker(
             2,
             True,
             600,
+            1,
+            None,
+            False,
             marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 4, reason="Need at least 4 GPUs"),
             id="pp2-cfg2-true_cfg",
         ),
+        pytest.param(
+            2,
+            1,
+            False,
+            1000,
+            2,
+            "test-lb",
+            True,
+            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
+            id="pp2-labeled_loopback",
+        ),
     ],
 )
-def test_scheduler_step(pp_size, cfg_size, do_true_cfg, input_seed):
-    """Rank 0 latents after scheduler_step match the single-GPU baseline across PP / CFG topologies."""
+def test_scheduler_step(
+    pp_size,
+    cfg_size,
+    do_true_cfg,
+    input_seed,
+    steps,
+    loopback_comm_id,
+    seed_pending_send,
+):
+    """
+    Rank 0 latents after scheduler_step match the single-GPU baseline across PP / CFG topologies.
+    Loopback case also checks pending sends.
+    """
     test_config = {
         "num_layers": 4,
         "dim": 64,
@@ -778,7 +1035,7 @@ def test_scheduler_step(pp_size, cfg_size, do_true_cfg, input_seed):
         "input_seed": input_seed,
     }
 
-    baseline = compute_scheduler_step_baseline(test_config, do_true_cfg)
+    baseline = compute_scheduler_step_baseline(test_config, do_true_cfg, steps=steps)
 
     mp_context = torch.multiprocessing.get_context("spawn")
     manager = mp_context.Manager()
@@ -788,15 +1045,28 @@ def test_scheduler_step(pp_size, cfg_size, do_true_cfg, input_seed):
     world_size = pp_size * cfg_size
     torch.multiprocessing.spawn(
         scheduler_step_worker,
-        args=(world_size, port, pp_size, cfg_size, do_true_cfg, test_config, q),
+        args=(
+            world_size,
+            port,
+            pp_size,
+            cfg_size,
+            do_true_cfg,
+            test_config,
+            q,
+            steps,
+            loopback_comm_id,
+            seed_pending_send,
+        ),
         nprocs=world_size,
     )
 
-    result = q.get()
+    results = dict(q.get() for _ in range(2 if seed_pending_send else 1))
     torch.testing.assert_close(
-        result,
+        results["latents"],
         baseline,
         rtol=0,
         atol=0,
         msg=f"PP={pp_size} CFG={cfg_size} scheduler step latents on rank 0 do not match single-GPU baseline",
     )
+    if seed_pending_send:
+        assert results["sentinel_waited"] is True

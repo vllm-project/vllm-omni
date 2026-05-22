@@ -1908,6 +1908,7 @@ class AsyncOmniEngine:
             use_hsdp = normalized_kwargs.get("use_hsdp") or False
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size") or -1
             hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size") or 1
+            enable_pipefusion = normalized_kwargs.get("enable_pipefusion") or False
             if sequence_parallel_size is None:
                 sequence_parallel_size = ulysses_degree * ring_degree
 
@@ -1925,6 +1926,7 @@ class AsyncOmniEngine:
                 use_hsdp=use_hsdp,
                 hsdp_shard_size=hsdp_shard_size,
                 hsdp_replicate_size=hsdp_replicate_size,
+                enable_pipefusion=enable_pipefusion,
             )
 
         num_devices = max(1, int(parallel_config.world_size))

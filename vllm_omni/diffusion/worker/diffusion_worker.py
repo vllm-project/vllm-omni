@@ -260,6 +260,7 @@ class DiffusionWorker:
                 fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
                 hsdp_replicate_size=parallel_config.hsdp_replicate_size if parallel_config.use_hsdp else 1,
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
+                enable_pipefusion=parallel_config.enable_pipefusion,
             )
             init_workspace_manager(self.device)
 
