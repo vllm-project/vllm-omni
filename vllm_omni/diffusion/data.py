@@ -745,8 +745,11 @@ class OmniDiffusionConfig:
             return
 
         is_checkpoint_fp8 = bool(getattr(tf_config.quant_config, "is_checkpoint_fp8_serialized", False))
-        should_use_checkpoint_config = self.quantization_config is None or (
-            is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config)
+        is_checkpoint_nvfp4 = bool(getattr(tf_config.quant_config, "is_checkpoint_nvfp4_serialized", False))
+        should_use_checkpoint_config = (
+            self.quantization_config is None
+            or (is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config))
+            or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
         )
         if should_use_checkpoint_config:
             self.quantization_config = tf_config.quant_config
@@ -764,6 +767,17 @@ class OmniDiffusionConfig:
             return isinstance(method, str) and method.lower() == "fp8"
         if hasattr(quant_config, "get_name"):
             return quant_config.get_name() == "fp8"
+        return False
+
+    @staticmethod
+    def _is_generic_nvfp4_quant_config(quant_config: object) -> bool:
+        if isinstance(quant_config, str):
+            return quant_config.lower() in {"fp4", "nvfp4", "modelopt_fp4"}
+        if isinstance(quant_config, Mapping):
+            method = quant_config.get("method", quant_config.get("quant_method"))
+            return isinstance(method, str) and method.lower() in {"fp4", "nvfp4", "modelopt_fp4"}
+        if hasattr(quant_config, "get_name"):
+            return quant_config.get_name() == "modelopt_fp4"
         return False
 
     def set_tf_model_config(self, tf_config: "TransformerConfig") -> None:
