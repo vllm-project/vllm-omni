@@ -606,6 +606,25 @@ class OmniDiffusionConfig:
 
         return False
 
+    def _resolve_master_port(self) -> int:
+        """Resolve torch.distributed master port without unnecessary random jitter.
+
+        Precedence:
+        1. ``MASTER_PORT`` environment variable (set by orchestrators for multi-replica launch).
+        2. Explicit ``master_port`` passed at construction time.
+        3. An OS-assigned ephemeral port when neither is provided.
+        """
+        from vllm.utils.network_utils import get_open_port
+
+        from vllm_omni.diffusion import envs
+
+        env_port = envs.MASTER_PORT
+        if env_port is not None:
+            return self.settle_port(env_port, port_inc=37)
+        if self.master_port is not None:
+            return self.settle_port(self.master_port, port_inc=37)
+        return self.settle_port(get_open_port(), port_inc=37)
+
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """
         Find an available port with retry logic.
@@ -642,9 +661,7 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
-        # TODO: remove hard code
-        initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
-        self.master_port = self.settle_port(initial_master_port, 37)
+        self.master_port = self._resolve_master_port()
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
