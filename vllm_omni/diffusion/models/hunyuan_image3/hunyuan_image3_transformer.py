@@ -2073,7 +2073,7 @@ class HunyuanImage3Model(nn.Module):
             return False
 
         def is_scalar_quant_scale(name: str, tensor: torch.Tensor) -> bool:
-            return tensor.numel() == 1 and name.endswith((".input_scale", ".weight_scale"))
+            return tensor.numel() == 1 and name.endswith((".input_scale", ".weight_scale", ".weight_scale_2"))
 
         def load_split_param(
             name: str,
