@@ -267,7 +267,7 @@ def enable_cache_for_longcat_image(pipeline: Any, cache_config: Any) -> Callable
         f"Enabling cache-dit on LongCatImage transformer with BlockAdapter: "
         f"Fn={db_cache_config.Fn_compute_blocks}, "
         f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
+        f"W={db_cache_config.max_warmup_steps}"
     )
 
     # Enable cache-dit using BlockAdapter for transformer
@@ -342,7 +342,7 @@ def enable_cache_for_flux(pipeline: Any, cache_config: Any) -> Callable[[int], N
         f"Enabling cache-dit on Flux transformer with BlockAdapter: "
         f"Fn={db_cache_config.Fn_compute_blocks}, "
         f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
+        f"W={db_cache_config.max_warmup_steps}"
     )
 
     # Enable cache-dit using BlockAdapter for transformer
@@ -419,7 +419,7 @@ def enable_cache_for_flux2_klein(pipeline: Any, cache_config: Any) -> Callable[[
         f"Enabling cache-dit on Flux2-Klein transformer with BlockAdapter: "
         f"Fn={db_cache_config.Fn_compute_blocks}, "
         f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
+        f"W={db_cache_config.max_warmup_steps}"
     )
 
     # Enable cache-dit using BlockAdapter for transformer
@@ -562,7 +562,7 @@ def enable_cache_for_sd3(pipeline: Any, cache_config: Any) -> Callable[[int], No
         f"Enabling cache-dit on StableDiffusion3 transformer with BlockAdapter: "
         f"Fn={db_cache_config.Fn_compute_blocks}, "
         f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
+        f"W={db_cache_config.max_warmup_steps}"
     )
 
     # Enable cache-dit using BlockAdapter for transformer
@@ -622,7 +622,7 @@ def enable_cache_for_ltx2(pipeline: Any, cache_config: Any) -> Callable[[int], N
         f"Enabling cache-dit on LTX2 transformer: "
         f"Fn={db_cache_config.Fn_compute_blocks}, "
         f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
+        f"W={db_cache_config.max_warmup_steps}"
     )
 
     cache_dit.enable_cache(
@@ -684,7 +684,7 @@ def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], No
         f"Enabling cache-dit on transformer: "
         f"Fn={db_cache_config.Fn_compute_blocks}, "
         f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
+        f"W={db_cache_config.max_warmup_steps}"
     )
 
     # Enable cache-dit on the transformer
@@ -746,7 +746,7 @@ def enable_cache_for_hunyuan_image3(pipeline: Any, cache_config: Any) -> Callabl
         f"Enabling cache-dit on HunyuanImage3 model: "
         f"Fn={db_cache_config.Fn_compute_blocks}, "
         f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
+        f"W={db_cache_config.max_warmup_steps}"
     )
     # HunyuanImage3 decoder layers are single-stream `hidden_states` blocks
     # (`HunyuanImage3DecoderLayer.forward(hidden_states, ...)`) while caller
@@ -1132,7 +1132,7 @@ def enable_cache_for_bagel(pipeline: Any, cache_config: Any) -> Callable[[int], 
         f"Enabling cache-dit on Bagel transformer: "
         f"Fn={db_cache_config.Fn_compute_blocks}, "
         f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
+        f"W={db_cache_config.max_warmup_steps}"
     )
 
     # Enable cache-dit on the transformer
@@ -1273,7 +1273,7 @@ def enable_cache_for_glm_image(pipeline: Any, cache_config: Any) -> Callable[[in
         f"Enabling cache-dit on GlmImage transformer with BlockAdapter: "
         f"Fn={db_cache_config.Fn_compute_blocks}, "
         f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
+        f"W={db_cache_config.max_warmup_steps}"
     )
 
     # Enable cache-dit using BlockAdapter for transformer
@@ -1320,6 +1320,74 @@ def enable_cache_for_glm_image(pipeline: Any, cache_config: Any) -> Callable[[in
     return refresh_cache_context
 
 
+def enable_cache_for_helios(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    """Enable cache-dit for Helios pipeline.
+
+    Args:
+        pipeline: The Helios pipeline instance.
+        cache_config: DiffusionCacheConfig instance with cache configuration.
+
+    Returns:
+        A refresh function that can be called to update cache context with new num_inference_steps.
+    """
+    # Build DBCacheConfig for transformer
+    db_cache_config = _build_db_cache_config(cache_config)
+
+    calibrator = None
+    if cache_config.enable_taylorseer:
+        taylorseer_order = cache_config.taylorseer_order
+        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+
+    transformer = getattr(pipeline, "transformer", None)
+    if transformer is None:
+        raise ValueError("Helios cache-dit enable expects pipeline.transformer to exist.")
+
+    # Build ParamsModifier for transformer
+    modifier = ParamsModifier(
+        cache_config=db_cache_config,
+        calibrator_config=calibrator,
+    )
+
+    logger.info(
+        f"Enabling cache-dit on Helios transformer with BlockAdapter: "
+        f"Fn={db_cache_config.Fn_compute_blocks}, "
+        f"Bn={db_cache_config.Bn_compute_blocks}, "
+        f"W={db_cache_config.max_warmup_steps}"
+    )
+
+    # Enable cache-dit using BlockAdapter for transformer
+    cache_dit.enable_cache(
+        (
+            BlockAdapter(
+                transformer=transformer,
+                blocks=transformer.blocks,
+                # (hidden_states, encoder_hidden_states) -> hidden_states
+                forward_pattern=ForwardPattern.Pattern_2,
+                check_forward_pattern=True,
+                has_separate_cfg=True,
+                params_modifiers=[modifier],
+            )
+        ),
+        cache_config=db_cache_config,
+    )
+
+    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        """Refresh cache context for the transformer with new num_inference_steps.
+
+        Args:
+            pipeline: The Helios pipeline instance.
+            num_inference_steps: New number of inference steps.
+        """
+        transformer = getattr(pipeline, "transformer", None)
+        if transformer is None:
+            raise ValueError("Helios cache-dit refresh expects pipeline.transformer to exist.")
+
+        if cache_config.scm_steps_mask_policy is None:
+            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+        else:
+            cache_dit.refresh_context(
+                transformer,
 def enable_cache_for_ernie_image(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for ERNIE-Image pipeline.
 
@@ -1521,6 +1589,7 @@ CUSTOM_DIT_ENABLERS.update(
         "BagelPipeline": enable_cache_for_bagel,
         "GlmImagePipeline": enable_cache_for_glm_image,
         "Flux2Pipeline": enable_cache_for_flux2,
+        "HeliosPipeline": enable_cache_for_helios,
         "ErnieImagePipeline": enable_cache_for_ernie_image,
         "HunyuanVideo15Pipeline": enable_cache_for_hunyuan_video_15,
         "HunyuanVideo15I2VPipeline": enable_cache_for_hunyuan_video_15,

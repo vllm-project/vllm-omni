@@ -14,6 +14,7 @@ This module tests the cache backend implementations:
 from unittest.mock import Mock, patch
 
 import pytest
+from cache_dit import ForwardPattern
 
 from vllm_omni.diffusion.cache.cache_dit_backend import (
     CUSTOM_DIT_ENABLERS,
@@ -168,6 +169,75 @@ class TestCacheDiTBackend:
 
         with pytest.raises(ValueError, match="HunyuanImage3Pipeline"):
             backend.enable(mock_pipeline)
+
+    def test_helios_custom_enabler_registered(self):
+        """Test Helios custom cache-dit enabler is registered."""
+        assert "HeliosPipeline" in CUSTOM_DIT_ENABLERS
+
+    @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
+    def test_enable_helios_pipeline_uses_transformer(self, mock_cache_dit, mock_block_adapter):
+        """Test Helios custom enabler uses pipeline.transformer for cache enable/refresh."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "HeliosPipeline"
+        mock_pipeline.transformer = Mock()
+        mock_pipeline.transformer.blocks = Mock()
+
+        mock_cache_dit.enable_cache = Mock()
+        mock_cache_dit.refresh_context = Mock()
+
+        backend = CacheDiTBackend({"Fn_compute_blocks": 1})
+        backend.enable(mock_pipeline)
+
+        assert backend.enabled is True
+        assert backend._refresh_func is not None
+        mock_block_adapter.assert_called_once()
+        adapter_kwargs = mock_block_adapter.call_args.kwargs
+        assert adapter_kwargs["transformer"] is mock_pipeline.transformer
+        assert adapter_kwargs["blocks"] is mock_pipeline.transformer.blocks
+        assert adapter_kwargs["forward_pattern"] == ForwardPattern.Pattern_2
+        assert adapter_kwargs["check_forward_pattern"] is True
+        assert adapter_kwargs["has_separate_cfg"] is True
+        assert len(adapter_kwargs["params_modifiers"]) == 1
+        mock_cache_dit.enable_cache.assert_called_once()
+        enable_cache_kwargs = mock_cache_dit.enable_cache.call_args.kwargs
+        assert enable_cache_kwargs["cache_config"].Fn_compute_blocks == 1
+
+        backend.refresh(mock_pipeline, num_inference_steps=50)
+        mock_cache_dit.refresh_context.assert_called_once()
+        call_args = mock_cache_dit.refresh_context.call_args
+        assert call_args[0][0] is mock_pipeline.transformer
+        assert call_args[1]["num_inference_steps"] == 50
+
+    def test_enable_helios_pipeline_requires_transformer(self):
+        """Test Helios enabler fails when pipeline.transformer is missing."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "HeliosPipeline"
+        mock_pipeline.transformer = None
+
+        backend = CacheDiTBackend({"Fn_compute_blocks": 1})
+
+        with pytest.raises(ValueError, match="pipeline.transformer"):
+            backend.enable(mock_pipeline)
+
+    @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
+    def test_refresh_helios_pipeline_requires_transformer(self, mock_cache_dit, mock_block_adapter):
+        """Test Helios refresh fails when pipeline.transformer is missing."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "HeliosPipeline"
+        mock_pipeline.transformer = Mock()
+        mock_pipeline.transformer.blocks = Mock()
+
+        mock_cache_dit.enable_cache = Mock()
+        mock_cache_dit.refresh_context = Mock()
+
+        backend = CacheDiTBackend({"Fn_compute_blocks": 1})
+        backend.enable(mock_pipeline)
+
+        mock_pipeline.transformer = None
+        with pytest.raises(ValueError, match="pipeline.transformer"):
+            backend.refresh(mock_pipeline, num_inference_steps=50)
 
 
 class TestTeaCacheBackend:

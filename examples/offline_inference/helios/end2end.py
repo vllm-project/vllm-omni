@@ -185,6 +185,20 @@ def parse_args() -> argparse.Namespace:
         help="Quantization method (e.g. 'fp8').",
     )
 
+    # Cache
+    parser.add_argument(
+        "--cache-backend",
+        type=str,
+        default=None,
+        choices=["cache_dit"],
+        help="Cache backend for acceleration (Helios). Default: None.",
+    )
+    parser.add_argument(
+        "--enable-cache-dit-summary",
+        action="store_true",
+        help="Enable cache-dit summary logging after diffusion forward passes.",
+    )
+
     # Memory & parallelism
     parser.add_argument("--vae-use-slicing", action="store_true", help="Enable VAE slicing.")
     parser.add_argument("--vae-use-tiling", action="store_true", help="Enable VAE tiling.")
@@ -202,6 +216,18 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    # Cache-dit config
+    cache_config = None
+    if args.cache_backend == "cache_dit":
+        cache_config = {
+            "Fn_compute_blocks": 1,
+            "Bn_compute_blocks": 0,
+            "max_warmup_steps": 4,
+            "residual_diff_threshold": 0.24,
+            "max_continuous_cached_steps": 3,
+            "force_refresh_step_hint": 50,
+            "force_refresh_step_policy": "repeat",
+        }
 
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
@@ -220,6 +246,9 @@ def main():
         enforce_eager=args.enforce_eager,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         quantization=args.quantization,
+        cache_backend=args.cache_backend,
+        cache_config=cache_config,
+        enable_cache_dit_summary=getattr(args, "enable_cache_dit_summary", False),
     )
 
     # Validate I2V / V2V arguments
