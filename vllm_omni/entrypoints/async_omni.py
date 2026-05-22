@@ -139,7 +139,6 @@ class AsyncOmni(EngineClient, OmniBase):
 
     def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
-        self.request_states = {}
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
         self._is_sleeping: bool = False
