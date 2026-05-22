@@ -36,9 +36,6 @@ def _register_omni_hf_configs() -> None:
         from transformers import AutoConfig
 
         from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
-        from vllm_omni.model_executor.models.eartts.configuration_eartts import (
-            EarTTSConfig,
-        )
         from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
@@ -63,7 +60,6 @@ def _register_omni_hf_configs() -> None:
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm", VoxCPMConfig),
         ("voxcpm2", VoxCPM2Config),
-        ("eartts", EarTTSConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)

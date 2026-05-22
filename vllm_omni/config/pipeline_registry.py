@@ -101,10 +101,6 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.moss_tts_nano.pipeline",
         "MOSS_TTS_NANO_PIPELINE",
     ),
-    "nemotron_voicechat": (
-        "vllm_omni.model_executor.models.nemotron_voicechat.pipeline",
-        "NEMOTRON_VOICECHAT_PIPELINE",
-    ),
 }
 
 # --- Single-stage diffusion pipelines (populated in PR 3/N) ---

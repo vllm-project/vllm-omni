@@ -9,6 +9,21 @@ The Nemotron prefill chunk is driven by a *system prompt string*
 it in-process and constructs the prefill combined embedding itself —
 no pre-computed embedding file is needed.
 
+The NemotronDuplexH + EarTTS model definitions and the
+``nemotron_voicechat`` pipeline live in the external ``nemo_voicechat``
+package (no longer in vllm-omni). Install it (editable is fine) before
+running this script::
+
+    pip install -e /lustre/fsw/portfolios/llmservice/users/vklimkov/may21_workspace/nemo_voicechat_ext
+
+The package declares ``nemo_voicechat.register:register_nemo_voicechat``
+as a ``vllm_omni.general_plugins`` entry point, so registration of the
+models, ``EarTTSConfig``, and the pipeline happens automatically in
+every process — including the spawned ``StageEngineCoreProc`` children.
+PYTHONPATH alone is *not* sufficient: vllm-omni uses ``spawn`` for stage
+children, which gives them a fresh interpreter, and entry-point discovery
+needs the package to be installed.
+
 When ``--profile`` is set the trace is always recorded with
 ``with_stack=True`` and ``record_shapes=True`` and dumped under
 ``./profiler_traces`` (hardcoded — change in code if needed).
@@ -43,7 +58,11 @@ from vllm import SamplingParams
 from vllm.engine.protocol import StreamingInput
 from vllm.sampling_params import RequestOutputKind
 
-from vllm_omni.model_executor.models.nemotron_duplex_h.nemotron_duplex_h import (
+# External package (must be ``pip install``'d so its
+# ``vllm_omni.general_plugins`` entry point is discoverable inside every
+# spawned StageEngineCoreProc — see module docstring above).
+from nemo_voicechat import default_deploy_yaml
+from nemo_voicechat.nemotron_duplex_h.nemotron_duplex_h import (
     NemotronDuplexHForCausalLM,
 )
 
@@ -54,19 +73,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _default_deploy_yaml() -> Path:
-    """Locate the nemotron_voicechat deploy YAML shipped with vllm_omni.
-
-    Resolved from the installed ``vllm_omni`` package rather than ``__file__``
-    so this script keeps working no matter where it's placed (benchmarks/,
-    examples/offline_inference/..., user scratch dirs, etc.).
-    """
-    import vllm_omni
-
-    return Path(vllm_omni.__file__).resolve().parent / "deploy" / "nemotron_voicechat.yaml"
-
-
-DEFAULT_DEPLOY_YAML = _default_deploy_yaml()
+DEFAULT_DEPLOY_YAML = default_deploy_yaml()
 
 TORCH_PROFILER_DIR = Path.cwd() / "profiler_traces"
 
@@ -142,7 +149,18 @@ def _load_inputs(
     t_prefill = NemotronDuplexHForCausalLM.compute_prefix_len(nemotron_tokenizer, system_prompt)
 
     pkg = torch.load(acoustic_path, weights_only=False, map_location="cpu")
-    acoustic_embeddings = pkg["acoustic_embeddings"].to(torch.float32).contiguous()
+    if "acoustic_embeddings" in pkg:
+        acoustic_embeddings = pkg["acoustic_embeddings"]
+    elif "input_embeds" in pkg:
+        acoustic_embeddings = pkg["input_embeds"]
+    else:
+        raise KeyError(
+            f"Expected 'acoustic_embeddings' or 'input_embeds' in {acoustic_path}, "
+            f"found keys: {sorted(pkg.keys())}"
+        )
+    acoustic_embeddings = acoustic_embeddings.to(torch.float32).contiguous()
+    if acoustic_embeddings.ndim == 3:
+        acoustic_embeddings = acoustic_embeddings[0]
     n_decode = int(acoustic_embeddings.shape[0])
 
     if speaker_latent_path is None:
@@ -313,6 +331,10 @@ async def run_streaming_request(
 
 
 async def main(args):
+    # No explicit ``register_nemo_voicechat()`` call needed: the
+    # ``nemo-voicechat`` package declares it as a ``vllm_omni.general_plugins``
+    # entry point, so vllm-omni loads it automatically in every process
+    # (orchestrator + each spawned stage child).
     from vllm_omni import AsyncOmni
 
     ckpt_dir = Path(args.ckpt_dir).expanduser().resolve()

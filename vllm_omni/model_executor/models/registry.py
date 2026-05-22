@@ -180,19 +180,6 @@ _OMNI_MODELS = {
         "modeling_moss_tts_nano",
         "MossTTSNanoForGeneration",
     ),
-    ## EarTTS
-    "EarTTSForCausalLM": (
-        "eartts",
-        "eartts",
-        "EarTTSForCausalLM",
-    ),
-    ## NemotronDuplexH (NemotronH + ASR head, used as the LLM stage in the
-    ## Nemotron + EarTTS S2S pipeline).
-    "NemotronDuplexHForCausalLM": (
-        "nemotron_duplex_h",
-        "nemotron_duplex_h",
-        "NemotronDuplexHForCausalLM",
-    ),
     "DyninOmniForConditionalGeneration": (
         "dynin_omni",
         "dynin_omni",
