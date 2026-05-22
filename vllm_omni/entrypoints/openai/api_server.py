@@ -632,6 +632,7 @@ async def omni_init_app_state(
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
+        state.sleeping_stages: set[int] = set()
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
         return
 
@@ -2931,9 +2932,11 @@ class OmniWakeupRequest(BaseModel):
 @router.post("/v1/omni/sleep")
 async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
     engine_client = raw_request.app.state.engine_client
-    sleeping_set = raw_request.app.state.sleeping_stages
     if not hasattr(engine_client, "sleep"):
         raise HTTPException(status_code=501, detail="Engine does not support sleep")
+    sleeping_set: set[int] = getattr(raw_request.app.state, "sleeping_stages", None)  # type: ignore[assignment]
+    if sleeping_set is None:
+        raise HTTPException(status_code=501, detail="Sleep/wakeup is not available for this engine configuration")
     acks = await engine_client.sleep(stage_ids=request.stage_ids, level=request.level)
     for sid in request.stage_ids:
         sleeping_set.add(sid)
@@ -2943,11 +2946,13 @@ async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
 @router.post("/v1/omni/wakeup")
 async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
     engine_client = raw_request.app.state.engine_client
-    sleeping_set = raw_request.app.state.sleeping_stages
-    if not any(sid in sleeping_set for sid in request.stage_ids):
-        return {"status": "SKIPPED", "reason": "Target stages are not sleeping."}
     if not hasattr(engine_client, "wake_up"):
         raise HTTPException(status_code=501, detail="Engine does not support wake_up")
+    sleeping_set: set[int] = getattr(raw_request.app.state, "sleeping_stages", None)  # type: ignore[assignment]
+    if sleeping_set is None:
+        raise HTTPException(status_code=501, detail="Sleep/wakeup is not available for this engine configuration")
+    if not any(sid in sleeping_set for sid in request.stage_ids):
+        return {"status": "SKIPPED", "reason": "Target stages are not sleeping."}
     acks = await engine_client.wake_up(stage_ids=request.stage_ids)
     for sid in request.stage_ids:
         if sid in sleeping_set:
