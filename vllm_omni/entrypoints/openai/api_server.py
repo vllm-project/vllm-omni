@@ -1539,10 +1539,6 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 extra_body["use_system_prompt"] = request.use_system_prompt
             if request.system_prompt is not None:
                 extra_body["system_prompt"] = request.system_prompt
-            if request.model_extra:
-                for k, v in request.model_extra.items():
-                    if v is not None and k not in extra_body:
-                        extra_body[k] = v
 
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=request.prompt,
@@ -1571,10 +1567,6 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             extra_args["system_prompt"] = request.system_prompt
         if request.bot_task is not None:
             extra_args["bot_task"] = request.bot_task
-        if request.model_extra:
-            for k, v in request.model_extra.items():
-                if v is not None and k not in extra_args:
-                    extra_args[k] = v
         if extra_args:
             gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
