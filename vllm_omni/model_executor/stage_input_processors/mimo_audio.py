@@ -173,7 +173,12 @@ def llm2code2wav_async_chunk(
 
     request_id = getattr(request, "external_req_id", None)
 
-    po_codes = pooling_output.get("codes", {})
+    # Text-only paths (e.g. modalities=["text"]) yield no codec pooling output;
+    # stage-0 still drives the chunk transfer adapter, so treat None as "no codes
+    # this step" rather than letting `.get()` raise AttributeError — an unhandled
+    # error here drops the chunk, starves stage-1 of the finished payload, and
+    # the stage subprocesses die before the final token is emitted.
+    po_codes = pooling_output.get("codes", {}) if pooling_output is not None else {}
     if "audio" not in po_codes:
         if is_finished:
             return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
