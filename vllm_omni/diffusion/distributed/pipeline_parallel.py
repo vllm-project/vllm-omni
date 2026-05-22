@@ -15,6 +15,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_pp_group,
     is_pipeline_first_stage,
 )
+from vllm_omni.diffusion.distributed.pipefusion.pipefusion_runtime import set_pipefusion_cache_key_if_initialized
 
 
 class AsyncLatents:
@@ -184,6 +185,8 @@ class PipelineParallelMixin:
         negative_kwargs: dict[str, Any] | None,
         cfg_normalize: bool = True,
         output_slice: int | None = None,
+        skip_sync: bool = False,
+        inter_comm_ids: list[str] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
         """
         Drop-in replacement for predict_noise_maybe_with_cfg that also handles PP.
@@ -205,34 +208,49 @@ class PipelineParallelMixin:
                 do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs, cfg_normalize, output_slice
             )
 
-        self._sync_pp_send()
+        # skip_sync: when processing a sequence in patches, deferring the sync
+        # allows inter-stage sends of one patch to overlap with compute on the next.
+        if not skip_sync:
+            self._sync_pp_send()
 
         pp_group = get_pp_group()
 
         cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
         if cfg_parallel_ready:
             # Each PP pipeline carries exactly one CFG branch determined by cfg_rank.
-            all_kwargs = [positive_kwargs if get_classifier_free_guidance_rank() == 0 else negative_kwargs]
+            cfg_rank = get_classifier_free_guidance_rank()
+            all_kwargs = [positive_kwargs if cfg_rank == 0 else negative_kwargs]
+            # keep the branch name for PipeFusion to cache KV values
+            cache_keys = ["inputs" if cfg_rank == 0 else "inputs_uncond"]
         else:
             # Sequential CFG (or no CFG): this PP pipeline handles all branches.
             all_kwargs = [positive_kwargs] + ([negative_kwargs] if do_true_cfg else [])
+            # keep the branch name for PipeFusion to cache KV values
+            cache_keys = ["inputs"] + (["inputs_uncond"] if do_true_cfg else [])
 
         # Non-first ranks receive intermediate tensors asynchronously
         n = len(all_kwargs)
+        if inter_comm_ids is None:
+            inter_comm_ids = [None] * n
+        if len(inter_comm_ids) != n:
+            raise ValueError(f"inter_comm_ids has length {len(inter_comm_ids)} but expected {n}")
         its: list[AsyncIntermediateTensors | None] = [None] * n
         if not pp_group.is_first_rank:
-            for i in range(n):
-                its[i] = AsyncIntermediateTensors(*pp_group.irecv_tensor_dict())
+            its = [AsyncIntermediateTensors(*pp_group.irecv_tensor_dict(comm_id=inter_comm_ids[i])) for i in range(n)]
 
         if not pp_group.is_last_rank:
             # First / middle rank: run partial forwards and propagate ITs downstream.
-            for kwargs, it in zip(all_kwargs, its):
+            for kwargs, it, cid, cache_key in zip(all_kwargs, its, inter_comm_ids, cache_keys):
+                set_pipefusion_cache_key_if_initialized(cache_key)
                 result = self.predict_noise(**kwargs, intermediate_tensors=it)
-                self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
+                self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors, comm_id=cid))
             return None
 
         # Last rank: run full forward
-        noise_preds = [self.predict_noise(**kwargs, intermediate_tensors=it) for kwargs, it in zip(all_kwargs, its)]
+        noise_preds = []
+        for kwargs, it, cache_key in zip(all_kwargs, its, cache_keys):
+            set_pipefusion_cache_key_if_initialized(cache_key)
+            noise_preds.append(self.predict_noise(**kwargs, intermediate_tensors=it))
 
         if cfg_parallel_ready:
             # All-gather the single-branch prediction across the CFG group and combine
@@ -263,6 +281,7 @@ class PipelineParallelMixin:
         do_true_cfg: bool,
         per_request_scheduler: Any | None = None,
         generator: torch.Generator | None = None,
+        loopback_comm_id: str | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | AsyncLatents:
         """
         Drop-in replacement for scheduler_step_maybe_with_cfg that also handles PP.
@@ -285,7 +304,7 @@ class PipelineParallelMixin:
             latents = super().scheduler_step_maybe_with_cfg(
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
             )
-            self._pp_send_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)
+            self._pp_send_work.extend(pp_group.isend_tensor_dict({"latents": latents}, dst=0, comm_id=loopback_comm_id))
         elif pp_group.is_first_rank:
-            latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
+            latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1, comm_id=loopback_comm_id))
         return latents
