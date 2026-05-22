@@ -10,7 +10,7 @@ for text-to-image generation, with vllm-omni specific extensions.
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 
@@ -173,5 +173,5 @@ class ImageGenerationResponse(BaseModel):
     cot_output: str | None = Field(
         None,
         description="Chain-of-thought text output from the AR stage. "
-                    "Only present for image editing (IT2I) with CoT-enabled models."
+        "Only present for image editing (IT2I) with CoT-enabled models.",
     )
