@@ -2537,10 +2537,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 flat_images.append(item)
 
-        if cot_output is not None:
-            stage_durations["cot_output"] = cot_output
-
-        return flat_images, stage_durations, peak_memory_mb
+        return flat_images, stage_durations, peak_memory_mb, cot_output
 
     async def _create_diffusion_chat_completion(
         self,
