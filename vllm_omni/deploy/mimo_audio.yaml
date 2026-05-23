@@ -1,3 +1,4 @@
+
 # MiMo Audio deploy: 2-stage thinker+talker → code2wav.
 #
 # Default mode is async-chunk streaming on a single GPU (both stages on
@@ -17,8 +18,8 @@ connectors:
       connector_get_sleep_s: 0.001
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      codec_chunk_frames: 3
-      codec_left_context_frames: 3
+      codec_chunk_frames: 30
+      codec_left_context_frames: 40
 
 stages:
   - stage_id: 0

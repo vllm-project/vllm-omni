@@ -9,10 +9,13 @@ import json
 import os
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
@@ -67,14 +70,20 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return {}
 
 
-def create_transformer_from_config(config: dict) -> LTX2VideoTransformer3DModel:
+def create_transformer_from_config(
+    config: dict,
+    quant_config: QuantizationConfig | None = None,
+) -> LTX2VideoTransformer3DModel:
     """Create LTX2VideoTransformer3DModel from config dict."""
-    if not config:
+    if not config and quant_config is None:
         return LTX2VideoTransformer3DModel()
 
     signature = inspect.signature(LTX2VideoTransformer3DModel.__init__)
     allowed_keys = set(signature.parameters.keys())
     kwargs = {k: v for k, v in config.items() if k in allowed_keys}
+    if quant_config is not None:
+        kwargs["quant_config"] = quant_config
+
     return LTX2VideoTransformer3DModel(**kwargs)
 
 
@@ -214,7 +223,8 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         ).to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        self.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only

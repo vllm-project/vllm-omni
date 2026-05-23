@@ -143,6 +143,18 @@ QUALITY_CONFIGS = [
         seed=142,
         num_inference_steps=20,
     ),
+    QualityTestConfig(
+        id="fp8_ltx2",
+        model="Lightricks/LTX-2",
+        quantization="fp8",
+        task="t2v",
+        prompt="A serene lakeside sunrise with mist over the water",
+        max_lpips=0.10,
+        height=256,
+        width=256,
+        num_frames=25,
+        num_inference_steps=8,
+    ),
 ]
 
 
@@ -261,8 +273,17 @@ def _generate_video(omni, config: QualityTestConfig):
         else:
             frames = inner
     elif hasattr(first, "images") and first.images:
-        frames = first.images
+        frames = first.images[0]
     else:
+        raise ValueError("Could not extract video frames from output.")
+
+    # LTX-2 (audio+video) may surface (video, audio) tuples or {"video": ...} dicts
+    if isinstance(frames, dict):
+        frames = frames.get("video") or frames.get("frames")
+    elif isinstance(frames, tuple) and len(frames) == 2:
+        frames = frames[0]
+
+    if frames is None:
         raise ValueError("Could not extract video frames from output.")
 
     if isinstance(frames, torch.Tensor):
@@ -275,7 +296,11 @@ def _generate_video(omni, config: QualityTestConfig):
             video = video.clamp(-1, 1) * 0.5 + 0.5
         return video.float().numpy(), peak_mem
 
-    return np.asarray(frames), peak_mem
+    frames_array = np.asarray(frames)
+    if frames_array.ndim == 5:
+        # strip the leading batch dim
+        frames_array = frames_array[0]
+    return frames_array, peak_mem
 
 
 def _compute_lpips(baseline, quantized, task: str) -> float:
@@ -318,8 +343,7 @@ def _compute_psnr_and_mae(baseline, quantized, task: str) -> tuple[float, float]
     return psnr, mae
 
 
-def _unload(omni):
-    del omni
+def _free_gpu_memory():
     gc.collect()
     if torch.cuda.is_available():
         torch.accelerator.empty_cache()
@@ -395,7 +419,9 @@ def test_quantization_quality(config: QualityTestConfig):
     # --- BF16 baseline ---
     omni_bl = Omni(model=config.baseline_ref())
     baseline_out, bl_mem = generate_fn(omni_bl, config)
-    _unload(omni_bl)
+    omni_bl.shutdown()
+    del omni_bl
+    _free_gpu_memory()
     _maybe_save_output(_OUTPUT_DIR, config, "baseline", baseline_out)
 
     # --- Quantized ---
@@ -405,7 +431,9 @@ def test_quantization_quality(config: QualityTestConfig):
     else:
         omni_qt = Omni(model=config.quantized_ref(), quantization_config=quantization)
     quant_out, qt_mem = generate_fn(omni_qt, config)
-    _unload(omni_qt)
+    omni_qt.shutdown()
+    del omni_qt
+    _free_gpu_memory()
     _maybe_save_output(_OUTPUT_DIR, config, "quantized", quant_out)
 
     # --- Similarity metrics ---

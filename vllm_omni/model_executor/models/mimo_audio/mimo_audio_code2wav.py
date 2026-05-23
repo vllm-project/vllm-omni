@@ -26,6 +26,13 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = logging.getLogger(__name__)
 
+# Minimum safe values for codec streaming parameters.  Mirrors the constants
+# in stage_input_processors/mimo_audio.py — keep in sync.
+_MIN_CODEC_CHUNK_FRAMES = 3
+_MIN_CODEC_LEFT_CONTEXT_FRAMES = 40  # must cover vocoder_attn_window_size[0]
+_DEFAULT_CODEC_CHUNK_FRAMES = 10
+_DEFAULT_CODEC_LEFT_CONTEXT_FRAMES = 40
+
 
 def flat_codec_group_element_count(group_size: int, audio_channels: int) -> int:
     """Flat token count for one MiMo talker codec group on the code2wav wire.
@@ -485,12 +492,37 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             if connector_cfg
             else None
         )
-        self._codec_chunk_frames = int(extra_cfg.get("codec_chunk_frames", 3)) if isinstance(extra_cfg, dict) else 3
-        if self._codec_chunk_frames <= 0:
-            raise ValueError(f"codec_chunk_frames must be positive, got {self._codec_chunk_frames}")
-        self._codec_left_context_frames = (
-            int(extra_cfg.get("codec_left_context_frames", 3)) if isinstance(extra_cfg, dict) else 3
+        raw_chunk = (
+            int(extra_cfg.get("codec_chunk_frames", _DEFAULT_CODEC_CHUNK_FRAMES))
+            if isinstance(extra_cfg, dict)
+            else _DEFAULT_CODEC_CHUNK_FRAMES
         )
+        if raw_chunk < _MIN_CODEC_CHUNK_FRAMES:
+            logger.warning(
+                "codec_chunk_frames=%d is below minimum %d; falling back to %d.",
+                raw_chunk,
+                _MIN_CODEC_CHUNK_FRAMES,
+                _DEFAULT_CODEC_CHUNK_FRAMES,
+            )
+            raw_chunk = _DEFAULT_CODEC_CHUNK_FRAMES
+        self._codec_chunk_frames = raw_chunk
+
+        raw_left = (
+            int(extra_cfg.get("codec_left_context_frames", _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES))
+            if isinstance(extra_cfg, dict)
+            else _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES
+        )
+        if raw_left < _MIN_CODEC_LEFT_CONTEXT_FRAMES:
+            logger.warning(
+                "codec_left_context_frames=%d is below minimum %d (must cover vocoder attention "
+                "window %s); falling back to %d to prevent voice instability.",
+                raw_left,
+                _MIN_CODEC_LEFT_CONTEXT_FRAMES,
+                getattr(self.config, "vocoder_attn_window_size", [40, 10]),
+                _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES,
+            )
+            raw_left = _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES
+        self._codec_left_context_frames = raw_left
 
     def load_weights(
         self,

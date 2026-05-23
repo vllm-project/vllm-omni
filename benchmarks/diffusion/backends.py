@@ -10,6 +10,8 @@ from typing import Any
 import aiohttp
 from tqdm import tqdm
 
+DEFAULT_EDITS_BOT_TASK = "think"
+
 
 @dataclass
 class RequestFuncInput:
@@ -27,6 +29,7 @@ class RequestFuncInput:
     extra_body: dict[str, Any] = field(default_factory=dict)
     image_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    default_bot_task: str | None = DEFAULT_EDITS_BOT_TASK
 
 
 @dataclass
@@ -51,6 +54,95 @@ def _encode_image_as_data_url(path: str) -> str:
         encoded = base64.b64encode(f.read()).decode("utf-8")
     mime = _guess_mime_type(path)
     return f"data:{mime};base64,{encoded}"
+
+
+async def async_request_image_edits(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+    enable_diffusion_pipeline_profiler: bool = False,
+) -> RequestFuncOutput:
+    """POST /v1/images/edits (multipart)."""
+    del enable_diffusion_pipeline_profiler
+    output = RequestFuncOutput()
+    output.start_time = time.perf_counter()
+
+    extra_body = dict(input.extra_body)
+    width = input.width or extra_body.get("width") or 1024
+    height = input.height or extra_body.get("height") or 1024
+    edits_url = input.api_url
+
+    form = aiohttp.FormData()
+    form.add_field("model", input.model)
+    form.add_field("prompt", input.prompt)
+    form.add_field("size", f"{width}x{height}")
+    form.add_field("response_format", "b64_json")
+
+    if input.num_inference_steps is not None:
+        form.add_field("num_inference_steps", str(input.num_inference_steps))
+    elif extra_body.get("num_inference_steps") is not None:
+        form.add_field("num_inference_steps", str(extra_body["num_inference_steps"]))
+
+    if input.seed is not None:
+        form.add_field("seed", str(input.seed))
+    elif extra_body.get("seed") is not None:
+        form.add_field("seed", str(extra_body["seed"]))
+
+    if extra_body.get("guidance_scale") is not None:
+        form.add_field("guidance_scale", str(extra_body["guidance_scale"]))
+    if extra_body.get("negative_prompt") is not None:
+        form.add_field("negative_prompt", str(extra_body["negative_prompt"]))
+    if extra_body.get("true_cfg_scale") is not None:
+        form.add_field("true_cfg_scale", str(extra_body["true_cfg_scale"]))
+    if extra_body.get("sys_type") is not None:
+        form.add_field("sys_type", str(extra_body["sys_type"]))
+    if extra_body.get("system_prompt") is not None:
+        form.add_field("system_prompt", str(extra_body["system_prompt"]))
+
+    bot_task = extra_body.get("bot_task")
+    if bot_task is None and input.default_bot_task is not None:
+        bot_task = input.default_bot_task
+    if bot_task is not None:
+        form.add_field("bot_task", str(bot_task))
+
+    assert input.image_paths is not None
+    for img_path in input.image_paths:
+        if not os.path.exists(img_path):
+            output.error = f"Image file not found: {img_path}"
+            output.success = False
+            if pbar:
+                pbar.update(1)
+            return output
+        with open(img_path, "rb") as img_f:
+            image_bytes = img_f.read()
+        form.add_field(
+            "image",
+            image_bytes,
+            filename=os.path.basename(img_path),
+            content_type=_guess_mime_type(img_path),
+        )
+
+    try:
+        async with session.post(edits_url, data=form) as response:
+            if response.status == 200:
+                resp_json = await response.json()
+                output.response_body = resp_json
+                output.success = True
+            else:
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+    except Exception as e:
+        output.error = str(e)
+        output.success = False
+
+    output.latency = time.perf_counter() - output.start_time
+
+    if output.success and input.slo_ms is not None:
+        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
+
+    if pbar:
+        pbar.update(1)
+    return output
 
 
 async def async_request_chat_completions(
@@ -378,6 +470,7 @@ backends_function_mapping = {
     "2i": {
         "/v1/chat/completions": (async_request_chat_completions, "/v1/chat/completions"),
         "/v1/images/generations": (async_request_openai_image_generations, "/v1/images/generations"),
+        "/v1/images/edits": (async_request_image_edits, "/v1/images/edits"),
     },
     "2v": {
         "/v1/videos": (async_request_v1_videos, "/v1/videos"),
