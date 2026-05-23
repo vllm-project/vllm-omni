@@ -80,7 +80,7 @@ class StageRuntimeInfo:
 
 @dataclass
 class StageRemoteFactoryContext:
-    """Per-stage context for dynamic replica attach (distributed mode only)."""
+    """Per-stage context for creating head-side clients for remote replicas."""
 
     stage_id: int
     stage_type: str
@@ -433,7 +433,7 @@ class StageRuntime:
         stage_plans: Sequence[LogicalStageInitPlan],
         stage_init_timeout: int,
     ) -> dict[int, list[StagePoolClient | None]]:
-        """Initialize all stage replicas (diffusion inline, LLM parallel).
+        """Initialize all stage replicas.
 
         Stages sharing the same GPU are initialized sequentially to avoid
         memory profiling interference. Stages on different GPUs are
@@ -445,64 +445,44 @@ class StageRuntime:
         }
         primary_exc: Exception | None = None
 
-        diffusion_replicas: list[tuple[int, ReplicaInitPlan]] = []
-        llm_replicas: list[tuple[int, ReplicaInitPlan]] = []
+        init_groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
         for plan in stage_plans:
             for replica in plan.replicas:
-                if replica.metadata.stage_type == "diffusion":
-                    diffusion_replicas.append((plan.stage_idx, replica))
-                else:
-                    llm_replicas.append((plan.stage_idx, replica))
+                init_groups.setdefault(self._replica_init_group_key(replica), []).append((plan.stage_idx, replica))
 
-        for stage_idx, replica in diffusion_replicas:
-            try:
-                initialized_clients_by_stage[stage_idx][replica.replica_id] = self._initialize_replica(
-                    replica, stage_init_timeout, stage_launch_lock
-                )
-            except Exception as exc:
-                primary_exc = exc
-                break
+        def _init_group(group: list[tuple[int, ReplicaInitPlan]]) -> None:
+            """Initialize replicas in one scheduling group sequentially."""
+            nonlocal primary_exc
+            for stage_idx, replica in group:
+                if primary_exc is not None:
+                    return
+                try:
+                    client = self._initialize_replica(
+                        replica,
+                        stage_init_timeout,
+                        stage_launch_lock,
+                    )
+                    initialized_clients_by_stage[stage_idx][replica.replica_id] = client
+                except Exception as exc:
+                    if primary_exc is None:
+                        primary_exc = exc
+                    return
 
-        if primary_exc is None and llm_replicas:
-            # Group replicas by device so co-located stages init sequentially.
-            device_groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
-            for stage_idx, replica in llm_replicas:
-                runtime_cfg = replica.metadata.runtime_cfg or {}
-                devices_key = str(
-                    runtime_cfg.get("devices") if hasattr(runtime_cfg, "get")
-                    else getattr(runtime_cfg, "devices", None)
-                )
-                device_groups.setdefault(devices_key, []).append((stage_idx, replica))
+        inline_keys = [key for key in init_groups if key.startswith("inline:")]
+        for key in inline_keys:
+            _init_group(init_groups.pop(key))
 
-            def _init_device_group(group: list[tuple[int, ReplicaInitPlan]]) -> None:
-                """Initialize replicas in a device group sequentially."""
-                nonlocal primary_exc
-                for stage_idx, replica in group:
-                    if primary_exc is not None:
-                        return
-                    try:
-                        client = self._initialize_replica(
-                            replica, stage_init_timeout, stage_launch_lock
-                        )
-                        initialized_clients_by_stage[stage_idx][replica.replica_id] = client
-                    except Exception as exc:
-                        if primary_exc is None:
-                            primary_exc = exc
-                        return
-
-            if len(device_groups) == 1:
-                # All on same device — just run sequentially
-                _init_device_group(list(device_groups.values())[0])
+        if primary_exc is None and init_groups:
+            if len(init_groups) == 1:
+                _init_group(next(iter(init_groups.values())))
             else:
-                # Different devices can init in parallel
                 future_to_group: dict[concurrent.futures.Future[None], str] = {}
                 with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=len(device_groups),
+                    max_workers=len(init_groups),
                     thread_name_prefix="stage-init",
                 ) as init_executor:
-                    for dev_key, group in device_groups.items():
-                        future = init_executor.submit(_init_device_group, group)
-                        future_to_group[future] = dev_key
+                    for group_key, group in init_groups.items():
+                        future_to_group[init_executor.submit(_init_group, group)] = group_key
 
                     for future in concurrent.futures.as_completed(future_to_group):
                         try:
@@ -517,79 +497,88 @@ class StageRuntime:
 
         return initialized_clients_by_stage
 
+    def _replica_init_group_key(self, replica: ReplicaInitPlan) -> str:
+        """Return the scheduling group used during replica initialization."""
+        if replica.launch_mode == "local" and replica.metadata.stage_type == "diffusion":
+            # Local diffusion process spawning must stay on the orchestrator
+            # thread. Keep all local diffusion replicas in one sequential group.
+            return "inline:diffusion"
+
+        runtime_cfg = replica.metadata.runtime_cfg or {}
+        devices = runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
+        return f"device:{devices}"
+
     def _initialize_replica(
         self,
         plan: ReplicaInitPlan,
         stage_init_timeout: int,
         stage_launch_lock: threading.Lock,
     ) -> StagePoolClient:
+        if plan.launch_mode == "remote":
+            return self._initialize_remote_replica(plan, stage_init_timeout)
         if plan.metadata.stage_type == "diffusion":
-            return self._initialize_diffusion_replica(plan, stage_init_timeout, stage_launch_lock)
-        return self._initialize_llm_replica(plan, stage_init_timeout, stage_launch_lock)
+            return self._initialize_local_diffusion_replica(plan, stage_init_timeout, stage_launch_lock)
+        return self._initialize_local_llm_replica(plan, stage_init_timeout, stage_launch_lock)
 
-    def _initialize_llm_replica(
+    def _initialize_remote_replica(
+        self,
+        plan: ReplicaInitPlan,
+        stage_init_timeout: int,
+    ) -> StagePoolClient:
+        """Initialize a remote replica. Only distributed runtime implements this."""
+        raise NotImplementedError("Remote replicas require DistStageRuntime")
+
+    def _initialize_local_llm_replica(
         self,
         plan: ReplicaInitPlan,
         stage_init_timeout: int,
         llm_stage_launch_lock: threading.Lock,
     ) -> StageEngineCoreClientBase:
-        """Initialize one LLM replica using vLLM's launch_core_engines pattern."""
+        """Initialize one local LLM replica using vLLM's launch/attach pattern."""
         proc = None
         engine_manager = None
         coordinator = None
         stage_client = None
         lock_fds: list[int] = []
         try:
-            if plan.launch_mode == "remote":
-                stage_client = self._initialize_llm_replica_remote(plan, stage_init_timeout)
-            else:
-                with llm_stage_launch_lock:
-                    with self._local_llm_launch_scope(
-                        plan,
-                        stage_init_timeout,
-                    ) as prepared:
-                        vllm_config, executor_class, lock_fds = prepared
-                        with launch_stage_replica(
-                            vllm_config=vllm_config,
-                            executor_class=executor_class,
-                            log_stats=False,
-                            stage_id=plan.metadata.stage_id,
-                            replica_id=plan.replica_id,
-                            stage_config=plan.stage_cfg,
-                            omni_master_server=self._get_omni_master_server(),
-                            omni_coordinator_address=self._get_coordinator_address(),
-                        ) as resources:
-                            engine_manager, coordinator, addresses = resources
+            with llm_stage_launch_lock:
+                with self._local_llm_launch_scope(
+                    plan,
+                    stage_init_timeout,
+                ) as prepared:
+                    vllm_config, executor_class, lock_fds = prepared
+                    with launch_stage_replica(
+                        vllm_config=vllm_config,
+                        executor_class=executor_class,
+                        log_stats=False,
+                        stage_id=plan.metadata.stage_id,
+                        replica_id=plan.replica_id,
+                        stage_config=plan.stage_cfg,
+                        omni_master_server=self._get_omni_master_server(),
+                        omni_coordinator_address=self._get_coordinator_address(),
+                    ) as resources:
+                        engine_manager, coordinator, addresses = resources
 
-                logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
-                stage_client = StageEngineCoreClientBase.make_async_mp_client(
-                    vllm_config=vllm_config,
-                    executor_class=executor_class,
-                    metadata=plan.metadata,
-                    client_addresses=self._client_addresses_from_zmq(addresses),
-                    engine_manager=engine_manager,
-                    coordinator=coordinator,
-                )
+            logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
+            stage_client = StageEngineCoreClientBase.make_async_mp_client(
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                metadata=plan.metadata,
+                client_addresses=self._client_addresses_from_zmq(addresses),
+                engine_manager=engine_manager,
+                coordinator=coordinator,
+            )
 
             logger.info("[StageRuntime] Stage %s initialized", plan.metadata.stage_id)
             return stage_client
         except Exception:
-            if stage_client is not None:
-                try:
-                    stage_client.shutdown()
-                except Exception as cleanup_error:
-                    logger.warning(
-                        "[StageRuntime] Failed to cleanup stage %s after attach failure: %s",
-                        plan.metadata.stage_id,
-                        cleanup_error,
-                    )
-            else:
-                self._cleanup_launched_llm_resources(
-                    stage_id=plan.metadata.stage_id,
-                    proc=proc,
-                    engine_manager=engine_manager,
-                    coordinator=coordinator,
-                )
+            self._cleanup_failed_replica_init(
+                stage_id=plan.metadata.stage_id,
+                stage_client=stage_client,
+                proc=proc,
+                engine_manager=engine_manager,
+                coordinator=coordinator,
+            )
             raise
         finally:
             if lock_fds:
@@ -603,47 +592,66 @@ class StageRuntime:
         """Return the master server for local distributed launches, if any."""
         return None
 
-    def _initialize_llm_replica_remote(
+    def _cleanup_failed_replica_init(
         self,
-        plan: ReplicaInitPlan,
-        stage_init_timeout: int,
-    ) -> StageEngineCoreClientBase:
-        """Initialize a remote LLM replica. Only used in distributed mode."""
-        raise NotImplementedError("Remote replicas require DistStageRuntime")
+        *,
+        stage_id: int,
+        stage_client: Any = None,
+        proc: Any = None,
+        engine_manager: Any = None,
+        coordinator: Any = None,
+    ) -> None:
+        """Best-effort cleanup when client creation or launch fails."""
+        if stage_client is not None:
+            try:
+                stage_client.shutdown()
+            except Exception as cleanup_error:
+                logger.warning(
+                    "[StageRuntime] Failed to cleanup stage %s after init failure: %s",
+                    stage_id,
+                    cleanup_error,
+                )
+            return
 
-    def _initialize_diffusion_replica(
+        if proc is not None:
+            terminate_alive_proc(proc)
+
+        self._cleanup_launched_llm_resources(
+            stage_id=stage_id,
+            engine_manager=engine_manager,
+            coordinator=coordinator,
+        )
+
+    def _initialize_local_diffusion_replica(
         self,
         plan: ReplicaInitPlan,
         stage_init_timeout: int,
         stage_launch_lock: threading.Lock,
     ) -> Any:
-        """Initialize one diffusion replica end-to-end."""
+        """Initialize one local diffusion replica end-to-end."""
         client = None
         proc = None
         lock_fds: list[int] = []
         try:
-            if plan.launch_mode == "remote":
-                client = self._initialize_diffusion_replica_remote(plan, stage_init_timeout)
-            else:
-                with stage_launch_lock:
-                    with self._stage_device_scope(plan.metadata.stage_id, plan.metadata.runtime_cfg):
-                        omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
-                        if omni_conn_cfg:
-                            inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                        inject_kv_stage_info(
-                            plan.stage_cfg, plan.metadata.stage_id, self._stage_configs
-                        )
-                        client, proc, lock_fds = launch_diffusion_stage_replica(
-                            model=self._model,
-                            stage_config=plan.stage_cfg,
-                            metadata=plan.metadata,
-                            stage_init_timeout=stage_init_timeout,
-                            batch_size=self._diffusion_batch_size,
-                            use_inline=self._num_stages == 1 and plan.num_replicas == 1,
-                            replica_id=plan.replica_id,
-                            omni_master_server=self._get_omni_master_server(),
-                            omni_coordinator_address=self._get_coordinator_address(),
-                        )
+            with stage_launch_lock:
+                with self._stage_device_scope(plan.metadata.stage_id, plan.metadata.runtime_cfg):
+                    omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
+                    if omni_conn_cfg:
+                        inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
+                    inject_kv_stage_info(
+                        plan.stage_cfg, plan.metadata.stage_id, self._stage_configs
+                    )
+                    client, proc, lock_fds = launch_diffusion_stage_replica(
+                        model=self._model,
+                        stage_config=plan.stage_cfg,
+                        metadata=plan.metadata,
+                        stage_init_timeout=stage_init_timeout,
+                        batch_size=self._diffusion_batch_size,
+                        use_inline=self._num_stages == 1 and plan.num_replicas == 1,
+                        replica_id=plan.replica_id,
+                        omni_master_server=self._get_omni_master_server(),
+                        omni_coordinator_address=self._get_coordinator_address(),
+                    )
 
             logger.info(
                 "[StageRuntime] Stage %s replica %s initialized (diffusion, batch_size=%d)",
@@ -651,20 +659,15 @@ class StageRuntime:
             )
             return client
         except Exception:
-            if proc is not None:
-                terminate_alive_proc(proc)
+            self._cleanup_failed_replica_init(
+                stage_id=plan.metadata.stage_id,
+                stage_client=client,
+                proc=proc,
+            )
             raise
         finally:
             if lock_fds:
                 release_device_locks(lock_fds)
-
-    def _initialize_diffusion_replica_remote(
-        self,
-        plan: ReplicaInitPlan,
-        stage_init_timeout: int,
-    ) -> Any:
-        """Initialize a remote diffusion replica. Only used in distributed mode."""
-        raise NotImplementedError("Remote replicas require DistStageRuntime")
 
     def _assemble_stage_pools(
         self,
@@ -791,8 +794,8 @@ class DistStageRuntime(StageRuntime):
     def initialize(self) -> None:
         """Run the full distributed stage initialization sequence."""
         stage_plans = self._prepare_stage_plans()
-        self._stage_remote_factory_contexts = self._capture_stage_factory_contexts(stage_plans)
         self._start_omni_master_server(stage_plans)
+        self._stage_remote_factory_contexts = self._capture_stage_factory_contexts(stage_plans)
         initialized_clients_by_stage: dict[int, list[StagePoolClient | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
@@ -848,75 +851,37 @@ class DistStageRuntime(StageRuntime):
     def _get_omni_master_server(self) -> OmniMasterServer | None:
         return self._omni_master_server
 
-    def _initialize_llm_replica_remote(
+    def _initialize_remote_replica(
         self,
         plan: ReplicaInitPlan,
         stage_init_timeout: int,
-    ) -> StageEngineCoreClientBase:
-        """Initialize a remote LLM replica via OmniMasterServer handshake."""
+    ) -> StagePoolClient:
+        """Wait for a configured remote replica and create its head-side client."""
         assert self._omni_master_server is not None
-        engine_manager = None
-        coordinator = None
-        try:
-            raw_stage_cfg = self._omni_master_server.get_stage_config(
-                plan.metadata.stage_id, timeout_s=stage_init_timeout, replica_id=plan.replica_id
-            )
-            if raw_stage_cfg is None:
-                raise ValueError(f"Remote stage {plan.metadata.stage_id} registered without stage config")
-            vllm_config = plan.stage_vllm_config
-            executor_class = plan.executor_class
-            assert vllm_config is not None
-            assert executor_class is not None
-            logger.info("[DistStageRuntime] Stage %s remote engine handshake started", plan.metadata.stage_id)
-            engine_manager, coordinator, addresses = self._connect_remote_llm_replica(
-                plan.metadata.stage_id,
-                plan.replica_id,
-                vllm_config,
-            )
-            logger.info("[DistStageRuntime] Stage %s remote engine startup completed", plan.metadata.stage_id)
-            client_addresses = self._client_addresses_from_zmq(addresses)
-            replica_host = self._omni_master_server.get_replica_host(plan.metadata.stage_id, plan.replica_id)
-            if replica_host:
-                client_addresses["replica_host"] = replica_host
-            return StageEngineCoreClientBase.make_async_mp_client(
-                vllm_config=vllm_config,
-                executor_class=executor_class,
-                metadata=plan.metadata,
-                client_addresses=client_addresses,
-                engine_manager=engine_manager,
-                coordinator=coordinator,
-            )
-        except Exception:
-            self._cleanup_launched_llm_resources(
-                stage_id=plan.metadata.stage_id,
-                engine_manager=engine_manager,
-                coordinator=coordinator,
-            )
-            raise
-
-    def _initialize_diffusion_replica_remote(
-        self,
-        plan: ReplicaInitPlan,
-        stage_init_timeout: int,
-    ) -> Any:
-        """Initialize a remote diffusion replica via OmniMasterServer."""
-        assert self._omni_master_server is not None
-        remote_stage_cfg = OmegaConf.create(
-            self._omni_master_server.get_stage_config(
-                plan.metadata.stage_id, timeout_s=stage_init_timeout, replica_id=plan.replica_id
-            )
+        registered_stage_cfg = self._omni_master_server.get_stage_config(
+            plan.metadata.stage_id,
+            timeout_s=stage_init_timeout,
+            replica_id=plan.replica_id,
         )
-        remote_metadata = extract_stage_metadata(remote_stage_cfg)
-        addresses = self._omni_master_server.get_zmq_addresses(plan.metadata.stage_id, replica_id=plan.replica_id)
-        logger.info("[DistStageRuntime] Stage %s remote diffusion startup completed", plan.metadata.stage_id)
-        from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+        if registered_stage_cfg is None:
+            raise ValueError(f"Remote stage {plan.metadata.stage_id} registered without stage config")
 
-        return StageDiffusionClient.from_addresses(
-            remote_metadata,
-            request_address=addresses.inputs[0],
-            response_address=addresses.outputs[0],
-            batch_size=self._diffusion_batch_size,
+        metadata = (
+            extract_stage_metadata(OmegaConf.create(registered_stage_cfg))
+            if plan.metadata.stage_type == "diffusion"
+            else copy.deepcopy(plan.metadata)
         )
+        metadata.replica_id = plan.replica_id
+        ctx = StageRemoteFactoryContext(
+            stage_id=plan.metadata.stage_id,
+            stage_type=plan.metadata.stage_type,
+            stage_cfg=plan.stage_cfg,
+            base_metadata=metadata,
+            vllm_config=plan.stage_vllm_config,
+            executor_class=plan.executor_class,
+            diffusion_batch_size=self._diffusion_batch_size,
+        )
+        return self._create_remote_replica_client(ctx, plan.replica_id)
 
     # ---- Distributed infrastructure ----
 
@@ -965,17 +930,15 @@ class DistStageRuntime(StageRuntime):
     def _capture_stage_factory_contexts(
         self, stage_plans: Sequence[LogicalStageInitPlan]
     ) -> dict[int, StageRemoteFactoryContext]:
-        """Snapshot per-stage construction context for dynamic replica attach."""
         contexts: dict[int, StageRemoteFactoryContext] = {}
         for plan in stage_plans:
             if not plan.replicas:
                 continue
             template = plan.replicas[0]
             stage_id = int(plan.configured_stage_id)
-            stage_type = template.metadata.stage_type or "llm"
             contexts[stage_id] = StageRemoteFactoryContext(
                 stage_id=stage_id,
-                stage_type=stage_type,
+                stage_type=template.metadata.stage_type or "llm",
                 stage_cfg=template.stage_cfg,
                 base_metadata=template.metadata,
                 vllm_config=template.stage_vllm_config,
@@ -996,67 +959,75 @@ class DistStageRuntime(StageRuntime):
         except Exception:
             logger.exception("[DistStageRuntime] Failed to enqueue register message")
 
-    async def _build_remote_replica(self, stage_id: int, replica_id: int) -> Any:
-        """Build a head-side client for a newly registered remote replica."""
+    async def _build_remote_replica(self, stage_id: int, replica_id: int) -> StagePoolClient:
         ctx = self._stage_remote_factory_contexts.get(stage_id)
         if ctx is None:
             raise ValueError(f"No factory context for stage {stage_id}")
+        return self._create_remote_replica_client(ctx, replica_id)
+
+    def _create_remote_replica_client(
+        self,
+        ctx: StageRemoteFactoryContext,
+        replica_id: int,
+    ) -> StagePoolClient:
+        """Create the head-side client for a remote replica.
+
+        Used by both initial remote slots and dynamic headless registrations.
+        """
+        assert self._omni_master_server is not None
+        stage_id = ctx.stage_id
+        metadata = copy.deepcopy(ctx.base_metadata)
+        metadata.replica_id = replica_id
 
         if ctx.stage_type == "diffusion":
-            assert self._omni_master_server is not None
             addresses = self._omni_master_server.get_zmq_addresses(stage_id, replica_id=replica_id)
-            metadata = copy.deepcopy(ctx.base_metadata)
-            metadata.replica_id = replica_id
             from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
-            return StageDiffusionClient.from_addresses(
+            client = StageDiffusionClient.from_addresses(
                 metadata,
                 request_address=addresses.inputs[0],
                 response_address=addresses.outputs[0],
                 batch_size=ctx.diffusion_batch_size,
             )
+            logger.info("[DistStageRuntime] Remote diffusion replica attached stage=%d replica=%d", stage_id, replica_id)
+            return client
 
-        # LLM replica
         assert ctx.vllm_config is not None
         assert ctx.executor_class is not None
         vllm_config = copy.deepcopy(ctx.vllm_config)
-        engine_manager, coordinator, addresses = self._connect_remote_llm_replica(
-            stage_id,
-            replica_id,
-            vllm_config,
-        )
-        metadata = copy.deepcopy(ctx.base_metadata)
-        metadata.replica_id = replica_id
-        client_addresses = self._client_addresses_from_zmq(addresses)
-        replica_host = self._omni_master_server.get_replica_host(stage_id, replica_id)
-        if replica_host:
-            client_addresses["replica_host"] = replica_host
-        return StageEngineCoreClientBase.make_async_mp_client(
-            vllm_config=vllm_config,
-            executor_class=ctx.executor_class,
-            metadata=metadata,
-            client_addresses=client_addresses,
-            engine_manager=engine_manager,
-            coordinator=coordinator,
-        )
-
-    def _connect_remote_llm_replica(
-        self,
-        stage_id: int,
-        replica_id: int,
-        vllm_config: Any,
-    ) -> tuple[Any, Any, Any]:
-        """Handshake with a remote LLM replica and return client resources."""
-        assert self._omni_master_server is not None
         vllm_config.parallel_config.data_parallel_size_local = 0
-        with connect_remote_engine_cores(
-            vllm_config=vllm_config,
-            omni_master_server=self._omni_master_server,
-            stage_id=stage_id,
-            replica_id=replica_id,
-        ) as remote_resources:
-            engine_manager, coordinator, addresses, _ = remote_resources
-        return engine_manager, coordinator, addresses
+        engine_manager = None
+        coordinator = None
+        try:
+            logger.info("[DistStageRuntime] Remote LLM handshake started stage=%d replica=%d", stage_id, replica_id)
+            with connect_remote_engine_cores(
+                vllm_config=vllm_config,
+                omni_master_server=self._omni_master_server,
+                stage_id=stage_id,
+                replica_id=replica_id,
+            ) as remote_resources:
+                engine_manager, coordinator, addresses, _ = remote_resources
+            client_addresses = self._client_addresses_from_zmq(addresses)
+            replica_host = self._omni_master_server.get_replica_host(stage_id, replica_id)
+            if replica_host:
+                client_addresses["replica_host"] = replica_host
+            client = StageEngineCoreClientBase.make_async_mp_client(
+                vllm_config=vllm_config,
+                executor_class=ctx.executor_class,
+                metadata=metadata,
+                client_addresses=client_addresses,
+                engine_manager=engine_manager,
+                coordinator=coordinator,
+            )
+            logger.info("[DistStageRuntime] Remote LLM replica attached stage=%d replica=%d", stage_id, replica_id)
+            return client
+        except Exception:
+            self._cleanup_launched_llm_resources(
+                stage_id=stage_id,
+                engine_manager=engine_manager,
+                coordinator=coordinator,
+            )
+            raise
 
 
 # ===========================================================================

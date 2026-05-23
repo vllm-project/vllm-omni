@@ -752,11 +752,11 @@ class TestSingleStageReplicaInitialization:
             side_effect=lambda **_: (events.append("attach"), sentinel_client)[1],
         )
 
-        result = runtime._initialize_llm_replica(plan, stage_init_timeout=60, llm_stage_launch_lock=threading.Lock())
+        result = runtime._initialize_remote_replica(plan, stage_init_timeout=60)
 
         assert result is sentinel_client
         runtime._omni_master_server.get_stage_config.assert_called_once_with(7, timeout_s=60, replica_id=0)
-        assert fake_vllm_config.parallel_config.data_parallel_size_local == 0
+        assert mock_connect.call_args.kwargs["vllm_config"].parallel_config.data_parallel_size_local == 0
         assert mock_connect.call_args.kwargs["stage_id"] == 7
         assert mock_connect.call_args.kwargs["replica_id"] == 0
         assert events == ["enter", "exit", "attach"]
@@ -779,7 +779,7 @@ class TestSingleStageReplicaInitialization:
         plan = _make_llm_plan(0, configured_stage_id=7, launch_mode="remote").replicas[0]
 
         with pytest.raises(ValueError, match="registered without stage config"):
-            runtime._initialize_llm_replica(plan, stage_init_timeout=60, llm_stage_launch_lock=threading.Lock())
+            runtime._initialize_remote_replica(plan, stage_init_timeout=60)
 
     def test_initialize_llm_replica_remote_attach_failure_cleans_up_started_resources(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
@@ -823,12 +823,12 @@ class TestSingleStageReplicaInitialization:
         )
 
         with pytest.raises(RuntimeError, match="attach failed"):
-            runtime._initialize_llm_replica(plan, stage_init_timeout=60, llm_stage_launch_lock=threading.Lock())
+            runtime._initialize_remote_replica(plan, stage_init_timeout=60)
 
         fake_manager.shutdown.assert_called_once()
         fake_coordinator.shutdown.assert_called_once()
 
-    def test_initialize_llm_replica_single_stage_local_uses_shared_launcher(self, mocker: MockerFixture):
+    def test_initialize_local_llm_replica_uses_shared_launcher(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
         from vllm_omni.platforms import current_omni_platform
 
@@ -879,7 +879,7 @@ class TestSingleStageReplicaInitialization:
             side_effect=lambda **_: sentinel_client,
         )
         try:
-            result = runtime._initialize_llm_replica(plan, stage_init_timeout=60, llm_stage_launch_lock=threading.Lock())
+            result = runtime._initialize_local_llm_replica(plan, stage_init_timeout=60, llm_stage_launch_lock=threading.Lock())
         finally:
             if prev_device_env is None:
                 os.environ.pop(device_env_var, None)
@@ -923,14 +923,14 @@ class TestSingleStageReplicaInitialization:
             return_value=sentinel_client,
         )
 
-        result = runtime._initialize_diffusion_replica(plan, stage_init_timeout=60, stage_launch_lock=threading.Lock())
+        result = runtime._initialize_remote_replica(plan, stage_init_timeout=60)
 
         assert result is sentinel_client
         runtime._omni_master_server.get_stage_config.assert_called_once_with(11, timeout_s=60, replica_id=0)
         runtime._omni_master_server.get_zmq_addresses.assert_called_once_with(11, replica_id=0)
         mock_from_addresses.assert_called_once()
 
-    def test_initialize_diffusion_replica_single_stage_local_registers_with_master(self, mocker: MockerFixture):
+    def test_initialize_local_diffusion_replica_registers_with_master(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
         from vllm_omni.platforms import current_omni_platform
 
@@ -978,7 +978,7 @@ class TestSingleStageReplicaInitialization:
         )
 
         try:
-            result = runtime._initialize_diffusion_replica(
+            result = runtime._initialize_local_diffusion_replica(
                 plan, stage_init_timeout=60, stage_launch_lock=threading.Lock()
             )
         finally:
@@ -1015,7 +1015,7 @@ class TestSingleStageReplicaInitialization:
             batch_size=4,
         )
 
-    def test_initialize_diffusion_replica_local_failure_terminates_proc(self, mocker: MockerFixture):
+    def test_initialize_local_diffusion_replica_failure_terminates_proc(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
         from vllm_omni.platforms import current_omni_platform
 
@@ -1061,7 +1061,7 @@ class TestSingleStageReplicaInitialization:
 
         try:
             with pytest.raises(RuntimeError, match="handshake failed"):
-                runtime._initialize_diffusion_replica(plan, stage_init_timeout=60, stage_launch_lock=threading.Lock())
+                runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=60, stage_launch_lock=threading.Lock())
         finally:
             if prev_device_env is None:
                 os.environ.pop(device_env_var, None)

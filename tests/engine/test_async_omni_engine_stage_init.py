@@ -173,7 +173,7 @@ def test_collect_initialized_clients_for_cleanup_deduplicates_clients():
     assert cleanup_clients == [shared, extra]
 
 
-def test_initialize_diffusion_replica_restores_device_visibility_after_local_init(monkeypatch):
+def test_initialize_local_diffusion_replica_restores_device_visibility_after_local_init(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
     from vllm_omni.platforms import current_omni_platform
 
@@ -204,7 +204,7 @@ def test_initialize_diffusion_replica_restores_device_visibility_after_local_ini
     )
 
     try:
-        runtime._initialize_diffusion_replica(plan, stage_init_timeout=1, stage_launch_lock=threading.Lock())
+        runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1, stage_launch_lock=threading.Lock())
         assert os.environ.get(env_var) == "0,1"
     finally:
         if old_env is None:
@@ -213,7 +213,7 @@ def test_initialize_diffusion_replica_restores_device_visibility_after_local_ini
             os.environ[env_var] = old_env
 
 
-def test_initialize_diffusion_replica_passes_stage_init_timeout_and_inline_flag(monkeypatch):
+def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline_flag(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
 
     runtime = StageRuntime(
@@ -242,7 +242,7 @@ def test_initialize_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
 
     monkeypatch.setattr(runtime_mod, "launch_diffusion_stage_replica", _capture_launch_diffusion_stage_replica)
 
-    runtime._initialize_diffusion_replica(plan, stage_init_timeout=302, stage_launch_lock=threading.Lock())
+    runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=302, stage_launch_lock=threading.Lock())
 
     assert captured == {
         "stage_id": 0,
@@ -478,7 +478,7 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
     assert captured_cleanup == [[initialized_client]]
 
 
-def test_initialize_llm_replica_passes_stage_init_timeout_to_complete_stage_handshake(monkeypatch):
+def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stage_handshake(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
     from vllm_omni.platforms import current_omni_platform
 
@@ -530,7 +530,7 @@ def test_initialize_llm_replica_passes_stage_init_timeout_to_complete_stage_hand
     )
 
     try:
-        runtime._initialize_llm_replica(plan, 302, threading.Lock())
+        runtime._initialize_local_llm_replica(plan, 302, threading.Lock())
     finally:
         if prev_device_env is None:
             os.environ.pop(device_env_var, None)
