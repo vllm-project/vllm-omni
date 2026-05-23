@@ -43,6 +43,7 @@ recipes/
 | [`Tencent/HunyuanImage-3.0-Instruct.md`](./Tencent/HunyuanImage-3.0-Instruct.md) | DiT-only text-to-image serving and benchmark, including ModelOpt mixed FP8/NVFP4 | 4x H100/H800 80GB / 2x B200 |
 | [`Wan-AI/Wan2.2-I2V.md`](./Wan-AI/Wan2.2-I2V.md) | Image-to-video serving (Wan2.2 14B) | 8x Ascend NPU (A2/A3) |
 | [`Wan-AI/Wan2.2-S2V.md`](./Wan-AI/Wan2.2-S2V.md) | Speech-to-video serving (Wan2.2 14B) | 2x A100/H100 80GB |
+| [`zai-org/GLM-TTS.md`](./zai-org/GLM-TTS.md) | Online serving for Chinese/English zero-shot voice-cloned TTS | 1x A40 48GB |
 
 Within a single recipe file, include different hardware support sections such
 as `GPU`, `ROCm`, and `NPU`, and add concrete tested configurations like
