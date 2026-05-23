@@ -3,11 +3,11 @@ from collections import Counter
 
 import pytest
 
-from vllm_omni.model_executor.models.minimind_o.minimind_omni_thinker import (
-    MiniMindOmniThinkerForConditionalGeneration,
-)
 from vllm_omni.model_executor.models.minimind_o.minimind_omni_talker import (
     MiniMindOmniTalkerForConditionalGeneration,
+)
+from vllm_omni.model_executor.models.minimind_o.minimind_omni_thinker import (
+    MiniMindOmniThinkerForConditionalGeneration,
 )
 
 
@@ -60,8 +60,8 @@ def test_hf_to_vllm_mapper_prefixes(cls, mapper_prefix, expected):
 
 def test_hf_checkpoint_prefixes_match_mappers():
     pytest.importorskip("huggingface_hub")
-    from huggingface_hub import hf_hub_download
     import torch
+    from huggingface_hub import hf_hub_download
 
     p = hf_hub_download("jingyaogong/minimind-3o", "pytorch_model.bin")
     sd = torch.load(p, map_location="cpu", weights_only=True)
