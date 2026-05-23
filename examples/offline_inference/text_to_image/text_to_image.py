@@ -30,6 +30,7 @@ def _resolve_quantization_label(cli_quantization: str | None, model: str) -> str
         return cli_quantization
     try:
         from vllm.transformers_utils.config import get_hf_file_to_dict
+
         cfg = get_hf_file_to_dict("transformer/config.json", model)
     except Exception:
         cfg = None
@@ -37,10 +38,10 @@ def _resolve_quantization_label(cli_quantization: str | None, model: str) -> str
         qc = cfg.get("quantization_config")
         if isinstance(qc, dict):
             method = qc.get("quant_method") or qc.get("method")
-            if method == "component" or (method is None and any(
-                isinstance(v, dict) and (v.get("quant_method") or v.get("method"))
-                for v in qc.values()
-            )):
+            if method == "component" or (
+                method is None
+                and any(isinstance(v, dict) and (v.get("quant_method") or v.get("method")) for v in qc.values())
+            ):
                 default = qc.get("default")
                 if isinstance(default, dict):
                     inner = default.get("quant_method") or default.get("method")

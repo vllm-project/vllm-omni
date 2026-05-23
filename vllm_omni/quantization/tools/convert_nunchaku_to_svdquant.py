@@ -51,13 +51,13 @@ Non-transformer subfolders + top-level files are hard-linked from the
 base pipeline by default (saves 35+ GB). `huggingface_hub.upload_folder`
 reads file content, so hard links upload fine. Use `--copy` to disable.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import shutil
-import sys
 from pathlib import Path
 
 import torch
@@ -117,10 +117,12 @@ def rename_key_zimage(key: str) -> str:
 # Per-linear nunchaku-fragment → row-major (with optional half-swap)
 # ---------------------------------------------------------------------------
 
+
 # nunchaku.lora.flux is the canonical home of unpack_lowrank_weight; import
 # lazily so the script can at least argparse-help without nunchaku installed.
 def _lowrank_unpack():
     from nunchaku.lora.flux.nunchaku_converter import unpack_lowrank_weight
+
     return unpack_lowrank_weight
 
 
@@ -154,12 +156,12 @@ def unpack_nvfp4_layer(
     """
     unpack_lowrank_weight = _lowrank_unpack()
 
-    qweight = params["qweight"]                # [N, K/2] int8 (nunchaku fragment)
-    wscales = params["wscales"]                # [K/16, N] fp8 (nunchaku fragment)
-    proj_up = params["proj_up"]                # [N, R] bf16 (nunchaku fragment)
-    proj_down = params["proj_down"]            # [K, R] bf16 (nunchaku fragment)
-    wcscales = params.get("wcscales")          # [N] bf16 (optional)
-    bias = params.get("bias")                  # [N] bf16 (optional)
+    qweight = params["qweight"]  # [N, K/2] int8 (nunchaku fragment)
+    wscales = params["wscales"]  # [K/16, N] fp8 (nunchaku fragment)
+    proj_up = params["proj_up"]  # [N, R] bf16 (nunchaku fragment)
+    proj_down = params["proj_down"]  # [K, R] bf16 (nunchaku fragment)
+    wcscales = params.get("wcscales")  # [N] bf16 (optional)
+    bias = params.get("bias")  # [N] bf16 (optional)
 
     N = qweight.shape[0]
     if half_swap_n:
@@ -169,9 +171,9 @@ def unpack_nvfp4_layer(
     # qweight: unpack fragment → [N, K/2] uint8 nibble bytes (low = even-k);
     # then `_unpack_nibbles` → [N, K] full-nibble form so we can slice on N
     # then repack to [N, K/2] for storage.
-    qw_rm = unpack_nunchaku_qweight_fp4(qweight.view(torch.int8))   # [N, K/2] uint8
+    qw_rm = unpack_nunchaku_qweight_fp4(qweight.view(torch.int8))  # [N, K/2] uint8
     if half_swap_n:
-        nibs = _unpack_nibbles(qw_rm)                                # [N, K] uint8
+        nibs = _unpack_nibbles(qw_rm)  # [N, K] uint8
         nibs = torch.cat([nibs[half:], nibs[:half]], dim=0).contiguous()
         qw_rm = _pack_qweight_row_major(nibs)
     qweight_out = qw_rm.contiguous()
@@ -216,6 +218,7 @@ def unpack_nvfp4_layer(
 # Input materialization
 # ---------------------------------------------------------------------------
 
+
 def _resolve_nunchaku_checkpoint(arg: str) -> Path:
     """Accept a local file path OR an HF spec `<repo_id>/<filename>`.
 
@@ -236,6 +239,7 @@ def _resolve_nunchaku_checkpoint(arg: str) -> Path:
     repo_id = "/".join(parts[:2])
     filename = "/".join(parts[2:])
     from huggingface_hub import hf_hub_download
+
     print(f"resolving nunchaku checkpoint: repo={repo_id} file={filename}")
     path = hf_hub_download(repo_id=repo_id, filename=filename)
     return Path(path)
@@ -249,6 +253,7 @@ def _resolve_base_pipeline(arg: str) -> Path:
         return p
     # HF repo id → snapshot_download (uses cache if present).
     from huggingface_hub import snapshot_download
+
     print(f"resolving base pipeline: repo={arg}")
     path = snapshot_download(repo_id=arg)
     return Path(path)
@@ -257,6 +262,7 @@ def _resolve_base_pipeline(arg: str) -> Path:
 # ---------------------------------------------------------------------------
 # Filesystem mirror (hard-link with copy fallback)
 # ---------------------------------------------------------------------------
+
 
 def _link_or_copy_file(src: Path, dst: Path, prefer_copy: bool) -> None:
     """Hard-link src → dst, falling back to copy. Resolves source symlinks
@@ -289,6 +295,7 @@ def _link_or_copy_tree(src: Path, dst: Path, prefer_copy: bool) -> None:
 # Conversion driver
 # ---------------------------------------------------------------------------
 
+
 def _group_keys_by_layer(
     keys: list[str],
 ) -> tuple[dict[str, list[str]], list[str]]:
@@ -296,9 +303,7 @@ def _group_keys_by_layer(
 
     A "linear" is any key prefix that has a `.qweight` sibling.
     """
-    qweight_prefixes = {
-        k.rsplit(".", 1)[0] for k in keys if k.endswith(".qweight")
-    }
+    qweight_prefixes = {k.rsplit(".", 1)[0] for k in keys if k.endswith(".qweight")}
     layer_to_suffixes: dict[str, list[str]] = {p: [] for p in qweight_prefixes}
     leftover: list[str] = []
     for k in keys:
@@ -310,9 +315,7 @@ def _group_keys_by_layer(
     return layer_to_suffixes, leftover
 
 
-def _detect_rank_precision(
-    f, sample_prefix: str
-) -> tuple[int, str]:
+def _detect_rank_precision(f, sample_prefix: str) -> tuple[int, str]:
     proj_down = f.get_tensor(f"{sample_prefix}.proj_down")
     wscales = f.get_tensor(f"{sample_prefix}.wscales")
     rank = int(proj_down.shape[1])
@@ -348,10 +351,7 @@ def convert(
             _link_or_copy_tree(item, d, prefer_copy)
         else:
             _link_or_copy_file(item, d, prefer_copy)
-    print(
-        f"mirrored {len(base_top_level) - 1} top-level entries from base "
-        f"({'copy' if prefer_copy else 'hard-link'})"
-    )
+    print(f"mirrored {len(base_top_level) - 1} top-level entries from base ({'copy' if prefer_copy else 'hard-link'})")
 
     # ----- transformer/ -----
     transformer_dir = output_dir / "transformer"
@@ -413,12 +413,11 @@ def convert(
             params = unpack_nvfp4_layer(params, half_swap_n=is_fused_gate_up(prefix))
 
             # ---- emit: rename source prefix to vllm-omni's param naming ----
-            out_prefix = rename_key(f"{prefix}.dummy")[:-len(".dummy")]
+            out_prefix = rename_key(f"{prefix}.dummy")[: -len(".dummy")]
             for suf, t in params.items():
                 out_sd[f"{out_prefix}.{suf}"] = t
             if progress and (i % 20 == 0 or i == n_linears - 1):
-                print(f"  [{i + 1}/{n_linears}] {prefix}"
-                      + (f"  ->  {out_prefix}" if out_prefix != prefix else ""))
+                print(f"  [{i + 1}/{n_linears}] {prefix}" + (f"  ->  {out_prefix}" if out_prefix != prefix else ""))
 
         # Leftover (unquantized) keys: rename too (most are no-ops; safer to apply uniformly).
         for k in leftover:
@@ -486,11 +485,13 @@ def convert(
     out_path = transformer_dir / "diffusion_pytorch_model.safetensors"
     # Preserve nunchaku metadata so downstream can still inspect provenance.
     out_metadata = {k: v for k, v in metadata.items() if isinstance(v, str)}
-    out_metadata["conversion"] = json.dumps({
-        "tool": "vllm_omni.quantization.tools.convert_nunchaku_to_svdquant",
-        "layout": "row_major",  # canonical; vLLM repacks for nunchaku backend at load
-        "half_swapped_layers": [p for p in layer_to_suffixes if is_fused_gate_up(p)],
-    })
+    out_metadata["conversion"] = json.dumps(
+        {
+            "tool": "vllm_omni.quantization.tools.convert_nunchaku_to_svdquant",
+            "layout": "row_major",  # canonical; vLLM repacks for nunchaku backend at load
+            "half_swapped_layers": [p for p in layer_to_suffixes if is_fused_gate_up(p)],
+        }
+    )
     save_file(out_sd, str(out_path), metadata=out_metadata)
     print(f"wrote {out_path} ({out_path.stat().st_size / 2**30:.2f} GiB)")
 
@@ -498,6 +499,7 @@ def convert(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -508,14 +510,14 @@ def main() -> None:
         "--nunchaku-checkpoint",
         required=True,
         help="Local path to nunchaku merged .safetensors OR HF spec "
-             "<repo_id>/<filename> (e.g. nunchaku-tech/nunchaku-z-image-turbo"
-             "/svdq-fp4_r128-z-image-turbo.safetensors).",
+        "<repo_id>/<filename> (e.g. nunchaku-tech/nunchaku-z-image-turbo"
+        "/svdq-fp4_r128-z-image-turbo.safetensors).",
     )
     parser.add_argument(
         "--base-pipeline",
         default="Tongyi-MAI/Z-Image-Turbo",
         help="Local diffusers folder OR HF repo id of the unquantized base "
-             "pipeline. Default: Tongyi-MAI/Z-Image-Turbo.",
+        "pipeline. Default: Tongyi-MAI/Z-Image-Turbo.",
     )
     parser.add_argument(
         "--output-dir",
@@ -526,7 +528,7 @@ def main() -> None:
         "--copy",
         action="store_true",
         help="Copy non-transformer files instead of hard-linking (slower, "
-             "uses ~35 GiB extra). Default: hard-link (HF upload-safe).",
+        "uses ~35 GiB extra). Default: hard-link (HF upload-safe).",
     )
     args = parser.parse_args()
 

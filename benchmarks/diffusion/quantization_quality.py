@@ -509,10 +509,7 @@ def run_benchmark(args):
     lines.append("")
     lines.append("| Config | Weights | Activations | Peak | Total Reduction |")
     lines.append("|--------|---------|-------------|------|-----------------|")
-    lines.append(
-        f"| BF16, TP={tp} | {bl_weights:.2f} GiB | {bl_acts:.2f} GiB "
-        f"| {bl_mem:.2f} GiB | — |"
-    )
+    lines.append(f"| BF16, TP={tp} | {bl_weights:.2f} GiB | {bl_acts:.2f} GiB | {bl_mem:.2f} GiB | — |")
     for r in all_results:
         reduction_pct = (bl_mem - r["memory_gib"]) / bl_mem * 100 if bl_mem > 0 else 0.0
         lines.append(
@@ -584,7 +581,7 @@ def parse_args():
             "One or more quantization methods to benchmark (e.g. fp8 int8 "
             "bitsandbytes). Use the sentinel `auto` for offline-quantized "
             "checkpoints (SVDQuant etc.) where the method + per-layer skip "
-            "list are baked into `transformer/config.json[\"quantization_config\"]` "
+            'list are baked into `transformer/config.json["quantization_config"]` '
             "— the bench will not override it and the on-disk config drives the run."
         ),
     )

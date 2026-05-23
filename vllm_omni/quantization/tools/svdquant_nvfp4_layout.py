@@ -7,6 +7,7 @@ The implementation moved to
 when SVDQuant landed in vLLM. The vllm-omni converter previously
 imported from this module; keep the import surface stable.
 """
+
 from vllm.model_executor.layers.quantization.utils.svdquant_nvfp4_layout import (  # noqa: F401
     _pack_nibbles,
     _unpack_nibbles,
