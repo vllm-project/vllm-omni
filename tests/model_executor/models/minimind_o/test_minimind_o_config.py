@@ -15,7 +15,9 @@ def test_minimind_omni_nested_configs():
     assert isinstance(cfg.vision_config, MiniMindOmniVisionConfig)
     assert isinstance(cfg.audio_config, MiniMindOmniAudioConfig)
     assert cfg.text_config.vocab_size == 6400
-    assert cfg.talker_config.vocab_size == cfg.audio_vocab_size
+    # Talker LM vocab follows text_config; codec/MTP use audio_vocab_size.
+    assert cfg.talker_config.vocab_size == cfg.text_config.vocab_size
+    assert cfg.talker_config.audio_vocab_size == cfg.audio_vocab_size
     assert cfg.audio_pad_token == 2049
     assert cfg.audio_ids[0] == 16
     assert cfg.image_ids[0] == 12
