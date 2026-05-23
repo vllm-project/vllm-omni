@@ -15,7 +15,9 @@ from vllm_omni.diffusion.data import DiffusionCacheConfig
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SEPARATE_CFG_ENABLERS = [
+    cd_backend.enable_cache_for_dreamid_omni,
     cd_backend.enable_cache_for_ltx2,
+    cd_backend.enable_cache_for_helios,
     cd_backend.enable_cache_for_wan22,
     cd_backend.enable_cache_for_longcat_image,
 ]
