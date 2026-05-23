@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
-from transformers import BatchFeature, PreTrainedModel, SiglipImageProcessor, SiglipVisionModel
+from transformers import BatchFeature, PreTrainedModel, SiglipImageProcessor, SiglipVisionModel, logger
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheConfig
 from vllm.config.multimodal import BaseDummyOptions
@@ -57,7 +57,6 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.model_executor.models.minimind_o.minimind_omni_config import (
@@ -68,7 +67,6 @@ from vllm_omni.model_executor.models.minimind_o.resource_utils import resolve_mo
 
 CapturedHiddenStates = dict[str, dict[str, dict[int, torch.Tensor]]]
 
-logger = init_logger(__name__)
 
 class MiniMindOmniAttention(nn.Module):
     def __init__(
@@ -868,13 +866,6 @@ class MiniMindOmniThinkerForConditionalGeneration(
         if audio_inputs.numel() == 0 or audio_inputs.size(0) == 0:
             return ()
 
-        logger.info(
-            "MiniMind-O audio encoder dtype before cast: audio_inputs=%s, audio_lens=%s, encoder=%s",
-            audio_inputs.dtype,
-            audio_lens.dtype if isinstance(audio_lens, torch.Tensor) else None,
-            self._module_input_dtype(self.audio_encoder),
-        )
-
         valid_fbank = audio_inputs.to(device=self.device, dtype=self.audio_encoder_dtype)
         if audio_lens is not None:
             valid_lens = audio_lens.reshape(-1).to(device=valid_fbank.device, dtype=torch.long)
@@ -885,13 +876,6 @@ class MiniMindOmniThinkerForConditionalGeneration(
                 device=valid_fbank.device,
                 dtype=torch.long,
             )
-
-        logger.info(
-            "MiniMind-O audio encoder dtype after cast: valid_fbank=%s, valid_lens=%s, encoder=%s",
-            valid_fbank.dtype,
-            valid_lens.dtype,
-            self._module_input_dtype(self.audio_encoder),
-        )
 
         with torch.autocast(device_type=valid_fbank.device.type, enabled=False):
             audio_hidden, _ = self.audio_encoder(valid_fbank, valid_lens)
