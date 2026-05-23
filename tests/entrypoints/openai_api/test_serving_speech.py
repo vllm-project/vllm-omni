@@ -2414,6 +2414,11 @@ class TestFunCineForgeServing:
             "vllm_omni.model_executor.models.funcineforge.video_preprocess.build_video_conditions",
             return_value=conditions,
         )
+        materialize = mocker.patch.object(
+            funcineforge_server,
+            "_materialize_video_source",
+            return_value="/tmp/policy_checked_source.mp4",
+        )
         request = OpenAICreateSpeechRequest(
             input="Dubbing line",
             video="file:///tmp/source.mp4",
@@ -2427,6 +2432,8 @@ class TestFunCineForgeServing:
         prompt = asyncio.run(funcineforge_server._build_funcineforge_prompt(request))
 
         preprocess.assert_called_once()
+        materialize.assert_awaited_once_with("file:///tmp/source.mp4", None)
+        assert preprocess.call_args.kwargs["video"] == "/tmp/policy_checked_source.mp4"
         assert prompt["prompt"] == "Dubbing line"
         assert prompt["multi_modal_data"]["audio"][1] == 16000
         mm_kwargs = prompt["mm_processor_kwargs"]
@@ -2515,6 +2522,11 @@ class TestFunCineForgeServing:
             "vllm_omni.model_executor.models.funcineforge.video_preprocess.build_video_conditions",
             return_value=conditions,
         )
+        mocker.patch.object(
+            funcineforge_server,
+            "_materialize_video_source",
+            return_value="/tmp/policy_checked_source.mp4",
+        )
         override_audio = ([0.5, 0.6, 0.7], 24000)
         mocker.patch.object(
             funcineforge_server,
@@ -2534,6 +2546,31 @@ class TestFunCineForgeServing:
 
         assert prompt["multi_modal_data"]["audio"][1] == 24000
         assert prompt["mm_processor_kwargs"]["face_embedding"] is face_embedding
+
+    def test_materialize_video_source_uses_media_connector(self, funcineforge_server, mocker: MockerFixture):
+        connector = mocker.MagicMock()
+        connector.load_from_url_async = mocker.AsyncMock(return_value="/tmp/materialized.mp4")
+        media_connector = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.MediaConnector",
+            return_value=connector,
+        )
+        funcineforge_server._diffusion_mode = False
+        funcineforge_server.model_config.allowed_local_media_path = "/tmp"
+        funcineforge_server.model_config.allowed_media_domains = ["example.com"]
+
+        path = asyncio.run(
+            funcineforge_server._materialize_video_source(
+                "https://example.com/input.mp4",
+                "/tmp/funcineforge",
+            )
+        )
+
+        assert path == "/tmp/materialized.mp4"
+        media_connector.assert_called_once_with(
+            allowed_local_media_path="/tmp",
+            allowed_media_domains=["example.com"],
+        )
+        connector.load_from_url_async.assert_awaited_once()
 
 
 class TestTTSAsyncOffloading:

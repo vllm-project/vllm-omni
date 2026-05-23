@@ -6,11 +6,13 @@ import math
 import os
 import re
 import struct
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 import soundfile as sf
@@ -1483,15 +1485,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
         """
-        # In diffusion mode, model_config may not be available
-        if self._diffusion_mode:
-            connector = MediaConnector()
-        else:
-            model_config = self.model_config
-            connector = MediaConnector(
-                allowed_local_media_path=model_config.allowed_local_media_path,
-                allowed_media_domains=model_config.allowed_media_domains,
-            )
+        connector = self._build_media_connector()
         wav_np, sr = await connector.fetch_audio_async(ref_audio_str)
         wav_np = np.asarray(wav_np, dtype=np.float32)
         if wav_np.ndim > 1:
@@ -1509,6 +1503,63 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
             )
         return wav_np.tolist(), sr
+
+    def _build_media_connector(self) -> MediaConnector:
+        if self._diffusion_mode:
+            return MediaConnector()
+
+        model_config = self.model_config
+        return MediaConnector(
+            allowed_local_media_path=model_config.allowed_local_media_path,
+            allowed_media_domains=model_config.allowed_media_domains,
+        )
+
+    async def _materialize_video_source(self, video: str, work_dir: str | None = None) -> str:
+        """Resolve video input through vLLM media policy into a local file."""
+
+        class _VideoFileMediaIO:
+            def __init__(self, output_dir: str | None) -> None:
+                self.output_dir = output_dir
+
+            def _write_bytes(self, data: bytes, suffix: str = ".mp4") -> str:
+                if self.output_dir is not None:
+                    os.makedirs(self.output_dir, exist_ok=True)
+                    handle = tempfile.NamedTemporaryFile(
+                        mode="wb",
+                        suffix=suffix,
+                        dir=self.output_dir,
+                        delete=False,
+                    )
+                else:
+                    handle = tempfile.NamedTemporaryFile(mode="wb", suffix=suffix, delete=False)
+                with handle:
+                    handle.write(data)
+                    return handle.name
+
+            def load_bytes(self, data: bytes) -> str:
+                return self._write_bytes(data)
+
+            def load_base64(self, media_type: str, data: str) -> str:
+                suffix = {
+                    "video/mp4": ".mp4",
+                    "video/quicktime": ".mov",
+                    "video/webm": ".webm",
+                    "video/x-matroska": ".mkv",
+                    "application/octet-stream": ".mp4",
+                }.get(media_type, ".mp4")
+                return self._write_bytes(base64.b64decode(data), suffix=suffix)
+
+            def load_file(self, filepath: Path) -> str:
+                return str(filepath)
+
+        parsed = urlparse(video)
+        video_url = video
+        if not parsed.scheme:
+            video_url = Path(video).expanduser().resolve().as_uri()
+
+        connector = self._build_media_connector()
+        media_io = _VideoFileMediaIO(work_dir)
+        return await connector.load_from_url_async(video_url, media_io)
 
     async def _generate_audio_chunks(
         self,
@@ -2009,8 +2060,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 build_video_conditions,
             )
 
+            video_path = await self._materialize_video_source(request.video, request.preprocess_work_dir)
             conditions = await make_async(build_video_conditions, executor=self._tts_executor)(
-                video=request.video,
+                video=video_path,
                 start=request.video_start,
                 end=request.video_end,
                 age=request.speaker_age,
