@@ -146,15 +146,14 @@ class StageEngineCoreClientBase(StageClientBase):
             self.stage_id = metadata.stage_id
             self.replica_id = getattr(metadata, "replica_id", 0)
             self.stage_type = metadata.stage_type
-            self.engine_output_type = metadata.engine_output_type
             self.is_comprehension = metadata.is_comprehension
             self.requires_multimodal_data = metadata.requires_multimodal_data
             self.engine_input_source = metadata.engine_input_source
             self.final_output = metadata.final_output
             self.final_output_type = metadata.final_output_type
             self.default_sampling_params = metadata.default_sampling_params
+            self.prompt_expand_func = metadata.prompt_expand_func
             self.custom_process_input_func = metadata.custom_process_input_func
-            self.model_stage = metadata.model_stage
 
         self.engine_outputs: Any = None
         self._proc = proc

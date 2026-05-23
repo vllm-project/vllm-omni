@@ -495,7 +495,7 @@ class TestSingleStageInitialization:
         monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
         monkeypatch.setattr(runtime_mod, "build_vllm_config", lambda *_, **__: (SimpleNamespace(), object))
         try:
-            stage_plans, _ = runtime._build_logical_stage_init_plans(None, [1, 1], {})
+            stage_plans = runtime._build_logical_stage_init_plans(None, [1, 1], {})
         finally:
             monkeypatch.undo()
 
@@ -577,7 +577,7 @@ class TestSingleStageInitialization:
             lambda *_, **__: (SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1)), object),
         )
         try:
-            stage_plans, _ = runtime._build_logical_stage_init_plans(None, [1], {})
+            stage_plans = runtime._build_logical_stage_init_plans(None, [1], {})
         finally:
             monkeypatch.undo()
 
@@ -620,7 +620,7 @@ class TestSingleStageInitialization:
         monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
         monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
         try:
-            stage_plans, _ = runtime._build_logical_stage_init_plans(None, [2], {0: ["0", "1"]})
+            stage_plans = runtime._build_logical_stage_init_plans(None, [2], {0: ["0", "1"]})
         finally:
             monkeypatch.undo()
 
@@ -649,7 +649,6 @@ class TestSingleStageInitialization:
         mocker.patch.object(runtime, "_prepare_stage_plans", return_value=[stage_plan])
         mock_start = mocker.patch.object(runtime, "_start_omni_master_server")
         mocker.patch.object(runtime, "_initialize_stage_replicas", return_value={0: [client]})
-        mocker.patch.object(runtime_mod, "build_stage0_input_processor", return_value=object())
         mocker.patch.object(runtime_mod, "build_llm_stage_output_processor", return_value=object())
 
         runtime.initialize()
@@ -668,7 +667,6 @@ class TestSingleStageInitialization:
         mocker.patch.object(runtime_mod, "compute_replica_layout", return_value=([1], {}))
         mocker.patch.object(plain_runtime, "_prepare_stage_plans", return_value=[stage_plan])
         mocker.patch.object(plain_runtime, "_initialize_stage_replicas", return_value={0: [client]})
-        mocker.patch.object(runtime_mod, "build_stage0_input_processor", return_value=object())
         mocker.patch.object(runtime_mod, "build_llm_stage_output_processor", return_value=object())
 
         plain_runtime.initialize()
@@ -695,7 +693,6 @@ class TestSingleStageInitialization:
 
         mocker.patch.object(runtime, "_start_omni_master_server", side_effect=_start_master)
         mocker.patch.object(runtime, "_initialize_stage_replicas", return_value={0: [initialized_client]})
-        mocker.patch.object(runtime_mod, "build_stage0_input_processor", return_value=object())
         mocker.patch.object(runtime, "_finalize_initialized_stages", side_effect=RuntimeError("assemble failed"))
         mock_shutdown = mocker.patch.object(runtime, "_shutdown_initialized_clients")
 
@@ -831,7 +828,7 @@ class TestSingleStageReplicaInitialization:
         fake_manager.shutdown.assert_called_once()
         fake_coordinator.shutdown.assert_called_once()
 
-    def test_initialize_llm_replica_single_stage_local_uses_launch_omni_core_engines(self, mocker: MockerFixture):
+    def test_initialize_llm_replica_single_stage_local_uses_shared_launcher(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
         from vllm_omni.platforms import current_omni_platform
 
@@ -875,7 +872,7 @@ class TestSingleStageReplicaInitialization:
         mocker.patch.object(runtime_mod, "build_engine_args_dict", return_value={})
         mocker.patch.object(runtime_mod, "acquire_device_locks", return_value=[])
         mocker.patch.object(runtime_mod, "release_device_locks")
-        mock_launch = mocker.patch.object(runtime_mod, "launch_omni_core_engines", side_effect=_fake_launch)
+        mock_launch = mocker.patch.object(runtime_mod, "launch_stage_replica", side_effect=_fake_launch)
         mocker.patch.object(
             StageEngineCoreClientBase,
             "make_async_mp_client",
@@ -893,6 +890,7 @@ class TestSingleStageReplicaInitialization:
         assert mock_launch.call_args.kwargs["stage_id"] == 3
         assert mock_launch.call_args.kwargs["stage_config"] is plan.stage_cfg
         assert mock_launch.call_args.kwargs["replica_id"] == 0
+        assert mock_launch.call_args.kwargs["omni_master_server"] is runtime._omni_master_server
 
     def test_initialize_diffusion_replica_remote_uses_from_addresses(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
@@ -962,10 +960,9 @@ class TestSingleStageReplicaInitialization:
 
         mocker.patch.object(runtime_mod, "setup_stage_devices")
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
-        mocker.patch.object(runtime_mod, "build_diffusion_config", return_value="diffusion-config")
-        mock_register = mocker.patch.object(
-            runtime_mod,
-            "register_stage_with_omni_master",
+        mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value="diffusion-config")
+        mock_register = mocker.patch(
+            "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
             return_value=("tcp://hs", "tcp://req", "tcp://resp"),
         )
         mock_spawn = mocker.patch(
@@ -1047,10 +1044,9 @@ class TestSingleStageReplicaInitialization:
 
         mocker.patch.object(runtime_mod, "setup_stage_devices")
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
-        mocker.patch.object(runtime_mod, "build_diffusion_config", return_value="diffusion-config")
-        mocker.patch.object(
-            runtime_mod,
-            "register_stage_with_omni_master",
+        mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value="diffusion-config")
+        mocker.patch(
+            "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
             return_value=("tcp://hs", "tcp://req", "tcp://resp"),
         )
         mocker.patch(
@@ -1061,7 +1057,7 @@ class TestSingleStageReplicaInitialization:
             "vllm_omni.diffusion.stage_diffusion_proc.complete_diffusion_handshake",
             side_effect=RuntimeError("handshake failed"),
         )
-        mock_terminate = mocker.patch.object(runtime_mod, "terminate_alive_proc")
+        mock_terminate = mocker.patch("vllm_omni.engine.stage_engine_startup.terminate_alive_proc")
 
         try:
             with pytest.raises(RuntimeError, match="handshake failed"):

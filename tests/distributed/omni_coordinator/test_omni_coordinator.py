@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import threading
 import time
 
 import pytest
@@ -46,6 +47,33 @@ def _drain_sub_messages(sub: zmq.Socket, max_seconds: float = 0.4) -> None:
     deadline = time.time() + max_seconds
     while time.time() < deadline:
         _recv_replica_list(sub, timeout_ms=50)
+
+
+def test_omni_coordinator_wait_for_shutdown_unblocks_on_close():
+    router_addr = get_engine_client_zmq_addr(
+        local_only=False,
+        host="127.0.0.1",
+        port=0,
+    )
+    pub_addr = get_engine_client_zmq_addr(
+        local_only=False,
+        host="127.0.0.1",
+        port=0,
+    )
+    coordinator = OmniCoordinator(
+        router_zmq_addr=router_addr,
+        pub_zmq_addr=pub_addr,
+        heartbeat_timeout=1000.0,
+    )
+
+    waiter = threading.Thread(target=coordinator.wait_for_shutdown)
+    waiter.start()
+    time.sleep(0.05)
+    assert waiter.is_alive()
+
+    coordinator.close()
+    waiter.join(timeout=1.0)
+    assert not waiter.is_alive()
 
 
 def test_omni_coordinator_pub_coalescing_on_rapid_queue_updates():

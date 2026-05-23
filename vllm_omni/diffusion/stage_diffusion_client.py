@@ -120,6 +120,7 @@ class StageDiffusionClient(StageClientBase):
         self.final_output = metadata.final_output
         self.final_output_type = metadata.final_output_type
         self.default_sampling_params = metadata.default_sampling_params
+        self.prompt_expand_func = metadata.prompt_expand_func
         self.requires_multimodal_data = getattr(metadata, "requires_multimodal_data", False)
         self.custom_process_input_func = getattr(metadata, "custom_process_input_func", None)
         self.engine_input_source = getattr(metadata, "engine_input_source", [])

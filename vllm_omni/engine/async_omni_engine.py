@@ -11,7 +11,6 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import json
-import os
 import queue
 import threading
 import time
@@ -51,12 +50,12 @@ from vllm_omni.engine.serialization import (
     serialize_additional_information,
 )
 from vllm_omni.engine.stage_client import StageClient
-from vllm_omni.engine.stage_pool import StagePool, StagePoolClient
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import (
-    DistStageRuntime,
     StageRuntimeInfo,
     create_stage_runtime,
 )
+from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
 from vllm_omni.inputs.data import OmniSamplingParams
@@ -276,6 +275,7 @@ class AsyncOmniEngine:
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
+        self.prompt_expand_func: Any | None = None
         self.supported_tasks: tuple[str, ...] = ("generate",)
         self.default_sampling_params_list: list[OmniSamplingParams] = []
         self.stage_metadata: list[StageRuntimeInfo] = []
@@ -343,14 +343,41 @@ class AsyncOmniEngine:
 
         self.num_stages = len(self.stage_configs)
         self.stage_pools = self._runtime.stage_pools
-        self.input_processor = self._runtime.input_processor
-        self.prompt_expand_func = self._runtime.prompt_expand_func
-        self.stage_clients = self._runtime.stage_clients
-        self.stage_vllm_configs = self._runtime.stage_vllm_configs
-        self.output_processors = self._runtime.output_processors
-        self.default_sampling_params_list = self._runtime.default_sampling_params_list
-        self.stage_metadata = self._runtime.stage_metadata
-        self.supported_tasks = self._runtime.supported_tasks
+        self.stage_clients = [
+            cast(StageClient, pool.stage_client)
+            for pool in self.stage_pools
+            if pool.stage_client is not None
+        ]
+        self.stage_vllm_configs = [pool.stage_vllm_config for pool in self.stage_pools]
+        self.output_processors = [pool.output_processor for pool in self.stage_pools]
+        self.input_processor = (
+            build_stage0_input_processor(self.stage_vllm_configs[0])
+            if self.stage_vllm_configs and self.stage_vllm_configs[0] is not None
+            else None
+        )
+        self.prompt_expand_func = next(
+            (
+                getattr(client, "prompt_expand_func", None)
+                for client in self.stage_clients
+                if getattr(client, "prompt_expand_func", None) is not None
+            ),
+            None,
+        )
+        self.default_sampling_params_list = [client.default_sampling_params for client in self.stage_clients]
+        self.stage_metadata = [
+            StageRuntimeInfo(
+                final_output=client.final_output,
+                final_output_type=client.final_output_type,
+                stage_type=client.stage_type,
+            )
+            for client in self.stage_clients
+        ]
+        supported_tasks: set[str] = set()
+        if any(getattr(client, "is_comprehension", False) for client in self.stage_clients):
+            supported_tasks.add("generate")
+        if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
+            supported_tasks.add("speech")
+        self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
 
     def _bootstrap_orchestrator(
         self,
@@ -366,16 +393,7 @@ class AsyncOmniEngine:
             self._initialize_stages(stage_init_timeout)
             pd_config = self._detect_pd_config()
 
-            membership_controller = None
-            if isinstance(self._runtime, DistStageRuntime) and self._runtime.coordinator_pub_address:
-                from vllm_omni.engine.membership_controller import MembershipController
-
-                membership_controller = MembershipController(
-                    stage_pools=self.stage_pools,
-                    coordinator_pub_address=self._runtime.coordinator_pub_address,
-                    load_balancer_factory=self._runtime.load_balancer_factory,
-                    remote_replica_factory=self._runtime.remote_replica_factory,
-                )
+            membership_controller = self._runtime.create_membership_controller()
 
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,

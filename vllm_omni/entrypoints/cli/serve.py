@@ -739,8 +739,10 @@ def run_headless(args: argparse.Namespace) -> None:
         spawn_diffusion_proc,
     )
     from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_omni_kv_config_for_stage
-    from vllm_omni.engine.omni_core_engine_proc_manager import OmniCoreEngineProcManager
-    from vllm_omni.engine.stage_engine_startup import register_stage_with_omni_master
+    from vllm_omni.engine.stage_engine_startup import (
+        launch_headless_llm_replica,
+        register_stage_with_omni_master,
+    )
     from vllm_omni.engine.stage_init_utils import (
         build_diffusion_config,
         build_engine_args_dict,
@@ -1045,11 +1047,6 @@ def run_headless(args: argparse.Namespace) -> None:
         omni_master_port,
     )
 
-    # One OmniMasterServer registration per omni replica; each registration
-    # yields its own (handshake, input, output) allocation and the head's
-    # OmniCoordinator ROUTER address. We then spawn one
-    # OmniCoreEngineProcManager per replica so its subprocess gets the
-    # right replica id wired into its OmniCoordClientForStage.
     log_stats = bool(args.log_stats)
     if args.disable_log_stats:
         log_stats = False
@@ -1058,54 +1055,22 @@ def run_headless(args: argparse.Namespace) -> None:
 
     try:
         for _rep_idx in range(omni_dp_size_local):
-            # Always auto-assign: see the diffusion branch comment above
-            # for the rationale (headless owns no replica-id namespace).
-            response = register_stage_with_omni_master(
-                omni_master_address=omni_master_address,
-                omni_master_port=omni_master_port,
-                omni_stage_id=stage_id,
-                omni_stage_config=stage_cfg,
-                coordinator=coordinator,
-                replica_id=None,
-                return_full_response=True,
-                replica_bind_address=omni_replica_address,
-                # LLM headless: the head binds *all* three sockets —
-                # handshake ROUTER (``connect_remote_engine_cores``),
-                # input ROUTER and output PULL (``CoreClient`` —
-                # ``make_zmq_socket`` defaults bind=True for PULL).
-                # The remote LLM worker is purely a connector: it
-                # opens 3 outbound TCP connections to the master's
-                # host. So the master must keep every address on
-                # its own host; rewriting any of them to this
-                # replica's NIC makes the head's ``bind`` go
-                # EADDRNOTAVAIL on a cross-host launch.
-                replica_binds_sockets=False,
-            )
             # Per-replica CUDA_VISIBLE_DEVICES, same pattern as the diffusion
-            # branch above. OmniCoreEngineProcManager.__init__ spawns its
-            # subprocesses via context.Process inside the constructor, so we
-            # must set the env *before* instantiation and restore after.
+            # branch above. The helper instantiates the process manager, which
+            # spawns subprocesses immediately, so set the env before calling it.
             with _replica_device_env(stage_id, per_replica_devices[_rep_idx]):
-                mgr = OmniCoreEngineProcManager(
-                    local_engine_count=local_engine_count,
-                    start_index=dp_rank,
-                    local_start_index=0,
+                mgr = launch_headless_llm_replica(
                     vllm_config=vllm_config,
-                    local_client=False,
-                    handshake_address=response.handshake_address,
                     executor_class=executor_class,
                     log_stats=log_stats,
-                    omni_stage_id=stage_id,
-                    omni_coordinator_address=response.coordinator_router_address,
-                    omni_replica_base_id=response.replica_id,
+                    omni_master_address=omni_master_address,
+                    omni_master_port=omni_master_port,
+                    stage_id=stage_id,
+                    stage_config=stage_cfg,
+                    coordinator=coordinator,
+                    replica_bind_address=omni_replica_address,
                 )
             engine_managers.append(mgr)
-            logger.info(
-                "[Headless] Stage %d replica id=%d up (coord=%s)",
-                stage_id,
-                response.replica_id,
-                response.coordinator_router_address,
-            )
 
         _wait_for_manager_liveness(engine_managers)
     finally:

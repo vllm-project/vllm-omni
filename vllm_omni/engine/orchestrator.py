@@ -972,7 +972,7 @@ class Orchestrator:
         for next_input in next_inputs:
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
-            model_stage = getattr(next_client, "model_stage", None)
+            model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,

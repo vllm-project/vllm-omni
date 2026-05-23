@@ -197,7 +197,11 @@ def test_initialize_diffusion_replica_restores_device_visibility_after_local_ini
 
     monkeypatch.setattr(runtime_mod, "setup_stage_devices", _fake_setup_stage_devices)
     monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
-    monkeypatch.setattr(runtime_mod, "initialize_diffusion_stage", lambda *_, **__: types.SimpleNamespace())
+    monkeypatch.setattr(
+        runtime_mod,
+        "launch_diffusion_stage_replica",
+        lambda **_: (types.SimpleNamespace(), None, []),
+    )
 
     try:
         runtime._initialize_diffusion_replica(plan, stage_init_timeout=1, stage_launch_lock=threading.Lock())
@@ -228,16 +232,15 @@ def test_initialize_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
     monkeypatch.setattr(runtime_mod, "setup_stage_devices", lambda *_: None)
     monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
 
-    def _capture_initialize_diffusion_stage(
-        stage_id, _model, _stage_cfg, _metadata, *, stage_init_timeout, batch_size, use_inline
-    ):
-        captured["stage_id"] = stage_id
-        captured["stage_init_timeout"] = stage_init_timeout
-        captured["batch_size"] = batch_size
-        captured["use_inline"] = use_inline
-        return types.SimpleNamespace()
+    def _capture_launch_diffusion_stage_replica(**kwargs):
+        captured["stage_id"] = kwargs["metadata"].stage_id
+        captured["stage_init_timeout"] = kwargs["stage_init_timeout"]
+        captured["batch_size"] = kwargs["batch_size"]
+        captured["use_inline"] = kwargs["use_inline"]
+        captured["omni_master_server"] = kwargs["omni_master_server"]
+        return types.SimpleNamespace(), None, []
 
-    monkeypatch.setattr(runtime_mod, "initialize_diffusion_stage", _capture_initialize_diffusion_stage)
+    monkeypatch.setattr(runtime_mod, "launch_diffusion_stage_replica", _capture_launch_diffusion_stage_replica)
 
     runtime._initialize_diffusion_replica(plan, stage_init_timeout=302, stage_launch_lock=threading.Lock())
 
@@ -246,10 +249,11 @@ def test_initialize_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
         "stage_init_timeout": 302,
         "batch_size": 4,
         "use_inline": True,
+        "omni_master_server": None,
     }
 
 
-def test_initialize_stages_exposes_logical_stage_views_and_builds_top_level_input_processor(monkeypatch):
+def test_stage_runtime_initializes_stage_pools(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
 
     runtime = StageRuntime(
@@ -296,8 +300,6 @@ def test_initialize_stages_exposes_logical_stage_views_and_builds_top_level_inpu
 
     stage0_output_processor = object()
     stage1_output_processor = object()
-    top_level_input_processor = object()
-
     monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: stage_plans)
     monkeypatch.setattr(runtime, "_initialize_stage_replicas", lambda *_: initialized_clients)
     monkeypatch.setattr(
@@ -305,23 +307,16 @@ def test_initialize_stages_exposes_logical_stage_views_and_builds_top_level_inpu
         "build_llm_stage_output_processor",
         lambda plan, _cfg: stage0_output_processor if plan.stage_idx == 0 else stage1_output_processor,
     )
-    monkeypatch.setattr(runtime_mod, "build_stage0_input_processor", lambda _cfg: top_level_input_processor)
 
     runtime.initialize()
 
     assert len(runtime.stage_pools) == 2
-    assert runtime.input_processor is top_level_input_processor
-    assert runtime.stage_clients == [stage0_client_r0, stage1_client_r0]
-    assert runtime.stage_vllm_configs == [cfg0, cfg1]
-    assert runtime.output_processors == [stage0_output_processor, stage1_output_processor]
-    assert runtime.default_sampling_params_list == [
-        stage0_client_r0.default_sampling_params,
-        stage1_client_r0.default_sampling_params,
-    ]
-    assert runtime.stage_metadata == [
-        StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm"),
-        StageRuntimeInfo(final_output=True, final_output_type=None, stage_type="llm"),
-    ]
+    assert runtime.stage_pools[0].stage_client is stage0_client_r0
+    assert runtime.stage_pools[1].stage_client is stage1_client_r0
+    assert runtime.stage_pools[0].stage_vllm_config is cfg0
+    assert runtime.stage_pools[1].stage_vllm_config is cfg1
+    assert runtime.stage_pools[0].output_processor is stage0_output_processor
+    assert runtime.stage_pools[1].output_processor is stage1_output_processor
 
 
 def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatch):
@@ -360,13 +355,12 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
         lambda stage_cfg, *_args, **_kwargs: (types.SimpleNamespace(tag=f"cfg-{stage_cfg.stage_id}"), object),
     )
 
-    stage_plans, prompt_expand_func = runtime._build_logical_stage_init_plans(
+    stage_plans = runtime._build_logical_stage_init_plans(
         omni_transfer_config=None,
         replicas_per_stage=[1, 3],
         replica_devices_map={1: ["1", "2", "3"]},
     )
 
-    assert prompt_expand_func is None
     assert [plan.configured_stage_id for plan in stage_plans] == [0, 1]
     assert [replica.stage_cfg.runtime.devices for replica in stage_plans[1].replicas] == ["1", "2", "3"]
     assert [replica.replica_id for replica in stage_plans[1].replicas] == [0, 1, 2]
@@ -524,11 +518,11 @@ def test_initialize_llm_replica_passes_stage_init_timeout_to_complete_stage_hand
         yield (fake_vllm_config, object, [])
 
     monkeypatch.setattr(runtime, "_local_llm_launch_scope", _capture_launch_scope)
-    monkeypatch.setattr(
-        runtime,
-        "_launch_local_llm_replica",
-        lambda *_args, **_kwargs: (types.SimpleNamespace(shutdown=lambda: None), None, fake_addresses),
-    )
+    @contextlib.contextmanager
+    def _fake_launch_stage_replica(**_kwargs):
+        yield (types.SimpleNamespace(shutdown=lambda: None), None, fake_addresses)
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
     monkeypatch.setattr(
         runtime_mod.StageEngineCoreClientBase,
         "make_async_mp_client",
