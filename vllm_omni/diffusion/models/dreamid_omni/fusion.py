@@ -128,8 +128,8 @@ class FusedBlock(nn.Module):
 
     def forward(
         self,
-        vid,
-        audio,
+        hidden_states,
+        encoder_hidden_states,
         attn: Attention,
         vid_e,
         vid_seq_lens,
@@ -148,6 +148,8 @@ class FusedBlock(nn.Module):
         audio_ref_lengths,
         audio_freqs_scaling,
     ):
+        vid = hidden_states
+        audio = encoder_hidden_states
         vid_block = self.vid_block
         audio_block = self.audio_block
 
