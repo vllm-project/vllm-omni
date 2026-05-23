@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
-from transformers import BatchFeature, PreTrainedModel, SiglipImageProcessor, SiglipVisionModel, logger
+from transformers import BatchFeature, PreTrainedModel, SiglipImageProcessor, SiglipVisionModel
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheConfig
 from vllm.config.multimodal import BaseDummyOptions
