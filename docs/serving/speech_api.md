@@ -5,6 +5,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
+- **FunCineForge** (`FunAudioLLM/Fun-CineForge`) -- Movie dubbing & TTS with voice cloning, optional face embedding and dialogue metadata. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
 
 See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, and MOSS-TTS-Nano.
@@ -594,6 +595,21 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | Model | Description |
 |-------|-------------|
 | `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
+
+### FunCineForge
+
+| Model | Description |
+|-------|-------------|
+| `FunAudioLLM/Fun-CineForge` | Movie dubbing & voice cloning. Requires `ref_audio` + `ref_text`. Optionally accepts `face_path`, `speech_type`, `speech_len`, and `dialogue` for cinematic dubbing. |
+
+#### Cinematic Dubbing Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `face_path` | string | null | Server-local path to a `.npz` or `.pkl` face embedding file for lip-sync conditioning. Must contain `embeddings` (N, 512) and `faceI` (N,) arrays. |
+| `speech_type` | string | null | Speech style type: `旁白` (narration), `独白` (monologue), `对话` (dialogue), `多人` (multi-speaker). |
+| `speech_len` | integer | null | Target speech sequence length in codec frames (25 Hz). Controls face embedding padding size. |
+| `dialogue` | array | null | Dialogue metadata for multi-speaker dubbing. Each entry: `{"start": float, "duration": float, "spk": int, "gender": str, "age": str}`. |
 
 ### MOSS-TTS-Nano
 

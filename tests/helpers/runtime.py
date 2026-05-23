@@ -1668,10 +1668,20 @@ class OpenAIClientHandler:
         # Standard OpenAI param: use omit when not provided to keep default behavior.
         response_format = request_config.get("response_format", omit)
 
-        # Qwen3-TTS custom fields, forwarded via extra_body.
+        # Custom fields forwarded via extra_body.
         extra_body: dict[str, Any] = {}
         # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
-        for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens"):
+        for key in (
+            "task_type",
+            "ref_text",
+            "ref_audio",
+            "language",
+            "max_new_tokens",
+            "face_path",
+            "speech_type",
+            "speech_len",
+            "dialogue",
+        ):
             if key in request_config:
                 extra_body[key] = request_config[key]
 

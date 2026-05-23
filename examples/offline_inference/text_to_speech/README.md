@@ -16,6 +16,7 @@ list of supported architectures across all modalities, see
 |---|---|---|---|---|---|---|
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
+| FunCineForge | `FunAudioLLM/Fun-CineForge` | 2 (talker + code2wav) | ✓ | ✓ | face embedding, dialogue metadata, speech type | 24 kHz |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
@@ -126,6 +127,60 @@ Streaming requires `async_chunk: true` in the stage config.
 ### Notes
 - Output: 44.1 kHz mono WAV.
 - DAC codec weights (`codec.pth`) are loaded lazily from the model directory.
+
+---
+
+## FunCineForge
+
+2-stage movie dubbing & TTS pipeline (`talker` + `code2wav`) at 24 kHz. Extends standard voice cloning with optional face embeddings and dialogue metadata for cinematic dubbing.
+
+### Prerequisites
+```bash
+uv pip install -e .
+```
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/funcineforge/end2end.py \
+    --ref-audio https://raw.githubusercontent.com/FunAudioLLM/FunCineForge/main/exps/data/ref.wav \
+    --ref-text "A single middle-aged male speaker with a practical tone." \
+    --text "Every closet on a Carnival cruise ship."
+```
+
+### Voice cloning
+```bash
+python examples/offline_inference/text_to_speech/funcineforge/end2end.py \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "Description of the speaker's voice and style." \
+    --text "Your text here."
+```
+
+### Face embedding (cinematic dubbing)
+When a pre-extracted face embedding file is available (`.npz` or `.pkl` containing `embeddings` and `faceI` arrays), pass it via `--face-path` together with `--speech-len`:
+```bash
+python examples/offline_inference/text_to_speech/funcineforge/end2end.py \
+    --ref-audio /path/to/vocal.wav \
+    --ref-text "Voice description." \
+    --text "Dialogue text." \
+    --face-path /path/to/faces.npz \
+    --speech-len 300 \
+    --speech-type "对话"
+```
+
+### Streaming
+Streaming is enabled by default via `async_chunk: true` in `vllm_omni/deploy/funcineforge.yaml`:
+```bash
+python examples/offline_inference/text_to_speech/funcineforge/end2end.py \
+    --async-chunk \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "Voice description." \
+    --text "Your text here."
+```
+
+### Notes
+- Stage 0 (`talker`) is a Qwen2-0.5B LM that generates 25 Hz codec tokens; stage 1 (`code2wav`) runs flow matching DiT + Causal HiFiGAN.
+- Deploy config auto-loads from `vllm_omni/deploy/funcineforge.yaml`. Override with `--stage-configs-path`.
+- For online serving, see [`examples/online_serving/text_to_speech/funcineforge/`](../../online_serving/text_to_speech/funcineforge/).
 
 ---
 

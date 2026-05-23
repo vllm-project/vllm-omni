@@ -81,6 +81,70 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
+    # FunCineForge cinematic dubbing parameters
+    face_path: str | None = Field(
+        default=None,
+        description=(
+            "Server-local path to a .npz or .pkl face embedding file for "
+            "lip-sync conditioning. The file must contain 'embeddings' (N, 512)"
+            " and 'faceI' (N,) arrays. Only used by FunCineForge."
+        ),
+    )
+    speech_type: str | None = Field(
+        default=None,
+        description=(
+            "Speech style type tag for FunCineForge dubbing. "
+            "Valid values: '旁白' (narration), '独白' (monologue), "
+            "'对话' (dialogue), '多人' (multi-speaker)."
+        ),
+    )
+    speech_len: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Target speech sequence length in codec frames (25 Hz) for "
+            "FunCineForge. Controls face embedding padding size."
+        ),
+    )
+    dialogue: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Dialogue metadata for FunCineForge multi-speaker dubbing. "
+            'Each entry: {"start": float, "duration": float, "spk": int, '
+            '"gender": str, "age": str}.'
+        ),
+    )
+    video: str | None = Field(
+        default=None,
+        description=(
+            "Input video for FunCineForge end-to-end dubbing. URL, base64 data URL, "
+            "file URI, or server-local path. When provided, FunCineForge extracts "
+            "reference audio and visual face embeddings from the selected segment."
+        ),
+    )
+    video_start: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Start time in seconds for the FunCineForge video segment.",
+    )
+    video_end: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="End time in seconds for the FunCineForge video segment.",
+    )
+    speaker_age: str | None = Field(
+        default=None,
+        description="Speaker age tag for FunCineForge video preprocessing.",
+    )
+    speaker_gender: str | None = Field(
+        default=None,
+        description="Speaker gender tag for FunCineForge video preprocessing.",
+    )
+    preprocess_work_dir: str | None = Field(
+        default=None,
+        description="Optional server-local scratch directory for FunCineForge video preprocessing artifacts.",
+    )
+
     extra_params: dict[str, Any] | None = Field(
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
@@ -105,6 +169,13 @@ class OpenAICreateSpeechRequest(BaseModel):
         if self.speaker_embedding is not None:
             if self.ref_audio is not None:
                 raise ValueError("'speaker_embedding' and 'ref_audio' are mutually exclusive")
+        return self
+
+    @model_validator(mode="after")
+    def validate_video_segment_constraints(self) -> "OpenAICreateSpeechRequest":
+        if self.video_end is not None and self.video_start is not None:
+            if self.video_end <= self.video_start:
+                raise ValueError("'video_end' must be greater than 'video_start'")
         return self
 
     @model_validator(mode="after")

@@ -20,6 +20,7 @@ logger = init_logger(__name__)
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
+    "FunCineForgeModel": "funcineforge",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
@@ -27,6 +28,7 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
     "CosyVoice3Model": "CosyVoice-BlankEN",
+    "FunCineForgeModel": "Qwen2-0.5B-CosyVoice-BlankEN",
 }
 
 
@@ -44,6 +46,7 @@ def _register_omni_hf_configs() -> None:
     # Register with both transformers AutoConfig and vLLM's config registry
     # so models with empty/missing config.json (e.g. CosyVoice3) can be
     # resolved when model_type is injected via hf_overrides.
+    # NOTE: FunCineForge is registered via transformers_utils/configs/funcineforge.py
     try:
         from vllm.transformers_utils.config import _CONFIG_REGISTRY
     except ImportError:

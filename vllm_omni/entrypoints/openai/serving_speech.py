@@ -6,11 +6,13 @@ import math
 import os
 import re
 import struct
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 import soundfile as sf
@@ -63,6 +65,7 @@ _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
+_FUNCINEFORGE_TTS_MODEL_STAGES = {"funcineforge_talker"}
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
@@ -73,13 +76,21 @@ _TTS_MODEL_STAGES: set[str] = (
     | _QWEN3_TTS_MODEL_STAGES
     | _FISH_TTS_MODEL_STAGES
     | _COSYVOICE3_TTS_MODEL_STAGES
+    | _FUNCINEFORGE_TTS_MODEL_STAGES
     | _OMNIVOICE_TTS_MODEL_STAGES
     | _COVO_AUDIO_MODEL_STAGES
     | _VOXCPM2_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
 )
-_SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {"fish_tts", "qwen3_tts", "voxtral_tts", "cosyvoice3", "voxcpm2"}
+_SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
+    "fish_tts",
+    "qwen3_tts",
+    "voxtral_tts",
+    "cosyvoice3",
+    "voxcpm2",
+    "funcineforge",
+}
 _TTS_LANGUAGES: set[str] = {
     "Auto",
     "Chinese",
@@ -332,6 +343,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None)
             in _COSYVOICE3_TTS_MODEL_STAGES
         )
+
+        self._is_funcineforge = (
+            self._tts_stage is not None
+            and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None)
+            in _FUNCINEFORGE_TTS_MODEL_STAGES
+        )
+
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
 
@@ -487,6 +505,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "fish_tts"
         if model_stage in _COSYVOICE3_TTS_MODEL_STAGES:
             return "cosyvoice3"
+        if model_stage in _FUNCINEFORGE_TTS_MODEL_STAGES:
+            return "funcineforge"
         if model_stage in _OMNIVOICE_TTS_MODEL_STAGES:
             return "omnivoice"
         if model_stage in _COVO_AUDIO_MODEL_STAGES:
@@ -1124,6 +1144,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_fish_tts_request(request)
         if self._tts_model_type == "cosyvoice3":
             return self._validate_cosyvoice3_request(request)
+        if self._tts_model_type == "funcineforge":
+            return self._validate_funcineforge_request(request)
         if self._tts_model_type == "voxcpm2":
             if request.max_new_tokens is not None:
                 if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
@@ -1427,6 +1449,35 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
+    def _validate_funcineforge_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate FunCineForge request parameters. Returns error message or None."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+
+        has_video = request.video is not None
+        if has_video:
+            if request.video_end is not None and request.video_start is not None:
+                if request.video_end <= request.video_start:
+                    return "video_end must be greater than video_start"
+        elif request.ref_audio is None:
+            return "FunCineForge requires either 'video' or 'ref_audio'"
+
+        if request.ref_audio is not None:
+            fmt_err = self._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+
+        if not has_video and (not request.ref_text or not request.ref_text.strip()):
+            return "FunCineForge requires 'ref_text' (clue/prompt text) when 'video' is not provided"
+
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+
+        return None
+
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
         """Resolve ref_audio to (wav_samples, sample_rate).
 
@@ -1434,15 +1485,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
         """
-        # In diffusion mode, model_config may not be available
-        if self._diffusion_mode:
-            connector = MediaConnector()
-        else:
-            model_config = self.model_config
-            connector = MediaConnector(
-                allowed_local_media_path=model_config.allowed_local_media_path,
-                allowed_media_domains=model_config.allowed_media_domains,
-            )
+        connector = self._build_media_connector()
         wav_np, sr = await connector.fetch_audio_async(ref_audio_str)
         wav_np = np.asarray(wav_np, dtype=np.float32)
         if wav_np.ndim > 1:
@@ -1460,6 +1503,63 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
             )
         return wav_np.tolist(), sr
+
+    def _build_media_connector(self) -> MediaConnector:
+        if self._diffusion_mode:
+            return MediaConnector()
+
+        model_config = self.model_config
+        return MediaConnector(
+            allowed_local_media_path=model_config.allowed_local_media_path,
+            allowed_media_domains=model_config.allowed_media_domains,
+        )
+
+    async def _materialize_video_source(self, video: str, work_dir: str | None = None) -> str:
+        """Resolve video input through vLLM media policy into a local file."""
+
+        class _VideoFileMediaIO:
+            def __init__(self, output_dir: str | None) -> None:
+                self.output_dir = output_dir
+
+            def _write_bytes(self, data: bytes, suffix: str = ".mp4") -> str:
+                if self.output_dir is not None:
+                    os.makedirs(self.output_dir, exist_ok=True)
+                    handle = tempfile.NamedTemporaryFile(
+                        mode="wb",
+                        suffix=suffix,
+                        dir=self.output_dir,
+                        delete=False,
+                    )
+                else:
+                    handle = tempfile.NamedTemporaryFile(mode="wb", suffix=suffix, delete=False)
+                with handle:
+                    handle.write(data)
+                    return handle.name
+
+            def load_bytes(self, data: bytes) -> str:
+                return self._write_bytes(data)
+
+            def load_base64(self, media_type: str, data: str) -> str:
+                suffix = {
+                    "video/mp4": ".mp4",
+                    "video/quicktime": ".mov",
+                    "video/webm": ".webm",
+                    "video/x-matroska": ".mkv",
+                    "application/octet-stream": ".mp4",
+                }.get(media_type, ".mp4")
+                return self._write_bytes(base64.b64decode(data), suffix=suffix)
+
+            def load_file(self, filepath: Path) -> str:
+                return str(filepath)
+
+        parsed = urlparse(video)
+        video_url = video
+        if not parsed.scheme:
+            video_url = Path(video).expanduser().resolve().as_uri()
+
+        connector = self._build_media_connector()
+        media_io = _VideoFileMediaIO(work_dir)
+        return await connector.load_from_url_async(video_url, media_io)
 
     async def _generate_audio_chunks(
         self,
@@ -1943,6 +2043,80 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prompt["additional_information"] = additional_information
         return prompt
 
+    async def _build_funcineforge_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> dict[str, Any]:
+        """Build prompt for FunCineForge.
+
+        FunCineForge uses multimodal input with reference audio for voice cloning,
+        similar to CosyVoice3.  Cinematic dubbing parameters (face embeddings,
+        speech type, dialogue metadata) are forwarded via ``mm_processor_kwargs``.
+        """
+        mm_kwargs: dict[str, Any] = {}
+
+        if request.video is not None:
+            from vllm_omni.model_executor.models.funcineforge.video_preprocess import (
+                build_video_conditions,
+            )
+
+            video_path = await self._materialize_video_source(request.video, request.preprocess_work_dir)
+            conditions = await make_async(build_video_conditions, executor=self._tts_executor)(
+                video=video_path,
+                start=request.video_start,
+                end=request.video_end,
+                age=request.speaker_age,
+                gender=request.speaker_gender,
+                speech_type=request.speech_type,
+                work_dir=request.preprocess_work_dir,
+            )
+            if request.ref_audio is not None:
+                wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
+                audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
+            else:
+                audio_data = conditions.ref_audio
+            mm_kwargs.update(
+                {
+                    "prompt_text": request.ref_text or request.instructions or "",
+                    "sample_rate": audio_data[1],
+                    "face_embedding": conditions.face_embedding,
+                    "speech_len": request.speech_len or conditions.speech_len,
+                    "speech_type": request.speech_type or conditions.speech_type,
+                    "dialogue": request.dialogue or conditions.dialogue,
+                }
+            )
+        else:
+            wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
+            audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
+            mm_kwargs.update(
+                {
+                    "prompt_text": request.ref_text,
+                    "sample_rate": sr,
+                }
+            )
+
+        if request.face_path is not None and "face_embedding" not in mm_kwargs:
+            from vllm_omni.model_executor.models.funcineforge.config import FunCineForgeConfig
+            from vllm_omni.model_executor.models.funcineforge.utils import load_face_embedding
+
+            config = FunCineForgeConfig()
+            speech_len = request.speech_len or 200
+            face_emb = load_face_embedding(request.face_path, speech_len, face_size=config.face_size)
+            mm_kwargs["face_embedding"] = face_emb
+
+        if request.speech_type is not None:
+            mm_kwargs["speech_type"] = request.speech_type
+        if request.speech_len is not None:
+            mm_kwargs["speech_len"] = request.speech_len
+        if request.dialogue is not None:
+            mm_kwargs["dialogue"] = request.dialogue
+
+        return {
+            "prompt": request.input,
+            "multi_modal_data": {"audio": audio_data},
+            "mm_processor_kwargs": mm_kwargs,
+        }
+
     # ---- Common speech generation helpers ----
 
     async def _prepare_speech_generation(
@@ -2060,6 +2234,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     tts_params["seed"] = [sampling_params_list[0].seed]
                 prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
+            elif self._tts_model_type == "funcineforge":
+                prompt = await self._build_funcineforge_prompt(request)
+                tts_params = {}
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)

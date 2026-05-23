@@ -31,6 +31,17 @@ models:
       voice_clone:
         task_type: Base
 
+  FunAudioLLM/Fun-CineForge:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone:
+        ref_audio: "https://raw.githubusercontent.com/FunAudioLLM/FunCineForge/main/exps/data/ref.wav"
+        ref_text: >-
+          A single middle-aged male speaker describes a business or construction
+          requirement with a practical and matter-of-fact tone.
+
   openbmb/VoxCPM2:
     supported_tasks: [voice_clone]
     backend: openai-audio-speech

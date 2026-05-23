@@ -2335,6 +2335,244 @@ class TestCosyVoice3Serving:
         cosyvoice3_server._build_cosyvoice3_prompt.assert_awaited_once()
 
 
+# ---- FunCineForge Serving Tests ----
+
+
+@pytest.fixture
+def funcineforge_server(mocker: MockerFixture):
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    mock_engine_client.model_config = mocker.MagicMock(model="FunAudioLLM/Fun-CineForge")
+    mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+    mock_engine_client.tts_batch_max_items = 32
+    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(
+            engine_args=SimpleNamespace(model_stage="funcineforge_talker"),
+            tts_args={},
+        )
+    ]
+
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    return OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+
+
+class TestFunCineForgeServing:
+    def test_validate_funcineforge_accepts_video_without_ref_audio(self, funcineforge_server):
+        request = OpenAICreateSpeechRequest(
+            input="Dubbing line",
+            video="file:///tmp/source.mp4",
+            video_start=0.0,
+            video_end=4.0,
+        )
+        error = funcineforge_server._validate_funcineforge_request(request)
+        assert error is None
+
+    def test_validate_funcineforge_still_accepts_legacy_ref_audio(self, funcineforge_server):
+        request = OpenAICreateSpeechRequest(
+            input="Dubbing line",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="A calm middle-aged male speaker.",
+        )
+        error = funcineforge_server._validate_funcineforge_request(request)
+        assert error is None
+
+    def test_validate_funcineforge_requires_video_or_ref_audio(self, funcineforge_server):
+        request = OpenAICreateSpeechRequest(input="Dubbing line")
+        error = funcineforge_server._validate_funcineforge_request(request)
+        assert error is not None
+        assert "video" in error
+        assert "ref_audio" in error
+
+    def test_build_funcineforge_prompt_from_video(self, funcineforge_server, mocker: MockerFixture):
+        from vllm_omni.model_executor.models.funcineforge.video_preprocess import (
+            FunCineForgeVideoConditions,
+        )
+
+        face_embedding = torch.ones((1, 100, 512), dtype=torch.float32)
+        conditions = FunCineForgeVideoConditions(
+            ref_audio=(np.zeros(16000, dtype=np.float32), 16000),
+            face_embedding=face_embedding,
+            speech_len=100,
+            speech_type="独白",
+            dialogue=[{"start": 0.0, "duration": 4.0, "spk": 1, "gender": "male", "age": "adult"}],
+            work_dir="/tmp/funcineforge",
+            ref_audio_path="/tmp/funcineforge/clip_0.wav",
+            video_clip_path="/tmp/funcineforge/clip_0.mp4",
+            face_path="/tmp/funcineforge/clip_0.pkl",
+        )
+        preprocess = mocker.patch(
+            "vllm_omni.model_executor.models.funcineforge.video_preprocess.build_video_conditions",
+            return_value=conditions,
+        )
+        materialize = mocker.patch.object(
+            funcineforge_server,
+            "_materialize_video_source",
+            return_value="/tmp/policy_checked_source.mp4",
+        )
+        request = OpenAICreateSpeechRequest(
+            input="Dubbing line",
+            video="file:///tmp/source.mp4",
+            video_start=1.0,
+            video_end=5.0,
+            instructions="A worried adult male voice.",
+            speaker_age="adult",
+            speaker_gender="male",
+        )
+
+        prompt = asyncio.run(funcineforge_server._build_funcineforge_prompt(request))
+
+        preprocess.assert_called_once()
+        materialize.assert_awaited_once_with("file:///tmp/source.mp4", None)
+        assert preprocess.call_args.kwargs["video"] == "/tmp/policy_checked_source.mp4"
+        assert prompt["prompt"] == "Dubbing line"
+        assert prompt["multi_modal_data"]["audio"][1] == 16000
+        mm_kwargs = prompt["mm_processor_kwargs"]
+        assert mm_kwargs["prompt_text"] == "A worried adult male voice."
+        assert mm_kwargs["face_embedding"] is face_embedding
+        assert mm_kwargs["speech_len"] == 100
+        assert mm_kwargs["speech_type"] == "独白"
+        assert mm_kwargs["dialogue"][0]["gender"] == "male"
+
+
+    def test_validate_funcineforge_video_end_before_start(self, funcineforge_server):
+        with pytest.raises(ValueError, match="video_end"):
+            OpenAICreateSpeechRequest(
+                input="Dubbing line",
+                video="file:///tmp/source.mp4",
+                video_start=5.0,
+                video_end=3.0,
+            )
+
+    def test_validate_funcineforge_no_ref_text_with_video_is_ok(self, funcineforge_server):
+        request = OpenAICreateSpeechRequest(
+            input="Dubbing line",
+            video="file:///tmp/source.mp4",
+            video_start=0.0,
+            video_end=4.0,
+        )
+        error = funcineforge_server._validate_funcineforge_request(request)
+        assert error is None
+
+    def test_validate_funcineforge_empty_input_rejected(self, funcineforge_server):
+        request = OpenAICreateSpeechRequest(
+            input="",
+            video="file:///tmp/source.mp4",
+        )
+        error = funcineforge_server._validate_funcineforge_request(request)
+        assert error is not None
+        assert "empty" in error.lower()
+
+    def test_build_funcineforge_prompt_face_path_only(self, funcineforge_server, mocker: MockerFixture):
+        mock_resolve = mocker.patch.object(
+            funcineforge_server,
+            "_resolve_ref_audio",
+            return_value=([0.1, 0.2, 0.3], 16000),
+        )
+        mock_load_face = mocker.patch(
+            "vllm_omni.model_executor.models.funcineforge.utils.load_face_embedding",
+            return_value=torch.ones((1, 200, 512), dtype=torch.float32),
+        )
+        mocker.patch(
+            "vllm_omni.model_executor.models.funcineforge.config.FunCineForgeConfig",
+        )
+        request = OpenAICreateSpeechRequest(
+            input="Dubbing line",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="A calm male voice.",
+            face_path="/tmp/faces.npz",
+            speech_len=200,
+        )
+        prompt = asyncio.run(funcineforge_server._build_funcineforge_prompt(request))
+
+        mock_resolve.assert_called_once()
+        mock_load_face.assert_called_once()
+        assert prompt["mm_processor_kwargs"]["face_embedding"] is not None
+        assert prompt["mm_processor_kwargs"]["prompt_text"] == "A calm male voice."
+
+    def test_build_funcineforge_prompt_video_with_override_ref_audio(
+        self, funcineforge_server, mocker: MockerFixture
+    ):
+        from vllm_omni.model_executor.models.funcineforge.video_preprocess import (
+            FunCineForgeVideoConditions,
+        )
+
+        face_embedding = torch.ones((1, 100, 512), dtype=torch.float32)
+        conditions = FunCineForgeVideoConditions(
+            ref_audio=(np.zeros(16000, dtype=np.float32), 16000),
+            face_embedding=face_embedding,
+            speech_len=100,
+            speech_type="独白",
+            dialogue=[{"start": 0.0, "duration": 4.0, "spk": 1, "gender": "male", "age": "adult"}],
+            work_dir="/tmp/funcineforge",
+            ref_audio_path="/tmp/funcineforge/clip_0.wav",
+            video_clip_path="/tmp/funcineforge/clip_0.mp4",
+            face_path="/tmp/funcineforge/clip_0.pkl",
+        )
+        mocker.patch(
+            "vllm_omni.model_executor.models.funcineforge.video_preprocess.build_video_conditions",
+            return_value=conditions,
+        )
+        mocker.patch.object(
+            funcineforge_server,
+            "_materialize_video_source",
+            return_value="/tmp/policy_checked_source.mp4",
+        )
+        override_audio = ([0.5, 0.6, 0.7], 24000)
+        mocker.patch.object(
+            funcineforge_server,
+            "_resolve_ref_audio",
+            return_value=override_audio,
+        )
+
+        request = OpenAICreateSpeechRequest(
+            input="Dubbing with override",
+            video="file:///tmp/source.mp4",
+            video_start=1.0,
+            video_end=5.0,
+            ref_audio="data:audio/wav;base64,override",
+            instructions="A worried voice.",
+        )
+        prompt = asyncio.run(funcineforge_server._build_funcineforge_prompt(request))
+
+        assert prompt["multi_modal_data"]["audio"][1] == 24000
+        assert prompt["mm_processor_kwargs"]["face_embedding"] is face_embedding
+
+    def test_materialize_video_source_uses_media_connector(self, funcineforge_server, mocker: MockerFixture):
+        connector = mocker.MagicMock()
+        connector.load_from_url_async = mocker.AsyncMock(return_value="/tmp/materialized.mp4")
+        media_connector = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.MediaConnector",
+            return_value=connector,
+        )
+        funcineforge_server._diffusion_mode = False
+        funcineforge_server.model_config.allowed_local_media_path = "/tmp"
+        funcineforge_server.model_config.allowed_media_domains = ["example.com"]
+
+        path = asyncio.run(
+            funcineforge_server._materialize_video_source(
+                "https://example.com/input.mp4",
+                "/tmp/funcineforge",
+            )
+        )
+
+        assert path == "/tmp/materialized.mp4"
+        media_connector.assert_called_once_with(
+            allowed_local_media_path="/tmp",
+            allowed_media_domains=["example.com"],
+        )
+        connector.load_from_url_async.assert_awaited_once()
+
+
 class TestTTSAsyncOffloading:
     """Tests for event-loop-safe offloading of blocking TTS operations."""
 

@@ -117,4 +117,17 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.moss_tts_nano.pipeline",
         "MOSS_TTS_NANO_PIPELINE",
     ),
+    "funcineforge": (
+        "vllm_omni.model_executor.models.funcineforge.pipeline",
+        "FUNCINEFORGE_PIPELINE",
+    ),
+}
+
+# --- Single-stage diffusion pipelines (populated in PR 3/N) ---
+_DIFFUSION_PIPELINES: dict[str, tuple[str, str]] = {}
+
+# Union view used by ``_LazyPipelineRegistry``; don't mutate at runtime.
+_VLLM_OMNI_PIPELINES: dict[str, tuple[str, str]] = {
+    **_OMNI_PIPELINES,
+    **_DIFFUSION_PIPELINES,
 }

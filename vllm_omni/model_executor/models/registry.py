@@ -57,6 +57,11 @@ _OMNI_MODELS = {
         "cosyvoice3",
         "CosyVoice3Model",
     ),
+    "FunCineForgeModel": (
+        "funcineforge",
+        "funcineforge",
+        "FunCineForgeModel",
+    ),
     "OmniVoiceModel": (
         "omnivoice",
         "omnivoice",
