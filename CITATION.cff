@@ -1,0 +1,84 @@
+cff-version: 1.2.0
+message: "If you use vLLM-Omni in your research, please cite the following paper."
+title: "vLLM-Omni: Fully Disaggregated Serving for Any-to-Any Multimodal Models"
+abstract: >
+  vLLM-Omni extends vLLM to omni-modality model inference and serving, with support for
+  text, image, video and audio inputs and outputs, non-autoregressive (Diffusion
+  Transformer) architectures, and fully disaggregated execution across heterogeneous
+  hardware (NVIDIA CUDA, AMD ROCm, Intel XPU, MThreads MUSA, and Ascend NPU).
+type: software
+url: "https://github.com/vllm-project/vllm-omni"
+repository-code: "https://github.com/vllm-project/vllm-omni"
+license: Apache-2.0
+authors:
+  - family-names: Yin
+    given-names: Peiqi
+  - family-names: Zhu
+    given-names: Jiangyun
+  - family-names: Gao
+    given-names: Han
+  - family-names: Zheng
+    given-names: Chenguang
+  - family-names: Huang
+    given-names: Yongxiang
+  - family-names: Zhou
+    given-names: Taichang
+  - family-names: Yang
+    given-names: Ruirui
+  - family-names: Liu
+    given-names: Weizhi
+  - family-names: Chen
+    given-names: Weiqing
+  - family-names: Guo
+    given-names: Canlin
+  - family-names: Deng
+    given-names: Didan
+  - family-names: Mo
+    given-names: Zifeng
+  - family-names: Wang
+    given-names: Cong
+  - family-names: Cheng
+    given-names: James
+  - family-names: Wang
+    given-names: Roger
+  - family-names: Liu
+    given-names: Hongsheng
+preferred-citation:
+  type: article
+  title: "vLLM-Omni: Fully Disaggregated Serving for Any-to-Any Multimodal Models"
+  year: 2026
+  journal: "arXiv preprint"
+  url: "https://arxiv.org/abs/2602.02204"
+  authors:
+    - family-names: Yin
+      given-names: Peiqi
+    - family-names: Zhu
+      given-names: Jiangyun
+    - family-names: Gao
+      given-names: Han
+    - family-names: Zheng
+      given-names: Chenguang
+    - family-names: Huang
+      given-names: Yongxiang
+    - family-names: Zhou
+      given-names: Taichang
+    - family-names: Yang
+      given-names: Ruirui
+    - family-names: Liu
+      given-names: Weizhi
+    - family-names: Chen
+      given-names: Weiqing
+    - family-names: Guo
+      given-names: Canlin
+    - family-names: Deng
+      given-names: Didan
+    - family-names: Mo
+      given-names: Zifeng
+    - family-names: Wang
+      given-names: Cong
+    - family-names: Cheng
+      given-names: James
+    - family-names: Wang
+      given-names: Roger
+    - family-names: Liu
+      given-names: Hongsheng

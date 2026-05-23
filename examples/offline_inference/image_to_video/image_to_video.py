@@ -75,7 +75,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default="", help="Text prompt describing the desired motion.")
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--guidance-scale", type=float, default=5.0, help="CFG scale.")
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=None,
+        help="CFG scale. Defaults to 4.0 for LTX2, 5.0 otherwise.",
+    )
     parser.add_argument(
         "--guidance-scale-high", type=float, default=None, help="Optional separate CFG for high-noise (MoE only)."
     )
@@ -83,8 +88,18 @@ def parse_args() -> argparse.Namespace:
         "--height", type=int, default=None, help="Video height (auto-calculated from image if not set)."
     )
     parser.add_argument("--width", type=int, default=None, help="Video width (auto-calculated from image if not set).")
-    parser.add_argument("--num-frames", type=int, default=81, help="Number of frames.")
-    parser.add_argument("--num-inference-steps", type=int, default=50, help="Sampling steps.")
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=None,
+        help="Number of frames. Defaults to 121 for LTX2, 81 otherwise.",
+    )
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Sampling steps. Defaults to 40 for LTX2, 50 otherwise.",
+    )
     parser.add_argument("--boundary-ratio", type=float, default=0.875, help="Boundary split ratio for MoE models.")
     parser.add_argument(
         "--frame-rate",
@@ -367,8 +382,8 @@ def main():
     print(f"\n{'=' * 60}")
     print("Generation Configuration:")
     print(f"  Model: {args.model}")
-    print(f"  Inference steps: {args.num_inference_steps}")
-    print(f"  Frames: {args.num_frames}")
+    print(f"  Inference steps: {num_inference_steps}")
+    print(f"  Frames: {num_frames}")
     print(f"  Solver: {args.sample_solver}")
     print(f"  diffusion_kv_cache_dtype(config): {args.diffusion_kv_cache_dtype}")
     print(f"  diffusion_kv_cache_skip_steps(config): {args.diffusion_kv_cache_skip_steps}")

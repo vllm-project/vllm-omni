@@ -120,3 +120,49 @@ curl -s http://localhost:8091/v1/chat/completions \
 ```
 
 For more details, please refer to [online serving](../user_guide/examples/online_serving/text_to_image.md).
+
+## Troubleshooting
+
+If you hit issues during your first run, please check the items below before opening
+an installation/bug issue. The first three problems make up the majority of new-user
+reports.
+
+### `vllm` does not recognise `--omni`
+
+The `--omni` flag is provided by vLLM-Omni and only works when its version is aligned
+with the installed vLLM. If you installed vLLM < 0.20.0 and vLLM-Omni 0.20.0, the
+entrypoint will no longer be hijacked and `--omni` will look unknown. Run
+`pip show vllm vllm-omni` and confirm that the major and minor versions match, then
+upgrade vLLM as needed.
+
+### `ModuleNotFoundError: No module named 'vllm_omni'`
+
+Most often this means you ran `python …` from a different environment than the one
+where vLLM-Omni was installed. Activate the same virtualenv used for `uv pip install -e .`
+and re-run; on Linux/macOS that is `source .venv/bin/activate`.
+
+### Out-of-memory (OOM) at startup
+
+Diffusion models in particular hold large weight, scheduler, and KV-cache buffers in
+GPU memory. If the engine OOMs before the first request:
+
+- Lower `gpu_memory_utilization` (defaults to 0.9; try 0.8 or 0.7). See the
+  [GPU memory configuration guide](../configuration/gpu_memory_utilization.md).
+- Reduce `max_num_seqs` for the AR stage.
+- Pick a smaller or quantized variant of the model.
+
+### Generated image / audio is silent or blank
+
+Make sure you saved the raw bytes returned by the API rather than the JSON envelope.
+The serving snippet above pipes through `jq` and `base64 -d` for that reason — without
+the decoding step the file will be a base64-encoded text blob, not a valid PNG or WAV.
+
+### Running on Windows
+
+vLLM-Omni is not natively supported on Windows. Please use WSL2 with Ubuntu 22.04+
+(`wsl --install -d Ubuntu-22.04`) and follow the Linux instructions inside the WSL
+shell.
+
+If your problem isn't covered here, open an
+[installation issue](https://github.com/vllm-project/vllm-omni/issues/new?template=200-installation.yml)
+with the output of `python collect_env.py` attached.
