@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
+    parser.add_argument("--cache-backend", type=str, default=None, choices=["cache_dit"], help="Cache backend.")
     parser.add_argument(
         "--use-hsdp",
         action="store_true",
@@ -146,12 +147,29 @@ def main() -> None:
         hsdp_replicate_size=args.hsdp_replicate_size,
     )
 
+    cache_config = None
+    if args.cache_backend == "cache_dit":
+        cache_config = {
+            "Fn_compute_blocks": 1,
+            "Bn_compute_blocks": 0,
+            "max_warmup_steps": 4,
+            "max_cached_steps": 20,
+            "residual_diff_threshold": 0.24,
+            "max_continuous_cached_steps": 3,
+            "enable_taylorseer": False,
+            "taylorseer_order": 1,
+            "scm_steps_mask_policy": None,
+            "scm_steps_policy": "dynamic",
+        }
+
     omni = Omni(
         model=args.model,
         parallel_config=parallel_config,
         model_type=args.model_type,
         enable_cpu_offload=args.enable_cpu_offload,
         enable_layerwise_offload=args.enable_layerwise_offload,
+        cache_backend=args.cache_backend,
+        cache_config=cache_config,
     )
     start = time.perf_counter()
     outputs = omni.generate(prompt, sampling_params)

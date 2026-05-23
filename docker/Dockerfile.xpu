@@ -133,6 +133,11 @@ ENTRYPOINT []
 
 FROM ${VLLM_BASE} AS vllm-omni
 
+RUN apt-get update && \
+    apt-get install -y espeak-ng ffmpeg git jq && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /workspace/vllm-omni
 COPY . .
 
