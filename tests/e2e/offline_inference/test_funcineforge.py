@@ -270,3 +270,236 @@ def test_funcineforge_offline_dubbing_with_face(async_chunk: bool) -> None:
             _assert_valid_audio(outputs)
     finally:
         os.unlink(face_path)
+
+
+# ---------------------------------------------------------------------------
+# Test: dubbing with speech_type parameter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("async_chunk", ASYNC_CHUNK_MODES)
+def test_funcineforge_offline_dubbing_with_speech_type(async_chunk: bool) -> None:
+    """FunCineForge dubbing with speech_type tag should produce valid audio.
+
+    Tests that the speech_type parameter ('旁白', '独白', '对话', '多人')
+    is correctly forwarded through mm_processor_kwargs to the model.
+    """
+    import tempfile
+
+    import torch
+
+    from vllm_omni.model_executor.models.funcineforge.utils import (
+        load_face_embedding,
+    )
+
+    ref_audio, ref_sr = _load_ref_audio()
+    model_dir = _resolve_model_dir()
+
+    face_data = _load_face_embedding()
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+        f.write(face_data)
+        face_path = f.name
+
+    try:
+        vocal_audio, vocal_sr = _load_vocal_audio()
+        config = FunCineForgeConfig()
+        speech_len = int(len(vocal_audio) / vocal_sr * config.token_rate)
+        face_emb = load_face_embedding(face_path, speech_len, face_size=config.face_size)
+
+        with OmniRunner(
+            str(model_dir),
+            seed=42,
+            stage_configs_path=get_deploy_config_path("funcineforge.yaml"),
+            async_chunk=async_chunk,
+            stage_init_timeout=300,
+        ) as omni_runner:
+            sampling_params_list = omni_runner.get_default_sampling_params_list()
+
+            inputs = [
+                {
+                    "prompt": SYNTH_TEXT,
+                    "multi_modal_data": {"audio": (ref_audio, ref_sr)},
+                    "modalities": ["audio"],
+                    "mm_processor_kwargs": {
+                        "prompt_text": CLUE_TEXT,
+                        "sample_rate": ref_sr,
+                        "face_embedding": face_emb,
+                        "speech_type": "旁白",
+                    },
+                }
+            ]
+
+            outputs = omni_runner.omni.generate(inputs, sampling_params_list)
+            _assert_valid_audio(outputs)
+    finally:
+        os.unlink(face_path)
+
+
+# ---------------------------------------------------------------------------
+# Test: full cinematic dubbing with face + speech_type + dialogue
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("async_chunk", ASYNC_CHUNK_MODES)
+def test_funcineforge_offline_dubbing_full_cinematic(async_chunk: bool) -> None:
+    """Full cinematic dubbing with face + speech_type + dialogue metadata.
+
+    Exercises the complete HF demo-style dubbing pipeline with all parameters:
+    face embedding (lip-sync), speech type tag, dialogue metadata with speaker
+    time alignment / gender / age tags.
+    """
+    import tempfile
+
+    import torch
+
+    from vllm_omni.model_executor.models.funcineforge.utils import (
+        load_face_embedding,
+    )
+
+    ref_audio, ref_sr = _load_ref_audio()
+    model_dir = _resolve_model_dir()
+
+    face_data = _load_face_embedding()
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+        f.write(face_data)
+        face_path = f.name
+
+    try:
+        vocal_audio, vocal_sr = _load_vocal_audio()
+        config = FunCineForgeConfig()
+        speech_len = int(len(vocal_audio) / vocal_sr * config.token_rate)
+        face_emb = load_face_embedding(face_path, speech_len, face_size=config.face_size)
+
+        dialogue = [
+            {"start": 0.0, "duration": 5.74, "spk": 1, "gender": "male", "age": "middle-aged"},
+        ]
+
+        with OmniRunner(
+            str(model_dir),
+            seed=42,
+            stage_configs_path=get_deploy_config_path("funcineforge.yaml"),
+            async_chunk=async_chunk,
+            stage_init_timeout=300,
+        ) as omni_runner:
+            sampling_params_list = omni_runner.get_default_sampling_params_list()
+
+            inputs = [
+                {
+                    "prompt": SYNTH_TEXT,
+                    "multi_modal_data": {"audio": (ref_audio, ref_sr)},
+                    "modalities": ["audio"],
+                    "mm_processor_kwargs": {
+                        "prompt_text": CLUE_TEXT,
+                        "sample_rate": ref_sr,
+                        "face_embedding": face_emb,
+                        "speech_type": "独白",
+                        "speech_len": speech_len,
+                        "dialogue": dialogue,
+                    },
+                }
+            ]
+
+            outputs = omni_runner.omni.generate(inputs, sampling_params_list)
+            _assert_valid_audio(outputs)
+    finally:
+        os.unlink(face_path)
+
+
+# ---------------------------------------------------------------------------
+# Test: video preprocessing end-to-end (requires demo checkout + moviepy)
+# ---------------------------------------------------------------------------
+
+
+def _has_video_preprocess() -> bool:
+    """Check if video preprocessing dependencies are available."""
+    try:
+        import moviepy  # noqa: F401
+    except ImportError:
+        return False
+    return os.environ.get("FUNCINEFORGE_DEMO_ROOT") is not None
+
+
+_GITHUB_VIDEO_URL = f"{_GITHUB_DATA_BASE}/clipped/en_monologue_1.mp4"
+
+
+@functools.lru_cache(maxsize=1)
+def _download_test_video() -> bytes:
+    """Download official test video clip."""
+    with urlopen(_GITHUB_VIDEO_URL, timeout=120) as resp:
+        return resp.read()
+
+
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("async_chunk", ASYNC_CHUNK_MODES)
+@pytest.mark.skipif(
+    not _has_video_preprocess(),
+    reason="Video preprocessing requires moviepy + FUNCINEFORGE_DEMO_ROOT",
+)
+def test_funcineforge_offline_video_preprocess(async_chunk: bool) -> None:
+    """FunCineForge offline dubbing from raw video input.
+
+    Downloads a test video from the official FunCineForge repo, runs
+    build_video_conditions() to extract face embeddings and reference
+    audio, then generates speech with the full cinematic pipeline.
+
+    Requires: moviepy + FUNCINEFORGE_DEMO_ROOT environment variable
+    pointing to a clone of the HuggingFace Fun-CineForge-Demo space.
+    """
+    import tempfile
+
+    from vllm_omni.model_executor.models.funcineforge.video_preprocess import (
+        build_video_conditions,
+    )
+
+    model_dir = _resolve_model_dir()
+
+    video_data = _download_test_video()
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        f.write(video_data)
+        video_path = f.name
+
+    try:
+        conditions = build_video_conditions(
+            video=video_path,
+            start=0.0,
+            end=5.0,
+            gender="male",
+            age="middle-aged",
+            speech_type="独白",
+        )
+        ref_wav, ref_sr = conditions.ref_audio
+
+        with OmniRunner(
+            str(model_dir),
+            seed=42,
+            stage_configs_path=get_deploy_config_path("funcineforge.yaml"),
+            async_chunk=async_chunk,
+            stage_init_timeout=300,
+        ) as omni_runner:
+            sampling_params_list = omni_runner.get_default_sampling_params_list()
+
+            inputs = [
+                {
+                    "prompt": SYNTH_TEXT,
+                    "multi_modal_data": {"audio": (ref_wav, ref_sr)},
+                    "modalities": ["audio"],
+                    "mm_processor_kwargs": {
+                        "prompt_text": CLUE_TEXT,
+                        "sample_rate": ref_sr,
+                        "face_embedding": conditions.face_embedding,
+                        "speech_len": conditions.speech_len,
+                        "speech_type": conditions.speech_type,
+                        "dialogue": conditions.dialogue,
+                    },
+                }
+            ]
+
+            outputs = omni_runner.omni.generate(inputs, sampling_params_list)
+            _assert_valid_audio(outputs)
+    finally:
+        os.unlink(video_path)

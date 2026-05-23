@@ -24,6 +24,12 @@ Examples:
         --ref-audio ref.wav --ref-text "A narrator." \\
         --face-path faces.npz --speech-type "对话" --speech-len 200 \\
         --dialogue-json '[{"start":0,"duration":3,"spk":1,"gender":"男","age":"中年"}]'
+
+    # End-to-end video dubbing. If --ref-audio is omitted, the selected
+    # video segment audio is used as the voice reference.
+    python speech_client.py --text "The door creaked open." \\
+        --video scene.mp4 --video-start 12.5 --video-end 17.0 \\
+        --ref-text "A tense adult male voice." --speaker-gender male --speaker-age adult
 """
 
 import argparse
@@ -36,41 +42,76 @@ import httpx
 DEFAULT_API_BASE = "http://localhost:8091"
 DEFAULT_API_KEY = "EMPTY"
 DEFAULT_MODEL = "FunAudioLLM/Fun-CineForge"
-DEFAULT_REF_AUDIO = "https://raw.githubusercontent.com/FunAudioLLM/FunCineForge/main/exps/data/ref.wav"
 DEFAULT_REF_TEXT = (
     "A single middle-aged male speaker describes a business or "
     "construction requirement with a practical and matter-of-fact tone."
 )
 
 
+def encode_file_to_base64(path: str, mime_map: dict[str, str], default_mime: str) -> str:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
+    ext = path.lower().rsplit(".", 1)[-1]
+    mime_type = mime_map.get(ext, default_mime)
+    with open(path, "rb") as f:
+        data_b64 = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:{mime_type};base64,{data_b64}"
+
+
 def encode_audio_to_base64(audio_path: str) -> str:
-    if not os.path.exists(audio_path):
-        raise FileNotFoundError(f"Audio file not found: {audio_path}")
-    ext = audio_path.lower().rsplit(".", 1)[-1]
-    mime_map = {
-        "wav": "audio/wav",
-        "mp3": "audio/mpeg",
-        "flac": "audio/flac",
-        "ogg": "audio/ogg",
-    }
-    mime_type = mime_map.get(ext, "audio/wav")
-    with open(audio_path, "rb") as f:
-        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
-    return f"data:{mime_type};base64,{audio_b64}"
+    return encode_file_to_base64(
+        audio_path,
+        {
+            "wav": "audio/wav",
+            "mp3": "audio/mpeg",
+            "flac": "audio/flac",
+            "ogg": "audio/ogg",
+        },
+        "audio/wav",
+    )
+
+
+def encode_video_to_base64(video_path: str) -> str:
+    return encode_file_to_base64(
+        video_path,
+        {
+            "mp4": "video/mp4",
+            "mov": "video/quicktime",
+            "webm": "video/webm",
+            "mkv": "video/x-matroska",
+        },
+        "video/mp4",
+    )
 
 
 def run_tts(args) -> None:
     ref_audio = args.ref_audio
     if ref_audio and not ref_audio.startswith(("http://", "https://", "data:")):
         ref_audio = encode_audio_to_base64(ref_audio)
+    video = args.video
+    if video and not video.startswith(("http://", "https://", "data:", "file://")):
+        video = encode_video_to_base64(video)
 
     payload = {
         "model": args.model,
         "input": args.text,
         "response_format": args.response_format,
-        "ref_audio": ref_audio,
         "ref_text": args.ref_text,
     }
+    if ref_audio:
+        payload["ref_audio"] = ref_audio
+    if video:
+        payload["video"] = video
+    if args.video_start is not None:
+        payload["video_start"] = args.video_start
+    if args.video_end is not None:
+        payload["video_end"] = args.video_end
+    if args.speaker_age:
+        payload["speaker_age"] = args.speaker_age
+    if args.speaker_gender:
+        payload["speaker_gender"] = args.speaker_gender
+    if args.preprocess_work_dir:
+        payload["preprocess_work_dir"] = args.preprocess_work_dir
 
     if args.face_path:
         payload["face_path"] = args.face_path
@@ -87,7 +128,10 @@ def run_tts(args) -> None:
 
     print(f"Model: {args.model}")
     print(f"Text: {args.text}")
-    print(f"Ref audio: {args.ref_audio}")
+    if args.video:
+        print(f"Video: {args.video}")
+    if args.ref_audio:
+        print(f"Ref audio: {args.ref_audio}")
     if args.face_path:
         print(f"Face embedding: {args.face_path}")
     if args.speech_type:
@@ -137,8 +181,8 @@ def main():
     parser.add_argument("--text", default="Hello, how are you?", help="Text to synthesize")
     parser.add_argument(
         "--ref-audio",
-        default=DEFAULT_REF_AUDIO,
-        help="Reference audio (local path or URL) for voice cloning",
+        default=None,
+        help="Reference audio (local path or URL) for voice cloning. Optional when --video is provided.",
     )
     parser.add_argument(
         "--ref-text",
@@ -157,6 +201,20 @@ def main():
         help="Audio format (default: wav)",
     )
     parser.add_argument("--output", "-o", default=None, help="Output file path")
+    parser.add_argument(
+        "--video",
+        default=None,
+        help="Input video (local path, file:// URI, data URL, or URL) for end-to-end FunCineForge dubbing",
+    )
+    parser.add_argument("--video-start", type=float, default=None, help="Video segment start time in seconds")
+    parser.add_argument("--video-end", type=float, default=None, help="Video segment end time in seconds")
+    parser.add_argument("--speaker-age", default=None, help="Speaker age tag for video preprocessing")
+    parser.add_argument("--speaker-gender", default=None, help="Speaker gender tag for video preprocessing")
+    parser.add_argument(
+        "--preprocess-work-dir",
+        default=None,
+        help="Optional server-local scratch directory for FunCineForge video preprocessing artifacts",
+    )
     parser.add_argument(
         "--face-path",
         default=None,

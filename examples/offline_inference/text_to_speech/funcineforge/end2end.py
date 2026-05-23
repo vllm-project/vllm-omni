@@ -274,7 +274,45 @@ def _verify_asr(path: str, expected_text: str, threshold: float) -> None:
         raise AssertionError(f"ASR similarity {score:.3f} < threshold {threshold:.3f}")
 
 
+def _build_video_offline_prompt(args: argparse.Namespace) -> dict[str, Any]:
+    """Build offline prompt from video input using build_video_conditions()."""
+    from vllm_omni.model_executor.models.funcineforge.video_preprocess import (
+        build_video_conditions,
+    )
+
+    conditions = build_video_conditions(
+        video=args.video,
+        start=args.video_start,
+        end=args.video_end,
+        age=getattr(args, "speaker_age", None),
+        gender=getattr(args, "speaker_gender", None),
+        speech_type=getattr(args, "speech_type", None),
+        work_dir=getattr(args, "preprocess_work_dir", None),
+    )
+    if args.ref_audio:
+        ref_wav, ref_sr = _load_audio(args.ref_audio)
+    else:
+        ref_wav, ref_sr = conditions.ref_audio
+
+    mm_kwargs: dict[str, Any] = {
+        "prompt_text": args.ref_text or "",
+        "sample_rate": ref_sr,
+        "face_embedding": conditions.face_embedding,
+        "speech_len": args.speech_len or conditions.speech_len,
+        "speech_type": args.speech_type or conditions.speech_type,
+        "dialogue": args.dialogue or conditions.dialogue,
+    }
+    return {
+        "prompt": args.text,
+        "multi_modal_data": {"audio": (ref_wav, ref_sr)},
+        "modalities": ["audio"],
+        "mm_processor_kwargs": mm_kwargs,
+    }
+
+
 def _offline_prompt(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "video", None):
+        return _build_video_offline_prompt(args)
     ref_wav, ref_sr = _load_audio(args.ref_audio)
     return {
         "prompt": args.text,
@@ -336,14 +374,32 @@ async def run_offline_async(args: argparse.Namespace) -> tuple[np.ndarray, int]:
 def run_online(args: argparse.Namespace) -> tuple[np.ndarray, int]:
     import httpx
 
-    body = {
+    body: dict[str, Any] = {
         "model": args.model,
         "input": args.text,
         "stream": args.async_chunk,
         "response_format": "wav",
-        "ref_audio": _to_data_url(args.ref_audio),
-        "ref_text": args.ref_text,
     }
+
+    if getattr(args, "video", None):
+        if _is_url(args.video):
+            body["video"] = args.video
+        else:
+            body["video"] = _to_data_url(args.video)
+        if getattr(args, "video_start", None) is not None:
+            body["video_start"] = args.video_start
+        if getattr(args, "video_end", None) is not None:
+            body["video_end"] = args.video_end
+        if getattr(args, "speaker_age", None):
+            body["speaker_age"] = args.speaker_age
+        if getattr(args, "speaker_gender", None):
+            body["speaker_gender"] = args.speaker_gender
+        if getattr(args, "preprocess_work_dir", None):
+            body["preprocess_work_dir"] = args.preprocess_work_dir
+    if args.ref_audio:
+        body["ref_audio"] = _to_data_url(args.ref_audio)
+    if args.ref_text:
+        body["ref_text"] = args.ref_text
     if args.face_path:
         body["face_path"] = args.face_path
     if getattr(args, "speech_len", None) is not None:
@@ -381,6 +437,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text", default=DEFAULT_TEXT)
     parser.add_argument("--ref-audio")
     parser.add_argument("--ref-text", default=DEFAULT_REF_TEXT)
+    parser.add_argument("--video", help="Input video for end-to-end dubbing (path or URL)")
+    parser.add_argument("--video-start", type=float, help="Video segment start time in seconds")
+    parser.add_argument("--video-end", type=float, help="Video segment end time in seconds")
+    parser.add_argument("--speaker-age", help="Speaker age tag for video preprocessing")
+    parser.add_argument("--speaker-gender", help="Speaker gender tag for video preprocessing")
+    parser.add_argument("--preprocess-work-dir", help="Scratch dir for video preprocessing artifacts")
     parser.add_argument("--face-path")
     parser.add_argument("--speech-len", type=int)
     parser.add_argument("--speech-type")
@@ -406,8 +468,8 @@ def main() -> None:
     args = parse_args()
     args.dialogue = None
     _apply_demo_args(args)
-    if not args.ref_audio:
-        raise ValueError("--ref-audio is required unless --demo-jsonl supplies it")
+    if not args.ref_audio and not getattr(args, "video", None):
+        raise ValueError("--ref-audio or --video is required unless --demo-jsonl supplies it")
     if args.mode == "offline" and args.async_chunk:
         audio, sr = asyncio.run(run_offline_async(args))
     elif args.mode == "offline":

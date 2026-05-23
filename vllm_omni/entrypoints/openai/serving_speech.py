@@ -1452,16 +1452,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
-        # FunCineForge requires reference audio for voice cloning
-        if request.ref_audio is None:
-            return "FunCineForge requires 'ref_audio' (reference audio for voice cloning)"
+        has_video = request.video is not None
+        if has_video:
+            if request.video_end is not None and request.video_start is not None:
+                if request.video_end <= request.video_start:
+                    return "video_end must be greater than video_start"
+        elif request.ref_audio is None:
+            return "FunCineForge requires either 'video' or 'ref_audio'"
 
-        fmt_err = self._validate_ref_audio_format(request.ref_audio)
-        if fmt_err:
-            return fmt_err
+        if request.ref_audio is not None:
+            fmt_err = self._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
 
-        if not request.ref_text or not request.ref_text.strip():
-            return "FunCineForge requires 'ref_text' (transcript of the reference audio)"
+        if not has_video and (not request.ref_text or not request.ref_text.strip()):
+            return "FunCineForge requires 'ref_text' (clue/prompt text) when 'video' is not provided"
 
         if request.max_new_tokens is not None:
             if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
@@ -1997,15 +2002,48 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         similar to CosyVoice3.  Cinematic dubbing parameters (face embeddings,
         speech type, dialogue metadata) are forwarded via ``mm_processor_kwargs``.
         """
-        wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
-        audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
+        mm_kwargs: dict[str, Any] = {}
 
-        mm_kwargs: dict[str, Any] = {
-            "prompt_text": request.ref_text,
-            "sample_rate": sr,
-        }
+        if request.video is not None:
+            from vllm_omni.model_executor.models.funcineforge.video_preprocess import (
+                build_video_conditions,
+            )
 
-        if request.face_path is not None:
+            conditions = await make_async(build_video_conditions, executor=self._tts_executor)(
+                video=request.video,
+                start=request.video_start,
+                end=request.video_end,
+                age=request.speaker_age,
+                gender=request.speaker_gender,
+                speech_type=request.speech_type,
+                work_dir=request.preprocess_work_dir,
+            )
+            if request.ref_audio is not None:
+                wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
+                audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
+            else:
+                audio_data = conditions.ref_audio
+            mm_kwargs.update(
+                {
+                    "prompt_text": request.ref_text or request.instructions or "",
+                    "sample_rate": audio_data[1],
+                    "face_embedding": conditions.face_embedding,
+                    "speech_len": request.speech_len or conditions.speech_len,
+                    "speech_type": request.speech_type or conditions.speech_type,
+                    "dialogue": request.dialogue or conditions.dialogue,
+                }
+            )
+        else:
+            wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
+            audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
+            mm_kwargs.update(
+                {
+                    "prompt_text": request.ref_text,
+                    "sample_rate": sr,
+                }
+            )
+
+        if request.face_path is not None and "face_embedding" not in mm_kwargs:
             from vllm_omni.model_executor.models.funcineforge.config import FunCineForgeConfig
             from vllm_omni.model_executor.models.funcineforge.utils import load_face_embedding
 
