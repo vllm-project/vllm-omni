@@ -24,6 +24,10 @@ from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import BasePipelineUtils, get_pipeline_utils
+from vllm_omni.diffusion.models.diffusers_adapter.quantization_utils import (
+    apply_diffusers_quantization_config,
+    ensure_supported_diffusers_quantization,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniPromptType, OmniTextPrompt
@@ -79,6 +83,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             "torch_dtype": dtype,
             **self.od_config.diffusers_load_kwargs,
         }
+        apply_diffusers_quantization_config(self.od_config, load_kwargs)
         logger.debug(f"Loading diffusers pipeline with kwargs: {load_kwargs}")
 
         pipeline_class = self.od_config.diffusers_pipeline_cls
@@ -190,10 +195,11 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 "Eager execution is not supported with the diffusers backend. "
                 "Use a native pipeline for continuous batching mode."
             )
-        if self.od_config.quantization_config is not None:
-            raise NotImplementedError(
-                "Quantization is not supported with the diffusers backend. Use a native pipeline for quantization."
-            )
+        if (
+            self.od_config.quantization_config is not None
+            and "quantization_config" not in self.od_config.diffusers_load_kwargs
+        ):
+            ensure_supported_diffusers_quantization(self.od_config.quantization_config)
 
     # ------------------------------------------------------------------
     # Wrap settings, inputs, and outputs

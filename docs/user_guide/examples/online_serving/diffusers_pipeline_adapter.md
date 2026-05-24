@@ -9,7 +9,8 @@ vLLM-Omni supports running diffusion models with the diffusers backend, directly
 
 The diffusers backend is a black-box adapter. Its primary focus is to serve diffusion models online.
 Currently, the following features are NOT yet supported.
-It is not guaranteed whether they will be supported in the future.
+Community contributions are welcome to add these features when they can be
+delegated cleanly to Diffusers or mapped conservatively from vLLM-Omni.
 
 - CFG parallel execution
 - Sequence parallel execution
@@ -56,6 +57,40 @@ For example: `--diffusers-load-kwargs '{"use_safetensors": true}'`.
 
 When a parameter is available in the vLLM-Omni interface, it will be adapted here.
 But if that parameter is simultaneously set in both the vLLM-Omni interface and `diffusers_load_kwargs`, the **latter** will take precedence.
+
+#### Quantization
+
+`diffusers_load_kwargs` is the canonical configuration path for Diffusers-native
+quantization. With the project-pinned Diffusers 0.38.0,
+`DiffusionPipeline.from_pretrained()` expects `quantization_config` to be a
+Diffusers `PipelineQuantizationConfig` object.
+This object form is mainly useful from Python/config paths that can pass Python
+objects; a raw JSON dict is not a Diffusers-native quantization config.
+
+As a courtesy layer, the diffusers backend can convert a small allowlist of
+vLLM-Omni quantization configs to Diffusers/TorchAO configs when
+`diffusers_load_kwargs` does not already contain `quantization_config`.
+Currently this only covers online/dynamic `fp8` and online/dynamic `int8`, both
+targeting the Diffusers pipeline `transformer` component. The converted config
+uses Diffusers/TorchAO dynamic quantization semantics; it does not try to
+emulate native vLLM-Omni checkpoint or low-bit post-load semantics. This
+courtesy path requires `torchao` to be installed.
+
+For example, the CLI can use the vLLM-Omni courtesy path:
+
+```bash
+vllm serve "Qwen/Qwen-Image" \
+    --omni \
+    --diffusion-load-format diffusers \
+    --quantization-config '{"method": "fp8"}'
+```
+
+Unsupported or ambiguous vLLM-Omni quantization methods, such as `gguf`,
+`modelopt`, `mxfp4`, `mxfp8`, serialized checkpoints, and static FP8 configs,
+fail explicitly instead of silently falling back. Layer-name skip lists such as
+`ignored_layers` are also not mapped because vLLM-Omni and Diffusers module
+names may differ. Use Diffusers-native configuration through
+`diffusers_load_kwargs` or a native vLLM-Omni pipeline for those cases.
 
 ### `--diffusers-call-kwargs`
 

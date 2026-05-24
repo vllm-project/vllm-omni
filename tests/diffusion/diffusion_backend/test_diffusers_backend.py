@@ -91,7 +91,7 @@ class TestPipelineArgumentsHandling:
 
     @pytest.mark.parametrize(
         "feature_id",
-        ["cfg_parallel", "ulysses", "ring", "teacache", "cache_dit", "enforce_eager", "quantization"],
+        ["cfg_parallel", "ulysses", "ring", "teacache", "cache_dit", "enforce_eager", "unsupported_quantization"],
     )
     def test_adapter_guard_unsupported_feature(self, feature_id):
         if feature_id == "cfg_parallel":
@@ -121,13 +121,82 @@ class TestPipelineArgumentsHandling:
             )
         elif feature_id == "enforce_eager":
             od_config = _make_od_config(enforce_eager=True)
-        elif feature_id == "quantization":
-            od_config = _make_od_config(quantization_config=SimpleNamespace(quant_method="fp8"))
+        elif feature_id == "unsupported_quantization":
+            od_config = _make_od_config(quantization_config=SimpleNamespace(quant_method="gguf"))
         else:
             raise ValueError(f"Unknown feature ID: {feature_id}")
 
         with pytest.raises(NotImplementedError):
             DiffusersAdapterPipeline(od_config=od_config)
+
+    def test_adapter_load_weights_injects_supported_quantization_config(self, mocker):
+        class FakePipelineQuantizationConfig:
+            def __init__(self, *, quant_mapping):
+                self.quant_mapping = quant_mapping
+
+        class FakeTorchAoConfig:
+            def __init__(self, quant_type, modules_to_not_convert=None):
+                self.quant_type = quant_type
+                self.modules_to_not_convert = modules_to_not_convert
+
+        class FakeInt8DynamicActivationInt8WeightConfig:
+            pass
+
+        class MockPipeline:
+            def __call__(self, prompt=None):
+                return None
+
+            def to(self, device):
+                return self
+
+        mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils._get_diffusers_quantization_classes",
+            return_value=(FakePipelineQuantizationConfig, FakeTorchAoConfig),
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils._get_torchao_quant_type_cls",
+            return_value=FakeInt8DynamicActivationInt8WeightConfig,
+        )
+        mock_from_pretrained = mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.from_pretrained",
+            return_value=MockPipeline(),
+        )
+
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(quantization_config=SimpleNamespace(quant_method="int8"))
+        )
+        adapter.load_weights()
+
+        pipeline_quant_config = mock_from_pretrained.call_args.kwargs["quantization_config"]
+        torchao_config = pipeline_quant_config.quant_mapping["transformer"]
+        assert isinstance(pipeline_quant_config, FakePipelineQuantizationConfig)
+        assert isinstance(torchao_config, FakeTorchAoConfig)
+        assert isinstance(torchao_config.quant_type, FakeInt8DynamicActivationInt8WeightConfig)
+
+    def test_adapter_load_weights_preserves_diffusers_native_quantization_config(self, mocker):
+        class MockPipeline:
+            def __call__(self, prompt=None):
+                return None
+
+            def to(self, device):
+                return self
+
+        diffusers_native_quantization_config = object()
+        mock_from_pretrained = mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.from_pretrained",
+            return_value=MockPipeline(),
+        )
+
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(
+                quantization_config=SimpleNamespace(quant_method="gguf"),
+                diffusers_load_kwargs={"quantization_config": diffusers_native_quantization_config},
+            )
+        )
+        adapter.load_weights()
+
+        kwargs = mock_from_pretrained.call_args.kwargs
+        assert kwargs["quantization_config"] is diffusers_native_quantization_config
 
     def test_adapter_guard_unknown_output_type(self, mocker):
         """Test that the adapter wraps an unknown output type as-is.
