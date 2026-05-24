@@ -19,6 +19,7 @@ from vllm_omni.engine.stage_engine_startup import (
     OmniMasterServer,
     StageAllocation,
     StageCoordinatorAddresses,
+    StageReplicaResources,
     connect_remote_engine_cores,
     launch_omni_core_engines,
 )
@@ -854,7 +855,10 @@ class TestSingleStageReplicaInitialization:
 
         @contextmanager
         def _fake_launch(**kwargs):
-            yield mocker.Mock(), None, fake_addresses
+            yield StageReplicaResources(
+                manager=mocker.Mock(),
+                addresses=fake_addresses,
+            )
 
         plan = _make_llm_plan(
             0,

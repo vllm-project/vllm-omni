@@ -520,9 +520,15 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
         yield (fake_vllm_config, object, [])
 
     monkeypatch.setattr(runtime, "_local_llm_launch_scope", _capture_launch_scope)
+
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
     @contextlib.contextmanager
     def _fake_launch_stage_replica(**_kwargs):
-        yield (types.SimpleNamespace(shutdown=lambda: None), None, fake_addresses)
+        yield StageReplicaResources(
+            manager=types.SimpleNamespace(shutdown=lambda: None),
+            addresses=fake_addresses,
+        )
 
     monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
     monkeypatch.setattr(

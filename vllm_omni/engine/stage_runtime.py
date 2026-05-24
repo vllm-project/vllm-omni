@@ -39,6 +39,7 @@ from vllm_omni.engine.stage_engine_startup import (
     connect_remote_engine_cores,
     launch_diffusion_stage_replica,
     launch_stage_replica,
+    StageReplicaResources,
 )
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
@@ -56,7 +57,6 @@ from vllm_omni.engine.stage_init_utils import (
     prepare_engine_environment,
     release_device_locks,
     setup_stage_devices,
-    terminate_alive_proc,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.utils import inject_omni_kv_config
@@ -152,37 +152,23 @@ class StageRuntime:
         return client_addresses
 
     @staticmethod
-    def _cleanup_launched_llm_resources(
+    def _cleanup_launched_resources(
         *,
         stage_id: int,
-        proc: Any = None,
-        engine_manager: Any = None,
-        coordinator: Any = None,
+        resources: StageReplicaResources | None = None,
     ) -> None:
-        """Release launch-only LLM resources when client creation never completed."""
-        if proc is not None:
-            try:
-                terminate_alive_proc(proc)
-            except Exception as cleanup_error:
-                logger.warning(
-                    "[StageRuntime] Failed to terminate process for stage %s: %s",
-                    stage_id,
-                    cleanup_error,
-                )
+        """Release launch-only resources when client creation never completed."""
+        if resources is None:
+            return
 
         for resource, resource_name in (
-            (engine_manager, "engine manager"),
-            (coordinator, "coordinator"),
+            (resources.manager, "manager"),
+            (resources.coordinator, "coordinator"),
         ):
             if resource is None:
                 continue
-            shutdown = getattr(resource, "shutdown", None)
-            close = getattr(resource, "close", None)
             try:
-                if callable(shutdown):
-                    shutdown()
-                elif callable(close):
-                    close()
+                resource.shutdown()
             except Exception as cleanup_error:
                 logger.warning(
                     "[StageRuntime] Failed to cleanup launched %s for stage %s: %s",
@@ -535,9 +521,7 @@ class StageRuntime:
         llm_stage_launch_lock: threading.Lock,
     ) -> StageEngineCoreClientBase:
         """Initialize one local LLM replica using vLLM's launch/attach pattern."""
-        proc = None
-        engine_manager = None
-        coordinator = None
+        resources: StageReplicaResources | None = None
         stage_client = None
         lock_fds: list[int] = []
         try:
@@ -557,28 +541,37 @@ class StageRuntime:
                         omni_master_server=self._get_omni_master_server(),
                         omni_coordinator_address=self._get_coordinator_address(),
                     ) as resources:
-                        engine_manager, coordinator, addresses = resources
+                        pass
 
             logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
+            assert resources is not None
+            assert resources.addresses is not None
             stage_client = StageEngineCoreClientBase.make_async_mp_client(
                 vllm_config=vllm_config,
                 executor_class=executor_class,
                 metadata=plan.metadata,
-                client_addresses=self._client_addresses_from_zmq(addresses),
-                engine_manager=engine_manager,
-                coordinator=coordinator,
+                client_addresses=self._client_addresses_from_zmq(resources.addresses),
+                engine_manager=resources.manager,
+                coordinator=resources.coordinator,
             )
 
             logger.info("[StageRuntime] Stage %s initialized", plan.metadata.stage_id)
             return stage_client
         except Exception:
-            self._cleanup_failed_replica_init(
-                stage_id=plan.metadata.stage_id,
-                stage_client=stage_client,
-                proc=proc,
-                engine_manager=engine_manager,
-                coordinator=coordinator,
-            )
+            if stage_client is not None:
+                try:
+                    stage_client.shutdown()
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "[StageRuntime] Failed to cleanup stage %s after init failure: %s",
+                        plan.metadata.stage_id,
+                        cleanup_error,
+                    )
+            else:
+                self._cleanup_launched_resources(
+                    stage_id=plan.metadata.stage_id,
+                    resources=resources,
+                )
             raise
         finally:
             if lock_fds:
@@ -591,40 +584,6 @@ class StageRuntime:
     def _get_omni_master_server(self) -> OmniMasterServer | None:
         """Return the master server for local distributed launches, if any."""
         return None
-
-    def _cleanup_failed_replica_init(
-        self,
-        *,
-        stage_id: int,
-        stage_client: Any = None,
-        proc: Any = None,
-        engine_manager: Any = None,
-        coordinator: Any = None,
-    ) -> None:
-        """Best-effort cleanup when client creation or launch fails."""
-        if stage_client is not None:
-            try:
-                stage_client.shutdown()
-            except Exception as cleanup_error:
-                logger.warning(
-                    "[StageRuntime] Failed to cleanup stage %s after init failure: %s",
-                    stage_id,
-                    cleanup_error,
-                )
-            return
-
-        if proc is not None:
-            shutdown = getattr(proc, "shutdown", None)
-            if callable(shutdown):
-                shutdown()
-            else:
-                terminate_alive_proc(proc)
-
-        self._cleanup_launched_llm_resources(
-            stage_id=stage_id,
-            engine_manager=engine_manager,
-            coordinator=coordinator,
-        )
 
     def _initialize_local_diffusion_replica(
         self,
@@ -662,11 +621,20 @@ class StageRuntime:
             )
             return client
         except Exception:
-            self._cleanup_failed_replica_init(
-                stage_id=plan.metadata.stage_id,
-                stage_client=client,
-                proc=None if resources is None else resources.manager,
-            )
+            if client is not None:
+                try:
+                    client.shutdown()
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "[StageRuntime] Failed to cleanup stage %s after init failure: %s",
+                        plan.metadata.stage_id,
+                        cleanup_error,
+                    )
+            else:
+                self._cleanup_launched_resources(
+                    stage_id=plan.metadata.stage_id,
+                    resources=resources,
+                )
             raise
         finally:
             if resources is not None and resources.lock_fds:
@@ -999,8 +967,7 @@ class DistStageRuntime(StageRuntime):
         assert ctx.executor_class is not None
         vllm_config = copy.deepcopy(ctx.vllm_config)
         vllm_config.parallel_config.data_parallel_size_local = 0
-        engine_manager = None
-        coordinator = None
+        resources = None
         try:
             logger.info("[DistStageRuntime] Remote LLM handshake started stage=%d replica=%d", stage_id, replica_id)
             with connect_remote_engine_cores(
@@ -1010,7 +977,14 @@ class DistStageRuntime(StageRuntime):
                 replica_id=replica_id,
             ) as remote_resources:
                 engine_manager, coordinator, addresses, _ = remote_resources
-            client_addresses = self._client_addresses_from_zmq(addresses)
+                resources = StageReplicaResources(
+                    manager=engine_manager,
+                    coordinator=coordinator,
+                    addresses=addresses,
+                )
+            assert resources is not None
+            assert resources.addresses is not None
+            client_addresses = self._client_addresses_from_zmq(resources.addresses)
             replica_host = self._omni_master_server.get_replica_host(stage_id, replica_id)
             if replica_host:
                 client_addresses["replica_host"] = replica_host
@@ -1019,16 +993,15 @@ class DistStageRuntime(StageRuntime):
                 executor_class=ctx.executor_class,
                 metadata=metadata,
                 client_addresses=client_addresses,
-                engine_manager=engine_manager,
-                coordinator=coordinator,
+                engine_manager=resources.manager,
+                coordinator=resources.coordinator,
             )
             logger.info("[DistStageRuntime] Remote LLM replica attached stage=%d replica=%d", stage_id, replica_id)
             return client
         except Exception:
-            self._cleanup_launched_llm_resources(
+            self._cleanup_launched_resources(
                 stage_id=stage_id,
-                engine_manager=engine_manager,
-                coordinator=coordinator,
+                resources=resources,
             )
             raise
 

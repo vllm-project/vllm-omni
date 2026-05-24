@@ -135,7 +135,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     """LLM headless: each loop iteration registers with auto-assigned
     replica_id (master picks a free slot) and spawns one
     ``OmniCoreEngineProcManager`` per local replica."""
-    from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
+    from vllm_omni.engine.stage_engine_startup import ReplicaSocketOwnership, StageRegistrationResponse
 
     stage_cfg = _make_stage_cfg(0, stage_type="llm")
     parallel_config = SimpleNamespace(
@@ -183,8 +183,8 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
 
     # The launcher must request auto-assignment (replica_id=None) and the
     # full response so it can wire the master-allocated coordinator into the
-    # spawned subprocess. ``replica_binds_sockets=False`` is required for LLM
-    # because the head binds all three sockets (handshake, input, output).
+    # spawned subprocess. LLM uses head-owned sockets: the head binds all
+    # three sockets (handshake, input, output) and the worker connects.
     assert mock_register.call_count == 1
     kwargs = mock_register.call_args.kwargs
     assert kwargs["omni_master_address"] == "127.0.0.1"
@@ -193,7 +193,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     assert kwargs["omni_stage_config"] is stage_cfg
     assert kwargs["replica_id"] is None
     assert kwargs["return_full_response"] is True
-    assert kwargs["replica_binds_sockets"] is False
+    assert kwargs["socket_ownership"] is ReplicaSocketOwnership.HEAD_BINDS
 
     assert mock_manager_cls.call_count == 1
     mgr_kwargs = mock_manager_cls.call_args.kwargs
@@ -276,7 +276,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
     """Diffusion headless: registers as auto-assign, spawns a single
     ``StageDiffusionProc`` per local replica, and waits for it via
     ``multiprocessing.connection.wait``."""
-    from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
+    from vllm_omni.engine.stage_engine_startup import ReplicaSocketOwnership, StageRegistrationResponse
 
     stage_cfg = _make_stage_cfg(1, stage_type="diffusion")
     od_config = mocker.Mock()
@@ -344,6 +344,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
     assert reg_kwargs["omni_stage_config"] is stage_cfg
     assert reg_kwargs["replica_id"] is None
     assert reg_kwargs["return_full_response"] is True
+    assert reg_kwargs["socket_ownership"] is ReplicaSocketOwnership.REPLICA_BINDS
 
     manager_kwargs = mock_manager.call_args.kwargs
     assert manager_kwargs["handshake_address"] == "tcp://127.0.0.1:26001"
