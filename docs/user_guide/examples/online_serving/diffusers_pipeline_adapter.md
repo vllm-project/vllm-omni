@@ -60,23 +60,22 @@ But if that parameter is simultaneously set in both the vLLM-Omni interface and 
 
 #### Quantization
 
-`diffusers_load_kwargs` is the canonical configuration path for Diffusers-native
-quantization. With the project-pinned Diffusers 0.38.0,
-`DiffusionPipeline.from_pretrained()` expects `quantization_config` to be a
-Diffusers `PipelineQuantizationConfig` object.
-This object form is mainly useful from Python/config paths that can pass Python
-objects; a raw JSON dict is not a Diffusers-native quantization config.
+`diffusers_load_kwargs` is the primary way to pass Diffusers-native loading
+options. For quantization, Diffusers expects `quantization_config` to be a
+`PipelineQuantizationConfig` object passed to
+`DiffusionPipeline.from_pretrained()`. This object form is mainly useful from
+Python/config paths that can pass Python objects; a raw JSON dict is not a
+Diffusers-native quantization config.
 
-As a courtesy layer, the diffusers backend can convert a small allowlist of
-vLLM-Omni quantization configs to Diffusers/TorchAO configs when
-`diffusers_load_kwargs` does not already contain `quantization_config`.
-Currently this only covers online/dynamic `fp8` and online/dynamic `int8`, both
-targeting the Diffusers pipeline `transformer` component. The converted config
-uses Diffusers/TorchAO dynamic quantization semantics; it does not try to
-emulate native vLLM-Omni checkpoint or low-bit post-load semantics. This
-courtesy path requires `torchao` to be installed.
+For convenience, the diffusers backend also supports a small, verified set of
+vLLM-Omni quantization configs when `diffusers_load_kwargs` does not already
+contain `quantization_config`. Currently this covers online/dynamic `fp8` and
+online/dynamic `int8` for Diffusers pipelines that expose a `transformer`
+component. The converted config uses Diffusers/TorchAO dynamic quantization; it
+does not try to emulate native vLLM-Omni checkpoint or low-bit post-load
+quantization. This path requires `torchao` to be installed.
 
-For example, the CLI can use the vLLM-Omni courtesy path:
+For example, the CLI can request dynamic FP8 through the vLLM-Omni interface:
 
 ```bash
 vllm serve "Qwen/Qwen-Image" \
@@ -85,12 +84,13 @@ vllm serve "Qwen/Qwen-Image" \
     --quantization-config '{"method": "fp8"}'
 ```
 
-Unsupported or ambiguous vLLM-Omni quantization methods, such as `gguf`,
-`modelopt`, `mxfp4`, `mxfp8`, serialized checkpoints, and static FP8 configs,
-fail explicitly instead of silently falling back. Layer-name skip lists such as
-`ignored_layers` are also not mapped because vLLM-Omni and Diffusers module
-names may differ. Use Diffusers-native configuration through
-`diffusers_load_kwargs` or a native vLLM-Omni pipeline for those cases.
+Other vLLM-Omni quantization methods, such as `gguf`, `modelopt`, `mxfp4`,
+`mxfp8`, serialized checkpoints, and static FP8 configs, are not mapped by the
+diffusers backend yet and fail explicitly instead of silently falling back.
+Layer-name skip lists such as `ignored_layers` are also not mapped because
+vLLM-Omni and Diffusers module names may differ. Use Diffusers-native
+configuration through `diffusers_load_kwargs` or a native vLLM-Omni pipeline
+for those cases.
 
 ### `--diffusers-call-kwargs`
 
