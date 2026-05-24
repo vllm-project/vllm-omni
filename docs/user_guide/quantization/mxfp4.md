@@ -134,7 +134,7 @@ can be pinned to BF16 via the Python API:
 ```python
 omni = Omni(
     model="<your-model>",
-    quantization={
+    quantization_config={
         "method": "mxfp4_dualscale",
         "ignored_layers": ["blocks.10.attn1.to_q"],   # explicit per-layer override
     },

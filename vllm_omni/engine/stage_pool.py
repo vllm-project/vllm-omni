@@ -301,6 +301,51 @@ class StagePool:
                 raise RuntimeError(f"no UP replica for stage {self.stage_id} after {self.DISPATCH_WAIT_TIMEOUT_S:.1f}s")
             await asyncio.sleep(min(self.DISPATCH_RETRY_INTERVAL_S, deadline - now))
 
+    def preselect_replica_id(
+        self,
+        request_id: str,
+        task: Task | None = None,
+        *,
+        affinity_request_id: str | None = None,
+    ) -> int | None:
+        """Synchronously pick and bind a replica before request preprocessing.
+
+        The main-thread input preprocessing path cannot await :meth:`pick`, but
+        multimodal cache UUID scoping needs to know the same replica that
+        :meth:`submit_initial` will later use. In distributed mode this checks
+        the hub's cached replica snapshot once and records the selected input
+        address in ``_affinity`` so the async submit path reuses the route. If
+        no replica is currently serviceable, return ``None`` and let the async
+        submit-time router wait without blocking the caller.
+        """
+        if self._hub is None or self._lb is None:
+            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+
+        bound_addr = self._affinity.get(request_id)
+        if bound_addr is not None:
+            replica_id = self._serviceable_replica_id_for_addr(bound_addr)
+            if replica_id is not None:
+                return replica_id
+            self._affinity.pop(request_id, None)
+
+        if affinity_request_id is not None:
+            parent_addr = self._affinity.get(affinity_request_id)
+            if parent_addr is not None:
+                replica_id = self._serviceable_replica_id_for_addr(parent_addr)
+                if replica_id is not None:
+                    self._affinity[request_id] = parent_addr
+                    return replica_id
+
+        task = task or Task(request_id=request_id)
+        candidates = self._collect_serviceable_replicas()
+        if not candidates:
+            return None
+
+        lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
+        replica_info, replica_id = candidates[lb_idx]
+        self._affinity[request_id] = replica_info.input_addr
+        return replica_id
+
     def _collect_serviceable_replicas(self) -> list[tuple[ReplicaInfo, int]]:
         """Return list of ``(ReplicaInfo, replica_id)`` for UP, attached replicas."""
         if self._hub is None:

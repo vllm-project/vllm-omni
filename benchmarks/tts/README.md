@@ -233,7 +233,6 @@ sentinel for regressions in this area.
 benchmarks/tts/
 ├── README.md                  (this file)
 ├── bench_tts.py               CLI — serve-mode benchmark driver
-├── bench_voxcpm_offline.py    CLI — offline VoxCPM benchmark (sync + streaming)
 ├── plot_results.py            Generate per-task / per-concurrency curves
 └── model_configs.yaml         Model registry (supported tasks + extra body)
 ```
