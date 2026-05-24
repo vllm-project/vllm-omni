@@ -40,7 +40,7 @@ RUN pip config set global.index-url http://pypi-cache:${PYPI_CACHE_PORT}/pypi/si
 
 # Install for pytest to make the docker build cache layer always valid
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install pytest>=6.0  pytest-cov modelscope
+    pip install 'pytest>=6.0' pytest-cov modelscope
 
 COPY . .
 
