@@ -80,7 +80,7 @@ def _get_torchao_quant_type_cls(class_name: str) -> type[Any]:
         raise ImportError(f"torchao.quantization.{class_name} is required for this quantization mapping.") from exc
 
 
-def _build_torchao_pipeline_quant_config(torchao_quant_type_name: str):
+def _build_torchao_pipeline_quant_config(torchao_quant_type_name: str) -> Any:
     PipelineQuantizationConfig, TorchAoConfig = _get_diffusers_quantization_classes()
     quant_type_cls = _get_torchao_quant_type_cls(torchao_quant_type_name)
     return PipelineQuantizationConfig(
@@ -115,7 +115,7 @@ def _validate_fp8_quant_config(quant_config: Any) -> None:
     _ensure_no_ignored_layers(quant_config)
 
 
-def _build_fp8_quant_config(quant_config: Any):
+def _build_fp8_quant_config(quant_config: Any) -> Any:
     _validate_fp8_quant_config(quant_config)
     return _build_torchao_pipeline_quant_config("Float8DynamicActivationFloat8WeightConfig")
 
@@ -136,7 +136,7 @@ def _validate_int8_quant_config(quant_config: Any) -> None:
     _ensure_no_ignored_layers(quant_config)
 
 
-def _build_int8_quant_config(quant_config: Any):
+def _build_int8_quant_config(quant_config: Any) -> Any:
     _validate_int8_quant_config(quant_config)
     return _build_torchao_pipeline_quant_config("Int8DynamicActivationInt8WeightConfig")
 
@@ -166,7 +166,7 @@ def ensure_supported_diffusers_quantization(quant_config: Any) -> None:
     validator(quant_config)
 
 
-def build_diffusers_quantization_config(quant_config: Any):
+def build_diffusers_quantization_config(quant_config: Any) -> Any:
     """Build a Diffusers PipelineQuantizationConfig from a supported config."""
 
     method = _get_quant_method_name(quant_config)
