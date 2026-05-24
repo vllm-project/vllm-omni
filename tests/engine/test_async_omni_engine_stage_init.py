@@ -9,7 +9,7 @@ import pytest
 
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.stage_runtime import StageRuntime, StageRuntimeInfo
+from vllm_omni.engine.stage_runtime import StageRuntime
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
     ReplicaInitPlan,
@@ -175,6 +175,7 @@ def test_collect_initialized_clients_for_cleanup_deduplicates_clients():
 
 def test_initialize_local_diffusion_replica_restores_device_visibility_after_local_init(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
     from vllm_omni.platforms import current_omni_platform
 
     runtime = StageRuntime(
@@ -200,7 +201,7 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
     monkeypatch.setattr(
         runtime_mod,
         "launch_diffusion_stage_replica",
-        lambda **_: (types.SimpleNamespace(), None, []),
+        lambda **_: (types.SimpleNamespace(), StageReplicaResources()),
     )
 
     try:
@@ -215,6 +216,7 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
 
 def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline_flag(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 
     runtime = StageRuntime(
         stage_configs=[types.SimpleNamespace()],
@@ -238,7 +240,7 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
         captured["batch_size"] = kwargs["batch_size"]
         captured["use_inline"] = kwargs["use_inline"]
         captured["omni_master_server"] = kwargs["omni_master_server"]
-        return types.SimpleNamespace(), None, []
+        return types.SimpleNamespace(), StageReplicaResources()
 
     monkeypatch.setattr(runtime_mod, "launch_diffusion_stage_replica", _capture_launch_diffusion_stage_replica)
 

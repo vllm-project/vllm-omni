@@ -731,13 +731,11 @@ def run_headless(args: argparse.Namespace) -> None:
     OmniCoordinator.
     """
     from vllm.v1.engine.coordinator import DPCoordinator
+    from vllm.v1.engine.utils import EngineZmqAddresses
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
     from vllm.version import __version__ as VLLM_VERSION
 
-    from vllm_omni.diffusion.stage_diffusion_proc import (
-        complete_diffusion_handshake,
-        spawn_diffusion_proc,
-    )
+    from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProcManager
     from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_omni_kv_config_for_stage
     from vllm_omni.engine.stage_engine_startup import (
         launch_headless_llm_replica,
@@ -755,7 +753,6 @@ def run_headless(args: argparse.Namespace) -> None:
         prepare_engine_environment,
         setup_stage_devices,
         split_devices_for_replicas,
-        terminate_alive_proc,
     )
     from vllm_omni.entrypoints.utils import inject_omni_kv_config, load_and_resolve_stage_configs
     from vllm_omni.platforms import current_omni_platform
@@ -870,7 +867,7 @@ def run_headless(args: argparse.Namespace) -> None:
             omni_master_port,
         )
 
-        procs: list[Any] = []
+        managers: list[StageDiffusionProcManager] = []
         try:
             for _rep_idx in range(omni_dp_size_local):
                 # Always auto-assign: headless processes carry no knowledge
@@ -902,7 +899,8 @@ def run_headless(args: argparse.Namespace) -> None:
                     # master server's pre-allocated ZMQ ports (returned
                     # by ``register_stage_with_omni_master``) also live
                     # in the ephemeral range and are not actually bound
-                    # until the headless ``_perform_diffusion_handshake``
+                    # until the headless diffusion manager binds its
+                    # vLLM-style startup handshake socket
                     # runs — so picking an ephemeral port here can steal
                     # a port the master server already promised to a
                     # sibling headless. Use ``settle_port`` from a base
@@ -914,18 +912,20 @@ def run_headless(args: argparse.Namespace) -> None:
                             61000 + _rep_idx * 100,
                             port_inc=37,
                         )
-                    proc, _, _, _ = spawn_diffusion_proc(
-                        model,
-                        od_config,
+                    manager = StageDiffusionProcManager(
+                        model=model,
+                        od_config=od_config,
+                        stage_init_timeout=args.stage_init_timeout,
                         handshake_address=response.handshake_address,
-                        request_address=response.input_address,
-                        response_address=response.output_address,
+                        addresses=EngineZmqAddresses(
+                            inputs=[response.input_address],
+                            outputs=[response.output_address],
+                        ),
                         omni_coordinator_address=response.coordinator_router_address,
                         omni_stage_id=stage_id,
                         omni_replica_id=response.replica_id,
                     )
-                complete_diffusion_handshake(proc, response.handshake_address, args.stage_init_timeout)
-                procs.append(proc)
+                managers.append(manager)
                 logger.info(
                     "[Headless] Diffusion replica id=%d for stage %d is up (coord=%s)",
                     response.replica_id,
@@ -937,7 +937,7 @@ def run_headless(args: argparse.Namespace) -> None:
             # immediately (the previous per-proc join loop only noticed
             # crashes in registration order). Any exit triggers fleet
             # shutdown via the finally block; non-zero exits propagate.
-            sentinel_to_proc = {p.sentinel: p for p in procs}
+            sentinel_to_proc = {m.proc.sentinel: m.proc for m in managers}
             died = connection.wait(list(sentinel_to_proc.keys()))
             first = sentinel_to_proc[died[0]]
             logger.info(
@@ -952,10 +952,9 @@ def run_headless(args: argparse.Namespace) -> None:
                 )
             return
         finally:
-            logger.info("[Headless] Shutting down %d diffusion replica(s) for stage %d.", len(procs), stage_id)
-            for p in procs:
-                if p.is_alive():
-                    terminate_alive_proc(p)
+            logger.info("[Headless] Shutting down %d diffusion replica(s) for stage %d.", len(managers), stage_id)
+            for manager in managers:
+                manager.shutdown()
 
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,

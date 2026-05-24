@@ -614,7 +614,11 @@ class StageRuntime:
             return
 
         if proc is not None:
-            terminate_alive_proc(proc)
+            shutdown = getattr(proc, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+            else:
+                terminate_alive_proc(proc)
 
         self._cleanup_launched_llm_resources(
             stage_id=stage_id,
@@ -630,8 +634,7 @@ class StageRuntime:
     ) -> Any:
         """Initialize one local diffusion replica end-to-end."""
         client = None
-        proc = None
-        lock_fds: list[int] = []
+        resources = None
         try:
             with stage_launch_lock:
                 with self._stage_device_scope(plan.metadata.stage_id, plan.metadata.runtime_cfg):
@@ -641,7 +644,7 @@ class StageRuntime:
                     inject_kv_stage_info(
                         plan.stage_cfg, plan.metadata.stage_id, self._stage_configs
                     )
-                    client, proc, lock_fds = launch_diffusion_stage_replica(
+                    client, resources = launch_diffusion_stage_replica(
                         model=self._model,
                         stage_config=plan.stage_cfg,
                         metadata=plan.metadata,
@@ -662,12 +665,12 @@ class StageRuntime:
             self._cleanup_failed_replica_init(
                 stage_id=plan.metadata.stage_id,
                 stage_client=client,
-                proc=proc,
+                proc=None if resources is None else resources.manager,
             )
             raise
         finally:
-            if lock_fds:
-                release_device_locks(lock_fds)
+            if resources is not None and resources.lock_fds:
+                release_device_locks(resources.lock_fds)
 
     def _assemble_stage_pools(
         self,

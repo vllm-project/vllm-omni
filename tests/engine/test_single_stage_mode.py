@@ -963,14 +963,18 @@ class TestSingleStageReplicaInitialization:
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value="diffusion-config")
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
-            return_value=("tcp://hs", "tcp://req", "tcp://resp"),
+            return_value=("tcp://127.0.0.1:26001", "tcp://127.0.0.1:26002", "tcp://127.0.0.1:26003"),
         )
-        mock_spawn = mocker.patch(
-            "vllm_omni.diffusion.stage_diffusion_proc.spawn_diffusion_proc",
-            return_value=(proc, None, None, None),
+        fake_manager = SimpleNamespace(
+            proc=proc,
+            addresses=SimpleNamespace(
+                inputs=["tcp://127.0.0.1:26002"],
+                outputs=["tcp://127.0.0.1:26003"],
+            ),
         )
-        mock_handshake = mocker.patch(
-            "vllm_omni.diffusion.stage_diffusion_proc.complete_diffusion_handshake"
+        mock_manager = mocker.patch(
+            "vllm_omni.diffusion.stage_diffusion_proc.StageDiffusionProcManager",
+            return_value=fake_manager,
         )
         mock_from_addresses = mocker.patch(
             "vllm_omni.diffusion.stage_diffusion_client.StageDiffusionClient.from_addresses",
@@ -996,24 +1000,26 @@ class TestSingleStageReplicaInitialization:
             return_addresses=True,
             replica_id=0,
         )
-        mock_spawn.assert_called_once_with(
-            "fake-model",
-            "diffusion-config",
-            handshake_address="tcp://hs",
-            request_address="tcp://req",
-            response_address="tcp://resp",
+        mock_manager.assert_called_once_with(
+            model="fake-model",
+            od_config="diffusion-config",
+            stage_init_timeout=60,
+            handshake_address="tcp://127.0.0.1:26001",
+            addresses=mocker.ANY,
             omni_coordinator_address=None,
             omni_stage_id=5,
             omni_replica_id=0,
         )
-        mock_handshake.assert_called_once_with(proc, "tcp://hs", 60)
+        assert mock_manager.call_args.kwargs["addresses"].inputs == ["tcp://127.0.0.1:26002"]
+        assert mock_manager.call_args.kwargs["addresses"].outputs == ["tcp://127.0.0.1:26003"]
         mock_from_addresses.assert_called_once_with(
             plan.metadata,
-            request_address="tcp://req",
-            response_address="tcp://resp",
-            proc=proc,
+            request_address="tcp://127.0.0.1:26002",
+            response_address="tcp://127.0.0.1:26003",
+            proc_manager=mocker.ANY,
             batch_size=4,
         )
+        assert mock_from_addresses.call_args.kwargs["proc_manager"].proc is proc
 
     def test_initialize_local_diffusion_replica_failure_terminates_proc(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
@@ -1047,17 +1053,12 @@ class TestSingleStageReplicaInitialization:
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value="diffusion-config")
         mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
-            return_value=("tcp://hs", "tcp://req", "tcp://resp"),
+            return_value=("tcp://127.0.0.1:26001", "tcp://127.0.0.1:26002", "tcp://127.0.0.1:26003"),
         )
         mocker.patch(
-            "vllm_omni.diffusion.stage_diffusion_proc.spawn_diffusion_proc",
-            return_value=(proc, None, None, None),
-        )
-        mocker.patch(
-            "vllm_omni.diffusion.stage_diffusion_proc.complete_diffusion_handshake",
+            "vllm_omni.diffusion.stage_diffusion_proc.StageDiffusionProcManager",
             side_effect=RuntimeError("handshake failed"),
         )
-        mock_terminate = mocker.patch("vllm_omni.engine.stage_engine_startup.terminate_alive_proc")
 
         try:
             with pytest.raises(RuntimeError, match="handshake failed"):
@@ -1067,8 +1068,6 @@ class TestSingleStageReplicaInitialization:
                 os.environ.pop(device_env_var, None)
             else:
                 os.environ[device_env_var] = prev_device_env
-
-        mock_terminate.assert_called_once_with(proc)
 
 
 # ---------------------------------------------------------------------------

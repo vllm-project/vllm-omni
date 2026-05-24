@@ -7,15 +7,11 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 from __future__ import annotations
 
 import inspect
-import multiprocessing.connection
 import os
 import socket
-import threading
-import weakref
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
-import psutil
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
@@ -37,8 +33,6 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
-
-SHUTDOWN_TIMEOUT_S = 5
 
 
 def _default_process_engine_inputs(
@@ -73,10 +67,8 @@ class StageEngineCoreClientBase(StageClientBase):
     - outputs_queue, output_queue_task
     - All utility methods (get_output_async, abort_requests_async, etc.)
 
-    The subprocess is spawned externally via ``spawn_stage_core`` /
-    ``complete_stage_handshake`` from *stage_engine_core_proc.py*.
-    In single-stage CLI mode, the client may instead attach to an
-    ``engine_manager`` / ``coordinator`` pair created elsewhere.
+    The stage engine subprocesses are owned by vLLM-style engine managers
+    (`resources.engine_manager`), matching `MPClient` ownership.
     """
 
     replica_id: int = 0
@@ -88,7 +80,6 @@ class StageEngineCoreClientBase(StageClientBase):
         log_stats: bool = False,
         metadata: StageMetadata | None = None,
         client_addresses: dict[str, str] | None = None,
-        proc: Any = None,
         engine_manager: Any = None,
         coordinator: Any = None,
         client_count: int = 1,
@@ -102,7 +93,6 @@ class StageEngineCoreClientBase(StageClientBase):
             log_stats=log_stats,
             metadata=metadata,
             client_addresses=client_addresses,
-            proc=proc,
             engine_manager=engine_manager,
             coordinator=coordinator,
             client_count=client_count,
@@ -120,7 +110,6 @@ class StageEngineCoreClientBase(StageClientBase):
         executor_class: type,
         log_stats: bool = False,
         client_addresses: dict[str, str] | None = None,
-        proc: Any = None,
         client_count: int = 1,
         client_index: int = 0,
         *,
@@ -135,10 +124,8 @@ class StageEngineCoreClientBase(StageClientBase):
         via helpers in stage_init_utils.py. This constructor just stores metadata
         and calls super().__init__().
 
-        The subprocess is spawned externally via ``spawn_stage_core`` /
-        ``complete_stage_handshake`` (see *stage_engine_core_proc.py*).
-        The resulting ``proc`` handle is passed in so this client can
-        manage the process lifecycle on shutdown.
+        The subprocess lifecycle is owned by the engine manager attached to
+        vLLM's background resources, not by this client directly.
         """
         # -------- Stage metadata (public fields used at runtime) --------
         self.replica_id = 0
@@ -156,7 +143,6 @@ class StageEngineCoreClientBase(StageClientBase):
             self.custom_process_input_func = metadata.custom_process_input_func
 
         self.engine_outputs: Any = None
-        self._proc = proc
         self.client_addresses = dict(client_addresses or {})
         self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
         self._kv_sender_host = self._resolve_contact_host()
@@ -181,6 +167,7 @@ class StageEngineCoreClientBase(StageClientBase):
             )
             if engine_manager is not None:
                 self.resources.engine_manager = engine_manager
+                self.start_engine_core_monitor()
             if coordinator is not None:
                 self.resources.coordinator = coordinator
         except Exception:
@@ -204,51 +191,12 @@ class StageEngineCoreClientBase(StageClientBase):
 
         self._initialize_kv_sender_endpoint()
 
-        if self._proc is not None:
-            self._start_proc_monitor()
-
         logger.info(
             "[%s] stage-%s [rep-%s] EngineCore running",
             client_name,
             self.stage_id,
             self.replica_id,
         )
-
-    def _start_proc_monitor(self) -> None:
-        """Start a daemon thread that watches the subprocess sentinel.
-
-        When the subprocess dies without sending the ZMQ ``ENGINE_CORE_DEAD``
-        sentinel (e.g. SIGKILL, segfault, OOM-killer), this thread sets
-        ``resources.engine_dead`` so subsequent calls raise
-        ``EngineDeadError``.
-        """
-        proc = self._proc
-        resources_ref = weakref.ref(self.resources)
-        stage_id = self.stage_id
-        replica_id = self.replica_id
-
-        def _monitor() -> None:
-            try:
-                multiprocessing.connection.wait([proc.sentinel])
-            except Exception:
-                return
-            resources = resources_ref()
-            if resources is None or resources.engine_dead:
-                return
-            resources.engine_dead = True
-            logger.error(
-                "[StageEngineCoreClient] stage-%s [rep-%s] subprocess died unexpectedly (exit code %s).",
-                stage_id,
-                replica_id,
-                proc.exitcode,
-            )
-
-        t = threading.Thread(
-            target=_monitor,
-            daemon=True,
-            name=f"StageCoreProcMonitor-{stage_id}",
-        )
-        t.start()
 
     def check_health(self) -> None:
         """Raise ``EngineDeadError`` if the stage subprocess is dead.
@@ -258,9 +206,6 @@ class StageEngineCoreClientBase(StageClientBase):
         """
         if self.resources.engine_dead:
             raise EngineDeadError(f"Stage-{self.stage_id} engine core is dead")
-        if self._proc is not None and not self._proc.is_alive():
-            self.resources.engine_dead = True
-            raise EngineDeadError(f"Stage-{self.stage_id} subprocess is not alive (exit code {self._proc.exitcode})")
 
     # ==================== Overrides ====================
 
@@ -467,41 +412,6 @@ class StageEngineCoreClientBase(StageClientBase):
             args=args,
             kwargs=kwargs,
         )
-
-    def shutdown(self, timeout: float | None = None) -> None:
-        """Shutdown managed resources and any externally spawned subprocess."""
-        child_procs: list[psutil.Process] = []
-        if self._proc is not None and self._proc.pid is not None:
-            try:
-                child_procs = psutil.Process(self._proc.pid).children(recursive=True)
-            except psutil.Error:
-                child_procs = []
-
-        try:
-            super().shutdown(timeout=timeout)
-        finally:
-            if self._proc is not None and self._proc.is_alive():
-                self._proc.terminate()
-                self._proc.join(timeout=SHUTDOWN_TIMEOUT_S)
-                if self._proc.is_alive():
-                    self._proc.kill()
-                    self._proc.join(timeout=SHUTDOWN_TIMEOUT_S)
-
-            alive_children = [proc for proc in child_procs if proc.is_running()]
-            for proc in alive_children:
-                try:
-                    proc.terminate()
-                except psutil.Error:
-                    pass
-            _, still_alive = psutil.wait_procs(alive_children, timeout=SHUTDOWN_TIMEOUT_S)
-            for proc in still_alive:
-                try:
-                    proc.kill()
-                except psutil.Error:
-                    pass
-            # The process handle is no longer reliable after best-effort cleanup.
-            self._proc = None
-
 
 class StageEngineCoreClient(StageEngineCoreClientBase, AsyncMPClient):
     """Stage async client backed by vLLM's ``AsyncMPClient``."""

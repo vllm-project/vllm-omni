@@ -7,7 +7,7 @@ import dataclasses
 import socket
 import threading
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import msgspec
@@ -31,7 +31,6 @@ from vllm_omni.engine.stage_init_utils import (
     build_diffusion_config,
     initialize_diffusion_stage,
     release_device_locks,
-    terminate_alive_proc,
 )
 
 logger = init_logger(__name__)
@@ -115,6 +114,16 @@ class StageCoordinatorAddresses:
     coordinator_input: str | None = None
     coordinator_output: str | None = None
     frontend_stats_publish_address: str | None = None
+
+
+@dataclass
+class StageReplicaResources:
+    """Resources created while launching one stage replica."""
+
+    manager: Any | None = None
+    coordinator: Any | None = None
+    addresses: EngineZmqAddresses | None = None
+    lock_fds: list[int] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -1074,7 +1083,7 @@ def launch_diffusion_stage_replica(
     replica_id: int = 0,
     omni_master_server: OmniMasterServer | None = None,
     omni_coordinator_address: str | None = None,
-) -> tuple[Any, Any, list[int]]:
+) -> tuple[Any, StageReplicaResources]:
     """Launch a local diffusion stage replica.
 
     Colocated mode delegates to ``initialize_diffusion_stage``. Distributed
@@ -1091,12 +1100,11 @@ def launch_diffusion_stage_replica(
             batch_size=batch_size,
             use_inline=use_inline,
         )
-        return client, None, []
+        return client, StageReplicaResources()
 
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
     from vllm_omni.diffusion.stage_diffusion_proc import (
-        complete_diffusion_handshake,
-        spawn_diffusion_proc,
+        StageDiffusionProcManager,
     )
 
     od_config = build_diffusion_config(model, stage_config, metadata)
@@ -1111,7 +1119,7 @@ def launch_diffusion_stage_replica(
         {"tensor_parallel_size": world_size},
         stage_init_timeout,
     )
-    proc = None
+    proc_manager = None
     try:
         handshake_address, request_address, response_address = register_stage_with_omni_master(
             omni_master_address=omni_master_server.address,
@@ -1121,28 +1129,34 @@ def launch_diffusion_stage_replica(
             return_addresses=True,
             replica_id=replica_id,
         )
-        proc, _, _, _ = spawn_diffusion_proc(
-            model,
-            od_config,
+        proc_manager = StageDiffusionProcManager(
+            model=model,
+            od_config=od_config,
+            stage_init_timeout=stage_init_timeout,
             handshake_address=handshake_address,
-            request_address=request_address,
-            response_address=response_address,
+            addresses=EngineZmqAddresses(
+                inputs=[request_address],
+                outputs=[response_address],
+            ),
             omni_coordinator_address=omni_coordinator_address,
             omni_stage_id=metadata.stage_id,
             omni_replica_id=replica_id,
         )
-        complete_diffusion_handshake(proc, handshake_address, stage_init_timeout)
         client = StageDiffusionClient.from_addresses(
             metadata,
-            request_address=request_address,
-            response_address=response_address,
-            proc=proc,
+            request_address=proc_manager.addresses.inputs[0],
+            response_address=proc_manager.addresses.outputs[0],
+            proc_manager=proc_manager,
             batch_size=batch_size,
         )
-        return client, proc, lock_fds
+        return client, StageReplicaResources(
+            manager=proc_manager,
+            addresses=proc_manager.addresses,
+            lock_fds=lock_fds,
+        )
     except Exception:
-        if proc is not None:
-            terminate_alive_proc(proc)
+        if proc_manager is not None:
+            proc_manager.shutdown()
         if lock_fds:
             release_device_locks(lock_fds)
         raise
