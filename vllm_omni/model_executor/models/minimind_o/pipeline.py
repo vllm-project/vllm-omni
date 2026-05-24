@@ -33,7 +33,7 @@ MINIMIND_OMNI_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             engine_output_type="latent",
-            custom_process_next_stage_input_func=f"{_PROC}.thinker2talker",
+            custom_process_next_stage_input_func=f"{_PROC}.thinker2talker_full_payload",
             sampling_constraints={"detokenize": True},
         ),
         StagePipelineConfig(
@@ -43,7 +43,7 @@ MINIMIND_OMNI_PIPELINE = PipelineConfig(
             input_sources=(0,),
             engine_output_type="latent",
             custom_process_input_func=f"{_PROC}.thinker2talker",
-            custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav",
+            custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             sampling_constraints={"detokenize": False},
         ),
         StagePipelineConfig(

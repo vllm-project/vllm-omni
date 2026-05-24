@@ -52,6 +52,7 @@ class MiniMindOmniForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             self.talker = None
             self.code2wav = None
         elif self.model_stage == "talker":
+            self.multimodal_config.skip_mm_profiling = True
             self.has_preprocess = True
             self.has_postprocess = True
             self.thinker = None
@@ -68,6 +69,7 @@ class MiniMindOmniForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             self.talker_mtp_output_key = self.talker.talker_mtp_output_key
             self.gpu_resident_buffer_keys = self.talker.gpu_resident_buffer_keys
         elif self.model_stage == "code2wav":
+            self.multimodal_config.skip_mm_profiling = True
             self.thinker = None
             self.talker = None
             self.code2wav = MiniMindOmniCode2Wav(
@@ -82,6 +84,7 @@ class MiniMindOmniForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 "Expected one of: 'thinker', 'talker', 'code2wav'."
             )
 
+        self.have_multimodal_outputs = getattr(self.model, "have_multimodal_outputs", False)
         self.make_empty_intermediate_tensors = getattr(self.model, "make_empty_intermediate_tensors", lambda: None)
 
     def get_language_model(self) -> nn.Module:

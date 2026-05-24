@@ -9,6 +9,7 @@ from typing import Any
 import torch
 from torch import nn
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -29,6 +30,8 @@ from vllm_omni.model_executor.models.minimind_o.minimind_omni_thinker import (
     MiniMindBlock,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+
+logger = init_logger(__name__)
 
 
 class MiniMindOmniTalkerHead(nn.Module):
@@ -476,6 +479,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
                         audio = audio.reshape(1, -1)
                     audio_codes_list.append(audio.to(dtype=torch.long))
         if not audio_codes_list:
+            logger.info("MiniMind talker make_omni_output: no audio codes found; emitting hidden only")
             return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs={})
         audio_codes = torch.cat(audio_codes_list, dim=0)
         valid = (audio_codes < 2048).all(dim=-1)
