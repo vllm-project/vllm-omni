@@ -64,9 +64,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-# Layout helpers live in vLLM proper now (algorithm-side); vllm-omni's
-# `svdquant_nvfp4_layout` module is a thin re-export for backward compat.
-from vllm.model_executor.layers.quantization.utils.svdquant_nvfp4_layout import (
+from vllm_omni.quantization.tools.svdquant_nvfp4_layout import (
     _unpack_nibbles,
     unpack_nunchaku_qweight_fp4,
     unpack_nunchaku_wscales_fp4,
@@ -296,12 +294,26 @@ def _link_or_copy_tree(src: Path, dst: Path, prefer_copy: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Suffixes nunchaku publishes alongside every quantized linear that the
+# vLLM SVDQuant LinearMethod does not consume — they bloat the output
+# checkpoint without serving any backend. Filter them at group time so
+# downstream conversion / save never touches them.
+#
+# `smooth_factor_orig`: declared by nunchaku as "(Unused)" (see
+# `nunchaku/models/linear.py:54`) and never read by any quantize/forward
+# path in either int4 or nvfp4. ~0.001 GB across a Z-Image checkpoint —
+# trivially small, but keeping it triggers a KeyError at load time since
+# vLLM does not register a `smooth_factor_orig` parameter.
+_DROPPED_NUNCHAKU_SUFFIXES: frozenset[str] = frozenset({"smooth_factor_orig"})
+
+
 def _group_keys_by_layer(
     keys: list[str],
 ) -> tuple[dict[str, list[str]], list[str]]:
     """Return (layer_prefix → list-of-suffixes, leftover-keys).
 
-    A "linear" is any key prefix that has a `.qweight` sibling.
+    A "linear" is any key prefix that has a `.qweight` sibling. Suffixes
+    in `_DROPPED_NUNCHAKU_SUFFIXES` are filtered out entirely.
     """
     qweight_prefixes = {k.rsplit(".", 1)[0] for k in keys if k.endswith(".qweight")}
     layer_to_suffixes: dict[str, list[str]] = {p: [] for p in qweight_prefixes}
@@ -309,6 +321,8 @@ def _group_keys_by_layer(
     for k in keys:
         prefix, _, suffix = k.rpartition(".")
         if prefix in layer_to_suffixes:
+            if suffix in _DROPPED_NUNCHAKU_SUFFIXES:
+                continue
             layer_to_suffixes[prefix].append(suffix)
         else:
             leftover.append(k)
