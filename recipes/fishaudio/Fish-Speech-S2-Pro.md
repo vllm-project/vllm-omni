@@ -102,3 +102,30 @@ curl -X POST http://localhost:8091/v1/audio/speech \
   both `ref_audio` and `ref_text` parameters.
 - Memory usage: Model loads at ~48.3 GiB, peaks at ~48.9 GiB during inference
   headroom for video frames and audio caches.
+
+### 2x H100 80GB
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- Required package: `fish-speech` (for DAC codec)
+- CUDA 12.8
+- vLLM version: 0.19.0+
+
+#### Command
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 vllm serve fishaudio/s2-pro --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/fish_qwen3_omni_2gpu.yaml
+```
+
+This profile pins Stage0 (Slow/Fast AR) to GPU 0 and Stage1 (DAC decoder)
+to GPU 1 to remove AR/DAC contention, sets `max_num_seqs=64` on both
+stages so concurrencies above 8 don't queue, and reduces
+`connector_get_sleep_s` from 10 ms to 1 ms so DAC chunks aren't held in
+the connector once they're ready.
+
+For benchmark numbers see the discussion in
+vllm-project/vllm-omni#2515 (initial H100x2 sweep by @Sy0307) and
+vllm-project/vllm-omni#3323 (H20x2 sweep with the shipped config).
