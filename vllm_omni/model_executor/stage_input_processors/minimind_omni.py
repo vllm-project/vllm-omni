@@ -78,8 +78,7 @@ def _pick_bridge(mm: OmniPayload, expected_len: int) -> torch.Tensor:
     if bridge is None:
         keys = sorted(mm.keys()) if isinstance(mm, dict) else []
         raise RuntimeError(
-            "MiniMind thinker output does not contain bridge hidden states for talker. "
-            f"Available keys: {keys}"
+            f"MiniMind thinker output does not contain bridge hidden states for talker. Available keys: {keys}"
         )
     if isinstance(bridge, list):
         bridge = bridge[0]
