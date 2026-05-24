@@ -103,10 +103,10 @@ docker run --runtime nvidia --gpus 2 \
     -p 8091:8091 \
     --ipc=host \
     vllm/vllm-omni:v0.21.0 \
-    --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
+    vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
 !!! tip
-    You can use this docker image to serve models the same way you would with in vLLM! To do so, make sure you overwrite the default entrypoint (`vllm serve --omni`) which works only for models supported in the vLLM-Omni project.
+    The CUDA image does not define a default entrypoint, so include `vllm serve ... --omni` after the image name.
 
 # --8<-- [end:pre-built-images]
