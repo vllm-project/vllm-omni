@@ -700,18 +700,35 @@ class AsyncOmni(EngineClient, OmniBase):
         wait_for_inflight_requests: bool = False,
         clear_cache: bool = True,
     ) -> None:
-        """Pause generation."""
+        """Pause generation.
+
+        Args:
+            mode: How to handle in-flight requests:
+                - ``"abort"``: Abort all in-flight requests immediately.
+                - ``"wait"``: Wait for in-flight requests to complete.
+                - ``"keep"``: Freeze requests in queue; they resume on
+                  :meth:`resume_generation`.
+            wait_for_inflight_requests: DEPRECATED. Use ``mode="wait"``.
+            clear_cache: Whether to clear prefix/mm/encoder caches.
+        """
+        # Handle deprecated parameter.
+        if wait_for_inflight_requests:
+            mode = "wait"
+
         async with self._pause_cond:
             if self._paused:
                 return
             self._paused = True
 
-        # TODO: Implement request draining if wait_for_inflight_requests
+        # TODO(AsyncOmni): Implement full mode handling (wait/keep).
+        # For now, "abort" aborts in-flight requests; "wait" and "keep"
+        # set the paused flag but do not yet drain or freeze requests.
 
         if clear_cache:
             # Clear caches for all stages.
+            reset_running = mode == "abort"
             await self.reset_prefix_cache(
-                reset_running_requests=not wait_for_inflight_requests,
+                reset_running_requests=reset_running,
                 reset_connector=True,
             )
             await self.reset_mm_cache()
@@ -797,6 +814,9 @@ class AsyncOmni(EngineClient, OmniBase):
                 actual_tp = config.parallel_config.tensor_parallel_size if config else 1
                 total_workers += actual_tp
 
+        clear_prefix_cache = level >= 1
+        await self.pause_generation(mode=mode, clear_cache=clear_prefix_cache)
+
         task_id = str(uuid.uuid4())
         self.event_resolver.watch_task(task_id, expected_count=total_workers)
         logger.info(f"[{self._name}] Sleep initiated (Task: {task_id}). Awaiting {total_workers} ACKs...")
@@ -838,6 +858,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_acks.append(ack)
         current_omni_platform.synchronize()
         await asyncio.sleep(0.1)
+        await self.resume_generation()
         self._is_sleeping = False
         logger.info(f"[{self._name}] All {len(final_acks)}/{total_workers} workers reported WARM for task {task_id}.")
         return final_acks
