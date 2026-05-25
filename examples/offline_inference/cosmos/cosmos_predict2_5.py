@@ -39,9 +39,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-latent-conditional-frames",
         type=int,
-        default=None,
-        help="video2world only. Diffusers Cosmos supports 1 or 2.",
+        default=2,
+        help="video2world only. Must be 1 or 2.",
     )
+    parser.add_argument("--conditional-frame-timestep", type=float, default=0.0001)
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--guidance-scale", type=float, default=7.0)
@@ -72,13 +73,17 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def build_extra_kwargs(args: argparse.Namespace) -> dict:
+    kwargs = {}
+    if args.conditional_frame_timestep is not None:
+        kwargs["conditional_frame_timestep"] = args.conditional_frame_timestep
     if args.mode == "image2world":
         image = Image.open(args.image).convert("RGB").resize((args.width, args.height))
-        return {"image": image}
+        kwargs["image"] = image
+        return kwargs
     if args.mode == "video2world":
         from diffusers.utils import load_video
 
-        kwargs = {"video": load_video(args.video)}
+        kwargs["video"] = load_video(args.video)
         if args.num_latent_conditional_frames is not None:
             kwargs["num_latent_conditional_frames"] = args.num_latent_conditional_frames
         return kwargs
@@ -118,10 +123,11 @@ def main() -> None:
         guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
         num_frames=args.num_frames,
+        extra_args=build_extra_kwargs(args),
     )
 
     start = time.perf_counter()
-    frames = omni.generate(prompt_dict, sampling, **build_extra_kwargs(args))
+    frames = omni.generate(prompt_dict, sampling)
     print(f"Generation time: {time.perf_counter() - start:.2f}s")
 
     if isinstance(frames, list):
@@ -132,34 +138,24 @@ def main() -> None:
             raise ValueError(
                 f"Unexpected output type '{frames.final_output_type}', expected 'image' for video generation."
             )
-        if frames.is_pipeline_output and frames.request_output is not None:
-            inner_output = frames.request_output
-            if isinstance(inner_output, OmniRequestOutput):
-                frames = inner_output
-        if isinstance(frames, OmniRequestOutput):
-            if frames.images:
-                if len(frames.images) == 1 and isinstance(frames.images[0], tuple) and len(frames.images[0]) == 2:
-                    frames = frames.images[0][0]
-                elif len(frames.images) == 1 and isinstance(frames.images[0], dict):
-                    frames = frames.images[0].get("frames") or frames.images[0].get("video")
-                else:
-                    frames = frames.images
-            else:
-                raise ValueError("No video frames found in OmniRequestOutput.")
+        if frames.is_pipeline_output and isinstance(frames.request_output, OmniRequestOutput):
+            frames = frames.request_output
+        frames = frames.images[0] if frames.images else None
 
-    if isinstance(frames, list) and frames:
-        first_item = frames[0]
-        if isinstance(first_item, tuple) and len(first_item) == 2:
-            frames = first_item[0]
-        elif isinstance(first_item, dict):
-            frames = first_item.get("frames") or first_item.get("video")
-        elif isinstance(first_item, list):
-            frames = first_item
-
-    if isinstance(frames, tuple) and len(frames) == 2:
+    # [numpy(T, H, W, C)] -> numpy(T, H, W, C)
+    if isinstance(frames, list) and frames and isinstance(frames[0], np.ndarray):
         frames = frames[0]
-    elif isinstance(frames, dict):
-        frames = frames.get("frames") or frames.get("video")
+
+    # Fallback for a raw tensor: -> numpy (T, H, W, C) in [0, 1]
+    if isinstance(frames, torch.Tensor):
+        frames = frames.detach().cpu()
+        if frames.dim() == 5:
+            frames = frames[0]
+        if frames.dim() == 4 and frames.shape[0] in (3, 4):
+            frames = frames.permute(1, 2, 3, 0)
+        if frames.is_floating_point():
+            frames = frames.clamp(-1, 1) * 0.5 + 0.5
+        frames = frames.float().numpy()
 
     if frames is None:
         raise ValueError("No video frames found in output.")
@@ -168,80 +164,7 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     from diffusers.utils import export_to_video
 
-    def _normalize_frame(frame):
-        if isinstance(frame, torch.Tensor):
-            frame_tensor = frame.detach().cpu()
-            if frame_tensor.dim() == 4 and frame_tensor.shape[0] == 1:
-                frame_tensor = frame_tensor[0]
-            if frame_tensor.dim() == 3 and frame_tensor.shape[0] in (3, 4):
-                frame_tensor = frame_tensor.permute(1, 2, 0)
-            if frame_tensor.is_floating_point():
-                frame_tensor = frame_tensor.clamp(-1, 1) * 0.5 + 0.5
-            return frame_tensor.float().numpy()
-        if isinstance(frame, np.ndarray):
-            frame_array = frame
-            if frame_array.ndim == 4 and frame_array.shape[0] == 1:
-                frame_array = frame_array[0]
-            if np.issubdtype(frame_array.dtype, np.integer):
-                frame_array = frame_array.astype(np.float32) / 255.0
-            return frame_array
-        try:
-            from PIL import Image as _Image
-        except ImportError:
-            _Image = None
-        if _Image is not None and isinstance(frame, _Image.Image):
-            return np.asarray(frame).astype(np.float32) / 255.0
-        return frame
-
-    def _ensure_frame_list(video_array):
-        if isinstance(video_array, list):
-            if len(video_array) == 0:
-                return video_array
-            first_item = video_array[0]
-            if isinstance(first_item, np.ndarray):
-                if first_item.ndim == 5:
-                    return list(first_item[0])
-                if first_item.ndim == 4:
-                    return list(first_item)
-                if first_item.ndim == 3:
-                    return video_array
-            return video_array
-        if isinstance(video_array, np.ndarray):
-            if video_array.ndim == 5:
-                return list(video_array[0])
-            if video_array.ndim == 4:
-                return list(video_array)
-            if video_array.ndim == 3:
-                return [video_array]
-        return video_array
-
-    if isinstance(frames, torch.Tensor):
-        video_tensor = frames.detach().cpu()
-        if video_tensor.dim() == 5:
-            if video_tensor.shape[1] in (3, 4):
-                video_tensor = video_tensor[0].permute(1, 2, 3, 0)
-            else:
-                video_tensor = video_tensor[0]
-        elif video_tensor.dim() == 4 and video_tensor.shape[0] in (3, 4):
-            video_tensor = video_tensor.permute(1, 2, 3, 0)
-        if video_tensor.is_floating_point():
-            video_tensor = video_tensor.clamp(-1, 1) * 0.5 + 0.5
-        video_array = video_tensor.float().numpy()
-    elif isinstance(frames, np.ndarray):
-        video_array = frames
-        if video_array.ndim == 5:
-            video_array = video_array[0]
-        if np.issubdtype(video_array.dtype, np.integer):
-            video_array = video_array.astype(np.float32) / 255.0
-    elif isinstance(frames, list):
-        if len(frames) == 0:
-            raise ValueError("No video frames found in output.")
-        video_array = [_normalize_frame(frame) for frame in frames]
-    else:
-        video_array = frames
-
-    video_array = _ensure_frame_list(video_array)
-    export_to_video(video_array, str(out_path), fps=args.fps)
+    export_to_video(frames, str(out_path), fps=args.fps)
     print(f"Saved to {out_path}")
 
 
