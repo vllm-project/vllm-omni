@@ -153,6 +153,54 @@ class _StubScheduler(SchedulerInterface):
         return None
 
 
+class TestGetSamplingParamsKey:
+    """Pure-function tests for the batch-compatibility key builder."""
+
+    @staticmethod
+    def _make(lora_int_id: int | None = None, lora_scale: float = 1.0) -> OmniDiffusionRequest:
+        from vllm_omni.lora.request import LoRARequest
+
+        sp = OmniDiffusionSamplingParams(num_inference_steps=2)
+        if lora_int_id is not None:
+            sp.lora_request = LoRARequest(
+                lora_name=f"adapter-{lora_int_id}",
+                lora_int_id=lora_int_id,
+                lora_path=f"/tmp/lora-{lora_int_id}",
+            )
+        sp.lora_scale = lora_scale
+        return OmniDiffusionRequest(
+            prompts=["prompt"],
+            sampling_params=sp,
+            request_ids=[f"req-{lora_int_id}-{lora_scale}"],
+        )
+
+    def test_distinguishes_lora_id(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        assert get_sampling_params_key(self._make(lora_int_id=1)) != get_sampling_params_key(self._make(lora_int_id=2))
+
+    def test_distinguishes_lora_scale(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        assert get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5)) != get_sampling_params_key(
+            self._make(lora_int_id=1, lora_scale=1.0)
+        )
+
+    def test_treats_no_lora_as_distinct_bucket(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        assert get_sampling_params_key(self._make(lora_int_id=None)) != get_sampling_params_key(
+            self._make(lora_int_id=1)
+        )
+
+    def test_equal_for_same_lora_identity(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        a = get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
+        b = get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
+        assert a == b
+
+
 class TestRequestScheduler:
     def setup_method(self) -> None:
         self.scheduler: RequestScheduler = RequestScheduler()
@@ -727,6 +775,114 @@ class TestStepScheduler:
         assert _new_ids(second) == [req_b]
         assert second.num_running_reqs == 1
         assert second.num_waiting_reqs == 1
+
+    def test_step_batch_co_schedules_requests_sharing_lora(self) -> None:
+        """Multiple requests with the same LoRA (id + scale) co-batch."""
+        from vllm_omni.lora.request import LoRARequest
+
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+
+        lora = LoRARequest(lora_name="adapter", lora_int_id=42, lora_path="/tmp/lora")
+
+        def _with_lora(req_id: str) -> OmniDiffusionRequest:
+            sp = OmniDiffusionSamplingParams(num_inference_steps=4)
+            sp.lora_request = lora
+            sp.lora_scale = 0.5
+            return _make_step_request(req_id, sampling_params=sp)
+
+        req_a = scheduler.add_request(_with_lora("a"))
+        req_b = scheduler.add_request(_with_lora("b"))
+        req_c = scheduler.add_request(_with_lora("c"))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_a, req_b, req_c]
+        assert sched_output.num_running_reqs == 3
+        assert sched_output.num_waiting_reqs == 0
+
+    def test_step_batch_separates_requests_with_different_lora_ids(self) -> None:
+        """Different LoRA adapters → distinct batches admitted in FIFO order."""
+        from vllm_omni.lora.request import LoRARequest
+
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=4))
+
+        lora_a = LoRARequest(lora_name="adapter-A", lora_int_id=1, lora_path="/tmp/lora-a")
+        lora_b = LoRARequest(lora_name="adapter-B", lora_int_id=2, lora_path="/tmp/lora-b")
+
+        def _build(req_id: str, lora: LoRARequest) -> OmniDiffusionRequest:
+            sp = OmniDiffusionSamplingParams(num_inference_steps=2)
+            sp.lora_request = lora
+            return _make_step_request(req_id, sampling_params=sp)
+
+        req_a1 = scheduler.add_request(_build("a1", lora_a))
+        req_b1 = scheduler.add_request(_build("b1", lora_b))
+        req_a2 = scheduler.add_request(_build("a2", lora_a))
+
+        # Strict FIFO admission: a1 starts; b1 (different LoRA) blocks the
+        # queue head, so a2 (compatible with a1) is *not* skipped ahead.
+        first = scheduler.schedule()
+        assert _new_ids(first) == [req_a1]
+        assert first.num_waiting_reqs == 2
+
+        # Drain a1 → b1 becomes head-of-line and is admitted with its LoRA.
+        scheduler.update_from_output(first, _make_step_output(req_a1, step_index=2, finished=True))
+        second = scheduler.schedule()
+        assert _new_ids(second) == [req_b1]
+        assert second.num_waiting_reqs == 1
+
+        # Drain b1 → a2 is admitted next; LoRA-A is re-activated for it.
+        scheduler.update_from_output(second, _make_step_output(req_b1, step_index=2, finished=True))
+        third = scheduler.schedule()
+        assert _new_ids(third) == [req_a2]
+        assert third.num_waiting_reqs == 0
+
+    def test_step_batch_separates_requests_with_different_lora_scale(self) -> None:
+        """Same adapter id but different scales → still separate batches."""
+        from vllm_omni.lora.request import LoRARequest
+
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=4))
+
+        lora = LoRARequest(lora_name="adapter", lora_int_id=7, lora_path="/tmp/lora")
+
+        def _build(req_id: str, scale: float) -> OmniDiffusionRequest:
+            sp = OmniDiffusionSamplingParams(num_inference_steps=2)
+            sp.lora_request = lora
+            sp.lora_scale = scale
+            return _make_step_request(req_id, sampling_params=sp)
+
+        req_full = scheduler.add_request(_build("full", 1.0))
+        req_half = scheduler.add_request(_build("half", 0.5))
+
+        sched_output = scheduler.schedule()
+
+        admitted = _new_ids(sched_output)
+        assert admitted == [req_full]
+        assert req_half not in admitted
+        assert sched_output.num_waiting_reqs == 1
+
+    def test_step_batch_separates_lora_from_no_lora(self) -> None:
+        """A LoRA request and a no-LoRA request do not share a batch."""
+        from vllm_omni.lora.request import LoRARequest
+
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=4))
+
+        lora = LoRARequest(lora_name="adapter", lora_int_id=3, lora_path="/tmp/lora")
+
+        sp_with = OmniDiffusionSamplingParams(num_inference_steps=2)
+        sp_with.lora_request = lora
+        req_with = scheduler.add_request(_make_step_request("with", sampling_params=sp_with))
+        req_without = scheduler.add_request(_make_step_request("without", num_inference_steps=2))
+
+        sched_output = scheduler.schedule()
+
+        admitted = _new_ids(sched_output)
+        assert admitted == [req_with]
+        assert req_without not in admitted
+        assert sched_output.num_waiting_reqs == 1
 
     def test_preempt_request_preserves_step_index(self) -> None:
         request = _make_step_request("preempt", num_inference_steps=3)

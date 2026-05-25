@@ -300,6 +300,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=("Custom system prompt. Used when --use-system-prompt is custom. "),
     )
+    parser.add_argument(
+        "--auxiliary-text-encoder",
+        type=str,
+        default=None,
+        help="Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
+    )
     current_omni_platform.pre_register_and_update(parser)
     from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
@@ -392,6 +398,7 @@ def main():
         "profiler_config": args.profiler_config,
         "init_timeout": args.init_timeout,
         "stage_init_timeout": args.stage_init_timeout,
+        "auxiliary_text_encoder": args.auxiliary_text_encoder,
         **lora_args,
         **quant_kwargs,
     }

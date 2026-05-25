@@ -18,11 +18,13 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
-from benchmarks.diffusion.backends import normalize_endpoint
-
 LOGGER = logging.getLogger(__name__)
 
 GREY_BLOCK_FILL = PatternFill(start_color="D3D3D3", fill_type="solid")
+LEGACY_BACKEND_ENDPOINT_ALIASES = {
+    "vllm-omni": "/v1/chat/completions",
+    "openai": "/v1/images/generations",
+}
 
 # Diffusion sheet columns (Qwen-Image diffusion benchmark).
 # Per-stage latency metrics. Unpack from stage_durations_mean/p50/p99 dicts
@@ -143,6 +145,20 @@ def _omni_group_key(record: dict[str, Any]) -> tuple[Any, ...]:
 
 def _diffusion_group_key(record: dict[str, Any]) -> tuple[Any, ...]:
     return (record.get("test_name") or "",)
+
+
+def normalize_endpoint(value: str) -> str:
+    """Normalize legacy backend aliases and endpoint paths for report rows."""
+    endpoint = str(value).strip()
+    if not endpoint:
+        raise ValueError("endpoint must not be empty.")
+    endpoint = LEGACY_BACKEND_ENDPOINT_ALIASES.get(
+        endpoint,
+        LEGACY_BACKEND_ENDPOINT_ALIASES.get(endpoint.lstrip("/"), endpoint),
+    )
+    if not endpoint.startswith("/"):
+        endpoint = f"/{endpoint}"
+    return endpoint
 
 
 def _load_summary_columns(script_dir: str) -> list[str]:

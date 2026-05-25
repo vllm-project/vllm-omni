@@ -397,7 +397,7 @@ names** discovered in Step 1. No code changes to the model are required.
 ```python
 omni = Omni(
     model="/path/to/your-model",
-    quantization_config={
+    quantization={
         "method": "mxfp4_dualscale",
         "ignored_layers": [
             "blocks.0.attn1.to_qkv",   # runtime name, not diffusers name

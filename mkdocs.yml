@@ -120,7 +120,9 @@ plugins:
           inventories:
           - https://docs.python.org/3/objects.inv
           - https://typing-extensions.readthedocs.io/en/latest/objects.inv
-          - https://docs.aiohttp.org/en/stable/objects.inv
+          # Disabled because Read the Docs strict builds fail if this
+          # external inventory intermittently resets the connection.
+          # - https://docs.aiohttp.org/en/stable/objects.inv
           - https://pillow.readthedocs.io/en/stable/objects.inv
           - https://numpy.org/doc/stable/objects.inv
           # Temporarily disabled due to decompression errors

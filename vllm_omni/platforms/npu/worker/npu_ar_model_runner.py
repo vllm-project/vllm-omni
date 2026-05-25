@@ -730,6 +730,39 @@ class NPUARModelRunner(OmniNPUModelRunner):
 
         return None
 
+    def _sample(
+        self,
+        logits: torch.Tensor | None,
+        spec_decode_metadata: Any,
+    ):
+        sampling_metadata = self.input_batch.sampling_metadata
+        if spec_decode_metadata is None:
+            model_sample = getattr(self.model, "sample", None)
+            self.input_batch.update_async_output_token_ids()
+            if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
+                # Apply logit bias (min_tokens, allowed_token_ids) before
+                # the custom model sampler — the standard GPU sampler does
+                # this internally, but prefer_model_sampler bypasses it.
+                if hasattr(self.sampler, "logit_bias_state"):
+                    self.sampler.logit_bias_state.apply_logit_bias(
+                        logits,
+                        self.input_batch.expanded_idx_mapping,
+                        self.input_batch.idx_mapping_np,
+                        self.input_batch.positions[self.input_batch.logits_indices],
+                    )
+                sampler_output = model_sample(
+                    logits,
+                    self._sampling_metadata_for_model_sampler(sampling_metadata),
+                )
+                if sampler_output is not None:
+                    return sampler_output
+            return self.sampler(
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+            )
+
+        return super()._sample(logits, spec_decode_metadata)
+
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
