@@ -666,17 +666,6 @@ class OmniServeCommand(CLISubcommand):
         return serve_parser
 
 
-def _create_default_diffusion_stage_cfg(args: argparse.Namespace) -> list[dict[str, Any]]:
-    """Create default diffusion stage configuration.
-
-    Uses AsyncOmniEngine's implementation which doesn't have OmegaConf
-    compatibility issues.
-    """
-    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-
-    return AsyncOmniEngine._create_default_diffusion_stage_cfg(vars(args))
-
-
 def run_headless(args: argparse.Namespace) -> None:
     """Run a single stage in headless mode.
 
@@ -699,10 +688,11 @@ def run_headless(args: argparse.Namespace) -> None:
         build_engine_args_dict,
         build_vllm_config,
         get_stage_connector_spec,
+        inject_omni_kv_connector_config,
         load_omni_transfer_config_for_model,
         prepare_engine_environment,
     )
-    from vllm_omni.entrypoints.utils import inject_omni_kv_config, load_and_resolve_stage_configs
+    from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
 
     model = args.model
     stage_id: int | None = args.stage_id
@@ -771,7 +761,6 @@ def run_headless(args: argparse.Namespace) -> None:
             stage_id=stage_id,
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
-            stage_init_timeout=args.stage_init_timeout,
             omni_dp_size_local=omni_dp_size_local,
             per_replica_devices=per_replica_devices,
             config_path=config_path,
@@ -780,7 +769,7 @@ def run_headless(args: argparse.Namespace) -> None:
         return
 
     omni_transfer_config = load_omni_transfer_config_for_model(model, config_path)
-    omni_conn_cfg, omni_from, omni_to = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
+    omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
@@ -798,17 +787,7 @@ def run_headless(args: argparse.Namespace) -> None:
         cli_tokenizer=getattr(args, "tokenizer", None),
     )
 
-    # Inject omni KV connector config so the engine runner can initialize the
-    # correct connector (sender/receiver role, type, addresses, etc.).
-    if omni_conn_cfg:
-        omni_kv = engine_args_dict.get("omni_kv_config") or {}
-        if not isinstance(omni_kv, dict):
-            omni_kv = dict(omni_kv)
-        omni_kv["connector_config"] = omni_conn_cfg
-        omni_kv["omni_from_stage"] = omni_from
-        omni_kv["omni_to_stage"] = omni_to
-        omni_kv.setdefault("stage_id", stage_id)
-        engine_args_dict["omni_kv_config"] = omni_kv
+    inject_omni_kv_connector_config(engine_args_dict, omni_kv_connector, stage_id)
 
     vllm_config, executor_class = build_vllm_config(
         stage_cfg,

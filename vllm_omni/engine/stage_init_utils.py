@@ -50,6 +50,7 @@ class ReplicaInitPlan:
     omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
     stage_vllm_config: Any | None = None
     executor_class: type | None = None
+    engine_args_dict: dict[str, Any] | None = None
 
 
 @dataclass
@@ -114,14 +115,6 @@ def apply_cli_tokenizer(
     if cli_tokenizer is None or stage_defines_tokenizer:
         return
     engine_args["tokenizer"] = cli_tokenizer
-
-
-def terminate_alive_proc(proc, timeout=5):
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(timeout=timeout)
-        if proc.is_alive():
-            proc.kill()
 
 
 def patch_generation_config_if_needed(model_config: Any) -> None:
@@ -286,6 +279,26 @@ def inject_kv_stage_info(stage_cfg: Any, stage_id: int, stage_configs: Sequence[
             )
     except Exception as e:
         logger.debug("Failed to inject stage info into omni_kv_config: %s", e)
+
+
+def inject_omni_kv_connector_config(
+    engine_args_dict: dict[str, Any],
+    omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None],
+    stage_id: int,
+) -> None:
+    """Inject resolved connector config into a stage engine-args dict."""
+    omni_conn_cfg, omni_from, omni_to = omni_kv_connector
+    if not omni_conn_cfg:
+        return
+
+    omni_kv = engine_args_dict.get("omni_kv_config") or {}
+    if not isinstance(omni_kv, dict):
+        omni_kv = dict(omni_kv)
+    omni_kv["connector_config"] = omni_conn_cfg
+    omni_kv["omni_from_stage"] = omni_from
+    omni_kv["omni_to_stage"] = omni_to
+    omni_kv.setdefault("stage_id", stage_id)
+    engine_args_dict["omni_kv_config"] = omni_kv
 
 
 @dataclass

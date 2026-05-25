@@ -19,9 +19,11 @@ from vllm_omni.engine.stage_engine_startup import (
     OmniMasterServer,
     StageAllocation,
     StageCoordinatorAddresses,
+    StageRegistrationResponse,
     StageReplicaResources,
+    connect_remote_diffusion_proc,
     connect_remote_engine_cores,
-    launch_omni_core_engines,
+    _launch_omni_core_engines,
 )
 from vllm_omni.engine.stage_init_utils import LogicalStageInitPlan, ReplicaInitPlan
 
@@ -78,6 +80,7 @@ def _make_llm_plan(
                 stage_vllm_config=vllm_config
                 or SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1)),
                 executor_class=object,
+                engine_args_dict={},
             )
         ],
     )
@@ -734,7 +737,11 @@ class TestSingleStageReplicaInitialization:
         def _fake_connect(**kwargs):
             events.append("enter")
             try:
-                yield fake_manager, fake_coordinator, fake_addresses, None
+                yield StageReplicaResources(
+                    manager=fake_manager,
+                    coordinator=fake_coordinator,
+                    addresses=fake_addresses,
+                )
             finally:
                 events.append("exit")
 
@@ -808,7 +815,11 @@ class TestSingleStageReplicaInitialization:
 
         @contextmanager
         def _fake_connect(**kwargs):
-            yield fake_manager, fake_coordinator, fake_addresses, None
+            yield StageReplicaResources(
+                manager=fake_manager,
+                coordinator=fake_coordinator,
+                addresses=fake_addresses,
+            )
 
         plan = _make_llm_plan(
             0,
@@ -912,16 +923,24 @@ class TestSingleStageReplicaInitialization:
         )
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 11, "stage_type": "diffusion"}
-        runtime._omni_master_server.get_zmq_addresses.return_value = SimpleNamespace(
-            inputs=["tcp://in"],
-            outputs=["tcp://out"],
-        )
+        def _fake_connect(**kwargs):
+            @contextmanager
+            def _ctx():
+                yield StageReplicaResources(
+                    addresses=SimpleNamespace(
+                        inputs=["tcp://in"],
+                        outputs=["tcp://out"],
+                    )
+                )
+
+            return _ctx()
 
         remote_metadata = _make_diffusion_plan(1, configured_stage_id=11, launch_mode="remote").replicas[0].metadata
         plan = _make_diffusion_plan(1, configured_stage_id=11, launch_mode="remote").replicas[0]
         sentinel_client = SimpleNamespace()
 
         mocker.patch.object(runtime_mod, "extract_stage_metadata", return_value=remote_metadata)
+        mock_connect = mocker.patch.object(runtime_mod, "connect_remote_diffusion_proc", side_effect=_fake_connect)
         mock_from_addresses = mocker.patch(
             "vllm_omni.diffusion.stage_diffusion_client.StageDiffusionClient.from_addresses",
             return_value=sentinel_client,
@@ -931,7 +950,11 @@ class TestSingleStageReplicaInitialization:
 
         assert result is sentinel_client
         runtime._omni_master_server.get_stage_config.assert_called_once_with(11, timeout_s=60, replica_id=0)
-        runtime._omni_master_server.get_zmq_addresses.assert_called_once_with(11, replica_id=0)
+        mock_connect.assert_called_once_with(
+            omni_master_server=runtime._omni_master_server,
+            stage_id=11,
+            replica_id=0,
+        )
         mock_from_addresses.assert_called_once()
 
     def test_initialize_local_diffusion_replica_registers_with_master(self, mocker: MockerFixture):
@@ -967,7 +990,13 @@ class TestSingleStageReplicaInitialization:
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value="diffusion-config")
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
-            return_value=("tcp://127.0.0.1:26001", "tcp://127.0.0.1:26002", "tcp://127.0.0.1:26003"),
+            return_value=StageRegistrationResponse(
+                handshake_address="tcp://127.0.0.1:26001",
+                input_address="tcp://127.0.0.1:26002",
+                output_address="tcp://127.0.0.1:26003",
+                replica_id=0,
+                coordinator_router_address=None,
+            ),
         )
         fake_manager = SimpleNamespace(
             proc=proc,
@@ -1001,7 +1030,6 @@ class TestSingleStageReplicaInitialization:
             omni_master_port=25000,
             omni_stage_id=5,
             omni_stage_config=plan.stage_cfg,
-            return_addresses=True,
             replica_id=0,
         )
         mock_manager.assert_called_once_with(
@@ -1057,7 +1085,13 @@ class TestSingleStageReplicaInitialization:
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value="diffusion-config")
         mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
-            return_value=("tcp://127.0.0.1:26001", "tcp://127.0.0.1:26002", "tcp://127.0.0.1:26003"),
+            return_value=StageRegistrationResponse(
+                handshake_address="tcp://127.0.0.1:26001",
+                input_address="tcp://127.0.0.1:26002",
+                output_address="tcp://127.0.0.1:26003",
+                replica_id=0,
+                coordinator_router_address=None,
+            ),
         )
         mocker.patch(
             "vllm_omni.diffusion.stage_diffusion_proc.StageDiffusionProcManager",
@@ -1122,8 +1156,10 @@ class TestConnectRemoteEngineCoresCoordinator:
             omni_master_server=omni_master_server,
             stage_id=7,
             replica_id=2,
-        ) as (_, yielded_coordinator, yielded_addresses, _tensor_queue):
-            assert yielded_coordinator is None
+        ) as resources:
+            assert resources.coordinator is None
+            yielded_addresses = resources.addresses
+            assert yielded_addresses is not None
             assert yielded_addresses.coordinator_input == "tcp://coord-in"
             assert yielded_addresses.coordinator_output == "tcp://coord-out"
             assert yielded_addresses.frontend_stats_publish_address == "tcp://stats"
@@ -1154,11 +1190,42 @@ class TestConnectRemoteEngineCoresCoordinator:
             vllm_config=vllm_config,
             omni_master_server=omni_master_server,
             stage_id=7,
-        ) as (_, yielded_coordinator, yielded_addresses, _tensor_queue):
-            assert yielded_coordinator is None
+        ) as resources:
+            assert resources.coordinator is None
+            yielded_addresses = resources.addresses
+            assert yielded_addresses is not None
             assert yielded_addresses.coordinator_input is None
             assert yielded_addresses.coordinator_output is None
             assert yielded_addresses.frontend_stats_publish_address is None
+
+    def test_connect_remote_diffusion_proc_waits_for_headless_remote(self, mocker: MockerFixture):
+        omni_master_server = mocker.Mock(spec=OmniMasterServer)
+        omni_master_server.get_zmq_addresses.return_value = EngineZmqAddresses(
+            inputs=["tcp://client-in"],
+            outputs=["tcp://client-out"],
+        )
+        omni_master_server.get_allocation.return_value = mocker.Mock(handshake_bind_address="tcp://127.0.0.1:26001")
+
+        @contextmanager
+        def fake_socket_ctx(*args, **kwargs):
+            yield mocker.Mock()
+
+        mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
+        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
+
+        with connect_remote_diffusion_proc(
+            omni_master_server=omni_master_server,
+            stage_id=7,
+            replica_id=2,
+        ) as resources:
+            assert resources.addresses is omni_master_server.get_zmq_addresses.return_value
+
+        omni_master_server.get_zmq_addresses.assert_called_once_with(7, replica_id=2)
+        omni_master_server.get_allocation.assert_called_once_with(7, replica_id=2)
+        mock_wait.assert_called_once()
+        _, _, core_engines, parallel_config, *_ = mock_wait.call_args.args
+        assert core_engines[0].local is False
+        assert parallel_config.data_parallel_size_local == 0
 
 
 class TestLaunchOmniCoreEngines:
@@ -1184,7 +1251,13 @@ class TestLaunchOmniCoreEngines:
 
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
-            return_value="tcp://127.0.0.1:26001",
+            return_value=StageRegistrationResponse(
+                handshake_address="tcp://127.0.0.1:26001",
+                input_address="tcp://client-in",
+                output_address="tcp://client-out",
+                replica_id=2,
+                coordinator_router_address=None,
+            ),
         )
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
         mock_manager_cls = mocker.patch(
@@ -1192,7 +1265,7 @@ class TestLaunchOmniCoreEngines:
             return_value=local_engine_manager,
         )
         mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
-        with launch_omni_core_engines(
+        with _launch_omni_core_engines(
             vllm_config=vllm_config,
             executor_class=mocker.Mock(),
             log_stats=False,
@@ -1255,7 +1328,13 @@ class TestLaunchOmniCoreEngines:
         mocker.patch("vllm_omni.engine.stage_engine_startup.DPCoordinator", return_value=coordinator)
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
-            return_value="tcp://127.0.0.1:26001",
+            return_value=StageRegistrationResponse(
+                handshake_address="tcp://127.0.0.1:26001",
+                input_address="tcp://client-in",
+                output_address="tcp://client-out",
+                replica_id=3,
+                coordinator_router_address=None,
+            ),
         )
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
         mocker.patch(
@@ -1263,7 +1342,7 @@ class TestLaunchOmniCoreEngines:
             return_value=mocker.Mock(),
         )
         mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
-        with launch_omni_core_engines(
+        with _launch_omni_core_engines(
             vllm_config=vllm_config,
             executor_class=mocker.Mock(),
             log_stats=False,

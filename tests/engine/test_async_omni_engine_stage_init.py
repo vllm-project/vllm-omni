@@ -507,19 +507,19 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
         omni_kv_connector=(None, None, None),
         stage_vllm_config=fake_vllm_config,
         executor_class=object,
+        engine_args_dict={},
     )
 
     device_env_var = current_omni_platform.device_control_env_var
     prev_device_env = os.environ.get(device_env_var)
     os.environ[device_env_var] = "0"
 
-    @contextlib.contextmanager
-    def _capture_launch_scope(plan, stage_init_timeout):
+    def _capture_acquire_device_locks(*_args):
         nonlocal captured_timeout
-        captured_timeout = stage_init_timeout
-        yield (fake_vllm_config, object, [])
+        captured_timeout = _args[2]
+        return []
 
-    monkeypatch.setattr(runtime, "_local_llm_launch_scope", _capture_launch_scope)
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", _capture_acquire_device_locks)
 
     from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 

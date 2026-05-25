@@ -161,9 +161,6 @@ class MembershipController:
         if pool is None:
             logger.warning("[MembershipController] register: stage_id %d out of range", stage_id)
             return
-        if self._remote_replica_factory is None:
-            logger.warning("[MembershipController] register: no factory installed")
-            return
         client = await self._remote_replica_factory(stage_id, replica_id)
         input_addr = StagePool._client_input_addr(client)
         if input_addr is None:

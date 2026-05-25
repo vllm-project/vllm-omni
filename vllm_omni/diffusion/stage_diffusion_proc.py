@@ -354,10 +354,10 @@ class StageDiffusionProc:
         ctx = zmq.asyncio.Context()
 
         request_socket = ctx.socket(zmq.PULL)
-        request_socket.bind(request_address)
+        request_socket.connect(request_address)
 
         response_socket = ctx.socket(zmq.PUSH)
-        response_socket.bind(response_address)
+        response_socket.connect(response_address)
 
         encoder = OmniMsgpackEncoder()
         decoder = OmniMsgpackDecoder()
@@ -600,10 +600,12 @@ class StageDiffusionProc:
     # Subprocess entry point
     # ------------------------------------------------------------------
 
-    @classmethod
     @staticmethod
     def _open_startup_handshake(
         handshake_address: str,
+        *,
+        local_client: bool,
+        headless: bool,
     ) -> tuple[zmq.Context, zmq.Socket, EngineZmqAddresses]:
         ctx = zmq.Context()
         socket = ctx.socket(zmq.DEALER)
@@ -611,20 +613,25 @@ class StageDiffusionProc:
         socket.connect(handshake_address)
         addresses = EngineCoreProc.startup_handshake(
             socket,
-            local_client=True,
-            headless=False,
+            local_client=local_client,
+            headless=headless,
             parallel_config=None,
         )
         return ctx, socket, addresses
 
     @staticmethod
-    def _send_startup_ready(handshake_socket: zmq.Socket) -> None:
+    def _send_startup_ready(
+        handshake_socket: zmq.Socket,
+        *,
+        local_client: bool,
+        headless: bool,
+    ) -> None:
         handshake_socket.send(
             msgspec.msgpack.encode(
                 {
                     "status": "READY",
-                    "local": True,
-                    "headless": False,
+                    "local": local_client,
+                    "headless": headless,
                 }
             )
         )
@@ -635,9 +642,9 @@ class StageDiffusionProc:
         model: str,
         od_config: OmniDiffusionConfig,
         handshake_address: str,
-        request_address: str,
-        response_address: str,
         *,
+        local_client: bool,
+        headless: bool,
         omni_coordinator_address: str | None = None,
         omni_stage_id: int | None = None,
         omni_replica_id: int = 0,
@@ -669,22 +676,29 @@ class StageDiffusionProc:
         handshake_ctx: zmq.Context | None = None
         handshake_socket: zmq.Socket | None = None
         try:
-            handshake_ctx, handshake_socket, addresses = cls._open_startup_handshake(handshake_address)
+            handshake_ctx, handshake_socket, addresses = cls._open_startup_handshake(
+                handshake_address,
+                local_client=local_client,
+                headless=headless,
+            )
             request_address = addresses.inputs[0]
             response_address = addresses.outputs[0]
 
             proc.initialize()
 
-            cls._send_startup_ready(handshake_socket)
+            cls._send_startup_ready(
+                handshake_socket,
+                local_client=local_client,
+                headless=headless,
+            )
             handshake_socket.close()
             handshake_ctx.term()
             handshake_socket = None
             handshake_ctx = None
 
-            # Wire OmniCoordClientForStage *after* READY so that the head
-            # has bound its head-side request/response sockets — the
-            # address pair we report is the same pair this proc binds to
-            # (request/response addresses passed in).
+            # Wire OmniCoordClientForStage *after* READY. The address pair is
+            # owned by the frontend client; this proc connects to it as the
+            # backend runtime.
             if omni_coordinator_address is not None:
                 if omni_stage_id is None:
                     raise ValueError("omni_stage_id must be provided when omni_coordinator_address is set")
@@ -759,8 +773,8 @@ class StageDiffusionProcManager:
                 "model": model,
                 "od_config": od_config,
                 "handshake_address": handshake_address,
-                "request_address": addresses.inputs[0],
-                "response_address": addresses.outputs[0],
+                "local_client": True,
+                "headless": False,
                 "omni_coordinator_address": omni_coordinator_address,
                 "omni_stage_id": omni_stage_id,
                 "omni_replica_id": omni_replica_id,
@@ -773,6 +787,42 @@ class StageDiffusionProcManager:
         self.failed_proc_name: str | None = None
 
         self._wait_until_started(handshake_address, stage_init_timeout)
+
+    @classmethod
+    def launch_headless(
+        cls,
+        *,
+        model: str,
+        od_config: OmniDiffusionConfig,
+        handshake_address: str,
+        addresses: EngineZmqAddresses,
+        omni_coordinator_address: str | None,
+        omni_stage_id: int,
+        omni_replica_id: int,
+    ) -> StageDiffusionProcManager:
+        """Launch a headless diffusion backend that connects to head-owned sockets."""
+        self = cls.__new__(cls)
+        ctx = get_mp_context()
+        proc = ctx.Process(
+            target=StageDiffusionProc.run_diffusion_proc,
+            name="StageDiffusionProc",
+            kwargs={
+                "model": model,
+                "od_config": od_config,
+                "handshake_address": handshake_address,
+                "local_client": False,
+                "headless": True,
+                "omni_coordinator_address": omni_coordinator_address,
+                "omni_stage_id": omni_stage_id,
+                "omni_replica_id": omni_replica_id,
+            },
+        )
+        proc.start()
+        self.proc = proc
+        self.addresses = addresses
+        self.manager_stopped = False
+        self.failed_proc_name = None
+        return self
 
     def _wait_until_started(self, handshake_address: str, stage_init_timeout: int) -> None:
         try:

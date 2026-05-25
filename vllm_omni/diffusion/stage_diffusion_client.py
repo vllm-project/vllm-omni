@@ -1,6 +1,6 @@
 """Stage Diffusion Client for vLLM-Omni multi-stage runtime.
 
-Attaches to StageDiffusionProc over ZMQ (PUSH/PULL) and exposes the
+Owns the frontend-side ZMQ sockets for StageDiffusionProc and exposes the
 interface the Orchestrator expects from a stage client.
 """
 
@@ -166,9 +166,9 @@ class StageDiffusionClient(StageClientBase):
 
         self._zmq_ctx = zmq.Context()
         self._request_socket = self._zmq_ctx.socket(zmq.PUSH)
-        self._request_socket.connect(request_address)
+        self._request_socket.bind(request_address)
         self._response_socket = self._zmq_ctx.socket(zmq.PULL)
-        self._response_socket.connect(response_address)
+        self._response_socket.bind(response_address)
 
         self._response_poller = zmq.asyncio.Poller()
         self._response_poller.register(self._response_socket, zmq.POLLIN)
@@ -419,6 +419,8 @@ class StageDiffusionClient(StageClientBase):
                 if self._shutting_down:
                     return None
                 raise EngineDeadError()
+            if self._proc_manager is None:
+                return None
             proc = self._proc_manager.proc
             if not self._shutting_down and not proc.is_alive():
                 self._engine_dead = True
@@ -526,6 +528,8 @@ class StageDiffusionClient(StageClientBase):
         """
         if self._engine_dead:
             raise EngineDeadError(f"Stage-{self.stage_id} diffusion subprocess is dead")
+        if self._proc_manager is None:
+            return
         proc = self._proc_manager.proc
         if not proc.is_alive():
             self._engine_dead = True
@@ -540,7 +544,7 @@ class StageDiffusionClient(StageClientBase):
         except Exception:
             pass
 
-        if self._proc_manager.proc.is_alive():
+        if self._proc_manager is not None and self._proc_manager.proc.is_alive():
             self._proc_manager.shutdown(timeout=10)
 
         self._request_socket.close(linger=0)
