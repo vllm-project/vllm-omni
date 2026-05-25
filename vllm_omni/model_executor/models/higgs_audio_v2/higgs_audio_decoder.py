@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Shared HiggsAudio codec decoder kernel.
+"""HiggsAudio codec decoder kernel for higgs-audio v2.
 
 This module hosts the parameter-side building blocks for the higgs-audio-v2
 audio tokenizer's decoder path:
@@ -10,11 +10,6 @@ audio tokenizer's decoder path:
     -> fc2 Linear(hidden_size, 256) -> [B, 256, T]
     -> DAC acoustic decoder (conv-transpose upsampling) -> [B, 1, T*960]
     -> 24 kHz waveform (25 fps x 960 samples/frame)
-
-Originally lived inside vllm_omni/model_executor/models/omnivoice/omnivoice_decoder.py.
-Lifted here so the new higgs_audio_v2 integration can reuse the exact same
-kernel, while OmniVoice continues to import the symbols via a backward-compatible
-re-export shim in omnivoice_decoder.py.
 """
 
 from __future__ import annotations

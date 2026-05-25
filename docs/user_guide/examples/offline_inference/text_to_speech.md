@@ -308,7 +308,7 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 
 ## higgs-audio v2
 
-2-stage TTS at 24 kHz: a vLLM-native Llama-3.2-3B talker with a DualFFN audio expert (Stage 0) feeding a HiggsAudio codec decoder (Stage 1) over the shared-memory connector. Stage 1 reuses the shared HiggsAudio decoder kernel at `vllm_omni/model_executor/models/_shared/higgs_audio_decoder.py`.
+2-stage TTS at 24 kHz: a vLLM-native Llama-3.2-3B talker with a DualFFN audio expert (Stage 0) feeding a HiggsAudio codec decoder (Stage 1) over the shared-memory connector. Stage 1 builds on the HiggsAudio decoder kernel at `vllm_omni/model_executor/models/higgs_audio_v2/higgs_audio_decoder.py`.
 
 ### Prerequisites
 

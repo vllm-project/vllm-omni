@@ -18,9 +18,9 @@ Two surfaces exposed:
    ``input_ids`` (``[Q * num_frames]``) per request and returns an
    :class:`vllm_omni.model_executor.models.output_templates.OmniOutput`.
 
-The kernel is the shared HiggsAudio codec helper in
-``vllm_omni/model_executor/models/_shared/higgs_audio_decoder.py``; both surfaces
-share the same RVQ + DAC weights.
+The kernel is the HiggsAudio codec helper in
+``vllm_omni/model_executor/models/higgs_audio_v2/higgs_audio_decoder.py``; both
+surfaces share the same RVQ + DAC weights.
 """
 
 from __future__ import annotations
@@ -33,12 +33,12 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from vllm_omni.model_executor.models._shared.higgs_audio_decoder import (
-    HiggsAudioRVQ,
-    load_higgs_audio_codec,
-)
 from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
     HiggsAudioV2Config,
+)
+from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_decoder import (
+    HiggsAudioRVQ,
+    load_higgs_audio_codec,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
