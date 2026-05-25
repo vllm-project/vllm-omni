@@ -20,6 +20,7 @@ For the full list of supported architectures across all modalities, see
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` | ✓ (`ref_audio`+`ref_text`) | ✓ (codec_streaming) | — | — |
+| GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
@@ -232,6 +233,42 @@ python higgs_audio_v2/batch_speech_client.py \
 - Output: 24 kHz mono.
 - `--ref-text` must be the real transcript of `--ref-audio`; mismatched text degrades cloned-voice quality.
 - Out of scope (rejected with explicit 4xx): multi-speaker `[SPEAKERn]` tags inside `input`, `profile:` text-only speaker descriptions, the `ref_audio_in_system_message` system-block variant, chunked long-form generation, and per-request `voice` / `instructions` / `task_type` / `language` / `speed != 1.0` / `x_vector_only_mode` / `speaker_embedding`.
+## GLM-TTS
+
+2-stage TTS (AR + DiT flow-matching) at 24 kHz. Every request requires `ref_audio` + `ref_text`.
+
+### Launch
+```bash
+vllm serve zai-org/GLM-TTS --omni --trust-remote-code --port 8091
+# or:
+bash examples/online_serving/text_to_speech/glm_tts/run_server.sh /path/to/GLM-TTS
+```
+
+### Sending requests
+```bash
+# Voice cloning (required)
+python examples/online_serving/text_to_speech/glm_tts/openai_speech_client.py \
+    --text "你好，这是语音克隆测试。" \
+    --ref-audio file:///path/to/ref.wav \
+    --ref-text "这是参考音频的文本内容。"
+
+# Custom format
+python examples/online_serving/text_to_speech/glm_tts/openai_speech_client.py \
+    --text "Hello, this is a voice cloning test." \
+    --ref-audio file:///path/to/ref.wav \
+    --ref-text "Transcript of the reference audio." \
+    --response-format mp3 -o output.mp3
+```
+
+### Gradio demo
+```bash
+bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
+```
+
+### Notes
+- Output: 24 kHz mono WAV via HiFT vocoder.
+- `ref_audio` + `ref_text` are **required** together on every request. Reference audio should be 3-10 seconds.
+- Voice cloning feature extraction (WhisperVQ, CampPlus, mel) runs on the model side — no external dependency on the serving layer.
 
 ---
 
@@ -469,6 +506,21 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
 ??? abstract "higgs_audio_v2/run_server.sh"
     ``````sh
     --8<-- "examples/online_serving/text_to_speech/higgs_audio_v2/run_server.sh"
+??? abstract "glm_tts/gradio_demo.py"
+    ``````py
+    --8<-- "examples/online_serving/text_to_speech/glm_tts/gradio_demo.py"
+    ``````
+??? abstract "glm_tts/openai_speech_client.py"
+    ``````py
+    --8<-- "examples/online_serving/text_to_speech/glm_tts/openai_speech_client.py"
+    ``````
+??? abstract "glm_tts/run_gradio_demo.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh"
+    ``````
+??? abstract "glm_tts/run_server.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_speech/glm_tts/run_server.sh"
     ``````
 ??? abstract "omnivoice/run_server.sh"
     ``````sh

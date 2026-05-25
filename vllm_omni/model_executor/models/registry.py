@@ -145,6 +145,12 @@ _OMNI_MODELS = {
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
     ),
+    ## glm_tts
+    "GLMTTSForConditionalGeneration": (
+        "glm_tts",
+        "glm_tts",
+        "GLMTTSForConditionalGeneration",
+    ),
     "OmniBagelForConditionalGeneration": (
         "bagel",
         "bagel",

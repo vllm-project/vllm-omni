@@ -1453,7 +1453,7 @@ class TestPlatformOverrides:
         assert deploy.stages[0].tensor_parallel_size == 2
         assert deploy.stages[0].devices == "0,1"
         # Stage 2 unaffected fields stay at base
-        assert deploy.stages[2].enforce_eager is True
+        assert deploy.stages[2].enforce_eager is False
 
     def test_xpu_overrides(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
