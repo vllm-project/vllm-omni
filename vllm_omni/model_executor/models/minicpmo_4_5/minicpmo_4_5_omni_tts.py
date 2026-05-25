@@ -93,7 +93,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     def _lazy_init_tts(self):
         if self._assets_loaded or self._tts_config is None:
             return
-        self._assets_loaded = True
         try:
             model_path = self.vllm_config.model_config.model
             import os
@@ -154,12 +153,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     torch.set_default_dtype(prev_dtype2)
                 self.tts_obj.audio_tokenizer = self.audio_tokenizer
                 logger.info("Loaded Token2wav from %s", token2wav_dir)
+            # Only mark init as complete after every step succeeds, so a
+            # partial failure leaves the next call free to retry the full
+            # init instead of short-circuiting back to a silent empty path.
+            self._assets_loaded = True
         except ImportError:
             # Surface missing dependencies directly so users can act on them
             # instead of getting a silent None waveform downstream.
             raise
-        except Exception as e:
-            logger.error("Failed to init 4.5 TTS: %s", e, exc_info=True)
+        except Exception:
+            # Re-raise non-import init failures (bad token2wav assets, missing
+            # weights, OOM during Token2wav construction, etc.) so the server
+            # fails loudly at startup / first request instead of returning
+            # silent empty audio for every subsequent request.
+            logger.error("Failed to init 4.5 TTS", exc_info=True)
+            raise
 
     def generate_speech(
         self,
