@@ -5,7 +5,12 @@ Tests for Stable Diffusion 3.5 medium model.
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import (
+    OmniServer,
+    OmniServerParams,
+    OpenAIClientHandler,
+    dummy_messages_from_mix_data,
+)
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
@@ -32,7 +37,10 @@ def _get_diffusion_feature_cases(model: str):
                     "2",
                 ],
             ),
-            marks=FOUR_CARD_FEATURE_MARKS,
+            marks=[
+                *FOUR_CARD_FEATURE_MARKS,
+                pytest.mark.skip(reason="#3432"),
+            ],
         ),
     ]
 
@@ -45,9 +53,10 @@ def _get_diffusion_feature_cases(model: str):
     indirect=True,
 )
 def test_sd3_medium(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+    messages = dummy_messages_from_mix_data(content_text=POSITIVE_PROMPT)
     request_config = {
         "model": omni_server.model,
-        "messages": [{"role": "user", "content": POSITIVE_PROMPT}],
+        "messages": messages,
         "extra_body": {
             "height": 1024,
             "width": 1024,

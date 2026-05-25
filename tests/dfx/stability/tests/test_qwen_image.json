@@ -11,7 +11,7 @@
                 "backend": "vllm-omni",
                 "duration_sec": 86400,
                 "max_concurrency": 1,
-                "num_prompts_per_batch": 10,
+                "num_prompts_per_batch": 50,
                 "width": {
                     "min": 512,
                     "max": 2048

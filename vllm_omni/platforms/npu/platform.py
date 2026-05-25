@@ -32,6 +32,14 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     dist_backend: str = "hccl"
 
     @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        super().set_device(device)
+        # Ascend quantized weights are converted from ND to FRACTAL_NZ
+        # after loading. Enable internal format so the NZ storage layout
+        # is preserved for fused NPU kernels.
+        torch.npu.config.allow_internal_format = True
+
+    @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         return "vllm_omni.platforms.npu.worker.npu_ar_worker.NPUARWorker"
 
@@ -78,7 +86,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
             backend = DiffusionAttentionBackendEnum[backend_upper]
-            logger.info("Using diffusion attention backend '%s'", backend_upper)
+            logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
 
         # Try FLASH_ATTN if mindiesd is available, otherwise fall back to SDPA
@@ -86,10 +94,10 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             # Configure ASCEND_CUSTOM_OPP_PATH for mindiesd custom ops upon import
             import mindiesd  # noqa: F401
 
-            logger.info("Defaulting to diffusion attention backend FLASH_ATTN")
+            logger.debug("Defaulting to diffusion attention backend FLASH_ATTN")
             return DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
 
-        logger.info("Falling back to diffusion attention backend SDPA")
+        logger.debug("Falling back to diffusion attention backend SDPA")
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod

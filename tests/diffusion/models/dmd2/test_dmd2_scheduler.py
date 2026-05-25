@@ -5,15 +5,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.flux.pipeline_flux import FluxDMD2Pipeline, FluxPipeline
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline, LTX2T2VDMD2Pipeline
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_image2video import LTX2I2VDMD2Pipeline, LTX2ImageToVideoPipeline
+from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImageDMD2Pipeline, QwenImagePipeline
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, WanT2VDMD2Pipeline
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import Wan22I2VPipeline, WanI2VDMD2Pipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest, OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_DMD2_TIMESTEPS = [999, 937, 833, 624]
+# Linspace fallback timesteps for num_inference_steps=4 (the mixin default when model_index is empty).
+_DMD2_TIMESTEPS = [999, 749, 499, 249]
 
 # DMD2 subclass → immediate base pipeline whose __init__ loads model weights (mocked in tests).
 _DMD2_BASE = {
@@ -21,6 +24,8 @@ _DMD2_BASE = {
     WanI2VDMD2Pipeline: Wan22I2VPipeline,
     LTX2T2VDMD2Pipeline: LTX2Pipeline,
     LTX2I2VDMD2Pipeline: LTX2ImageToVideoPipeline,
+    FluxDMD2Pipeline: FluxPipeline,
+    QwenImageDMD2Pipeline: QwenImagePipeline,
 }
 
 
@@ -48,7 +53,7 @@ def _make_request(**sp_kwargs) -> OmniDiffusionRequest:
 
 @pytest.fixture(
     params=list(_DMD2_BASE.keys()),
-    ids=["wan_t2v", "wan_i2v", "ltx2_t2v", "ltx2_i2v"],
+    ids=["wan_t2v", "wan_i2v", "ltx2_t2v", "ltx2_i2v", "flux", "qwen_image"],
 )
 def pipeline(request):
     return _make_pipeline(request.param)
@@ -80,6 +85,48 @@ def test_forward_timesteps_match_dmd2_schedule(pipeline):
         pipeline.forward(_make_request())
 
     assert pipeline.scheduler.timesteps.long().tolist() == _DMD2_TIMESTEPS
+
+
+def test_default_solver_is_ode(pipeline):
+    """Default dmd2_config.solver is 'ode' → scheduler.stochastic_sampling is False."""
+    assert pipeline.dmd2_config.solver == "ode"
+    assert pipeline.scheduler.config.stochastic_sampling is False
+
+
+def test_sde_solver_plumbed_to_scheduler():
+    """solver='sde' in model_index → scheduler.stochastic_sampling is True."""
+    from vllm_omni.diffusion.models.dmd2 import DMD2Config
+    from vllm_omni.diffusion.models.schedulers import DMD2EulerScheduler
+
+    cfg = DMD2Config.from_model_index({"dmd2_config": {"solver": "sde"}})
+    scheduler = DMD2EulerScheduler(
+        num_train_timesteps=1000,
+        shift=1.0,
+        dmd2_timesteps=cfg.resolve_timesteps(),
+        stochastic_sampling=(cfg.solver == "sde"),
+    )
+    assert scheduler.config.stochastic_sampling is True
+
+
+def test_solver_case_insensitive():
+    """'SDE', 'Sde', ' sde ' all normalize to 'sde'."""
+    from vllm_omni.diffusion.models.dmd2 import DMD2Config
+
+    for raw in ("SDE", "Sde", " sde ", "sde"):
+        cfg = DMD2Config.from_model_index({"dmd2_config": {"solver": raw}})
+        assert cfg.solver == "sde"
+
+
+def test_solver_invalid_raises():
+    """Unknown solver strings raise ValueError with a clear message."""
+    import pytest
+
+    from vllm_omni.diffusion.models.dmd2 import DMD2Config
+
+    with pytest.raises(ValueError, match="solver must be one of"):
+        DMD2Config.from_model_index({"dmd2_config": {"solver": "euler"}})
+    with pytest.raises(ValueError, match="solver must be one of"):
+        DMD2Config(solver="dpmpp")  # type: ignore[arg-type]
 
 
 def test_forward_timesteps_idempotent_across_calls(pipeline):

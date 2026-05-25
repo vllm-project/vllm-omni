@@ -19,6 +19,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import Distribu
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
@@ -152,6 +153,41 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         # Check if model is a local path
         local_files_only = os.path.exists(model)
 
+        # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
+        # SD3.5 loads six subfolders in a row, each with multi-shard
+        # safetensors - it is the worst-case fan-out for the race window.
+        prefetch_subfolders(
+            model,
+            [
+                "scheduler",
+                "tokenizer",
+                "tokenizer_2",
+                "tokenizer_3",
+                "text_encoder",
+                "text_encoder_2",
+                "text_encoder_3",
+                "vae",
+            ],
+            local_files_only=local_files_only,
+        )
+
+        # ``transformers`` v5 changed ``from_pretrained``'s default
+        # ``torch_dtype`` from fp32 to whatever ``config.torch_dtype`` is
+        # baked into the checkpoint (fp16 for ``stabilityai/stable-
+        # diffusion-3.5-medium``). Without an explicit override the text
+        # encoders + VAE end up in fp16 while the rest of the pipeline
+        # (transformer, ``CombinedTimestepTextProjEmbeddings``,
+        # ``PatchEmbed``) is materialised in ``od_config.dtype`` (bf16
+        # by default). The first time latents flow through the
+        # transformer this surfaces as ``RuntimeError: Input type
+        # (c10::Half) and bias type (c10::BFloat16) should be the same``
+        # inside ``SD3Transformer2DModel.pos_embed`` (Buildkite #8418
+        # ``test_sd3_medium``). Pin every weight-loading
+        # ``from_pretrained`` to ``od_config.dtype`` so the whole
+        # pipeline is dtype-consistent. Tokenizers and the scheduler
+        # don't carry weights and therefore don't take ``torch_dtype``.
+        dtype = od_config.dtype
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
@@ -163,20 +199,30 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             model, subfolder="tokenizer_3", local_files_only=local_files_only
         )
         self.text_encoder = CLIPTextModelWithProjection.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
+            model,
+            subfolder="text_encoder",
+            torch_dtype=dtype,
+            local_files_only=local_files_only,
         )
         self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-            model, subfolder="text_encoder_2", local_files_only=local_files_only
+            model,
+            subfolder="text_encoder_2",
+            torch_dtype=dtype,
+            local_files_only=local_files_only,
         )
         self.text_encoder_3 = T5EncoderModel.from_pretrained(
             model,
             subfolder="text_encoder_3",
+            torch_dtype=dtype,
             local_files_only=local_files_only,
         )
         self.transformer = SD3Transformer2DModel(od_config=od_config)
 
         self.vae = DistributedAutoencoderKL.from_pretrained(
-            model, subfolder="vae", local_files_only=local_files_only
+            model,
+            subfolder="vae",
+            torch_dtype=dtype,
+            local_files_only=local_files_only,
         ).to(self.device)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
@@ -275,10 +321,8 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         self,
         prompt: str | list[str] = "",
         num_images_per_prompt: int = 1,
-        dtype: torch.dtype | None = None,
         clip_model_index: int = 0,
     ):
-        dtype = dtype or self.text_encoder.dtype
         clip_tokenizers = [self.tokenizer, self.tokenizer_2]
         clip_text_encoders = [self.text_encoder, self.text_encoder_2]
 
@@ -305,11 +349,11 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                 f" {self.tokenizer_max_length} tokens: {removed_text}"
             )
         prompt_embeds = text_encoder(text_input_ids.to(self.device), output_hidden_states=True)
-        pooled_prompt_embeds = prompt_embeds[0]
+        pooled_prompt_embeds = prompt_embeds[0].to(dtype=self.od_config.dtype, device=self.device)
 
         prompt_embeds = prompt_embeds.hidden_states[-2]
 
-        prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=self.device)
+        prompt_embeds = prompt_embeds.to(dtype=self.od_config.dtype, device=self.device)
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
@@ -323,10 +367,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         prompt: str | list[str] = "",
         num_images_per_prompt: int = 1,
         max_sequence_length: int = 256,
-        dtype: torch.dtype | None = None,
-    ):
-        dtype = dtype or self.text_encoder_3.dtype
-
+    ) -> torch.Tensor:
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
 
@@ -338,7 +379,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                     self.transformer.joint_attention_dim,
                 ),
                 device=self.device,
-                dtype=dtype,
+                dtype=self.od_config.dtype,
             )
 
         text_inputs = self.tokenizer_3(
@@ -361,8 +402,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
         prompt_embeds = self.text_encoder_3(text_input_ids.to(self.device))[0]
 
-        dtype = self.text_encoder_3.dtype
-        prompt_embeds = prompt_embeds.to(dtype=dtype, device=self.device)
+        prompt_embeds = prompt_embeds.to(dtype=self.od_config.dtype, device=self.device)
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
@@ -439,13 +479,11 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         num_channels_latents,
         height,
         width,
-        dtype,
-        device,
         generator,
         latents=None,
     ) -> torch.Tensor:
         if latents is not None:
-            return latents.to(device=device, dtype=dtype)
+            return latents.to(device=self.device, dtype=self.od_config.dtype)
 
         shape = (
             batch_size,
@@ -460,7 +498,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.od_config.dtype)
 
         return latents
 
@@ -504,9 +542,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         latents: torch.Tensor,
         timesteps: torch.Tensor,
         prompt_embeds: torch.Tensor,
-        pooled_prompt_embeds: torch.Tensor,
-        negative_prompt_embeds: torch.Tensor,
-        negative_pooled_prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_pooled_prompt_embeds: torch.Tensor | None,
         do_true_cfg: bool,
         guidance_scale: float,
         cfg_normalize: bool = False,
@@ -536,8 +574,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             self._current_timestep = t
 
             # Broadcast timestep to match batch size
-            timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
-
+            timestep = t.expand(latents.shape[0]).to(device=self.device, dtype=self.od_config.dtype)
             positive_kwargs = {
                 "hidden_states": latents,
                 "timestep": timestep,
@@ -665,8 +702,6 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             num_channels_latents,
             height,
             width,
-            prompt_embeds.dtype,
-            self.device,
             generator,
             latents,
         )
@@ -691,6 +726,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         if self.output_type == "latent":
             image = latents
         else:
+            # Ensure the latents are the same dtype as the VAE for decode
             latents = latents.to(self.vae.dtype)
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 

@@ -5,6 +5,12 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.data_entry_keys import (
+    CodesStruct,
+    MetaStruct,
+    OmniPayloadStruct,
+)
+
 logger = init_logger(__name__)
 
 
@@ -24,16 +30,14 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
 
 
 def slow_ar_to_dac_decoder(
-    stage_list: list[Any],
-    engine_input_source: list[int],
-    prompt: Any = None,
-    requires_multimodal_data: bool = False,
+    source_outputs: list[Any],
+    _prompt: Any = None,
+    _requires_multimodal_data: bool = False,
 ) -> list[Any]:
     """Non-async processor: wait for Slow AR to finish, then pass all codes to DAC decoder."""
     from vllm_omni.inputs.data import OmniTokensPrompt
-    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
 
-    slow_ar_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    slow_ar_outputs = source_outputs
     dac_inputs: list[OmniTokensPrompt] = []
 
     for output in slow_ar_outputs:
@@ -61,7 +65,7 @@ def slow_ar_to_dac_decoder_async_chunk(
     pooling_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
-) -> dict[str, Any] | None:
+) -> OmniPayloadStruct | None:
     """Async streaming processor: emit code chunks as they are produced.
 
     Accumulates per-step codes and emits fixed-size chunks with left context
@@ -109,10 +113,10 @@ def slow_ar_to_dac_decoder_async_chunk(
 
     if length <= 0:
         if finished:
-            return {
-                "codes": {"audio": []},
-                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
-            }
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+            )
         return None
 
     in_initial_phase = initial_chunk_size > 0 and length <= chunk_size
@@ -140,9 +144,12 @@ def slow_ar_to_dac_decoder_async_chunk(
 
     # Pack into codebook-major flat codes.
     stacked_frames = torch.stack(window_frames, dim=0)
-    code_predictor_codes = stacked_frames.transpose(0, 1).reshape(-1).tolist()
+    code_predictor_codes = stacked_frames.transpose(0, 1).reshape(-1)
 
-    return {
-        "codes": {"audio": code_predictor_codes},
-        "meta": {"left_context_size": left_context_size, "finished": torch.tensor(finished, dtype=torch.bool)},
-    }
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=code_predictor_codes),
+        meta=MetaStruct(
+            left_context_size=left_context_size,
+            finished=torch.tensor(finished, dtype=torch.bool),
+        ),
+    )

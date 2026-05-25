@@ -8,12 +8,14 @@ from typing import Any, get_args, get_origin
 
 import yaml
 from vllm.logger import init_logger
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config.stage_config import StageConfigFactory
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
 from vllm_omni.entrypoints.stage_utils import _to_dict
+from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
 # Get the project root directory (2 levels up from this file)
@@ -327,11 +329,16 @@ def resolve_model_config_path(model: str) -> str:
             except Exception as e:
                 raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
         else:
-            raise ValueError(
-                f"Could not determine model_type for model: {model}. "
-                f"Model is not in standard transformers format and does not have model_index.json. "
-                f"Please ensure the model has proper configuration files with 'model_type' field"
-            )
+            # No config.json at repo root (e.g. GLM-TTS stores configs in
+            # subdirectories only).  Try matching against registered deploy
+            # YAML filenames before giving up.
+            model_type = _try_resolve_omni_model_type(model)
+            if model_type is None:
+                raise ValueError(
+                    f"Could not determine model_type for model: {model}. "
+                    f"Model is not in standard transformers format and does not have model_index.json. "
+                    f"Please ensure the model has proper configuration files with 'model_type' field"
+                )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
     if model_type in _DIFFUSERS_CLASS_TO_CONFIG:
@@ -744,54 +751,6 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
     return filtered_kwargs
 
 
-# TODO(wuhang): Remove after PR #1115.
-def build_base_engine_args(source: Any) -> dict[str, Any] | None:
-    """Build base engine args with tokenizer and parallel configuration.
-
-    Automatically detects whether source is a dict-like object or namespace object.
-
-    Args:
-        source: Source object (args namespace or kwargs dict) containing configuration.
-
-    Returns:
-        Dictionary containing tokenizer and parallel configuration overrides,
-        or None if no configuration is present.
-    """
-    # Auto-detect source type: dict-like objects have 'get' method
-    is_dict_like = hasattr(source, "get") and callable(getattr(source, "get"))
-
-    # Extract tokenizer
-    if is_dict_like:
-        tokenizer = source.get("tokenizer", None)
-    else:
-        tokenizer = getattr(source, "tokenizer", None)
-
-    base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
-
-    # Extract parallel configuration
-    parallel_keys = [
-        "tensor_parallel_size",
-        "pipeline_parallel_size",
-        "data_parallel_size",
-        "data_parallel_size_local",
-        "data_parallel_backend",
-        "distributed_executor_backend",
-    ]
-
-    if is_dict_like:
-        parallel_overrides = {k: source[k] for k in parallel_keys if k in source and source[k] is not None}
-    else:
-        parallel_overrides = {
-            k: getattr(source, k) for k in parallel_keys if hasattr(source, k) and getattr(source, k) is not None
-        }
-
-    if parallel_overrides:
-        base_engine_args = base_engine_args or {}
-        base_engine_args.update(parallel_overrides)
-
-    return base_engine_args
-
-
 # The following code detects if the process is running in a container and if
 # PID host is available. If so, we can use process-scoped memory tracking;
 # otherwise we need sequential init locks.
@@ -850,3 +809,40 @@ def detect_pid_host() -> bool:
         return True
 
     return has_pid_host()
+
+
+### Helpers for handling delta messages
+def coerce_param_message_types(params: list[OmniSamplingParams], is_streaming: bool):
+    """Iterate over the sampling params and convert to the message types
+    to DELTA messages, if streaming is enabled, or FINAL_ONLY if
+    it's disabled, while respecting `.skip_clone` on the params.
+
+    This is needed to avoid emitting redundant multimodal data.
+    """
+    # Coerce vLLM's default output kinds as needed to handle streaming
+    # (i.e., DELTA output kind). Note that this is only applied to non
+    # Diffusion sampling params.
+    #
+    # NOTE: Hidden states will still be passed between stages.
+    for idx, sp in enumerate(params):
+        # For OmniDiffusionParams don't set output kind
+        if isinstance(sp, SamplingParams):
+            params[idx] = maybe_coerce_to_message_type(sp, is_streaming)
+    return params
+
+
+def maybe_coerce_to_message_type(params: SamplingParams, is_streaming: bool):
+    """If this is a CUMULATIVE message, coerce it to DELTA if streaming, otherwise FINAL_ONLY."""
+    target_type = RequestOutputKind.DELTA if is_streaming else RequestOutputKind.FINAL_ONLY
+    if params.output_kind == target_type:
+        return params
+    elif is_streaming and params.output_kind == RequestOutputKind.FINAL_ONLY:
+        logger.warning("Request appears to be streaming, but got request type final only!")
+    elif not is_streaming and params.output_kind == RequestOutputKind.DELTA:
+        logger.warning("Request appears to not be streaming, but got request type delta!")
+
+    if not params.skip_clone:
+        params = params.clone()
+        params.skip_clone = True
+    params.output_kind = target_type
+    return params

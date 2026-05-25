@@ -32,6 +32,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
     OmniDiffusionConfig,
@@ -403,8 +404,8 @@ def ulysses_attention_on_test_model(
         pipeline_parallel_size=1,
     )
 
-    # Set the config so Attention can access it
-    with set_forward_context(omni_diffusion_config=od_config):
+    # Set the config so Attention can access it during init and forward
+    with set_forward_context(omni_diffusion_config=od_config), set_current_diffusion_config(od_config):
         # Create model
         hidden_size = num_heads * head_size
 

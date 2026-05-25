@@ -1,30 +1,21 @@
 from collections.abc import Iterable
-from typing import Any
 
 import torch
 import torch.nn as nn
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerConfig,
 )
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoder,
-)
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
 from vllm.model_executor.models.interfaces import (
-    MultiModalEmbeddings,
     SupportsPP,
-)
-from vllm.model_executor.models.qwen2_5_omni_thinker import (
-    Qwen2_5OmniThinkerDummyInputsBuilder,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
     maybe_prefix,
 )
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mtp import (
@@ -32,34 +23,15 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mt
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3MoeLLMForCausalLM,
-    Qwen3Omni_VisionTransformer,
-    Qwen3OmniMoeConditionalGenerationMixin,
-    Qwen3OmniMoeThinkerMultiModalProcessor,
-    Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
-try:
-    import flash_attn
-except (ImportError, ModuleNotFoundError):
-    flash_attn = None
-
-
 logger = init_logger(__name__)
 
-Qwen3OmniMoeThinkerDummyInputsBuilder = Qwen2_5OmniThinkerDummyInputsBuilder
 
-
-@MULTIMODAL_REGISTRY.register_processor(
-    Qwen3OmniMoeThinkerMultiModalProcessor,
-    info=Qwen3OmniMoeThinkerProcessingInfo,
-    dummy_inputs=Qwen3OmniMoeThinkerDummyInputsBuilder,
-)
 class Qwen3OmniMoeTalkerForConditionalGeneration(
     nn.Module,
-    # SupportsMultiModal,
     SupportsPP,
-    Qwen3OmniMoeConditionalGenerationMixin,
 ):
     """
     Qwen3 Omni MoE Talker - Converts text to audio codec codes.
@@ -216,31 +188,6 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
 
         return result_codes, summed_embeddings
 
-    def init_multi_modal(self, thinker_config: Any) -> None:
-        """
-        Initialize multimodal components from the thinker.
-
-        Unlike Qwen2.5 Omni which creates audio_tower and visual encoders here,
-        Qwen3 Omni MoE has a cleaner separation: the thinker is the ONLY module
-        that processes raw multimodal inputs. The talker only handles text-to-audio
-        conversion using pre-processed embeddings from the thinker.
-
-        This method exists for API compatibility and stores the thinker config
-        for reference. The actual multimodal processing components (audio_tower,
-        visual) are ONLY in the thinker, not duplicated in the talker.
-
-        Args:
-            thinker_config: Configuration from the thinker model (for reference only)
-        """
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(thinker_config.audio_config)
-        self.visual = Qwen3Omni_VisionTransformer(
-            vision_config=thinker_config.vision_config,
-            norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(self.prefix, "visual"),
-            # attn_backend_override=attn_backend_override,
-        )
-
     def project_thinker_outputs(
         self,
         thinker_embeds: torch.Tensor | None = None,
@@ -300,11 +247,15 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        inputs_embeds: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         """Forward pass through the talker model."""
+        if inputs_embeds is None and input_ids is not None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+            input_ids = None
+
         talker_hidden_states, _ = self.language_model.model(
             input_ids,
             positions,
@@ -334,89 +285,8 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         """Create empty intermediate tensors for pipeline parallelism."""
         return self.language_model.make_empty_intermediate_tensors(batch_size, dtype, device)
 
-    def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
-        mm_input_by_modality = {}
-
-        # Preserve the order of modalities if there are multiple of them
-        # from the order of kwargs.
-        for input_key in kwargs:
-            if input_key in ("pixel_values", "image_embeds") and "image" not in mm_input_by_modality:
-                mm_input_by_modality["image"] = self._parse_and_validate_image_input(**kwargs)
-            if input_key in ("pixel_values_videos", "video_embeds") and "video" not in mm_input_by_modality:
-                mm_input_by_modality["video"] = self._parse_and_validate_video_input(**kwargs)
-            if input_key in ("input_audio_features") and "audio" not in mm_input_by_modality:
-                mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(**kwargs)
-        return mm_input_by_modality
-
-    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
-        mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
-        if not mm_input_by_modality:
-            return []
-
-        logger.warning(
-            "\n\n\n"
-            "THIS FUNCTION RETURNS DUMMY MULTIMODAL EMBEDDINGS FOR PROFILE RUN, "
-            "SHOULD NOT BE CALLED IN INFERENCE."
-            "\n\n\n"
-        )
-
-        # The result multimodal_embeddings is tuple of tensors, with each
-        # tensor corresponding to a multimodal data item (image or video).
-        dummy_multimodal_embeddings: tuple[torch.Tensor, ...] = ()
-
-        # NOTE: It is important to iterate over the keys in this dictionary
-        # to preserve the order of the modalities.
-        # TODO: do projection for all multimodel
-        for modality in mm_input_by_modality:
-            multimodal_input = mm_input_by_modality[modality]
-            if modality == "image":
-                image_embeddings = self._process_image_input(multimodal_input)
-                dummy_image_embeddings = ()
-                for image_embed in image_embeddings:
-                    dummy_image_embeddings += (
-                        torch.zeros(
-                            image_embed.shape[0],
-                            self.config.text_config.hidden_size,
-                            device=image_embed.device,
-                            dtype=torch.bfloat16,
-                        ),
-                    )
-                dummy_multimodal_embeddings += tuple(image_embeddings)
-            if modality == "video":
-                video_embeddings = self._process_video_input(multimodal_input)
-                dummy_video_video_embeddings = ()
-                for video_embed in video_embeddings:
-                    dummy_video_video_embeddings += (
-                        torch.zeros(
-                            video_embed.shape[0],
-                            self.config.text_config.hidden_size,
-                            device=video_embed.device,
-                            dtype=torch.bfloat16,
-                        ),
-                    )
-                dummy_multimodal_embeddings += tuple(dummy_video_video_embeddings)
-            if modality == "audio":
-                audio_embeddings = self._process_audio_input(multimodal_input)
-                dummy_audio_embeddings = ()
-                for audio_embed in audio_embeddings:
-                    dummy_audio_embeddings += (
-                        torch.zeros(
-                            audio_embed.shape[0],
-                            self.config.text_config.hidden_size,
-                            device=audio_embed.device,
-                            dtype=torch.bfloat16,
-                        ),
-                    )
-                dummy_multimodal_embeddings += tuple(dummy_audio_embeddings)
-        return dummy_multimodal_embeddings
-
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: MultiModalEmbeddings | None = None,
-        is_multimodal: bool = False,
-    ):
-        """Get the input embedding layer (for codec tokens)."""
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed codec input IDs."""
         return self.language_model.embed_input_ids(input_ids)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -451,13 +321,6 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         except Exception:
             logger.error("Error logging model load summary")
 
-        multi_model_weights = set()
-        for name, param in self.visual.named_parameters():
-            multi_model_weights.add("visual." + name)
-        for name, param in self.audio_tower.named_parameters():
-            multi_model_weights.add("audio_tower." + name)
-        loaded.update(multi_model_weights)
-
         return loaded
 
 
@@ -489,7 +352,7 @@ class Qwen3OmniMoeModel(Qwen3MoeLLMForCausalLM):
     """
     Qwen3 Omni MoE Talker language model.
 
-    Extends Qwen3MoeLLMForCausalLM (which already uses SharedFusedMoE with
+    Extends Qwen3MoeLLMForCausalLM (which already uses FusedMoE with
     shared-expert support) and replaces the text embedding / LM head with a
     codec embedding so the talker operates over audio-codec tokens instead
     of text tokens.

@@ -11,15 +11,16 @@ Same structure as test_qwen3_omni (models, stage_configs, test_params, parametri
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import pytest
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
+# See tests/e2e/online_serving/test_qwen3_tts_base.py for the vendored-asset rationale.
+REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
@@ -66,7 +67,7 @@ def get_prompt():
 
 
 @pytest.mark.advanced_model
-@pytest.mark.omni
+@pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:

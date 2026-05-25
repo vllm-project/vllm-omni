@@ -48,7 +48,6 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import (
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder.t5_gemma_encoder import T5GemmaEncoderModelTP
-from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -1641,6 +1640,20 @@ def get_magi_human_post_process_func(*args, **kwargs):
 # ===========================================================================
 
 
+def _load_json(model_path: str, filename: str, local_files_only: bool = True) -> dict:
+    """Load a JSON config file from a local path or HuggingFace Hub repo."""
+    if local_files_only:
+        path = os.path.join(model_path, *filename.split("/"))
+        with open(path) as f:
+            return json.load(f)
+    else:
+        from huggingface_hub import hf_hub_download
+
+        cached = hf_hub_download(repo_id=model_path, filename=filename)
+        with open(cached) as f:
+            return json.load(f)
+
+
 def _resolve_subdir(
     model_path: str,
     subfolder: str,
@@ -1671,7 +1684,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         super().__init__()
         model_path = od_config.model
         local_files_only = os.path.exists(model_path)
-        device = f"cuda:{torch.cuda.current_device()}"
+        device = f"cuda:{torch.accelerator.current_device_index()}"
         self.device_str = device
         self.dtype = od_config.dtype or torch.bfloat16
 
@@ -2242,7 +2255,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                 1 - self.sr_audio_noise_scale
             )
 
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             sr_steps = sr_num_steps or self.sr_num_inference_steps_default
             final_latent_video, _ = self._evaluate_with_latent(
                 context,
@@ -2261,9 +2274,9 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
             final_latent_video = br_latent_video
             final_latent_audio = br_latent_audio
 
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
         videos_np = self._decode_video(final_latent_video)
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
         audio_np = self._decode_audio(final_latent_audio)
 
         return DiffusionOutput(output=(videos_np, audio_np))
