@@ -24,11 +24,16 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
     model_type="minicpmo_4_5",
     model_arch="MiniCPMO45OmniForConditionalGeneration",
     # MiniCPM-o 4.5's HF config.json reports `model_type="minicpmo"` and
-    # `architectures=["MiniCPMO"]` (shared with older MiniCPM-o 1.0 / 2.6),
-    # so we identify 4.5 via the HF arch fallback below + the "version"
-    # field. The 4.5-specific name is kept so model repos can opt into the
-    # explicit arch in the future without breaking auto-resolution today.
+    # `architectures=["MiniCPMO"]` — both shared verbatim with older MiniCPM-o
+    # 1.0 / 2.6 checkpoints. The only field distinguishing the generations is
+    # the top-level ``version`` string, so we register both the shared
+    # ``MiniCPMO`` arch (for auto-detection) and the 4.5-specific arch (for
+    # repos that opt into the explicit name later), then pin the routing to
+    # 4.5 via ``hf_config_predicate``. Without the predicate, loading a 2.6
+    # checkpoint would also intersect ``["MiniCPMO"]`` here and get routed
+    # into the 4.5 pipeline, which would then fail at load time.
     hf_architectures=("MiniCPMO", "MiniCPMO45OmniForConditionalGeneration"),
+    hf_config_predicate=lambda c: str(getattr(c, "version", "")) == "4.5",
     stages=(
         StagePipelineConfig(
             stage_id=0,
