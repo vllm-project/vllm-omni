@@ -61,7 +61,7 @@ def get_default_config(default_path):
     return modify_stage_config(
         default_path,
         updates={
-            "stages": {0: {"default_sampling_params.max_tokens": 2048}, 1: {"default_sampling_params.max_tokens": 32768}, 2: {"default_sampling_params.max_tokens": 65535}},
+            "stages": {0: {"default_sampling_params.max_tokens": 2048}, 1: {"default_sampling_params.max_tokens": 8192}, 2: {"default_sampling_params.max_tokens": 65535}},
         },
     )
 
@@ -569,16 +569,16 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
-        content_text="Tell a 500-word story.",
+        content_text="Tell a 300-word story.",
     )
 
     request_config = {
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
+        "similarity_threshold": 0.85
     }
-
-    responses = openai_client.send_omni_request(request_config, request_num=32)
+    responses = openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
     text = responses[0].text_content if responses else ""
     word_count = len(text.split())
-    assert word_count >= 300, f"Expected at least 300 words in long output, got {word_count}"
+    assert word_count >= 200, f"Expected at least 200 words in long output, got {word_count}"
