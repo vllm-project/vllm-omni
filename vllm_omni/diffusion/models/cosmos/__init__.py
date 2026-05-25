@@ -8,5 +8,4 @@ __all__ = [
     "CosmosTransformer3DModel",
     "CosmosPredict25Pipeline",
     "get_cosmos_predict25_post_process_func",
-    "CosmosTransformer3DModel",
 ]

@@ -712,7 +712,7 @@ class CosmosTransformer3DModel(nn.Module):
         post_patch_width = width // p_w
 
         hidden_states = self.patch_embed(hidden_states)
-        hidden_states = hidden_states.flatten(1, 3)  # [B, T, H, W, C] -> [B, THW, C]
+        hidden_states = hidden_states.flatten(1, 3)  # [B, T, H, W, C] -> [B, T*H*W, C]
 
         # Timestep embeddings
         if timestep.ndim == 1:
@@ -729,7 +729,7 @@ class CosmosTransformer3DModel(nn.Module):
                 .expand(-1, -1, post_patch_height, post_patch_width, -1)
                 .flatten(1, 3)
                 for x in (temb, embedded_timestep)
-            )  # [BT, C] -> [B, T, 1, 1, C] -> [B, T, H, W, C] -> [B, THW, C]
+            )  # [BT, C] -> [B, T, 1, 1, C] -> [B, T, H, W, C] -> [B, T*H*W, C]
         else:
             raise ValueError(f"Expected timestep to have shape [B, 1, T, 1, 1] or [T], but got {timestep.shape}")
 
