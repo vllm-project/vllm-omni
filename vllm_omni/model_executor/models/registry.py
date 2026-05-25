@@ -129,6 +129,12 @@ _OMNI_MODELS = {
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
     ),
+    ## glm_tts
+    "GLMTTSForConditionalGeneration": (
+        "glm_tts",
+        "glm_tts",
+        "GLMTTSForConditionalGeneration",
+    ),
     "OmniBagelForConditionalGeneration": (
         "bagel",
         "bagel",
@@ -149,12 +155,6 @@ _OMNI_MODELS = {
         "fish_speech",
         "fish_speech_dac_decoder",
         "FishSpeechDACDecoder",
-    ),
-    ## VoxCPM
-    "VoxCPMForConditionalGeneration": (
-        "voxcpm",
-        "voxcpm",
-        "VoxCPMForConditionalGeneration",
     ),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (

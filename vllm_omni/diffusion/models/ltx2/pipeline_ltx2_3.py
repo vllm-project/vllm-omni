@@ -174,7 +174,8 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
 
         # --- Transformer: created empty, weights loaded via AutoWeightsLoader ---
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        self.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
 
         # --- Scheduler ---
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(

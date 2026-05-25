@@ -290,7 +290,22 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         )
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        ).to(self.device)
+        )
+        # Qwen2.5-VL ships a vision tower that text-to-image does not use.
+        # Drop it while the model is still on CPU, before moving to GPU, so
+        # the vision tower never consumes GPU memory. Handle both transformers
+        # layouts: newer puts visual under .model, older puts it directly on
+        # the model.
+        visual_owner = None
+        if hasattr(self.text_encoder, "model") and hasattr(self.text_encoder.model, "visual"):
+            visual_owner = self.text_encoder.model
+        elif hasattr(self.text_encoder, "visual"):
+            visual_owner = self.text_encoder
+        if visual_owner is not None:
+            del visual_owner.visual
+        else:
+            logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
+        self.text_encoder = self.text_encoder.to(self.device)
         self.vae = DistributedAutoencoderKLQwenImage.from_pretrained(
             model, subfolder="vae", local_files_only=local_files_only
         ).to(self.device)
