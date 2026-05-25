@@ -311,19 +311,20 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
             dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
 
-            # talker returns (mel_spec, waveform_or_None) tuple
+            # Talker returns a (mel_spec, waveform_or_None) tuple. MiniCPM-o
+            # 4.5 emits only the waveform (mel_spec is always None); keep the
+            # 2-slot unpack so a future mel-emitting variant can plug in
+            # without changing the wrapper.
+            mm_out: dict = {}
             if isinstance(talker_result, tuple) and len(talker_result) == 2:
-                mel_spec, waveform = talker_result
-                mm_out = {}
-                if mel_spec is not None:
-                    mm_out["mel_spec"] = [mel_spec]
+                _, waveform = talker_result
                 if waveform is not None:
                     mm_out["model_outputs"] = [waveform]
-                elif mel_spec is not None:
-                    mm_out["model_outputs"] = [mel_spec]
-                return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=mm_out)
 
-            return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
+            return OmniOutput(
+                text_hidden_states=dummy_hidden,
+                multimodal_outputs=mm_out if mm_out else None,
+            )
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
 

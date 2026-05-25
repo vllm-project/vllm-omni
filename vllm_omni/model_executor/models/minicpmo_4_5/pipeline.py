@@ -50,12 +50,20 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=1,
             model_stage="tts",
-            # Talker is a self-contained MiniCPMTTS + Token2wav module; it
-            # consumes thinker hidden states + token ids rather than sharing
-            # the thinker backbone, so it carries its own model_arch.  The
-            # vocoder runs in the same process as the talker LLM, so this
-            # stage emits the final audio waveform directly.
-            model_arch="MiniCPMO45OmniTTSForConditionalGeneration",
+            # Stage 1 shares the top-level wrapper class
+            # (``MiniCPMO45OmniForConditionalGeneration``) inherited from
+            # ``model_arch`` above. The wrapper dispatches on ``model_stage``
+            # and, for ``"tts"``, instantiates the standalone TTS submodule
+            # (``MiniCPMO45OmniTTSForConditionalGeneration``) internally.
+            # Routing through the wrapper is required so that the runner-side
+            # ``runtime_additional_information`` payload reaches the talker
+            # (the standalone TTS class only reads ``additional_information``,
+            # so wiring stage 1 directly to it would always trigger the dummy
+            # path) and so the resulting waveform is packaged as
+            # ``OmniOutput.multimodal_outputs["model_outputs"]`` instead of
+            # being returned as a bare tuple that the AR runner would mistake
+            # for hidden states. ``hf_config_name="tts_config"`` keeps KV
+            # cache / mrope sizing scoped to the talker sub-config.
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(0,),
             final_output=True,

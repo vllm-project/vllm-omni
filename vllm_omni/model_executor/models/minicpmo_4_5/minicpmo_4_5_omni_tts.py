@@ -404,8 +404,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         logger.info("4.5 Talker: generating speech for %d tokens", tts_token_ids.shape[0])
         waveform = self.generate_speech(tts_token_ids, tts_hidden_states)
+        # Tuple layout: (mel_spec, waveform). 4.5 talker emits only waveform,
+        # so mel_spec stays None; the wrapper unpacks in this order and
+        # packages the waveform into ``multimodal_outputs["model_outputs"]``.
         if waveform is not None:
-            return torch.tensor(waveform, dtype=torch.float32), None
+            return None, torch.tensor(waveform, dtype=torch.float32)
         return None, None
 
     def compute_logits(self, hidden_states, *args, **kwargs):
