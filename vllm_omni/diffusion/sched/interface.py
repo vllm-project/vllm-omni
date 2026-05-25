@@ -108,25 +108,27 @@ class CachedRequestData:
 
 
 @dataclass
+class Layout:
+    """How the previous latent should be sliced.
+
+    - head [0:len(finished_idxs)] are chunks completing denoising (to decode)
+    - next [len(finished_idxs) : len(finished_idxs)+len(circulating_idxs)] are
+      re-admitted chunks
+    - rank 0 appends len(new_idxs) fresh randn rows at the tail before forwarding.
+    """
+
+    circulating_idxs: list[int]
+    finished_idxs: list[int]
+    new_idxs: list[int]
+
+
+@dataclass
 class RankTask:
     """One unit of work for a rank in a stream-batch micro-step."""
 
     sched_req_id: str
     chunk_indices: list[int]
-
-
-@dataclass
-class Rank0Layout:
-    """How rank 0 should slice the [B_prev, ...] tensor it receives from last rank.
-
-    - head [0:n_finished] are chunks completing denoising (to decode)
-    - next [n_finished : n_finished+n_circulating] are re-admitted chunks
-    - rank 0 appends n_new fresh randn rows at the tail before forwarding.
-    """
-
-    n_circulating: int
-    finished_idxs: list[int]
-    new_idxs: list[int]
+    layout: Layout
 
 
 @dataclass
@@ -141,8 +143,7 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int
 
     # stream-batch scheduling fields
-    assignment: list[RankTask | None] | None = None
-    rank0_layouts: dict[str, Rank0Layout] | None = None
+    assignment: list[RankTask] | None = None
 
     @cached_property
     def scheduled_req_ids(self) -> list[str]:

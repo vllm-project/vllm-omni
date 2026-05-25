@@ -2,7 +2,7 @@
 
 Each ``schedule()`` call corresponds to one micro-step. The pipeline is modeled
 as ``pp_size`` per-rank chunk queues plus a transient ``returning`` queue.
-At each schedule(), chunks at rank N-1 drain (finished -> Rank0Layout finished
+At each schedule(), chunks at rank N-1 drain (finished -> Layout finished
 slice, otherwise -> returning), queues shift one rank, and rank 0 receives the
 returning chunks plus B fresh admits drawn from the source video frames in
 ``prompts[0]["multi_modal_data"]["video"]``.
@@ -23,7 +23,7 @@ from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
-    Rank0Layout,
+    Layout,
     RankTask,
 )
 
@@ -72,7 +72,9 @@ class _Progress:
     batch_size: int = 0
     
     # chunks that will be processed by rank r at the current micro-step
-    chunks_at: list[deque[_InFlightChunk]] = field(default_factory=list) 
+    chunks_at: list[deque[_InFlightChunk]] = field(default_factory=list)
+    # rank r's layout — constructed at rank 0 and shifted forward each step
+    layouts_at: list[Layout] = field(default_factory=list)
 
     @property
     def output_chunks_target(self) -> int:
@@ -144,12 +146,12 @@ class StreamBatchScheduler(_BaseScheduler):
     Per micro-step:
       1. Promote waiting requests (handled by the base class).
       2. Drain rank N-1: finished chunks -> finished slice in
-         Rank0Layout, otherwise -> returning queue.
+         Layout, otherwise -> returning queue.
       3. Shift per-rank queues by one (rank r <- rank r-1).
       4. Rank 0 = returning + B fresh admits, where
          `B = min(B_target, queue_chunks_available, output_chunks_remaining)`.
-      5. Emit per-rank assignment and the per-request Rank0Layout. Flip req state
-         RUNNING -> BLOCKED when admission is starved on input.
+      5. Emit per-rank assignment with Layout attached to every RankTask. Flip
+         req state RUNNING -> BLOCKED when admission is starved on input.
     """
 
     def __init__(self) -> None:
@@ -198,13 +200,16 @@ class StreamBatchScheduler(_BaseScheduler):
         for new_req in base_output.scheduled_new_reqs:
             self._init_progress(new_req.sched_req_id, new_req.req)
 
-        rank0_layouts: dict[str, Rank0Layout] = {}
         for progress in self._progress.values():
-            rank0_layouts[progress.sched_req_id] = self._advance_chunk_pipeline(progress)
+            self._advance_chunk_pipeline(progress)
 
         if self._progress:
             base_output.assignment = self._build_assignment()
-            base_output.rank0_layouts = rank0_layouts
+
+        logger.info(
+            "StreamBatchScheduler schedule: %d running req(s), assignment=%s",
+            len(self._running), base_output.assignment,
+        )
 
         return base_output
 
@@ -221,6 +226,10 @@ class StreamBatchScheduler(_BaseScheduler):
             num_steps=num_steps,
             pp_size=self.pp_size,
             chunks_at=[deque() for _ in range(self.pp_size)],
+            layouts_at=[
+                Layout(circulating_idxs=[], finished_idxs=[], new_idxs=[])
+                for _ in range(self.pp_size)
+            ],
         )
 
         self._slo.register(
@@ -236,14 +245,14 @@ class StreamBatchScheduler(_BaseScheduler):
             sched_req_id, chunk_frames, num_frames, num_steps, sampling.slo_fps, self.pp_size,
         )
 
-    def _advance_chunk_pipeline(self, progress: _Progress) -> Rank0Layout:
-        """Advance the per-rank queues by one micro-step and return rank 0's layout."""
+    def _advance_chunk_pipeline(self, progress: _Progress) -> None:
+        """Advance the per-rank queues and layouts by one micro-step."""
 
         pp = progress.pp_size
 
         # 1. Drain last rank from previous step
         finished_idxs: list[int] = []
-        circulating = []
+        circulating: list[_InFlightChunk] = []
         last = progress.chunks_at[pp - 1]
         while last:
             chunk = last.popleft()
@@ -253,9 +262,10 @@ class StreamBatchScheduler(_BaseScheduler):
             else:
                 circulating.append(chunk)
 
-        # 2. Shift: rank r receives what rank r-1 had
+        # 2. Shift chunks and layouts: rank r receives what rank r-1 had
         for r in range(pp - 1, 0, -1):
             progress.chunks_at[r] = progress.chunks_at[r - 1]
+            progress.layouts_at[r] = progress.layouts_at[r - 1]
         progress.chunks_at[0] = deque()
 
         # 3. Rank 0 = circulating + B fresh admits
@@ -278,7 +288,14 @@ class StreamBatchScheduler(_BaseScheduler):
             new_idxs.append(chunk_idx)
         progress.batch_size = batch_size
 
-        # 4. Flip RUNNING -> BLOCKED if input-starved and we still owe output.
+        # 4. Set rank 0's layout for this step.
+        progress.layouts_at[0] = Layout(
+            circulating_idxs=[c.chunk_idx for c in circulating],
+            finished_idxs=finished_idxs,
+            new_idxs=new_idxs,
+        )
+
+        # 5. Flip RUNNING -> BLOCKED if input-starved and we still owe output.
         if (
             batch_size == 0
             and output_chunks_remaining > 0
@@ -292,24 +309,17 @@ class StreamBatchScheduler(_BaseScheduler):
                 progress.sched_req_id, progress.frames_committed, progress.num_frames, available_frames,
             )
 
-        return Rank0Layout(
-            n_circulating=len(circulating),
-            finished_idxs=finished_idxs,
-            new_idxs=new_idxs,
-        )
-
-    def _build_assignment(self) -> list[RankTask | None]:
+    def _build_assignment(self) -> list[RankTask]:
         assert len(self._progress) <= 1 #TODO: support multiple requests
-        assignment: list[RankTask | None] = [None] * self.pp_size
+        assignment: list[RankTask] = []
         for progress in self._progress.values():
             for r in range(self.pp_size):
                 queue = progress.chunks_at[r]
-                if not queue:
-                    continue
-                assignment[r] = RankTask(
+                assignment.append(RankTask(
                     sched_req_id=progress.sched_req_id,
                     chunk_indices=[c.chunk_idx for c in queue],
-                )
+                    layout=progress.layouts_at[r],
+                ))
         return assignment
 
     # ── Output processing ──────────────────────────────────────────────────

@@ -360,12 +360,20 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             unique_reply_rank=0,
             exec_all_ranks=True,
         )
-        if not isinstance(result, BaseRunnerOutput):
-            raise RuntimeError(
-                f"Unexpected response type for execute_micro_step: {type(result)!r}"
+        
+        if isinstance(result, BaseRunnerOutput):
+            return result
+        if isinstance(result, DiffusionOutput):
+            req_id = scheduler_output.scheduled_req_ids[0] if scheduler_output.scheduled_req_ids else ""
+            return RunnerOutput(
+                req_id=req_id,
+                step_index=None,
+                finished=True,
+                result=result,
             )
-        return result
-
+        else:
+            raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
+    
     def collective_rpc(
         self,
         method: str,

@@ -161,6 +161,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         sigmas: list[float] | None = None,
         mu: float | None = None,
         shift: float | None = None,
+        sigma_start: float = 1.0,
     ) -> None:
         """
         Sets the discrete timesteps used for the diffusion chain (run before inference).
@@ -176,9 +177,15 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 Parameter for dynamic shifting.
             shift (`float`, *optional*):
                 Override shift parameter.
+            sigma_start (`float`, defaults to 1.0):
+                Scales the post-shift sigmas so step 0
+                lands at ``sigma_start`` instead of 1.0.
         """
         if self.config.use_dynamic_shifting and mu is None:
             raise ValueError("Must pass a value for `mu` when `use_dynamic_shifting` is True")
+
+        if not 0.0 < sigma_start <= 1.0:
+            raise ValueError(f"sigma_start must be in (0, 1], got {sigma_start}")
 
         if sigmas is None:
             assert num_inference_steps is not None
@@ -192,6 +199,9 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 shift = self.config.shift
             assert isinstance(sigmas, np.ndarray)
             sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+
+        if sigma_start != 1.0:
+            sigmas = sigmas * float(sigma_start)
 
         if self.config.final_sigmas_type == "sigma_min":
             sigma_last = self.sigma_min

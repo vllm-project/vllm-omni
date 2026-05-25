@@ -33,7 +33,7 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
-from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, Layout
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput, ChunkState
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
@@ -159,7 +159,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             raise ValueError(
                 "stream_batch=True requires a pipeline implementing the micro-step "
                 "execution protocol (prepare_encode, set_pp_recv_dict_buffers, "
-                "denoise_step, prefetch_its, step_scheduler, post_decode, encode_chunk_inputs); "
+                "denoise_step, prefetch_tensors, step_scheduler, post_decode, encode_chunk_inputs); "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
 
@@ -538,87 +538,63 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 pp_group = get_pp_group()
                 task = assignment[pp_group.rank_in_group]
-                chunk_idxs = list(task.chunk_indices) if task else []
+                chunk_idxs = list(task.chunk_indices)
+                layout = task.layout
 
                 if is_new_request:
                     pp_group.reset_buffer()
-                    self.pipeline.is_buffer_setup = False
                     self.pipeline.prepare_encode(state)
-                    state.extra["initial_latent_template"] = state.latents
-
-                state.batched_timesteps = None
+                    self.pipeline.set_pp_recv_dict_buffers(state)
 
                 t_start_ns = time.perf_counter_ns() if pp_group.is_first_rank else None
                 result: DiffusionOutput | None = None
                 finished = False
 
                 if pp_group.is_first_rank:
-                    result, finished = self._rank0_assemble_input(state, sched_output)
+                    result = self._update_decoded_chunks(state, layout)
+                    finished = result is not None
 
-                if not chunk_idxs:
-                    return RunnerOutput(
-                        req_id=state.req_id,
-                        finished=finished,
-                        result=result,
-                        micro_step_wall_ns=(
-                            time.perf_counter_ns() - t_start_ns if t_start_ns is not None else None
-                        ),
+                if pp_group.is_first_rank or pp_group.is_last_rank:
+                    self._prepare_chunk_latents(state, layout, is_first_rank=pp_group.is_first_rank)
+
+                if chunk_idxs:
+                    chunks: list[ChunkState] = [
+                        self._get_or_create_chunk(state, idx)[0] for idx in chunk_idxs
+                    ]
+
+                    # Per-row timesteps
+                    state.batched_timesteps = torch.stack(
+                        [state.timesteps[c.step_index] for c in chunks]
                     )
 
-                template = state.extra["initial_latent_template"]
-                chunks: list[ChunkState] = [
-                    self._get_or_create_chunk(state, idx)[0] for idx in chunk_idxs
-                ]
+                    batch_size = len(chunks)
+                    noise_pred = self.pipeline.denoise_step(state, batch_size=batch_size)
 
-                if pp_group.is_last_rank:
-                    if pp_group.world_size == 1:
+                    if noise_pred is None and getattr(self.pipeline, "interrupt", False):
+                        self._update_state_after(state, layout, finished=True)
+                        return RunnerOutput(
+                            req_id=state.req_id,
+                            finished=True,
+                            result=DiffusionOutput(error="micro-step denoise interrupted"),
+                        )
+
+                    schedulers = [c.scheduler for c in chunks]
+                    self.pipeline.step_scheduler(
+                        state, noise_pred, per_request_scheduler=schedulers, batch_size=batch_size,
+                    )
+
+                    for c in chunks:
+                        c.step_index += 1
+
+                    if pp_group.is_last_rank:
                         for i, c in enumerate(chunks):
-                            c.latents = state.latents[i:i + 1]
-                    else:
-                        for c in chunks:
-                            if c.latents is None:
-                                c.latents = (
-                                    template
-                                    if c.idx == 0
-                                    else torch.randn_like(template, generator=state.sampling.generator)
-                                )
-                        state.latents = torch.cat([c.latents for c in chunks], dim=0)
-                elif not pp_group.is_first_rank:
-                    state.latents = template.expand(len(chunks), *template.shape[1:])
+                            c.latents = state.latents[i : i + 1]
 
-                if not self.pipeline.is_buffer_setup:
-                    self.pipeline.set_pp_recv_dict_buffers(state)
+                prev_task = assignment[pp_group.group_prev_rank]
+                if prev_task.chunk_indices:
+                    self.pipeline.prefetch_tensors(state, batch_size=len(prev_task.chunk_indices))
 
-                # Per-row timesteps
-                state.batched_timesteps = torch.stack(
-                    [state.scheduler.timesteps[c.step_index] for c in chunks]
-                )
-
-                batch_size = len(chunks)
-                noise_pred = self.pipeline.denoise_step(state, batch_size=batch_size)
-
-                if noise_pred is None and getattr(self.pipeline, "interrupt", False):
-                    self.state_cache.pop(state.req_id, None)
-                    return RunnerOutput(
-                        req_id=state.req_id,
-                        finished=True,
-                        result=DiffusionOutput(error="micro-step denoise interrupted"),
-                    )
-
-                self.pipeline.prefetch_its(state, batch_size=batch_size)
-
-                schedulers = [c.scheduler for c in chunks]
-                self.pipeline.step_scheduler(
-                    state, noise_pred, per_request_scheduler=schedulers, batch_size=batch_size,
-                )
-
-                if pp_group.is_last_rank:
-                    for i, c in enumerate(chunks):
-                        c.latents = state.latents[i:i + 1]
-
-                for c in chunks:
-                    c.step_index += 1
-
+                self._update_state_after(state, layout, finished=finished)
                 return RunnerOutput(
                     req_id=state.req_id,
                     finished=finished,
@@ -639,52 +615,49 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         chunks[chunk_idx] = chunk
         return chunk, True
     
-    def _rank0_assemble_input(
-        self, state: DiffusionRequestState, scheduler_output: DiffusionSchedulerOutput,
-    ) -> tuple[DiffusionOutput | None, bool]:
-        """Build rank 0's batched forward input."""
-
-        layouts = scheduler_output.rank0_layouts
-        layout = layouts.get(state.req_id) if layouts else None
-        if layout is None:
-            return None, False
-
-        prev_latents = state.latents
+    def _prepare_chunk_latents(self, state: DiffusionRequestState, layout: Layout, is_first_rank: bool):
         pieces: list[torch.Tensor] = []
 
         n_finished = len(layout.finished_idxs)
-        if n_finished > 0 and prev_latents is not None:
-            saved = state.latents
-            state.latents = prev_latents[: n_finished]
-            decoded = self.pipeline.post_decode(state)
-            state.latents = saved
+
+        for i, idx in enumerate(layout.circulating_idxs):
+            chunk, _ = self._get_or_create_chunk(state, idx)
+            if is_first_rank:
+                chunk.latents = state.latents[n_finished + i : n_finished + i + 1]
+            pieces.append(chunk.latents)
+
+        if layout.new_idxs:
+            encoded = self.pipeline.encode_chunk_inputs(state, layout.new_idxs)
+            for i, idx in enumerate(layout.new_idxs):
+                chunk, _ = self._get_or_create_chunk(state, idx)
+                chunk.latents = encoded[i : i + 1]
+            pieces.append(encoded)
+
+        state.latents = torch.cat(pieces, dim=0) if pieces else None
+
+    def _update_decoded_chunks(self, state: DiffusionRequestState, layout: Layout) -> DiffusionOutput | None:
+        n_finished = len(layout.finished_idxs)
+        if n_finished > 0:
+            decoded = self.pipeline.post_decode(state.latents[: n_finished])
             state.extra.setdefault("decoded_chunks", []).append(decoded)
             state.extra["num_chunks_decoded"] = (
                 state.extra.get("num_chunks_decoded", 0) + n_finished
             )
-            for idx in layout.finished_idxs:
-                state.extra.get("chunks", {}).pop(idx, None)
-
-        if layout.n_circulating > 0 and prev_latents is not None:
-            pieces.append(
-                prev_latents[n_finished : n_finished + layout.n_circulating]
-            )
-
-        if layout.new_idxs:
-            encoded = self.pipeline.encode_chunk_inputs(state, layout.new_idxs)
-            for latent, idx in zip(encoded, layout.new_idxs):
-                chunk, _ = self._get_or_create_chunk(state, idx)
-                chunk.latents = latent
-                pieces.append(latent)
-
-        state.latents = torch.cat(pieces, dim=0) if pieces else None
 
         output_chunks_target = state.sampling.num_frames // state.sampling.chunk_frames
-        if state.extra.get("num_chunks_decoded", 0) >= output_chunks_target:
-            self.state_cache.pop(state.req_id, None)
-            return self._merge_chunk_outputs(state.extra["decoded_chunks"]), True
-        return None, False
 
+        if state.extra.get("num_chunks_decoded", 0) >= output_chunks_target:
+            return self._merge_chunk_outputs(state.extra["decoded_chunks"])
+        
+        return None
+
+    def _update_state_after(self, state: DiffusionRequestState, layout: Layout, finished: bool = False):
+        for idx in layout.finished_idxs:
+            state.extra.get("chunks", {}).pop(idx, None)
+        
+        if finished:
+            self.state_cache.pop(state.req_id, None)
+    
     @staticmethod
     def _merge_chunk_outputs(chunks: list[DiffusionOutput]) -> DiffusionOutput:
         """Merge decoded chunk outputs into a single video tensor.

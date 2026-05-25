@@ -1046,7 +1046,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 if isinstance(value, TensorMetadata):
                     if torch.Size(value.size).numel() == 0:
                         continue
-                    device = self.device if value.device == "cuda" else torch.device(value.device)
+                    device = torch.device(value.device) if value.device == "cpu" else self.device
                     buffers[key_] = torch.empty(value.size, dtype=value.dtype, device=device)
             buffer_pair.append(buffers)
         self.dict_recv_buffer[key] = buffer_pair
@@ -1107,7 +1107,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
                     if isinstance(value, TensorMetadata):
                         if torch.Size(value.size).numel() == 0:
                             continue
-                        device = self.device if value.device == "cuda" else torch.device(value.device)
+                        device = torch.device(value.device) if value.device == "cpu" else self.device
                         buffers[k] = torch.empty(value.size, dtype=value.dtype, device=device)
                 buffer_pair.append(buffers)
             self.dict_recv_buffer[key] = buffer_pair

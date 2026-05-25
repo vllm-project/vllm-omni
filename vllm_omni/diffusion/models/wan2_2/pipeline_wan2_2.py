@@ -441,8 +441,6 @@ class Wan22Pipeline(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
 
-        self.is_buffer_setup = False
-
     def _create_transformer(self, config: dict) -> WanTransformer3DModel:
         """Create a transformer from a config dict. Respects od_config.quantization_config."""
         quant_config = getattr(self.od_config, "quantization_config", None)
@@ -1041,7 +1039,7 @@ class Wan22Pipeline(
         if boundary_ratio is None and guidance_scale_2 is not None:
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
 
-    # ── Step-execution protocol (SupportsStepExecution) + Micro-step execution (SupportsMicroStepExecution) ──
+    # ── Micro-step execution (SupportsMicroStepExecution) Wan2.1 model (single-stage) ──
 
     def _extract_prompts(
         self,
@@ -1191,6 +1189,7 @@ class Wan22Pipeline(
         height = params["height"]
         width = params["width"]
         num_frames = params["num_frames"]
+        chunk_frames = params["chunk_frames"]
         device = params["device"]
         dtype = params["dtype"]
         generator = params["generator"]
@@ -1213,11 +1212,7 @@ class Wan22Pipeline(
             dtype=dtype,
         )
 
-        # Scheduler
-        self.scheduler.set_timesteps(params["num_steps"], device=device)
-        req_scheduler = copy.deepcopy(self.scheduler)
-
-        # I2V conditioning
+        # Multi-modal inputs (I2V image, V2V video)
         multi_modal_data = (
             state.prompts[0].get("multi_modal_data", {})
             if state.prompts and not isinstance(state.prompts[0], str)
@@ -1227,9 +1222,31 @@ class Wan22Pipeline(
         if isinstance(raw_image, list):
             raw_image = raw_image[0]
 
+        v2v_video = multi_modal_data.get("video", None) if multi_modal_data else None
+        noise_scale = float((state.sampling.extra_args or {}).get("noise_scale", 0.8))
+        sigma_start = noise_scale if (v2v_video is not None and 0.0 < noise_scale < 1.0) else 1.0
+
+        # Scheduler
+        self.scheduler.set_timesteps(params["num_steps"], device=device, sigma_start=sigma_start)
+        req_scheduler = copy.deepcopy(self.scheduler)
+
         latent_condition = None
         first_frame_mask = None
 
+        if v2v_video is not None:
+            # V2V mode
+            num_channels_latents = self.transformer_config.in_channels
+            latents = self.prepare_latents(
+                batch_size=prompt_embeds.shape[0],
+                num_channels_latents=num_channels_latents,
+                height=height,
+                width=width,
+                num_frames=chunk_frames,
+                dtype=torch.float32,
+                device="meta",  # NOTE: stream mode; latents will be prepared per-chunk in `encode_chunk_inputs`
+                generator=generator,
+                latents=state.sampling.latents,
+            )
         if self.expand_timesteps and raw_image is not None:
             # I2V mode
             from diffusers.video_processor import VideoProcessor
@@ -1323,35 +1340,33 @@ class Wan22Pipeline(
 
         pp_group = get_pp_group()
         if pp_group.world_size == 1:
-            self.is_buffer_setup = True
             return
 
-        # Pre-populate buffer pairs for every B in 1..slo_max_batch
         slo_fps = getattr(state.sampling, "slo_fps", None)
         slo_max_batch = getattr(state.sampling, "slo_max_batch", 1)
-        b_max = max(1, slo_max_batch if slo_fps else 1)
+        slo_max_batch = max(1, slo_max_batch if slo_fps else 1)
+        num_inference_steps = state.sampling.num_inference_steps or 4
 
-        _, channels, num_frames, height, width = state.latents.shape
+        _, channels, latent_chunk_frames, height, width = state.latents.shape
         p_t, p_h, p_w = self.transformer_config.patch_size
-        seq_len = (num_frames // p_t) * (height // p_h) * (width // p_w)
         inner_dim = self.transformer_config.num_attention_heads * self.transformer_config.attention_head_dim
         it_dtype = (self.transformer or self.transformer_2).dtype
         latents_dtype = state.latents.dtype
-        device = state.latents.device
+        
+        seq_len = (latent_chunk_frames // p_t) * (height // p_h) * (width // p_w)
 
         cfg_branches = 2 if state.do_true_cfg else 1
-        for B in range(1, b_max + 1):
+
+        for batch_size in range(1, slo_max_batch * num_inference_steps + 1):
             latents_template = {
-                "latents": torch.empty(B, channels, num_frames, height, width, dtype=latents_dtype, device=device)
+                "latents": torch.empty(batch_size, channels, latent_chunk_frames, height, width, dtype=latents_dtype, device="meta")
             }
             it_template = {
-                "hidden_states": torch.empty(B, seq_len, inner_dim, dtype=it_dtype, device=self.device)
+                "hidden_states": torch.empty(batch_size, seq_len, inner_dim, dtype=it_dtype, device="meta")
             }
-            pp_group.set_recv_dict_buffer("latents", -1, latents_template, batch_size=B)
+            pp_group.set_recv_dict_buffer("latents", -1, latents_template, batch_size=batch_size)
             for seg in range(cfg_branches):
-                pp_group.set_recv_dict_buffer("intermediate", seg, it_template, batch_size=B)
-
-        self.is_buffer_setup = True
+                pp_group.set_recv_dict_buffer("intermediate", seg, it_template, batch_size=batch_size)
 
     def denoise_step(
         self,
@@ -1366,8 +1381,8 @@ class Wan22Pipeline(
         it overrides ``current_timestep`` and ``_prepare_latent_input``
         forwards the per-row timesteps directly to the transformer.
         Model selection uses the per-row max so a batch straddling the
-        high/low noise boundary picks the high-noise transformer (correct
-        for single-stage Wan2.1; Wan2.2 boundary-straddling is a TODO).
+        high/low noise boundary picks the high-noise transformer (NOTE correct
+        for single-stage Wan2.1).
         """
         t = state.batched_timesteps if state.batched_timesteps is not None else state.current_timestep
         self._current_timestep = t
@@ -1380,10 +1395,19 @@ class Wan22Pipeline(
 
         do_true_cfg = current_guidance_scale > 1.0 and state.negative_prompt_embeds is not None
 
+        # Stream-batch path fuses B chunks along dim 0
+        B = latent_model_input.shape[0]
+        encoder_pos = state.prompt_embeds
+        if encoder_pos is not None and encoder_pos.shape[0] == 1 and B > 1:
+            encoder_pos = encoder_pos.expand(B, *encoder_pos.shape[1:]).contiguous()
+        encoder_neg = state.negative_prompt_embeds
+        if encoder_neg is not None and encoder_neg.shape[0] == 1 and B > 1:
+            encoder_neg = encoder_neg.expand(B, *encoder_neg.shape[1:]).contiguous()
+
         positive_kwargs = {
             "hidden_states": latent_model_input,
             "timestep": timestep,
-            "encoder_hidden_states": state.prompt_embeds,
+            "encoder_hidden_states": encoder_pos,
             "attention_kwargs": {},
             "return_dict": False,
             "current_model": current_model,
@@ -1392,7 +1416,7 @@ class Wan22Pipeline(
             {
                 "hidden_states": latent_model_input,
                 "timestep": timestep,
-                "encoder_hidden_states": state.negative_prompt_embeds,
+                "encoder_hidden_states": encoder_neg,
                 "attention_kwargs": {},
                 "return_dict": False,
                 "current_model": current_model,
@@ -1412,22 +1436,20 @@ class Wan22Pipeline(
             preposted_its=preposted_its,
         )
 
-    def prefetch_its(self, state: DiffusionRequestState, batch_size: int = 1) -> None:
-        """Prefetch intermediate tensors for the next step."""
-        t = state.current_timestep
-        boundary_timestep = state.extra.get("boundary_timestep")
-        _, current_guidance_scale = self._select_model_for_timestep(t, boundary_timestep)
-        do_true_cfg = current_guidance_scale > 1.0 and state.negative_prompt_embeds is not None
+    def prefetch_tensors(self, state: DiffusionRequestState, batch_size: int = 1) -> None:
+        """Prefetch next-step tensors: latents on first rank, ITs on others."""
+        do_true_cfg = state.do_true_cfg
         buf_idx = state.step_index % 2
-        is_last_step = state.step_index == state.total_steps - 1
 
-        preposted = self.prefetch_its_maybe_with_cfg(
+        preposted = self.prefetch_tensors_maybe_with_cfg(
             do_true_cfg=do_true_cfg,
             buf_idx=buf_idx,
-            is_last_step=is_last_step,
             batch_size=batch_size,
         )
-        if preposted is not None:
+
+        if isinstance(preposted, AsyncLatents):
+            state.latents = preposted
+        elif preposted is not None:
             state.extra["preposted_its"] = preposted
 
     def step_scheduler(
@@ -1443,14 +1465,9 @@ class Wan22Pipeline(
 
         ``per_request_scheduler`` may be a single scheduler (B=1) or a list of
         per-chunk schedulers (B>1, last rank loops one ``step()`` per row).
-        ``batch_size`` keys the PP recv buffer pool on first rank.
         """
         t = state.batched_timesteps if state.batched_timesteps is not None else state.current_timestep
-        boundary_timestep = state.extra.get("boundary_timestep")
-        t_select = t.max() if t.ndim > 0 else t
-        _, current_guidance_scale = self._select_model_for_timestep(t_select, boundary_timestep)
-        do_true_cfg = current_guidance_scale > 1.0 and state.negative_prompt_embeds is not None
-        buf_idx = state.step_index % 2
+        do_true_cfg = state.do_true_cfg
 
         if per_request_scheduler is None:
             per_request_scheduler = state.scheduler
@@ -1461,9 +1478,9 @@ class Wan22Pipeline(
             state.latents,
             do_true_cfg,
             per_request_scheduler=per_request_scheduler,
-            buf_idx=buf_idx,
             batch_size=batch_size,
         )
+
         state.step_index += 1
 
     def post_decode(
@@ -1475,9 +1492,6 @@ class Wan22Pipeline(
         self._sync_pp_send()
         self._current_timestep = None
 
-        # if current_omni_platform.is_available():
-        #     current_omni_platform.empty_cache()
-
         # I2V: blend final latents with condition
         latent_condition = state.extra.get("latent_condition")
         first_frame_mask = state.extra.get("first_frame_mask")
@@ -1485,15 +1499,13 @@ class Wan22Pipeline(
             state.latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * state.latents
 
         latents = state.latents.to(self.vae.dtype)
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+        
+        latents_mean = self._latents_mean.to(latents.device, latents.dtype)
+        latents_inv_std = self._latents_inv_std.to(
             latents.device, latents.dtype
         )
-        latents = latents / latents_std + latents_mean
+
+        latents = latents / latents_inv_std + latents_mean
         output = self.vae.decode(latents, return_dict=False)[0]
 
         return DiffusionOutput(
@@ -1505,7 +1517,7 @@ class Wan22Pipeline(
         self,
         state: DiffusionRequestState,
         new_idxs: list[int],
-    ) -> list[torch.Tensor]:
+    ) -> torch.Tensor:
         """Streaming V2V initial latents (StreamDiffusionV2-style).
 
         For each newly admitted chunk: VAE-encode the source frames at
@@ -1514,6 +1526,7 @@ class Wan22Pipeline(
         (default 0.8). The transformer then runs the full schedule starting at
         ``step_index=0`` on this partially-noised latent.
         """
+        batch_size = len(new_idxs)
         noise_scale = float((state.sampling.extra_args or {}).get("noise_scale", 0.8))
         chunk_frames = state.sampling.chunk_frames
         prompt = state.prompts[0] if state.prompts else None
@@ -1528,7 +1541,7 @@ class Wan22Pipeline(
         latents_mean = self._latents_mean.to(self.device)
         latents_inv_std = self._latents_inv_std.to(self.device)
 
-        out: list[torch.Tensor] = []
+        controls: list[torch.Tensor] = []
         for idx in new_idxs:
             start = idx * chunk_frames
             end = start + chunk_frames
@@ -1545,13 +1558,29 @@ class Wan22Pipeline(
                 frames = torch.cat([frames, pad], dim=0)
 
             # [n, C, H, W] -> [1, C, n, H, W]
-            control = (
+            controls.append(
                 frames.permute(1, 0, 2, 3)
                 .unsqueeze(0)
                 .to(device=self.device, dtype=self.vae.dtype)
             )
-            clean = retrieve_latents(self.vae.encode(control), sample_mode="argmax")
-            clean = ((clean.float() - latents_mean.to(clean.dtype)) * latents_inv_std.to(clean.dtype)).to(self.vae.dtype)
-            noise = torch.randn_like(clean)
-            out.append(noise * noise_scale + clean * (1.0 - noise_scale))
-        return out
+        control = torch.cat(controls, dim=0)
+
+        latents = self.prepare_latents(
+            batch_size=batch_size,
+            num_channels_latents=self.transformer_config.in_channels,
+            height=state.extra["height"],
+            width=state.extra["width"],
+            num_frames=chunk_frames,
+            dtype=self.vae.dtype,
+            device=self.device,
+            generator=state.sampling.generator,
+            latents=None,
+        )
+
+        latent_condition = retrieve_latents(self.vae.encode(control), sample_mode="argmax")
+        latent_condition = (
+            (latent_condition.float() - latents_mean.to(latent_condition.dtype))
+            * latents_inv_std.to(latent_condition.dtype)
+        ).to(self.vae.dtype)
+
+        return latents * noise_scale + latent_condition * (1.0 - noise_scale)
