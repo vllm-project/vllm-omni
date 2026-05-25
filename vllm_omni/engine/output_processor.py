@@ -128,6 +128,10 @@ class OmniRequestState(RequestState):
     ):
         super().__init__(*args, **kwargs)
         # Omni-specific: multimodal output accumulation
+        # TODO: mm_type is per-request, not per-key. If a model ever produces
+        # both audio and latent outputs, the modality type would flip on each
+        # add_multimodal_tensor() call. Consider tracking per-key modality
+        # types (e.g. dict[str, str]) for future multi-output models.
         self.mm_type: str | None = None
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
 

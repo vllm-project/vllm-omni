@@ -179,6 +179,8 @@ class StageEngineCoreClientBase(StageClientBase):
         # OmniEngineCoreOutputs (which carries multimodal_output per
         # EngineCoreOutput) instead of the base EngineCoreOutputs.
         # Must happen BEFORE super().__init__() which creates the decoder.
+        # TODO: Add a defensive assertion after super().__init__() to verify
+        # the decoder uses OmniEngineCoreOutputs, catching import-order regressions.
         _vllm_engine_module.EngineCoreOutput = OmniEngineCoreOutput
         _vllm_engine_module.EngineCoreOutputs = OmniEngineCoreOutputs
         _vllm_core_client_module.EngineCoreOutputs = OmniEngineCoreOutputs
