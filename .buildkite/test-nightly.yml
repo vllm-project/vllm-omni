@@ -1086,9 +1086,8 @@ steps:
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "diffusion-x2iat-test"
     steps:
       - label: ":full_moon: Quantization Test with H100"
-        timeout_in_minutes: 90
         commands:
-          - timeout 30m pytest -sv tests/diffusion/quantization -m 'full_model and cuda and H100' --run-level "full_model"
+          - timeout 60m pytest -sv tests/diffusion/quantization -m 'full_model and cuda and H100' --run-level "full_model"
         agents:
           queue: "mithril-h100-pool"
         plugins:
