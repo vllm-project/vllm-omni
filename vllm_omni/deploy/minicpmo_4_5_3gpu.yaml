@@ -30,7 +30,9 @@ stages:
       repetition_penalty: 1.1
 
   - stage_id: 1
-    max_num_seqs: 16
+    # Talker only consumes runtime_additional_information[0]; any value > 1
+    # makes concurrent requests share request-0's audio (mm_outputs fallback).
+    max_num_seqs: 1
     gpu_memory_utilization: 0.75
     enforce_eager: true
     max_num_batched_tokens: 8192
