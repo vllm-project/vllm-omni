@@ -246,7 +246,11 @@ def pure_diffusion_app(pure_diffusion_engine, mocker):
     ).for_diffusion.return_value = mocker.MagicMock()
     mocker.patch("vllm_omni.entrypoints.openai.api_server._DiffusionServingModels")
 
-    asyncio.get_event_loop().run_until_complete(omni_init_app_state(pure_diffusion_engine, app.state, args))
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(omni_init_app_state(pure_diffusion_engine, app.state, args))
+    finally:
+        loop.close()
 
     return app
 
