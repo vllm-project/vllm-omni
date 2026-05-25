@@ -131,11 +131,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                         "MiniCPM-o 4.5 token2wav stage requires the `stepaudio2` Python "
                         "module (a MiniCPM-o-flavored Token2wav vocoder, NOT the upstream "
                         "stepfun-ai/Step-Audio2 — the upstream signature does not accept "
-                        "n_timesteps and will fail at __init__). Install via either:\n"
-                        "    pip install minicpmo-utils[all]   # MiniCPM-o umbrella, recommended\n"
-                        "    pip install stepaudio2-minicpmo   # bare token2wav package\n"
-                        "Both ship the same `from stepaudio2 import Token2wav` entry point used "
-                        "by openbmb/MiniCPM-o-4_5/modeling_minicpmo.py."
+                        "n_timesteps and will fail at __init__). Install via:\n"
+                        "    pip install 'vllm-omni[minicpmo]'   # recommended, declared as PR extra\n"
+                        "Equivalent direct installs of the same `from stepaudio2 import Token2wav`\n"
+                        "entry point used by openbmb/MiniCPM-o-4_5/modeling_minicpmo.py:\n"
+                        "    pip install stepaudio2-minicpmo     # bare token2wav package\n"
+                        "    pip install 'minicpmo-utils[all]'   # MiniCPM-o umbrella (also brings image/video deps)"
                     )
                 prev_dtype2 = torch.get_default_dtype()
                 torch.set_default_dtype(torch.float32)
