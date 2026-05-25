@@ -218,14 +218,24 @@ def test_rejects_modules_to_not_convert_name_mapping():
         )
 
 
+def test_accepts_transformer_pipeline_component():
+    quantization_utils.ensure_supported_diffusers_quantization_components({"scheduler", "transformer", "vae"})
+
+
+def test_rejects_pipeline_components_without_transformer():
+    with pytest.raises(NotImplementedError, match="transformer"):
+        quantization_utils.ensure_supported_diffusers_quantization_components({"scheduler", "unet", "vae"})
+
+
 def test_apply_preserves_diffusers_load_kwargs_quantization_config(caplog):
     od_config = SimpleNamespace(quantization_config=_quant_config("fp8"))
     existing = object()
     load_kwargs = {"quantization_config": existing}
 
     with caplog.at_level("WARNING"):
-        quantization_utils.apply_diffusers_quantization_config(od_config, load_kwargs)
+        injected = quantization_utils.apply_diffusers_quantization_config(od_config, load_kwargs)
 
+    assert injected is False
     assert load_kwargs["quantization_config"] is existing
     assert "Using the Diffusers-native quantization_config" in caplog.text
 
@@ -234,8 +244,9 @@ def test_apply_skips_when_no_vllm_quantization_config():
     od_config = SimpleNamespace(quantization_config=None)
     load_kwargs = {}
 
-    quantization_utils.apply_diffusers_quantization_config(od_config, load_kwargs)
+    injected = quantization_utils.apply_diffusers_quantization_config(od_config, load_kwargs)
 
+    assert injected is False
     assert load_kwargs == {}
 
 
@@ -243,7 +254,8 @@ def test_apply_injects_converted_quantization_config():
     od_config = SimpleNamespace(quantization_config=_quant_config("int8"))
     load_kwargs = {}
 
-    quantization_utils.apply_diffusers_quantization_config(od_config, load_kwargs)
+    injected = quantization_utils.apply_diffusers_quantization_config(od_config, load_kwargs)
 
+    assert injected is True
     torchao_config = load_kwargs["quantization_config"].quant_mapping["transformer"]
     assert isinstance(torchao_config.quant_type, _FakeInt8DynamicActivationInt8WeightConfig)

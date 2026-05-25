@@ -92,6 +92,19 @@ def _build_torchao_pipeline_quant_config(torchao_quant_type_name: str) -> Any:
     )
 
 
+def ensure_supported_diffusers_quantization_components(component_names: set[str]) -> None:
+    if _DIFFUSERS_DEFAULT_QUANT_COMPONENT in component_names:
+        return
+
+    available_components = ", ".join(sorted(component_names)) or "<none>"
+    raise NotImplementedError(
+        "Diffusers backend quantization conversion currently only supports "
+        f"pipelines with a '{_DIFFUSERS_DEFAULT_QUANT_COMPONENT}' component. "
+        f"Found pipeline components: {available_components}. Use "
+        "diffusers_load_kwargs for a native Diffusers quantization config."
+    )
+
+
 def _validate_fp8_quant_config(quant_config: Any) -> None:
     if getattr(quant_config, "is_checkpoint_fp8_serialized", False):
         raise NotImplementedError(
@@ -174,17 +187,18 @@ def build_diffusers_quantization_config(quant_config: Any) -> Any:
     return builder(quant_config)
 
 
-def apply_diffusers_quantization_config(od_config: Any, load_kwargs: dict[str, Any]) -> None:
+def apply_diffusers_quantization_config(od_config: Any, load_kwargs: dict[str, Any]) -> bool:
     """Inject a courtesy-converted quantization_config into load kwargs.
 
     ``diffusers_load_kwargs`` is the canonical Diffusers backend configuration
     path, so an explicit ``quantization_config`` already present in
-    ``load_kwargs`` is never replaced.
+    ``load_kwargs`` is never replaced. Returns whether a config was injected by
+    this helper.
     """
 
     quant_config = getattr(od_config, "quantization_config", None)
     if quant_config is None:
-        return
+        return False
 
     if "quantization_config" in load_kwargs:
         logger.warning(
@@ -192,6 +206,7 @@ def apply_diffusers_quantization_config(od_config: Any, load_kwargs: dict[str, A
             "were provided for the diffusers backend. Using the Diffusers-native "
             "quantization_config from diffusers_load_kwargs."
         )
-        return
+        return False
 
     load_kwargs["quantization_config"] = build_diffusers_quantization_config(quant_config)
+    return True

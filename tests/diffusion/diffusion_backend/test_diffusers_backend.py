@@ -65,6 +65,35 @@ def _make_request(**overrides) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(**defaults)
 
 
+def _patch_fake_diffusers_quantization_backends(mocker):
+    class FakePipelineQuantizationConfig:
+        def __init__(self, *, quant_mapping):
+            self.quant_mapping = quant_mapping
+
+    class FakeTorchAoConfig:
+        def __init__(self, quant_type, modules_to_not_convert=None):
+            self.quant_type = quant_type
+            self.modules_to_not_convert = modules_to_not_convert
+
+    class FakeInt8DynamicActivationInt8WeightConfig:
+        pass
+
+    mocker.patch(
+        "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils._get_diffusers_quantization_classes",
+        return_value=(FakePipelineQuantizationConfig, FakeTorchAoConfig),
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils._get_torchao_quant_type_cls",
+        return_value=FakeInt8DynamicActivationInt8WeightConfig,
+    )
+    return FakePipelineQuantizationConfig, FakeTorchAoConfig, FakeInt8DynamicActivationInt8WeightConfig
+
+
+class _TransformerBackedPipeline(DiffusionPipeline):
+    def __init__(self, transformer):
+        pass
+
+
 @pytest.mark.core_model
 @pytest.mark.cpu
 class TestPipelineArgumentsHandling:
@@ -130,17 +159,11 @@ class TestPipelineArgumentsHandling:
             DiffusersAdapterPipeline(od_config=od_config)
 
     def test_adapter_load_weights_injects_supported_quantization_config(self, mocker):
-        class FakePipelineQuantizationConfig:
-            def __init__(self, *, quant_mapping):
-                self.quant_mapping = quant_mapping
-
-        class FakeTorchAoConfig:
-            def __init__(self, quant_type, modules_to_not_convert=None):
-                self.quant_type = quant_type
-                self.modules_to_not_convert = modules_to_not_convert
-
-        class FakeInt8DynamicActivationInt8WeightConfig:
-            pass
+        (
+            FakePipelineQuantizationConfig,
+            FakeTorchAoConfig,
+            FakeInt8DynamicActivationInt8WeightConfig,
+        ) = _patch_fake_diffusers_quantization_backends(mocker)
 
         class MockPipeline:
             def __call__(self, prompt=None):
@@ -149,21 +172,25 @@ class TestPipelineArgumentsHandling:
             def to(self, device):
                 return self
 
-        mocker.patch(
-            "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils._get_diffusers_quantization_classes",
-            return_value=(FakePipelineQuantizationConfig, FakeTorchAoConfig),
-        )
-        mocker.patch(
-            "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils._get_torchao_quant_type_cls",
-            return_value=FakeInt8DynamicActivationInt8WeightConfig,
-        )
         mock_from_pretrained = mocker.patch(
             "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.from_pretrained",
             return_value=MockPipeline(),
         )
+        mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.load_config",
+            return_value={
+                "_class_name": "TransformerBackedPipeline",
+                "scheduler": ["diffusers", "SchedulerMixin"],
+                "transformer": ["diffusers", "Transformer2DModel"],
+                "vae": ["diffusers", "AutoencoderKL"],
+            },
+        )
 
         adapter = DiffusersAdapterPipeline(
-            od_config=_make_od_config(quantization_config=SimpleNamespace(quant_method="int8"))
+            od_config=_make_od_config(
+                quantization_config=SimpleNamespace(quant_method="int8"),
+                diffusers_pipeline_cls=_TransformerBackedPipeline,
+            )
         )
         adapter.load_weights()
 
@@ -172,6 +199,59 @@ class TestPipelineArgumentsHandling:
         assert isinstance(pipeline_quant_config, FakePipelineQuantizationConfig)
         assert isinstance(torchao_config, FakeTorchAoConfig)
         assert isinstance(torchao_config.quant_type, FakeInt8DynamicActivationInt8WeightConfig)
+
+    @pytest.mark.parametrize(
+        ("pipeline_config", "diffusers_load_kwargs", "diffusers_pipeline_cls"),
+        [
+            (
+                {
+                    "_class_name": "NoTransformerPipeline",
+                    "scheduler": ["diffusers", "SchedulerMixin"],
+                    "unet": ["diffusers", "UNet2DConditionModel"],
+                    "vae": ["diffusers", "AutoencoderKL"],
+                },
+                {},
+                _TransformerBackedPipeline,
+            ),
+            (
+                {
+                    "_class_name": "TransformerPipeline",
+                    "scheduler": ["diffusers", "SchedulerMixin"],
+                    "transformer": ["diffusers", "Transformer2DModel"],
+                    "vae": ["diffusers", "AutoencoderKL"],
+                },
+                {"transformer": None},
+                None,
+            ),
+        ],
+    )
+    def test_adapter_load_weights_rejects_converted_quantization_without_transformer_component(
+        self,
+        pipeline_config,
+        diffusers_load_kwargs,
+        diffusers_pipeline_cls,
+        mocker,
+    ):
+        _patch_fake_diffusers_quantization_backends(mocker)
+        mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.load_config",
+            return_value=pipeline_config,
+        )
+        mock_from_pretrained = mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.from_pretrained"
+        )
+
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(
+                quantization_config=SimpleNamespace(quant_method="int8"),
+                diffusers_load_kwargs=diffusers_load_kwargs,
+                diffusers_pipeline_cls=diffusers_pipeline_cls,
+            )
+        )
+
+        with pytest.raises(NotImplementedError, match="transformer"):
+            adapter.load_weights()
+        mock_from_pretrained.assert_not_called()
 
     def test_adapter_load_weights_preserves_diffusers_native_quantization_config(self, mocker):
         class MockPipeline:
