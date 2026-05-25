@@ -4,6 +4,16 @@ NVIDIA Cosmos-Predict2.5 supports text-to-video (T2W), image-to-video (I2W), and
 
 > **Note:** Model requires `--revision diffusers/base/post-trained` to locate weights inside the HF repo.
 
+## Prerequisites
+
+The pipeline runs the Cosmos Guardrail safety checker, which is mandatory under the
+[NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license).
+Install it before running (it downloads additional guardrail models and uses extra VRAM):
+
+```bash
+pip install cosmos_guardrail
+```
+
 ## Run Examples
 
 ```bash
@@ -36,7 +46,6 @@ python cosmos_predict2_5.py \
   --mode video2world \
   --video /path/to/video.mp4 \
   --prompt "The robot continues pouring liquid into the container" \
-  --num-latent-conditional-frames 2 \
   --output output_v2w.mp4
 ```
 
@@ -51,7 +60,8 @@ python cosmos_predict2_5.py \
 | `--negative-prompt` | `""` | Negative prompt |
 | `--image` | — | Input image (required for `image2world`) |
 | `--video` | — | Input video (required for `video2world`) |
-| `--num-latent-conditional-frames` | — | V2W only; must be `1` or `2` |
+| `--num-latent-conditional-frames` | `2` | V2W only; must be `1` or `2` |
+| `--conditional-frame-timestep` | `0.0001` | Timestep value used for the conditional frames during denoising |
 | `--height` / `--width` | `704` / `1280` | Video resolution |
 | `--num-frames` | `93` | Number of output frames |
 | `--num-inference-steps` | `36` | Denoising steps |
