@@ -32,15 +32,16 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     RegisterRemoteReplicaMessage,
 )
+from vllm_omni.engine.output_modality import FinalOutputModalityType
 from vllm_omni.engine.stage_client import StageClient, StagePoolClient
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
     OmniMasterServer,
+    StageReplicaResources,
     connect_remote_diffusion_proc,
     connect_remote_engine_cores,
     launch_diffusion_stage_replica,
     launch_stage_replica,
-    StageReplicaResources,
 )
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
@@ -53,8 +54,8 @@ from vllm_omni.engine.stage_init_utils import (
     compute_replica_layout,
     extract_stage_metadata,
     get_stage_connector_spec,
-    inject_omni_kv_connector_config,
     inject_kv_stage_info,
+    inject_omni_kv_connector_config,
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
@@ -65,12 +66,6 @@ from vllm_omni.entrypoints.utils import inject_omni_kv_config
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Output modality type (duplicated from async_omni_engine to avoid circular import)
-# ---------------------------------------------------------------------------
-from vllm_omni.engine.output_modality import FinalOutputModalityType
 
 
 @dataclass(frozen=True, slots=True)
@@ -589,9 +584,7 @@ class StageRuntime:
                     omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
                     if omni_conn_cfg:
                         inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                    inject_kv_stage_info(
-                        plan.stage_cfg, plan.metadata.stage_id, self._stage_configs
-                    )
+                    inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self._stage_configs)
                     client, resources = launch_diffusion_stage_replica(
                         model=self._model,
                         stage_config=plan.stage_cfg,
@@ -606,7 +599,9 @@ class StageRuntime:
 
             logger.info(
                 "[StageRuntime] Stage %s replica %s initialized (diffusion, batch_size=%d)",
-                plan.metadata.stage_id, plan.replica_id, self._diffusion_batch_size,
+                plan.metadata.stage_id,
+                plan.replica_id,
+                self._diffusion_batch_size,
             )
             return client
         except Exception:
@@ -661,6 +656,7 @@ class StageRuntime:
             )
 
         return stage_pools
+
 
 # ===========================================================================
 # DistStageRuntime
@@ -829,8 +825,7 @@ class DistStageRuntime(StageRuntime):
         """Start OmniMasterServer and OmniCoordinatorRuntime."""
         if not self._omni_master_address or not self._omni_master_port:
             raise ValueError(
-                "AsyncOmniEngine single_stage_mode requires both omni_master_address and "
-                "omni_master_port to be set."
+                "AsyncOmniEngine single_stage_mode requires both omni_master_address and omni_master_port to be set."
             )
 
         from vllm_omni.distributed.omni_coordinator import OmniCoordinatorRuntime
@@ -924,7 +919,11 @@ class DistStageRuntime(StageRuntime):
 
             resources = None
             try:
-                logger.info("[DistStageRuntime] Remote diffusion handshake started stage=%d replica=%d", stage_id, replica_id)
+                logger.info(
+                    "[DistStageRuntime] Remote diffusion handshake started stage=%d replica=%d",
+                    stage_id,
+                    replica_id,
+                )
                 with connect_remote_diffusion_proc(
                     omni_master_server=self._omni_master_server,
                     stage_id=stage_id,
@@ -946,7 +945,11 @@ class DistStageRuntime(StageRuntime):
                 response_address=resources.addresses.outputs[0],
                 batch_size=ctx.diffusion_batch_size,
             )
-            logger.info("[DistStageRuntime] Remote diffusion replica attached stage=%d replica=%d", stage_id, replica_id)
+            logger.info(
+                "[DistStageRuntime] Remote diffusion replica attached stage=%d replica=%d",
+                stage_id,
+                replica_id,
+            )
             return client
 
         assert ctx.vllm_config is not None

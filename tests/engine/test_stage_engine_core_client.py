@@ -30,4 +30,3 @@ def test_check_health_raises_when_resources_engine_dead():
     client = _make_client(engine_dead=True)
     with pytest.raises(EngineDeadError, match="engine core is dead"):
         client.check_health()
-

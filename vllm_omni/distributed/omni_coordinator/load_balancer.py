@@ -6,7 +6,6 @@ from __future__ import annotations
 import random
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from enum import Enum
 from typing import Any, TypedDict
 

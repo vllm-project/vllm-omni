@@ -413,6 +413,7 @@ class StageEngineCoreClientBase(StageClientBase):
             kwargs=kwargs,
         )
 
+
 class StageEngineCoreClient(StageEngineCoreClientBase, AsyncMPClient):
     """Stage async client backed by vLLM's ``AsyncMPClient``."""
 

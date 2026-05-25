@@ -9,13 +9,13 @@ import pytest
 
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.stage_runtime import StageRuntime
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
     ReplicaInitPlan,
     build_stage0_input_processor,
     compute_replica_layout,
 )
+from vllm_omni.engine.stage_runtime import StageRuntime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -326,7 +326,9 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
 
     runtime = StageRuntime(
         stage_configs=[
-            types.SimpleNamespace(stage_id=0, stage_type="llm", engine_args={}, runtime=types.SimpleNamespace(devices="0")),
+            types.SimpleNamespace(
+                stage_id=0, stage_type="llm", engine_args={}, runtime=types.SimpleNamespace(devices="0")
+            ),
             types.SimpleNamespace(
                 stage_id=1, stage_type="llm", engine_args={}, runtime=types.SimpleNamespace(devices="1,2,3")
             ),

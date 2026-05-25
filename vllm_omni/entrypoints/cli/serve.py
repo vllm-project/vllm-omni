@@ -10,7 +10,6 @@ import json
 import os
 import signal
 from types import FrameType
-from typing import Any
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand

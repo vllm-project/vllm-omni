@@ -643,9 +643,7 @@ def register_stage_with_omni_master(
             # Advertise this host for KV connector routing. Serving/control
             # sockets stay head-owned; remote workers only connect to them.
             if replica_bind_address is None:
-                replica_bind_address = _detect_local_bind_address(
-                    omni_master_address, omni_master_port
-                )
+                replica_bind_address = _detect_local_bind_address(omni_master_address, omni_master_port)
             payload["replica_bind_address"] = replica_bind_address
 
             reg_sock.send(msgspec.msgpack.encode(payload))
@@ -923,6 +921,7 @@ def launch_stage_replica(
         return
 
     from vllm.utils.network_utils import get_open_zmq_ipc_path
+
     from vllm_omni.engine.omni_core_engine_proc_manager import OmniCoreEngineProcManager
 
     addresses = get_engine_zmq_addresses(vllm_config)
@@ -1061,6 +1060,7 @@ def launch_headless_llm_replicas(
     )
 
     try:
+
         def _launch_one(rep_idx: int) -> Any:
             return launch_headless_llm_replica(
                 vllm_config=vllm_config,
@@ -1333,8 +1333,8 @@ def launch_diffusion_stage_replica(
         )
         return client, StageReplicaResources()
 
-    from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
     from vllm_omni.diffusion import stage_diffusion_proc
+    from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
     od_config = build_diffusion_config(model, stage_config, metadata)
     parallel_config = getattr(od_config, "parallel_config", None)

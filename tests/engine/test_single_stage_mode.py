@@ -13,7 +13,6 @@ from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.stage_runtime import DistStageRuntime, StageRuntime
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
     OmniMasterServer,
@@ -21,11 +20,12 @@ from vllm_omni.engine.stage_engine_startup import (
     StageCoordinatorAddresses,
     StageRegistrationResponse,
     StageReplicaResources,
+    _launch_omni_core_engines,
     connect_remote_diffusion_proc,
     connect_remote_engine_cores,
-    _launch_omni_core_engines,
 )
 from vllm_omni.engine.stage_init_utils import LogicalStageInitPlan, ReplicaInitPlan
+from vllm_omni.engine.stage_runtime import DistStageRuntime, StageRuntime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -462,9 +462,7 @@ class TestSingleStageModeDetection:
 
 
 class TestSingleStageInitialization:
-    def _build_runtime(
-        self, stage_cfgs: list[Any], *, stage_id_filter: int | None
-    ) -> DistStageRuntime:
+    def _build_runtime(self, stage_cfgs: list[Any], *, stage_id_filter: int | None) -> DistStageRuntime:
         return DistStageRuntime(
             stage_configs=stage_cfgs,
             model="fake-model",
@@ -894,7 +892,9 @@ class TestSingleStageReplicaInitialization:
             side_effect=lambda **_: sentinel_client,
         )
         try:
-            result = runtime._initialize_local_llm_replica(plan, stage_init_timeout=60, llm_stage_launch_lock=threading.Lock())
+            result = runtime._initialize_local_llm_replica(
+                plan, stage_init_timeout=60, llm_stage_launch_lock=threading.Lock()
+            )
         finally:
             if prev_device_env is None:
                 os.environ.pop(device_env_var, None)
@@ -923,6 +923,7 @@ class TestSingleStageReplicaInitialization:
         )
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 11, "stage_type": "diffusion"}
+
         def _fake_connect(**kwargs):
             @contextmanager
             def _ctx():
@@ -1074,7 +1075,6 @@ class TestSingleStageReplicaInitialization:
         runtime._coordinator_runtime = None
 
         plan = _make_diffusion_plan(0, configured_stage_id=5, launch_mode="local").replicas[0]
-        proc = mocker.Mock()
 
         device_env_var = current_omni_platform.device_control_env_var
         prev_device_env = os.environ.get(device_env_var)
@@ -1100,7 +1100,9 @@ class TestSingleStageReplicaInitialization:
 
         try:
             with pytest.raises(RuntimeError, match="handshake failed"):
-                runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=60, stage_launch_lock=threading.Lock())
+                runtime._initialize_local_diffusion_replica(
+                    plan, stage_init_timeout=60, stage_launch_lock=threading.Lock()
+                )
         finally:
             if prev_device_env is None:
                 os.environ.pop(device_env_var, None)

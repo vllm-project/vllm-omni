@@ -22,7 +22,7 @@ from vllm_omni.distributed.omni_coordinator import (
 )
 from vllm_omni.distributed.omni_coordinator.messages import ReplicaStatus
 from vllm_omni.distributed.omni_coordinator.omni_coord_client_for_hub import OmniCoordClientForHub
-from vllm_omni.engine.messages import ErrorMessage, EngineQueueMessage
+from vllm_omni.engine.messages import EngineQueueMessage, ErrorMessage
 from vllm_omni.engine.stage_pool import StagePool
 
 logger = init_logger(__name__)
@@ -62,9 +62,7 @@ class MembershipController:
 
     def start(self) -> asyncio.Task[None]:
         """Start the replica watcher as a background task. Returns the task."""
-        self._watcher_task = asyncio.create_task(
-            self._watch_replica_list(), name="membership-watcher"
-        )
+        self._watcher_task = asyncio.create_task(self._watch_replica_list(), name="membership-watcher")
         return self._watcher_task
 
     async def handle_register(self, stage_id: int, replica_id: int) -> None:
@@ -86,9 +84,7 @@ class MembershipController:
         if pool is None:
             return
         effective_output_queue = output_queue if output_queue is not None else self._output_queue
-        effective_cleanup_callback = (
-            cleanup_callback if cleanup_callback is not None else self._cleanup_callback
-        )
+        effective_cleanup_callback = cleanup_callback if cleanup_callback is not None else self._cleanup_callback
         affected = pool.invalidate_addr(input_addr)
         self._detach_replica(stage_id, input_addr)
         if affected and effective_cleanup_callback is not None:
@@ -135,11 +131,7 @@ class MembershipController:
         while not self._shutdown_event.is_set():
             try:
                 snap = self._hub.get_replica_list()
-                current = {
-                    (rep.stage_id, rep.input_addr)
-                    for rep in snap.replicas
-                    if rep.status == ReplicaStatus.UP
-                }
+                current = {(rep.stage_id, rep.input_addr) for rep in snap.replicas if rep.status == ReplicaStatus.UP}
                 for stage_id, addr in last_up - current:
                     self._spawn_task(
                         self.handle_unregister(stage_id, addr),
@@ -164,13 +156,13 @@ class MembershipController:
         client = await self._remote_replica_factory(stage_id, replica_id)
         input_addr = StagePool._client_input_addr(client)
         if input_addr is None:
-            raise RuntimeError(
-                f"remote replica factory for stage {stage_id} produced a client without input address"
-            )
+            raise RuntimeError(f"remote replica factory for stage {stage_id} produced a client without input address")
         pool.add_client(input_addr, client)
         logger.info(
             "[MembershipController] attached remote replica stage=%d replica=%d addr=%s",
-            stage_id, replica_id, input_addr,
+            stage_id,
+            replica_id,
+            input_addr,
         )
 
     def _detach_replica(self, stage_id: int, input_addr: str) -> None:
@@ -183,9 +175,7 @@ class MembershipController:
         try:
             client.shutdown()
         except Exception:
-            logger.exception(
-                "[MembershipController] failed to shutdown client stage=%d addr=%s", stage_id, input_addr
-            )
+            logger.exception("[MembershipController] failed to shutdown client stage=%d addr=%s", stage_id, input_addr)
         logger.info("[MembershipController] detached replica stage=%d addr=%s", stage_id, input_addr)
 
     def install_unregister_handlers(

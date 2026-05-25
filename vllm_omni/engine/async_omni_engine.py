@@ -50,12 +50,12 @@ from vllm_omni.engine.serialization import (
     serialize_additional_information,
 )
 from vllm_omni.engine.stage_client import StageClient
+from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import (
     StageRuntimeInfo,
     create_stage_runtime,
 )
-from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
 from vllm_omni.inputs.data import OmniSamplingParams
@@ -344,9 +344,7 @@ class AsyncOmniEngine:
         self.num_stages = len(self.stage_configs)
         self.stage_pools = self._runtime.stage_pools
         self.stage_clients = [
-            cast(StageClient, pool.stage_client)
-            for pool in self.stage_pools
-            if pool.stage_client is not None
+            cast(StageClient, pool.stage_client) for pool in self.stage_pools if pool.stage_client is not None
         ]
         self.stage_vllm_configs = [pool.stage_vllm_config for pool in self.stage_pools]
         self.output_processors = [pool.output_processor for pool in self.stage_pools]
