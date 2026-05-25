@@ -1,4 +1,6 @@
-# Ming-flash-omni 2.0 for omni-speech chat and standalone TTS
+# Ming-flash-omni 2.0
+
+> Online serving for multimodal chat + standalone TTS
 
 ## Summary
 
@@ -22,9 +24,12 @@ Use this recipe when you want a known-good starting point for serving
 
 - Upstream model:
   [`inclusionAI/Ming`](https://github.com/inclusionAI/Ming)
-- For offline inference and additional client variants, see
-  `examples/offline_inference/ming_flash_omni{,_tts}/` and
-  `examples/online_serving/ming_flash_omni{,_tts}/`.
+- For offline inference and additional client variants, see the
+  multimodal example dirs `examples/offline_inference/ming_flash_omni/` and
+  `examples/online_serving/ming_flash_omni/`. The standalone TTS variant
+  lives under the consolidated text-to-speech hub at
+  `examples/offline_inference/text_to_speech/ming_flash_omni_tts/` and
+  `examples/online_serving/text_to_speech/ming_flash_omni_tts/`.
 
 
 ## Hardware Support

@@ -31,9 +31,11 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.multimodal.audio import AudioResampler
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .minicpm4_paged import MiniCPM4PagedForVoxCPM2, MiniCPM4PagedResidualLM
 from .voxcpm2_import_utils import import_voxcpm2_core
@@ -228,7 +230,7 @@ class _PerfTimer:
     def _resolve(self) -> None:
         if not self._pairs:
             return
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         for name, s, e in self._pairs:
             self._timers[name] = self._timers.get(name, 0.0) + s.elapsed_time(e)
             self._counts[name] = self._counts.get(name, 0) + 1
@@ -432,7 +434,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._tts.base_lm = None
         del self._tts.residual_lm
         self._tts.residual_lm = None
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
         self._inference_timesteps = 10
         self._cfg_value = 2.0
@@ -446,13 +448,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._max_decode_steps = 2000
         self._max_batch_size = getattr(vllm_config.scheduler_config, "max_num_seqs", 4)
 
+        # Speaker cache for ref_audio_feat across requests
+        self._speaker_cache = get_speaker_cache()
+
         self._perf = _PerfTimer(enabled=_ENABLE_PROFILING)
         self._cfm_buffers: _CFMBufferManager | None = None
         self._enable_cuda_graph = True
         self._scaffold_graphs: dict[int, _CapturedGraph] = {}
         self._residual_graphs: dict[int, _CapturedGraph] = {}
         self._max_cached_graphs = self._max_batch_size
-        self._cuda_graph_pool: tuple | None = None
         self._cuda_graph_warmup_steps = 0
         self._cuda_graph_warmup_threshold = 3
 
@@ -657,11 +661,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         tts = self.tts
         return tts.stop_head(tts.stop_actn(tts.stop_proj(lm_h)))
 
-    def _get_cuda_graph_pool(self) -> tuple:
-        if self._cuda_graph_pool is None:
-            self._cuda_graph_pool = torch.cuda.graph_pool_handle()
-        return self._cuda_graph_pool
-
     @staticmethod
     def _nullify_volatile_metadata(ctx: Any) -> Any:
         """Set ``scheduler_metadata`` to None on all attention layers.
@@ -694,7 +693,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         hidden_size = self.config.hidden_size
         dtype = self._side_dtype
         dev = torch.device(self._device)
-        pool = self._get_cuda_graph_pool()
 
         model.precompute_fused_qkv()
 
@@ -717,7 +715,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             for _ in range(3):
                 _ = model(**call_kwargs)
 
-            with torch.cuda.graph(g.graph, pool=pool):
+            with torch.cuda.graph(g.graph, pool=current_platform.get_global_graph_pool()):
                 g.output = model(**call_kwargs)
 
         logger.info("CUDA Graph captured for %s (batch_size=%d)", label, batch_size)
@@ -1165,15 +1163,48 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 prompt_text = prompt_text[0] if prompt_text else None
 
             state.prompt_cache = None
+            voice_name = info_dict.get("voice_name")
+            if isinstance(voice_name, list):
+                voice_name = voice_name[0] if voice_name else None
+            _created_at = int(info_dict.get("voice_created_at") or 0)
+
             if ref_audio or (prompt_audio and prompt_text):
-                try:
-                    state.prompt_cache = self._build_prompt_cache(
-                        ref_audio=ref_audio,
-                        prompt_audio=prompt_audio,
-                        prompt_text=prompt_text,
+                # Check speaker cache for reference-only mode
+                if voice_name and ref_audio and not prompt_audio:
+                    _cache_key = self._speaker_cache.make_cache_key(
+                        voice_name, model_type="voxcpm2", created_at=_created_at
                     )
-                except Exception as e:
-                    logger.warning("build_prompt_cache failed: %s", e)
+                    cached = self._speaker_cache.get(_cache_key)
+                    if cached is not None:
+                        state.prompt_cache = {
+                            "mode": "reference",
+                            "ref_audio_feat": cached["ref_audio_feat"].clone(),
+                        }
+                        logger.debug("Speaker cache HIT for VoxCPM2 speaker '%s'", voice_name)
+
+                if state.prompt_cache is None:
+                    try:
+                        state.prompt_cache = self._build_prompt_cache(
+                            ref_audio=ref_audio,
+                            prompt_audio=prompt_audio,
+                            prompt_text=prompt_text,
+                        )
+                        if (
+                            voice_name
+                            and state.prompt_cache is not None
+                            and state.prompt_cache.get("mode") == "reference"
+                            and "ref_audio_feat" in state.prompt_cache
+                        ):
+                            _key = self._speaker_cache.make_cache_key(
+                                voice_name, model_type="voxcpm2", created_at=_created_at
+                            )
+                            self._speaker_cache.put(
+                                _key, {"ref_audio_feat": state.prompt_cache["ref_audio_feat"].cpu()}
+                            )
+                            logger.debug("Speaker cache STORE for VoxCPM2 speaker '%s'", voice_name)
+                    except Exception as e:
+                        logger.warning("build_prompt_cache failed: %s; falling back to zero-shot", e)
+                        state.prompt_cache = None
 
             inputs = self._build_prefill_inputs(token_ids, dev, req_id)
             tts = self.tts

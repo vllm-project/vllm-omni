@@ -1,5 +1,6 @@
 # tests/entrypoints/openai/test_serving_speech.py
 import asyncio
+import json
 import logging
 import os
 import struct
@@ -300,6 +301,24 @@ def client(test_app):
 
 
 class TestSpeechAPI:
+    @pytest.fixture(autouse=True)
+    def _mock_upload_io(self, mocker: MockerFixture):
+        """Mock soundfile/safetensors so upload accepts fake audio bytes."""
+        samples = np.zeros(88200, dtype=np.float32)  # 2s @ 44.1 kHz
+        mocker.patch("soundfile.read", return_value=(samples, 44100))
+
+        def _fake_save_file(tensors, path, metadata=None):
+            Path(path).touch()
+
+        mocker.patch("safetensors.torch.save_file", side_effect=_fake_save_file)
+        mock_ctx = mocker.MagicMock()
+        mock_ctx.keys.return_value = ["audio"]
+        mock_ctx.get_tensor.return_value = torch.zeros(88200)
+        mock_ctx.metadata.return_value = {"sample_rate": "44100"}
+        mock_safe_open = mocker.MagicMock()
+        mock_safe_open.return_value.__enter__.return_value = mock_ctx
+        mocker.patch("safetensors.safe_open", mock_safe_open)
+
     def test_create_speech_success(self, client):
         payload = {
             "input": "Hello world",
@@ -470,27 +489,17 @@ class TestSpeechAPI:
         assert "MIME type" in result["detail"]
 
     def test_upload_voice_name_collision(self, client):
-        """Test voice upload with duplicate name."""
-        # First upload
+        """Re-uploading the same name overwrites the previous entry (no 400)."""
         audio_content = b"fake audio content"
-        files = {
-            "audio_sample": ("test.wav", audio_content, "audio/wav"),
-        }
-        data = {
-            "consent": "user_consent_123",
-            "name": "test_voice",
-        }
+        files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
+        data = {"consent": "user_consent_123", "name": "test_voice"}
 
         response = client.post("/v1/audio/voices", files=files, data=data)
         assert response.status_code == 200
 
-        # Second upload with same name
         response = client.post("/v1/audio/voices", files=files, data=data)
-        assert response.status_code == 400
-        result = response.json()
-        assert "detail" in result
-        assert "already exists" in result["detail"]
-        response = client.delete("/v1/audio/voices/test_voice")
+        assert response.status_code == 200
+        client.delete("/v1/audio/voices/test_voice")
 
     def test_upload_voice_missing_parameters(self, client):
         """Test voice upload with missing required parameters."""
@@ -556,7 +565,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_success(self, client):
         """Upload a voice via speaker_embedding JSON."""
-        import json
 
         emb = [0.1] * 1024
         data = {
@@ -577,7 +585,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_appears_in_listing(self, client):
         """Embedding-uploaded voice appears in list with correct source."""
-        import json
 
         emb = [0.2] * 2048
         data = {
@@ -598,7 +605,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_and_audio_mutually_exclusive(self, client):
         """Providing both audio_sample and speaker_embedding returns 400."""
-        import json
 
         emb = [0.1] * 1024
         files = {"audio_sample": ("test.wav", b"fake", "audio/wav")}
@@ -624,7 +630,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_nan_rejected(self, client):
         """NaN values in speaker_embedding return 400."""
-        import json
 
         data = {
             "speaker_embedding": json.dumps([0.1] * 1023 + [float("nan")]),
@@ -634,6 +639,45 @@ class TestSpeechAPI:
         response = client.post("/v1/audio/voices", data=data)
         assert response.status_code == 400
         assert "finite" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_create_diffusion_speech_extra_params(self, mocker: MockerFixture):
+        """Test that extra_params are correctly applied to sampling_params_list in diffusion mode."""
+        # Mock the engine client
+        mock_engine = mocker.MagicMock()
+
+        # Mock default sampling params
+        mock_sampling_param = mocker.MagicMock()
+        mock_sampling_param.extra_args = {"existing_arg": "value"}
+        mock_engine.default_sampling_params_list = [mock_sampling_param]
+
+        # Mock generate to yield a valid OmniRequestOutput
+        async def mock_generate(*args, **kwargs):
+            yield create_mock_audio_output_for_test()
+
+        mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
+
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+
+        # Mock create_audio to avoid actual audio processing/saving
+        mocker.patch.object(
+            server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy", media_type="audio/wav")
+        )
+
+        req = OpenAICreateSpeechRequest(input="Hello", extra_params={"new_arg": 123, "existing_arg": "new_value"})
+
+        await server._create_diffusion_speech(req)
+
+        # Verify generate was called
+        mock_engine.generate.assert_called_once()
+
+        # Get the sampling_params_list passed to generate
+        kwargs = mock_engine.generate.call_args.kwargs
+        passed_params = kwargs["sampling_params_list"]
+
+        # Verify it was deepcopied and updated
+        assert passed_params is not mock_engine.default_sampling_params_list
+        assert passed_params[0].extra_args == {"existing_arg": "new_value", "new_arg": 123}
 
 
 class TestTTSMethods:
@@ -883,7 +927,6 @@ class TestTTSMethods:
 
     def test_upload_voice_embedding_wrong_dims_rejected(self, speech_server):
         """Embedding uploads must match the loaded Qwen3-TTS model before being stored."""
-        import json
 
         speech_server._tts_model_type = "qwen3_tts"
         speech_server.engine_client.model_config = SimpleNamespace(
@@ -970,7 +1013,7 @@ class TestTTSMethods:
                 "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
                 "mime_type": "audio/wav",
                 "ref_text": None,
-                "created_at": 1711234567.89,
+                "created_at": 1711234567,
             }
         }
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
@@ -983,7 +1026,7 @@ class TestTTSMethods:
         assert params["ref_audio"] == ["data:audio/wav;base64,ZmFrZWF1ZGlv"]
         assert params["x_vector_only_mode"] == [True]
         assert params["task_type"] == ["Base"]
-        assert params["voice_created_at"] == [1711234567.89]
+        assert params["voice_created_at"] == [1711234567]
         assert "ref_text" not in params
 
     def test_build_tts_params_with_uploaded_voice_ref_text(self, speech_server, mocker: MockerFixture):
@@ -994,7 +1037,7 @@ class TestTTSMethods:
                 "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
                 "mime_type": "audio/wav",
                 "ref_text": "Hello world transcript",
-                "created_at": 1711234567.89,
+                "created_at": 1711234567,
             }
         }
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
@@ -1008,7 +1051,7 @@ class TestTTSMethods:
         assert params["x_vector_only_mode"] == [False]
         assert params["task_type"] == ["Base"]
         assert params["ref_text"] == ["Hello world transcript"]
-        assert params["voice_created_at"] == [1711234567.89]
+        assert params["voice_created_at"] == [1711234567]
 
     def test_build_tts_params_without_uploaded_voice(self, speech_server):
         """Test _build_tts_params does not auto-set ref_audio for non-uploaded voices."""
@@ -1051,28 +1094,29 @@ class TestTTSMethods:
         assert "x_vector_only_mode" not in params
 
     def test_get_uploaded_audio_data(self, speech_server, mocker: MockerFixture):
-        """Test _get_uploaded_audio_data function."""
-        # Mock file operations
-        mock_open = mocker.patch("builtins.open", create=True)
-        mock_b64encode = mocker.patch("base64.b64encode")
-        mock_exists = mocker.patch("pathlib.Path.exists")
-        mock_exists.return_value = True
-        mock_b64encode.return_value = b"ZmFrZWF1ZGlv"
+        """Returns a data URL by loading audio via safetensors + re-encoding WAV."""
+        mocker.patch("pathlib.Path.exists", return_value=True)
+        mocker.patch("soundfile.write")
+        mocker.patch("base64.b64encode", return_value=b"ZmFrZWF1ZGlv")
+        mock_ctx = mocker.MagicMock()
+        mock_ctx.keys.return_value = ["audio"]
+        mock_ctx.get_tensor.return_value = torch.zeros(88200)
+        mock_ctx.metadata.return_value = {"sample_rate": "44100"}
+        mock_safe_open = mocker.MagicMock()
+        mock_safe_open.return_value.__enter__.return_value = mock_ctx
+        mocker.patch("safetensors.safe_open", mock_safe_open)
 
-        # Setup mock file
-        mock_file = mocker.MagicMock()
-        mock_file.read.return_value = b"fakeaudio"
-        mock_open.return_value.__enter__.return_value = mock_file
-
-        # Setup uploaded speaker
         speech_server.uploaded_speakers = {
-            "test_voice": {"name": "test_voice", "file_path": "/tmp/test.wav", "mime_type": "audio/wav"}
+            "test_voice": {
+                "name": "test_voice",
+                "file_path": "/tmp/test.safetensors",
+                "mime_type": "audio/wav",
+                "embedding_source": "audio",
+                "sample_rate": 44100,
+            }
         }
         result = speech_server._get_uploaded_audio_data("test_voice")
-
         assert result == "data:audio/wav;base64,ZmFrZWF1ZGlv"
-        mock_open.assert_called_once_with(Path("/tmp/test.wav"), "rb")
-        mock_b64encode.assert_called_once_with(b"fakeaudio")
 
     def test_get_uploaded_audio_data_missing_file(self, speech_server, mocker: MockerFixture):
         """Test _get_uploaded_audio_data when file is missing."""
@@ -1229,24 +1273,6 @@ class TestTTSMethods:
         assert params["voice_clone_prompt"][0]["ref_spk_embedding"] == fake_emb
         # Must NOT have ref_audio — that would fail for safetensors files
         assert "ref_audio" not in params
-
-    def test_validate_rejects_embedding_voice_with_pending_cache(self, speech_server, mocker: MockerFixture):
-        """Validation should reject embedding voices whose cache is not yet ready."""
-        speech_server.uploaded_speakers = {
-            "myvoice": {
-                "name": "myvoice",
-                "file_path": "/tmp/myvoice.safetensors",
-                "mime_type": "application/x-safetensors",
-                "embedding_source": "direct",
-                "cache_status": "pending",
-                "cache_file": None,
-            }
-        }
-        req = OpenAICreateSpeechRequest.model_validate({"input": "Hello", "speaker": "myvoice", "task_type": "Base"})
-        mocker.patch("pathlib.Path.exists", return_value=True)
-        err = speech_server._validate_qwen_tts_request(req)
-        assert err is not None
-        assert "not yet ready" in err
 
     def test_x_vector_only_mode_not_overwritten_for_uploaded_embedding(self, speech_server, mocker: MockerFixture):
         """x_vector_only_mode set by uploaded embedding must not be overwritten by request field."""
@@ -2294,6 +2320,7 @@ class TestCosyVoice3Serving:
                 "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
             }
         )
+        cosyvoice3_server._apply_cosyvoice3_dynamic_tokens = mocker.MagicMock(side_effect=lambda spl, req: spl)
 
         request = OpenAICreateSpeechRequest(
             input="Hello",
@@ -2306,6 +2333,84 @@ class TestCosyVoice3Serving:
         assert generator == "generator"
         assert tts_params == {}
         cosyvoice3_server._build_cosyvoice3_prompt.assert_awaited_once()
+
+
+# ---- GLM-TTS Serving Tests ----
+
+
+@pytest.fixture
+def glm_tts_server(mocker: MockerFixture):
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    mock_engine_client.model_config = mocker.MagicMock(
+        model="zai-org/GLM-TTS",
+        hf_config=SimpleNamespace(min_token_text_ratio=2, max_token_text_ratio=20),
+    )
+    mock_engine_client.default_sampling_params_list = [
+        SimpleNamespace(max_tokens=2048, min_tokens=None, extra_args=None)
+    ]
+    mock_engine_client.tts_batch_max_items = 32
+    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(
+            engine_args=SimpleNamespace(model_stage="glm_tts"),
+            tts_args={},
+        )
+    ]
+
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    return OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+
+
+class TestGLMTTSServing:
+    def test_validate_glm_tts_requires_ref_audio(self, glm_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
+        error = glm_tts_server._validate_glm_tts_request(request)
+        assert error is not None
+        assert "ref_audio" in error
+
+    def test_validate_glm_tts_requires_ref_text(self, glm_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        error = glm_tts_server._validate_glm_tts_request(request)
+        assert error is not None
+        assert "ref_text" in error
+
+    def test_estimate_glm_tts_target_text_len_uses_tokenizer_tokens(
+        self,
+        glm_tts_server,
+        mocker: MockerFixture,
+    ):
+        class FakeTokenizer:
+            def encode(self, text):
+                assert text == "normalized target"
+                return [10, 20, 30]
+
+        mocker.patch(
+            "vllm_omni.model_executor.models.glm_tts.glm_tts.resolve_glm_tts_tokenizer_path",
+            return_value="resolved-tokenizer",
+        )
+        load_tokenizer = mocker.patch(
+            "vllm_omni.model_executor.models.glm_tts.glm_tts.load_glm_tts_tokenizer",
+            return_value=FakeTokenizer(),
+        )
+        mocker.patch(
+            "vllm_omni.model_executor.models.glm_tts.text_frontend.GLMTTSTextFrontend.text_normalize",
+            return_value="normalized target",
+        )
+
+        text_token_len = glm_tts_server._estimate_glm_tts_text_token_len("abcdef")
+
+        assert text_token_len == 3
+        load_tokenizer.assert_called_once()
 
 
 class TestTTSAsyncOffloading:

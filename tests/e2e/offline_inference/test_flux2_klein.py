@@ -4,30 +4,25 @@
 """
 End-to-end test for Flux2 Klein inpainting.
 
+Inpainting uses ``omni_runner_handler.send_diffusion_request`` with
+``multi_modal_data`` containing ``image`` and ``mask_image``; see
+:meth:`OmniRunnerHandler.send_diffusion_request` in ``tests.helpers.runtime``.
 """
-
-# ruff: noqa: E402
-
-import os
-import sys
-from pathlib import Path
 
 import pytest
 import torch
 from PIL import Image, ImageDraw
 
-from vllm_omni.entrypoints.omni import Omni
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import DiffusionResponse, OmniRunnerHandler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
-
 MODEL = "black-forest-labs/FLUX.2-klein-4B"
+
+_OMNI_RUNNER_PARAM = (MODEL, None)
+
+pytestmark = [pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)]
 
 _HEIGHT = 512
 _WIDTH = 512
@@ -49,50 +44,56 @@ def _create_test_inputs(color: tuple = (100, 150, 200)):
     return _create_test_image(_WIDTH, _HEIGHT, color), _create_test_mask(_WIDTH, _HEIGHT)
 
 
-def _extract_images_from_output(outputs: list) -> list[Image.Image]:
-    images = []
-    for req_output in outputs:
-        if hasattr(req_output, "images") and req_output.images:
-            images.extend(req_output.images)
-        elif hasattr(req_output, "request_output") and req_output.request_output:
-            stage_out = req_output.request_output
-            if isinstance(stage_out, OmniRequestOutput) and hasattr(stage_out, "images"):
-                images.extend(stage_out.images)
-            elif isinstance(stage_out, list):
-                for s in stage_out:
-                    if hasattr(s, "images") and s.images:
-                        images.extend(s.images)
-    return images
+def _images_from_response(response: DiffusionResponse) -> list[Image.Image]:
+    if isinstance(response.images[0], list):
+        return [f for fr in response.images for f in fr]
+    return list(response.images)
+
+
+def _send_inpaint_with_generator(
+    omni_runner_handler: OmniRunnerHandler, prompt: str, input_image, mask_image, generator: torch.Generator
+) -> DiffusionResponse:
+    return omni_runner_handler.send_diffusion_request(
+        {
+            "model": MODEL,
+            "prompt": prompt,
+            "multi_modal_data": {"image": input_image, "mask_image": mask_image},
+            "sampling_params": OmniDiffusionSamplingParams(
+                height=_HEIGHT,
+                width=_WIDTH,
+                num_inference_steps=_NUM_INFERENCE_STEPS,
+                guidance_scale=0.0,
+                generator=generator,
+                num_outputs_per_prompt=1,
+            ),
+        }
+    )
 
 
 # Regression test for https://github.com/vllm-project/vllm-omni/issues/3097
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
-def test_flux2_klein_can_accept_text_inputs():
-    model = Omni(model=MODEL)
-    outputs = model.generate(
-        "a cup of coffee on the table",
-        OmniDiffusionSamplingParams(num_inference_steps=2, seed=42),
+def test_flux2_klein_can_accept_text_inputs(omni_runner_handler: OmniRunnerHandler):
+    omni_runner_handler.send_diffusion_request(
+        {
+            "model": MODEL,
+            "prompt": "a cup of coffee on the table",
+            "sampling_params": OmniDiffusionSamplingParams(num_inference_steps=2, seed=42),
+        }
     )
-    assert len(outputs[0].images) == 1
 
 
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
-def test_flux2_klein_inpaint_basic():
-    m = None
-    try:
-        m = Omni(model=MODEL)
-        input_image, mask_image = _create_test_inputs()
-
-        outputs = m.generate(
-            prompts=[
-                {
-                    "prompt": "Fill in the masked area with a beautiful garden",
-                    "multi_modal_data": {"image": input_image, "mask_image": mask_image},
-                }
-            ],
-            sampling_params_list=OmniDiffusionSamplingParams(
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_flux2_klein_inpaint_basic(omni_runner_handler: OmniRunnerHandler):
+    input_image, mask_image = _create_test_inputs()
+    omni_runner_handler.send_diffusion_request(
+        {
+            "model": MODEL,
+            "prompt": "Fill in the masked area with a beautiful garden",
+            "multi_modal_data": {"image": input_image, "mask_image": mask_image},
+            "sampling_params": OmniDiffusionSamplingParams(
                 height=_HEIGHT,
                 width=_WIDTH,
                 num_inference_steps=_NUM_INFERENCE_STEPS,
@@ -100,128 +101,45 @@ def test_flux2_klein_inpaint_basic():
                 generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
                 num_outputs_per_prompt=1,
             ),
-        )
-
-        images = _extract_images_from_output(list(outputs))
-        assert len(images) == 1
-        assert images[0].size == (_WIDTH, _HEIGHT)
-    finally:
-        if m is not None and hasattr(m, "close"):
-            m.close()
+        }
+    )
 
 
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
-def test_flux2_klein_inpaint_deterministic():
-    m = None
-    try:
-        m = Omni(model=MODEL)
-        input_image, mask_image = _create_test_inputs()
-        seed = 12345
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_flux2_klein_inpaint_deterministic(omni_runner_handler: OmniRunnerHandler):
+    input_image, mask_image = _create_test_inputs()
+    seed = 12345
 
-        gen1 = torch.Generator(current_omni_platform.device_type).manual_seed(seed)
-        gen2 = torch.Generator(current_omni_platform.device_type).manual_seed(seed)
+    gen1 = torch.Generator(current_omni_platform.device_type).manual_seed(seed)
+    gen2 = torch.Generator(current_omni_platform.device_type).manual_seed(seed)
 
-        outputs1 = m.generate(
-            prompts=[
-                {
-                    "prompt": "A red flower in a field",
-                    "multi_modal_data": {"image": input_image, "mask_image": mask_image},
-                }
-            ],
-            sampling_params_list=OmniDiffusionSamplingParams(
-                height=_HEIGHT,
-                width=_WIDTH,
-                num_inference_steps=_NUM_INFERENCE_STEPS,
-                guidance_scale=0.0,
-                generator=gen1,
-                num_outputs_per_prompt=1,
-            ),
-        )
+    r1 = _send_inpaint_with_generator(omni_runner_handler, "A red flower in a field", input_image, mask_image, gen1)
+    r2 = _send_inpaint_with_generator(omni_runner_handler, "A red flower in a field", input_image, mask_image, gen2)
 
-        outputs2 = m.generate(
-            prompts=[
-                {
-                    "prompt": "A red flower in a field",
-                    "multi_modal_data": {"image": input_image, "mask_image": mask_image},
-                }
-            ],
-            sampling_params_list=OmniDiffusionSamplingParams(
-                height=_HEIGHT,
-                width=_WIDTH,
-                num_inference_steps=_NUM_INFERENCE_STEPS,
-                guidance_scale=0.0,
-                generator=gen2,
-                num_outputs_per_prompt=1,
-            ),
-        )
+    images1 = _images_from_response(r1)
+    images2 = _images_from_response(r2)
 
-        images1 = _extract_images_from_output(list(outputs1))
-        images2 = _extract_images_from_output(list(outputs2))
-
-        assert len(images1) == 1
-        assert len(images2) == 1
-
-        assert list(images1[0].getdata()) == list(images2[0].getdata()), (
-            "Same input with same seed should produce identical output. "
-            "This is critical for offline/online consistency."
-        )
-    finally:
-        if m is not None and hasattr(m, "close"):
-            m.close()
+    assert list(images1[0].getdata()) == list(images2[0].getdata()), (
+        "Same input with same seed should produce identical output. This is critical for offline/online consistency."
+    )
 
 
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
-def test_flux2_klein_inpaint_different_seeds_different_output():
-    m = None
-    try:
-        m = Omni(model=MODEL)
-        input_image, mask_image = _create_test_inputs()
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_flux2_klein_inpaint_different_seeds_different_output(omni_runner_handler: OmniRunnerHandler):
+    input_image, mask_image = _create_test_inputs()
 
-        gen1 = torch.Generator(current_omni_platform.device_type).manual_seed(42)
-        gen2 = torch.Generator(current_omni_platform.device_type).manual_seed(99999)
+    gen1 = torch.Generator(current_omni_platform.device_type).manual_seed(42)
+    gen2 = torch.Generator(current_omni_platform.device_type).manual_seed(99999)
 
-        outputs1 = m.generate(
-            prompts=[
-                {
-                    "prompt": "A beautiful landscape",
-                    "multi_modal_data": {"image": input_image, "mask_image": mask_image},
-                }
-            ],
-            sampling_params_list=OmniDiffusionSamplingParams(
-                height=_HEIGHT,
-                width=_WIDTH,
-                num_inference_steps=_NUM_INFERENCE_STEPS,
-                guidance_scale=0.0,
-                generator=gen1,
-                num_outputs_per_prompt=1,
-            ),
-        )
+    r1 = _send_inpaint_with_generator(omni_runner_handler, "A beautiful landscape", input_image, mask_image, gen1)
+    r2 = _send_inpaint_with_generator(omni_runner_handler, "A beautiful landscape", input_image, mask_image, gen2)
 
-        outputs2 = m.generate(
-            prompts=[
-                {
-                    "prompt": "A beautiful landscape",
-                    "multi_modal_data": {"image": input_image, "mask_image": mask_image},
-                }
-            ],
-            sampling_params_list=OmniDiffusionSamplingParams(
-                height=_HEIGHT,
-                width=_WIDTH,
-                num_inference_steps=_NUM_INFERENCE_STEPS,
-                guidance_scale=0.0,
-                generator=gen2,
-                num_outputs_per_prompt=1,
-            ),
-        )
+    images1 = _images_from_response(r1)
+    images2 = _images_from_response(r2)
 
-        images1 = _extract_images_from_output(list(outputs1))
-        images2 = _extract_images_from_output(list(outputs2))
-
-        assert len(images1) == 1
-        assert len(images2) == 1
-
-        different_pixel_count = sum(1 for p1, p2 in zip(images1[0].getdata(), images2[0].getdata()) if p1 != p2)
-        assert different_pixel_count > 0, "Different seeds should produce different outputs"
-    finally:
-        if m is not None and hasattr(m, "close"):
-            m.close()
+    different_pixel_count = sum(1 for p1, p2 in zip(images1[0].getdata(), images2[0].getdata()) if p1 != p2)
+    assert different_pixel_count > 0, "Different seeds should produce different outputs"

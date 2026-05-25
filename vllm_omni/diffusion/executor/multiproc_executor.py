@@ -22,7 +22,7 @@ from vllm_omni.diffusion.worker import WorkerProc
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-    from vllm_omni.diffusion.worker.utils import RunnerOutput
+    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -215,11 +215,27 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if self._closed:
                 return
 
-            dead = [p.name for p in self._processes if p.sentinel in finished]
+            dead = [p for p in self._processes if p.sentinel in finished]
             if dead:
+                details = []
+                for p in dead:
+                    code = p.exitcode
+                    # Negative exitcode == killed by signal N (-9 = SIGKILL/OOM,
+                    # -11 = SIGSEGV). Surface this so callers don't only see
+                    # "died unexpectedly" with no root cause.
+                    if code is not None and code < 0:
+                        try:
+                            import signal as _signal
+
+                            sig = _signal.Signals(-code).name
+                        except (ValueError, ImportError):
+                            sig = f"signal {-code}"
+                        details.append(f"{p.name}(exitcode={code}, {sig})")
+                    else:
+                        details.append(f"{p.name}(exitcode={code})")
                 logger.error(
                     "Diffusion worker(s) died unexpectedly: %s",
-                    dead,
+                    details,
                 )
                 self.is_failed = True
 
@@ -273,7 +289,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             logger.error(f"Generate call failed: {e}")
             raise
 
-    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Adapt request-mode scheduler output to worker execute_model RPC."""
         from vllm_omni.diffusion.worker.utils import RunnerOutput
 
@@ -301,9 +317,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             result=result,
         )
 
-    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Forward step-mode scheduler output to worker execute_stepwise RPC."""
-        from vllm_omni.diffusion.worker.utils import RunnerOutput
+        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, RunnerOutput
 
         self._ensure_open()
         result = self.collective_rpc(
@@ -313,7 +329,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             exec_all_ranks=True,
         )
 
-        if isinstance(result, RunnerOutput):
+        if isinstance(result, BaseRunnerOutput):
             return result
         # TODO: Remove this fallback; DiffusionOutput cannot faithfully represent
         # failed multi-request step batches.

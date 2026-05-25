@@ -33,6 +33,12 @@ vllm serve Qwen/Qwen-Image --omni \
     --port 8091
 ```
 
+To replay step-wise continuous batching, compare
+`vllm serve Qwen/Qwen-Image --omni --port 8089 --step-execution --max-num-seqs 1`
+against the same command with `--max-num-seqs 8`. `--step-execution` is the
+feature gate, and increasing `--max-num-seqs` above `1` lets the scheduler
+keep more compatible requests active at once.
+
 ## 3.2 Key Parameters
 
 | Parameter             | Description              |
@@ -52,7 +58,7 @@ Record these parameters when reporting performance results.
 
 ```bash
 python benchmarks/diffusion/diffusion_benchmark_serving.py \
-    --backend vllm-omni \
+    --endpoint /v1/chat/completions \
     --dataset <DATASET_NAME> \
     --task t2i \
     --num-prompts <N> \
@@ -65,11 +71,12 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 | Parameter              | Description                       |
 | ---------------------- | --------------------------------- |
-| `--backend`            | Serving backend (use `vllm-omni`) |
+| `--endpoint`           | API endpoint (use `/v1/chat/completions`; leading `/` is optional) |
 | `--dataset`            | Dataset name (`random` or custom) |
 | `--task`               | Task type (e.g., `t2i`)           |
 | `--num-prompts`        | Total number of requests          |
 | `--max-concurrency`    | Client-side concurrency           |
+| `--warmup-concurrency` | Warmup concurrency for batch-shape prewarming |
 | `--random-request-config`| JSON string defining random request |
 
 ---
@@ -122,7 +129,7 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 ```bash
 python benchmarks/diffusion/diffusion_benchmark_serving.py \
-    --backend vllm-omni \
+    --endpoint /v1/chat/completions \
     --dataset random \
     --task t2i \
     --num-prompts 1 \
@@ -132,6 +139,12 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
         {"width":512,"height":512,"num_inference_steps":20,"weight":1}
     ]'
 ```
+
+For a continuous-batching A/B replay, run the same benchmark command twice
+against the two serving configs above and keep traffic plus warmup settings
+identical across both runs. If the measured run uses `--max-concurrency 8`,
+warm with `--warmup-requests 8 --warmup-concurrency 8` so the first measured
+batch does not include compile or CUDA-graph capture overhead.
 
 ---
 
@@ -163,6 +176,7 @@ To ensure consistent and comparable benchmark results:
 * Record parallel configuration
 * Record benchmark parameters (resolution, concurrency, number of prompts)
 * Ensure no background workload on GPUs during testing
+* When comparing continuous batching, keep warmup settings the same across runs
 
 ---
 

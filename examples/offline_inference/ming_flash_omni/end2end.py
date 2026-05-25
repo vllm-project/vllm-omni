@@ -303,7 +303,10 @@ def main(args):
     else:
         query_result = query_func(processor)
 
-    omni = Omni.from_cli_args(args, model=MODEL_NAME)
+    omni_kwargs = vars(args).copy()
+    # override CLI --model with derived model_name
+    omni_kwargs["model"] = MODEL_NAME
+    omni = Omni(**omni_kwargs)
 
     # Thinker sampling params
     thinker_sampling_params = SamplingParams(

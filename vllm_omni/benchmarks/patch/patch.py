@@ -8,6 +8,7 @@ import ssl
 import sys
 import time
 import traceback
+import wave
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -35,6 +36,7 @@ from vllm.tokenizers import TokenizerLike
 
 logger = init_logger(__name__)
 
+from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
@@ -44,6 +46,33 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextDataset,
 )
+
+_AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
+_DEFAULT_AUDIO_CONTINUITY_THRESHOLD_S = 0.1
+
+
+def _audio_continuity_threshold_s() -> float:
+    """Return the per-request underrun budget (s).
+
+    Read from ``VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S`` so users can
+    re-aim the SLO without rebuilding. Defaults to 100 ms - the standard
+    "audible gap" budget for streaming TTS.
+    """
+    raw = os.environ.get(_AUDIO_CONTINUITY_THRESHOLD_ENV)
+    if not raw:
+        return _DEFAULT_AUDIO_CONTINUITY_THRESHOLD_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %.3fs",
+            _AUDIO_CONTINUITY_THRESHOLD_ENV,
+            raw,
+            _DEFAULT_AUDIO_CONTINUITY_THRESHOLD_S,
+        )
+        return _DEFAULT_AUDIO_CONTINUITY_THRESHOLD_S
+    return max(value, 0.0)
+
 
 get_samples_old = datasets.get_samples
 
@@ -314,6 +343,16 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_frames: int = 0
     audio_rtf: float = 0.0
     text_latency: float = 0.0
+    #: Worst-case streaming-audio underrun (wall-clock seconds the player
+    #: would have been starved). Populated by the audio-speech backend; ``0.0``
+    #: for backends that do not run continuity analysis.
+    audio_underrun_s: float = 0.0
+    #: Whether the request stayed under the continuity threshold (default
+    #: 100 ms). Mirrors ``audio_underrun_s <= threshold``.
+    audio_continuity_ok: bool = True
+    #: Number of inter-chunk intervals during which the player buffer went
+    #: negative.
+    audio_underrun_event_count: int = 0
     #: Raw PCM s16le mono at 24 kHz for Seed-TTS WER: from ``/v1/audio/speech`` stream or
     #: resampled export after ``openai-chat-omni`` audio deltas.
     tts_output_pcm_bytes: bytes | None = None
@@ -374,6 +413,14 @@ async def async_request_openai_chat_omni_completions(
         # outputs or metrics from previous attempts.
         generated_text = ""
         generated_audio = None
+        # For wav responses, accumulate decoded PCM bytes per chunk
+        # to avoid repeated AudioSegment decode/concat.
+        wav_pcm_buffer = bytearray()
+        wav_audio_params: tuple[int, int, int] | None = None
+        wav_inconsistent_chunk_count = 0
+        first_inconsistent_wav_params: tuple[int, int, int] | None = None
+        # For non-wav responses, accumulate encoded bytes then decode once.
+        audio_bytes_buffer = bytearray()
         ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
@@ -440,12 +487,28 @@ async def async_request_openai_chat_omni_completions(
                                         audio_generate_time = timestamp - st
                                         if content:
                                             audio_bytes = base64.b64decode(content)
-                                            seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
-                                            if seg is not None:
-                                                if generated_audio is None:
-                                                    generated_audio = seg
-                                                else:
-                                                    generated_audio = generated_audio + seg
+                                            if response_format == "wav":
+                                                try:
+                                                    with wave.open(io.BytesIO(audio_bytes), "rb") as wav_reader:
+                                                        params = (
+                                                            wav_reader.getnchannels(),
+                                                            wav_reader.getsampwidth(),
+                                                            wav_reader.getframerate(),
+                                                        )
+                                                        if wav_audio_params is None:
+                                                            wav_audio_params = params
+                                                        elif wav_audio_params != params:
+                                                            wav_inconsistent_chunk_count += 1
+                                                            if first_inconsistent_wav_params is None:
+                                                                first_inconsistent_wav_params = params
+                                                            continue
+                                                        wav_pcm_buffer.extend(
+                                                            wav_reader.readframes(wav_reader.getnframes())
+                                                        )
+                                                except Exception as ex:
+                                                    logger.warning("Failed to parse wav audio chunk: %s", ex)
+                                            else:
+                                                audio_bytes_buffer.extend(audio_bytes)
 
                                 if metrics := data.get("metrics"):
                                     output.output_tokens = metrics.get("num_tokens_out", 0)
@@ -454,8 +517,34 @@ async def async_request_openai_chat_omni_completions(
                                     if (pt := usage.get("prompt_tokens")) is not None:
                                         output.prompt_len = pt
 
+                    if wav_inconsistent_chunk_count > 0:
+                        logger.warning(
+                            "Dropped %d wav chunks with inconsistent params during benchmark "
+                            "(expected=%s, first_inconsistent=%s). "
+                            "Audio frames/duration may be undercounted.",
+                            wav_inconsistent_chunk_count,
+                            wav_audio_params,
+                            first_inconsistent_wav_params,
+                        )
+
                     output.latency = timestamp - st
                     output.generated_text = generated_text
+                    if response_format == "wav" and wav_pcm_buffer and wav_audio_params is not None:
+                        channels, sample_width, frame_rate = wav_audio_params
+                        generated_audio = AudioSegment(
+                            data=bytes(wav_pcm_buffer),
+                            sample_width=sample_width,
+                            frame_rate=frame_rate,
+                            channels=channels,
+                        )
+                    elif audio_bytes_buffer:
+                        try:
+                            generated_audio = AudioSegment.from_file(
+                                io.BytesIO(bytes(audio_bytes_buffer)),
+                                format=response_format,
+                            )
+                        except Exception as ex:
+                            logger.warning("Failed to decode accumulated audio bytes: %s", ex)
                     if generated_audio is not None:
                         output.audio_duration = len(generated_audio) / 1000.0
                         frame_width = generated_audio.frame_width
@@ -554,6 +643,8 @@ async def async_request_openai_audio_speech(
     total_pcm_bytes = 0
     capture_wer_pcm = _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False)
     pcm_capture = bytearray() if capture_wer_pcm else None
+    chunk_arrival_times_s: list[float] = []
+    chunk_sizes: list[int] = []
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
@@ -562,9 +653,12 @@ async def async_request_openai_audio_speech(
                         continue
                     timestamp = time.perf_counter()
                     if output.audio_ttfp == 0.0:
+                        # TTS speech endpoint emits no text tokens, so TTFT is
+                        # not defined here; only audio TTFP is meaningful.
                         output.audio_ttfp = timestamp - st
-                        output.ttft = output.audio_ttfp
                     total_pcm_bytes += len(chunk)
+                    chunk_arrival_times_s.append(timestamp - st)
+                    chunk_sizes.append(len(chunk))
                     if pcm_capture is not None:
                         pcm_capture.extend(chunk)
 
@@ -579,6 +673,18 @@ async def async_request_openai_audio_speech(
                 else:
                     output.audio_rtf = 0
                     logger.warning("Audio duration is zero")
+
+                continuity = compute_continuity_stats(
+                    chunk_arrival_times_s=chunk_arrival_times_s,
+                    chunk_bytes=chunk_sizes,
+                    sample_rate=sample_rate,
+                    sample_width=sample_width,
+                    channels=channels,
+                    threshold_s=_audio_continuity_threshold_s(),
+                )
+                output.audio_underrun_s = continuity.max_underrun_s
+                output.audio_continuity_ok = continuity.is_continuous
+                output.audio_underrun_event_count = continuity.underrun_event_count
                 if pcm_capture is not None and pcm_capture:
                     output.tts_output_pcm_bytes = bytes(pcm_capture)
                 elif capture_wer_pcm:
@@ -966,11 +1072,16 @@ async def benchmark(
         # metric.
         if metric_attribute_name not in selected_percentile_metrics:
             return
+        # No text tokens generated (e.g. pure TTS speech endpoint): per-token
+        # latency metrics (ttft/tpot/itl) are undefined, so skip them.
+        is_text_token_metric = not (metric_attribute_name == "e2el" or metric_attribute_name.startswith("audio"))
+        if is_text_token_metric and getattr(metrics, "total_output", 0) == 0:
+            return
         is_audio_rtf = metric_attribute_name == "audio_rtf"
-        is_audio_duration = metric_attribute_name == "audio_duration"
+        is_audio_duration_or_underrun = metric_attribute_name in ("audio_duration", "audio_underrun")
 
         suffix = "_ms"
-        if is_audio_duration:
+        if is_audio_duration_or_underrun:
             suffix = "_s"
         elif is_audio_rtf:
             suffix = ""
@@ -981,7 +1092,7 @@ async def benchmark(
         median_attr_name = f"median_{metric_attribute_name}{suffix}"
         median_value = getattr(metrics, median_attr_name, 0.0)
         result[median_attr_name] = median_value
-        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}"):
+        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}", None) or []:
             p_word = str(int(p)) if int(p) == p else str(p)
             result[f"p{p_word}_{metric_attribute_name}{suffix}"] = value
 
