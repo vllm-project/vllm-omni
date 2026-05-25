@@ -554,10 +554,10 @@ class CUDAGraphDecoderWrapper:
         chunk_size: int = 300,
         left_context_size: int = 25,
     ) -> torch.Tensor:
+        wavs = []
         start_index = 0
         total_len = codes.shape[-1]
         total_upsample = self.decoder.total_upsample
-        wavs: list[torch.Tensor] = []
 
         while start_index < total_len:
             end_index = min(start_index + chunk_size, total_len)
@@ -566,8 +566,11 @@ class CUDAGraphDecoderWrapper:
             codes_chunk = codes[..., start_index - context_size : end_index]
             wav_chunk = self._decode(codes_chunk, clone_graph_output=False)
 
-            src_start = context_size * total_upsample
-            wavs.append(wav_chunk[..., src_start:].clone())
+            # Keep origin/main's concat semantics: Qwen3-Omni can return a chunk
+            # that is shorter than the nominal code_len * total_upsample length.
+            # Clone each slice because graph outputs are static buffers that later
+            # replays may overwrite.
+            wavs.append(wav_chunk[..., context_size * total_upsample :].clone())
             start_index = end_index
 
         if not wavs:

@@ -65,10 +65,10 @@ _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
-_VOXCPM_TTS_MODEL_STAGES = {"latent_generator", "vae"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
+_GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -76,10 +76,10 @@ _TTS_MODEL_STAGES: set[str] = (
     | _COSYVOICE3_TTS_MODEL_STAGES
     | _OMNIVOICE_TTS_MODEL_STAGES
     | _COVO_AUDIO_MODEL_STAGES
-    | _VOXCPM_TTS_MODEL_STAGES
     | _VOXCPM2_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
+    | _GLM_TTS_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {"fish_tts", "qwen3_tts", "voxtral_tts", "cosyvoice3", "voxcpm2"}
 _TTS_LANGUAGES: set[str] = {
@@ -337,6 +337,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
 
+        # GLM-TTS lazy-cached resources (populated on first GLM-TTS request)
+        self._glm_tts_text_tokenizer: object | None = None
+        self._glm_tts_text_frontend: object | None = None
+
         # Cache TTS configuration values (computed once, reused per request)
         self._max_instructions_length = self._compute_max_instructions_length()
 
@@ -481,8 +485,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         model_arch = getattr(self._tts_stage.engine_args, "model_arch", None)
         if model_arch == "VoxCPM2TalkerForConditionalGeneration":
             return "voxcpm2"
-        if model_arch == "VoxCPMForConditionalGeneration":
-            return "voxcpm"
         if model_stage in _QWEN3_TTS_MODEL_STAGES:
             return "qwen3_tts"
         if model_stage in _VOXTRAL_TTS_MODEL_STAGES:
@@ -497,16 +499,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_arch = getattr(self._tts_stage.engine_args, "model_arch", None)
             if model_arch and "CovoAudio" in model_arch:
                 return "covo_audio"
-        if model_stage in (_VOXCPM_TTS_MODEL_STAGES | _VOXCPM2_TTS_MODEL_STAGES):
-            has_vae_stage = any(
-                getattr(getattr(stage, "engine_args", None), "model_stage", None) == "vae"
-                for stage in self.engine_client.stage_configs
-            )
-            return "voxcpm" if has_vae_stage or model_stage == "vae" else "voxcpm2"
+        if model_stage in _VOXCPM2_TTS_MODEL_STAGES:
+            return "voxcpm2"
         if model_stage in _MING_TTS_MODEL_STAGES:
             return "ming_flash_omni_tts"
         if model_stage in _MOSS_TTS_MODEL_STAGES:
             return "moss_tts_nano"
+        if model_stage in _GLM_TTS_MODEL_STAGES:
+            return "glm_tts"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -536,7 +536,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # is no static speaker list to surface here.
             return set()
         try:
-            if self._tts_model_type == "voxcpm":
+            if self._tts_model_type == "glm_tts":
                 return set()
             if self._tts_model_type == "voxcpm2":
                 return {"default"}
@@ -599,8 +599,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _estimate_prompt_len(self, tts_params: dict[str, Any]) -> int:
         """Estimate prompt length so the placeholder matches model-side embeddings."""
         try:
-            if self._tts_model_type == "voxcpm":
-                return 1
             from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
                 Qwen3TTSTalkerForConditionalGeneration,
             )
@@ -797,12 +795,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         voice_lower = request.voice.lower()
         if voice_lower not in self.uploaded_speakers:
-            if self._tts_model_type in ("cosyvoice3", "fish_tts", "omnivoice", "moss_tts_nano"):
+            if self._tts_model_type in ("cosyvoice3", "fish_tts", "omnivoice", "moss_tts_nano", "glm_tts"):
                 label = {
                     "cosyvoice3": "CosyVoice3",
                     "fish_tts": "Fish Speech",
                     "omnivoice": "OmniVoice",
                     "moss_tts_nano": "MOSS-TTS-Nano",
+                    "glm_tts": "GLM-TTS",
                 }.get(self._tts_model_type, self._tts_model_type)
                 return (
                     f"Unknown voice '{request.voice}'. {label} has no "
@@ -1136,8 +1135,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_fish_tts_request(request)
         if self._tts_model_type == "cosyvoice3":
             return self._validate_cosyvoice3_request(request)
-        if self._tts_model_type == "voxcpm":
-            return self._validate_voxcpm_request(request)
         if self._tts_model_type == "voxcpm2":
             if request.max_new_tokens is not None:
                 if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
@@ -1149,6 +1146,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_ming_tts_request(request)
         if self._tts_model_type == "moss_tts_nano":
             return self._validate_moss_tts_request(request)
+        if self._tts_model_type == "glm_tts":
+            return self._validate_glm_tts_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
@@ -1233,43 +1232,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             request.voice = request.voice.lower()
             if self.supported_speakers and request.voice not in self.supported_speakers:
                 return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
-
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
-                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
-            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
-                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
-
-        return None
-
-    def _validate_voxcpm_request(self, request: OpenAICreateSpeechRequest) -> str | None:
-        """Validate VoxCPM request parameters. Returns error message or None."""
-        if not request.input or not request.input.strip():
-            return "Input text cannot be empty"
-
-        if request.voice is not None:
-            return "'voice' is not supported for VoxCPM"
-        if request.instructions is not None:
-            return "'instructions' is not supported for VoxCPM"
-        if request.language is not None:
-            return "'language' is not supported for VoxCPM"
-        if request.task_type not in (None, "Base"):
-            return "VoxCPM only supports plain TTS or voice cloning with ref_audio/ref_text"
-        if request.x_vector_only_mode is not None:
-            return "'x_vector_only_mode' is not supported for VoxCPM"
-        if request.speaker_embedding is not None:
-            return "'speaker_embedding' is not supported for VoxCPM"
-        if request.initial_codec_chunk_frames is not None:
-            return "'initial_codec_chunk_frames' is not supported for VoxCPM"
-
-        if request.ref_audio is not None:
-            fmt_err = self._validate_ref_audio_format(request.ref_audio)
-            if fmt_err:
-                return fmt_err
-            if not request.ref_text or not request.ref_text.strip():
-                return "Voice cloning requires 'ref_text' (transcript of the reference audio)"
-        elif request.ref_text is not None:
-            return "'ref_text' requires 'ref_audio' for VoxCPM voice cloning"
 
         if request.max_new_tokens is not None:
             if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
@@ -1433,6 +1395,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
         params["prompt_audio_array"] = [[wav_list, sr]]
         return params
+
+    def _validate_glm_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate GLM-TTS request — requires ref_audio for voice cloning."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+
+        if request.ref_audio is None:
+            return "GLM-TTS requires 'ref_audio' for zero-shot voice cloning"
+        fmt_err = self._validate_ref_audio_format(request.ref_audio)
+        if fmt_err:
+            return fmt_err
+        if not request.ref_text or not request.ref_text.strip():
+            return "GLM-TTS voice cloning requires 'ref_text' (transcript of the reference audio)"
+
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be >= {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+        return None
 
     def _validate_fish_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate Fish Speech request parameters. Returns error message or None."""
@@ -1643,18 +1625,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Processes each parameter if present, skips if not.
         Values are wrapped in lists as required by the model.
         """
-        if self._tts_model_type == "voxcpm":
-            params: dict[str, Any] = {
-                "text": [request.input],
-                "cfg_value": [2.0],
-                "inference_timesteps": [10],
-                "min_len": [2],
-                "max_new_tokens": [request.max_new_tokens or 4096],
-            }
-            if request.ref_text is not None:
-                params["ref_text"] = [request.ref_text]
-            return params
-
         params: dict[str, Any] = {}
 
         # Text content (always required)
@@ -1787,6 +1757,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self,
         request: OpenAICreateSpeechRequest,
         ref_audio_data: tuple[list[float], int] | None = None,
+        *,
+        has_inline_ref_audio: bool = False,
     ) -> dict[str, Any]:
         """Build prompt for Fish Speech S2 Pro.
 
@@ -1838,7 +1810,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Pass voice identity for model-side DAC code caching.
         if request.voice is not None:
             voice_lower = request.voice.lower()
-            if voice_lower in self.uploaded_speakers:
+            if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
                 additional_information["voice_name"] = voice_lower
                 additional_information["voice_created_at"] = self._voice_created_at(voice_lower)
         if request.max_new_tokens is not None:
@@ -1852,6 +1824,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _build_cosyvoice3_prompt(
         self,
         request: OpenAICreateSpeechRequest,
+        *,
+        has_inline_ref_audio: bool = False,
     ) -> dict[str, Any]:
         """Build prompt for CosyVoice3.
 
@@ -1870,8 +1844,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Pass voice metadata for caching in the processor
         if request.voice:
             voice_lower = request.voice.lower()
-            mm_kwargs["voice_name"] = voice_lower
-            mm_kwargs["voice_created_at"] = self._voice_created_at(voice_lower)
+            if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                mm_kwargs["voice_name"] = voice_lower
+                mm_kwargs["voice_created_at"] = self._voice_created_at(voice_lower)
 
         return {
             "prompt": request.input,
@@ -1956,6 +1931,105 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         return sampling_params_list
 
+    # ---- GLM-TTS helpers ----
+
+    async def _build_glm_tts_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+        *,
+        has_inline_ref_audio: bool = False,
+    ) -> dict[str, Any]:
+        """Build prompt for GLM-TTS.
+
+        Uses the multimodal processor path (same as CosyVoice3):
+        - prompt: synthesis text
+        - multi_modal_data["audio"]: (wav_samples, sr) reference audio
+        - mm_processor_kwargs["prompt_text"]: reference text transcript
+
+        AR preprocess() builds [PromptText | Text | BOA | PromptSpeechTokens + ATS].
+        DiT receives prompt_token, prompt_feat, embedding for conditioning.
+        """
+        # Voice cloning requires ref_audio + ref_text
+        if request.ref_audio is not None and request.ref_text:
+            wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
+            audio_data = (np.asarray(wav_samples, dtype=np.float32), int(sr))
+
+            mm_kwargs: dict[str, Any] = {
+                "prompt_text": request.ref_text,
+            }
+            if request.voice:
+                voice_lower = request.voice.lower()
+                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                    mm_kwargs["voice_name"] = voice_lower
+                    mm_kwargs["voice_created_at"] = self._voice_created_at(voice_lower)
+
+            return {
+                "prompt": request.input,
+                "multi_modal_data": {
+                    "audio": audio_data,
+                },
+                "mm_processor_kwargs": mm_kwargs,
+                "additional_information": self._build_glm_tts_prefill_metadata(
+                    request.input,
+                    request.ref_text,
+                ),
+            }
+
+        raise ValueError("GLM-TTS requires ref_audio and ref_text for voice cloning.")
+
+    def _glm_tts_text_tokenizer_and_frontend(self):
+        from vllm_omni.model_executor.models.glm_tts.glm_tts import (
+            load_glm_tts_tokenizer,
+            resolve_glm_tts_tokenizer_path,
+        )
+        from vllm_omni.model_executor.models.glm_tts.text_frontend import GLMTTSTextFrontend
+
+        cached = self._glm_tts_text_tokenizer
+        if cached is None:
+            model_name_or_path = self.engine_client.model_config.model
+            tokenizer_path = getattr(self.engine_client.model_config, "tokenizer", None)
+            if tokenizer_path is None:
+                tokenizer_path = resolve_glm_tts_tokenizer_path(model_name_or_path)
+            cached = load_glm_tts_tokenizer(
+                tokenizer_path,
+                model_name_or_path=model_name_or_path,
+                trust_remote_code=bool(getattr(self.engine_client.model_config, "trust_remote_code", False)),
+            )
+            self._glm_tts_text_tokenizer = cached
+
+        frontend = self._glm_tts_text_frontend
+        if frontend is None:
+            frontend = GLMTTSTextFrontend()
+            self._glm_tts_text_frontend = frontend
+        return cached, frontend
+
+    def _estimate_glm_tts_text_token_len(self, text: str | None, *, add_trailing_space: bool = False) -> int:
+        """Estimate GLM-TTS normalized text length with the model tokenizer."""
+        cached, frontend = self._glm_tts_text_tokenizer_and_frontend()
+        text = text or ""
+        normalized = frontend.text_normalize(text) or text
+        normalized = normalized.strip()
+        if add_trailing_space and normalized:
+            normalized = f"{normalized} "
+        return max(1, len(cached.encode(normalized)))
+
+    def _build_glm_tts_prefill_metadata(self, text: str, prompt_text: str | None) -> dict[str, Any]:
+        """Build GLM-TTS processor length metadata for additional_information.
+
+        The model preprocess hook runs before postprocess can mirror MM kwargs
+        into additional_information, so these scalar fields must originate from
+        the request payload rather than runner-level mm_features.
+        """
+        text_len = self._estimate_glm_tts_text_token_len(text)
+        prompt_text_len = (
+            self._estimate_glm_tts_text_token_len(prompt_text, add_trailing_space=True) if prompt_text else 0
+        )
+        return {
+            "glm_tts_text_token_len": [text_len],
+            "glm_tts_prompt_text_token_len": [prompt_text_len],
+            "input_len": [prompt_text_len + text_len + 1],
+        }
+
     # ---- Ming-flash-omni standalone-talker (TTS) helpers ----
 
     def _build_ming_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
@@ -2020,7 +2094,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Resolve uploaded voice for non-Qwen3 models.
         # Qwen3 TTS has its own uploaded voice handling in _build_tts_params().
-        if self._tts_model_type in ("fish_tts", "cosyvoice3", "moss_tts_nano"):
+        has_inline_ref_audio = request.ref_audio is not None
+        if self._tts_model_type in ("fish_tts", "cosyvoice3", "moss_tts_nano", "glm_tts"):
             err = self._apply_uploaded_speaker(request)
             if err:
                 raise ValueError(err)
@@ -2033,7 +2108,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.ref_audio is not None:
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 ref_audio_data = (wav_list, sr)
-            prompt = await self._build_fish_speech_prompt_async(request, ref_audio_data=ref_audio_data)
+            prompt = await self._build_fish_speech_prompt_async(
+                request, ref_audio_data=ref_audio_data, has_inline_ref_audio=has_inline_ref_audio
+            )
             tts_params = {}
         elif self._tts_model_type == "omnivoice":
             if not request.input or not request.input.strip():
@@ -2050,8 +2127,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt["ref_text"] = request.ref_text
             if request.voice:
                 voice_lower = request.voice.lower()
-                prompt["voice_name"] = voice_lower
-                prompt["voice_created_at"] = self._voice_created_at(voice_lower)
+                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                    prompt["voice_name"] = voice_lower
+                    prompt["voice_created_at"] = self._voice_created_at(voice_lower)
             if request.language:
                 prompt["lang"] = request.language
             if request.instructions:
@@ -2068,7 +2146,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if voice_lower not in self.uploaded_speakers and voice_lower not in self.supported_speakers:
                     all_voices = sorted(self.uploaded_speakers.keys() | self.supported_speakers)
                     raise ValueError(f"Invalid voice '{request.voice}'. Supported: {', '.join(all_voices) or 'none'}")
-                if voice_lower in self.uploaded_speakers:
+                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
                     if self.uploaded_speakers[voice_lower].get("embedding_source") == "direct":
                         raise ValueError(
                             f"Uploaded voice '{request.voice}' uses a speaker embedding (Qwen3-only). "
@@ -2080,9 +2158,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = {}
             if request.voice:
                 voice_lower = request.voice.lower()
-                additional = prompt.setdefault("additional_information", {})
-                additional["voice_name"] = voice_lower
-                additional["voice_created_at"] = self._voice_created_at(voice_lower)
+                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                    additional = prompt.setdefault("additional_information", {})
+                    additional["voice_name"] = voice_lower
+                    additional["voice_created_at"] = self._voice_created_at(voice_lower)
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
             if validation_error:
@@ -2092,7 +2171,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt = await self._build_voxtral_prompt_async(request)
                 tts_params = {}
             elif self._tts_model_type == "cosyvoice3":
-                prompt = await self._build_cosyvoice3_prompt(request)
+                prompt = await self._build_cosyvoice3_prompt(request, has_inline_ref_audio=has_inline_ref_audio)
+                tts_params = {}
+            elif self._tts_model_type == "glm_tts":
+                prompt = await self._build_glm_tts_prompt(request, has_inline_ref_audio=has_inline_ref_audio)
                 tts_params = {}
             elif self._tts_model_type == "ming_flash_omni_tts":
                 prompt = self._build_ming_prompt(request)
@@ -2101,8 +2183,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 tts_params = await self._build_moss_tts_params(request)
                 if request.voice:
                     voice_lower = request.voice.lower()
-                    tts_params["voice_name"] = [voice_lower]
-                    tts_params["voice_created_at"] = [self._voice_created_at(voice_lower)]
+                    if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                        tts_params["voice_name"] = [voice_lower]
+                        tts_params["voice_created_at"] = [self._voice_created_at(voice_lower)]
                 # Propagate seed from sampling params for deterministic generation.
                 # MOSS-TTS-Nano uses its own internal sampling inside
                 # inference_stream(), which reads seed from additional_information
@@ -2158,14 +2241,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "voxtral_tts"
         elif self._tts_model_type == "cosyvoice3":
             model_type = "cosyvoice3"
-        elif self._tts_model_type == "voxcpm":
-            model_type = "voxcpm"
         elif self._tts_model_type == "voxcpm2":
             model_type = "voxcpm2"
         elif self._tts_model_type == "ming_flash_omni_tts":
             model_type = "ming_flash_omni_tts"
         elif self._tts_model_type == "moss_tts_nano":
             model_type = "moss_tts_nano"
+        elif self._tts_model_type == "glm_tts":
+            model_type = "glm_tts"
         elif self._is_tts:
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:
@@ -2182,6 +2265,57 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # EOS and max_token_text_ratio to cap generation length.
         if self._tts_model_type == "cosyvoice3" and sampling_params_list:
             sampling_params_list = self._apply_cosyvoice3_dynamic_tokens(sampling_params_list, request)
+
+        # GLM-TTS: set dynamic min/max tokens based on text length.
+        if self._tts_model_type == "glm_tts" and sampling_params_list:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            glm_metadata = prompt.get("additional_information") if isinstance(prompt, dict) else None
+            text_len_value = None
+            if isinstance(glm_metadata, dict):
+                text_len_value = glm_metadata.get("glm_tts_text_token_len")
+                if isinstance(text_len_value, list) and text_len_value:
+                    text_len_value = text_len_value[0]
+            text_token_len = (
+                int(text_len_value)
+                if text_len_value is not None
+                else self._estimate_glm_tts_text_token_len(request.input)
+            )
+            hf_cfg = self.model_config.hf_config
+            min_ratio = getattr(hf_cfg, "min_token_text_ratio", 2)
+            max_ratio = getattr(hf_cfg, "max_token_text_ratio", 20)
+            stage_min_tokens = getattr(sampling_params_list[0], "min_tokens", None)
+            stage_max_tokens = getattr(sampling_params_list[0], "max_tokens", None)
+            cap_candidates = [int(cap) for cap in (stage_max_tokens, request.max_new_tokens) if cap is not None]
+            hard_cap = min(cap_candidates) if cap_candidates else None
+
+            min_tokens = max(1, int(text_token_len * min_ratio))
+            if stage_min_tokens is not None:
+                min_tokens = max(min_tokens, int(stage_min_tokens))
+            if hard_cap is not None:
+                min_tokens = min(min_tokens, hard_cap)
+
+            max_tokens = max(min_tokens, int(text_token_len * max_ratio))
+            if hard_cap is not None:
+                max_tokens = min(max_tokens, hard_cap)
+            sampling_params_list[0].min_tokens = min_tokens
+            sampling_params_list[0].max_tokens = max_tokens
+            seed = getattr(request, "seed", None)
+            if seed is not None:
+                sampling_params_list[0].seed = seed
+            logger.info(
+                "GLM-TTS dynamic tokens: text_tokens=%d, min_ratio=%s, max_ratio=%s, "
+                "stage_min=%s, stage_max=%s, request_max=%s, min_tokens=%d, max_tokens=%d",
+                text_token_len,
+                min_ratio,
+                max_ratio,
+                stage_min_tokens,
+                stage_max_tokens,
+                request.max_new_tokens,
+                min_tokens,
+                max_tokens,
+            )
 
         # Apply model-specific extra parameters
         if request.extra_params is not None and sampling_params_list:
@@ -2375,6 +2509,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     all_voices = sorted(self.uploaded_speakers.keys() | self.supported_speakers)
                     raise ValueError(f"Invalid voice '{request.voice}'. Supported: {', '.join(all_voices) or 'none'}")
 
+            has_inline_ref_audio = request.ref_audio is not None
             err = self._apply_uploaded_speaker(request)
             if err:
                 raise ValueError(err)
@@ -2388,8 +2523,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt["ref_text"] = request.ref_text
             if request.voice:
                 voice_lower = request.voice.lower()
-                prompt["voice_name"] = voice_lower
-                prompt["voice_created_at"] = self._voice_created_at(voice_lower)
+                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                    prompt["voice_name"] = voice_lower
+                    prompt["voice_created_at"] = self._voice_created_at(voice_lower)
             if request.language:
                 prompt["lang"] = request.language
             if request.instructions:

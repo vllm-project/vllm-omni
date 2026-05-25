@@ -171,18 +171,6 @@ def test_collect_initialized_clients_for_cleanup_deduplicates_clients():
     assert cleanup_clients == [shared, extra]
 
 
-def test_initialize_stages_rejects_non_diffusion_replicas_in_single_stage_mode():
-    engine = object.__new__(AsyncOmniEngine)
-    engine.single_stage_mode = True
-    engine.stage_configs = [types.SimpleNamespace(stage_id=0, runtime={"num_replicas": 2})]
-
-    with pytest.raises(
-        ValueError,
-        match="single_stage_mode only supports num_replicas > 1 for diffusion stages",
-    ):
-        engine._validate_single_stage_mode_replica_constraints()
-
-
 def test_initialize_diffusion_replica_restores_device_visibility_after_local_init(monkeypatch):
     import vllm_omni.engine.async_omni_engine as engine_mod
     from vllm_omni.platforms import current_omni_platform
@@ -427,6 +415,7 @@ def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_rep
     engine.single_stage_mode = False
     engine._single_stage_id_filter = None
     engine._omni_master_server = None
+    engine._coordinator_runtime = None
     engine.stage_configs = [types.SimpleNamespace()]
 
     cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
@@ -471,6 +460,7 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
     engine.single_stage_mode = False
     engine._single_stage_id_filter = None
     engine._omni_master_server = None
+    engine._coordinator_runtime = None
     engine.stage_configs = [types.SimpleNamespace()]
 
     cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))

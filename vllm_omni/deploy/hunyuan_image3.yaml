@@ -15,6 +15,16 @@ connectors:
       device_name: ""
       memory_pool_size: 4294967296
       memory_pool_device: "cpu"
+  yuanrong_te_connector:
+    name: YuanrongTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      rpc_port: "auto"
+      protocol: "ascend"
+      device_name: "auto"
+      memory_pool_size: 1073741824
+      memory_pool_device: "npu"
   shared_memory_connector:
     name: SharedMemoryConnector
     extra:

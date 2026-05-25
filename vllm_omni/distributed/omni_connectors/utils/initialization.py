@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..factory import OmniConnectorFactory
-from .config import ConnectorSpec, OmniTransferConfig
+from .config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec, OmniTransferConfig
+from .env import expand_env_int
+from .local_rank import get_connector_local_rank
 from .logging import get_connector_logger
 
 if TYPE_CHECKING:
@@ -26,8 +28,16 @@ KV_TRANSFER_PORT_OFFSET = 100
 
 # Port stride between TP ranks so each worker binds a unique ZMQ port
 # when TP > 1.  Must be larger than the maximum number of pipeline stages.
-# Formula: zmq_port = base + KV_TRANSFER_PORT_OFFSET + rank * STRIDE + stage
+# Formula:
+#   zmq_port = base + KV_TRANSFER_PORT_OFFSET
+#            + replica * KV_REPLICA_PORT_STRIDE
+#            + rank * KV_RANK_PORT_STRIDE
+#            + stage
 KV_RANK_PORT_STRIDE = 16
+
+# Port stride between Omni replicas of the same stage.  This reserves a
+# comfortably sized block per replica for TP-rank and stage offsets.
+KV_REPLICA_PORT_STRIDE = 1024
 
 
 def initialize_connectors_from_config(
@@ -85,18 +95,20 @@ def create_connectors_from_config(
     for edge_key, connector_spec in connectors_config.items():
         from_stage, to_stage = edge_key
         try:
-            if connector_spec.name == "MooncakeTransferEngineConnector":
+            if connector_spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
                 extra = dict(connector_spec.extra) if connector_spec.extra else {}
-                base_port = extra.get("zmq_port", 50051)
+                base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
                 try:
                     stage_offset = int(from_stage)
                 except (TypeError, ValueError):
                     stage_offset = 0
 
+                local_rank = 0 if str(caller_stage_id) == "orchestrator" else get_connector_local_rank()
                 if str(caller_stage_id) == "orchestrator":
-                    adjusted_port = base_port + orchestrator_port_offset + stage_offset
+                    rank0_port = base_port + orchestrator_port_offset + stage_offset
                 else:
-                    adjusted_port = base_port + port_offset + stage_offset
+                    rank0_port = base_port + port_offset + stage_offset
+                adjusted_port = rank0_port + local_rank * KV_RANK_PORT_STRIDE
                 extra["zmq_port"] = adjusted_port
 
                 if is_sender is not None:

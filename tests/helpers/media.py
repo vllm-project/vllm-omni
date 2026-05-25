@@ -623,9 +623,11 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
 
     if current_omni_platform.is_available():
         n = current_omni_platform.get_device_count()
-        if n == 1:
-            device_index = 0
-        elif n > 1:
+        # Single-GPU runners (e.g. the L4 nightly): the model server already
+        # occupies device 0. Loading Whisper there, once per concurrent
+        # request, competes for VRAM and OOMs. Only borrow an accelerator
+        # when a spare device exists; otherwise validate on CPU.
+        if n > 1:
             device_index = n - 1
 
     if device_index is not None:

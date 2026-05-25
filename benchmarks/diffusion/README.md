@@ -30,7 +30,7 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 **Notes**
 
-- The benchmark talks to `http://<host>:<port>/v1/chat/completions`.
+- By default, image tasks talk to `http://<host>:<port>/v1/chat/completions`; video tasks talk to `/v1/videos`.
 - If you run the server on another host or port, pass `--base-url` accordingly.
 
 ## 2. Supported Datasets
@@ -95,8 +95,9 @@ You can point to your own trace using `--dataset-path`.
 
 ### Basic flags
 
-- `--base-url`: Server address (the script calls `.../v1/chat/completions`).
+- `--base-url`: Server address; `--endpoint` selects the path appended to this base URL.
 - `--model`: The OpenAI-compatible `model` field.
+- `--endpoint`: API endpoint path. Leading `/` is optional, e.g. `/v1/videos` or `v1/videos`.
 - `--task`: Task type (e.g., `t2i`, `t2v`, `i2i`, `i2v`).
 - `--dataset`: Dataset mode (`vbench` / `trace` / `random`).
 - `--num-prompts`: Number of requests to send.
