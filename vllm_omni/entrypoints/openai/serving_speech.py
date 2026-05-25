@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import math
@@ -184,6 +185,55 @@ def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
         return directory_resolved in file_path_resolved.parents or directory_resolved == file_path_resolved
     except Exception:
         return False
+
+
+def _conditioning_cache_salt(request, tts_params: dict | None = None) -> str:
+    """Stable hash of the real Stage 0 conditioning for the prefix cache.
+
+    The talker's vLLM prompt is placeholder token ids; the real inputs are
+    rebuilt from text / ref_audio / ref_text into inputs_embeds. vLLM hashes
+    token ids (folded with cache_salt) for prefix caching, so without a salt
+    every request collides and a hit could reuse KV from a semantically
+    different input. Tying the salt to the conditioning keeps a hit safe:
+    identical conditioning may share the prefix, any difference never does.
+
+    Raw request fields alone are not enough for uploaded voices: the request
+    only carries the voice *name* (ref_audio/ref_text/task_type are resolved
+    from stored voice data into ``tts_params``). Delete + re-upload under the
+    same name leaves every raw field identical, so the resolved conditioning
+    must also be folded in. ``voice_created_at`` bumps on every (re-)upload,
+    which uniquely identifies the resolved reference artifact together with
+    the voice name; the decoded ref_audio array itself need not be hashed.
+    """
+    h = hashlib.sha256()
+    for part in (
+        request.input,
+        request.task_type,
+        request.language,
+        request.voice,
+        request.ref_text,
+        request.ref_audio,
+        request.instructions,
+        request.x_vector_only_mode,
+        request.speaker_embedding,
+    ):
+        h.update(b"\x00")
+        if part is not None:
+            h.update(repr(part).encode("utf-8"))
+    # Fold resolved conditioning that is auto-derived for uploaded voices and
+    # absent from the raw request.
+    for key in (
+        "voice_created_at",
+        "task_type",
+        "speaker",
+        "ref_text",
+        "x_vector_only_mode",
+    ):
+        h.update(b"\x00")
+        value = tts_params.get(key) if tts_params is not None else None
+        if value is not None:
+            h.update(repr(value).encode("utf-8"))
+    return h.hexdigest()[:32]
 
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
@@ -1500,6 +1550,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id: str,
         response_format: str = "pcm",
         raw_request: Request | None = None,
+        request_start_s: float | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -1520,6 +1571,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prev_count = 0
         sample_rate_val = 24000
         first_chunk = True
+        first_audio_chunk_s: float | None = None
+        stream_start_s = request_start_s if request_start_s is not None else time.perf_counter()
 
         try:
             async for res in generator:
@@ -1571,11 +1624,40 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         stream_format="audio",
                         base64_encode=False,
                     )
+                    if first_audio_chunk_s is None:
+                        first_audio_chunk_s = time.perf_counter()
                     yield self.create_audio(audio_obj).audio_data
+            total_ms = (time.perf_counter() - stream_start_s) * 1000.0
+            if first_audio_chunk_s is not None:
+                first_chunk_ms = (first_audio_chunk_s - stream_start_s) * 1000.0
+                logger.info(
+                    "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=%.2f",
+                    request_id,
+                    total_ms,
+                    first_chunk_ms,
+                )
+            else:
+                logger.info(
+                    "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=NA",
+                    request_id,
+                    total_ms,
+                )
         except asyncio.CancelledError:
+            total_ms = (time.perf_counter() - stream_start_s) * 1000.0
+            logger.info(
+                "[SpeechE2E] request_id=%s stream=true status=cancelled total_ms=%.2f",
+                request_id,
+                total_ms,
+            )
             logger.info("Streaming request %s cancelled by client", request_id)
             raise
         except EngineDeadError as e:
+            total_ms = (time.perf_counter() - stream_start_s) * 1000.0
+            logger.error(
+                "[SpeechE2E] request_id=%s stream=true status=engine_dead total_ms=%.2f",
+                request_id,
+                total_ms,
+            )
             logger.error(
                 "EngineDeadError during streaming speech for %s: %s",
                 request_id,
@@ -1589,6 +1671,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             raise
         except Exception as e:
+            total_ms = (time.perf_counter() - stream_start_s) * 1000.0
+            logger.exception(
+                "[SpeechE2E] request_id=%s stream=true status=error total_ms=%.2f error=%s",
+                request_id,
+                total_ms,
+                e,
+            )
             logger.exception("Streaming speech generation failed for %s: %s", request_id, e)
             raise
 
@@ -2195,6 +2284,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     tts_params["seed"] = [sampling_params_list[0].seed]
                 prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
+                prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
@@ -2210,6 +2300,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ph_len = await self._estimate_prompt_len_async(tts_params)
                 prompt = tokens_input(prompt_token_ids=[1] * ph_len)
                 prompt["additional_information"] = tts_params
+                prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
@@ -2651,6 +2742,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return error_check_ret
 
         request_id = f"speech-{random_uuid()}"
+        request_start_s = time.perf_counter()
         if raw_request:
             raw_request.state.request_metadata = RequestResponseMetadata(
                 request_id=request_id,
@@ -2683,20 +2775,58 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         request_id,
                         response_format,
                         raw_request=raw_request,
+                        request_start_s=request_start_s,
                     ),
                     media_type=media_type,
                 )
 
             audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.info(
+                "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
+                request_id,
+                total_ms,
+                len(audio_bytes) if isinstance(audio_bytes, (bytes, bytearray)) else len(str(audio_bytes)),
+            )
             return Response(content=audio_bytes, media_type=media_type)
 
         except asyncio.CancelledError:
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.info(
+                "[SpeechE2E] request_id=%s stream=%s status=cancelled total_ms=%.2f",
+                request_id,
+                bool(request.stream),
+                total_ms,
+            )
             return self.create_error_response("Client disconnected")
         except (EngineGenerateError, EngineDeadError):
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.error(
+                "[SpeechE2E] request_id=%s stream=%s status=engine_error total_ms=%.2f",
+                request_id,
+                bool(request.stream),
+                total_ms,
+            )
             raise  # Propagate to the global Omni exception handler
         except ValueError as e:
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.warning(
+                "[SpeechE2E] request_id=%s stream=%s status=bad_request total_ms=%.2f error=%s",
+                request_id,
+                bool(request.stream),
+                total_ms,
+                e,
+            )
             return self.create_error_response(e)
         except Exception as e:
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.exception(
+                "[SpeechE2E] request_id=%s stream=%s status=error total_ms=%.2f error=%s",
+                request_id,
+                bool(request.stream),
+                total_ms,
+                e,
+            )
             logger.exception("Speech generation failed: %s", e)
             return self.create_error_response(f"Speech generation failed: {e}")
 
