@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 def _patch_cosmos_guardrail_snapshot_download() -> None:
     """Avoid materializing nested ``.locks/`` files as cache symlinks."""
-    
+
     import cosmos_guardrail.cosmos_guardrail as _cg
 
     original = _cg.snapshot_download

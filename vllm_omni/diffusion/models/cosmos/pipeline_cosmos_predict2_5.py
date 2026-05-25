@@ -21,20 +21,18 @@ import json
 import logging
 import os
 from collections.abc import Iterable
-from typing import Any
 
 import numpy as np
 import torch
-from torch import nn
 import torchvision.transforms.functional
-
 from diffusers import AutoencoderKLWan
 from diffusers.schedulers import UniPCMultistepScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
+from torch import nn
 from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration
-
 from vllm.model_executor.models.utils import AutoWeightsLoader
+
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -75,7 +73,6 @@ def load_transformer_config(
 def get_cosmos_predict25_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
-
     video_processor = VideoProcessor(vae_scale_factor=8)
 
     def post_process_func(
@@ -179,7 +176,7 @@ class CosmosPredict25Pipeline(nn.Module):
                 self.scheduler.betas = self.scheduler.betas.cpu()
 
         self._guidance_scale = None
-        self._num_timesteps = None                
+        self._num_timesteps = None
 
     @property
     def guidance_scale(self):
@@ -291,8 +288,6 @@ class CosmosPredict25Pipeline(nn.Module):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
-
-
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
 
@@ -321,21 +316,21 @@ class CosmosPredict25Pipeline(nn.Module):
 
     def prepare_latents(
         self,
-        video: torch.Tensor | None,        
+        video: torch.Tensor | None,
         batch_size: int,
-        num_channels_latents: int = 16,        
+        num_channels_latents: int = 16,
         height: int = 704,
         width: int = 1280,
         num_frames_in: int = 93,
-        num_frames_out: int = 93,                
+        num_frames_out: int = 93,
         dtype: torch.dtype | None = None,
         device: torch.device | None = None,
-        generator: torch.Generator | list[torch.Generator] | None = None,        
+        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
     ):
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(f"Generator list length {len(generator)} does not match batch size {batch_size}.")
-                
+
         B = batch_size
         C = num_channels_latents
         T = (num_frames_out - 1) // self.vae_scale_factor_temporal + 1
@@ -425,7 +420,6 @@ class CosmosPredict25Pipeline(nn.Module):
         ):
             raise ValueError(f"`negative_prompt` has to be of type `str` or `list` but is {type(negative_prompt)}")
 
-
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -450,19 +444,20 @@ class CosmosPredict25Pipeline(nn.Module):
         if self.safety_checker is None:
             raise ValueError(
                 f"You have disabled the safety checker for {self.__class__}. This is in violation of the "
-                "[NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license). "
-                f"Please ensure that you are compliant with the license agreement."
+                "[NVIDIA Open Model License Agreement]"
+                "(https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license). "
+                "Please ensure that you are compliant with the license agreement."
             )
 
         extra = getattr(req.sampling_params, "extra_args", {}) or {}
         image = extra.get("image", image)
         video = extra.get("video", video)
         num_latent_conditional_frames = extra.get("num_latent_conditional_frames", num_latent_conditional_frames)
-        conditional_frame_timestep = extra.get("conditional_frame_timestep", conditional_frame_timestep)        
+        conditional_frame_timestep = extra.get("conditional_frame_timestep", conditional_frame_timestep)
 
         if image is not None and video is not None:
             raise ValueError("image and video cannot be provided simultaneously")
-        
+
         if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
             prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
             negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
@@ -488,7 +483,7 @@ class CosmosPredict25Pipeline(nn.Module):
         num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         num_videos_per_prompt = req.sampling_params.num_outputs_per_prompt or 1
-        max_sequence_length=req.sampling_params.max_sequence_length or 512
+        max_sequence_length = req.sampling_params.max_sequence_length or 512
 
         # Ensure dimensions are compatible with VAE and patch size
         patch_size = self.transformer.config.patch_size
@@ -588,16 +583,16 @@ class CosmosPredict25Pipeline(nn.Module):
         num_frames_out = num_frames
         assert num_frames_in <= num_frames_out, f"expected ({num_frames_in=}) <= ({num_frames_out=})"
         video = video.to(device=device, dtype=self.vae.dtype)
-                           
+
         num_channels_latents = self.transformer.config.in_channels - 1
         latents, cond_latent, cond_mask, cond_indicator = self.prepare_latents(
             video=video,
             batch_size=batch_size,
-            num_channels_latents=num_channels_latents,            
+            num_channels_latents=num_channels_latents,
             height=height,
             width=width,
             num_frames_in=num_frames_in,
-            num_frames_out=num_frames,                                   
+            num_frames_out=num_frames,
             dtype=torch.float32,
             device=self.device,
             generator=generator,
@@ -625,7 +620,7 @@ class CosmosPredict25Pipeline(nn.Module):
                 )
             else:
                 in_timestep = sigma_t
-            
+
             in_latents = cond_mask * cond_latent + (1 - cond_mask) * latents
             in_latents = in_latents.to(dtype)
 
@@ -636,7 +631,7 @@ class CosmosPredict25Pipeline(nn.Module):
                 encoder_hidden_states=prompt_embeds,
                 padding_mask=padding_mask,
                 return_dict=False,
-            )[0]            
+            )[0]
 
             noise_pred = gt_velocity + noise_pred * (1 - cond_mask)
 
@@ -648,7 +643,7 @@ class CosmosPredict25Pipeline(nn.Module):
                     encoder_hidden_states=negative_prompt_embeds,
                     padding_mask=padding_mask,
                     return_dict=False,
-                )[0]                
+                )[0]
 
                 noise_pred_neg = gt_velocity + noise_pred_neg * (1 - cond_mask)
                 noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_neg)

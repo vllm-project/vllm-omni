@@ -22,15 +22,14 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-from diffusers.models.embeddings import Timesteps
 from diffusers.models.attention import FeedForward
+from diffusers.models.embeddings import Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
 from vllm_omni.diffusion.attention.layer import Attention
 
 logger = init_logger(__name__)
@@ -217,12 +216,11 @@ class CosmosSelfAttention(nn.Module):
         )
 
         self.attn = Attention(
-             num_heads=num_heads,
-             head_size=head_dim,
-             softmax_scale=1.0 / (head_dim**0.5),
-             causal=False,
+            num_heads=num_heads,
+            head_size=head_dim,
+            softmax_scale=1.0 / (head_dim**0.5),
+            causal=False,
         )
-
 
     def forward(
         self,
@@ -245,6 +243,7 @@ class CosmosSelfAttention(nn.Module):
         # Apply RoPE
         if image_rotary_emb is not None:
             from diffusers.models.embeddings import apply_rotary_emb
+
             query = apply_rotary_emb(query, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
             key = apply_rotary_emb(key, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
 
@@ -291,7 +290,7 @@ class CosmosCrossAttention(nn.Module):
 
         # Query projection
         self.to_q = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
-        
+
         # Separate K and V projections for cross-attention
         self.to_k = ReplicatedLinear(self.cross_attention_dim, self.inner_kv_dim, bias=bias)
         self.to_v = ReplicatedLinear(self.cross_attention_dim, self.inner_kv_dim, bias=bias)
@@ -305,12 +304,11 @@ class CosmosCrossAttention(nn.Module):
         )
 
         self.attn = Attention(
-             num_heads=num_heads,
-             head_size=head_dim,
-             softmax_scale=1.0 / (head_dim**0.5),
-             causal=False,
+            num_heads=num_heads,
+            head_size=head_dim,
+            softmax_scale=1.0 / (head_dim**0.5),
+            causal=False,
         )
-
 
     def forward(
         self,
@@ -337,6 +335,7 @@ class CosmosCrossAttention(nn.Module):
         # Apply RoPE
         if image_rotary_emb is not None:
             from diffusers.models.embeddings import apply_rotary_emb
+
             query = apply_rotary_emb(query, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
             key = apply_rotary_emb(key, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
 
@@ -347,8 +346,9 @@ class CosmosCrossAttention(nn.Module):
         # Output projection
         hidden_states, _ = self.to_out[0](hidden_states)
         hidden_states = self.to_out[1](hidden_states)
-                
+
         return hidden_states
+
 
 class CosmosTransformerBlock(nn.Module):
     """
@@ -372,7 +372,7 @@ class CosmosTransformerBlock(nn.Module):
         self.attn1 = CosmosSelfAttention(
             dim=hidden_size,
             num_heads=num_attention_heads,
-            head_dim=attention_head_dim,         
+            head_dim=attention_head_dim,
             dropout=0.0,
             bias=False,
             eps=1e-5,
@@ -383,7 +383,7 @@ class CosmosTransformerBlock(nn.Module):
             query_dim=hidden_size,
             cross_attention_dim=cross_attention_dim,
             num_heads=num_attention_heads,
-            head_dim=attention_head_dim,            
+            head_dim=attention_head_dim,
             dropout=0.0,
             bias=False,
             eps=1e-5,
@@ -542,11 +542,11 @@ class CosmosTransformer3DModel(nn.Module):
     A Transformer model for video-like data used in [Cosmos](https://github.com/NVIDIA/Cosmos).
 
     This is an optimized version of the diffusers CosmosTransformer3DModel that uses
-    vLLM's efficient QKVParallelLinear and RMSNorm implementations.    
+    vLLM's efficient QKVParallelLinear and RMSNorm implementations.
 
     Args:
-        patch_size: 3D patch dimensions for patchifying the input latent tensors (t_patch, h_patch, w_patch).    
-        num_attention_heads: The number of heads to use for multi-head attention.        
+        patch_size: 3D patch dimensions for patchifying the input latent tensors (t_patch, h_patch, w_patch).
+        num_attention_heads: The number of heads to use for multi-head attention.
         attention_head_dim: The number of channels in each attention head.
         in_channels: The number of channels in the input.
         out_channels: The number of channels in the output.
@@ -560,13 +560,12 @@ class CosmosTransformer3DModel(nn.Module):
         extra_pos_embed_type: The type of extra positional embeddings to use. Can be one of `None` or `learnable`.
     """
 
-
     _repeated_blocks = ["CosmosTransformerBlock"]
     _layerwise_offload_blocks_attr = "transformer_blocks"
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
-    
+
     def __init__(
         self,
         *,
@@ -611,7 +610,7 @@ class CosmosTransformer3DModel(nn.Module):
                 "extra_pos_embed_type": extra_pos_embed_type,
                 "use_crossattn_projection": use_crossattn_projection,
                 "crossattn_proj_in_channels": crossattn_proj_in_channels,
-                "encoder_hidden_states_channels": encoder_hidden_states_channels,                                                                                                                                               
+                "encoder_hidden_states_channels": encoder_hidden_states_channels,
             },
         )()
 
@@ -643,7 +642,7 @@ class CosmosTransformer3DModel(nn.Module):
         # Time Embedding
         self.time_embed = CosmosEmbedding(
             embedding_dim=hidden_size,
-            condition_dim=hidden_size,            
+            condition_dim=hidden_size,
         )
 
         # Transformer Blocks
@@ -663,11 +662,9 @@ class CosmosTransformer3DModel(nn.Module):
 
         # Output norm & projection
         self.norm_out = CosmosAdaLayerNorm(hidden_size, adaln_lora_dim)
-        self.proj_out = nn.Linear(
-            hidden_size, patch_size[0] * patch_size[1] * patch_size[2] * out_channels, bias=False
-        )
+        self.proj_out = nn.Linear(hidden_size, patch_size[0] * patch_size[1] * patch_size[2] * out_channels, bias=False)
 
-        if self.config.use_crossattn_projection:    
+        if self.config.use_crossattn_projection:
             self.crossattn_proj = nn.Sequential(
                 nn.Linear(crossattn_proj_in_channels, encoder_hidden_states_channels, bias=True),
                 nn.GELU(),
@@ -688,7 +685,6 @@ class CosmosTransformer3DModel(nn.Module):
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor] | Transformer2DModelOutput:
-
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
 
         # oncatenate padding mask if needed & prepare attention mask
@@ -697,6 +693,7 @@ class CosmosTransformer3DModel(nn.Module):
 
         if self.config.concat_padding_mask:
             from torchvision import transforms
+
             padding_mask_resized = transforms.functional.resize(
                 padding_mask, list(hidden_states.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
             )
@@ -707,7 +704,6 @@ class CosmosTransformer3DModel(nn.Module):
         # Generate positional embeddings
         image_rotary_emb = self.rope(hidden_states, fps=fps)
         extra_pos_emb = self.learnable_pos_embed(hidden_states) if self.config.extra_pos_embed_type else None
-
 
         # Patchify input
         p_t, p_h, p_w = self.config.patch_size
@@ -766,7 +762,6 @@ class CosmosTransformer3DModel(nn.Module):
         return Transformer2DModelOutput(sample=hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-
         # Map separate Q/K/V weights from checkpoint to fused QKV parameter in model
         stacked_params_mapping = [
             (".attn1.to_qkv", ".attn1.to_q", "q"),
