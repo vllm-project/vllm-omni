@@ -377,17 +377,17 @@ def load_higgs_audio_codec(
     Returns:
         (quantizer, fc2, acoustic_decoder, tokenizer_config)
         - quantizer: ``HiggsAudioRVQ`` with ``num_quantizers`` discovered from
-          the state dict (defaults to 8 for boson-ai checkpoints).
+            the state dict (defaults to 8 for boson-ai checkpoints).
         - fc2: ``nn.Linear`` projecting RVQ output (1024) into the DAC's
-          hidden dimension (typically 256). May be uninitialized when loaded
-          from the boson-ai standalone layout (no ``fc2.*`` keys present).
+            hidden dimension (typically 256). May be uninitialized when loaded
+            from the boson-ai standalone layout (no ``fc2.*`` keys present).
         - acoustic_decoder: DAC decoder with HiggsAudioV2 output-padding fix
-          and tanh-replaced-by-Identity. Fully initialized for the OmniVoice
-          layout; partially initialized for boson-ai standalone (missing
-          ``decoder_2.*`` -> ``acoustic_decoder.*`` mapping is not yet
-          implemented; full upstream-decoder vendoring is the next step).
+            and tanh-replaced-by-Identity. Fully initialized for the OmniVoice
+            layout; partially initialized for boson-ai standalone (missing
+            ``decoder_2.*`` -> ``acoustic_decoder.*`` mapping is not yet
+            implemented; full upstream-decoder vendoring is the next step).
         - tokenizer_config: The loaded ``config.json`` dict; useful for
-          callers that need ``sample_rate`` or other tokenizer metadata.
+            callers that need ``sample_rate`` or other tokenizer metadata.
     """
     config_path = os.path.join(audio_tokenizer_dir, "config.json")
 
