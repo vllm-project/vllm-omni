@@ -806,7 +806,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         voice_lower = request.voice.lower()
         if voice_lower not in self.uploaded_speakers:
-            if self._tts_model_type in ("cosyvoice3", "fish_tts", "omnivoice", "moss_tts_nano", "glm_tts", "higgs_audio_v2"):
+            if self._tts_model_type in (
+                "cosyvoice3",
+                "fish_tts",
+                "omnivoice",
+                "moss_tts_nano",
+                "glm_tts",
+                "higgs_audio_v2",
+            ):
                 label = {
                     "cosyvoice3": "CosyVoice3",
                     "fish_tts": "Fish Speech",
@@ -1474,6 +1481,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if request.max_new_tokens is not None:
             if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
                 return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+
     def _validate_glm_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate GLM-TTS request — requires ref_audio for voice cloning."""
         if not request.input or not request.input.strip():
