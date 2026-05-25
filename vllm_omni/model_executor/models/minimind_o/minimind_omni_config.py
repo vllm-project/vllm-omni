@@ -4,13 +4,11 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Any
 
 from transformers import AutoConfig, PretrainedConfig
 
 
-@dataclass
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
 
@@ -294,9 +292,36 @@ class MiniMindOmniConfig(PretrainedConfig):
 
         super().__init__(**kwargs)
 
+        # Mirror MiniMindConfig fields at the OmniConfig top level for callers
+        # that expect a standard text-model config shape.
+        self.hidden_size = self.text_config.hidden_size
+        self.num_hidden_layers = self.text_config.num_hidden_layers
+        self.use_moe = self.text_config.use_moe
+        self.dropout = self.text_config.dropout
+        self.vocab_size = self.text_config.vocab_size
+        self.bos_token_id = self.text_config.bos_token_id
+        self.eos_token_id = self.text_config.eos_token_id
+        self.flash_attn = self.text_config.flash_attn
+        self.num_attention_heads = self.text_config.num_attention_heads
+        self.num_key_value_heads = self.text_config.num_key_value_heads
+        self.head_dim = self.text_config.head_dim
+        self.hidden_act = self.text_config.hidden_act
+        self.intermediate_size = self.text_config.intermediate_size
+        self.max_position_embeddings = self.text_config.max_position_embeddings
+        self.rms_norm_eps = self.text_config.rms_norm_eps
+        self.rope_theta = self.text_config.rope_theta
+        self.tie_word_embeddings = self.text_config.tie_word_embeddings
+        self.inference_rope_scaling = self.text_config.inference_rope_scaling
+        self.rope_scaling = self.text_config.rope_scaling
+        self.num_experts = self.text_config.num_experts
+        self.num_experts_per_tok = self.text_config.num_experts_per_tok
+        self.moe_intermediate_size = self.text_config.moe_intermediate_size
+        self.norm_topk_prob = self.text_config.norm_topk_prob
+        self.router_aux_loss_coef = self.text_config.router_aux_loss_coef
+
         # init vision config
         vision_defaults = {
-            "hidden_size": hidden_size,
+            "hidden_size": self.hidden_size,
             "image_ids": image_ids,
             "image_special_token": image_special_token,
             "image_hidden_size": image_hidden_size,
@@ -311,7 +336,7 @@ class MiniMindOmniConfig(PretrainedConfig):
 
         # init audio config
         audio_defaults = {
-            "hidden_size": hidden_size,
+            "hidden_size": self.hidden_size,
             "audio_ids": audio_ids,
             "audio_special_token": audio_special_token,
             "audio_hidden_size": audio_hidden_size,
@@ -341,30 +366,30 @@ class MiniMindOmniConfig(PretrainedConfig):
         talker_defaults = {
             "hidden_size": talker_hidden_size,
             "num_hidden_layers": num_talker_hidden_layers,
-            "use_moe": self.text_config.use_moe,
-            "dropout": self.text_config.dropout,
-            "vocab_size": self.text_config.vocab_size,
-            "bos_token_id": self.text_config.bos_token_id,
+            "use_moe": self.use_moe,
+            "dropout": self.dropout,
+            "vocab_size": self.vocab_size,
+            "bos_token_id": self.bos_token_id,
             "eos_token_id": self.audio_config.audio_stop_token,
-            "flash_attn": self.text_config.flash_attn,
-            "num_attention_heads": self.text_config.num_attention_heads,
-            "num_key_value_heads": self.text_config.num_key_value_heads,
+            "flash_attn": self.flash_attn,
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
             "head_dim": None,
-            "hidden_act": self.text_config.hidden_act,
+            "hidden_act": self.hidden_act,
             "intermediate_size": None,
-            "max_position_embeddings": self.text_config.max_position_embeddings,
-            "rms_norm_eps": self.text_config.rms_norm_eps,
-            "rope_theta": self.text_config.rope_theta,
+            "max_position_embeddings": self.max_position_embeddings,
+            "rms_norm_eps": self.rms_norm_eps,
+            "rope_theta": self.rope_theta,
             "tie_word_embeddings": False,
-            "inference_rope_scaling": self.text_config.inference_rope_scaling,
-            "rope_scaling": self.text_config.rope_scaling,
-            "num_experts": self.text_config.num_experts,
-            "num_experts_per_tok": self.text_config.num_experts_per_tok,
+            "inference_rope_scaling": self.inference_rope_scaling,
+            "rope_scaling": self.rope_scaling,
+            "num_experts": self.num_experts,
+            "num_experts_per_tok": self.num_experts_per_tok,
             "moe_intermediate_size": None,
-            "norm_topk_prob": self.text_config.norm_topk_prob,
-            "router_aux_loss_coef": self.text_config.router_aux_loss_coef,
+            "norm_topk_prob": self.norm_topk_prob,
+            "router_aux_loss_coef": self.router_aux_loss_coef,
             "num_code_layers": self.code2wav_config.codec_num_code_layers,
-            "text_hidden_size": self.text_config.hidden_size,
+            "text_hidden_size": self.hidden_size,
             "audio_vocab_size": self.audio_config.audio_vocab_size,
             "audio_pad_token": self.audio_config.audio_pad_token,
             "audio_stop_token": self.audio_config.audio_stop_token,
@@ -404,11 +429,7 @@ class MiniMindOmniConfig(PretrainedConfig):
         self.image_hidden_size = self.vision_config.image_hidden_size
         self.image_token_len = self.vision_config.image_token_len
         self.vision_model_path = self.vision_config.vision_model_path
-        self.bridge_layer = (
-            bridge_layer
-            if bridge_layer is not None
-            else int(getattr(self.text_config, "num_hidden_layers", num_hidden_layers)) // 2 - 1
-        )
+        self.bridge_layer = bridge_layer if bridge_layer is not None else int(self.num_hidden_layers) // 2 - 1
 
     def get_text_config(self, **kwargs: Any) -> PretrainedConfig:
         return self.text_config
