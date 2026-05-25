@@ -1,5 +1,3 @@
-from unittest.mock import Mock, patch
-
 import pytest
 import torch
 
@@ -19,10 +17,14 @@ class MockInputBatch:
         self.req_ids = ["req1", "req2"]
         self.req_id_to_index = {req_id: i for i, req_id in enumerate(self.req_ids)}
         self.num_computed_tokens_cpu = num_computed_tokens_cpu
+
         # Block table is only mocked for validation of length;
         # we don't actually need to add valid values here since
         # we patch the table when testing.
-        self.block_table = Mock()
+        class _DummyBlockTable:
+            pass
+
+        self.block_table = _DummyBlockTable()
         self.block_table.block_tables = [None]
 
 
@@ -186,7 +188,7 @@ def fake_get_cached_block_ids(self, req_idx, *args, **kwargs):
 
 
 @pytest.mark.parametrize("num_tokens_padded", [None, 16])
-def test_get_merged_hidden_states(num_tokens_padded):
+def test_get_merged_hidden_states(num_tokens_padded, mocker):
     """Ensure that hidden states are merged correctly."""
     cache = get_omni_pcache()
 
@@ -221,16 +223,16 @@ def test_get_merged_hidden_states(num_tokens_padded):
 
     input_batch = MockInputBatch(num_computed_tokens_cpu=torch.Tensor([orig_num_tokens_unpadded, 0]))
 
-    with patch(
+    mocker.patch(
         "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_cached_block_ids",
         new=fake_get_cached_block_ids,
-    ):
-        merged_states = cache.get_merged_hidden_states(
-            query_start_loc=[0, num_new_toks_req1],
-            input_batch=input_batch,
-            hidden_states=new_hidden_states,
-            num_scheduled_tokens=num_scheduled_tokens,
-        )
+    )
+    merged_states = cache.get_merged_hidden_states(
+        query_start_loc=[0, num_new_toks_req1],
+        input_batch=input_batch,
+        hidden_states=new_hidden_states,
+        num_scheduled_tokens=num_scheduled_tokens,
+    )
 
     assert "req1" in merged_states and "req2" in merged_states
     req1_merged_states = merged_states["req1"]
@@ -255,7 +257,7 @@ def test_get_merged_hidden_states(num_tokens_padded):
         {"foo": 100, "bar": 50, "baz": 10},
     ],
 )
-def test_get_merged_multimodal_outputs(feat_dims, num_tokens_padded):
+def test_get_merged_multimodal_outputs(feat_dims, num_tokens_padded, mocker):
     cache = get_omni_pcache_with_mm_tensors(feat_dims, seq_len=DEFAULT_SEQ_LEN)
 
     orig_num_tokens_unpadded = 8
@@ -298,16 +300,16 @@ def test_get_merged_multimodal_outputs(feat_dims, num_tokens_padded):
 
     input_batch = MockInputBatch(num_computed_tokens_cpu=torch.Tensor([orig_num_tokens_unpadded, 0]))
 
-    with patch(
+    mocker.patch(
         "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_cached_block_ids",
         new=fake_get_cached_block_ids,
-    ):
-        merged_mm_outputs = cache.get_merged_multimodal_states(
-            query_start_loc=[0, num_new_toks_req1],
-            input_batch=input_batch,
-            multimodal_outputs=new_mm_outputs,
-            num_scheduled_tokens=num_scheduled_tokens,
-        )
+    )
+    merged_mm_outputs = cache.get_merged_multimodal_states(
+        query_start_loc=[0, num_new_toks_req1],
+        input_batch=input_batch,
+        multimodal_outputs=new_mm_outputs,
+        num_scheduled_tokens=num_scheduled_tokens,
+    )
 
     # Ensure the passthrough data wasn't dropped
     assert "passthrough_data" in merged_mm_outputs

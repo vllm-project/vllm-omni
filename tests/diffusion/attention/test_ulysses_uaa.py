@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -79,7 +80,7 @@ def _run_attention_case(
     )
     od_config = OmniDiffusionConfig(model="test", dtype=torch.float32, parallel_config=parallel_config)
 
-    with set_forward_context(omni_diffusion_config=od_config):
+    with set_forward_context(omni_diffusion_config=od_config), set_current_diffusion_config(od_config):
         attn = Attention(
             num_heads=num_heads,
             head_size=head_size,

@@ -87,22 +87,10 @@ def _decode_runtime_bridge_info(value: Any) -> dict[str, Any]:
 
 
 def _bridge_tokens(
-    stage_list,
-    engine_input_source,
+    source_outputs,
     prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
 ):
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-
-    source_outputs = stage_list[source_stage_id].engine_outputs
     next_inputs = []
     if not isinstance(prompt, list):
         prompt = [prompt]
@@ -117,11 +105,9 @@ def _bridge_tokens(
         if not token_ids:
             token_ids = _to_token_id_list(mm_out.get("text_tokens"))
         if not token_ids:
-            token_ids = list(getattr(output, "token_ids", []) or [])
+            token_ids = list(output.cumulative_token_ids or [])
         if not token_ids:
-            raise RuntimeError(
-                f"Stage {source_stage_id} output for request {source_output.request_id} has no token_ids"
-            )
+            raise RuntimeError(f"Stage output for request {source_output.request_id} has no token_ids")
 
         detok_id = _to_int(mm_out.get("detok_id"), default=0)
         src_prompt = prompt_meta_by_reqid.get(source_output.request_id, {})
@@ -147,18 +133,16 @@ def _bridge_tokens(
 
 
 def token2text_to_token2image(
-    stage_list,
-    engine_input_source,
+    source_outputs,
     prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
 ):
-    return _bridge_tokens(stage_list, engine_input_source, prompt, requires_multimodal_data)
+    return _bridge_tokens(source_outputs, prompt, requires_multimodal_data)
 
 
 def token2image_to_token2audio(
-    stage_list,
-    engine_input_source,
+    source_outputs,
     prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
 ):
-    return _bridge_tokens(stage_list, engine_input_source, prompt, requires_multimodal_data)
+    return _bridge_tokens(source_outputs, prompt, requires_multimodal_data)

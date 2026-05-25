@@ -32,6 +32,11 @@ class ImageGenerationRequest(BaseModel):
 
     # Required fields
     prompt: str = Field(..., description="Text description of the desired image(s)")
+    bot_task: str | None = Field(
+        None,
+        description="Task mode for the model (e.g., 'cot' enables chain-of-thought generation). "
+        "Only supported by specific diffusion models.",
+    )
 
     # OpenAI standard fields
     model: str | None = Field(
@@ -139,6 +144,12 @@ class ImageGenerationRequest(BaseModel):
     vae_use_slicing: bool | None = Field(default=False, description="Enable VAE slicing")
     vae_use_tiling: bool | None = Field(default=False, description="Enable VAE tiling")
 
+    # Output format for generated images
+    output_format: str | None = Field(
+        default=None,
+        description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
+    )
+
 
 class ImageData(BaseModel):
     """Single generated image data"""
@@ -159,3 +170,8 @@ class ImageGenerationResponse(BaseModel):
     data: list[ImageData] = Field(..., description="Array of generated images")
     output_format: str = Field(None, description="The output format of the image generation")
     size: str = Field(None, description="The size of the image generated")
+    cot_output: str | None = Field(
+        None,
+        description="Chain-of-thought text output from the AR stage. "
+        "Only present for image editing (IT2I) with CoT-enabled models.",
+    )

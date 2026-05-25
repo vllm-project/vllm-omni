@@ -108,6 +108,11 @@ _OMNI_MODELS = {
         "mimo_audio",
         "MiMoAudioForConditionalGeneration",
     ),
+    "MiMoV2ASRForCausalLM": (
+        "mimo_audio",
+        "mimo_audio",
+        "MiMoAudioForConditionalGeneration",
+    ),
     "MiMoAudioLLMModel": (
         "mimo_audio",
         "mimo_audio_llm",
@@ -123,6 +128,12 @@ _OMNI_MODELS = {
         "glm_image",
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
+    ),
+    ## glm_tts
+    "GLMTTSForConditionalGeneration": (
+        "glm_tts",
+        "glm_tts",
+        "GLMTTSForConditionalGeneration",
     ),
     "OmniBagelForConditionalGeneration": (
         "bagel",
@@ -145,12 +156,6 @@ _OMNI_MODELS = {
         "fish_speech_dac_decoder",
         "FishSpeechDACDecoder",
     ),
-    ## VoxCPM
-    "VoxCPMForConditionalGeneration": (
-        "voxcpm",
-        "voxcpm",
-        "VoxCPMForConditionalGeneration",
-    ),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",
@@ -169,6 +174,38 @@ _OMNI_MODELS = {
         "VoxtralTTSAudioGenerationForConditionalGeneration",
     ),
     "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
+    ## covo_audio
+    "CovoAudioForCausalLM": (
+        "covo_audio",
+        "covo_audio",
+        "CovoAudioForConditionalGeneration",
+    ),
+    "CovoAudioForConditionalGeneration": (
+        "covo_audio",
+        "covo_audio",
+        "CovoAudioForConditionalGeneration",
+    ),
+    "CovoAudioModel": (
+        "covo_audio",
+        "covo_audio",
+        "CovoAudioForConditionalGeneration",
+    ),
+    "CovoAudioLLMModel": (
+        "covo_audio",
+        "covo_audio_llm",
+        "CovoAudioLLMForConditionalGeneration",
+    ),
+    "CovoAudioCode2WavModel": (
+        "covo_audio",
+        "covo_audio_code2wav",
+        "CovoAudioCode2WavForConditionalGeneration",
+    ),
+    ## MOSS-TTS-Nano
+    "MossTTSNanoForCausalLM": (
+        "moss_tts_nano",
+        "modeling_moss_tts_nano",
+        "MossTTSNanoForGeneration",
+    ),
     "DyninOmniForConditionalGeneration": (
         "dynin_omni",
         "dynin_omni",
@@ -184,6 +221,11 @@ _OMNI_MODELS = {
         "ming_flash_omni",
         "ming_flash_omni_thinker",
         "MingFlashOmniThinkerForConditionalGeneration",
+    ),
+    "MingFlashOmniTalkerForConditionalGeneration": (
+        "ming_flash_omni",
+        "ming_flash_omni_talker",
+        "MingFlashOmniTalkerForConditionalGeneration",
     ),
     # Alias: HF repo currently ships this architecture name in config.json
     "BailingMM2NativeForConditionalGeneration": (

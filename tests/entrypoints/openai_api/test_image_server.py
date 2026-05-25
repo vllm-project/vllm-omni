@@ -13,15 +13,20 @@ from argparse import Namespace
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import SamplingParams
+from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
+from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels, router
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
+from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -210,7 +215,11 @@ def async_omni_test_client():
             ]
             default_sampling_params_list = [
                 SamplingParams(temperature=0.1),
-                OmniDiffusionSamplingParams(),
+                OmniDiffusionSamplingParams(
+                    num_inference_steps=4,
+                    guidance_scale=7.5,
+                    generator_device="cpu",
+                ),
             ]
             self.engine = SimpleNamespace(
                 stage_configs=stage_configs,
@@ -407,6 +416,29 @@ def test_health_endpoint_no_engine():
     assert data["status"] == "unhealthy"
 
 
+def test_health_endpoint_dead_engine():
+    """Health returns 503 when the engine raises EngineDeadError."""
+    from unittest.mock import AsyncMock
+
+    from fastapi import FastAPI
+    from vllm.v1.engine.exceptions import EngineDeadError
+
+    from vllm_omni.entrypoints.openai.api_server import router
+
+    app = FastAPI()
+    app.include_router(router)
+
+    dead_engine = AsyncMock()
+    dead_engine.check_health = AsyncMock(side_effect=EngineDeadError())
+    app.state.engine_client = dead_engine
+
+    client = TestClient(app)
+    response = client.get("/health")
+    assert response.status_code == 503
+    data = response.json()
+    assert data["status"] == "unhealthy"
+
+
 def test_models_endpoint(test_client):
     """Test /v1/models endpoint for diffusion mode"""
     response = test_client.get("/v1/models")
@@ -544,6 +576,90 @@ def test_multistage_images_async_omni_construction(async_omni_test_client):
     assert captured[1].seed == 7
     assert captured[1].num_inference_steps == 12
     assert captured[1].guidance_scale == 6.5
+
+
+def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
+    """GLM-Image multistage: stage-0 gets target_h/w from requested size.
+
+    max_tokens comes from the deploy YAML default (upper-bound ceiling),
+    NOT computed dynamically from height/width.
+    """
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            stage_configs = [
+                SimpleNamespace(stage_type="llm", is_comprehension=True, model_arch="GlmImageForConditionalGeneration"),
+                SimpleNamespace(stage_type="diffusion", is_comprehension=False, model_arch="GlmImagePipeline"),
+            ]
+            # YAML default max_tokens for GLM-Image AR stage (upper bound for 2048x2048 t2i)
+            default_sampling_params_list = [
+                SamplingParams(temperature=0.1, seed=42, max_tokens=4353),
+                OmniDiffusionSamplingParams(height=1024, width=1024),
+            ]
+            self.engine = SimpleNamespace(
+                stage_configs=stage_configs,
+                default_sampling_params_list=default_sampling_params_list,
+            )
+            self.default_sampling_params_list = default_sampling_params_list
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self._images = [Image.new("RGB", (64, 64), color="green")]
+            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+            self.captured_sampling_params_list = (
+                sampling_params_list if sampling_params_list is not None else [sampling_params]
+            )
+            self.captured_prompt = prompt
+            yield MockGenerationResult([img.copy() for img in self._images])
+
+        def __class_getitem__(cls, item):
+            return cls
+
+        def get_diffusion_od_config(self):
+            return self.od_config
+
+    app = FastAPI()
+    app.include_router(router)
+    engine = FakeAsyncOmniClass()
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = engine
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
+    app.state.engine_client = engine
+    app.state.stage_configs = [
+        SimpleNamespace(stage_type="llm", model_arch="GlmImageForConditionalGeneration"),
+        SimpleNamespace(stage_type="diffusion", model_arch="GlmImagePipeline"),
+    ]
+    app.state.openai_serving_models = _DiffusionServingModels(
+        [BaseModelPath(name="THUDM/GLM-4.5V", model_path="THUDM/GLM-4.5V")]
+    )
+    app.state.args = Namespace(
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
+        max_generated_image_size=1048576,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a coral reef",
+            "n": 1,
+            "size": "1024x1024",
+            "seed": 7,
+        },
+    )
+    assert response.status_code == 200
+
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert len(captured) == 2
+    # max_tokens comes from YAML default, not computed dynamically
+    assert captured[0].max_tokens == 4353
+    assert captured[0].extra_args["target_h"] == 1024
+    assert captured[0].extra_args["target_w"] == 1024
+    assert captured[1].height == 1024
+    assert captured[1].width == 1024
 
 
 def test_image_edits_async_omni_stage_configs_only(async_omni_stage_configs_only_client):
@@ -851,6 +967,19 @@ def test_model_field_omitted_works(test_client):
     assert response.status_code == 200
 
 
+def test_generate_images_rejects_model_mismatch(test_client):
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "test",
+            "model": "Qwen/Qwen-Image-2512",
+            "size": "1024x1024",
+        },
+    )
+    assert response.status_code == 400
+    assert "model mismatch" in response.json()["detail"].lower()
+
+
 def make_test_image_bytes(size=(64, 64)) -> bytes:
     img = Image.new(
         "RGB",
@@ -954,6 +1083,20 @@ def test_image_edit_rejects_multiple_images_when_model_does_not_support_them(asy
     assert engine.captured_prompt is None
 
 
+def test_image_edit_rejects_model_mismatch(test_client):
+    img_bytes = make_test_image_bytes((16, 16))
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit me",
+            "model": "Qwen/Qwen-Image-Edit",
+        },
+    )
+    assert response.status_code == 400
+    assert "model mismatch" in response.json()["detail"].lower()
+
+
 def test_image_edit_rejects_too_many_images_for_qwen_image_edit_2511(async_omni_test_client):
     engine = async_omni_test_client.app.state.engine_client
     engine.get_diffusion_od_config = lambda: SimpleNamespace(
@@ -1009,6 +1152,28 @@ def test_image_edit_rejects_too_many_images_for_qwen_image_edit_2511_before_load
     assert response.status_code == 400
     assert response.json()["detail"] == "Received 5 input images. At most 4 images are supported by this model."
     assert engine.captured_prompt is None
+
+
+def test_image_edit_ignores_mock_like_multimodal_limit(async_omni_test_client):
+    engine = async_omni_test_client.app.state.engine_client
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        supports_multimodal_inputs=SimpleNamespace(),
+        max_multimodal_image_inputs=SimpleNamespace(),
+    )
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((16, 16)))],
+        data={"prompt": "hello world."},
+    )
+
+    assert response.status_code == 200
+    captured_prompt = engine.captured_prompt
+    assert captured_prompt is not None
+    # Multi-stage path uses "img2img" key for single reference image
+    processed_images = captured_prompt["multi_modal_data"]["img2img"]
+    assert isinstance(processed_images, Image.Image)
+    assert processed_images.size == (16, 16)
 
 
 def test_image_edit_parameter_pass(async_omni_test_client):
@@ -1184,8 +1349,16 @@ def test_image_edit_parameter_default(async_omni_test_client):
     engine = async_omni_test_client.app.state.engine_client
     captured_sampling_params = engine.captured_sampling_params_list[-1]
 
-    assert captured_sampling_params.width == 24
-    assert captured_sampling_params.height == 16
+    # size="auto" on multi-stage pipelines deliberately leaves the diffusion
+    # stages sampling_params width/height unset so AR-driven pipelines (e.g.
+    # HunyuanImage-3.0) can let ar2diffusion override the final bucket from
+    # the AR-predicted ratio token; see
+    # test_image_edits_size_auto_preserves_bridge_size for the contract.
+    # Single-stage diffusion (test_image_edit_parameter_default_single_stage)
+    # still pins width/height to the input image size via api_servers
+    # gen_params, which is unchanged.
+    assert captured_sampling_params.width is None
+    assert captured_sampling_params.height is None
     assert captured_sampling_params.num_outputs_per_prompt == 1
     assert captured_sampling_params.num_inference_steps == 4
     assert captured_sampling_params.guidance_scale == 7.5
@@ -1484,3 +1657,59 @@ def test_extract_images_from_result():
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
     assert images[0].size == (32, 32)
+
+
+def test_image_edits_size_auto_preserves_bridge_size(async_omni_stage_configs_only_client):
+    """size=auto must NOT pin the diffusion stage sampling_params.height/width.
+
+    Regression: prior to the fix, edit_images resolved size=auto to the
+    first input image dimensions and forwarded them through gen_params +
+    extra_body to the diffusion stages sampling_params. AR-driven
+    pipelines (e.g. HunyuanImage-3.0) rely on ar2diffusions
+    bridge to override the final bucket via the AR-predicted ratio token,
+    and the DiT pre_process_func only fills sampling_params from the
+    bridge value when sampling_params.width is None (see
+    pipeline_hunyuan_image3.py:290). Non-None width from the input image
+    silently suppressed the AR decision, producing the wrong bucket
+    (e.g. 1024x1024 square instead of the AR-decided 1280x720 landscape
+    for multi-image fusion).
+
+    Cross-pins the multi-image fix at the API level: 2 reference images
+    with bot_task=think must produce 2 <img> placeholders in the captured
+    AR prompt (build_prompt called with num_images=2).
+    """
+    img_a = make_test_image_bytes((32, 32))
+    img_b = make_test_image_bytes((128, 64))
+    response = async_omni_stage_configs_only_client.post(
+        "/v1/images/edits",
+        files=[("image", img_a), ("image", img_b)],
+        data={
+            "prompt": "fuse",
+            "size": "auto",
+            "bot_task": "think",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    engine = async_omni_stage_configs_only_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert len(captured) == 2
+
+    diffusion_params = captured[1]
+    assert diffusion_params.height is None, (
+        f"size=auto leaked into diffusion sampling_params.height={diffusion_params.height}; "
+        "must stay None so AR-driven pipelines can apply the bridges decision."
+    )
+    assert diffusion_params.width is None, (
+        f"size=auto leaked into diffusion sampling_params.width={diffusion_params.width}; "
+        "must stay None so AR-driven pipelines can apply the bridges decision."
+    )
+
+    KEY = "prompt"
+    IMG = "<img>"
+    captured_prompt = engine.captured_prompt
+    if isinstance(captured_prompt, dict) and isinstance(captured_prompt.get("prompt"), str):
+        assert captured_prompt["prompt"].count("<img>") == 2, (
+            f"N=2 reference images must emit 2 <img> placeholders in AR prompt; got {captured_prompt[KEY].count(IMG)} -- prompt: {captured_prompt[KEY]!r}"
+        )

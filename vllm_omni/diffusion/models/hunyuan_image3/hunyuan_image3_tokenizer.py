@@ -35,6 +35,8 @@ class TokenizerEncodeOutput(BaseOutput):
     all_image_slices: list[slice] | None = None
     cond_timestep_scatter_index: torch.Tensor | None = None
     gen_timestep_scatter_index: torch.Tensor | None = None
+    think_recaption_end_pos: list[int | None] | list[list[int | None]] | None = None
+    uncond_cfg_start_pos: list[int | None] | None = None
 
 
 class Conversation:
@@ -59,6 +61,7 @@ class TokenizerWrapper:
         self.cfg_token_id = self.tokenizer.convert_tokens_to_ids("<cfg>")
         self.end_answer_token_id = self.tokenizer.convert_tokens_to_ids("</answer>")
         self.end_recaption_token_id = self.tokenizer.convert_tokens_to_ids("</recaption>")
+        self.end_think_token_id = self.tokenizer.convert_tokens_to_ids("</think>")
         self.ratio_token_offset = self.tokenizer.convert_tokens_to_ids("<img_ratio_0>")
         self.special_token_map = self.tokenizer.added_tokens_encoder
 
@@ -310,8 +313,14 @@ class TokenizerWrapper:
             if key == "text":
                 token_seq.extend(source)  # text token sequence
                 extra_token_pos["<text>_start"].append(token_count)
+                if "<cfg>_start" not in extra_token_pos and len(source) > 0 and source[0] == self.cfg_token_id:
+                    extra_token_pos["<cfg>_start"].append(token_count)
                 token_count += len(source)
                 extra_token_pos["<text>_end"].append(token_count - 1)
+                if len(source) > 0 and source[-1] == self.end_think_token_id:
+                    extra_token_pos["<think>_end"].append(token_count - 1)
+                if len(source) > 0 and source[-1] == self.end_recaption_token_id:
+                    extra_token_pos["<recaption>_end"].append(token_count - 1)
 
             elif key == "gen_image":
                 if isinstance(source, int):
@@ -828,6 +837,12 @@ class TokenizerWrapper:
         # real_pos is the first position of the <pad> token
         real_pos = torch.tensor(extra_token_pos.get("first_pad", [full_seq_token_tensor.shape[0]]), dtype=torch.long)
 
+        # used in AR kv reuse case
+        think_end_pos = extra_token_pos.get("<think>_end", [None])[0]
+        recaption_end_pos = extra_token_pos.get("<recaption>_end", [None])[0]
+        think_recaption_end_pos = [recaption_end_pos or think_end_pos]
+        uncond_cfg_start_pos = [extra_token_pos.get("<cfg>_start", [None])[0]]
+
         return TokenizerEncodeOutput(
             tokens=full_seq_token_tensor,
             timestep_scatter_index=timestep_scatter_index,
@@ -845,6 +860,8 @@ class TokenizerWrapper:
             all_image_slices=all_image_slices,
             cond_timestep_scatter_index=cond_timestep_scatter_index,
             gen_timestep_scatter_index=gen_timestep_scatter_index,
+            think_recaption_end_pos=think_recaption_end_pos,
+            uncond_cfg_start_pos=uncond_cfg_start_pos,
         )
 
     def get_cot_sections(self, cot_text, uncond_kwargs, cot_max_length=None, drop_think=False):

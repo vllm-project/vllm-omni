@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
@@ -18,6 +20,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def mock_engine():
     with patch("vllm_omni.diffusion.inline_stage_diffusion_client.DiffusionEngine") as mock:
         engine_instance = MagicMock()
+        engine_instance.executor = SimpleNamespace(
+            register_failure_callback=MagicMock(),
+            check_health=MagicMock(),
+        )
         mock.make_engine.return_value = engine_instance
         yield engine_instance
 
@@ -94,3 +100,59 @@ def test_inline_shutdown(client, mock_engine):
 
     assert client._shutting_down
     mock_engine.close.assert_called_once()
+
+
+def test_inline_registers_executor_failure_callback(client, mock_engine):
+    mock_engine.executor.register_failure_callback.assert_called_once()
+
+
+def test_inline_executor_failure_marks_engine_dead(client, mock_engine):
+    callback = mock_engine.executor.register_failure_callback.call_args.args[0]
+
+    callback()
+
+    assert client._engine_dead is True
+    with pytest.raises(EngineDeadError, match="inline diffusion engine is dead"):
+        client.get_diffusion_output_nowait()
+
+
+def test_inline_returns_queued_output_before_engine_dead(client, mock_engine):
+    callback = mock_engine.executor.register_failure_callback.call_args.args[0]
+    output = OmniRequestOutput.from_diffusion(request_id="req-queued", images=[])
+    client._output_queue.put_nowait(output)
+
+    callback()
+
+    assert client.get_diffusion_output_nowait() is output
+    with pytest.raises(EngineDeadError, match="inline diffusion engine is dead"):
+        client.get_diffusion_output_nowait()
+
+
+def test_inline_check_health_marks_engine_dead(client, mock_engine):
+    mock_engine.executor.check_health.side_effect = EngineDeadError()
+
+    with pytest.raises(EngineDeadError):
+        client.check_health()
+
+    assert client._engine_dead is True
+
+
+def test_inline_client_requires_replica_id(mock_engine):
+    metadata = SimpleNamespace(
+        stage_id=0,
+        final_output=True,
+        final_output_type="image",
+        default_sampling_params={},
+        requires_multimodal_data=False,
+        custom_process_input_func=None,
+        engine_input_source=[],
+    )
+    with patch.object(InlineStageDiffusionClient, "_enrich_config"):
+        od_config = MagicMock(spec=OmniDiffusionConfig)
+        with pytest.raises(AttributeError, match="replica_id"):
+            InlineStageDiffusionClient(
+                model="test_model",
+                od_config=od_config,
+                metadata=metadata,
+                batch_size=1,
+            )

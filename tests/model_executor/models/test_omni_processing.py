@@ -22,17 +22,18 @@ from vllm.config.multimodal import (
     VideoDummyOptions,
 )
 from vllm.inputs import MultiModalDataDict, MultiModalInput
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import MultiModalProcessorOnlyCache
 from vllm.multimodal.inputs import batched_tensors_equal
 from vllm.multimodal.processing import BaseMultiModalProcessor, InputProcessingContext
 from vllm.tokenizers import TokenizerLike, cached_tokenizer_from_config
 
+from tests.model_executor.helpers import bootstrap_vllm_layer_custom_op_modules
 from tests.model_executor.models.registry import (
     _MULTIMODAL_OMNI_EXAMPLE_MODELS,
     _OmniExamplesInfo,
 )
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.model_executor.models.registry import OmniModelRegistry
 
 
 def random_image(rng: np.random.RandomState, min_wh: int, max_wh: int):
@@ -128,6 +129,36 @@ def _build_model_config(model_arch: str, info: _OmniExamplesInfo) -> OmniModelCo
     return model_config
 
 
+def _get_model_class_for_omni_processing(
+    model_config: OmniModelConfig,
+):
+    """Resolve the multimodal model class for processor tests.
+
+    vLLM's ``MULTIMODAL_REGISTRY._get_model_cls`` uses
+    :func:`get_model_architecture`, which re-imports
+    :mod:`vllm.model_executor.model_loader` and can re-register the same
+    custom Torch / CustomOp names when tests run in isolation
+    (``tests/model_executor/``).  Omni-registered classes are loaded
+    unambiguously via :meth:`OmniModelRegistry._try_load_model_cls`.
+
+    :func:`bootstrap_vllm_layer_custom_op_modules` also runs (see
+    :file:`../helpers.py` and :file:`../conftest.py`) so vLLM layer modules are in :data:`sys.modules`
+    before shims like ``qwen2_5_omni_thinker`` import
+    :mod:`vllm.model_executor.models.qwen2_5_omni_thinker` (avoids duplicate
+    ``@CustomOp.register`` e.g. ``fatrelu_and_mul``).
+    """
+    bootstrap_vllm_layer_custom_op_modules()
+    if not model_config.model_arch:
+        raise ValueError("OmniModelConfig.model_arch is required for processing tests")
+    model_cls = OmniModelRegistry._try_load_model_cls(model_config.model_arch)
+    if model_cls is None:
+        raise RuntimeError(
+            f"OmniModelRegistry has no class registered for {model_config.model_arch!r}; "
+            "add it to vllm_omni.model_executor.models or fix the test matrix."
+        )
+    return model_cls
+
+
 def _test_processing_correctness(
     model_arch: str,
     hit_rate: float,
@@ -141,7 +172,7 @@ def _test_processing_correctness(
 
     model_config = _build_model_config(model_arch, info)
 
-    model_cls = MULTIMODAL_REGISTRY._get_model_cls(model_config)
+    model_cls = _get_model_class_for_omni_processing(model_config)
     factories = model_cls._processor_factory
     ctx = InputProcessingContext(
         model_config,

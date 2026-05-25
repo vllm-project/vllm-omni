@@ -65,6 +65,22 @@ def apply_rotary_emb_mindiesd(
         return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
 
 
+def _ensure_batch_dim(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    # Upstream fused rotary kernels expect ``x`` shaped as
+    # ``[batch_size, seq_len, nheads, headdim]``. Some omni diffusion call
+    # sites pass ``[seq_len, nheads, headdim]`` instead, so normalize to 4D
+    # here before entering the fused path.
+    if x.dim() == 3:
+        return x.unsqueeze(0), True
+    return x, False
+
+
+def _restore_batch_dim(x: torch.Tensor, squeezed: bool) -> torch.Tensor:
+    if squeezed:
+        return x.squeeze(0)
+    return x
+
+
 class RotaryEmbedding(CustomOp):
     """
     rotary positional embedding.
@@ -72,18 +88,18 @@ class RotaryEmbedding(CustomOp):
            of 1st half and 2nd half (GPT-NeoX style).
     """
 
-    def __init__(
-        self,
-        is_neox_style: bool = False,
-    ) -> None:
+    def __init__(self, is_neox_style: bool = False) -> None:
         super().__init__()
         self.is_neox_style = is_neox_style
         self.interleaved = not is_neox_style
         self.apply_rotary_emb_flash_attn = None
+        self.has_mindie = False
         if find_spec("flash_attn") is not None:
             from flash_attn.ops.triton.rotary import apply_rotary
 
             self.apply_rotary_emb_flash_attn = apply_rotary
+        if find_spec("mindiesd") is not None:
+            self.has_mindie = True
 
     def forward_cuda(
         self,
@@ -98,12 +114,14 @@ class RotaryEmbedding(CustomOp):
             cos = cos[0]
             sin = sin[0]
 
-        return apply_rotary_emb(
+        x, squeezed = _ensure_batch_dim(x)
+        output = apply_rotary_emb(
             x,
             cos,
             sin,
             interleaved=self.interleaved,
         )
+        return _restore_batch_dim(output, squeezed)
 
     def forward_hip(
         self,
@@ -119,12 +137,14 @@ class RotaryEmbedding(CustomOp):
             cos = cos[0]
             sin = sin[0]
 
-        return self.apply_rotary_emb_flash_attn(
+        x, squeezed = _ensure_batch_dim(x)
+        output = self.apply_rotary_emb_flash_attn(
             x,
             cos,
             sin,
             interleaved=self.interleaved,
         )
+        return _restore_batch_dim(output, squeezed)
 
     def forward_npu(
         self,
@@ -132,7 +152,7 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        if find_spec("mindiesd"):
+        if self.has_mindie:
             return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved)
         else:
             return self.forward_native(x, cos, sin)
@@ -165,6 +185,87 @@ class RotaryEmbedding(CustomOp):
             sin,
             interleaved=self.interleaved,
         )
+
+
+class RotaryEmbeddingWan(RotaryEmbedding):
+    """
+    rotary positional embedding for Wan.
+    interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
+           of 1st half and 2nd half (GPT-NeoX style).
+    """
+
+    def __init__(self, is_neox_style: bool = False, half_head_dim: bool = False) -> None:
+        super().__init__(is_neox_style=is_neox_style)
+        self.half_head_dim = half_head_dim
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+
+        if cos.dim() > 2:
+            cos = cos.reshape(-1, cos.shape[-1])
+            sin = sin.reshape(-1, sin.shape[-1])
+
+        return apply_rotary_emb(
+            x,
+            cos,
+            sin,
+            interleaved=self.interleaved,
+        )
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.apply_rotary_emb_flash_attn is None:
+            return self.forward_native(x, cos, sin)
+
+        if cos.dim() > 2:
+            cos = cos.reshape(-1, cos.shape[-1])
+            sin = sin.reshape(-1, sin.shape[-1])
+
+        return self.apply_rotary_emb_flash_attn(
+            x,
+            cos,
+            sin,
+            interleaved=self.interleaved,
+        )
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.has_mindie:
+            if cos.dim() > 2:
+                cos = cos.reshape(-1, cos.shape[-1])
+                sin = sin.reshape(-1, sin.shape[-1])
+            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved, self.half_head_dim)
+        else:
+            return self.forward_native(x, cos, sin)
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
+        rotated = torch.stack(
+            (
+                x1 * cos - x2 * sin,
+                x1 * sin + x2 * cos,
+            ),
+            dim=-1,
+        )
+        return rotated.flatten(-2, -1).to(x.dtype)
 
 
 def apply_rope_to_qk(
