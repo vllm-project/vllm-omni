@@ -221,7 +221,7 @@ class PipelineConfig:
     # Example: MiniCPM-o 4.5 and 2.6 both ship ``architectures=["MiniCPMO"]``
     # but differ on the ``version`` field, so the 4.5 pipeline declares
     # ``hf_config_predicate=lambda c: getattr(c, "version", "") == "4.5"``
-    # to avoid mis-routing 2.6 checkpoints.
+    # to avoid misrouting 2.6 checkpoints.
     hf_config_predicate: Callable[[Any], bool] | None = None
     # Diffusers pipeline class name: for models that ship a ``model_index.json``
     # (no root ``config.json``), the ``_class_name`` field is matched against
