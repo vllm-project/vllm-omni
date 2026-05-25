@@ -555,12 +555,7 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
         content_text="Tell a 300-word story.",
     )
 
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": True,
-        "similarity_threshold": 0.85
-    }
+    request_config = {"model": omni_server.model, "messages": messages, "stream": True, "similarity_threshold": 0.85}
     responses = openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
     text = responses[0].text_content if responses else ""
     word_count = len(text.split())
