@@ -317,7 +317,6 @@ class FlashAttentionImpl(AttentionImpl):
         # So reuse SDPA's mask reshape logic: [B, S] -> [B, 1, Sq, Skv]
         attention_mask = _maybe_reshape_attn_mask(query, key, attention_mask, mask_mode="full_qk")
 
-        output = attention_forward(
         layout = self.qkv_layout or "BNSD"
         return attention_forward(
             query,
