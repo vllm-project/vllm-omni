@@ -429,6 +429,78 @@ class GroupCoordinator:
                 async_handle.wait()
         return tensor_dict
 
+    def isend_tensor_dict(
+        self,
+        tensor_dict: dict[str, torch.Tensor | Any],
+        dst: int | None = None,
+    ) -> list[torch.distributed.Work]:
+        """Non-blocking send of a tensor dictionary.
+
+        Sends metadata via the Gloo CPU group (blocking) then starts a
+        non-blocking NCCL isend for each GPU tensor.  Returns the list of
+        Work handles; the caller must call handle.wait() before the tensors
+        can be safely reused or freed.
+
+        NOTE: `dst` is the group rank of the destination.
+        """
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return []
+
+        if dst is None:
+            dst = self.group_next_rank
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        self.send_object(metadata_list, dst=dst)
+
+        handles: list[torch.distributed.Work] = []
+        for tensor in tensor_list:
+            if tensor.numel() == 0:
+                continue
+            group = self.cpu_group if tensor.is_cpu else self.device_group
+            handle = torch.distributed.isend(tensor, dst=self.ranks[dst], group=group)
+            if tensor.is_cuda:
+                # Keep allocator from reusing this CUDA buffer before the async send finishes.
+                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            handles.append(handle)
+        return handles
+
+    def irecv_tensor_dict(
+        self,
+        src: int | None = None,
+    ) -> tuple[dict[str, torch.Tensor | Any], list[torch.distributed.Work], list]:
+        """Non-blocking receive of a tensor dictionary.
+
+        Receives metadata via the Gloo CPU group (blocking) then starts a
+        non-blocking NCCL irecv for each GPU tensor.  Returns
+        ``(tensor_dict, comm_handles, comm_postprocess)`` matching the
+        interface expected by ``AsyncIntermediateTensors``.
+
+        NOTE: `src` is the group rank of the source.
+        """
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return {}, [], []
+
+        if src is None:
+            src = self.group_prev_rank
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        recv_metadata_list = self.recv_object(src=src)
+        tensor_dict: dict[str, Any] = {}
+        handles: list[torch.distributed.Work] = []
+
+        for key, value in recv_metadata_list:
+            if isinstance(value, TensorMetadata):
+                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                if tensor.numel() > 0:
+                    group = self.cpu_group if tensor.is_cpu else self.device_group
+                    handles.append(torch.distributed.irecv(tensor, src=self.ranks[src], group=group))
+                _update_nested_dict(tensor_dict, key, tensor)
+            else:
+                _update_nested_dict(tensor_dict, key, value)
+
+        return tensor_dict, handles, []
+
     def send_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],

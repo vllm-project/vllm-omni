@@ -68,12 +68,6 @@ class MooncakeAgentMetadata:
     lengths: list[int]
 
 
-# BufferAllocator and ManagedBuffer are imported from
-# ``vllm_omni.distributed.omni_connectors.utils.memory_pool`` (shared with
-# MoriTransferEngineConnector and any future RDMA connector that needs a
-# pool with a first-fit allocator).
-
-
 class MooncakeTransferEngineConnector(OmniConnectorBase):
     """
     OmniConnector implementation using Mooncake Transfer Engine with a managed memory pool.
@@ -774,7 +768,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 # Success
                 # Ensure data is visible on GPU
                 # Note: RDMA write visibility on GPU usually requires some form of fence/sync.
-                # torch.cuda.synchronize() is a heavy hammer but safe.
+                # torch.accelerator.synchronize() is a heavy hammer but safe.
                 # Ideally Mooncake engine provides a way to poll for completion that guarantees visibility.
                 # TODO(wzliu): Replace synchronize with cuda event in the future for better performance.
                 if self.pool.is_cuda:

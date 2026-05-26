@@ -1,7 +1,7 @@
-"""Test environment / lifecycle helpers (GPU cleanup hooks and memory monitoring for tests).
+"""Test environment / lifecycle helpers (device cleanup hooks and memory monitoring for tests).
 
-``vllm.platforms`` / ``vllm_omni.platforms`` are imported only inside functions that need them
-so importing this module at pytest plugin load does not run before session autouse fixtures
+``vllm_omni.platforms`` is imported only inside functions that need it so importing this module
+at pytest plugin load does not run before session autouse fixtures.
 """
 
 from __future__ import annotations
@@ -15,10 +15,7 @@ from contextlib import contextmanager
 
 import torch
 
-
-def run_forced_gpu_cleanup_round() -> None:
-    run_pre_test_cleanup(enable_force=True)
-    run_post_test_cleanup(enable_force=True)
+from vllm_omni.platforms import current_omni_platform
 
 
 def get_physical_device_indices(devices):
@@ -37,35 +34,27 @@ def wait_for_gpu_memory_to_clear(
     threshold_ratio: float | None = None,
     timeout_s: float = 120,
 ) -> None:
-    from vllm.platforms import current_platform
-
     assert threshold_bytes is not None or threshold_ratio is not None
     devices = get_physical_device_indices(devices)
     start_time = time.time()
 
     device_list = ", ".join(str(d) for d in devices)
     if threshold_bytes is not None:
-        threshold_str = f"{threshold_bytes / 2**30:.2f} GiB"
-        condition_str = f"Memory usage ≤ {threshold_str}"
-    else:
-        threshold_percent = threshold_ratio * 100
-        threshold_str = f"{threshold_percent:.1f}%"
-        condition_str = f"Memory usage ratio ≤ {threshold_str}"
-
-    print(f"[GPU Memory Monitor] Waiting for GPU {device_list} to free memory, Condition: {condition_str}")
-
-    if threshold_bytes is not None:
+        condition_str = f"Memory usage ≤ {threshold_bytes / 2**30:.2f} GiB"
 
         def is_free(used, total):
             return used <= threshold_bytes / 2**30
     else:
+        condition_str = f"Memory usage ratio ≤ {threshold_ratio * 100:.1f}%"
 
         def is_free(used, total):
             return used / total <= threshold_ratio
 
+    print(f"[GPU Memory Monitor] Waiting for GPU {device_list} to free memory, Condition: {condition_str}")
+
     @contextmanager
-    def nvml_scope():
-        if current_platform.is_rocm():
+    def smi_scope():
+        if current_omni_platform.is_rocm():
             from amdsmi import amdsmi_init, amdsmi_shut_down
 
             amdsmi_init()
@@ -73,7 +62,7 @@ def wait_for_gpu_memory_to_clear(
                 yield
             finally:
                 amdsmi_shut_down()
-        elif current_platform.is_cuda():
+        elif current_omni_platform.is_cuda():
             from vllm.third_party.pynvml import nvmlInit, nvmlShutdown
 
             nvmlInit()
@@ -84,147 +73,86 @@ def wait_for_gpu_memory_to_clear(
         else:
             yield
 
-    is_rocm = current_platform.is_rocm()
-
-    with nvml_scope():
-        if is_rocm:
+    def get_mem_gib(device: int) -> tuple[float, float]:
+        if current_omni_platform.is_rocm():
             from amdsmi import amdsmi_get_gpu_vram_usage, amdsmi_get_processor_handles
-        elif current_platform.is_cuda():
-            from vllm.third_party.pynvml import nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
 
+            info = amdsmi_get_gpu_vram_usage(amdsmi_get_processor_handles()[device])
+            return info["vram_used"] / 2**10, info["vram_total"] / 2**10
+        if current_omni_platform.is_npu():
+            free_bytes, total_bytes = torch.npu.mem_get_info(device)
+            return (total_bytes - free_bytes) / 2**30, total_bytes / 2**30
+        from vllm.third_party.pynvml import nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
+
+        info = nvmlDeviceGetMemoryInfo(nvmlDeviceGetHandleByIndex(device))
+        return info.used / 2**30, info.total / 2**30
+
+    with smi_scope():
         while True:
-            output: dict[int, str] = {}
-            output_raw: dict[int, tuple[float, float]] = {}
-            for device in devices:
-                if is_rocm:
-                    dev_handle = amdsmi_get_processor_handles()[device]
-                    mem_info = amdsmi_get_gpu_vram_usage(dev_handle)
-                    gb_used = mem_info["vram_used"] / 2**10
-                    gb_total = mem_info["vram_total"] / 2**10
-                else:
-                    dev_handle = nvmlDeviceGetHandleByIndex(device)
-                    mem_info = nvmlDeviceGetMemoryInfo(dev_handle)
-                    gb_used = mem_info.used / 2**30
-                    gb_total = mem_info.total / 2**30
-                output_raw[device] = (gb_used, gb_total)
-                usage_percent = (gb_used / gb_total) * 100 if gb_total > 0 else 0
-                output[device] = f"{gb_used:.1f}GiB/{gb_total:.1f}GiB ({usage_percent:.1f}%)"
+            output_raw = {d: get_mem_gib(d) for d in devices}
+            output = {
+                d: f"{used:.1f}GiB/{total:.1f}GiB ({(used / total) * 100 if total > 0 else 0:.1f}%)"
+                for d, (used, total) in output_raw.items()
+            }
 
             print("[GPU Memory Status] Current usage:")
             for device_id, mem_info in output.items():
                 print(f"  GPU {device_id}: {mem_info}")
 
             dur_s = time.time() - start_time
-            elapsed_minutes = dur_s / 60
             if all(is_free(used, total) for used, total in output_raw.values()):
                 print(f"[GPU Memory Freed] Devices {device_list} meet memory condition")
                 print(f"   Condition: {condition_str}")
-                print(f"   Wait time: {dur_s:.1f} seconds ({elapsed_minutes:.1f} minutes)")
+                print(f"   Wait time: {dur_s:.1f} seconds ({dur_s / 60:.1f} minutes)")
                 break
 
             if dur_s >= timeout_s:
                 raise ValueError(
                     f"[GPU Memory Timeout] Devices {device_list} still don't meet memory condition after {dur_s:.1f} seconds\n"
                     f"Condition: {condition_str}\n"
-                    f"Current status:\n" + "\n".join(f"  GPU {device}: {output[device]}" for device in devices)
+                    f"Current status:\n" + "\n".join(f"  GPU {d}: {output[d]}" for d in devices)
                 )
 
             gc.collect()
-            torch.cuda.empty_cache()
+            current_omni_platform.empty_cache()
             time.sleep(5)
 
 
+def _run_smi(label: str, cmd: list[str], head_lines: int, timeout: float = 5) -> None:
+    print("\n" + "=" * 80)
+    print(label)
+    print("=" * 80)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode == 0 and result.stdout.strip():
+            lines = result.stdout.strip().split("\n")
+            for line in lines[:head_lines]:
+                print(line)
+            if len(lines) > head_lines:
+                print(f"... (showing first {head_lines} of {len(lines)} lines)")
+        else:
+            print(f"{cmd[0]} command failed or produced no output")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        print(f"{cmd[0]} not available or timed out")
+    except Exception as e:
+        print(f"Error running {' '.join(cmd)}: {e}")
+
+
 def _print_gpu_processes() -> None:
-    """Print GPU information including nvidia-smi/amd-smi and system processes."""
-    from vllm.platforms import current_platform
+    """Print device information via nvidia-smi/npu-smi/amd-smi."""
+    from vllm_omni.platforms import current_omni_platform
 
-    # Check for NVIDIA GPUs
-    if current_platform.is_cuda():
-        print("\n" + "=" * 80)
-        print("NVIDIA GPU Information (nvidia-smi)")
-        print("=" * 80)
-        try:
-            nvidia_result = subprocess.run(
-                ["nvidia-smi"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if nvidia_result.returncode == 0:
-                lines = nvidia_result.stdout.strip().split("\n")
-                for line in lines[:20]:
-                    print(line)
-                if len(lines) > 20:
-                    print(f"... (showing first 20 of {len(lines)} lines)")
-            else:
-                print("nvidia-smi command failed")
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            print("nvidia-smi not available or timed out")
-        except Exception as e:
-            print(f"Error running nvidia-smi: {e}")
-
-        print("\n" + "=" * 80)
-        print("Detailed GPU Processes (nvidia-smi pmon)")
-        print("=" * 80)
-        try:
-            pmon_result = subprocess.run(
-                ["nvidia-smi", "pmon", "-c", "1"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-            )
-            if pmon_result.returncode == 0 and pmon_result.stdout.strip():
-                print(pmon_result.stdout)
-            else:
-                print("No active GPU processes found via nvidia-smi pmon")
-        except Exception:
-            print("nvidia-smi pmon not available")
-
-    # Check for AMD ROCm GPUs
-    elif current_platform.is_rocm():
-        print("\n" + "=" * 80)
-        print("AMD GPU Information (amd-smi)")
-        print("=" * 80)
-        try:
-            amd_result = subprocess.run(
-                ["amd-smi"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if amd_result.returncode == 0:
-                lines = amd_result.stdout.strip().split("\n")
-                for line in lines[:30]:  # Show more lines for AMD output
-                    print(line)
-                if len(lines) > 30:
-                    print(f"... (showing first 30 of {len(lines)} lines)")
-            else:
-                print("amd-smi command failed")
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            print("amd-smi not available or timed out")
-        except Exception as e:
-            print(f"Error running amd-smi: {e}")
-
-        print("\n" + "=" * 80)
-        print("Detailed AMD GPU Processes (amd-smi process)")
-        print("=" * 80)
-        try:
-            process_result = subprocess.run(
-                ["amd-smi", "process"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-            )
-            if process_result.returncode == 0 and process_result.stdout.strip():
-                print(process_result.stdout)
-            else:
-                print("No active GPU processes found via amd-smi process")
-        except Exception:
-            print("amd-smi process not available")
-
+    if current_omni_platform.is_cuda():
+        _run_smi("NVIDIA GPU Information (nvidia-smi)", ["nvidia-smi"], 20)
+        _run_smi("Detailed GPU Processes (nvidia-smi pmon)", ["nvidia-smi", "pmon", "-c", "1"], 100, timeout=3)
+    elif current_omni_platform.is_npu():
+        _run_smi("Ascend NPU Information (npu-smi info)", ["npu-smi", "info"], 40)
+    elif current_omni_platform.is_rocm():
+        _run_smi("AMD GPU Information (amd-smi)", ["amd-smi"], 30)
+        _run_smi("Detailed AMD GPU Processes (amd-smi process)", ["amd-smi", "process"], 100, timeout=3)
     else:
         print("\n" + "=" * 80)
-        print("WARNING: No supported GPU platform detected (neither CUDA nor ROCm)")
+        print("WARNING: No supported device platform detected")
         print("=" * 80)
 
     print("\n" + "=" * 80)
@@ -232,19 +160,10 @@ def _print_gpu_processes() -> None:
     print("=" * 80)
 
 
-_SKIPPED_GPU_CLEANUP_MSG = (
-    "\nSkipping GPU memory cleanup check (typically: instance already up; no check needed between tests)\n"
-)
-
-
-def run_pre_test_cleanup(enable_force: bool = False) -> None:
-    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
-        print(_SKIPPED_GPU_CLEANUP_MSG)
-        return
-
+def run_pre_test_cleanup() -> None:
     print("Pre-test GPU status:")
 
-    num_gpus = torch.cuda.device_count()
+    num_gpus = current_omni_platform.device_count()
     if num_gpus > 0:
         try:
             wait_for_gpu_memory_to_clear(
@@ -255,14 +174,10 @@ def run_pre_test_cleanup(enable_force: bool = False) -> None:
             print(f"Pre-test cleanup note: {e}")
 
 
-def run_post_test_cleanup(enable_force: bool = False) -> None:
-    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
-        print(_SKIPPED_GPU_CLEANUP_MSG)
-        return
-
-    if torch.cuda.is_available():
+def run_post_test_cleanup() -> None:
+    if current_omni_platform.is_available():
         gc.collect()
-        torch.cuda.empty_cache()
+        current_omni_platform.empty_cache()
 
         print("Post-test GPU status:")
         _print_gpu_processes()
@@ -318,6 +233,5 @@ __all__ = [
     "get_physical_device_indices",
     "run_post_test_cleanup",
     "run_pre_test_cleanup",
-    "run_forced_gpu_cleanup_round",
     "wait_for_gpu_memory_to_clear",
 ]

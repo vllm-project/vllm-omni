@@ -28,7 +28,6 @@ Frame interpolation is currently supported for:
 
 - `WanPipeline` (Wan2.2 text-to-video)
 - `WanImageToVideoPipeline`
-- `Wan22TI2VPipeline`
 
 ## Request Parameters
 

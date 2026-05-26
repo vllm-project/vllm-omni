@@ -35,6 +35,7 @@ def _make_runner(multimodal_outputs):
     runner.device = torch.device("cpu")
     runner.supports_mm_inputs = False
     runner.speculative_config = None
+    runner.routed_experts_initialized = False
     return runner
 
 

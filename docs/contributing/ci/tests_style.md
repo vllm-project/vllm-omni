@@ -54,6 +54,8 @@ vllm_omni/                                    tests/
 │   │                                            │   │   └── test_lora_manager.py        ✅
 │   ├── models/                                 │   ├── models/
 │   │   ├── qwen_image/                         │   │   ├── qwen_image/                 (e2e coverage)
+│   │   ├── ovis_image/                         │   │   ├── ovis_image/
+│   │   │   └── ...                             │   │   │   └── test_ovis_image.py     ✅
 │   │   ├── z_image/                            │   │   └── z_image/
 │   │   └── ...                                 │   │       └── test_zimage_tp_constraints.py  ✅
 │   └── worker/                                 │   └── worker/
@@ -134,15 +136,13 @@ vllm_omni/                                    tests/
                                                │   ├── test_qwen3_omni.py
                                                │   ├── test_qwen3_omni_expansion.py
                                                │   ├── test_mimo_audio.py
-                                               │   ├── test_image_gen_edit.py
                                                │   └── test_images_generations_lora.py
                                                └── offline_inference/                  ✅
                                                    ├── test_qwen2_5_omni.py
                                                    ├── test_qwen3_omni.py
                                                    ├── test_bagel_text2img.py
-                                                   ├── test_t2i_model.py
-                                                   ├── test_t2v_model.py
-                                                   ├── test_ovis_image.py
+                                                   ├── test_z_image.py
+                                                   ├── test_wan22.py
                                                    ├── test_zimage_tensor_parallel.py
                                                    ├── test_cache_dit.py
                                                    ├── test_teacache.py
@@ -213,7 +213,6 @@ E2E Online tests for Qwen3-Omni model with mix input and audio+text output.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import threading
 from pathlib import Path

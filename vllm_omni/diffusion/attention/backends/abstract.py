@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Generic, TypeVar
+from dataclasses import dataclass, field
+from typing import Any, Generic, TypeVar
 
 import torch
 
@@ -64,12 +64,31 @@ class AttentionMetadata:
     # a replicated tensor among processes appended to the front or rear of value, depends the joint_strategy
     joint_strategy: str = "front"
     # the strategy to joint the query, key, and value, can be "front" or "rear"
+    extra: dict[str, Any] = field(default_factory=dict)
+    # Opaque backend-specific per-forward parameters (e.g. block masks, KV indices).
+    # Backends MUST silently ignore unknown keys.
+    #
+    # Well-known optional keys (convention, not required on all forwards):
+    #   "kv_cache_dtype": str | None — quantized KV dtype (e.g. "fp8"); backends
+    #     decide whether/how to apply.
+
+    # Piecewise attention metadata (mixed causal/full masks).
+    # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
+    full_attn_spans: list[list[tuple[int, int]]] | None = None
 
 
 T = TypeVar("T", bound=AttentionMetadata)
 
 
 class AttentionImpl(ABC, Generic[T]):
+    # Per-platform kv_cache_dtype support. Maps OmniPlatformEnum value
+    # (e.g. "cuda", "npu") to the set of quantized dtypes that platform
+    # handles.
+    #
+    # To add FP8 support for a new platform in a subclass:
+    #   _supported_kv_cache_dtypes = {"cuda": {"fp8"}, "npu": {"fp8"}}
+    _supported_kv_cache_dtypes: dict[str, set[str]] = {}
+
     @abstractmethod
     def __init__(
         self,
@@ -79,9 +98,17 @@ class AttentionImpl(ABC, Generic[T]):
         causal: bool = False,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        qkv_layout: str | None = None,
+        backend_kwargs: dict[str, Any] | None = None,
         **extra_impl_args,
     ) -> None:
         raise NotImplementedError
+
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: str | None, platform_key: str) -> bool:
+        if kv_cache_dtype is None:
+            return True
+        return kv_cache_dtype in cls._supported_kv_cache_dtypes.get(platform_key, set())
 
     def forward(
         self,

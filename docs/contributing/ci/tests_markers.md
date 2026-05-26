@@ -11,7 +11,8 @@ Defined in `pyproject.toml`:
 | `advanced_model`   | L3 tests (run on each merge to main)                 |
 | `full_model`       | L4 tests (run nightly) |
 | `diffusion`        | Diffusion model tests                                     |
-| `omni`             | Omni model tests                                          |
+| `omni`             | Omni multimodal model tests |
+| `tts`              | TTS model tests     |
 | `cache`            | Cache backend tests                                       |
 | `parallel`         | Parallelism/distributed tests                             |
 | `cpu`              | Tests that run on CPU                                     |

@@ -239,6 +239,7 @@ data/
 datasets/
 *.csv
 *.json
+!tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 *.jsonl
 *.parquet

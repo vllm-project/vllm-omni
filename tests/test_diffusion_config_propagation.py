@@ -119,3 +119,9 @@ def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
 
     assert od_config.supports_multimodal_inputs is True
     assert od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+
+
+def test_additional_config_roundtrip():
+    additional_config = {"torchair_graph_config": {"enabled": True}}
+    od = _roundtrip_diffusion_config(model="x", additional_config=additional_config)
+    assert od.additional_config == additional_config

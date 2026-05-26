@@ -10,7 +10,6 @@ actual model inference, not mocks.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import pytest
 
@@ -40,7 +39,7 @@ tts_server_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
-            server_args=["--trust-remote-code", "--disable-log-stats"],
+            server_args=["--trust-remote-code"],
         ),
         id="async_chunk",
     )
@@ -49,7 +48,7 @@ tts_server_params = [
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
-@pytest.mark.omni
+@pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_server, openai_client) -> None:
@@ -75,7 +74,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
-@pytest.mark.omni
+@pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_002(omni_server, openai_client) -> None:
