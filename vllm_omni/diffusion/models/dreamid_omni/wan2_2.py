@@ -1,6 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
-from typing import TYPE_CHECKING
 
 import torch
 import torch.amp as amp
@@ -13,11 +12,9 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.attention.layer import Attention
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 try:
     from dreamid_omni.modules.model import (
