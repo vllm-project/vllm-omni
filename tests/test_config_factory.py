@@ -292,6 +292,58 @@ class TestStageConfig:
         assert "hsdp_shard_size" not in omega_config.engine_args
         assert "hsdp_replicate_size" not in omega_config.engine_args
 
+    def test_to_omegaconf_diffusion_parallel_degree_overrides_recompute_sequence_parallel_size(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "parallel_config": {
+                    "sequence_parallel_size": 1,
+                    "ulysses_degree": 1,
+                    "ring_degree": 1,
+                }
+            },
+            runtime_overrides={
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 8
+        assert "ulysses_degree" not in omega_config.engine_args
+        assert "ring_degree" not in omega_config.engine_args
+        assert "sequence_parallel_size" not in omega_config.engine_args
+
+    def test_to_omegaconf_diffusion_parallel_explicit_sequence_parallel_size_is_preserved(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "parallel_config": {
+                    "sequence_parallel_size": 1,
+                    "ulysses_degree": 1,
+                    "ring_degree": 1,
+                }
+            },
+            runtime_overrides={
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+                "sequence_parallel_size": 16,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 16
+
     def test_to_omegaconf_llm_parallel_overrides_remain_top_level(self):
         config = StageConfig(
             stage_id=0,

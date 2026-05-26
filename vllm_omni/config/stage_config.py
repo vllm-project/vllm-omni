@@ -131,6 +131,8 @@ def _apply_diffusion_parallel_runtime_overrides(
     parallel_fields = frozenset(f.name for f in fields(DiffusionParallelConfig))
     parallel_config = engine_args.get("parallel_config")
     parallel_config_dict = dict(parallel_config) if parallel_config is not None else None
+    degree_overridden = False
+    sequence_parallel_explicit = runtime_overrides.get("sequence_parallel_size") is not None
 
     for key in list(runtime_overrides.keys()):
         value = runtime_overrides.get(key)
@@ -138,7 +140,14 @@ def _apply_diffusion_parallel_runtime_overrides(
             continue
         if parallel_config_dict is None:
             parallel_config_dict = {}
+        if key in ("ulysses_degree", "ring_degree"):
+            degree_overridden = True
         parallel_config_dict[key] = runtime_overrides.pop(key)
+
+    if parallel_config_dict is not None and degree_overridden and not sequence_parallel_explicit:
+        ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
+        ring_degree = parallel_config_dict.get("ring_degree") or 1
+        parallel_config_dict["sequence_parallel_size"] = ulysses_degree * ring_degree
 
     if parallel_config_dict is not None:
         engine_args["parallel_config"] = parallel_config_dict
