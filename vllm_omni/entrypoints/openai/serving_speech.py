@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import math
@@ -68,6 +69,7 @@ _COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
+_HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
@@ -75,13 +77,21 @@ _TTS_MODEL_STAGES: set[str] = (
     | _FISH_TTS_MODEL_STAGES
     | _COSYVOICE3_TTS_MODEL_STAGES
     | _OMNIVOICE_TTS_MODEL_STAGES
+    | _HIGGS_AUDIO_V2_TTS_MODEL_STAGES
     | _COVO_AUDIO_MODEL_STAGES
     | _VOXCPM2_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
     | _GLM_TTS_MODEL_STAGES
 )
-_SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {"fish_tts", "qwen3_tts", "voxtral_tts", "cosyvoice3", "voxcpm2"}
+_SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
+    "fish_tts",
+    "qwen3_tts",
+    "voxtral_tts",
+    "cosyvoice3",
+    "voxcpm2",
+    "higgs_audio_v2",
+}
 _TTS_LANGUAGES: set[str] = {
     "Auto",
     "Chinese",
@@ -184,6 +194,55 @@ def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
         return directory_resolved in file_path_resolved.parents or directory_resolved == file_path_resolved
     except Exception:
         return False
+
+
+def _conditioning_cache_salt(request, tts_params: dict | None = None) -> str:
+    """Stable hash of the real Stage 0 conditioning for the prefix cache.
+
+    The talker's vLLM prompt is placeholder token ids; the real inputs are
+    rebuilt from text / ref_audio / ref_text into inputs_embeds. vLLM hashes
+    token ids (folded with cache_salt) for prefix caching, so without a salt
+    every request collides and a hit could reuse KV from a semantically
+    different input. Tying the salt to the conditioning keeps a hit safe:
+    identical conditioning may share the prefix, any difference never does.
+
+    Raw request fields alone are not enough for uploaded voices: the request
+    only carries the voice *name* (ref_audio/ref_text/task_type are resolved
+    from stored voice data into ``tts_params``). Delete + re-upload under the
+    same name leaves every raw field identical, so the resolved conditioning
+    must also be folded in. ``voice_created_at`` bumps on every (re-)upload,
+    which uniquely identifies the resolved reference artifact together with
+    the voice name; the decoded ref_audio array itself need not be hashed.
+    """
+    h = hashlib.sha256()
+    for part in (
+        request.input,
+        request.task_type,
+        request.language,
+        request.voice,
+        request.ref_text,
+        request.ref_audio,
+        request.instructions,
+        request.x_vector_only_mode,
+        request.speaker_embedding,
+    ):
+        h.update(b"\x00")
+        if part is not None:
+            h.update(repr(part).encode("utf-8"))
+    # Fold resolved conditioning that is auto-derived for uploaded voices and
+    # absent from the raw request.
+    for key in (
+        "voice_created_at",
+        "task_type",
+        "speaker",
+        "ref_text",
+        "x_vector_only_mode",
+    ):
+        h.update(b"\x00")
+        value = tts_params.get(key) if tts_params is not None else None
+        if value is not None:
+            h.update(repr(value).encode("utf-8"))
+    return h.hexdigest()[:32]
 
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
@@ -505,6 +564,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "ming_flash_omni_tts"
         if model_stage in _MOSS_TTS_MODEL_STAGES:
             return "moss_tts_nano"
+        if model_stage in _HIGGS_AUDIO_V2_TTS_MODEL_STAGES:
+            return "higgs_audio_v2"
         if model_stage in _GLM_TTS_MODEL_STAGES:
             return "glm_tts"
         return None
@@ -795,12 +856,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         voice_lower = request.voice.lower()
         if voice_lower not in self.uploaded_speakers:
-            if self._tts_model_type in ("cosyvoice3", "fish_tts", "omnivoice", "moss_tts_nano", "glm_tts"):
+            if self._tts_model_type in (
+                "cosyvoice3",
+                "fish_tts",
+                "omnivoice",
+                "moss_tts_nano",
+                "glm_tts",
+                "higgs_audio_v2",
+            ):
                 label = {
                     "cosyvoice3": "CosyVoice3",
                     "fish_tts": "Fish Speech",
                     "omnivoice": "OmniVoice",
                     "moss_tts_nano": "MOSS-TTS-Nano",
+                    "higgs_audio_v2": "Higgs-Audio V2",
                     "glm_tts": "GLM-TTS",
                 }.get(self._tts_model_type, self._tts_model_type)
                 return (
@@ -1396,6 +1465,73 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         params["prompt_audio_array"] = [[wav_list, sr]]
         return params
 
+    def _validate_higgs_audio_v2_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate higgs_audio_v2 request parameters. Returns error message or None.
+
+        Accepted: plain text -> speech, or shallow voice clone via ``ref_audio``
+        + ``ref_text`` (both required together). Still out of scope: preset
+        ``voice``/``speaker`` selection, ``x_vector_only_mode`` /
+        ``speaker_embedding`` helpers, ``task_type``/``language``/
+        ``instructions``/``speed`` overrides, and multi-speaker ``[SPEAKERn]``
+        tags inside the input body.
+        """
+        from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer import (
+            MULTI_SPEAKER_TAG_PATTERN,
+        )
+
+        if not request.input or not request.input.strip():
+            return "higgs_audio_v2: input text cannot be empty"
+
+        # Voice clone: ref_audio and ref_text must come together.
+        if request.ref_audio is not None and not request.ref_text:
+            return (
+                "higgs_audio_v2 voice clone requires both 'ref_audio' and "
+                "'ref_text'; received ref_audio without ref_text"
+            )
+        if request.ref_text and request.ref_audio is None:
+            return (
+                "higgs_audio_v2 voice clone requires both 'ref_audio' and "
+                "'ref_text'; received ref_text without ref_audio"
+            )
+
+        if request.x_vector_only_mode is not None:
+            return "higgs_audio_v2 v1 does not support 'x_vector_only_mode' (voice-cloning helper field)"
+        if request.speaker_embedding is not None:
+            return "higgs_audio_v2 v1 does not support 'speaker_embedding' (voice-cloning helper field)"
+        if request.voice and request.ref_audio is None:
+            # _apply_uploaded_speaker runs before this validator; if voice was
+            # an uploaded speaker, ref_audio is now populated and ref_text is
+            # backfilled from the speaker entry. A bare voice= with no
+            # ref_audio means the name didn't resolve to an uploaded speaker
+            # (and higgs has no built-in preset voices).
+            return (
+                "higgs_audio_v2 v1 does not support 'voice'/'speaker' selection for built-in voices; "
+                f"upload a voice first via POST /v1/audio/voices, or use ref_audio + ref_text. "
+                f"Got voice={request.voice!r}"
+            )
+        if request.instructions:
+            return (
+                "higgs_audio_v2 v1 does not support 'instructions' (voice "
+                "style/emotion control); supply plain text instead"
+            )
+        if request.task_type is not None:
+            return "higgs_audio_v2 v1 does not support 'task_type'; the model is single-mode plain text -> speech"
+        if request.language is not None:
+            return (
+                "higgs_audio_v2 v1 does not accept 'language' overrides; the model infers language from the input text"
+            )
+        if request.speed is not None and request.speed != 1.0:
+            return (
+                "higgs_audio_v2 v1 does not support 'speed' adjustments; the audio is rendered at native rate (24 kHz)"
+            )
+
+        if MULTI_SPEAKER_TAG_PATTERN.search(request.input):
+            return "higgs_audio_v2 v1 does not support multi-speaker [SPEAKERn] tags; remove the tag from the input"
+
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+
     def _validate_glm_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate GLM-TTS request — requires ref_audio for voice cloning."""
         if not request.input or not request.input.strip():
@@ -1415,6 +1551,80 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
                 return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
         return None
+
+    async def _build_higgs_audio_v2_params(self, request: OpenAICreateSpeechRequest):
+        """Build prompt_token_ids for higgs_audio_v2 via the upstream processor.
+
+        Plain-text path: runs ``build_plain_text_prompt`` and returns the
+        token-only prompt. Voice-clone path (``ref_audio`` + ``ref_text``):
+        resolves the reference clip via ``_resolve_ref_audio``, runs
+        ``build_voice_clone_prompt`` (which encodes the clip through HF's
+        ``HiggsAudioV2TokenizerModel`` loaded from the k2-fsa/OmniVoice
+        ``audio_tokenizer/`` subdirectory), and attaches the encoded
+        ``audio_input_ids`` + ``audio_input_ids_mask`` tensors via
+        ``additional_information`` so the talker substitutes them at the
+        prompt-side audio placeholders.
+        """
+        from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer import (
+            build_plain_text_prompt,
+            build_voice_clone_prompt,
+            input_ids_to_python_list,
+        )
+
+        processor = await self._resolve_higgs_audio_v2_processor()
+
+        if request.ref_audio is None:
+            inputs = await asyncio.to_thread(build_plain_text_prompt, processor, request.input)
+            prompt_token_ids = input_ids_to_python_list(inputs)
+            return tokens_input(prompt_token_ids=prompt_token_ids)
+
+        wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+        wav = np.asarray(wav_list, dtype=np.float32)
+        out = await asyncio.to_thread(
+            build_voice_clone_prompt,
+            processor,
+            request.input,
+            wav,
+            int(sr),
+            request.ref_text or "",
+        )
+        prompt = tokens_input(prompt_token_ids=out["prompt_token_ids"])
+        # Pass tensors at the top level of additional_information (NOT list-
+        # wrapped). ``vllm_omni.data_entry_keys.serialize_payload`` routes
+        # bare ``torch.Tensor`` values through ``_serialize_tensor``; a list
+        # containing tensors would fall into the ``list_data`` field which
+        # msgspec cannot serialize and the tensors would be dropped over the
+        # process boundary (silent voice-clone failure).
+        prompt["additional_information"] = {
+            "audio_input_ids": out["audio_input_ids"],
+            "audio_input_ids_mask": out["audio_input_ids_mask"],
+        }
+        return prompt
+
+    async def _resolve_higgs_audio_v2_processor(self):
+        """Lazy-load the AutoProcessor for higgs_audio_v2 (once per serving instance)."""
+        cached = getattr(self, "_higgs_audio_v2_processor", None)
+        if cached is not None:
+            return cached
+
+        from transformers import AutoProcessor
+
+        model_path = None
+        for stage in self.engine_client.stage_configs:
+            model_path = getattr(getattr(stage, "engine_args", None), "model", None)
+            if model_path:
+                break
+        if model_path is None:
+            # Fallback: the orchestrator stores the served model id on the engine
+            # itself (set by AsyncOmniEngine.__init__). Stage-level engine_args
+            # may not surface ``model`` when the deploy yaml doesn't set it per
+            # stage (the CLI-passed model id is the single source of truth).
+            model_path = getattr(self.engine_client, "model", None)
+        if model_path is None:
+            raise RuntimeError("higgs_audio_v2 serving could not resolve the model path from the engine stage configs")
+        processor = AutoProcessor.from_pretrained(model_path)
+        self._higgs_audio_v2_processor = processor
+        return processor
 
     def _validate_fish_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate Fish Speech request parameters. Returns error message or None."""
@@ -1500,6 +1710,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id: str,
         response_format: str = "pcm",
         raw_request: Request | None = None,
+        request_start_s: float | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -1520,6 +1731,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prev_count = 0
         sample_rate_val = 24000
         first_chunk = True
+        first_audio_chunk_s: float | None = None
+        stream_start_s = request_start_s if request_start_s is not None else time.perf_counter()
 
         try:
             async for res in generator:
@@ -1571,11 +1784,40 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         stream_format="audio",
                         base64_encode=False,
                     )
+                    if first_audio_chunk_s is None:
+                        first_audio_chunk_s = time.perf_counter()
                     yield self.create_audio(audio_obj).audio_data
+            total_ms = (time.perf_counter() - stream_start_s) * 1000.0
+            if first_audio_chunk_s is not None:
+                first_chunk_ms = (first_audio_chunk_s - stream_start_s) * 1000.0
+                logger.info(
+                    "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=%.2f",
+                    request_id,
+                    total_ms,
+                    first_chunk_ms,
+                )
+            else:
+                logger.info(
+                    "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=NA",
+                    request_id,
+                    total_ms,
+                )
         except asyncio.CancelledError:
+            total_ms = (time.perf_counter() - stream_start_s) * 1000.0
+            logger.info(
+                "[SpeechE2E] request_id=%s stream=true status=cancelled total_ms=%.2f",
+                request_id,
+                total_ms,
+            )
             logger.info("Streaming request %s cancelled by client", request_id)
             raise
         except EngineDeadError as e:
+            total_ms = (time.perf_counter() - stream_start_s) * 1000.0
+            logger.error(
+                "[SpeechE2E] request_id=%s stream=true status=engine_dead total_ms=%.2f",
+                request_id,
+                total_ms,
+            )
             logger.error(
                 "EngineDeadError during streaming speech for %s: %s",
                 request_id,
@@ -1589,6 +1831,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             raise
         except Exception as e:
+            total_ms = (time.perf_counter() - stream_start_s) * 1000.0
+            logger.exception(
+                "[SpeechE2E] request_id=%s stream=true status=error total_ms=%.2f error=%s",
+                request_id,
+                total_ms,
+                e,
+            )
             logger.exception("Streaming speech generation failed for %s: %s", request_id, e)
             raise
 
@@ -2137,6 +2386,29 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         elif self._tts_model_type == "covo_audio":
             prompt = self._build_covo_audio_prompt(request)
             tts_params = {}
+        elif self._tts_model_type == "higgs_audio_v2":
+            # Explicit higgs_audio_v2 branch: do NOT fall through to the
+            # Qwen-style generic placeholder path; build prompt_token_ids
+            # directly via the upstream processor + the project's plain-text
+            # helper.
+            #
+            # Resolve uploaded voices first so a voice=<name> request (after
+            # POST /v1/audio/voices) populates ref_audio + ref_text from the
+            # cached speaker entry, mirroring the cosyvoice3 / voxcpm2 flow.
+            err = self._apply_uploaded_speaker(request)
+            if err:
+                raise ValueError(err)
+            validation_error = self._validate_higgs_audio_v2_request(request)
+            if validation_error:
+                raise ValueError(validation_error)
+            prompt = await self._build_higgs_audio_v2_params(request)
+            if request.voice:
+                voice_lower = request.voice.lower()
+                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                    additional = prompt.setdefault("additional_information", {})
+                    additional["voice_name"] = voice_lower
+                    additional["voice_created_at"] = self._voice_created_at(voice_lower)
+            tts_params = {}
         elif self._tts_model_type == "voxcpm2":
             # voxcpm2 doesn't use `_apply_uploaded_speaker` because the prompt builder needs the
             # raw waveform tuple for prefill-length accounting, not a base64 data URL.
@@ -2195,6 +2467,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     tts_params["seed"] = [sampling_params_list[0].seed]
                 prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
+                prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
@@ -2210,6 +2483,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ph_len = await self._estimate_prompt_len_async(tts_params)
                 prompt = tokens_input(prompt_token_ids=[1] * ph_len)
                 prompt["additional_information"] = tts_params
+                prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
@@ -2247,6 +2521,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "ming_flash_omni_tts"
         elif self._tts_model_type == "moss_tts_nano":
             model_type = "moss_tts_nano"
+        elif self._tts_model_type == "higgs_audio_v2":
+            model_type = "higgs_audio_v2"
         elif self._tts_model_type == "glm_tts":
             model_type = "glm_tts"
         elif self._is_tts:
@@ -2651,6 +2927,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return error_check_ret
 
         request_id = f"speech-{random_uuid()}"
+        request_start_s = time.perf_counter()
         if raw_request:
             raw_request.state.request_metadata = RequestResponseMetadata(
                 request_id=request_id,
@@ -2683,20 +2960,58 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         request_id,
                         response_format,
                         raw_request=raw_request,
+                        request_start_s=request_start_s,
                     ),
                     media_type=media_type,
                 )
 
             audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.info(
+                "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
+                request_id,
+                total_ms,
+                len(audio_bytes) if isinstance(audio_bytes, (bytes, bytearray)) else len(str(audio_bytes)),
+            )
             return Response(content=audio_bytes, media_type=media_type)
 
         except asyncio.CancelledError:
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.info(
+                "[SpeechE2E] request_id=%s stream=%s status=cancelled total_ms=%.2f",
+                request_id,
+                bool(request.stream),
+                total_ms,
+            )
             return self.create_error_response("Client disconnected")
         except (EngineGenerateError, EngineDeadError):
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.error(
+                "[SpeechE2E] request_id=%s stream=%s status=engine_error total_ms=%.2f",
+                request_id,
+                bool(request.stream),
+                total_ms,
+            )
             raise  # Propagate to the global Omni exception handler
         except ValueError as e:
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.warning(
+                "[SpeechE2E] request_id=%s stream=%s status=bad_request total_ms=%.2f error=%s",
+                request_id,
+                bool(request.stream),
+                total_ms,
+                e,
+            )
             return self.create_error_response(e)
         except Exception as e:
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.exception(
+                "[SpeechE2E] request_id=%s stream=%s status=error total_ms=%.2f error=%s",
+                request_id,
+                bool(request.stream),
+                total_ms,
+                e,
+            )
             logger.exception("Speech generation failed: %s", e)
             return self.create_error_response(f"Speech generation failed: {e}")
 
