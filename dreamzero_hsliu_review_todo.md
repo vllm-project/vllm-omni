@@ -3,7 +3,7 @@
 Scope: review comments by `hsliuustc0106` starting from:
 `assert is stripped under python -O. This check (and the 14 others in this file)...`
 
-Current status: H01, H02, H04, and H05 implemented; H03 skipped by decision; remaining items pending discussion and confirmation.
+Current status: H01, H02, H04, H05, and H06 implemented; H03 skipped by decision; remaining items pending discussion and confirmation.
 
 ## H01. Runtime `assert` in `causal_wan_model.py`
 
@@ -97,7 +97,7 @@ Current status: H01, H02, H04, and H05 implemented; H03 skipped by decision; rem
   - `examples/online_serving/dreamzero/openpi_client.py`
   - `tests/dreamzero/openpi_client_helper.py`
   - `examples/online_serving/dreamzero/droid_sim_eval_client.py`
-- Current code status: all three call `msgpack_numpy.unpackb(response)` and immediately convert to `np.asarray(..., dtype=np.float32)` in `infer()`.
+- Current code status: implemented. All three clients now decode action responses through a helper that surfaces msgpack error dicts before converting normal action payloads to `np.float32`.
 - Risk: server-side inference errors are reported to users as confusing NumPy conversion `TypeError` instead of the real server error message.
 - Proposed fix:
   - Decode binary responses first.
@@ -105,6 +105,6 @@ Current status: H01, H02, H04, and H05 implemented; H03 skipped by decision; rem
   - Otherwise convert decoded action payload to `np.float32`.
   - Apply the same helper logic to all three clients to avoid drift.
 - Test plan:
-  - Add or update client unit tests for msgpack structured error payloads.
-  - Verify normal array payloads still convert to `np.float32`.
-- Confirmation: pending.
+  - Done: added `tests/dreamzero/test_openpi_client_helper.py` coverage for msgpack structured error payloads.
+  - Done: verified normal action payloads still convert to `np.float32`.
+- Confirmation: confirmed and implemented.

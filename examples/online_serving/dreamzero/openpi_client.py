@@ -58,6 +58,16 @@ CAMERA_FILES = {
 }
 
 
+def _decode_action_response(response: bytes | str) -> np.ndarray:
+    if isinstance(response, str):
+        raise RuntimeError(f"Inference failed: {response}")
+    decoded = msgpack_numpy.unpackb(response)
+    if isinstance(decoded, dict) and decoded.get("type") == "error":
+        message = decoded.get("message", decoded)
+        raise RuntimeError(f"Inference failed: {message}")
+    return np.asarray(decoded, dtype=np.float32)
+
+
 @dataclass(frozen=True)
 class DreamZeroServerMetadata:
     image_resolution: tuple[int, int]
@@ -129,9 +139,7 @@ class OpenPIWebsocketClient:
         payload["endpoint"] = "infer"
         self._ws.send(self._packer.pack(payload))
         response = self._ws.recv()
-        if isinstance(response, str):
-            raise RuntimeError(f"Inference failed: {response}")
-        return np.asarray(msgpack_numpy.unpackb(response), dtype=np.float32)
+        return _decode_action_response(response)
 
     def reset(self, reset_info: dict[str, Any] | None = None) -> str:
         payload = dict(reset_info or {})

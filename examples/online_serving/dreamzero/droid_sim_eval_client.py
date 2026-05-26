@@ -121,6 +121,16 @@ SCENE_PROMPTS = {
 }
 
 
+def _decode_action_response(response: bytes | str) -> np.ndarray:
+    if isinstance(response, str):
+        raise RuntimeError(f"Error in inference server:\n{response}")
+    decoded = msgpack_numpy.unpackb(response)
+    if isinstance(decoded, dict) and decoded.get("type") == "error":
+        message = decoded.get("message", decoded)
+        raise RuntimeError(f"Error in inference server:\n{message}")
+    return np.asarray(decoded, dtype=np.float32)
+
+
 @dataclass(frozen=True)
 class StepRecord:
     """One fully materialized rollout step for later JSON export.
@@ -210,9 +220,7 @@ class OpenPIWebsocketClientPolicy(BasePolicy):
         payload["endpoint"] = "infer"
         self._ws.send(self._packer.pack(payload))
         response = self._ws.recv()
-        if isinstance(response, str):
-            raise RuntimeError(f"Error in inference server:\n{response}")
-        return np.asarray(msgpack_numpy.unpackb(response), dtype=np.float32)
+        return _decode_action_response(response)
 
     @override
     def reset(self, reset_info: dict[str, Any] | None = None) -> str:
