@@ -3,7 +3,7 @@
 Scope: review comments by `hsliuustc0106` starting from:
 `assert is stripped under python -O. This check (and the 14 others in this file)...`
 
-Current status: H01, H02, and H04 implemented; remaining items pending discussion and confirmation.
+Current status: H01, H02, H04, and H05 implemented; H03 skipped by decision; remaining items pending discussion and confirmation.
 
 ## H01. Runtime `assert` in `causal_wan_model.py`
 
@@ -50,7 +50,7 @@ Current status: H01, H02, and H04 implemented; remaining items pending discussio
   - Option C: if unsupported/unknown, remove one alias and require explicit `embodiment_id`.
 - Test plan:
   - Update `tests/dreamzero/test_utils.py` to assert the intended mapping or alias behavior.
-- Confirmation: pending.
+- Confirmation: skipped by decision; no code change.
 
 ## H04. No-op `if True:` wrapper in `causal_wan_model.py`
 
@@ -73,7 +73,7 @@ Current status: H01, H02, and H04 implemented; remaining items pending discussio
 - Review: the server uses long-lived `session_id` as per-inference engine `request_id`, causing duplicate active request IDs for concurrent clients or repeated calls.
 - Link: https://github.com/vllm-project/vllm-omni/pull/2162#discussion_r3294078365
 - File: `vllm_omni/entrypoints/openai/realtime/robot/openpi_serving.py`
-- Current code status: `_build_request()` still sets `request_ids=[f"robot-{session_id}"]`.
+- Current code status: implemented. `_build_request()` now keeps `session_id` in `extra_args` and generates a unique engine request ID per inference.
 - Risk:
   - Two websocket clients without explicit `session_id` both use `robot-default`.
   - Two clients sharing a logical session reuse the same engine request ID.
@@ -87,7 +87,7 @@ Current status: H01, H02, and H04 implemented; remaining items pending discussio
 - Test plan:
   - Unit test `_build_request()` twice with the same `session_id` and verify `request_ids[0]` differs while `extra_args["session_id"]` stays the same.
   - Add a concurrency-oriented serving test if feasible, or at least a regression test for duplicate ID avoidance.
-- Confirmation: pending.
+- Confirmation: confirmed and implemented.
 
 ## H06. OpenPI clients do not surface msgpack structured errors
 
