@@ -701,6 +701,10 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
             raise ValueError(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
+        elif isinstance(prompt, str) and not prompt.strip():
+            raise ValueError("`prompt` cannot be empty or whitespace-only.")
+        elif isinstance(prompt, list) and any(isinstance(p, str) and not p.strip() for p in prompt):
+            raise ValueError("`prompt` cannot contain empty or whitespace-only strings.")
         elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
 
@@ -861,7 +865,11 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
 
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps
+            if req.sampling_params.num_inference_steps is not None
+            else num_inference_steps
+        )
         sigmas = req.sampling_params.sigmas or sigmas
         guidance_scale = (
             req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale

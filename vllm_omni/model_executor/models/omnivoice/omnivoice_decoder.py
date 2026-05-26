@@ -108,7 +108,10 @@ class OmniVoiceDecoder(nn.Module):
         quantized = self.quantizer.decode(codes)
 
         # Project: [B, 1024, T] → fc2 → [B, 256, T]
-        quantized = self.fc2(quantized.transpose(1, 2)).transpose(1, 2)
+        # Cast to fc2 weight dtype (may be fp16 when checkpoint stores weights as fp16),
+        # then upcast back to float32 — acoustic decoder ConvTranspose1d upsampling
+        # produces intermediate values that exceed the fp16 range (~65504), causing NaN.
+        quantized = self.fc2(quantized.transpose(1, 2).to(self.fc2.weight.dtype)).transpose(1, 2).float()
 
         # Acoustic decoder: [B, 256, T] → [B, 1, T*960]
         audio = self.acoustic_decoder(quantized)
@@ -191,6 +194,11 @@ class OmniVoiceDecoder(nn.Module):
             if higgs_name in state_dict:
                 param.data.copy_(state_dict[higgs_name])
                 loaded += 1
+
+        # Checkpoint weights may be fp16; force float32 so ConvTranspose1d
+        # upsampling doesn't overflow (fp16 max ~65504 is too small for
+        # intermediate activations in the DAC upsampling chain).
+        self.acoustic_decoder.float()
 
         # Apply HiggsAudioV2 output padding adjustment
         self._adjust_output_padding(self.acoustic_decoder)

@@ -23,6 +23,16 @@ logger = init_logger(__name__)
 # example ``examples/offline_inference/mimo_audio/end2end.py``.
 MAX_CODE2WAV_TOKENS = 18192
 
+# Minimum safe values for codec streaming parameters.
+# codec_left_context_frames must cover the vocoder attention window
+# (vocoder_attn_window_size defaults to [40, 10]).  Values below the minimum
+# cause acoustic-state resets at chunk boundaries, producing voice instability
+# (multiple speakers / timbre shifts in the output audio).
+_MIN_CODEC_CHUNK_FRAMES = 3
+_MIN_CODEC_LEFT_CONTEXT_FRAMES = 40
+_DEFAULT_CODEC_CHUNK_FRAMES = 10
+_DEFAULT_CODEC_LEFT_CONTEXT_FRAMES = 40
+
 
 def prepend_and_flatten_colmajor(x: torch.Tensor, pad_vec: torch.Tensor) -> torch.Tensor:
     """
@@ -80,6 +90,10 @@ def _flush_remaining_codes(
 
     length = len(accumulated)
     chunk_length = length % chunk_size
+    # When the accumulated length aligns with chunk_size boundary (remainder == 0),
+    # we still need to flush the final chunk with full context to give the vocoder
+    # enough attention window — otherwise the tail audio cuts off and produces
+    # voice instability. Fall back to chunk_size as the context length.
     context_length = chunk_length if chunk_length != 0 else chunk_size
     end_index = min(length, left_context_size + context_length)
 
@@ -136,12 +150,35 @@ def llm2code2wav_async_chunk(
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
-    chunk_size = int(cfg.get("codec_chunk_frames", 3))
-    left_context_size = int(cfg.get("codec_left_context_frames", 3))
+    chunk_size = int(cfg.get("codec_chunk_frames", _DEFAULT_CODEC_CHUNK_FRAMES))
+    if chunk_size < _MIN_CODEC_CHUNK_FRAMES:
+        logger.warning(
+            "codec_chunk_frames=%d is below minimum %d; falling back to %d.",
+            chunk_size,
+            _MIN_CODEC_CHUNK_FRAMES,
+            _DEFAULT_CODEC_CHUNK_FRAMES,
+        )
+        chunk_size = _DEFAULT_CODEC_CHUNK_FRAMES
+
+    left_context_size = int(cfg.get("codec_left_context_frames", _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES))
+    if left_context_size < _MIN_CODEC_LEFT_CONTEXT_FRAMES:
+        logger.warning(
+            "codec_left_context_frames=%d is below minimum %d (must cover vocoder attention window); "
+            "falling back to %d to prevent voice instability.",
+            left_context_size,
+            _MIN_CODEC_LEFT_CONTEXT_FRAMES,
+            _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES,
+        )
+        left_context_size = _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES
 
     request_id = getattr(request, "external_req_id", None)
 
-    po_codes = pooling_output.get("codes", {})
+    # Text-only paths (e.g. modalities=["text"]) yield no codec pooling output;
+    # stage-0 still drives the chunk transfer adapter, so treat None as "no codes
+    # this step" rather than letting `.get()` raise AttributeError — an unhandled
+    # error here drops the chunk, starves stage-1 of the finished payload, and
+    # the stage subprocesses die before the final token is emitted.
+    po_codes = pooling_output.get("codes", {}) if pooling_output is not None else {}
     if "audio" not in po_codes:
         if is_finished:
             return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
@@ -156,11 +193,6 @@ def llm2code2wav_async_chunk(
 
     pad_vec = torch.tensor([TALKER_CODEC_PAD_TOKEN_ID] * 4, device=code_tensor.device, dtype=code_tensor.dtype)
     code_list = prepend_and_flatten_colmajor(code_tensor, pad_vec).tolist()
-
-    if sum(code_list) == 0:
-        if is_finished:
-            return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
-        return None
 
     if request_id is None:
         return None

@@ -155,6 +155,11 @@ class NPUARModelRunner(OmniNPUModelRunner):
         finally:
             set_cudagraph_capturing_enabled(False)
 
+    def _model_needs_full_prefix_hidden_states(self) -> bool:
+        """See gpu_ar_model_runner._model_needs_full_prefix_hidden_states."""
+        model = getattr(self, "model", None)
+        return bool(getattr(model, "requires_full_prefix_cached_hidden_states", True))
+
     def _maybe_update_prefix_cache(
         self,
         hidden_states: torch.Tensor,
@@ -169,8 +174,9 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     type(multimodal_outputs),
                 )
 
+            hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
             self.omni_prefix_cache.update_omni_tensor_prefix_cache(
-                hidden_states=hidden_states,
+                hidden_states=hs_for_cache,
                 multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 slot_mapping=self.input_batch.block_table[0].slot_mapping.cpu,
@@ -185,12 +191,13 @@ class NPUARModelRunner(OmniNPUModelRunner):
     ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
         combined_hidden_states, combined_multimodal_outputs = None, None
         if self.omni_prefix_cache is not None:
-            combined_hidden_states = self.omni_prefix_cache.get_merged_hidden_states(
-                query_start_loc=self.query_start_loc.cpu,
-                input_batch=self.input_batch,
-                hidden_states=hidden_states,
-                num_scheduled_tokens=num_scheduled_tokens,
-            )
+            if self._model_needs_full_prefix_hidden_states():
+                combined_hidden_states = self.omni_prefix_cache.get_merged_hidden_states(
+                    query_start_loc=self.query_start_loc.cpu,
+                    input_batch=self.input_batch,
+                    hidden_states=hidden_states,
+                    num_scheduled_tokens=num_scheduled_tokens,
+                )
             combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
                 query_start_loc=self.query_start_loc.cpu,
                 input_batch=self.input_batch,
@@ -729,6 +736,39 @@ class NPUARModelRunner(OmniNPUModelRunner):
             )
 
         return None
+
+    def _sample(
+        self,
+        logits: torch.Tensor | None,
+        spec_decode_metadata: Any,
+    ):
+        sampling_metadata = self.input_batch.sampling_metadata
+        if spec_decode_metadata is None:
+            model_sample = getattr(self.model, "sample", None)
+            self.input_batch.update_async_output_token_ids()
+            if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
+                # Apply logit bias (min_tokens, allowed_token_ids) before
+                # the custom model sampler — the standard GPU sampler does
+                # this internally, but prefer_model_sampler bypasses it.
+                if hasattr(self.sampler, "logit_bias_state"):
+                    self.sampler.logit_bias_state.apply_logit_bias(
+                        logits,
+                        self.input_batch.expanded_idx_mapping,
+                        self.input_batch.idx_mapping_np,
+                        self.input_batch.positions[self.input_batch.logits_indices],
+                    )
+                sampler_output = model_sample(
+                    logits,
+                    self._sampling_metadata_for_model_sampler(sampling_metadata),
+                )
+                if sampler_output is not None:
+                    return sampler_output
+            return self.sampler(
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+            )
+
+        return super()._sample(logits, spec_decode_metadata)
 
     @torch.inference_mode()
     def sample_tokens(

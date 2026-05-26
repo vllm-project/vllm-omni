@@ -16,7 +16,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 
-from .initialization import KV_RANK_PORT_STRIDE, KV_TRANSFER_PORT_OFFSET
+from .initialization import KV_RANK_PORT_STRIDE, KV_REPLICA_PORT_STRIDE, KV_TRANSFER_PORT_OFFSET
 
 logger = init_logger(__name__)
 
@@ -94,20 +94,42 @@ def get_tp_world_size() -> int:
     return 1
 
 
+def get_omni_replica_id() -> int:
+    """Return the Omni replica id for this worker process."""
+    try:
+        replica_id = int(os.environ.get("VLLM_OMNI_REPLICA_ID", "0"))
+    except (ValueError, TypeError):
+        return 0
+    return max(replica_id, 0)
+
+
 # ------------------------------------------------------------------ #
 #  ZMQ port computation
 # ------------------------------------------------------------------ #
 
 
-def kv_zmq_port(base_port: int, from_stage: int, local_rank: int = 0) -> int:
+def kv_zmq_port(
+    base_port: int,
+    from_stage: int,
+    local_rank: int = 0,
+    replica_id: int | None = None,
+) -> int:
     """Compute the ZMQ port for a KV-transfer connector.
 
-    Each TP rank gets its own port so that TP > 1 deployments do not
-    cause ``EADDRINUSE`` when multiple sender workers bind on the same
-    host.  The formula is backward-compatible: rank 0 produces the same
-    port as the previous ``base + OFFSET + stage`` formula.
+    Each Omni replica and TP rank gets its own port so multi-replica or
+    TP > 1 deployments do not cause ``EADDRINUSE`` when multiple sender
+    workers bind on the same host. The formula is backward-compatible:
+    replica 0 / rank 0 produces the previous ``base + OFFSET + stage`` port.
+
     """
-    return base_port + KV_TRANSFER_PORT_OFFSET + local_rank * KV_RANK_PORT_STRIDE + from_stage
+    replica = get_omni_replica_id() if replica_id is None else max(int(replica_id), 0)
+    return (
+        base_port
+        + KV_TRANSFER_PORT_OFFSET
+        + replica * KV_REPLICA_PORT_STRIDE
+        + local_rank * KV_RANK_PORT_STRIDE
+        + from_stage
+    )
 
 
 # ------------------------------------------------------------------ #

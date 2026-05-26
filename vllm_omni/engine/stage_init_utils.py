@@ -61,6 +61,63 @@ class LogicalStageInitPlan:
     replicas: list[ReplicaInitPlan]
 
 
+@dataclass
+class StageRemoteFactoryContext:
+    """Per-stage context cached by AsyncOmniEngine for dynamic replica attach.
+
+    Populated once during ``_bootstrap_orchestrator`` from the per-stage
+    init plans. ``_build_remote_replica`` consumes it to construct the
+    right head-side stage client when a headless replica registers.
+    """
+
+    stage_id: int
+    stage_type: str
+    stage_cfg: Any
+    base_metadata: Any
+    # LLM-only fields:
+    vllm_config: Any | None = None
+    executor_class: type | None = None
+    # Diffusion-only fields:
+    diffusion_batch_size: int = 1
+
+
+def capture_stage_factory_contexts(
+    stage_plans: Sequence[LogicalStageInitPlan],
+    diffusion_batch_size: int,
+) -> dict[int, StageRemoteFactoryContext]:
+    """Snapshot per-stage construction context for dynamic replica attach.
+
+    Called once after ``_initialize_stages`` finishes. The captured
+    context holds everything ``_build_remote_replica`` needs to build a
+    fresh head-side client when a new headless replica registers
+    (vllm_config / executor_class for LLM, batch_size for diffusion,
+    plus the base stage metadata).
+
+    Per-replica fields like ``replica_id`` are filled in at build time,
+    not at capture time.
+    """
+    contexts: dict[int, StageRemoteFactoryContext] = {}
+    for plan in stage_plans:
+        if not plan.replicas:
+            # Stage was declared but has zero replicas locally; we still
+            # want to be able to attach incoming headless ones, so use
+            # the stage_cfg-derived context if any replica plan exists.
+            continue
+        template = plan.replicas[0]
+        stage_id = int(plan.configured_stage_id)
+        stage_type = template.metadata.stage_type or "llm"
+        contexts[stage_id] = StageRemoteFactoryContext(
+            stage_id=stage_id,
+            stage_type=stage_type,
+            stage_cfg=template.stage_cfg,
+            base_metadata=template.metadata,
+            vllm_config=template.stage_vllm_config,
+            executor_class=template.executor_class,
+            diffusion_batch_size=diffusion_batch_size,
+        )
+    return contexts
+
+
 def _resolve_model_to_local_path(model: str) -> str:
     """Resolve an HF Hub model ID to a local cache path."""
     if os.path.isdir(model):
@@ -420,32 +477,59 @@ def split_devices_for_replicas(
     """Split a devices string into per-replica subsets.
 
     When ``num_replicas`` is 1, returns ``[devices_str]`` unchanged.
-    Otherwise, the total number of device IDs must equal
-    ``num_replicas * tp_size``; each replica gets ``tp_size`` consecutive
-    device IDs.
+    Otherwise, two YAML shapes are accepted:
 
-    Example::
+    1. **Legacy / pool mode** — ``len(devices) == num_replicas * tp_size``:
+       the string enumerates the full per-stage pool. Each replica gets
+       ``tp_size`` consecutive entries. The values are logical indices
+       into the launcher's ``CUDA_VISIBLE_DEVICES``.
 
-        split_devices_for_replicas("1,2,3,4", num_replicas=2, tp_size=2, stage_id=1)
-        # → ["1,2", "3,4"]
+       ``split_devices_for_replicas("1,2,3,4", 2, 2, 1) → ["1,2", "3,4"]``
+
+    2. **Template mode** — ``len(devices) == tp_size``: the YAML declares
+       a single per-replica template (the same shape one replica would
+       use), and is **dp-independent**. Each replica r gets the offsets
+       ``[r*tp_size + a for a in template]`` of the launcher's
+       ``CUDA_VISIBLE_DEVICES``. The template's entries must lie in
+       ``[0, tp_size)``.
+
+       ``split_devices_for_replicas("0,1", 2, 2, 1) → ["0,1", "2,3"]``
+       ``split_devices_for_replicas("0,1", 4, 2, 1) → ["0,1", "2,3", "4,5", "6,7"]``
+
+       This lets the same ``devices: "0,1"`` YAML work for any
+       ``--omni-dp-size-local``: the launcher's CVD scales, the YAML
+       does not.
+
+    Any other length raises ``ValueError`` (the two modes are
+    length-disjoint for ``num_replicas > 1``).
     """
     if num_replicas <= 1 or devices_str is None:
         return [devices_str] if devices_str is not None else [devices_str]
 
     device_list = [d.strip() for d in devices_str.split(",") if d.strip()]
-    required = num_replicas * tp_size
-    if len(device_list) != required:
-        raise ValueError(
-            f"Stage {stage_id}: num_replicas={num_replicas}, "
-            f"tensor_parallel_size={tp_size} requires "
-            f"{required} devices, got {len(device_list)}: {devices_str}"
-        )
 
-    result: list[str] = []
-    for r in range(num_replicas):
-        chunk = device_list[r * tp_size : (r + 1) * tp_size]
-        result.append(",".join(chunk))
-    return result
+    if len(device_list) == num_replicas * tp_size:
+        return [",".join(device_list[r * tp_size : (r + 1) * tp_size]) for r in range(num_replicas)]
+
+    if len(device_list) == tp_size:
+        try:
+            offsets = [int(a) for a in device_list]
+        except ValueError as e:
+            raise ValueError(f"Stage {stage_id}: template-mode devices must be ints, got {devices_str!r}") from e
+        bad = [a for a in offsets if not (0 <= a < tp_size)]
+        if bad:
+            raise ValueError(
+                f"Stage {stage_id}: template-mode device offset(s) {bad} "
+                f"out of range [0, {tp_size}); devices={devices_str!r}"
+            )
+        return [",".join(str(r * tp_size + a) for a in offsets) for r in range(num_replicas)]
+
+    raise ValueError(
+        f"Stage {stage_id}: devices={devices_str!r} has {len(device_list)} id(s); "
+        f"need either {tp_size} (template, dp-independent) or "
+        f"{num_replicas * tp_size} (pool / legacy). "
+        f"num_replicas={num_replicas}, tensor_parallel_size={tp_size}."
+    )
 
 
 def get_stage_tp_size(stage_cfg: Any) -> int:
@@ -479,8 +563,18 @@ def get_stage_devices_per_replica(stage_cfg: Any) -> int:
 
 def compute_replica_layout(
     stage_configs: Sequence[Any],
+    *,
+    allow_zero: bool = False,
 ) -> tuple[list[int], dict[int, list[str]]]:
     """Compute per-stage replica counts and device assignments.
+
+    Args:
+        stage_configs: per-stage config objects with a ``runtime`` sub-config
+            exposing ``num_replicas`` and ``devices``.
+        allow_zero: when True, ``num_replicas == 0`` is honored (used by
+            single-stage / head-distributed mode for non-self stages that
+            will be filled dynamically by remote registrations); when False
+            (default), the count is clamped to at least 1.
 
     Returns:
         replicas_per_stage: num_replicas per logical stage.
@@ -495,7 +589,9 @@ def compute_replica_layout(
             if hasattr(runtime_cfg, "get")
             else getattr(runtime_cfg, "num_replicas", 1)
         )
-        replicas_per_stage.append(max(1, num_replicas))
+        if num_replicas < 0:
+            raise ValueError(f"num_replicas must be >= 0, got {num_replicas}")
+        replicas_per_stage.append(num_replicas if allow_zero else max(1, num_replicas))
 
     replica_devices_map: dict[int, list[str]] = {}
     for stage_id, stage_cfg in enumerate(stage_configs):
