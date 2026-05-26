@@ -38,6 +38,7 @@ import torch
 import zmq
 
 from ..utils.logging import get_connector_logger
+from ..utils.memory_pool import BufferAllocator, ManagedBuffer
 from ..utils.serialization import OmniSerializer
 from .base import OmniConnectorBase
 
@@ -99,117 +100,6 @@ class QueryResponse(msgspec.Struct):
     request_id: str
     data_size: int
     is_fast_path: bool
-
-
-# ---------------------------------------------------------------------------
-# Pool memory management (shared with MooncakeTransferEngineConnector)
-# ---------------------------------------------------------------------------
-
-
-class BufferAllocator:
-    """Simple first-fit allocator over a contiguous memory pool."""
-
-    def __init__(self, total_size: int, alignment: int = 4096):
-        self.total_size = total_size
-        self.alignment = alignment
-        self.lock = threading.Lock()
-        self.free_blocks: list[tuple[int, int]] = [(0, total_size)]
-
-    def alloc(self, size: int) -> int:
-        aligned = (size + self.alignment - 1) // self.alignment * self.alignment
-        with self.lock:
-            for i, (start, bsz) in enumerate(self.free_blocks):
-                if bsz >= aligned:
-                    remainder = bsz - aligned
-                    if remainder > 0:
-                        self.free_blocks[i] = (start + aligned, remainder)
-                    else:
-                        self.free_blocks.pop(i)
-                    return start
-        raise MemoryError(f"Out of memory in buffer pool. Requested {size} bytes (aligned {aligned}).")
-
-    def free(self, offset: int, size: int) -> None:
-        aligned = (size + self.alignment - 1) // self.alignment * self.alignment
-        with self.lock:
-            for start, length in self.free_blocks:
-                if offset == start and aligned == length:
-                    return
-                if offset >= start and offset + aligned <= start + length:
-                    return
-                if not (offset + aligned <= start or start + length <= offset):
-                    raise RuntimeError(
-                        f"Memory corruption: freeing {offset}-{offset + aligned} "
-                        f"overlaps with free block {start}-{start + length}"
-                    )
-            self.free_blocks.append((offset, aligned))
-            self.free_blocks.sort()
-
-            i = 0
-            while i < len(self.free_blocks) - 1:
-                cs, csz = self.free_blocks[i]
-                ns, nsz = self.free_blocks[i + 1]
-                if cs + csz == ns:
-                    self.free_blocks[i] = (cs, csz + nsz)
-                    self.free_blocks.pop(i + 1)
-                else:
-                    i += 1
-
-
-class ManagedBuffer:
-    """Zero-copy view into the global memory pool.
-
-    Callers **must** call :meth:`release` (or use the context manager) after
-    they are done reading/writing the buffer so the region is returned to the
-    :class:`BufferAllocator`.
-    """
-
-    def __init__(
-        self,
-        allocator: BufferAllocator,
-        offset: int,
-        size: int,
-        pool_tensor: torch.Tensor,
-    ):
-        self.allocator = allocator
-        self.offset = offset
-        self.size = size
-        self.pool_tensor = pool_tensor
-        self._released = False
-
-    def release(self) -> None:
-        if not self._released:
-            self.allocator.free(self.offset, self.size)
-            self._released = True
-
-    def __del__(self) -> None:
-        self.release()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.release()
-
-    @property
-    def tensor(self) -> torch.Tensor:
-        return self.pool_tensor[self.offset : self.offset + self.size]
-
-    def as_tensor(self, dtype: torch.dtype, shape: tuple) -> torch.Tensor:
-        itemsize = torch.tensor([], dtype=dtype).element_size()
-        expected = itemsize
-        for d in shape:
-            expected *= d
-        if expected != self.size:
-            raise ValueError(f"Shape {shape} dtype {dtype} needs {expected} bytes, buffer has {self.size}")
-        if self.offset % itemsize != 0:
-            raise RuntimeError(f"Buffer offset {self.offset} not aligned for {dtype}")
-        return self.tensor.view(dtype).reshape(shape)
-
-    def to_bytes(self) -> bytes:
-        t = self.tensor
-        if t.is_cuda:
-            t = t.cpu()
-        return t.numpy().tobytes()
 
 
 # ---------------------------------------------------------------------------
