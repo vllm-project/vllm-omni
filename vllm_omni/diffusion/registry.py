@@ -266,6 +266,11 @@ _DIFFUSION_MODELS = {
         "pipeline_lingbot_world_fast",
         "LingbotWorldFastPipeline",
     ),
+    "HiDreamImagePipeline": (
+        "hidream_image",
+        "pipeline_hidream_image",
+        "HiDreamImagePipeline",
+    ),
 }
 
 
@@ -488,6 +493,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "LingbotWorldFastPipeline": "get_lingbot_world_fast_post_process_func",
+    "HiDreamImagePipeline": "get_hidream_image_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {

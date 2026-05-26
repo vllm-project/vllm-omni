@@ -20,14 +20,15 @@ logger = init_logger(__name__)
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
+    "GLMTTSForConditionalGeneration": "glm_tts",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
-    "VoxCPMForConditionalGeneration": "voxcpm",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
     "CosyVoice3Model": "CosyVoice-BlankEN",
+    "GLMTTSForConditionalGeneration": "vq32k-phoneme-tokenizer",
 }
 
 
@@ -38,6 +39,10 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+        from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
+        from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
+        from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
         return
@@ -52,6 +57,10 @@ def _register_omni_hf_configs() -> None:
 
     for model_type, config_cls in [
         ("qwen3_tts", Qwen3TTSConfig),
+        ("cosyvoice3", CosyVoice3Config),
+        ("glm_tts", GLMTTSConfig),
+        ("omnivoice", OmniVoiceConfig),
+        ("voxcpm2", VoxCPM2Config),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -155,6 +164,10 @@ class OmniEngineArgs(EngineArgs):
 
     omni_master_address: str | None = None
     omni_master_port: int | None = None
+    # OmniCoordinator integration knobs (process-local).
+    omni_dp_size_local: int = 1
+    omni_lb_policy: str = "random"
+    omni_heartbeat_timeout: float = 30.0
     stage_configs_path: str | None = None
     output_modalities: list[str] | None = None
     log_stats: bool = False
@@ -295,6 +308,7 @@ class OmniEngineArgs(EngineArgs):
                             model_path,
                             allow_patterns=[
                                 f"{subfolder}/tokenizer*",
+                                f"{subfolder}/tokenization_*",
                                 f"{subfolder}/special_tokens*",
                                 f"{subfolder}/vocab*",
                                 f"{subfolder}/merges*",

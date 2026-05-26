@@ -1320,6 +1320,74 @@ def enable_cache_for_glm_image(pipeline: Any, cache_config: Any) -> Callable[[in
     return refresh_cache_context
 
 
+def enable_cache_for_dreamid_omni(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    """Enable cache-dit for DreamID-Omni fused pipeline.
+
+    Args:
+        pipeline: The DreamIDOmni pipeline instance.
+        cache_config: DiffusionCacheConfig instance with cache configuration.
+
+    Returns:
+        A refresh function that can be called with a new ``num_inference_steps``
+        to update the cache context for the pipeline.
+    """
+    transformer = getattr(pipeline, "transformer", None)
+    fused_blocks = getattr(transformer, "fused_blocks", None)
+    if transformer is None or fused_blocks is None:
+        raise ValueError("DreamIDOmniPipeline cache-dit expects pipeline.transformer.fused_blocks.")
+
+    db_cache_config = _build_db_cache_config(cache_config)
+
+    calibrator = None
+    if cache_config.enable_taylorseer:
+        taylorseer_order = cache_config.taylorseer_order
+        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+
+    modifier = ParamsModifier(
+        cache_config=db_cache_config,
+        calibrator_config=calibrator,
+    )
+
+    logger.info(
+        f"Enabling cache-dit on DreamID-Omni fused blocks: "
+        f"Fn={db_cache_config.Fn_compute_blocks}, "
+        f"Bn={db_cache_config.Bn_compute_blocks}, "
+        f"W={db_cache_config.max_warmup_steps}, "
+    )
+
+    cache_dit.enable_cache(
+        BlockAdapter(
+            transformer=transformer,
+            blocks=fused_blocks,
+            forward_pattern=ForwardPattern.Pattern_0,
+            params_modifiers=[modifier],
+            has_separate_cfg=True,
+        ),
+        cache_config=db_cache_config,
+    )
+
+    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        transformer = pipeline.transformer
+        if cache_config.scm_steps_mask_policy is None:
+            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+        else:
+            cache_dit.refresh_context(
+                transformer,
+                cache_config=DBCacheConfig().reset(
+                    num_inference_steps=num_inference_steps,
+                    steps_computation_mask=cache_dit.steps_mask(
+                        mask_policy=cache_config.scm_steps_mask_policy,
+                        total_steps=num_inference_steps,
+                    ),
+                    steps_computation_policy=cache_config.scm_steps_policy,
+                ),
+                verbose=verbose,
+            )
+
+    return refresh_cache_context
+
+
 def enable_cache_for_ernie_image(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for ERNIE-Image pipeline.
 
@@ -1413,7 +1481,7 @@ def enable_cache_for_helios(pipeline: Any, cache_config: Any) -> Callable[[int],
             params_modifiers=[
                 ParamsModifier(cache_config=db_cache_config, calibrator_config=calibrator_config),
             ],
-            has_separate_cfg=False,
+            has_separate_cfg=True,
         ),
         cache_config=db_cache_config,
         calibrator_config=calibrator_config,
@@ -1505,7 +1573,6 @@ CUSTOM_DIT_ENABLERS.update(
     {
         "Wan22Pipeline": enable_cache_for_wan22,
         "Wan22I2VPipeline": enable_cache_for_wan22,
-        "Wan22TI2VPipeline": enable_cache_for_wan22,
         "HunyuanImage3Pipeline": enable_cache_for_hunyuan_image3,
         "FluxPipeline": enable_cache_for_flux,
         "Flux2KleinPipeline": enable_cache_for_flux2_klein,
@@ -1522,6 +1589,7 @@ CUSTOM_DIT_ENABLERS.update(
         "BagelPipeline": enable_cache_for_bagel,
         "GlmImagePipeline": enable_cache_for_glm_image,
         "Flux2Pipeline": enable_cache_for_flux2,
+        "DreamIDOmniPipeline": enable_cache_for_dreamid_omni,
         "ErnieImagePipeline": enable_cache_for_ernie_image,
         "HunyuanVideo15Pipeline": enable_cache_for_hunyuan_video_15,
         "HunyuanVideo15I2VPipeline": enable_cache_for_hunyuan_video_15,
