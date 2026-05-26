@@ -182,26 +182,31 @@ python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
     --output-dir output_audio
 ```
 
-Observed cold-start (first process, no inductor cache):
-```text
-Saved       : output_audio/output.wav
-Duration    : 6.72s
-Inference   : 37.58s
-RTF         : 5.593
-```
+`end2end.py` is a one-shot script (init → one `generate()` → exit), so
+its reported RTF includes per-process compile + CUDA-Graph capture +
+first-request runtime warmup. To separate the warmup cost from the
+talker's true per-step throughput, the table below reports **5
+consecutive `engine.generate([prompt])` calls in the same process**
+after a one-off ~28 s engine init:
 
-Observed warm-cache (subsequent invocation, inductor cache hit):
-```text
-Saved       : output_audio/output.wav
-Duration    : 6.72s
-Inference   : 11.96s
-RTF         : 1.780
-```
+| call | duration | inference | RTF   | notes                                            |
+| ---- | -------- | --------- | ----- | ------------------------------------------------ |
+| #1   | 6.72 s   | 11.97 s   | 1.782 | cold: torch.compile + CUDA-Graph capture         |
+| #2   | 6.24 s   | 11.43 s   | 1.831 | still runtime warmup                             |
+| #3   | 6.88 s   | 0.82 s    | 0.120 | ⚡ steady-state                                   |
+| #4   | 6.56 s   | 0.78 s    | 0.119 | steady-state                                     |
+| #5   | 5.76 s   | 0.70 s    | 0.121 | steady-state                                     |
 
-The cold-start overhead (~25 s) is dominated by torch.compile of
-LocDiT / feat_encoder / AudioVAE + flashinfer JIT + CUDA-Graph capture.
-Subsequent runs in a long-lived server amortise this to ~RTF 0.5 on a
-single 4090, so prefer the online serving path for repeated workloads.
+**Steady-state RTF (mean of calls #3–#5): 0.120**, i.e. ~8× real-time on
+a single 4090. The high call-#1 / call-#2 numbers are one-time warmup
+costs that **amortise to zero after the second request** — they are not
+the model's per-step throughput.
+
+A literal one-shot `python end2end.py` invocation in a fresh process
+only sees call #1 (~RTF 1.8). For repeated workloads, either reuse the
+same engine across calls (as in the table above) or use the online
+serving path (T1–T5); a long-lived server amortises the warmup across
+all subsequent requests (T1 wall-time RTF was 0.51 with a warm server).
 
 Voice cloning + continuation mode (`ref_audio` + transcript):
 
@@ -212,18 +217,23 @@ python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
     --ref-text "Original transcript of the reference audio."
 ```
 
-Observed (warm-cache run, using a 10.08 s reference WAV):
-```text
-Saved       : output_audio/output.wav
-Duration    : 5.44s
-Inference   : 12.27s
-RTF         : 2.256
-```
+Same 5-call methodology as the zero-shot table, this time with a
+10.08 s reference WAV supplied via `--ref-audio` (and matching
+`--ref-text`):
 
-The small RTF bump over zero-shot warm-cache (1.78 → 2.26) comes from
-the one-off `AudioVAE.encode` over the reference clip plus the
-ref-continuation prompt build; subsequent decode steps run at the same
-per-step rate as zero-shot.
+| call | duration | inference | RTF   | notes                                            |
+| ---- | -------- | --------- | ----- | ------------------------------------------------ |
+| #1   | 5.44 s   | 12.38 s   | 2.276 | cold: compile + CUDA-Graph capture + ref encode  |
+| #2   | 5.12 s   | 2.47 s    | 0.482 | most warmup done                                 |
+| #3   | 5.44 s   | 0.76 s    | 0.139 | ⚡ steady-state                                   |
+| #4   | 4.96 s   | 0.68 s    | 0.137 | steady-state                                     |
+| #5   | 5.28 s   | 0.71 s    | 0.134 | steady-state                                     |
+
+**Steady-state cloning RTF (mean of calls #3–#5): 0.137**, i.e. only
+**+0.017 RTF** above the zero-shot steady-state of 0.120. That delta is
+the per-request `AudioVAE.encode` over the reference clip (~85 ms for a
+10 s ref WAV) plus the ref-continuation prompt build; the AR decode
+steps themselves run at the same per-step rate as zero-shot.
 
 #### Notes
 
@@ -231,4 +241,4 @@ per-step rate as zero-shot.
 - Memory usage: ~4.9 GiB model weights + ~15.2 GiB KV cache ≈ 22 GiB / 24 GiB resident with the default `voxcpm2.yaml`. On a shared GPU, pass `--gpu-memory-utilization 0.75` (or lower) if startup fails the free-memory check.
 - Key flags: `--omni` is required. `--trust-remote-code` is not needed — the HF config registers under `model_type=voxcpm2`.
 - Output: 48 kHz mono. When streaming PCM to a player, use `-r 48000`.
-- Cold start: ~60 s server boot + ~25 s first-inference overhead (torch.compile + flashinfer JIT + CUDA-Graph capture). Subsequent requests run at RTF ~0.5; keep the server warm for interactive use.
+- Cold start: ~60 s server boot + ~25 s first-inference overhead (torch.compile + flashinfer JIT + CUDA-Graph capture). Steady-state inference RTF is **~0.12** (~8× real-time on a single 4090; see T6 table for the per-call breakdown); online server requests run at ~RTF 0.5 wall-time (includes HTTP round-trip). Keep the server warm for interactive use.
