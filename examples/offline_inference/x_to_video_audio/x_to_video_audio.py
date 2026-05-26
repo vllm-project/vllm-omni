@@ -4,6 +4,7 @@
 import argparse
 import re
 import time
+from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -105,6 +106,27 @@ def load_image_and_audio(image_paths, audio_paths):
         audio_array = audio_array[int(sr * 1) : int(sr * 3)]
         audio.append(audio_array)
     return image, audio
+
+
+def _extract_peak_memory_mb(result: Any) -> float:
+    """Pull worker-reported peak VRAM (MiB) generation result.
+
+    Mirrors vllm_omni/entrypoints/openai/serving_video.py:_extract_peak_memory_mb.
+    """
+    if isinstance(result, list):
+        result = result[0] if result else None
+    if result is None:
+        return 0.0
+    val = getattr(result, "peak_memory_mb", 0.0)
+    if not val:
+        inner = getattr(result, "request_output", None)
+        if isinstance(inner, list):
+            inner = inner[0] if inner else None
+        val = getattr(inner, "peak_memory_mb", 0.0)
+    try:
+        return float(val or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def main() -> None:
@@ -218,6 +240,9 @@ def main() -> None:
         f.write(video_bytes)
     print(f"Saved generated video to {output_path}")
     print(f"Total time: {elapsed:.2f}s")
+    peak_mb = _extract_peak_memory_mb(outputs)
+    if peak_mb:
+        print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
 
 
 if __name__ == "__main__":
