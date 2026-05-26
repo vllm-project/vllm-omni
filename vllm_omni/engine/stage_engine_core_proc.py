@@ -35,8 +35,8 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.utils import shutdown
 
-from vllm_omni.engine.arg_utils import register_omni_models_to_vllm
 from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
+from vllm_omni.engine.arg_utils import register_omni_models_to_vllm
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
