@@ -33,6 +33,7 @@ import time
 import uuid
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -73,6 +74,9 @@ TEST_PROMPTS: list[dict[str, str]] = [
     {"prompt": "a spaceship flying above a volcano", "negative_prompt": "low contrast"},
     {"prompt": "a watercolor painting of a mountain lake", "negative_prompt": "photo, realistic"},
 ]
+
+TRUE_CFG_PARITY_SCALES = [1.0, 3.0, 6.0]
+TRUE_CFG_PARITY_SEEDS = [123, 456, 789]
 
 
 # ------------------------------------------------------------------
@@ -129,6 +133,38 @@ def _extract_images(output: OmniRequestOutput) -> list:
     if inner is not None and hasattr(inner, "images") and inner.images:
         return inner.images
     return []
+
+
+def _image_to_array(image) -> np.ndarray:
+    array = np.asarray(image)
+    if array.dtype == np.uint8:
+        return array.astype(np.float32)
+    return array
+
+
+def _assert_image_close(actual, expected, *, label: str) -> None:
+    actual_array = _image_to_array(actual)
+    expected_array = _image_to_array(expected)
+    assert actual_array.shape == expected_array.shape, (
+        f"{label}: shape mismatch, actual={actual_array.shape}, expected={expected_array.shape}"
+    )
+    diff = np.abs(actual_array.astype(np.float32) - expected_array.astype(np.float32))
+    max_diff = float(diff.max()) if diff.size else 0.0
+    mean_diff = float(diff.mean()) if diff.size else 0.0
+    print(f"   {label}: max_abs_diff={max_diff:.4f}, mean_abs_diff={mean_diff:.4f}")
+    np.testing.assert_array_equal(
+        actual_array,
+        expected_array,
+        err_msg=f"{label}: image parity mismatch",
+    )
+
+
+def _true_cfg_sampling_params(scale: float, seed: int) -> OmniDiffusionSamplingParams:
+    return _default_sampling_params(
+        guidance_scale=0.0,
+        true_cfg_scale=scale,
+        seed=seed,
+    )
 
 
 # ------------------------------------------------------------------
@@ -313,6 +349,64 @@ async def validate_concurrent(omni: AsyncOmni, prompts: list[dict[str, str]]) ->
     print("   ✅ All request_ids matched, results count correct.\n")
 
 
+async def validate_true_cfg_scale_parity(omni: AsyncOmni, prompts: list[dict[str, str]]) -> None:
+    """Compare separate vs concurrent requests with mixed true CFG scale patterns."""
+    num_parity_requests = len(TRUE_CFG_PARITY_SCALES)
+    if len(prompts) < num_parity_requests:
+        raise ValueError(f"true CFG parity validation requires at least {num_parity_requests} prompts")
+
+    prompts = prompts[:num_parity_requests]
+    samplings = [
+        _true_cfg_sampling_params(scale, seed)
+        for scale, seed in zip(TRUE_CFG_PARITY_SCALES, TRUE_CFG_PARITY_SEEDS, strict=True)
+    ]
+
+    print("🔍 Validating true CFG scale parity with separate vs concurrent requests ...")
+    separate_images = []
+    separate_start = time.perf_counter()
+    for i, (prompt, sampling, scale) in enumerate(zip(prompts, samplings, TRUE_CFG_PARITY_SCALES, strict=True)):
+        result = await _collect_generate(
+            omni,
+            prompt=prompt,
+            request_id=f"true-cfg-separate-{i}-{uuid.uuid4().hex[:8]}",
+            sampling_params_list=[sampling],
+        )
+        images = _extract_images(result)
+        assert len(images) == 1, f"Expected one separate image for prompt {i}, got {len(images)}"
+        separate_images.append(images[0])
+        print(f"   separate prompt {i}: scale={scale}, request_id={result.request_id}")
+    separate_time = time.perf_counter() - separate_start
+
+    concurrent_request_ids = [f"true-cfg-batched-{i}-{uuid.uuid4().hex[:8]}" for i in range(len(prompts))]
+    concurrent_start = time.perf_counter()
+    concurrent_results = await asyncio.gather(
+        *(
+            _collect_generate(
+                omni,
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=[sampling],
+            )
+            for prompt, request_id, sampling in zip(prompts, concurrent_request_ids, samplings, strict=True)
+        )
+    )
+    concurrent_time = time.perf_counter() - concurrent_start
+
+    returned_ids = [result.request_id for result in concurrent_results]
+    assert returned_ids == concurrent_request_ids, (
+        f"Request ID order mismatch: {returned_ids} != {concurrent_request_ids}"
+    )
+
+    for i, result in enumerate(concurrent_results):
+        images = _extract_images(result)
+        assert len(images) == 1, f"Expected one concurrent image for prompt {i}, got {len(images)}"
+        _assert_image_close(images[0], separate_images[i], label=f"prompt {i}, scale={TRUE_CFG_PARITY_SCALES[i]}")
+
+    print(f"   ✅ Separate true-CFG time: {separate_time:.2f}s")
+    print(f"   ✅ Concurrent true-CFG time: {concurrent_time:.2f}s")
+    print("   ✅ true CFG scale parity passed.\n")
+
+
 # ------------------------------------------------------------------
 # Single vs Parallel comparison (CLI only)
 # ------------------------------------------------------------------
@@ -364,6 +458,8 @@ async def main(model: str, num_prompts: int, mode: str, batch_size: int = 1) -> 
             await validate_concurrent(omni, prompts)
         elif mode == "validate_batch":
             await validate_batch_explicit(omni, prompts)
+        elif mode == "true_cfg_parity":
+            await validate_true_cfg_scale_parity(omni, prompts)
         elif mode == "batch":
             await run_batch(omni, prompts, label="measurement")
         elif mode == "batch_explicit":
@@ -540,6 +636,23 @@ def test_diffusion_batching_async_explicit_batch(model_name: str):
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 @pytest.mark.parametrize("model_name", models)
+def test_diffusion_batching_true_cfg_scale_parity(model_name: str):
+    """Mixed true CFG branch patterns should preserve per-request results under concurrency."""
+
+    async def _inner():
+        omni = AsyncOmni(model=model_name, diffusion_batch_size=2)
+        try:
+            await validate_true_cfg_scale_parity(omni, TEST_PROMPTS[: len(TRUE_CFG_PARITY_SCALES)])
+        finally:
+            omni.shutdown()
+
+    asyncio.run(_inner())
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
+@pytest.mark.parametrize("model_name", models)
 def test_diffusion_batching_num_outputs(model_name: str):
     """Test that the diffusion model respects num_outputs_per_prompt and
     generates the correct number of images per request."""
@@ -613,12 +726,21 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=1, help="Diffusion batch size (1 = no batching)")
     parser.add_argument(
         "--mode",
-        choices=["batch", "batch_explicit", "single", "compare", "validate", "validate_batch"],
+        choices=[
+            "batch",
+            "batch_explicit",
+            "single",
+            "compare",
+            "validate",
+            "validate_batch",
+            "true_cfg_parity",
+        ],
         default="compare",
         help=(
             "Run mode: 'batch' (parallel gather), 'batch_explicit' (list-prompt batch API), "
             "'single' (sequential), 'compare' (all three), "
-            "'validate' (concurrent correctness), 'validate_batch' (list-prompt correctness)"
+            "'validate' (concurrent correctness), 'validate_batch' (list-prompt correctness), "
+            "'true_cfg_parity' (separate vs concurrent true-CFG image parity)"
         ),
     )
     args = parser.parse_args()

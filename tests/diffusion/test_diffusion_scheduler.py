@@ -157,10 +157,15 @@ class TestGetSamplingParamsKey:
     """Pure-function tests for the batch-compatibility key builder."""
 
     @staticmethod
-    def _make(lora_int_id: int | None = None, lora_scale: float = 1.0) -> OmniDiffusionRequest:
+    def _make(
+        lora_int_id: int | None = None,
+        lora_scale: float = 1.0,
+        prompts=None,
+        **sampling_kwargs,
+    ) -> OmniDiffusionRequest:
         from vllm_omni.lora.request import LoRARequest
 
-        sp = OmniDiffusionSamplingParams(num_inference_steps=2)
+        sp = OmniDiffusionSamplingParams(num_inference_steps=2, **sampling_kwargs)
         if lora_int_id is not None:
             sp.lora_request = LoRARequest(
                 lora_name=f"adapter-{lora_int_id}",
@@ -169,7 +174,7 @@ class TestGetSamplingParamsKey:
             )
         sp.lora_scale = lora_scale
         return OmniDiffusionRequest(
-            prompts=["prompt"],
+            prompts=["prompt"] if prompts is None else prompts,
             sampling_params=sp,
             request_ids=[f"req-{lora_int_id}-{lora_scale}"],
         )
@@ -199,6 +204,87 @@ class TestGetSamplingParamsKey:
         a = get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
         b = get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
         assert a == b
+
+    def test_equal_for_different_non_one_guidance_scales(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        assert get_sampling_params_key(self._make(guidance_scale=4.0)) == get_sampling_params_key(
+            self._make(guidance_scale=7.5)
+        )
+
+    def test_distinguishes_default_and_non_one_guidance_scales(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        assert get_sampling_params_key(self._make(guidance_scale=1.0)) != get_sampling_params_key(
+            self._make(guidance_scale=7.5)
+        )
+
+    def test_equal_for_different_non_one_second_guidance_scales(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        assert get_sampling_params_key(
+            self._make(
+                guidance_scale=4.0,
+                guidance_scale_2=8.0,
+            )
+        ) == get_sampling_params_key(
+            self._make(
+                guidance_scale=7.5,
+                guidance_scale_2=3.0,
+            )
+        )
+
+    def test_distinguishes_second_guidance_branch_pattern(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        assert get_sampling_params_key(
+            self._make(
+                guidance_scale=4.0,
+                guidance_scale_2=1.0,
+            )
+        ) != get_sampling_params_key(
+            self._make(
+                guidance_scale=7.5,
+                guidance_scale_2=3.0,
+            )
+        )
+
+    def test_equal_for_different_non_one_true_cfg_scales(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        assert get_sampling_params_key(
+            self._make(
+                prompts=[{"prompt": "prompt", "negative_prompt": "bad"}],
+                true_cfg_scale=3.0,
+            )
+        ) == get_sampling_params_key(
+            self._make(
+                prompts=[{"prompt": "prompt", "negative_prompt": "bad"}],
+                true_cfg_scale=5.0,
+            )
+        )
+
+    def test_distinguishes_true_cfg_branch_pattern(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        assert get_sampling_params_key(
+            self._make(
+                prompts=[{"prompt": "prompt", "negative_prompt": "bad"}],
+                true_cfg_scale=1.0,
+            )
+        ) != get_sampling_params_key(
+            self._make(
+                prompts=[{"prompt": "prompt", "negative_prompt": "bad"}],
+                true_cfg_scale=5.0,
+            )
+        )
+
+    def test_distinguishes_resolution(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        assert get_sampling_params_key(self._make(guidance_scale=4.0, width=512)) != get_sampling_params_key(
+            self._make(guidance_scale=7.5, width=768)
+        )
 
 
 class TestRequestScheduler:
@@ -281,6 +367,99 @@ class TestRequestScheduler:
         assert _new_ids(sched_output) == [req_id_a, req_id_b]
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 0
+
+    def test_batches_requests_with_different_non_one_guidance_scales(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_id_a = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_a"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    guidance_scale=4.0,
+                    num_inference_steps=1,
+                ),
+                request_ids=["a"],
+            )
+        )
+        req_id_b = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_b"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    guidance_scale=7.5,
+                    num_inference_steps=1,
+                ),
+                request_ids=["b"],
+            )
+        )
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_id_a, req_id_b]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 0
+
+    def test_batches_requests_with_different_non_one_true_cfg_scales(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_id_a = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=[{"prompt": "prompt_a", "negative_prompt": "bad"}],
+                sampling_params=OmniDiffusionSamplingParams(
+                    true_cfg_scale=3.0,
+                    num_inference_steps=1,
+                ),
+                request_ids=["a"],
+            )
+        )
+        req_id_b = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=[{"prompt": "prompt_b", "negative_prompt": "bad"}],
+                sampling_params=OmniDiffusionSamplingParams(
+                    true_cfg_scale=6.0,
+                    num_inference_steps=1,
+                ),
+                request_ids=["b"],
+            )
+        )
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_id_a, req_id_b]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 0
+
+    def test_rejects_mixed_default_and_non_one_guidance_scales(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_id_a = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_a"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    guidance_scale=1.0,
+                    num_inference_steps=1,
+                ),
+                request_ids=["a"],
+            )
+        )
+        scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_b"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    guidance_scale=7.5,
+                    num_inference_steps=1,
+                ),
+                request_ids=["b"],
+            )
+        )
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_id_a]
+        assert sched_output.num_running_reqs == 1
+        assert sched_output.num_waiting_reqs == 1
 
     def test_incompatible_waiting_head_blocks_later_compatible_request(self) -> None:
         scheduler = RequestScheduler()

@@ -36,6 +36,18 @@ def _slice_pred(pred: tuple[torch.Tensor, ...], output_slice: int) -> tuple[torc
     return tuple(p[:, :output_slice] for p in pred)
 
 
+def _reshape_cfg_scale(true_cfg_scale: float | torch.Tensor, pred: torch.Tensor) -> float | torch.Tensor:
+    if not torch.is_tensor(true_cfg_scale):
+        return true_cfg_scale
+
+    scale = true_cfg_scale.to(device=pred.device, dtype=pred.dtype)
+    if scale.ndim == 0:
+        return scale
+    if scale.numel() == pred.shape[0]:
+        return scale.reshape(pred.shape[0], *([1] * (pred.ndim - 1)))
+    return scale
+
+
 def _dispatch_branches(n_branches: int, n_ranks: int) -> list[list[int]]:
     """
     Round-robin dispatch N branches to M ranks.
@@ -76,7 +88,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
-        true_cfg_scale: float,
+        true_cfg_scale: float | torch.Tensor,
         positive_kwargs: dict[str, Any],
         negative_kwargs: dict[str, Any] | None,
         cfg_normalize: bool = True,
@@ -171,7 +183,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         self,
         positive_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
         negative_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
-        true_cfg_scale: float,
+        true_cfg_scale: float | torch.Tensor,
         cfg_normalize: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
@@ -205,7 +217,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
         results = []
         for p, n in zip(pos_t, neg_t):
-            comb = n + true_cfg_scale * (p - n)
+            scale = _reshape_cfg_scale(true_cfg_scale, p)
+            comb = n + scale * (p - n)
             if cfg_normalize:
                 comb = self.cfg_normalize_function(p, comb)
             results.append(comb)
@@ -216,7 +229,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
     def predict_noise_with_multi_branch_cfg(
         self,
         do_true_cfg: bool,
-        true_cfg_scale: float | dict[str, float],
+        true_cfg_scale: float | torch.Tensor | dict[str, float],
         branches_kwargs: list[dict[str, Any]],
         cfg_normalize: bool = False,
         output_slice: int | None = None,
@@ -276,7 +289,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         branches_kwargs: list[dict[str, Any]],
         n_branches: int,
         cfg_world_size: int,
-        true_cfg_scale: float,
+        true_cfg_scale: float | torch.Tensor,
         cfg_normalize: bool,
         output_slice: int | None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -342,7 +355,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
     def combine_multi_branch_cfg_noise(
         self,
         predictions: list[torch.Tensor | tuple[torch.Tensor, ...]],
-        true_cfg_scale: float | dict[str, float],
+        true_cfg_scale: float | torch.Tensor | dict[str, float],
         cfg_normalize: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
@@ -359,16 +372,11 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Returns:
             Combined noise prediction.
         """
-        positive = _wrap(predictions[0])
-        negative = _wrap(predictions[1])
-
-        results = []
-        for p, n in zip(positive, negative):
-            comb = n + true_cfg_scale * (p - n)
-            if cfg_normalize:
-                comb = self.cfg_normalize_function(p, comb)
-            results.append(comb)
-        return _unwrap(tuple(results))
+        if len(predictions) < 2:
+            raise ValueError("Multi-branch CFG requires at least positive and negative predictions.")
+        if isinstance(true_cfg_scale, dict):
+            raise TypeError("Default multi-branch CFG combine requires a scalar or tensor scale.")
+        return self.combine_cfg_noise(predictions[0], predictions[1], true_cfg_scale, cfg_normalize)
 
     def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor | tuple[torch.Tensor, ...] | IntermediateTensors:
         """

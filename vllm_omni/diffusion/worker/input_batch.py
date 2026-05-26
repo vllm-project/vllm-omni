@@ -402,17 +402,37 @@ def _prepare_timesteps(
 
 def _prepare_cfg_scalars(
     states: Sequence[DiffusionRequestState],
-) -> tuple[bool, float, bool]:
-    def _cfg_scalars(state: DiffusionRequestState) -> tuple[bool, float, bool]:
-        true_cfg_scale = getattr(state.sampling, "true_cfg_scale", None) or 4.0
-        cfg_normalize = bool(getattr(state.sampling, "cfg_normalize", False))
-        return state.do_true_cfg, true_cfg_scale, cfg_normalize
+) -> tuple[bool, torch.Tensor, bool]:
+    do_true_cfg = states[0].do_true_cfg
+    cfg_normalize = bool(getattr(states[0].sampling, "cfg_normalize", False))
 
-    scalars = _cfg_scalars(states[0])
-    for state in states[1:]:
-        if _cfg_scalars(state) != scalars:
-            raise ValueError("Mixed CFG settings in one diffusion batch are not supported.")
-    return scalars
+    gathered_scales: list[torch.Tensor] = []
+    for state in states:
+        if state.do_true_cfg != do_true_cfg:
+            raise ValueError("Mixed true CFG settings in one diffusion batch are not supported.")
+        if bool(getattr(state.sampling, "cfg_normalize", False)) != cfg_normalize:
+            raise ValueError("Mixed CFG normalization settings in one diffusion batch are not supported.")
+
+        latents = _require_state_latents(state, for_field="true_cfg_scale")
+        true_cfg_scale = getattr(state.sampling, "true_cfg_scale", None) or 4.0
+        scale_tensor = torch.as_tensor(
+            true_cfg_scale,
+            device=latents.device,
+            dtype=latents.dtype,
+        )
+        gathered_scales.append(
+            _expand_scalar_or_vector(
+                scale_tensor,
+                num_rows=int(latents.shape[0]),
+                field_name="true_cfg_scale",
+            )
+        )
+
+    return (
+        do_true_cfg,
+        _gather_tensor_rows(gathered_scales, field_name="true_cfg_scale"),
+        cfg_normalize,
+    )
 
 
 def _prepare_guidance(
@@ -593,9 +613,9 @@ class InputBatch:
     prompt_embeds_mask: torch.Tensor | None
     negative_prompt_embeds: torch.Tensor | None
     negative_prompt_embeds_mask: torch.Tensor | None
+    true_cfg_scale: torch.Tensor
     guidance: torch.Tensor | None = None
     do_true_cfg: bool = False
-    true_cfg_scale: float = 4.0
     cfg_normalize: bool = False
     image_latents: torch.Tensor | None = None
 

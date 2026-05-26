@@ -179,7 +179,7 @@ class PipelineParallelMixin:
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
-        true_cfg_scale: float,
+        true_cfg_scale: float | torch.Tensor,
         positive_kwargs: dict[str, Any],
         negative_kwargs: dict[str, Any] | None,
         cfg_normalize: bool = True,

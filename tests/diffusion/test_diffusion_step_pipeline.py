@@ -13,6 +13,7 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
+import vllm_omni.diffusion.distributed.cfg_parallel as cfg_parallel_module
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
@@ -94,6 +95,74 @@ class _StepPipeline:
         del kwargs
         self.decode_calls += 1
         return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
+
+
+class _GuidanceStepPipeline(_StepPipeline):
+    """Pipeline stub that makes per-request guidance affect the step output."""
+
+    def prepare_encode(self, state, **kwargs):
+        del kwargs
+        self.prepare_calls += 1
+        state.timesteps = [torch.tensor(1.0)]
+        state.latents = torch.tensor([[float(state.sampling.seed)]])
+        state.prompt_embeds = torch.tensor([[[0.0, 0.0]]])
+        state.guidance = torch.tensor([state.sampling.guidance_scale])
+        return state
+
+    def denoise_step(self, input_batch, **kwargs):
+        del kwargs
+        self.denoise_calls += 1
+        return input_batch.latents + input_batch.guidance.reshape(-1, 1)
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del kwargs
+        self.scheduler_calls += 1
+        state.latents = noise_pred
+        state.step_index += 1
+
+    def post_decode(self, state, **kwargs):
+        del kwargs
+        self.decode_calls += 1
+        return DiffusionOutput(output=state.latents.clone())
+
+
+class _TrueCfgStepPipeline(_StepPipeline, CFGParallelMixin):
+    """Pipeline stub that makes per-request true CFG scale affect output."""
+
+    def prepare_encode(self, state, **kwargs):
+        del kwargs
+        self.prepare_calls += 1
+        state.timesteps = [torch.tensor(1.0)]
+        state.latents = torch.tensor([[float(state.sampling.seed)]])
+        state.prompt_embeds = torch.tensor([[[0.0, 0.0]]])
+        state.negative_prompt_embeds = torch.tensor([[[1.0, 1.0]]])
+        state.do_true_cfg = True
+        return state
+
+    def predict_noise(self, **kwargs):
+        return kwargs["x"]
+
+    def denoise_step(self, input_batch, **kwargs):
+        del kwargs
+        self.denoise_calls += 1
+        return self.predict_noise_maybe_with_cfg(
+            input_batch.do_true_cfg,
+            input_batch.true_cfg_scale,
+            {"x": input_batch.latents + 1},
+            {"x": input_batch.latents - 1},
+            cfg_normalize=False,
+        )
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del kwargs
+        self.scheduler_calls += 1
+        state.latents = noise_pred
+        state.step_index += 1
+
+    def post_decode(self, state, **kwargs):
+        del kwargs
+        self.decode_calls += 1
+        return DiffusionOutput(output=state.latents.clone())
 
 
 class _InterruptingStepPipeline(_StepPipeline):
@@ -227,6 +296,30 @@ def _make_engine_request(req_id: str = "req-1", num_inference_steps: int = 2) ->
     return OmniDiffusionRequest(
         prompts=[f"prompt-{req_id}"],
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=num_inference_steps),
+        request_ids=[req_id],
+    )
+
+
+def _make_guidance_request(req_id: str, *, seed: int, guidance_scale: float) -> OmniDiffusionRequest:
+    return OmniDiffusionRequest(
+        prompts=[f"prompt-{req_id}"],
+        sampling_params=OmniDiffusionSamplingParams(
+            guidance_scale=guidance_scale,
+            num_inference_steps=1,
+            seed=seed,
+        ),
+        request_ids=[req_id],
+    )
+
+
+def _make_true_cfg_request(req_id: str, *, seed: int, true_cfg_scale: float) -> OmniDiffusionRequest:
+    return OmniDiffusionRequest(
+        prompts=[{"prompt": f"prompt-{req_id}", "negative_prompt": "bad"}],
+        sampling_params=OmniDiffusionSamplingParams(
+            true_cfg_scale=true_cfg_scale,
+            num_inference_steps=1,
+            seed=seed,
+        ),
         request_ids=[req_id],
     )
 
@@ -426,6 +519,73 @@ class TestRunner:
 
         result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
         assert len(result) == 2
+
+    def test_batch_preserves_per_request_guidance(self, monkeypatch):
+        req_1 = _make_guidance_request("req-1", seed=10, guidance_scale=4.0)
+        req_2 = _make_guidance_request("req-2", seed=20, guidance_scale=7.5)
+
+        batched_runner = _make_runner()
+        batched_runner.pipeline = _GuidanceStepPipeline()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        batched = DiffusionModelRunner.execute_stepwise(
+            batched_runner,
+            _make_batch_scheduler_output([req_1, req_2]),
+        )
+
+        separate_outputs = []
+        for req in (req_1, req_2):
+            runner = _make_runner()
+            runner.pipeline = _GuidanceStepPipeline()
+            separate_outputs.append(
+                DiffusionModelRunner.execute_stepwise(
+                    runner,
+                    _make_scheduler_output(req, sched_req_id=req.request_ids[0]),
+                ).get_req_output(req.request_ids[0])
+            )
+
+        for req, separate in zip((req_1, req_2), separate_outputs, strict=True):
+            batched_output = batched.get_req_output(req.request_ids[0])
+            assert batched_output.finished is True
+            assert separate.finished is True
+            torch.testing.assert_close(batched_output.result.output, separate.result.output)
+
+        assert batched_runner.pipeline.denoise_calls == 1
+
+    def test_batch_preserves_per_request_true_cfg_scale(self, monkeypatch):
+        req_1 = _make_true_cfg_request("req-1", seed=10, true_cfg_scale=3.0)
+        req_2 = _make_true_cfg_request("req-2", seed=20, true_cfg_scale=6.0)
+
+        batched_runner = _make_runner()
+        batched_runner.pipeline = _TrueCfgStepPipeline()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        monkeypatch.setattr(cfg_parallel_module, "get_classifier_free_guidance_world_size", lambda: 1)
+
+        batched = DiffusionModelRunner.execute_stepwise(
+            batched_runner,
+            _make_batch_scheduler_output([req_1, req_2]),
+        )
+
+        separate_outputs = []
+        for req in (req_1, req_2):
+            runner = _make_runner()
+            runner.pipeline = _TrueCfgStepPipeline()
+            separate_outputs.append(
+                DiffusionModelRunner.execute_stepwise(
+                    runner,
+                    _make_scheduler_output(req, sched_req_id=req.request_ids[0]),
+                ).get_req_output(req.request_ids[0])
+            )
+
+        for req, separate in zip((req_1, req_2), separate_outputs, strict=True):
+            batched_output = batched.get_req_output(req.request_ids[0])
+            assert batched_output.finished is True
+            assert separate.finished is True
+            torch.testing.assert_close(batched_output.result.output, separate.result.output)
+
+        assert batched.get_req_output("req-1").result.output.item() == 15.0
+        assert batched.get_req_output("req-2").result.output.item() == 31.0
+        assert batched_runner.pipeline.denoise_calls == 1
 
     def test_rejects_missing_cached_state(self):
         runner = _make_runner()

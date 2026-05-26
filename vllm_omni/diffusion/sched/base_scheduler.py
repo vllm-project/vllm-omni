@@ -25,6 +25,11 @@ logger = init_logger(__name__)
 # LoRA identity is derived from `sampling.lora_request`, not a same-named field
 # on sampling params, so it must be resolved separately from the bulk lookup.
 _KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {"lora_int_id"}
+_CFG_SCALE_USES_CFG_BRANCHES_KEY = -1.0
+
+
+def _has_negative_prompt(request: OmniDiffusionRequest) -> bool:
+    return any(not isinstance(prompt, str) and prompt.get("negative_prompt") for prompt in request.prompts)
 
 
 def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey | None:
@@ -34,9 +39,23 @@ def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey 
 
     sampling = request.sampling_params
     lora_request = getattr(sampling, "lora_request", None)
+    values = {name: getattr(sampling, name) for name in _KEY_FIELD_NAMES}
+
+    # Qwen true CFG also needs the positive/negative branch scheduler bucket.
+    true_cfg_scale = values.get("true_cfg_scale")
+    if true_cfg_scale is not None:
+        if true_cfg_scale > 1.0 and _has_negative_prompt(request):
+            values["do_classifier_free_guidance"] = True
+        if true_cfg_scale != 1.0:
+            values["true_cfg_scale"] = _CFG_SCALE_USES_CFG_BRANCHES_KEY
+
+    for cfg_scale_field in ("guidance_scale", "guidance_scale_2"):
+        cfg_scale = values.get(cfg_scale_field)
+        if cfg_scale is not None and cfg_scale != 1.0:
+            values[cfg_scale_field] = _CFG_SCALE_USES_CFG_BRANCHES_KEY
     return SamplingParamsKey(
         lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
-        **{name: getattr(sampling, name) for name in _KEY_FIELD_NAMES},
+        **values,
     )
 
 
