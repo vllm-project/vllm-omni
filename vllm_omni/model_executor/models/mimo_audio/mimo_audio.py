@@ -349,6 +349,18 @@ class MiMoAudioDataParser(MultiModalDataParser):
 
 
 class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProcessingInfo]):
+    def _hf_processor_applies_updates(
+        self,
+        prompt_text,
+        mm_items,
+        hf_processor_mm_kwargs,
+        tokenization_kwargs,
+    ) -> bool:
+        # MiMoAudio's _call_hf_processor does NOT expand <|empty|> placeholders
+        # into audio feature tokens. We must let vllm apply the updates itself
+        # via _apply_prompt_updates (requires is_update_applied=False).
+        return False
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -865,8 +877,10 @@ class MiMoAudioForConditionalGeneration(
     def generate_audio(self, code: torch.Tensor):
         token2wav_dev = self._module_device(self.token2wav)
         # Check if in CUDA graph capture phase
-        is_capturing = torch.cuda.is_current_stream_capturing()
-
+        if torch.cuda.is_available() and token2wav_dev.type == "cuda":
+            is_capturing = torch.cuda.is_current_stream_capturing()
+        else:
+            is_capturing = False
         if isinstance(code, torch.Tensor):
             if is_capturing:
                 # During CUDA graph capture, avoid device movement operations

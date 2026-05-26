@@ -59,3 +59,27 @@ stages:
       top_k: -1
       max_tokens: 18192
       seed: 42
+
+platforms:
+  xpu:
+    async_chunk: false
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.5
+        enforce_eager: true
+        disable_hybrid_kv_cache_manager: true
+        enable_prefix_caching: false
+        skip_mm_profiling: true
+        max_num_batched_tokens: 8192
+        max_model_len: 8192
+        devices: "2"
+      - stage_id: 1
+        gpu_memory_utilization: 0.35
+        enforce_eager: true
+        disable_hybrid_kv_cache_manager: true
+        enable_prefix_caching: false
+        skip_mm_profiling: true
+        async_scheduling: false
+        max_num_batched_tokens: 8192
+        max_model_len: 8192
+        devices: "3"

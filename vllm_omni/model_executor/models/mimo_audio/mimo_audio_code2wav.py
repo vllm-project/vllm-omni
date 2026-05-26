@@ -645,7 +645,10 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         )
         per_left, per_chunk = self._mimo_codec_runtime_lists(len(request_ids_list), runtime_additional_information)
 
-        is_capturing = torch.cuda.is_current_stream_capturing()
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            is_capturing = torch.cuda.is_current_stream_capturing()
+        else:
+            is_capturing = False
         if is_capturing:
             return OmniOutput(
                 text_hidden_states=None,
@@ -953,7 +956,10 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
 
     def _decode_waveform_from_codes(self, code_tensor: torch.Tensor) -> torch.Tensor:
         # Check if in CUDA graph capture phase
-        is_capturing = torch.cuda.is_current_stream_capturing()
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            is_capturing = torch.cuda.is_current_stream_capturing()
+        else:
+            is_capturing = False
 
         # During CUDA graph capture, return dummy tensor to avoid operations like .cpu() which are not allowed
         if is_capturing:

@@ -808,11 +808,11 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         self,
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
-        tokens_device: torch.device = torch.device(
-            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
-        ),
+        tokens_device: torch.device | None = None,
         local_sampler: MiMoSampler | MiMoLocalSamplerTensor | None = None,
     ):
+        if tokens_device is None:
+            tokens_device = local_embeds.device
         B = local_embeds.shape[0]
         delay_iters = self.group_size + max(self.delay_pattern)
 
@@ -862,11 +862,11 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         self,
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
-        tokens_device: torch.device = torch.device(
-            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
-        ),
+        tokens_device: torch.device | None = None,
         local_sampler: MiMoSampler | None = None,
     ):
+        if tokens_device is None:
+            tokens_device = local_embeds.device
         if local_sampler is None:
             local_sampler = MiMoSampler(do_sample=False, temperature=0.9, top_p=0.95)
 
@@ -1049,7 +1049,10 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         else:
             request_ids = [str(i) for i in range(len(query_start_loc[1:]))] if query_start_loc is not None else []
         num_reqs = len(request_ids)
-        is_capturing = torch.cuda.is_current_stream_capturing()
+        if torch.cuda.is_available() and input_ids.device.type == "cuda":
+            is_capturing = torch.cuda.is_current_stream_capturing()
+        else:
+            is_capturing = False
 
         merge_mm_embedding_info, has_merge_mm_embedding, kwargs = self._collect_merge_mm_embedding_info(
             input_ids,

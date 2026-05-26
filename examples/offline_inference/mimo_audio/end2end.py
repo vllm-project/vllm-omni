@@ -220,9 +220,13 @@ def main(args):
     # Notice: The audio files used in this example are available at: https://github.com/XiaomiMiMo/MiMo-Audio/tree/main/examples
     if args.query_type == "tts_sft":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type tts_sft
+        if text is None:
+            text = "The weather is so nice today."
         query_result = query_func(text=text, read_text_only=True)
     elif args.query_type == "tts_sft_with_instruct":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type tts_sft_with_instruct --instruct "Speak happily in a child's voice"
+        if text is None:
+            text = "The weather is so nice today."
         query_result = query_func(text=text, instruct=instruct, read_text_only=True)
     elif args.query_type == "tts_sft_with_audio":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type tts_sft_with_audio --audio_path "./spoken_dialogue_assistant_turn_1.wav"
@@ -354,7 +358,7 @@ def parse_args():
         "--text",
         "-t",
         type=str,
-        default="",
+        default=None,
         help="input text",
     )
     parser.add_argument(
