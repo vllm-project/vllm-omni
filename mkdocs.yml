@@ -55,6 +55,7 @@ theme:
   custom_dir: docs/mkdocs/overrides
 
 hooks:
+  - docs/mkdocs/hooks/mock_heavy_imports.py
   - docs/mkdocs/hooks/search_index.py
   - docs/mkdocs/hooks/generate_api_readme.py
   - docs/mkdocs/hooks/url_schemes.py
@@ -97,6 +98,7 @@ plugins:
       exclude:
         - "re:vllm_omni\\._.*"  # Internal modules
         - "vllm_omni.diffusion.models.qwen_image"  # avoid importing vllm in mkdocs building
+        - "vllm_omni.diffusion.models.omniweaving"  # avoid importing vllm in mkdocs building
         - "vllm_omni.diffusion.quantization"  # avoid importing vllm in mkdocs building
         - "vllm_omni.quantization"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.async_diffusion"  # avoid importing vllm in mkdocs building
@@ -106,6 +108,8 @@ plugins:
       handlers:
         python:
           options:
+            allow_inspection: false
+            force_inspection: false
             show_symbol_type_heading: true
             show_symbol_type_toc: true
             filters:
