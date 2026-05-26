@@ -157,6 +157,10 @@ def main() -> None:
             frames = frames.clamp(-1, 1) * 0.5 + 0.5
         frames = frames.float().numpy()
 
+    # postprocess_video returns a batched array: (B, T, H, W, C) -> (T, H, W, C)
+    if isinstance(frames, np.ndarray) and frames.ndim == 5:
+        frames = frames[0]
+
     if frames is None:
         raise ValueError("No video frames found in output.")
 
