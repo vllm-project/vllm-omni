@@ -729,7 +729,7 @@ class QwenImageTransformerBlock(nn.Module):
                 gather_output=True,
                 return_bias=False,
                 quant_config=None,
-                prefix="img_mod.1",
+                prefix=_join_prefix(prefix, "txt_mod.1"),
             ),
         )
         self.img_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -760,7 +760,7 @@ class QwenImageTransformerBlock(nn.Module):
                 gather_output=True,
                 return_bias=False,
                 quant_config=None,
-                prefix="txt_mod.1",
+                prefix=_join_prefix(prefix, "img_mod.1"),
             ),
         )
         self.txt_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
