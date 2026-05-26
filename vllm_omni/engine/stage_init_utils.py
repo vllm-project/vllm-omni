@@ -47,6 +47,7 @@ class ReplicaInitPlan:
     stage_cfg: Any
     metadata: Any
     stage_connector_spec: dict[str, Any]
+    stage_output_connector_spec: dict[str, Any]
     omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
     stage_vllm_config: Any | None = None
     executor_class: type | None = None
@@ -639,6 +640,7 @@ def build_engine_args_dict(
     stage_config: Any,
     model: str,
     stage_connector_spec: dict[str, Any] | None = None,
+    stage_output_connector_spec: dict[str, Any] | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Build the normalized engine args dict for one stage."""
@@ -667,8 +669,10 @@ def build_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
-    if engine_args_dict.get("async_chunk", False):
+    if stage_connector_spec is not None:
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
+    if stage_output_connector_spec is not None:
+        engine_args_dict["stage_output_connector_spec"] = dict(stage_output_connector_spec or {})
 
     if stage_type == "diffusion":
         from vllm_omni.diffusion.data import parse_attention_config
@@ -699,6 +703,7 @@ def build_vllm_config(
     stage_config: Any,
     model: str,
     stage_connector_spec: dict[str, Any] | None = None,
+    stage_output_connector_spec: dict[str, Any] | None = None,
     engine_args_dict: dict[str, Any] | None = None,
     headless: bool = False,
 ) -> tuple[Any, type]:
@@ -712,6 +717,7 @@ def build_vllm_config(
             stage_config,
             model,
             stage_connector_spec=stage_connector_spec,
+            stage_output_connector_spec=stage_output_connector_spec,
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
@@ -981,6 +987,16 @@ def get_stage_connector_spec(
     for cfg in stage_connectors_cfg.values():
         return dict(cfg.get("spec", {}))
     return {}
+
+
+def get_stage_worker_connector_specs(
+    omni_transfer_config: Any,
+    stage_id: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return (input_spec, output_spec) for worker-side recv/send connectors."""
+    from vllm_omni.distributed.omni_connectors import get_worker_connector_specs_for_stage
+
+    return get_worker_connector_specs_for_stage(omni_transfer_config, stage_id)
 
 
 def build_diffusion_config(

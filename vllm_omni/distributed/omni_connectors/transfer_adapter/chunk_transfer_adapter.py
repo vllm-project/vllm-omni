@@ -75,10 +75,30 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "extra": getattr(connector_config, "extra", {}),
             }
 
-        connector_specs = ConnectorSpec(
-            name=connector_config.get("name", "SharedMemoryConnector"),
-            extra=connector_config.get("extra", {}),
-        )
+        name = connector_config.get("name", "SharedMemoryConnector")
+        extra = dict(connector_config.get("extra", {}) or {})
+        stage_id = extra.get("stage_id", getattr(model_config, "stage_id", 0))
+        try:
+            stage_id_int = int(stage_id)
+        except (TypeError, ValueError):
+            stage_id_int = 0
+
+        # Stage-0 GPU workers own Mooncake ZMQ bind for async_chunk puts.
+        # The engine-core scheduler must not bind the same port.
+        if (
+            name == "MooncakeTransferEngineConnector"
+            and stage_id_int == 0
+            and str(extra.get("role", "sender")).lower() == "sender"
+        ):
+            logger.info(
+                "Stage-0 scheduler uses SharedMemoryConnector instead of "
+                "MooncakeTransferEngineConnector to avoid ZMQ port collision "
+                "with the stage worker sender."
+            )
+            name = "SharedMemoryConnector"
+            extra = {"stage_id": stage_id_int}
+
+        connector_specs = ConnectorSpec(name=name, extra=extra)
         return OmniConnectorFactory.create_connector(connector_specs)
 
     def load_async(self, request: Request):

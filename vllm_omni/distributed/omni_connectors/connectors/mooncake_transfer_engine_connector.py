@@ -431,8 +431,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     tensor_data = data
                 else:
                     size = len(data)
-                    # Convert bytes to tensor for copy
-                    tensor_data = torch.frombuffer(data, dtype=torch.uint8)
+                    # Convert bytes to a writable tensor buffer to avoid
+                    # PyTorch's non-writable frombuffer warning.
+                    tensor_data = torch.frombuffer(bytearray(data), dtype=torch.uint8)
 
                 # 2. Alloc from pool
                 try:
@@ -542,8 +543,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             return self._sender_endpoints[sender_rank]
         host = getattr(self, "sender_host", None)
         port = getattr(self, "sender_zmq_port", None)
-        if host and port and str(host).lower() != "auto":
-            return (host, int(port))
+        if host and port:
+            host_str = str(host).strip()
+            if host_str and host_str.lower() != "auto":
+                return (host_str, int(port))
+            # Single-node deploys often leave sender_host as "auto" in config.
+            # In that case, fall back to this process's resolved local host.
+            if host_str.lower() == "auto" and getattr(self, "host", None):
+                return (str(self.host), int(port))
         return None
 
     def _query_metadata_at(self, get_key: str, host: str, port: int) -> dict[str, Any] | None:
@@ -638,15 +645,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         if not metadata:
             # Path 3: no metadata at all — query default sender
-            if not self.sender_host or not self.sender_zmq_port or str(self.sender_host).lower() == "auto":
-                raise RuntimeError(
-                    f"get(metadata=None) requires sender info to be resolved, "
-                    f"but sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}. "
-                    f"Call update_sender_info(host, port) before using get() without metadata."
-                )
             metadata = self._query_metadata_from_sender(get_key)
             if not metadata:
-                return None
+                raise RuntimeError(
+                    f"get(metadata=None) requires sender info to be resolved, "
+                    f"but sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}, "
+                    f"resolved_local_host={getattr(self, 'host', None)!r}. "
+                    f"Call update_sender_info(host, port) before using get() without metadata."
+                )
         elif "data_size" not in metadata:
             # Path 2: partial metadata (host/port only) — query that sender
             partial_host = metadata.get("source_host")

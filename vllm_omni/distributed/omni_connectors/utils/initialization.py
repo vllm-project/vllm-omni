@@ -40,6 +40,33 @@ KV_RANK_PORT_STRIDE = 16
 KV_REPLICA_PORT_STRIDE = 1024
 
 
+def apply_mooncake_stage_connector_extra(
+    extra: dict[str, Any],
+    *,
+    from_stage: str | int,
+    role: str,
+) -> dict[str, Any]:
+    """Apply per-edge ZMQ port offsets for a stage-local Mooncake connector.
+
+    Senders bind ``zmq_port = base + from_stage``. Receivers do not bind but
+    need ``sender_zmq_port`` pointing at the upstream sender's bound port.
+    """
+    extra = dict(extra)
+    base_port = int(extra.get("zmq_port", 50051))
+    try:
+        stage_offset = int(from_stage)
+    except (TypeError, ValueError):
+        stage_offset = 0
+    sender_port = base_port + stage_offset
+    role_l = str(role).lower()
+    if role_l == "sender":
+        extra["zmq_port"] = sender_port
+    elif role_l == "receiver":
+        extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
+        extra["sender_zmq_port"] = sender_port
+    return extra
+
+
 def initialize_connectors_from_config(
     config_path: str | Path | None = None,
     default_shm_threshold: int = 65536,
@@ -176,15 +203,73 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
             # Incoming edge → this stage is the receiver
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "receiver")
+            if spec.name == "MooncakeTransferEngineConnector":
+                extra = apply_mooncake_stage_connector_extra(
+                    extra, from_stage=from_stage, role="receiver"
+                )
             stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
         elif from_stage == target_stage and target_stage == "0":
             # Outgoing edge for stage 0 — included for async_chunk spec
             # extraction (omni_stage.py), NOT for connector instantiation.
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "sender")
+            if spec.name == "MooncakeTransferEngineConnector":
+                extra = apply_mooncake_stage_connector_extra(
+                    extra, from_stage=from_stage, role="sender"
+                )
             stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
 
     return stage_connectors_config
+
+
+def get_worker_connector_specs_for_stage(
+    transfer_config: OmniTransferConfig | None,
+    stage_id: str | int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return (input_spec, output_spec) for a stage worker.
+
+    ``input_spec`` is used for recv (upstream -> this stage).
+    ``output_spec`` is used for send (this stage -> downstream).
+    When a side is missing, the corresponding dict is empty.
+    """
+    if not transfer_config:
+        return {}, {}
+
+    target_stage = str(stage_id)
+    input_spec: dict[str, Any] = {}
+    output_spec: dict[str, Any] = {}
+
+    for (from_stage, to_stage), spec in transfer_config.connectors.items():
+        if to_stage == target_stage and not input_spec:
+            extra = dict(spec.extra) if spec.extra else {}
+            extra.setdefault("role", "receiver")
+            if spec.name == "MooncakeTransferEngineConnector":
+                extra = apply_mooncake_stage_connector_extra(
+                    extra,
+                    from_stage=from_stage,
+                    role="receiver",
+                )
+            input_spec = {"name": spec.name, "extra": extra}
+
+        if from_stage == target_stage and not output_spec:
+            extra = dict(spec.extra) if spec.extra else {}
+            extra.setdefault("role", "sender")
+            if spec.name == "MooncakeTransferEngineConnector":
+                extra = apply_mooncake_stage_connector_extra(
+                    extra,
+                    from_stage=from_stage,
+                    role="sender",
+                )
+            output_spec = {
+                "name": spec.name,
+                "extra": extra,
+                "to_stage": int(to_stage) if str(to_stage).isdigit() else to_stage,
+            }
+
+        if input_spec and output_spec:
+            break
+
+    return input_spec, output_spec
 
 
 def load_omni_transfer_config(

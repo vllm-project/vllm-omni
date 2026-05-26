@@ -90,6 +90,7 @@ def _make_llm_plan(
                     is_comprehension=is_comprehension and replica_id == 0,
                 ),
                 stage_connector_spec={},
+                stage_output_connector_spec={},
                 omni_kv_connector=(None, None, None),
                 stage_vllm_config=vllm_config,
                 executor_class=object,
@@ -124,6 +125,7 @@ def _make_diffusion_plan(
                 stage_cfg=stage_cfg,
                 metadata=_make_diffusion_metadata(configured_stage_id, replica_id=replica_id),
                 stage_connector_spec={},
+                stage_output_connector_spec={},
                 omni_kv_connector=(None, None, None),
             )
         )
@@ -350,7 +352,7 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
         "extract_stage_metadata",
         lambda cfg: types.SimpleNamespace(**metadata_by_stage[cfg.stage_id].__dict__),
     )
-    monkeypatch.setattr(engine_mod, "get_stage_connector_spec", lambda **_: {})
+    monkeypatch.setattr(engine_mod, "get_stage_worker_connector_specs", lambda **_: ({}, {}))
     monkeypatch.setattr(engine_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
     monkeypatch.setattr(engine_mod, "build_engine_args_dict", lambda *_, **__: {})
     monkeypatch.setattr(
@@ -518,6 +520,7 @@ def test_initialize_llm_replica_passes_stage_init_timeout_to_complete_stage_hand
         stage_cfg=types.SimpleNamespace(engine_args={}, runtime=types.SimpleNamespace(devices="0")),
         metadata=types.SimpleNamespace(stage_id=0, runtime_cfg={"devices": "0"}),
         stage_connector_spec={},
+        stage_output_connector_spec={},
         omni_kv_connector=(None, None, None),
         stage_vllm_config=fake_vllm_config,
         executor_class=object,

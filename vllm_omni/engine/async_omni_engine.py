@@ -94,7 +94,7 @@ from vllm_omni.engine.stage_init_utils import (
     capture_stage_factory_contexts,
     compute_replica_layout,
     extract_stage_metadata,
-    get_stage_connector_spec,
+    get_stage_worker_connector_specs,
     initialize_diffusion_stage,
     inject_kv_stage_info,
     load_omni_transfer_config_for_model,
@@ -521,10 +521,9 @@ class AsyncOmniEngine:
             if base_metadata.prompt_expand_func is not None:
                 prompt_expand_func = base_metadata.prompt_expand_func
 
-            stage_connector_spec = get_stage_connector_spec(
+            stage_connector_spec, stage_output_connector_spec = get_stage_worker_connector_specs(
                 omni_transfer_config=omni_transfer_config,
                 stage_id=configured_stage_id,
-                async_chunk=self.async_chunk,
             )
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
             num_replicas = replicas_per_stage[stage_idx]
@@ -544,6 +543,7 @@ class AsyncOmniEngine:
                     stage_cfg,
                     self.model,
                     stage_connector_spec=stage_connector_spec,
+                    stage_output_connector_spec=stage_output_connector_spec,
                     cli_tokenizer=getattr(self, "tokenizer", None),
                 )
                 omni_conn_cfg, omni_from, omni_to = omni_kv_connector
@@ -566,6 +566,7 @@ class AsyncOmniEngine:
                     stage_cfg,
                     self.model,
                     stage_connector_spec=stage_connector_spec,
+                    stage_output_connector_spec=stage_output_connector_spec,
                     engine_args_dict=engine_args_dict,
                 )
 
@@ -597,6 +598,7 @@ class AsyncOmniEngine:
                         stage_cfg=replica_cfg,
                         metadata=replica_metadata,
                         stage_connector_spec=stage_connector_spec,
+                        stage_output_connector_spec=stage_output_connector_spec,
                         omni_kv_connector=omni_kv_connector,
                         stage_vllm_config=stage_vllm_config,
                         executor_class=executor_class,
@@ -884,6 +886,7 @@ class AsyncOmniEngine:
                                 stage_cfg,
                                 self.model,
                                 stage_connector_spec=plan.stage_connector_spec,
+                                stage_output_connector_spec=plan.stage_output_connector_spec,
                                 cli_tokenizer=getattr(self, "tokenizer", None),
                             )
                             lock_fds = acquire_device_locks(

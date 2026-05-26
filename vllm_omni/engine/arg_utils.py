@@ -108,7 +108,8 @@ class OmniEngineArgs(EngineArgs):
         custom_process_next_stage_input_func: Optional path to a custom function for processing
             inputs from previous stages
             If None, default processing is used.
-        stage_connector_spec: Extra configuration for stage connector
+        stage_connector_spec: Extra configuration for stage input connector
+        stage_output_connector_spec: Extra configuration for stage output connector
         async_chunk: If set to True, perform async chunk
         worker_type: Model Type, e.g., "ar" or "generation"
         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
@@ -137,6 +138,7 @@ class OmniEngineArgs(EngineArgs):
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
+    stage_output_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
     async_chunk: bool = False
     omni_kv_config: dict | None = None
@@ -252,6 +254,13 @@ class OmniEngineArgs(EngineArgs):
             "extra": self.stage_connector_spec.get("extra", {}).copy(),
         }
         stage_connector_config["extra"]["stage_id"] = self.stage_id
+        stage_output_connector_config = {
+            "name": self.stage_output_connector_spec.get("name", "SharedMemoryConnector"),
+            "extra": self.stage_output_connector_spec.get("extra", {}).copy(),
+        }
+        stage_output_connector_config["extra"]["stage_id"] = self.stage_id
+        if "to_stage" in self.stage_output_connector_spec:
+            stage_output_connector_config["to_stage"] = self.stage_output_connector_spec.get("to_stage")
 
         # If model_arch is specified, inject it into hf_overrides so vLLM can
         # resolve the architecture even when config.json lacks 'architectures'.
@@ -345,6 +354,7 @@ class OmniEngineArgs(EngineArgs):
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
             stage_connector_config=stage_connector_config,
+            stage_output_connector_config=stage_output_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,

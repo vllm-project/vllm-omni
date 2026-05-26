@@ -146,20 +146,37 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     )
     vllm_config = SimpleNamespace(parallel_config=parallel_config, needs_dp_coordinator=False)
     engine_manager = mocker.Mock()
+    omni_transfer_config = mocker.Mock()
+    stage_connector_spec = {"name": "MooncakeTransferEngineConnector", "extra": {"role": "receiver"}}
+    stage_output_connector_spec = {
+        "name": "MooncakeTransferEngineConnector",
+        "extra": {"role": "sender"},
+        "to_stage": 1,
+    }
+    engine_args_dict = {"max_model_len": 128}
 
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
         return_value=("/fake/stages.yaml", [stage_cfg]),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
-    mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    mock_load_transfer_config = mocker.patch(
+        "vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model",
+        return_value=omni_transfer_config,
+    )
+    mock_worker_specs = mocker.patch(
+        "vllm_omni.engine.stage_init_utils.get_stage_worker_connector_specs",
+        return_value=(stage_connector_spec, stage_output_connector_spec),
+    )
     mocker.patch(
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
     )
-    mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
-    mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
-    mocker.patch(
+    mock_build_engine_args = mocker.patch(
+        "vllm_omni.engine.stage_init_utils.build_engine_args_dict",
+        return_value=engine_args_dict,
+    )
+    mock_build_vllm_config = mocker.patch(
         "vllm_omni.engine.stage_init_utils.build_vllm_config",
         return_value=(vllm_config, object),
     )
@@ -180,6 +197,24 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     mocker.patch("signal.signal")
 
     run_headless(_make_headless_args(stage_id=0))
+
+    mock_load_transfer_config.assert_called_once_with("fake-model", "/fake/stages.yaml")
+    mock_worker_specs.assert_called_once_with(omni_transfer_config=omni_transfer_config, stage_id=0)
+    mock_build_engine_args.assert_called_once_with(
+        stage_cfg,
+        "fake-model",
+        stage_connector_spec=stage_connector_spec,
+        stage_output_connector_spec=stage_output_connector_spec,
+        cli_tokenizer=None,
+    )
+    mock_build_vllm_config.assert_called_once_with(
+        stage_cfg,
+        "fake-model",
+        stage_connector_spec=stage_connector_spec,
+        stage_output_connector_spec=stage_output_connector_spec,
+        engine_args_dict=engine_args_dict,
+        headless=True,
+    )
 
     # The launcher must request auto-assignment (replica_id=None) and the
     # full response so it can wire the master-allocated coordinator into the
@@ -208,6 +243,59 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     engine_manager.shutdown.assert_called_once_with()
 
 
+def test_run_headless_honors_explicit_log_stats_flag(mocker: MockerFixture) -> None:
+    from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
+
+    stage_cfg = _make_stage_cfg(0, stage_type="llm")
+    parallel_config = SimpleNamespace(
+        data_parallel_size_local=1,
+        data_parallel_rank=0,
+        data_parallel_rank_local=0,
+        node_rank_within_dp=0,
+    )
+    vllm_config = SimpleNamespace(parallel_config=parallel_config, needs_dp_coordinator=False)
+    engine_manager = mocker.Mock()
+
+    mocker.patch(
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
+        return_value=("/fake/stages.yaml", [stage_cfg]),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
+    mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.get_stage_worker_connector_specs",
+        return_value=({}, {}),
+    )
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
+        return_value=(None, None, None),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.build_vllm_config",
+        return_value=(vllm_config, object),
+    )
+    mocker.patch(
+        "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
+        return_value=StageRegistrationResponse(
+            handshake_address="tcp://127.0.0.1:26001",
+            input_address="tcp://127.0.0.1:26002",
+            output_address="tcp://127.0.0.1:26003",
+            replica_id=0,
+            coordinator_router_address=None,
+        ),
+    )
+    mock_manager_cls = mocker.patch(
+        "vllm_omni.engine.omni_core_engine_proc_manager.OmniCoreEngineProcManager",
+        return_value=engine_manager,
+    )
+    mocker.patch("signal.signal")
+
+    run_headless(_make_headless_args(stage_id=0, log_stats=True))
+
+    assert mock_manager_cls.call_args.kwargs["log_stats"] is True
+
+
 def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: MockerFixture) -> None:
     """``--omni-dp-size-local=N`` must spawn N managers, each with its own
     master-assigned replica_id, and join all of them before returning."""
@@ -234,7 +322,10 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
     )
-    mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.get_stage_worker_connector_specs",
+        return_value=({}, {}),
+    )
     mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
     mocker.patch(
         "vllm_omni.engine.stage_init_utils.build_vllm_config",

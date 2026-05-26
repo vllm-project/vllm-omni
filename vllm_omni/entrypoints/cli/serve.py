@@ -704,7 +704,7 @@ def run_headless(args: argparse.Namespace) -> None:
         build_engine_args_dict,
         build_vllm_config,
         extract_stage_metadata,
-        get_stage_connector_spec,
+        get_stage_worker_connector_specs,
         get_stage_devices_per_replica,
         inject_kv_stage_info,
         load_omni_transfer_config_for_model,
@@ -922,10 +922,9 @@ def run_headless(args: argparse.Namespace) -> None:
                 if p.is_alive():
                     terminate_alive_proc(p)
 
-    stage_connector_spec = get_stage_connector_spec(
+    stage_connector_spec, stage_output_connector_spec = get_stage_worker_connector_specs(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
-        async_chunk=False,
     )
 
     # ``runtime_cfg`` is mostly inherited from the parent's
@@ -936,6 +935,7 @@ def run_headless(args: argparse.Namespace) -> None:
         stage_cfg,
         model,
         stage_connector_spec=stage_connector_spec,
+        stage_output_connector_spec=stage_output_connector_spec,
         cli_tokenizer=getattr(args, "tokenizer", None),
     )
 
@@ -955,6 +955,7 @@ def run_headless(args: argparse.Namespace) -> None:
         stage_cfg,
         model,
         stage_connector_spec=stage_connector_spec,
+        stage_output_connector_spec=stage_output_connector_spec,
         engine_args_dict=engine_args_dict,
         headless=True,
     )

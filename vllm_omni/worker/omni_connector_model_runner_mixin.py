@@ -77,7 +77,14 @@ class OmniConnectorModelRunnerMixin:
             model_config: Stage-level model config with connector settings.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
-        self._omni_connector: OmniConnectorBase | None = self._create_connector(model_config)
+        self._omni_connector: OmniConnectorBase | None = self._create_connector(
+            model_config,
+            config_attr="stage_connector_config",
+        )
+        self._omni_output_connector: OmniConnectorBase | None = self._create_connector(
+            model_config,
+            config_attr="stage_output_connector_config",
+        )
         self._kv_transfer_manager = kv_transfer_manager
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
@@ -90,11 +97,13 @@ class OmniConnectorModelRunnerMixin:
         self._custom_process_func_path, self._custom_process_func = self._load_custom_func(model_config)
         self._custom_process_supports_is_finished = self._custom_process_supports_is_finished_kwarg()
         logger.info(
-            "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, connector=%s, func_path=%s",
+            "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, "
+            "in_connector=%s, out_connector=%s, func_path=%s",
             self._stage_id,
             self._async_chunk,
             self._custom_process_func,
             type(self._omni_connector).__name__ if self._omni_connector else None,
+            type(self._get_send_connector()).__name__ if self._get_send_connector() else None,
             self._custom_process_func_path,
         )
 
@@ -172,7 +181,7 @@ class OmniConnectorModelRunnerMixin:
         self._stop_event = threading.Event()
         self._work_available = threading.Event()
 
-        # Start background threads only when there's a connector
+        # Start background threads only when there is corresponding I/O work.
         self._recv_thread: threading.Thread | None = None
         self._save_thread: threading.Thread | None = None
         if self._omni_connector is not None:
@@ -182,6 +191,7 @@ class OmniConnectorModelRunnerMixin:
                 name="omni-mixin-recv",
             )
             self._recv_thread.start()
+        if self._get_send_connector() is not None:
             self._save_thread = threading.Thread(
                 target=self._save_loop,
                 daemon=True,
@@ -196,9 +206,17 @@ class OmniConnectorModelRunnerMixin:
             self._recv_thread.join(timeout=5)
         if self._save_thread is not None:
             self._save_thread.join(timeout=5)
+        closed_ids: set[int] = set()
         if self._omni_connector is not None:
             try:
                 self._omni_connector.close()
+                closed_ids.add(id(self._omni_connector))
+            except Exception:
+                pass
+        out_connector = getattr(self, "_omni_output_connector", None)
+        if out_connector is not None and id(out_connector) not in closed_ids:
+            try:
+                out_connector.close()
             except Exception:
                 pass
 
@@ -444,9 +462,9 @@ class OmniConnectorModelRunnerMixin:
     def _payload_audio_codes(payload: Any) -> Any:
         if not isinstance(payload, dict):
             return None
-        if "code_predictor_codes" in payload:
-            logger.warning_once("legacy flat 'code_predictor_codes' key in payload; expected 'codes.audio'")
         codes = payload.get("codes")
+        if "code_predictor_codes" in payload and not isinstance(codes, dict):
+            logger.warning_once("legacy flat 'code_predictor_codes' key in payload; expected 'codes.audio'")
         if isinstance(codes, dict):
             return codes.get("audio")
         return None
@@ -706,6 +724,131 @@ class OmniConnectorModelRunnerMixin:
         return False
 
     @staticmethod
+    def _coerce_connector_payload_dict(payload_data: Any) -> dict[str, Any] | None:
+        if isinstance(payload_data, dict):
+            return payload_data
+        to_dict_fn = getattr(payload_data, "to_dict", None)
+        if callable(to_dict_fn):
+            coerced = to_dict_fn()
+            return coerced if isinstance(coerced, dict) else None
+        try:
+            from vllm_omni.data_entry_keys import to_dict
+
+            coerced = to_dict(payload_data)
+            return coerced if isinstance(coerced, dict) else None
+        except Exception:
+            return None
+
+    def _should_use_qwen3_thinker_to_talker_packet_path(
+        self,
+        *,
+        for_recv: bool = False,
+        transfer_mode: str | None = None,
+    ) -> bool:
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            MODE_ASYNC_CHUNK,
+            MODE_NON_ASYNC_FULL_PAYLOAD,
+            should_use_thinker_to_talker_packet_path,
+        )
+
+        connector = self._omni_connector if for_recv else self._get_send_connector()
+        if connector is None:
+            return False
+        model_config = self._get_model_config()
+        if for_recv:
+            from_stage_id = self._stage_id - 1
+            to_stage_id = self._stage_id
+        else:
+            from_stage_id = self._stage_id
+            to_stage_id = self._next_stage_id
+        resolved_mode = transfer_mode
+        if resolved_mode is None:
+            resolved_mode = MODE_ASYNC_CHUNK if self._async_chunk else MODE_NON_ASYNC_FULL_PAYLOAD
+        return should_use_thinker_to_talker_packet_path(
+            async_chunk=self._async_chunk,
+            supports_raw_data=getattr(connector, "supports_raw_data", False),
+            model_arch=getattr(model_config, "model_arch", None) if model_config is not None else None,
+            from_stage_id=from_stage_id,
+            to_stage_id=to_stage_id,
+            transfer_mode=resolved_mode,
+        )
+
+    def _enqueue_full_payload_packet_send(
+        self,
+        *,
+        req_id: str,
+        external_req_id: str,
+        connector_put_key: str,
+        payload: dict[str, Any],
+        next_stage_id: int,
+        chunk_id: int,
+        packet_mode: str | None = None,
+    ) -> None:
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            MODE_ASYNC_CHUNK,
+            split_qwen3_full_payload,
+        )
+
+        mode = packet_mode or MODE_ASYNC_CHUNK
+        tensor_puts, sidecar = split_qwen3_full_payload(
+            payload,
+            request_id=req_id,
+            external_req_id=external_req_id,
+            from_stage_id=self._stage_id,
+            to_stage_id=next_stage_id,
+            chunk_id=chunk_id,
+            mode=mode,
+        )
+        tasks: list[dict[str, Any]] = []
+        send_connector = self._get_send_connector()
+        for put_key, tensor in tensor_puts:
+            tasks.append(
+                {
+                    "stage_id": self._stage_id,
+                    "next_stage_id": next_stage_id,
+                    "put_key": put_key,
+                    "data": tensor,
+                    "request_id": req_id,
+                    "connector": send_connector,
+                }
+            )
+        tasks.append(
+            {
+                "stage_id": self._stage_id,
+                "next_stage_id": next_stage_id,
+                "put_key": connector_put_key,
+                "data": sidecar,
+                "request_id": req_id,
+                "connector": send_connector,
+            }
+        )
+        with self._lock:
+            dq = self._pending_save_reqs.setdefault(req_id, deque())
+            for task in tasks:
+                dq.append(task)
+                self._pending_save_counts[req_id] += 1
+
+    def _reconstruct_qwen3_packet_payload(
+        self,
+        connector: OmniConnectorBase,
+        sidecar: dict[str, Any],
+        from_stage: str,
+        to_stage: str,
+    ) -> dict[str, Any]:
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            reconstruct_qwen3_full_payload,
+        )
+
+        def get_tensor(transfer_key: str) -> Any:
+            result = connector.get(from_stage, to_stage, transfer_key)
+            if result is None:
+                return None
+            data, _size = result
+            return data
+
+        return reconstruct_qwen3_full_payload(sidecar, get_tensor)
+
+    @staticmethod
     def _new_full_payload_accumulator(output: dict[str, Any]):
         chunks: dict[str, list[torch.Tensor]] = {}
         latest: dict[str, Any] = {}
@@ -873,16 +1016,46 @@ class OmniConnectorModelRunnerMixin:
                 connector_put_key,
                 next_stage_id,
             )
-            task = {
-                "stage_id": self._stage_id,
-                "next_stage_id": next_stage_id,
-                "put_key": connector_put_key,
-                "data": payload,
-                "request_id": req_id,
-            }
-            with self._lock:
-                self._pending_save_reqs.setdefault(req_id, deque()).append(task)
-                self._pending_save_counts[req_id] += 1
+            payload_dict = self._coerce_connector_payload_dict(payload)
+            from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+                payload_has_packet_tensors,
+            )
+
+            use_packet = (
+                payload_dict is not None
+                and payload_has_packet_tensors(payload_dict)
+                and self._should_use_qwen3_thinker_to_talker_packet_path(
+                    transfer_mode="non_async_full_payload",
+                )
+            )
+            if use_packet:
+                self._enqueue_full_payload_packet_send(
+                    req_id=req_id,
+                    external_req_id=external_req_id,
+                    connector_put_key=connector_put_key,
+                    payload=payload_dict,
+                    next_stage_id=next_stage_id,
+                    chunk_id=chunk_id,
+                    packet_mode="non_async_full_payload",
+                )
+                logger.info(
+                    "[Stage-%s] send_full_payload_outputs: packet_put req=%s key=%s mode=non_async_full_payload",
+                    self._stage_id,
+                    req_id,
+                    connector_put_key,
+                )
+            else:
+                task = {
+                    "stage_id": self._stage_id,
+                    "next_stage_id": next_stage_id,
+                    "put_key": connector_put_key,
+                    "data": payload,
+                    "request_id": req_id,
+                    "connector": self._get_send_connector(),
+                }
+                with self._lock:
+                    self._pending_save_reqs.setdefault(req_id, deque()).append(task)
+                    self._pending_save_counts[req_id] += 1
             sent_ids.append(req_id)
         if sent_ids:
             self._work_available.set()
@@ -1017,24 +1190,48 @@ class OmniConnectorModelRunnerMixin:
         next_stage_id = self._next_stage_id
         connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
 
-        if chunk_id == 0:
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            payload_has_packet_tensors,
+        )
+
+        payload_dict = self._coerce_connector_payload_dict(payload_data)
+        use_packet = (
+            payload_dict is not None
+            and self._should_use_qwen3_thinker_to_talker_packet_path()
+            and payload_has_packet_tensors(payload_dict)
+        )
+        if chunk_id == 0 or use_packet:
             logger.info(
-                "[Stage-%s] send_chunk: first chunk enqueued, req=%s key=%s",
+                "[Stage-%s] send_chunk: enqueue req=%s key=%s chunk=%s packet=%s",
                 self._stage_id,
                 request_id,
                 connector_put_key,
+                chunk_id,
+                use_packet,
             )
 
-        task = {
-            "stage_id": self._stage_id,
-            "next_stage_id": next_stage_id,
-            "put_key": connector_put_key,
-            "data": payload_data,
-            "request_id": request_id,
-        }
-        with self._lock:
-            self._pending_save_reqs.setdefault(request_id, deque()).append(task)
-            self._pending_save_counts[request_id] += 1
+        if use_packet:
+            assert payload_dict is not None
+            self._enqueue_full_payload_packet_send(
+                req_id=request_id,
+                external_req_id=request_id,
+                connector_put_key=connector_put_key,
+                payload=payload_dict,
+                next_stage_id=next_stage_id,
+                chunk_id=chunk_id,
+            )
+        else:
+            task = {
+                "stage_id": self._stage_id,
+                "next_stage_id": next_stage_id,
+                "put_key": connector_put_key,
+                "data": payload_data,
+                "request_id": request_id,
+                "connector": self._get_send_connector(),
+            }
+            with self._lock:
+                self._pending_save_reqs.setdefault(request_id, deque()).append(task)
+                self._pending_save_counts[request_id] += 1
         self._work_available.set()
         return True
 
@@ -1503,6 +1700,12 @@ class OmniConnectorModelRunnerMixin:
 
     @property
     def connector(self) -> Any | None:
+        return self._get_send_connector()
+
+    def _get_send_connector(self) -> OmniConnectorBase | None:
+        connector = getattr(self, "_omni_output_connector", None)
+        if connector is not None:
+            return connector
         return self._omni_connector
 
     # ------------------------------------------------------------------ #
@@ -1537,6 +1740,15 @@ class OmniConnectorModelRunnerMixin:
                     break
                 try:
                     made_progress = self._poll_single_request(req_id) or made_progress
+                except RuntimeError as exc:
+                    if "get(metadata=None) requires sender info to be resolved" in str(exc):
+                        logger.debug(
+                            "[Stage-%s] recv_loop pending sender endpoint for req=%s; retrying",
+                            self._stage_id,
+                            req_id,
+                        )
+                        continue
+                    logger.warning("Error receiving data for %s", req_id, exc_info=True)
                 except Exception:
                     logger.warning("Error receiving data for %s", req_id, exc_info=True)
 
@@ -1651,6 +1863,28 @@ class OmniConnectorModelRunnerMixin:
         payload_data, _size = result
         if not payload_data:
             return False
+
+        if isinstance(payload_data, dict) and self._should_use_qwen3_thinker_to_talker_packet_path(for_recv=True):
+            from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import is_packet_sidecar
+
+            if is_packet_sidecar(payload_data):
+                try:
+                    payload_data = self._reconstruct_qwen3_packet_payload(
+                        connector,
+                        payload_data,
+                        str(target_stage_id),
+                        str(self._stage_id),
+                    )
+                except Exception:
+                    logger.warning(
+                        "[Stage-%s] failed to reconstruct Qwen3 packet payload for req=%s key=%s",
+                        self._stage_id,
+                        req_id,
+                        connector_get_key,
+                        exc_info=True,
+                    )
+                    return False
+
         if isinstance(payload_data, dict):
             logger.info(
                 "[Stage-%s] recv_chunk_result: req=%s ext=%s key=%s keys=%s finished=%s",
@@ -1820,7 +2054,7 @@ class OmniConnectorModelRunnerMixin:
         ``success=False``), returns False **without** decrementing
         ``_pending_save_counts`` so the caller can retry or clean up.
         """
-        connector = self._omni_connector
+        connector = task.get("connector") or self._get_send_connector()
         if connector is None:
             return True
 
@@ -1997,9 +2231,9 @@ class OmniConnectorModelRunnerMixin:
         return snapshot
 
     @staticmethod
-    def _create_connector(model_config: Any) -> OmniConnectorBase | None:
+    def _create_connector(model_config: Any, config_attr: str = "stage_connector_config") -> OmniConnectorBase | None:
         """Create a connector from model_config, or None if unconfigured."""
-        connector_config = getattr(model_config, "stage_connector_config", None)
+        connector_config = getattr(model_config, config_attr, None)
         if connector_config is None:
             return None
 
@@ -2024,7 +2258,7 @@ class OmniConnectorModelRunnerMixin:
         try:
             return OmniConnectorFactory.create_connector(spec)
         except Exception as exc:
-            raise RuntimeError(f"Failed to create connector {name}") from exc
+            raise RuntimeError(f"Failed to create connector {name} from {config_attr}") from exc
 
     @staticmethod
     def _load_custom_func(model_config: Any) -> tuple[str | None, Any | None]:
@@ -2124,8 +2358,10 @@ class OmniConnectorModelRunnerMixin:
         Falls back to ``stage_id + 1`` when the config does not specify
         a ``to_stage`` explicitly.
         """
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        if connector_config is not None:
+        for config_attr in ("stage_output_connector_config", "stage_connector_config"):
+            connector_config = getattr(model_config, config_attr, None)
+            if connector_config is None:
+                continue
             if isinstance(connector_config, dict):
                 to_stage = connector_config.get("to_stage")
             else:
@@ -2143,7 +2379,9 @@ class OmniConnectorModelRunnerMixin:
         Returns ``{"from_tp": int, "to_tp": int, "local_rank": int}``.
         When ``rank_mapping`` is absent, assumes 1:1 homogeneous mapping.
         """
-        connector_config = getattr(model_config, "stage_connector_config", None)
+        connector_config = getattr(model_config, "stage_output_connector_config", None)
+        if connector_config is None:
+            connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is not None and not isinstance(connector_config, dict):
             connector_config = getattr(connector_config, "__dict__", {})
 

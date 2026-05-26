@@ -151,13 +151,37 @@ def _extract_qwen3_full_payload_codec_rows(
     ):
         trailing_placeholder_count += 1
 
-    aligned_len = min(int(code_predictor_codes.shape[0]), len(output_token_ids))
+    raw_rows = int(code_predictor_codes.shape[0])
+    row_in_codebook_mask_all = (code_predictor_codes.max(dim=1).values < _QWEN3_CODEC_CODEBOOK_SIZE) & (
+        code_predictor_codes.min(dim=1).values >= 0
+    )
+
+    # In some non-async runs the Request snapshot only carries the final few
+    # output token ids while the accumulated codec tensor is complete.  Treat
+    # that as an incomplete alignment signal instead of dropping most audio.
+    if 0 < len(output_token_ids) < max(1, raw_rows // 2):
+        non_placeholder_mask = code_predictor_codes.any(dim=1)
+        filtered_rows = code_predictor_codes[row_in_codebook_mask_all & non_placeholder_mask]
+        if filtered_rows.numel() == 0:
+            filtered_rows = code_predictor_codes[:0]
+        return filtered_rows, {
+            "raw_rows": raw_rows,
+            "aligned_rows": len(output_token_ids),
+            "valid_rows": int(filtered_rows.shape[0]) if filtered_rows.ndim > 0 else 0,
+            "trailing_placeholder_count": trailing_placeholder_count,
+            "alignment_fallback": 1,
+            "zero_placeholder_rows": int((~non_placeholder_mask).sum().item()),
+        }
+
+    aligned_len = min(raw_rows, len(output_token_ids))
     if aligned_len <= 0:
         return code_predictor_codes[:0], {
-            "raw_rows": int(code_predictor_codes.shape[0]),
+            "raw_rows": raw_rows,
             "aligned_rows": 0,
             "valid_rows": 0,
             "trailing_placeholder_count": trailing_placeholder_count,
+            "alignment_fallback": 0,
+            "zero_placeholder_rows": 0,
         }
 
     aligned_rows = code_predictor_codes[-aligned_len:]
@@ -174,10 +198,12 @@ def _extract_qwen3_full_payload_codec_rows(
     if filtered_rows.numel() == 0:
         filtered_rows = aligned_rows[:0]
     return filtered_rows, {
-        "raw_rows": int(code_predictor_codes.shape[0]),
+        "raw_rows": raw_rows,
         "aligned_rows": aligned_len,
         "valid_rows": int(filtered_rows.shape[0]) if filtered_rows.ndim > 0 else 0,
         "trailing_placeholder_count": trailing_placeholder_count,
+        "alignment_fallback": 0,
+        "zero_placeholder_rows": 0,
     }
 
 

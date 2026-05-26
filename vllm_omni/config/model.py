@@ -101,6 +101,7 @@ class OmniModelConfig(ModelConfig):
              "audio", "latents"). If None, output type is inferred.
          stage_connector_config: Stage connector configuration dictionary.
              Contains "name" (connector name), "extra" (extra connector config).
+         stage_output_connector_config: Output connector configuration dictionary.
          task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
              If not specified, will be inferred from model path.
 
@@ -126,6 +127,12 @@ class OmniModelConfig(ModelConfig):
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_config: dict[str, Any] = field(
+        default_factory=lambda: {
+            "name": "SharedMemoryConnector",
+            "extra": {},
+        }
+    )
+    stage_output_connector_config: dict[str, Any] = field(
         default_factory=lambda: {
             "name": "SharedMemoryConnector",
             "extra": {},

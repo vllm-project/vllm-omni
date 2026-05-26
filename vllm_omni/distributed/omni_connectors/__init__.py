@@ -23,6 +23,7 @@ from .utils.initialization import (
     build_stage_connectors,
     get_connectors_config_for_stage,
     get_stage_connector_config,
+    get_worker_connector_specs_for_stage,
     initialize_connectors_from_config,
     initialize_orchestrator_connectors,
     load_omni_transfer_config,
@@ -51,6 +52,7 @@ __all__ = [
     "load_omni_transfer_config",
     "initialize_connectors_from_config",
     "get_connectors_config_for_stage",
+    "get_worker_connector_specs_for_stage",
     # Manager helpers
     "initialize_orchestrator_connectors",
     "get_stage_connector_config",
