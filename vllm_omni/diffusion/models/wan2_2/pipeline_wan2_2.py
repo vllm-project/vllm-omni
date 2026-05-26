@@ -1072,6 +1072,7 @@ class Wan22Pipeline(
         height = sampling.height or 480
         width = sampling.width or 832
         num_frames = sampling.num_frames or 81
+        chunk_frames = sampling.chunk_frames or 8
         num_steps = sampling.num_inference_steps or 40
 
         patch_size = self.transformer_config.patch_size
@@ -1083,7 +1084,7 @@ class Wan22Pipeline(
             num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
 
-        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 4.0
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
         guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
         guidance_high = (
             sampling.guidance_scale_2
@@ -1115,6 +1116,7 @@ class Wan22Pipeline(
             "height": height,
             "width": width,
             "num_frames": num_frames,
+            "chunk_frames": chunk_frames,
             "num_steps": num_steps,
             "guidance_low": guidance_low,
             "guidance_high": guidance_high,
@@ -1242,12 +1244,12 @@ class Wan22Pipeline(
                 height=height,
                 width=width,
                 num_frames=chunk_frames,
-                dtype=torch.float32,
-                device="meta",  # NOTE: stream mode; latents will be prepared per-chunk in `encode_chunk_inputs`
-                generator=generator,
+                dtype=self.vae.dtype,
+                device="meta",  # NOTE: stream mode; latents are prepared per-chunk in `encode_chunk_inputs`
+                generator=None,
                 latents=state.sampling.latents,
             )
-        if self.expand_timesteps and raw_image is not None:
+        elif self.expand_timesteps and raw_image is not None:
             # I2V mode
             from diffusers.video_processor import VideoProcessor
 

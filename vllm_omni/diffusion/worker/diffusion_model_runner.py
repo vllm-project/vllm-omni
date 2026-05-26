@@ -638,7 +638,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def _update_decoded_chunks(self, state: DiffusionRequestState, layout: Layout) -> DiffusionOutput | None:
         n_finished = len(layout.finished_idxs)
         if n_finished > 0:
-            decoded = self.pipeline.post_decode(state.latents[: n_finished])
+            saved = state.latents
+            state.latents = state.latents[:n_finished]
+            decoded = self.pipeline.post_decode(state)
+            state.latents = saved
+            
             state.extra.setdefault("decoded_chunks", []).append(decoded)
             state.extra["num_chunks_decoded"] = (
                 state.extra.get("num_chunks_decoded", 0) + n_finished
