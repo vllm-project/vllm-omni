@@ -171,9 +171,13 @@ class Attention(nn.Module):
     def _init_kv_cache_quantization(self, config) -> None:
         if config is None:
             return
-        dtype = config.diffusion_kv_cache_dtype
+        dtype = getattr(config, "diffusion_kv_cache_dtype", None)
+        if dtype == "auto":
+            dtype = None
+        parallel_config = getattr(config, "parallel_config", None)
+        ring_degree = getattr(parallel_config, "ring_degree", 1)
         if dtype:
-            if config.parallel_config.ring_degree > 1:
+            if ring_degree > 1:
                 raise ValueError(
                     "KV quantization is not compatible with ring attention "
                     "(ring_degree > 1). Ring kernels do not propagate quantization descale "
@@ -190,8 +194,8 @@ class Attention(nn.Module):
                 )
                 dtype = None
         self._kv_cache_dtype = dtype
-        self._kv_cache_skip_steps = config.diffusion_kv_cache_skip_step_indices
-        self._kv_cache_skip_layers = config.diffusion_kv_cache_skip_layer_indices
+        self._kv_cache_skip_steps = getattr(config, "diffusion_kv_cache_skip_step_indices", None)
+        self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
 
     def _should_apply_kv_cache_quant(self) -> bool:
         skip_steps = self._kv_cache_skip_steps

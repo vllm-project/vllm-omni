@@ -101,3 +101,4 @@ Key arguments:
 - `--video-negative-prompt`: negative prompt for video generation.
 - `--audio-negative-prompt`: negative prompt for audio generation.
 - `--enable-cpu-offload`: enable CPU offload (defaults False).
+- `--cache-backend`: enable `cache_dit` for acceleration.

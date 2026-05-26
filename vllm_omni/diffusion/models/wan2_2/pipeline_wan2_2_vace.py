@@ -45,6 +45,7 @@ logger = init_logger(__name__)
 def create_vace_transformer_from_config(
     config: dict,
     quant_config: QuantizationConfig | None = None,
+    prefix: str = "",
 ) -> WanVACETransformer3DModel:
     """Create WanVACETransformer3DModel from config dict."""
     kwargs = {}
@@ -84,6 +85,8 @@ def create_vace_transformer_from_config(
         kwargs["vace_in_channels"] = config["vace_in_channels"]
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
+    if prefix:
+        kwargs["prefix"] = prefix
 
     return WanVACETransformer3DModel(**kwargs)
 

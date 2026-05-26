@@ -78,6 +78,24 @@ def parse_args():
     parser.add_argument("--init-timeout", type=int, default=300, help="Initialization timeout in seconds.")
     parser.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")
     parser.add_argument(
+        "--diffusion-kv-cache-dtype",
+        type=str,
+        default=None,
+        help="Diffusion attention KV cache dtype, for example 'fp8'. Separate from vLLM --kv-cache-dtype.",
+    )
+    parser.add_argument(
+        "--diffusion-kv-cache-skip-steps",
+        type=str,
+        default=None,
+        help="Denoising step selector to keep diffusion KV cache in native dtype, for example '0,1,4-6'.",
+    )
+    parser.add_argument(
+        "--diffusion-kv-cache-skip-layers",
+        type=str,
+        default=None,
+        help="Transformer layer selector to keep diffusion KV cache in native dtype, for example '0-2,10'.",
+    )
+    parser.add_argument(
         "--additional-config",
         type=str,
         default=None,
@@ -140,6 +158,9 @@ def main():
         "init_timeout": args.init_timeout,
         "enforce_eager": args.enforce_eager,
         "mode": _MODALITY_MODE[args.modality],
+        "diffusion_kv_cache_dtype": args.diffusion_kv_cache_dtype,
+        "diffusion_kv_cache_skip_steps": args.diffusion_kv_cache_skip_steps,
+        "diffusion_kv_cache_skip_layers": args.diffusion_kv_cache_skip_layers,
     }
 
     if additional_config is not None:
@@ -237,6 +258,9 @@ def main():
         print(f"  Inference steps: {args.steps}")
         print(f"  Guidance scale: {args.guidance_scale}")
         print(f"  Seed: {args.seed}")
+        print(f"  diffusion_kv_cache_dtype: {args.diffusion_kv_cache_dtype}")
+        print(f"  diffusion_kv_cache_skip_steps: {args.diffusion_kv_cache_skip_steps}")
+        print(f"  diffusion_kv_cache_skip_layers: {args.diffusion_kv_cache_skip_layers}")
     if args.modality == "text2img":
         print(f"  Output size: {args.width}x{args.height}")
     if args.image_path:

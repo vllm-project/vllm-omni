@@ -118,7 +118,7 @@ def build_bench_args(
         "--num-warmups",
         "2",
         "--percentile-metrics",
-        "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun",
     ]
 
     if resolved_dataset_path:

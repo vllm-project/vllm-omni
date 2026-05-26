@@ -2,6 +2,7 @@ import os
 
 import pytest
 import torch
+from vllm.distributed import parallel_state
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -59,3 +60,15 @@ def default_vllm_config():
 
     with set_current_vllm_config(VllmConfig(device_config=device_config)):
         yield
+
+
+@pytest.fixture()
+def init_fake_tp_group(mocker):
+    """Provide a fake TP group so vllm linear layers can be instantiated."""
+    mock_tp = mocker.MagicMock()
+    mock_tp.world_size = 1
+    mock_tp.rank_in_group = 0
+    old = parallel_state._TP
+    parallel_state._TP = mock_tp
+    yield
+    parallel_state._TP = old
