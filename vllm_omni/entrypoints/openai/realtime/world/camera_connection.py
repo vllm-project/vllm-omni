@@ -5,7 +5,7 @@
 
 Protocol (compatible with DreamZero test_client_AR.py):
     Connect  -> server sends msgpack(PolicyServerConfig fields)
-    Infer    -> client sends msgpack(obs), server sends msgpack(ndarray)
+    Infer    -> client sends msgpack(req), server sends msgpack(ndarray)
     Reset    -> client sends msgpack({endpoint:reset}), server sends "reset successful"
 """
 
@@ -24,6 +24,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import _normalize_frames
 
 logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0
+CHUNK_FRAMES = 4
 
 
 def _get_msgpack_numpy() -> Any:
@@ -63,10 +64,10 @@ class WorldCameraRealtimeConnection:
         await self.websocket.send_bytes(_pack({"type": "error", "message": message}))
 
     def _unpack_request(self, data: bytes) -> dict[str, Any]:
-        obs = _unpack(data)
-        if not isinstance(obs, dict):
+        req = _unpack(data)
+        if not isinstance(req, dict):
             raise ValueError("Invalid request payload")
-        return obs
+        return req
 
     async def handle_connection(self) -> None:
         """Main loop."""
@@ -99,7 +100,7 @@ class WorldCameraRealtimeConnection:
                     continue
 
                 try:
-                    obs = self._unpack_request(msg["bytes"])
+                    req = self._unpack_request(msg["bytes"])
                 except Exception:
                     logger.exception("Invalid world model OpenPI request payload")
                     try:
@@ -109,13 +110,13 @@ class WorldCameraRealtimeConnection:
                     continue
 
                 try:
-                    endpoint = obs.pop("endpoint", "infer")
+                    endpoint = req.pop("endpoint", "infer")
 
                     if endpoint == "reset":
-                        self.serving.reset(obs)
+                        self.serving.reset(req)
                         await self.websocket.send_text("reset successful")
                     else:
-                        result = await self.serving.infer(obs)
+                        result = await self.serving.infer(req)
 
                         if (
                             len(result.images) == 1
@@ -135,8 +136,6 @@ class WorldCameraRealtimeConnection:
                             frames = frames.numpy(force=True)
 
                         frames = _normalize_frames(frames)
-
-                        CHUNK_FRAMES = 4
 
                         total = (len(frames) + CHUNK_FRAMES - 1) // CHUNK_FRAMES
                         for i in range(total):

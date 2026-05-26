@@ -6,11 +6,11 @@ Talks to the WebSocket endpoint ``/v1/realtime/world/camera`` exposed by
 ``vllm serve --omni`` when the loaded pipeline is ``LingbotWorldFastPipeline``.
 
 The endpoint speaks the OpenPI policy protocol on the wire:
-    1. Connect    -> server sends msgpack(PolicyServerConfig)
-    2. Client send msgpack(obs)
+    1. Connect    -> server sends msgpack(CameraServerConfig)
+    2. Client send msgpack(request)
     3. Server send msgpack(ndarray)  # generated frames
 
-The ``obs`` payload sent here contains:
+The ``request`` payload sent here contains:
     - "image":   numpy array, the input image
     - "prompt":  str, the text prompt describing the desired motion
     - "camera":  {"poses": ndarray, "intrinsics": ndarray}
@@ -58,8 +58,8 @@ def _load_camera(camera_dir: str) -> dict:
     return {"poses": poses, "intrinsics": intrinsics}
 
 
-def generate_video(args: Namespace) -> np.ndarray:
-    """Send a single inference request and return the generated frames."""
+def generate_video(args: Namespace) -> list[np.ndarray]:
+    """Send inference requests and return the generated frames."""
     image = _load_image(args.image)
     full_camera = _load_camera(args.camera_path)
 
@@ -80,16 +80,11 @@ def generate_video(args: Namespace) -> np.ndarray:
             "intrinsics": full_camera["intrinsics"][starting_frame : starting_frame + args.num_frames],
         }
 
+        request: dict = {"prompt": args.prompt, "camera": camera, "extra_body": extra_body}
         if i == 0:
-            extra_body["num_frames"] = (args.num_frames // 4) * 4 + 1
-        else:
-            extra_body["num_frames"] = (args.num_frames // 4) * 4
+            request["image"] = image
 
-        obs: dict = {"prompt": args.prompt, "camera": camera, "extra_body": extra_body}
-        if i == 0:
-            obs["image"] = image
-
-        obs["session_id"] = args.session_id
+        request["session_id"] = args.session_id
 
         endpoint = f"{args.server.rstrip('/')}/v1/realtime/world/camera"
         print(f"Connecting to {endpoint} ...")
@@ -98,12 +93,12 @@ def generate_video(args: Namespace) -> np.ndarray:
             # 1. Server sends CameraServerConfig on connect.
             _unpack(ws.recv())
 
-            # 2. Send obs.
+            # 2. Send request.
             print(
-                f"Sending obs image=  ({str(image.shape) if obs.get('image', None) is not None else 'None'}, "
+                f"Sending request image=  ({str(image.shape) if request.get('image', None) is not None else 'None'}, "
                 f"poses={camera['poses'].shape}, intrinsics={camera['intrinsics'].shape})..."
             )
-            ws.send(_pack(obs))
+            ws.send(_pack(request))
 
             # 3. Receive generated frames.
             chunks: list[np.ndarray] = []
@@ -121,7 +116,7 @@ def generate_video(args: Namespace) -> np.ndarray:
             clip = np.concatenate(chunks, axis=0)
             # The first chunk of frames returned was used to condition the video continuation but they are not useful
             if i != 0:
-                clip = clip[3:]
+                clip = clip[args.num_skip_frames :]
             for frame in clip:
                 video.append(frame)
 
@@ -163,6 +158,7 @@ def main():
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--num-frames", type=int, default=24)
     parser.add_argument("--num-calls", type=int, default=2)
+    parser.add_argument("--num-skip-frames", type=int, default=4)
     args = parser.parse_args()
 
     frames = generate_video(args)

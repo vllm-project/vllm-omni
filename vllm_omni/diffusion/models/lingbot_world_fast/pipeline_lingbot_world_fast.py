@@ -168,9 +168,12 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         multi_modal_data = req.prompts[0].get("multi_modal_data", {})
 
         session_id = str(req.sampling_params.extra_args.get("session_id") or None)
+
+        force_reset = req.sampling_params.extra_args.get("force_reset") or False
+
         extension = True
 
-        if self.state.session_id is None or self.state.session_id != session_id:
+        if force_reset or self.state.session_id is None or self.state.session_id != session_id:
             self.state.reset()
             self.state.session_id = session_id
             extension = False
@@ -236,9 +239,13 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         new_lat_f = max(new_lat_f, 1)
         max_seq_len = chunk_size * lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
-        seed = random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
-        seed_g.manual_seed(seed)
+        seed_g = req.sampling_params.generator
+        if seed_g is None:
+            seed = req.sampling_params.seed
+            if seed is None:
+                seed = random.randint(0, sys.maxsize)
+            seed_g = torch.Generator(device=self.device)
+            seed_g.manual_seed(seed)
         noise = torch.randn(16, new_lat_f, lat_h, lat_w, dtype=torch.float32, generator=seed_g, device=self.device)
 
         # Fresh: msk[0] = 1 (anchor) and the rest = 0, replicated into 4 channels grouped

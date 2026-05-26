@@ -109,7 +109,7 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {num_inference_steps}")
     print(f"  Frames: {args.num_frames}")
-    print(f"  Video size: {args.width}x{args.height}")
+    print(f"  Video size: {width}x{height}")
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()
