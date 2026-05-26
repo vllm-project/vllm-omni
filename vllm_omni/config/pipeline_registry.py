@@ -125,4 +125,8 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.minicpmo_4_5.pipeline",
         "MINICPMO_4_5_PIPELINE",
     ),
+    "higgs_audio_v2": (
+        "vllm_omni.model_executor.models.higgs_audio_v2.pipeline",
+        "HIGGS_AUDIO_V2_PIPELINE",
+    ),
 }

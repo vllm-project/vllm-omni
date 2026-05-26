@@ -102,6 +102,22 @@ _OMNI_MODELS = {
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
     ),
+    ## higgs-audio v2
+    "HiggsAudioV2ForConditionalGeneration": (
+        "higgs_audio_v2",
+        "higgs_audio_v2_talker",
+        "HiggsAudioV2TalkerForConditionalGeneration",
+    ),
+    "HiggsAudioV2TalkerForConditionalGeneration": (
+        "higgs_audio_v2",
+        "higgs_audio_v2_talker",
+        "HiggsAudioV2TalkerForConditionalGeneration",
+    ),
+    "HiggsAudioV2Code2WavForConditionalGeneration": (
+        "higgs_audio_v2",
+        "higgs_audio_v2_code2wav",
+        "HiggsAudioV2Code2WavForConditionalGeneration",
+    ),
     ## mimo_audio
     "MiMoAudioModel": (
         "mimo_audio",

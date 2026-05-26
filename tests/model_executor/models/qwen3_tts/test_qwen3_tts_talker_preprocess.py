@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,6 +16,8 @@ from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
 def _make_minimal_talker():
     model = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
     model.talker_config = SimpleNamespace(codec_pad_id=7, num_code_groups=16)
+    model._ref_audio_artifact_cache_max_entries = 256
+    model._ref_audio_artifact_cache = OrderedDict()
     return model
 
 
