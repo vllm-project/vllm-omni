@@ -15,6 +15,7 @@ import msgspec
 import torch
 import zmq
 
+from ..utils.kv_utils import get_tp_world_size
 from ..utils.logging import get_connector_logger
 from ..utils.memory_pool import BufferAllocator, ManagedBuffer
 from ..utils.serialization import OmniSerializer
@@ -106,6 +107,17 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     def __init__(self, config: dict[str, Any]):
         if TransferEngine is None:
             raise ImportError("Mooncake not available")
+
+        # ---- TP=1-only guard (chunk_transfer_adapter path) ----
+        # See ``MoriTransferEngineConnector`` for the rationale.
+        tp_world_size = get_tp_world_size()
+        if tp_world_size > 1:
+            raise NotImplementedError(
+                f"MooncakeTransferEngineConnector chunk-mode RDMA path is currently "
+                f"TP=1-only (detected tp_world_size={tp_world_size}).  Reuse "
+                f"``utils/kv_utils.kv_zmq_port`` (KV path's rank-aware formula) "
+                f"to lift this."
+            )
 
         self._closed = False
         self._bind_error: Exception | None = None  # fatal ZMQ bind error from listener thread

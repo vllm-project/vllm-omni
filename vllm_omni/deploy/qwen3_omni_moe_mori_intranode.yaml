@@ -29,6 +29,9 @@
 #
 # Dependencies: mori (``pip install mori``), torch-rocm>=2.9, vllm-omni
 # with #2383 deploy schema, ibverbs/RDMA NICs exposed via /dev/infiniband.
+#
+# Limitation: TP=1-only.  Connector raises NotImplementedError on
+# tp_world_size > 1 (chunk-path endpoint derivation isn't rank-aware yet).
 async_chunk: true
 
 connectors:

@@ -263,3 +263,55 @@ def test_inject_helper_is_noop_for_non_integer_stage(_stable_local_ip):
 def test_get_connectors_config_for_stage_none_transfer_config():
     """Callers pass ``None`` when no yaml was loaded; return an empty dict."""
     assert get_connectors_config_for_stage(None, 0) == {}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TP > 1 fail-fast guard for chunk-mode RDMA connectors
+# (see _inject_chunk_path_endpoints: chunk path lacks per-rank ZMQ port stride)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _mock_sdk_non_none(monkeypatch, mod):
+    """Ensure the SDK availability gate (``if X is None: raise ImportError``)
+    in each connector's ``__init__`` doesn't fire before our TP guard does.
+    Only the *presence* of the SDK matters for the gate; tests don't need a
+    functional SDK because the TP guard is supposed to ``raise`` first.
+    """
+    for sdk_attr in ("IOEngine", "TransferEngine"):
+        if hasattr(mod, sdk_attr) and getattr(mod, sdk_attr) is None:
+            monkeypatch.setattr(mod, sdk_attr, object)  # any non-None sentinel
+
+
+@pytest.mark.parametrize(
+    "module_path, class_name",
+    [
+        (
+            "vllm_omni.distributed.omni_connectors.connectors.mori_transfer_engine_connector",
+            "MoriTransferEngineConnector",
+        ),
+        (
+            "vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector",
+            "MooncakeTransferEngineConnector",
+        ),
+    ],
+)
+def test_chunk_mode_connector_fails_fast_on_tp_gt_1(monkeypatch, module_path, class_name):
+    """Both Mori and Mooncake chunk-mode connectors must reject TP > 1 on init.
+
+    The chunk path's endpoint derivation in
+    ``_inject_chunk_path_endpoints`` is keyed only on stage_id, so multiple
+    TP ranks in the same stage would collide on the listener port and
+    receivers cannot route per-rank shards.  Until a rank-aware variant of
+    ``utils/kv_utils.kv_zmq_port`` is ported here, the connectors must
+    refuse TP > 1 deployments at construction time with a clear
+    NotImplementedError pointing at the missing infrastructure.
+    """
+    import importlib
+
+    mod = importlib.import_module(module_path)
+    _mock_sdk_non_none(monkeypatch, mod)
+    monkeypatch.setattr(mod, "get_tp_world_size", lambda: 2)
+
+    cls = getattr(mod, class_name)
+    with pytest.raises(NotImplementedError, match=r"TP=1-only"):
+        cls({})
