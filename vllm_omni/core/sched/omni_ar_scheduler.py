@@ -599,9 +599,30 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         else:
             super()._update_request_as_session(session, update)
-            # Upstream's stage-0 streaming session update extends the
-            # prompt but does not propagate per-chunk
-            # ``additional_information``
+            # Upstream's stage-0 streaming session update extends the prompt
+            # but never touches ``additional_information``, so per-chunk
+            # payloads (e.g. nemotron_voicechat's ``acoustic_embedding`` or
+            # EarTTS's ``input_text_tokens``) were dropped on the scheduler
+            # side and the runner only ever saw the initial request's value.
+            #
+            # Replace (not merge) is the right session-level semantics: the
+            # session field is just a courier for the latest chunk's payload
+            # to ``OmniNewRequestData``. Whole-dict accumulation across
+            # chunks is intentionally avoided here so that models that pass
+            # disjoint per-chunk keys (decode-only fields) do not keep stale
+            # prefill-only fields around. Per-key accumulation, where a
+            # model needs it (e.g. Qwen3-Omni thinker concatenating
+            # ``("embed", "prefill")``), is handled by the runner's
+            # ``_update_streaming_input_additional_info`` against the
+            # model's ``streaming_accumulated_keys`` set, so the merge
+            # policy stays a per-model concern, not a per-scheduler one.
+            #
+            # ``None`` is treated as "chunk omitted the field" rather than
+            # "clear the session" so a streaming pipeline can keep sending
+            # placeholder chunks without payloads without losing the
+            # initial request's state — this differs from
+            # ``_replace_session_with_streaming_update`` at stage_id != 0,
+            # which always overwrites.
             new_info = getattr(update, "additional_information", None)
             if new_info is not None:
                 session.additional_information = new_info
