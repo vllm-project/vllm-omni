@@ -332,6 +332,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            if self.omni_prefix_cache is not None:
+                self.omni_prefix_cache.discard_deferred_mm_outputs(req_id)
             if hasattr(self, "_downstream_payload_cache"):
                 self._downstream_payload_cache.pop(req_id, None)
             if hasattr(self, "_talker_mtp_generators"):
