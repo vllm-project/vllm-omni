@@ -88,7 +88,8 @@ class DroidTransform(RobotPolicyTransform):
         right_ext = maybe_preprocess(right_ext)
         wrist = maybe_preprocess(wrist)
         ref = next((v for v in [wrist, left_ext, right_ext] if v is not None), None)
-        assert ref is not None
+        if ref is None:
+            raise RuntimeError("Expected at least one DROID camera view after preprocessing.")
         t, h, w, c = ref.shape
 
         out = np.zeros((t, 2 * h, 2 * w, c), dtype=ref.dtype)  # (T, 2H, 2W, C)

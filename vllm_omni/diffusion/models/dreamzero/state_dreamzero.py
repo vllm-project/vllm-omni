@@ -142,17 +142,20 @@ class DreamZeroState:
     ) -> None:
         """Update a single layer's KV cache after prefill."""
         cache = self.kv_cache_neg if is_negative else self.kv_cache
-        assert cache is not None, "KV caches not initialized, call create_kv_caches first"
+        if cache is None:
+            raise RuntimeError("KV caches not initialized, call create_kv_caches first.")
         cache[layer_index] = updated_kv.clone()
 
     def get_kv_caches(self, is_negative: bool = False) -> list[torch.Tensor]:
         """Get KV caches for the specified branch."""
         cache = self.kv_cache_neg if is_negative else self.kv_cache
-        assert cache is not None, "KV caches not initialized"
+        if cache is None:
+            raise RuntimeError("KV caches not initialized.")
         return cache
 
     def get_crossattn_caches(self, is_negative: bool = False) -> list[dict[str, bool | torch.Tensor | None]]:
         """Get cross-attention caches for the specified branch."""
         cache = self.crossattn_cache_neg if is_negative else self.crossattn_cache
-        assert cache is not None, "Cross-attn caches not initialized"
+        if cache is None:
+            raise RuntimeError("Cross-attn caches not initialized.")
         return cache

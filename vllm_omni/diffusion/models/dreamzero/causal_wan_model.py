@@ -41,7 +41,8 @@ from vllm_omni.diffusion.models.dreamzero.action_encoder import (
 
 def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
     """Sinusoidal positional embedding for timesteps."""
-    assert dim % 2 == 0
+    if dim % 2 != 0:
+        raise ValueError(f"dim must be even, got {dim}.")
     half = dim // 2
     position = position.type(torch.float64)
     sinusoid = torch.outer(
@@ -56,7 +57,8 @@ def rope_params(max_seq_len: int, dim: int) -> torch.Tensor:
     """Precompute complex-valued RoPE frequencies (polar form).
     Returns: complex tensor [max_seq_len, dim // 2]
     """
-    assert dim % 2 == 0
+    if dim % 2 != 0:
+        raise ValueError(f"dim must be even, got {dim}.")
     freqs = torch.outer(
         torch.arange(max_seq_len),
         1.0 / torch.pow(10000, torch.arange(0, dim, 2).to(torch.float64).div(dim)),
@@ -87,8 +89,10 @@ def rope_action_apply(
     B, seq_len, n, _ = x.shape
     x = torch.view_as_complex(x.to(torch.float64).reshape(B, seq_len, n, -1, 2))
     if action_register_length is not None:
-        assert num_action_per_block is not None
-        assert num_state_per_block is not None
+        if num_action_per_block is None:
+            raise ValueError("num_action_per_block is required when action_register_length is set.")
+        if num_state_per_block is None:
+            raise ValueError("num_state_per_block is required when action_register_length is set.")
         chunk_size = action_register_length // (num_action_per_block + num_state_per_block)
         freqs_1d_action = freqs_action[: chunk_size * num_action_per_block].view(
             chunk_size * num_action_per_block, 1, -1
@@ -114,7 +118,12 @@ def causal_rope_action_apply(
     B, seq_len, n, _ = x.shape
     x = torch.view_as_complex(x.to(torch.float64).reshape(B, seq_len, n, -1, 2))
     if action_register_length is not None:
-        assert action_register_length == (num_action_per_block + num_state_per_block)
+        expected_length = num_action_per_block + num_state_per_block
+        if action_register_length != expected_length:
+            raise ValueError(
+                f"action_register_length must equal num_action_per_block + num_state_per_block "
+                f"({expected_length}), got {action_register_length}."
+            )
         freqs_action = freqs_action[
             action_state_index * num_action_per_block : (action_state_index + 1) * num_action_per_block
         ]
@@ -229,7 +238,8 @@ class WanT2VCrossAttention(nn.Module):
 
     def __init__(self, dim: int, num_heads: int, window_size=(-1, -1), qk_norm: bool = True, eps: float = 1e-6) -> None:
         super().__init__()
-        assert dim % num_heads == 0
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}.")
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -288,7 +298,8 @@ class WanI2VCrossAttention(nn.Module):
 
     def __init__(self, dim: int, num_heads: int, window_size=(-1, -1), qk_norm: bool = True, eps: float = 1e-6) -> None:
         super().__init__()
-        assert dim % num_heads == 0
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}.")
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -375,8 +386,9 @@ class CausalWanSelfAttention(nn.Module):
         num_action_per_block: int = 32,
         num_state_per_block: int = 1,
     ) -> None:
-        assert dim % num_heads == 0
         super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}.")
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -425,61 +437,62 @@ class CausalWanSelfAttention(nn.Module):
 
         updated_kv_cache: torch.Tensor | None = None
 
-        assert kv_cache is not None, "Inference only — kv_cache required."
-        if True:
-            action_state_index = max(0, (current_start_frame - 1) // self.num_frame_per_block)
+        if kv_cache is None:
+            raise RuntimeError("Inference only: kv_cache is required.")
 
-            roped_query = causal_rope_action_apply(
-                q,
-                freqs,
-                freqs_action,
-                freqs_state,
-                action_register_length,
-                self.num_action_per_block,
-                self.num_state_per_block,
-                action_state_index,
-            ).type_as(v)
-            roped_key = causal_rope_action_apply(
-                k,
-                freqs,
-                freqs_action,
-                freqs_state,
-                action_register_length,
-                self.num_action_per_block,
-                self.num_state_per_block,
-                action_state_index,
-            ).type_as(v)
+        action_state_index = max(0, (current_start_frame - 1) // self.num_frame_per_block)
 
-            roped_action_query = None
-            roped_action_key = None
-            action_v = None
+        roped_query = causal_rope_action_apply(
+            q,
+            freqs,
+            freqs_action,
+            freqs_state,
+            action_register_length,
+            self.num_action_per_block,
+            self.num_state_per_block,
+            action_state_index,
+        ).type_as(v)
+        roped_key = causal_rope_action_apply(
+            k,
+            freqs,
+            freqs_action,
+            freqs_state,
+            action_register_length,
+            self.num_action_per_block,
+            self.num_state_per_block,
+            action_state_index,
+        ).type_as(v)
 
-            if action_register_length is not None:
-                roped_action_query = roped_query[:, -action_register_length:]
-                roped_query = roped_query[:, :-action_register_length]
-                roped_action_key = roped_key[:, -action_register_length:]
-                roped_key = roped_key[:, :-action_register_length]
-                action_v = v[:, -action_register_length:]
-                v = v[:, :-action_register_length]
+        roped_action_query = None
+        roped_action_key = None
+        action_v = None
 
-            updated_k = kv_cache[0]
-            updated_v = kv_cache[1]
-            new_k = torch.cat([updated_k, roped_key], dim=1)
-            new_v = torch.cat([updated_v, v], dim=1)
-            new_k = new_k[:, -self.max_attention_size :]
-            new_v = new_v[:, -self.max_attention_size :]
+        if action_register_length is not None:
+            roped_action_query = roped_query[:, -action_register_length:]
+            roped_query = roped_query[:, :-action_register_length]
+            roped_action_key = roped_key[:, -action_register_length:]
+            roped_key = roped_key[:, :-action_register_length]
+            action_v = v[:, -action_register_length:]
+            v = v[:, :-action_register_length]
 
-            if action_register_length is not None:
-                q_cat = torch.cat([roped_query, roped_action_query], dim=1)
-                k_cat = torch.cat([new_k, roped_action_key], dim=1)
-                v_cat = torch.cat([new_v, action_v], dim=1)
-            else:
-                q_cat = roped_query
-                k_cat = new_k
-                v_cat = new_v
+        updated_k = kv_cache[0]
+        updated_v = kv_cache[1]
+        new_k = torch.cat([updated_k, roped_key], dim=1)
+        new_v = torch.cat([updated_v, v], dim=1)
+        new_k = new_k[:, -self.max_attention_size :]
+        new_v = new_v[:, -self.max_attention_size :]
 
-            x = self.attn(q_cat, k_cat, v_cat)
-            updated_kv_cache = torch.stack([new_k, new_v], dim=0)
+        if action_register_length is not None:
+            q_cat = torch.cat([roped_query, roped_action_query], dim=1)
+            k_cat = torch.cat([new_k, roped_action_key], dim=1)
+            v_cat = torch.cat([new_v, action_v], dim=1)
+        else:
+            q_cat = roped_query
+            k_cat = new_k
+            v_cat = new_v
+
+        x = self.attn(q_cat, k_cat, v_cat)
+        updated_kv_cache = torch.stack([new_k, new_v], dim=0)
 
         x = x.flatten(2)
         x = self.o(x)
@@ -634,7 +647,8 @@ class CausalWanModel(nn.Module):
         num_state_per_block: int = 1,
     ) -> None:
         super().__init__()
-        assert model_type in ["t2v", "i2v", "ti2v"]
+        if model_type not in ["t2v", "i2v", "ti2v"]:
+            raise ValueError(f"Unsupported model_type={model_type!r}; expected one of ['t2v', 'i2v', 'ti2v'].")
         self.model_type = model_type
         self.patch_size = patch_size
         self.frame_seqlen = frame_seqlen
@@ -716,7 +730,10 @@ class CausalWanModel(nn.Module):
 
         self.head = CausalHead(dim, out_dim, patch_size, eps)
 
-        assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}.")
+        if (dim // num_heads) % 2 != 0:
+            raise ValueError(f"dim // num_heads must be even, got {dim // num_heads}.")
         d = dim // num_heads
         self.freqs_action = rope_params(1024 * 10, d)
         self.freqs_state = rope_params(1024, d)
@@ -794,7 +811,9 @@ class CausalWanModel(nn.Module):
         B = x.shape[0]
         c = self.out_dim
         grid_size = grid_size.tolist()
-        assert x.shape[1] == math.prod(grid_size)
+        expected_seq_len = math.prod(grid_size)
+        if x.shape[1] != expected_seq_len:
+            raise ValueError(f"x sequence length must equal product(grid_size)={expected_seq_len}, got {x.shape[1]}.")
         x = x.view(B, *grid_size, *self.patch_size, c)
         x = torch.einsum("bfhwpqrc->bcfphqwr", x)
         x = x.reshape(B, c, *[i * j for i, j in zip(grid_size, self.patch_size)])
@@ -835,7 +854,8 @@ class CausalWanModel(nn.Module):
 
         timestep = timestep.unsqueeze(-1).expand(B, F_t, seq_len // F_t).reshape(B, -1)
         if action is not None:
-            assert timestep_action is not None and state is not None
+            if timestep_action is None or state is None:
+                raise RuntimeError("timestep_action and state are required when action is provided.")
             state_features_t = self.state_encoder(state, adapter_category_id)
             stride = timestep_action.shape[1] // state_features_t.shape[1]
             timestep_state = timestep_action[:, ::stride]
@@ -895,8 +915,10 @@ class CausalWanModel(nn.Module):
         embodiment_id: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
         if self.model_type == "i2v":
-            assert clip_feature is not None and y is not None
-        assert context.shape[1] == self.text_len
+            if clip_feature is None or y is None:
+                raise RuntimeError("clip_feature and y are required for i2v inference.")
+        if context.shape[1] != self.text_len:
+            raise ValueError(f"context length must be {self.text_len}, got {context.shape[1]}.")
 
         if y is not None:
             x = torch.cat([x, y.to(dtype=x.dtype)], dim=1)

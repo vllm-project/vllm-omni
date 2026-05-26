@@ -4,8 +4,10 @@
 from collections import OrderedDict
 
 import pytest
+import torch
 
 from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
+from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -42,3 +44,16 @@ def test_dreamzero_pipeline_state_lru_caps_retained_sessions() -> None:
 
     assert list(pipeline._states) == ["session-a", "session-c"]
     assert "session-b" not in pipeline._states
+
+
+def test_dreamzero_state_cache_access_requires_initialization() -> None:
+    state = DreamZeroState()
+
+    with pytest.raises(RuntimeError, match="KV caches not initialized"):
+        state.get_kv_caches()
+
+    with pytest.raises(RuntimeError, match="Cross-attn caches not initialized"):
+        state.get_crossattn_caches()
+
+    with pytest.raises(RuntimeError, match="create_kv_caches first"):
+        state.update_kv_cache(0, torch.empty(0))

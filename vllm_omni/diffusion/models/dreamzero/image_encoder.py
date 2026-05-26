@@ -35,7 +35,8 @@ class DreamZeroVisionSelfAttention(nn.Module):
         proj_dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        assert dim % num_heads == 0
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}.")
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -70,7 +71,8 @@ class DreamZeroVisionAttentionBlock(nn.Module):
         norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
-        assert activation == "gelu", "DreamZero image encoder uses GELU."
+        if activation != "gelu":
+            raise ValueError(f"DreamZero image encoder uses GELU; got activation={activation!r}.")
         self.post_norm = post_norm
         hidden_dim = int(dim * mlp_ratio)
 
@@ -119,7 +121,8 @@ class DreamZeroVisionTransformer(nn.Module):
         norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
-        assert pool_type == "token"
+        if pool_type != "token":
+            raise ValueError(f"DreamZero image encoder only supports pool_type='token', got {pool_type!r}.")
         self.image_size = image_size
         self.patch_size = patch_size
         self.num_patches = (image_size // patch_size) ** 2
