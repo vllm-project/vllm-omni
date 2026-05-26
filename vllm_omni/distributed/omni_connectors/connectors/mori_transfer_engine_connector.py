@@ -135,8 +135,13 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         self._worker_local = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
 
-        # Track remote engines already registered with IOEngine
-        self._registered_engines: set[str] = set()
+        # Track remote engines already registered with IOEngine.
+        # ``mori.io.IOEngine.deregister_remote_engine`` requires the original
+        # ``EngineDesc`` object (its pybind signature is typed
+        # ``deregister_remote_engine(self, engine_desc: EngineDesc)``), not
+        # just the key string -- so we keep the desc alongside the key so
+        # ``close()`` can pass a valid object back at teardown.
+        self._registered_engines: dict[str, EngineDesc] = {}
         self._registered_engines_lock = threading.Lock()
 
         self._metrics = {
@@ -390,7 +395,7 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         with self._registered_engines_lock:
             if key not in self._registered_engines:
                 self.engine.register_remote_engine(desc)
-                self._registered_engines.add(key)
+                self._registered_engines[key] = desc
                 logger.debug(f"Registered remote Mori engine: {key}")
         return key
 
@@ -725,6 +730,34 @@ class MoriTransferEngineConnector(OmniConnectorBase):
                 self.zmq_ctx.term()
         except Exception as e:
             logger.warning(f"Failed to terminate ZMQ context: {e}")
+
+        # ---- Release Mori IOEngine resources ----
+        # ``mori.io.IOEngine`` does not expose an explicit ``shutdown()`` /
+        # ``close()`` entry-point, so we best-effort deregister every resource
+        # we registered with it and then drop the only reference we hold so
+        # Python GC triggers the C++ destructor.
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            pool_desc = getattr(self, "pool_mem_desc", None)
+            if pool_desc is not None:
+                try:
+                    engine.deregister_memory(pool_desc)
+                except Exception as e:
+                    logger.warning(f"Mori deregister_memory failed: {e}")
+                self.pool_mem_desc = None  # type: ignore[assignment]
+
+            with self._registered_engines_lock:
+                remote_descs = list(self._registered_engines.values())
+                self._registered_engines.clear()
+            for desc in remote_descs:
+                try:
+                    engine.deregister_remote_engine(desc)
+                except Exception as e:
+                    logger.debug(f"Mori deregister_remote_engine({desc.key!r}) failed: {e}")
+
+            # Drop the only reference to IOEngine; the C++ destructor runs
+            # under Python GC and unwinds backend / RDMA fabric state.
+            self.engine = None  # type: ignore[assignment]
 
         self.pool = None  # type: ignore[assignment]
         logger.info("MoriTransferEngineConnector closed.")
