@@ -181,5 +181,39 @@
                 }
             }
         ]
+    },
+    {
+        "test_name": "test_qwen_image_single_device_step_execution_high_concurrency",
+        "description": "Single-device Qwen-Image step-level execution benchmark at 512x512, 20 steps, concurrency sweep",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Qwen/Qwen-Image",
+            "serve_args": {
+                "enable-diffusion-pipeline-profiler": true,
+                "step-execution": true,
+                "max-num-seqs": 8
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "512x512_steps20_high_concurrency",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 512,
+                "height": 512,
+                "num-inference-steps": 20,
+                "num-prompts": [20, 40, 80, 160],
+                "max-concurrency": [1, 2, 4, 8],
+                "warmup-requests": 8,
+                "warmup-concurrency": 8,
+                "warmup-num-inference-steps": 20,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": [0.30, 0.50, 0.60, 0.70],
+                    "latency_mean": [3.50, 4.00, 7.00, 12.00],
+                    "peak_memory_mb_mean": [67000, 67000, 67000, 67000]
+                }
+            }
+        ]
     }
 ]
