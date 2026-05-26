@@ -29,7 +29,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalHiFTGenerator,
 )
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
-from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
+from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 logger = init_logger(__name__)
 

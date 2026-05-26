@@ -572,7 +572,7 @@ def test_wan22_i2v_online_serving_generates_video(
     wan22_i2v_image_source: str | None,
     wan22_i2v_online_timeout_seconds: int,
 ) -> None:
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+    if not torch.cuda.is_available() or torch.accelerator.device_count() < 2:
         pytest.skip("Wan2.2 I2V similarity e2e test requires >= 2 CUDA GPUs.")
 
     _probe_binary("ffprobe")
@@ -597,7 +597,7 @@ def test_wan22_i2v_online_serving_generates_video(
 def test_wan22_i2v_serving_matches_diffusers_video_similarity(
     wan22_i2v_image_source: str | None,
 ) -> None:
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+    if not torch.cuda.is_available() or torch.accelerator.device_count() < 2:
         pytest.skip("Wan2.2 I2V similarity e2e test requires >= 2 CUDA GPUs.")
 
     _probe_binary("ffmpeg")

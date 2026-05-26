@@ -4,7 +4,7 @@ import argparse
 import os
 import sys
 import time
-import types
+import warnings
 import weakref
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal
@@ -14,9 +14,15 @@ from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.messages import (
+    EngineQueueMessage,
+    ErrorMessage,
+    OutputMessage,
+    StageMetricsMessage,
+)
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
-from vllm_omni.entrypoints.utils import get_final_stage_id_for_e2e
+from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
@@ -70,8 +76,14 @@ def omni_snapshot_download(model_id: str) -> str:
             allow_patterns=["*"],
             require_all=True,
         )
+    except huggingface_hub.errors.GatedRepoError:
+        raise ValueError(
+            f"Access to model '{model_id}' is restricted. "
+            f"Visit https://huggingface.co/{model_id} to accept "
+            f"the license and request access."
+        )
     except huggingface_hub.errors.RepositoryNotFoundError:
-        logger.warning("Repository not found for '%s'.", model_id)
+        raise ValueError(f"Repository not found for '{model_id}'. Please check the model name or path.")
     except PermissionError:
         logger.warning(
             "Permission denied when downloading '%s'. Assuming the model is already cached locally.",
@@ -95,14 +107,25 @@ class OmniBase(PDDisaggregationMixin):
         parser: argparse.ArgumentParser | None = None,
         **overrides: Any,
     ) -> OmniBase:
-        """Build from argparse. If ``parser`` is passed and not yet nullified,
-        un-typed engine fields are reset to ``None``."""
+        """Deprecated argparse builder.
+
+        Build from argparse. If ``parser`` is passed and not yet nullified,
+        un-typed engine fields are reset to ``None``. New callers should
+        nullify deploy-overriding parser defaults with
+        ``nullify_stage_engine_defaults(parser)`` and construct Omni/AsyncOmni
+        directly.
+        """
+        warnings.warn(
+            "`from_cli_args()` is deprecated. Nullify deploy-overriding parser defaults "
+            "with `nullify_stage_engine_defaults(parser)` and construct Omni/AsyncOmni "
+            "directly from `vars(args)`.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         kwargs: dict[str, Any] = {k: v for k, v in vars(args).items() if not k.startswith("_")}
 
         if parser is not None and not getattr(parser, "_omni_nullified", False):
-            from vllm_omni.engine.arg_utils import (
-                deploy_override_field_names,
-            )
+            from vllm_omni.config.stage_config import deploy_override_field_names
             from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
 
             explicit = detect_explicit_cli_keys(sys.argv[1:], parser) or set()
@@ -124,6 +147,7 @@ class OmniBase(PDDisaggregationMixin):
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)
+        self._enable_ar_profiler = kwargs.pop("enable_ar_profiler", False)
         # NOTE: read-only lookup — must NOT pop. Popping here drops the key
         # before it reaches ``StageConfigFactory._create_from_registry``, so
         # ``--no-async-chunk`` (``async_chunk=False``) silently fails to
@@ -170,12 +194,10 @@ class OmniBase(PDDisaggregationMixin):
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         if not self.output_modalities:
             self.output_modalities = [
-                self.engine.get_stage_metadata(i).get("final_output_type") for i in range(self.engine.num_stages)
+                self.engine.get_stage_metadata(i).final_output_type for i in range(self.engine.num_stages)
             ]
 
-        self._stage_meta_list = [
-            types.SimpleNamespace(**self.engine.get_stage_metadata(i)) for i in range(self.engine.num_stages)
-        ]
+        self._stage_meta_list = [self.engine.get_stage_metadata(i) for i in range(self.engine.num_stages)]
 
         logger.info(
             "[%s] Initialized with %s stages for model %s",
@@ -196,9 +218,18 @@ class OmniBase(PDDisaggregationMixin):
         """Expose engine stage configs for PD disaggregation detection and validation."""
         return self.engine.stage_configs
 
+    def _has_dead_stage(self) -> bool:
+        for stage_client in self.engine.stage_clients:
+            if getattr(stage_client, "_engine_dead", False):
+                return True
+            resources = getattr(stage_client, "resources", None)
+            if resources is not None and getattr(resources, "engine_dead", False):
+                return True
+        return False
+
     @property
     def is_running(self) -> bool:
-        return self.engine.is_alive()
+        return self.engine.is_alive() and not self._has_dead_stage()
 
     @property
     def errored(self) -> bool:
@@ -211,15 +242,7 @@ class OmniBase(PDDisaggregationMixin):
         ``resources.engine_dead`` (StageEngineCoreClient / AsyncMPClient)
         since the two client types store the flag differently.
         """
-        if not self.engine.is_alive():
-            return True
-        for stage_client in self.engine.stage_clients:
-            if getattr(stage_client, "_engine_dead", False):
-                return True
-            resources = getattr(stage_client, "resources", None)
-            if resources is not None and getattr(resources, "engine_dead", False):
-                return True
-        return False
+        return not self.engine.is_alive() or self._has_dead_stage()
 
     def check_health(self) -> None:
         if not self.engine.is_alive():
@@ -231,9 +254,14 @@ class OmniBase(PDDisaggregationMixin):
     def resolve_sampling_params_list(
         self,
         sampling_params_list: Sequence[Any] | Any | None,
+        allow_delta_coercion: bool = False,
     ) -> Sequence[Any]:
         if sampling_params_list is None:
             normalized = self.default_sampling_params_list
+            # Set the output kind to delta since no params were specified
+            if allow_delta_coercion:
+                normalized = coerce_param_message_types(list(normalized), is_streaming=True)
+
         elif isinstance(sampling_params_list, Sequence) and not isinstance(sampling_params_list, (str, bytes)):
             normalized = sampling_params_list
         elif self.num_stages == 1:
@@ -249,6 +277,10 @@ class OmniBase(PDDisaggregationMixin):
         try:
             if req_state is None or req_state.metrics is None:
                 return
+            if self.log_stats:
+                # Emit per-request orchestrator timing (including e2e_total_ms)
+                # before dropping request state.
+                req_state.metrics.build_and_log_summary()
         except Exception:
             logger.exception(
                 "[%s] Failed to build/log summary for req=%s",
@@ -265,17 +297,15 @@ class OmniBase(PDDisaggregationMixin):
             self._stage_meta_list,
         )
 
-    def _process_stage_metrics_message(self, msg: dict[str, Any]) -> None:
-        req_id = msg.get("request_id")
+    def _process_stage_metrics_message(self, msg: StageMetricsMessage) -> None:
+        req_id = msg.request_id
         req_state = self.request_states.get(req_id)
         if req_state is None or req_state.metrics is None:
             return
-        _m = msg.get("metrics")
-        if _m is None:
-            return
-        stage_id = msg.get("stage_id", 0)
+        _m = msg.metrics
+        stage_id = msg.stage_id
         req_state.metrics.on_stage_metrics(stage_id, req_id, _m)
-        submit_ts = msg.get("stage_submit_ts")
+        submit_ts = msg.stage_submit_ts
         now = time.time()
         if req_state.metrics.stage_first_ts[stage_id] is None:
             req_state.metrics.stage_first_ts[stage_id] = submit_ts if submit_ts is not None else now
@@ -283,40 +313,30 @@ class OmniBase(PDDisaggregationMixin):
 
     def _handle_output_message(
         self,
-        msg: dict[str, Any] | None,
+        msg: EngineQueueMessage | None,
     ) -> OutputMessageHandleResult:
         """Handle one Orchestrator output-queue message."""
         if msg is None:
             return True, None, None, None
 
-        msg_type = msg.get("type")
-        if msg_type == "stage_metrics":
+        if isinstance(msg, StageMetricsMessage):
             self._process_stage_metrics_message(msg)
             return True, None, None, None
 
-        if msg_type == "error":
-            error_text = msg.get("error", "Orchestrator returned an error message")
-            stage_id = msg.get("stage_id")
-            if msg.get("fatal"):
+        if isinstance(msg, ErrorMessage):
+            if msg.fatal:
                 raise OmniEngineDeadError(
-                    error_text,
-                    error_stage_id=stage_id,
+                    msg.error,
+                    error_stage_id=msg.stage_id,
                 )
-            raise RuntimeError(error_text)
+            raise RuntimeError(msg.error)
 
-        if msg_type != "output":
-            logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg_type)
+        if not isinstance(msg, OutputMessage):
+            logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg.type)
             return True, None, None, None
 
-        req_id = msg.get("request_id")
-        if req_id is None:
-            logger.warning("[%s] got output message without request_id", self.__class__.__name__)
-            return True, None, None, None
-
-        stage_id = msg.get("stage_id")
-        if stage_id is None:
-            logger.warning("[%s] got output message without stage_id for req=%s", self.__class__.__name__, req_id)
-            return True, None, None, None
+        req_id = msg.request_id
+        stage_id = msg.stage_id
 
         req_state = self.request_states.get(req_id)
         if req_state is None:
@@ -333,7 +353,7 @@ class OmniBase(PDDisaggregationMixin):
 
     def _check_engine_output_error(
         self,
-        result: dict[str, Any],
+        result: OutputMessage,
         request_id: str,
         stage_id: int,
     ) -> None:
@@ -343,7 +363,7 @@ class OmniBase(PDDisaggregationMixin):
         engine is unrecoverable, otherwise raises :class:`EngineGenerateError`
         (recoverable, single-request failure).
         """
-        engine_outputs = result.get("engine_outputs")
+        engine_outputs = result.engine_outputs
         error_text = getattr(engine_outputs, "error", None)
         if error_text is None:
             return
@@ -364,31 +384,55 @@ class OmniBase(PDDisaggregationMixin):
 
     def _process_single_result(
         self,
-        result: dict[str, Any],
+        result: OutputMessage,
         stage_id: int,
         metrics: OrchestratorMetrics,
         req_start_ts: dict[str, float],
         wall_start_ts: float,
         final_stage_id_for_e2e: int,
     ) -> OmniRequestOutput | None:
-        req_id = result.get("request_id")
-        engine_outputs = result.get("engine_outputs")
-        stage_durations = getattr(result["engine_outputs"], "stage_durations", {})
-        peak_memory_mb = getattr(result["engine_outputs"], "peak_memory_mb", 0.0)
+        req_id = result.request_id
+        engine_outputs = result.engine_outputs
+        stage_durations = getattr(engine_outputs, "stage_durations", {})
+        peak_memory_mb = getattr(engine_outputs, "peak_memory_mb", 0.0)
+
+        # Merge AR stage timing from OrchestratorAggregator.stage_events
+        if self._enable_ar_profiler:
+            ar_events = metrics.stage_events.get(str(req_id), [])
+            for evt in ar_events:
+                if evt.stage_id != stage_id:
+                    stage_durations[f"ar_stage_{evt.stage_id}"] = evt.stage_gen_time_ms / 1000.0
+
+        # Merge pipeline timings from Orchestrator into stage_durations
+        _m = result.metrics
+        if _m is not None and hasattr(_m, "pipeline_timings") and _m.pipeline_timings:
+            for key, value in _m.pipeline_timings.items():
+                if key not in stage_durations:
+                    stage_durations[key] = value
+
+        # Merge per-stage gen times into stage_durations
+        for evt in metrics.stage_events.get(str(req_id), []):
+            key = f"stage_{evt.stage_id}_gen_ms"
+            if key not in stage_durations:
+                stage_durations[key] = evt.stage_gen_time_ms
+        # Current stage gen time (not yet in stage_events at this point)
+        if _m is not None:
+            stage_durations.setdefault(f"stage_{stage_id}_gen_ms", _m.stage_gen_time_ms)
+
         finished = engine_outputs.finished
 
-        submit_ts = result.get("stage_submit_ts")
+        submit_ts = result.stage_submit_ts
         now = time.time()
         if metrics.stage_first_ts[stage_id] is None:
             metrics.stage_first_ts[stage_id] = submit_ts if submit_ts is not None else now
         metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, now)
 
-        _m = result.get("metrics")
+        _m = result.metrics
         if finished and _m is not None:
             metrics.on_stage_metrics(stage_id, req_id, _m)
 
         stage_meta = self.engine.get_stage_metadata(stage_id)
-        if not stage_meta["final_output"]:
+        if not stage_meta.final_output:
             return None
 
         try:
@@ -402,11 +446,12 @@ class OmniBase(PDDisaggregationMixin):
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 
-        images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
+        output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
+        images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         return OmniRequestOutput(
             request_id=req_id or "",
             stage_id=stage_id,
-            final_output_type=stage_meta["final_output_type"],
+            final_output_type=output_type,
             request_output=engine_outputs,
             images=images,
             trajectory_latents=getattr(engine_outputs, "trajectory_latents", None),

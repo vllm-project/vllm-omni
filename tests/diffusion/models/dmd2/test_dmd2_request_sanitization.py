@@ -5,8 +5,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.flux.pipeline_flux import FluxDMD2Pipeline, FluxPipeline
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline, LTX2T2VDMD2Pipeline
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_image2video import LTX2I2VDMD2Pipeline, LTX2ImageToVideoPipeline
+from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImageDMD2Pipeline, QwenImagePipeline
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, WanT2VDMD2Pipeline
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import Wan22I2VPipeline, WanI2VDMD2Pipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest, OmniDiffusionSamplingParams
@@ -19,6 +21,8 @@ _DMD2_BASE = {
     WanI2VDMD2Pipeline: Wan22I2VPipeline,
     LTX2T2VDMD2Pipeline: LTX2Pipeline,
     LTX2I2VDMD2Pipeline: LTX2ImageToVideoPipeline,
+    FluxDMD2Pipeline: FluxPipeline,
+    QwenImageDMD2Pipeline: QwenImagePipeline,
 }
 
 
@@ -49,7 +53,7 @@ def _make_request(prompts=None, **sp_kwargs) -> OmniDiffusionRequest:
 
 @pytest.fixture(
     params=list(_DMD2_BASE.keys()),
-    ids=["wan_t2v", "wan_i2v", "ltx2_t2v", "ltx2_i2v"],
+    ids=["wan_t2v", "wan_i2v", "ltx2_t2v", "ltx2_i2v", "flux", "qwen_image"],
 )
 def pipeline(request):
     return _make_pipeline(request.param)
@@ -63,13 +67,13 @@ def pipeline(request):
 def test_num_inference_steps_forced_to_dmd2_value(pipeline):
     req = _make_request(num_inference_steps=40)
     pipeline._sanitize_dmd2_request(req)
-    assert req.sampling_params.num_inference_steps == pipeline.num_inference_steps
+    assert req.sampling_params.num_inference_steps == pipeline.dmd2_config.num_inference_steps
 
 
 def test_num_inference_steps_already_correct(pipeline):
-    req = _make_request(num_inference_steps=pipeline.num_inference_steps)
+    req = _make_request(num_inference_steps=pipeline.dmd2_config.num_inference_steps)
     pipeline._sanitize_dmd2_request(req)
-    assert req.sampling_params.num_inference_steps == pipeline.num_inference_steps
+    assert req.sampling_params.num_inference_steps == pipeline.dmd2_config.num_inference_steps
 
 
 # ---------------------------------------------------------------------------
@@ -80,19 +84,19 @@ def test_num_inference_steps_already_correct(pipeline):
 def test_guidance_scale_forced_to_one(pipeline):
     req = _make_request(guidance_scale=5.0, guidance_scale_provided=True)
     pipeline._sanitize_dmd2_request(req)
-    assert req.sampling_params.guidance_scale == pipeline.dmd2_guidance_scale
+    assert req.sampling_params.guidance_scale == pipeline.dmd2_config.guidance_scale
     assert req.sampling_params.guidance_scale_provided is False
 
 
 def test_guidance_scale_already_correct(pipeline):
-    req = _make_request(guidance_scale=pipeline.dmd2_guidance_scale, guidance_scale_provided=False)
+    req = _make_request(guidance_scale=pipeline.dmd2_config.guidance_scale, guidance_scale_provided=False)
     pipeline._sanitize_dmd2_request(req)
-    assert req.sampling_params.guidance_scale == pipeline.dmd2_guidance_scale
+    assert req.sampling_params.guidance_scale == pipeline.dmd2_config.guidance_scale
 
 
 def test_guidance_scale_provided_flag_cleared(pipeline):
     """guidance_scale_provided=True must be cleared even if scale is already dmd2_guidance_scale."""
-    req = _make_request(guidance_scale=pipeline.dmd2_guidance_scale, guidance_scale_provided=True)
+    req = _make_request(guidance_scale=pipeline.dmd2_config.guidance_scale, guidance_scale_provided=True)
     pipeline._sanitize_dmd2_request(req)
     assert req.sampling_params.guidance_scale_provided is False
 
@@ -164,15 +168,44 @@ def test_multiple_prompts_all_sanitized(pipeline):
 # ---------------------------------------------------------------------------
 
 
+def test_sample_solver_stripped_from_extra_args(pipeline):
+    """[C1] defense: sample_solver must not leak into req for the base pipeline to read."""
+    req = _make_request()
+    req.sampling_params.extra_args = {"sample_solver": "euler"}
+    pipeline._sanitize_dmd2_request(req)
+    assert "sample_solver" not in req.sampling_params.extra_args
+
+
+def test_flow_shift_stripped_from_extra_args(pipeline):
+    """[C1] defense: flow_shift must not leak into req for the base pipeline to read."""
+    req = _make_request()
+    req.sampling_params.extra_args = {"flow_shift": 3.0}
+    pipeline._sanitize_dmd2_request(req)
+    assert "flow_shift" not in req.sampling_params.extra_args
+
+
+def test_unrelated_extra_args_preserved(pipeline):
+    """Sanitizer only strips sample_solver / flow_shift; other extras pass through."""
+    req = _make_request()
+    req.sampling_params.extra_args = {"sample_solver": "euler", "unrelated": 42}
+    pipeline._sanitize_dmd2_request(req)
+    assert req.sampling_params.extra_args == {"unrelated": 42}
+
+
+# ---------------------------------------------------------------------------
+# Clean request — nothing changes
+# ---------------------------------------------------------------------------
+
+
 def test_clean_request_no_changes(pipeline):
     req = _make_request(
-        guidance_scale=pipeline.dmd2_guidance_scale,
+        guidance_scale=pipeline.dmd2_config.guidance_scale,
         guidance_scale_provided=False,
         do_classifier_free_guidance=False,
         is_cfg_negative=False,
     )
     pipeline._sanitize_dmd2_request(req)
-    assert req.sampling_params.guidance_scale == pipeline.dmd2_guidance_scale
+    assert req.sampling_params.guidance_scale == pipeline.dmd2_config.guidance_scale
     assert req.sampling_params.guidance_scale_provided is False
     assert req.sampling_params.guidance_scale_2 is None
     assert req.sampling_params.true_cfg_scale is None

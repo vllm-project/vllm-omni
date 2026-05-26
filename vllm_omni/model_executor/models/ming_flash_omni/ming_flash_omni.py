@@ -104,8 +104,8 @@ class MingFlashOmniForConditionalGeneration(
                 "model_arch='MingFlashOmniTalkerForConditionalGeneration' "
                 "directly — the talker has a self-contained LLM that "
                 "tokenises text itself and does not need the multimodal "
-                "preprocess path. See stage_configs/ming_flash_omni.yaml "
-                "stage 1 and stage_configs/ming_flash_omni_tts.yaml."
+                "preprocess path. See vllm_omni/deploy/ming_flash_omni.yaml "
+                "stage 1 and vllm_omni/deploy/ming_flash_omni_tts.yaml."
             )
 
         if self.model_stage == "thinker":

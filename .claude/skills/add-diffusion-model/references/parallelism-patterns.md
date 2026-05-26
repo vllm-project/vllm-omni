@@ -92,6 +92,7 @@ class TPSelfAttention(nn.Module):
             softmax_scale=1.0 / (self.head_dim ** 0.5),
             causal=False,
             num_kv_heads=self.to_qkv.num_kv_heads,  # Local KV heads per GPU
+            role="self",
         )
 
     def forward(self, x):

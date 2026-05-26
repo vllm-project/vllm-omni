@@ -49,7 +49,7 @@ def get_gpu_info() -> list[dict]:
 
         if not torch.cuda.is_available():
             return []
-        for i in range(torch.cuda.device_count()):
+        for i in range(torch.accelerator.device_count()):
             free, total = torch.cuda.mem_get_info(i)
             props = torch.cuda.get_device_properties(i)
             gpus.append(

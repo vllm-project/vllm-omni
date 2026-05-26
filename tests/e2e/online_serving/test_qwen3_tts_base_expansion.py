@@ -12,17 +12,18 @@ import os
 import pytest
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+pytestmark = [pytest.mark.full_model, pytest.mark.tts]
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 
-REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
+# See tests/e2e/online_serving/test_qwen3_tts_base.py for the vendored-asset rationale.
+REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
@@ -45,7 +46,7 @@ tts_server_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
-            server_args=["--trust-remote-code", "--disable-log-stats"],
+            server_args=["--trust-remote-code"],
         ),
         id="async_chunk",
     ),
@@ -56,7 +57,7 @@ tts_server_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
-            server_args=["--trust-remote-code", "--disable-log-stats", "--no-async-chunk"],
+            server_args=["--trust-remote-code", "--no-async-chunk"],
         ),
         id="no_async_chunk",
     ),

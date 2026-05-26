@@ -36,7 +36,7 @@ This recipe documents one validated CUDA GPU configuration.
 - GPU: `NVIDIA A100-SXM4-80GB`, 81920 MiB reported in `nvidia-smi` samples
 - Runtime: CUDA `cu130` wheel stack
 - vLLM version: `0.19.0+cu130`
-- vLLM-Omni version or commit: `0.1.dev1415+g6b52db9e2`
+- vLLM-Omni version or commit: `0.19.0rc1`
 - Related package versions: `torch==2.10.0+cu130`,
   `transformers==4.57.6`, `accelerate==1.12.0`, `soundfile==0.13.1`
 

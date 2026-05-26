@@ -28,11 +28,13 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 ### Launch individual stages (stage-based CLI)
 
 Adopt the stage-based CLI architecture to independently instantiate execution processes per functional stage.
+The example below pins Stage 0 to GPU 0 and Stage 1/2 to GPU 1 via
+`CUDA_VISIBLE_DEVICES`.
 
 **1. Stage 0 (Thinker + API server)**
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
     --port 8091 \
     --stage-id 0 \
     --omni-master-address 127.0.0.1 \
@@ -42,7 +44,7 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
 **2. Stage 1 (Talker)**
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
     --stage-id 1 \
     --headless \
     --omni-master-address 127.0.0.1 \
@@ -52,7 +54,7 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
 **3. Stage 2 (Code2Wav)**
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
     --stage-id 2 \
     --headless \
     --omni-master-address 127.0.0.1 \
@@ -75,7 +77,7 @@ that kind of change. Since each command launches one stage, just pass the knob
 directly on that stage command:
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
     --stage-id 1 \
     --headless \
     --gpu-memory-utilization 0.5 \

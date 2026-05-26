@@ -32,7 +32,7 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import FusedMoE, SharedFusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -329,7 +329,7 @@ class BailingMoeV2SparseMoeBlock(nn.Module):
         else:
             self.shared_experts = None
 
-        self.experts = SharedFusedMoE(
+        self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
@@ -337,7 +337,6 @@ class BailingMoeV2SparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             custom_routing_function=_unpack_multi_routing,
             renormalize=False,  # we handle normalization in the gate
-            reduce_results=True,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
@@ -417,17 +416,8 @@ class BailingMoeV2SparseMoeBlock(nn.Module):
             dim=-1,
         )
 
-        # SharedFusedMoE expects 2D hidden_states
         hidden_states_2d = hidden_states.view(-1, h)
-        result = self.experts(hidden_states_2d, packed_routing)
-
-        if self.shared_experts is not None:
-            shared_output, fused_out = result
-        else:
-            shared_output, fused_out = None, result
-
-        final_hidden_states = fused_out + shared_output if shared_output is not None else fused_out
-
+        final_hidden_states = self.experts(hidden_states_2d, packed_routing)
         final_hidden_states = final_hidden_states.view(bsz, seq_len, h)
 
         return final_hidden_states.squeeze(0) if input_is_2d else final_hidden_states
