@@ -716,18 +716,20 @@ class QwenImageTransformerBlock(nn.Module):
         self.attention_head_dim = attention_head_dim
 
         # Image processing modules.
-        # Modulation linear is kept full precision (quant_config=None) — it
+        # Modulation linear is kept unquantized (quant_config=None) — it
         # produces shift/scale/gate values that are precision-sensitive
-        # (see #2728).
+        # (see #2728). Use column TP with gather_output=True so weights are
+        # sharded while downstream modulation still receives full [B, 6 * dim].
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            ColumnParallelLinear(
                 dim,
                 6 * dim,
                 bias=True,
+                gather_output=True,
                 return_bias=False,
                 quant_config=None,
-                prefix=_join_prefix(prefix, "img_mod.1"),
+                prefix="img_mod.1",
             ),
         )
         self.img_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -751,13 +753,14 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules.
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            ColumnParallelLinear(
                 dim,
                 6 * dim,
                 bias=True,
+                gather_output=True,
                 return_bias=False,
                 quant_config=None,
-                prefix=_join_prefix(prefix, "txt_mod.1"),
+                prefix="txt_mod.1",
             ),
         )
         self.txt_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
