@@ -84,3 +84,16 @@ python cosmos_predict2_5.py \
 Input video must have at least `4 * (num_latent_conditional_frames - 1) + 1` frames:
 - `num_latent_conditional_frames=1` → minimum 1 frame
 - `num_latent_conditional_frames=2` → minimum 5 frames
+
+## Memory & Latency
+
+Measured on a single NVIDIA A100-SXM4-80GB at default settings (704×1280, 93 frames, 36 steps):
+
+| Model | Mode | Flags | Peak VRAM (BF16) | Wall time |
+|---|---|---|---|---|
+| `Cosmos-Predict2.5-2B` | Text2World | — | 36.6 GiB | ~13 min |
+| `Cosmos-Predict2.5-2B` | Image2World | — | 35.5 GiB | ~13 min |
+| `Cosmos-Predict2.5-2B` | Video2World | — | 36.5 GiB | ~13 min |
+| `Cosmos-Predict2.5-14B` | Text2World | `--enable-cpu-offload` | 49.2 GiB | ~48 min |
+
+At the default resolution the 2B model needs ~37 GiB; on smaller GPUs use `--enable-cpu-offload` and/or lower `--height`/`--width`/`--num-frames`.
