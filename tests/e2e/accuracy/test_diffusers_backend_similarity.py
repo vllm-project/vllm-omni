@@ -85,6 +85,7 @@ def _run_vllm_omni_wan22_i2v(
         str(BOUNDARY_RATIO),
         "--flow-shift",
         str(FLOW_SHIFT),
+        "--disable-log-stats",
     ]
     form_data = {
         "prompt": VIDEO_PROMPT,
@@ -174,6 +175,7 @@ def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
         "900",
         "--diffusion-load-format",
         "diffusers",
+        "--disable-log-stats",
         # "--enable-diffusion-pipeline-profiler",
     ]
     with OmniServer(model, server_args, use_omni=True) as omni_server:
