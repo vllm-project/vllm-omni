@@ -4,6 +4,12 @@ import torch
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
+from vllm_omni.data_entry_keys import (
+    CodesStruct,
+    MetaStruct,
+    OmniPayload,
+    OmniPayloadStruct,
+)
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_CODEC_PAD_TOKEN_ID
 
@@ -16,6 +22,16 @@ logger = init_logger(__name__)
 # ``vllm_omni/model_executor/stage_configs/mimo_audio.yaml`` and the offline
 # example ``examples/offline_inference/mimo_audio/end2end.py``.
 MAX_CODE2WAV_TOKENS = 18192
+
+# Minimum safe values for codec streaming parameters.
+# codec_left_context_frames must cover the vocoder attention window
+# (vocoder_attn_window_size defaults to [40, 10]).  Values below the minimum
+# cause acoustic-state resets at chunk boundaries, producing voice instability
+# (multiple speakers / timbre shifts in the output audio).
+_MIN_CODEC_CHUNK_FRAMES = 3
+_MIN_CODEC_LEFT_CONTEXT_FRAMES = 40
+_DEFAULT_CODEC_CHUNK_FRAMES = 10
+_DEFAULT_CODEC_LEFT_CONTEXT_FRAMES = 40
 
 
 def prepend_and_flatten_colmajor(x: torch.Tensor, pad_vec: torch.Tensor) -> torch.Tensor:
@@ -53,9 +69,12 @@ def prepend_and_flatten_colmajor(x: torch.Tensor, pad_vec: torch.Tensor) -> torc
     return y_col_major
 
 
-def _make_finished_sentinel() -> dict[str, Any]:
+def _make_finished_sentinel() -> OmniPayloadStruct:
     """Return a minimal payload with finished=True so Stage-1 can end the request."""
-    return {"codes": {"audio": []}, "meta": {"finished": torch.tensor(True, dtype=torch.bool)}}
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+        meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+    )
 
 
 def _flush_remaining_codes(
@@ -63,7 +82,7 @@ def _flush_remaining_codes(
     request_id: str,
     chunk_size: int,
     left_context_size: int,
-) -> dict[str, Any]:
+) -> OmniPayloadStruct:
     """Flush any accumulated but unsent codes when the request finishes."""
     accumulated = transfer_manager.code_prompt_token_ids.get(request_id, [])
     if not accumulated:
@@ -71,23 +90,27 @@ def _flush_remaining_codes(
 
     length = len(accumulated)
     chunk_length = length % chunk_size
+    # When the accumulated length aligns with chunk_size boundary (remainder == 0),
+    # we still need to flush the final chunk with full context to give the vocoder
+    # enough attention window — otherwise the tail audio cuts off and produces
+    # voice instability. Fall back to chunk_size as the context length.
     context_length = chunk_length if chunk_length != 0 else chunk_size
     end_index = min(length, left_context_size + context_length)
 
     # Align with qwen3_omni talker2code2wav_async_chunk: decoder strip uses explicit frame count.
     left_ctx_frames = max(0, min(length - context_length, left_context_size))
-    flat_codes = torch.tensor(accumulated[-end_index:]).reshape(-1).tolist()
+    flat_codes = torch.tensor(accumulated[-end_index:]).reshape(-1)
 
-    return {
-        "codes": {"audio": flat_codes},
-        "meta": {
-            "left_context_size": left_ctx_frames,
-            "codec_chunk_frames": chunk_size,
-            "codec_left_context_frames": left_context_size,
-            "code_flat_numel": len(flat_codes),
-            "finished": torch.tensor(True, dtype=torch.bool),
-        },
-    }
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=flat_codes),
+        meta=MetaStruct(
+            left_context_size=left_ctx_frames,
+            codec_chunk_frames=chunk_size,
+            codec_left_context_frames=left_context_size,
+            code_flat_numel=int(flat_codes.numel()),
+            finished=torch.tensor(True, dtype=torch.bool),
+        ),
+    )
 
 
 def _is_codes_empty(codes: Any) -> bool:
@@ -114,10 +137,10 @@ def _to_code_tensor(codes: Any) -> torch.Tensor | None:
 
 def llm2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any],
+    pooling_output: OmniPayload,
     request: Any,
     is_finished: bool = False,
-) -> dict[str, Any] | None:
+) -> OmniPayloadStruct | None:
     """
     Async chunk version: convert stage-0 pooling_output to code2wav payload (pooling / connector accumulation).
 
@@ -127,12 +150,35 @@ def llm2code2wav_async_chunk(
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
-    chunk_size = int(cfg.get("codec_chunk_frames", 3))
-    left_context_size = int(cfg.get("codec_left_context_frames", 3))
+    chunk_size = int(cfg.get("codec_chunk_frames", _DEFAULT_CODEC_CHUNK_FRAMES))
+    if chunk_size < _MIN_CODEC_CHUNK_FRAMES:
+        logger.warning(
+            "codec_chunk_frames=%d is below minimum %d; falling back to %d.",
+            chunk_size,
+            _MIN_CODEC_CHUNK_FRAMES,
+            _DEFAULT_CODEC_CHUNK_FRAMES,
+        )
+        chunk_size = _DEFAULT_CODEC_CHUNK_FRAMES
+
+    left_context_size = int(cfg.get("codec_left_context_frames", _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES))
+    if left_context_size < _MIN_CODEC_LEFT_CONTEXT_FRAMES:
+        logger.warning(
+            "codec_left_context_frames=%d is below minimum %d (must cover vocoder attention window); "
+            "falling back to %d to prevent voice instability.",
+            left_context_size,
+            _MIN_CODEC_LEFT_CONTEXT_FRAMES,
+            _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES,
+        )
+        left_context_size = _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES
 
     request_id = getattr(request, "external_req_id", None)
 
-    po_codes = pooling_output.get("codes", {})
+    # Text-only paths (e.g. modalities=["text"]) yield no codec pooling output;
+    # stage-0 still drives the chunk transfer adapter, so treat None as "no codes
+    # this step" rather than letting `.get()` raise AttributeError — an unhandled
+    # error here drops the chunk, starves stage-1 of the finished payload, and
+    # the stage subprocesses die before the final token is emitted.
+    po_codes = pooling_output.get("codes", {}) if pooling_output is not None else {}
     if "audio" not in po_codes:
         if is_finished:
             return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
@@ -148,11 +194,6 @@ def llm2code2wav_async_chunk(
     pad_vec = torch.tensor([TALKER_CODEC_PAD_TOKEN_ID] * 4, device=code_tensor.device, dtype=code_tensor.dtype)
     code_list = prepend_and_flatten_colmajor(code_tensor, pad_vec).tolist()
 
-    if sum(code_list) == 0:
-        if is_finished:
-            return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
-        return None
-
     if request_id is None:
         return None
 
@@ -167,18 +208,16 @@ def llm2code2wav_async_chunk(
     left_ctx_frames = max(0, min(length - context_length, left_context_size))
     flat_codes = torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:]).reshape(-1).tolist()
 
-    return {
-        "codes": {
-            "audio": flat_codes,
-        },
-        "meta": {
-            "left_context_size": left_ctx_frames,
-            "codec_chunk_frames": chunk_size,
-            "codec_left_context_frames": left_context_size,
-            "code_flat_numel": len(flat_codes),
-            "finished": torch.tensor(is_finished, dtype=torch.bool),
-        },
-    }
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor(flat_codes)),
+        meta=MetaStruct(
+            left_context_size=left_ctx_frames,
+            codec_chunk_frames=chunk_size,
+            codec_left_context_frames=left_context_size,
+            code_flat_numel=len(flat_codes),
+            finished=torch.tensor(is_finished, dtype=torch.bool),
+        ),
+    )
 
 
 def llm2code2wav(

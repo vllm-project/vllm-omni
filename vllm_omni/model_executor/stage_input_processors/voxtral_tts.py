@@ -4,6 +4,12 @@ import torch
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
+from vllm_omni.data_entry_keys import (
+    CodesStruct,
+    MetaStruct,
+    OmniPayload,
+    OmniPayloadStruct,
+)
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
@@ -29,7 +35,7 @@ def generator2tokenizer(
     return tokenizer_inputs
 
 
-def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
+def _extract_last_frame(pooling_output: OmniPayload) -> torch.Tensor | None:
     audio = pooling_output.get("audio")
     if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
         return None
@@ -38,10 +44,10 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
 
 def generator2tokenizer_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any],
+    pooling_output: OmniPayload,
     request: Any,
     is_finished: bool = False,
-) -> dict[str, Any] | None:
+) -> OmniPayloadStruct | None:
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
 
@@ -71,10 +77,10 @@ def generator2tokenizer_async_chunk(
     # finished and nothing was produced, emit an EOF marker.
     if length <= 0:
         if finished:
-            return {
-                "codes": {"audio": []},
-                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
-            }
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+            )
         return None
 
     # Use a small chunk size at begin
@@ -94,7 +100,12 @@ def generator2tokenizer_async_chunk(
     # Pack context + chunk into codebook-major flat codes for adapter.
     code_predictor_codes = torch.tensor(window_frames).reshape(-1).tolist()
 
-    return {
-        "codes": {"audio": [int(ctx_frames)] + [int(context_length)] + code_predictor_codes},
-        "meta": {"finished": torch.tensor(finished, dtype=torch.bool)},
-    }
+    return OmniPayloadStruct(
+        codes=CodesStruct(
+            audio=torch.tensor(
+                [int(ctx_frames), int(context_length)] + code_predictor_codes,
+                dtype=torch.long,
+            ),
+        ),
+        meta=MetaStruct(finished=torch.tensor(finished, dtype=torch.bool)),
+    )

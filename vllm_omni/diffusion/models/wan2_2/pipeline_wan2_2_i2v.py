@@ -17,11 +17,14 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -36,6 +39,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     resolve_wan_sample_solver,
     retrieve_latents,
 )
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -133,7 +137,12 @@ def get_wan22_i2v_pre_process_func(
 
 
 class Wan22I2VPipeline(
-    nn.Module, SupportImageInput, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    SupportImageInput,
+    PipelineParallelMixin,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
 ):
     """
     Wan2.2 Image-to-Video Pipeline.
@@ -222,10 +231,25 @@ class Wan22I2VPipeline(
         # Transformers (weights loaded via load_weights)
         # Load config from model directory or HF Hub to get correct in_channels for I2V models
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
+        self.transformer = create_transformer_from_config(
+            transformer_config,
+            quant_config=od_config.quantization_config,
+        )
         if self.has_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = create_transformer_from_config(transformer_2_config)
+            t2_quant = transformer_2_config.get("quantization_config")
+            if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
+                from vllm_omni.quantization.factory import build_quant_config
+
+                method = t2_quant["quant_method"]
+                kwargs = {k: v for k, v in t2_quant.items() if k != "quant_method"}
+                t2_quant = build_quant_config(method, **kwargs)
+            else:
+                t2_quant = None
+            self.transformer_2 = create_transformer_from_config(
+                transformer_2_config,
+                quant_config=t2_quant,
+            )
         else:
             self.transformer_2 = None
 
@@ -281,9 +305,11 @@ class Wan22I2VPipeline(
         attention_kwargs: dict[str, Any],
         condition: torch.Tensor,
         first_frame_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AsyncLatents:
+        if attention_kwargs is None:
+            attention_kwargs = {}
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
+            for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
 
                 # Select model and guidance scale based on timestep
@@ -292,6 +318,8 @@ class Wan22I2VPipeline(
                 if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_high
+
+                set_forward_context_denoise_step_idx(step_idx)
 
                 # Prepare latent input
                 if self.expand_timesteps:
@@ -308,6 +336,7 @@ class Wan22I2VPipeline(
                     timestep = t.expand(latents.shape[0])
 
                 do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+                # Prepare kwargs for positive and negative predictions
                 positive_kwargs = {
                     "hidden_states": latent_model_input,
                     "timestep": timestep,
@@ -330,6 +359,7 @@ class Wan22I2VPipeline(
                 else:
                     negative_kwargs = None
 
+                # Predict noise with automatic CFG parallel handling
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=do_true_cfg,
                     true_cfg_scale=current_guidance_scale,
@@ -338,6 +368,7 @@ class Wan22I2VPipeline(
                     cfg_normalize=False,
                 )
 
+                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
                 pbar.update()
 
@@ -357,6 +388,11 @@ class Wan22I2VPipeline(
         pixel_values = pixel_values.to(device=device, dtype=self.image_encoder.dtype)
         image_embeds = self.image_encoder(pixel_values, output_hidden_states=True)
         return image_embeds.hidden_states[-2]
+
+    def _create_transformer(self, config: dict) -> WanTransformer3DModel:
+        """Create a transformer from a config dict. Respects od_config.quantization_config."""
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        return create_transformer_from_config(config, quant_config=quant_config)
 
     def forward(
         self,
@@ -652,7 +688,11 @@ class Wan22I2VPipeline(
             output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
         )
 
-    def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
+    def predict_noise(
+        self,
+        current_model: nn.Module | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | IntermediateTensors:
         """
         Forward pass through transformer to predict noise.
 
@@ -661,11 +701,12 @@ class Wan22I2VPipeline(
             **kwargs: Arguments to pass to the transformer
 
         Returns:
-            Predicted noise tensor
+            Predicted noise tensor or IntermediateTensors on non-last PP stages.
         """
         if current_model is None:
             current_model = self.transformer
-        return current_model(**kwargs)[0]
+        result = current_model(**kwargs)
+        return result if isinstance(result, IntermediateTensors) else result[0]
 
     def encode_prompt(
         self,

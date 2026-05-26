@@ -55,6 +55,7 @@ dev = [
     "opencc>=1.2.0",
     "mistune>=3.2.0", # for example tests
     "torchmetrics>=1.4.0", # for accuracy similarity metrics
+    "ray[default]", # for RL test
     "jiwer>=3.0.0",
     "zhon>=2.0.0",
     "zhconv>=1.4.2",
@@ -62,11 +63,17 @@ dev = [
     "funasr>=1.0.0",
     "lpips>=0.1.4", # for quantization fp8
     "orjson>=3.11.7", # to make v1/embeddings API fast
-    "voxcpm>=2.0.2" # for voxcpm model test
+    "voxcpm>=2.0.2", # for VoxCPM2 path-locating in tests
+    "torchdiffeq>=0.2.5" # for covo_audio Test
 ]
 
 demo = [
     "gradio>=6.7.0",
+]
+
+# Local-test-only extras
+local = [
+    "FlagEmbedding",
 ]
 
 docs = [
@@ -182,6 +189,7 @@ markers = [
     "core_model: L1&L2 tests (run in each PR)",
     "advanced_model: L3 level tests (run on each merge)",
     "full_model: L4 level tests (run nightly)",
+    "local_model: tests (run locally)",
     # function module markers
     "diffusion: Diffusion model tests",
     "omni: Omni model tests",
@@ -233,6 +241,8 @@ extend-ignore-identifiers-re = [
     ".*MoBA",
     ".*temperal_downsample",
     ".*_nd",
+    ".*nd$",
+    ".*EmbedND$",
     ".*nothink.*",
     ".*NOTHINK.*",
     ".*nin.*",
@@ -250,3 +260,4 @@ fullset = "fullset"
 Vai = "Vai"
 tockens = "tockens"
 CANN = "CANN"
+ND = "ND"

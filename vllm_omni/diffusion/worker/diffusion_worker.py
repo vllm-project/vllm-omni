@@ -97,7 +97,7 @@ def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _Diffus
 
 @contextmanager
 def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[None]:
-    from vllm.model_executor.layers.quantization import modelopt as vllm_modelopt
+    import vllm.model_executor.layers.quantization.modelopt as vllm_modelopt
 
     linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
     if linear_method_cls in {
@@ -124,6 +124,37 @@ def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[No
             return
 
     yield
+
+
+def _is_unexpected_additional_config_type_error(exc: TypeError) -> bool:
+    """Return True only for constructor rejections of the additional_config kwarg."""
+    message = str(exc)
+    return "unexpected keyword argument" in message and "additional_config" in message
+
+
+def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDiffusionConfig) -> VllmConfig:
+    """Create a worker-local VllmConfig while preserving additional_config when supported."""
+    config_kwargs: dict[str, Any] = {
+        "compilation_config": CompilationConfig(),
+        "device_config": DeviceConfig(device=device),
+    }
+    if od_config.additional_config:
+        config_kwargs["additional_config"] = od_config.additional_config
+
+    try:
+        return VllmConfig(**config_kwargs)
+    except TypeError as exc:
+        if not _is_unexpected_additional_config_type_error(exc):
+            raise
+
+        logger.debug("Worker-local VllmConfig does not accept additional_config in constructor: %s", exc)
+        config_kwargs.pop("additional_config", None)
+        vllm_config = VllmConfig(**config_kwargs)
+        try:
+            setattr(vllm_config, "additional_config", dict(od_config.additional_config))
+        except Exception as set_exc:  # pragma: no cover - defensive for older vLLM builds
+            logger.warning("Failed to attach additional_config to worker VllmConfig: %s", set_exc)
+        return vllm_config
 
 
 class DiffusionWorker:
@@ -154,6 +185,10 @@ class DiffusionWorker:
         self.model_runner: DiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
+        # Worker-side cache of (lora_request, lora_scale) per scheduled
+        # request id. Used by step mode to recover LoRA identity for cached
+        # requests, which only carry their sched_req_id in subsequent ticks.
+        self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner using the platform-specified class
@@ -188,10 +223,7 @@ class DiffusionWorker:
 
         # Create vllm_config for parallel configuration. Pass explicit device_config
         # so DeviceConfig does not rely on current_platform in worker subprocesses.
-        vllm_config = VllmConfig(
-            compilation_config=CompilationConfig(),
-            device_config=DeviceConfig(device=self.device),
-        )
+        vllm_config = _create_diffusion_worker_vllm_config(self.device, self.od_config)
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
@@ -339,13 +371,7 @@ class DiffusionWorker:
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
-        if self.lora_manager is not None:
-            # Step mode does not support LoRA yet. Clear any previously active
-            # adapter first so worker-local LoRA state cannot leak in.
-            self.lora_manager.set_active_adapter(None)
-
-        if any(new_req.req.sampling_params.lora_request is not None for new_req in scheduler_output.scheduled_new_reqs):
-            raise ValueError("Step mode does not support LoRA yet.")
+        self._activate_step_lora(scheduler_output)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
         with ctx:
@@ -353,6 +379,43 @@ class DiffusionWorker:
         if profiler:
             profiler.step()
         return output
+
+    def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
+        """Activate the LoRA adapter for the scheduled step batch.
+
+        Newly scheduled requests register their (lora_request, lora_scale)
+        in ``_step_lora_state`` so cached requests can resolve to the same
+        adapter on later ticks. Finished requests are evicted. Batch
+        homogeneity is enforced by the scheduler via ``SamplingParamsKey``,
+        so any scheduled request id resolves to the active LoRA identity.
+        """
+        for sched_req_id in scheduler_output.finished_req_ids:
+            self._step_lora_state.pop(sched_req_id, None)
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            sampling = new_req.req.sampling_params
+            self._step_lora_state[new_req.sched_req_id] = (
+                sampling.lora_request,
+                sampling.lora_scale,
+            )
+
+        if self.lora_manager is None:
+            return
+
+        lora_request: LoRARequest | None = None
+        lora_scale = 1.0
+        for sched_req_id in scheduler_output.scheduled_req_ids:
+            entry = self._step_lora_state.get(sched_req_id)
+            if entry is not None:
+                lora_request, lora_scale = entry
+                break
+
+        try:
+            self.lora_manager.set_active_adapter(lora_request, lora_scale)
+        except Exception as exc:
+            if lora_request is not None:
+                raise
+            logger.warning("LoRA activation skipped: %s", exc)
 
     def load_weights(self, weights) -> set[str]:
         """Load weights by delegating to the model runner."""
@@ -767,6 +830,14 @@ class WorkerProc:
     ) -> None:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
+
+        # Set process title for visibility in nvidia-smi / htop (optional, non-fatal)
+        try:
+            import setproctitle
+
+            setproctitle.setproctitle(f"vLLM-Omni::StageDiffusionProc-{rank}")
+        except ImportError:
+            pass  # setproctitle not installed, skip process title setting
 
         load_omni_general_plugins()
         worker_proc = WorkerProc(
