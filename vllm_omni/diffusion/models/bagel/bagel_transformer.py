@@ -1389,6 +1389,18 @@ class Bagel(nn.Module):
         packed_timestep_embeds = self.time_embedder(packed_timesteps)
         packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + packed_pos_embed
 
+        # Mirror forward_cache_update_vit: build a full packed_sequence so MoE gen-mode
+        # indexes (packed_text_indexes / packed_vae_token_indexes) match tensor length.
+        packed_text_embedding = self.language_model.forward(
+            packed_text_ids=packed_text_ids,
+            return_embeddings_only=True,
+        ).packed_query_sequence
+        packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
+        packed_sequence[packed_text_indexes] = packed_text_embedding
+        if packed_latent.dtype != packed_sequence.dtype:
+            packed_latent = packed_latent.to(packed_sequence.dtype)
+        packed_sequence[packed_vae_token_indexes] = packed_latent
+
         extra_inputs = {}
         if self.use_moe:
             extra_inputs = {
@@ -1398,7 +1410,7 @@ class Bagel(nn.Module):
             }
 
         output = self.language_model.forward(
-            packed_text_ids=packed_text_ids,
+            packed_query_sequence=packed_sequence,
             query_lens=packed_seqlens,
             packed_query_position_ids=packed_position_ids,
             packed_query_indexes=packed_indexes,
