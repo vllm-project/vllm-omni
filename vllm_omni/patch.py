@@ -102,7 +102,15 @@ if not hasattr(RequestStatus, "WAITING_FOR_CHUNK"):
     # as a non-finished state and remains compatible with existing comparisons.
     extend_enum(RequestStatus, "WAITING_FOR_CHUNK", -1)
 
-for module_name, module in sys.modules.items():
+if not hasattr(RequestStatus, "WAITING_FOR_INPUT"):
+    # Full-payload stage handoff uses a distinct waiting state so the
+    # scheduler can restore the request once non-stage-0 inputs arrive.
+    extend_enum(RequestStatus, "WAITING_FOR_INPUT", -2)
+
+# Snapshot sys.modules: `hasattr` below can trigger lazy submodule imports
+# (e.g. transformers' `_LazyModule.__getattr__`), which mutate sys.modules
+# during iteration and raise `dictionary changed size during iteration`.
+for module_name, module in list(sys.modules.items()):
     # only do patch on module of vllm, pass others
     if "vllm" not in module_name:
         continue

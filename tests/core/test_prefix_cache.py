@@ -13,7 +13,7 @@ DEFAULT_SHAPE = torch.Size([NUM_BLOCKS, BLOCK_SIZE, HIDDEN_SIZE])
 
 
 class MockInputBatch:
-    def __init__(self, num_computed_tokens_cpu):
+    def __init__(self, num_computed_tokens_cpu, block_table=None):
         self.req_ids = ["req1", "req2"]
         self.req_id_to_index = {req_id: i for i, req_id in enumerate(self.req_ids)}
         self.num_computed_tokens_cpu = num_computed_tokens_cpu
@@ -21,11 +21,33 @@ class MockInputBatch:
         # Block table is only mocked for validation of length;
         # we don't actually need to add valid values here since
         # we patch the table when testing.
-        class _DummyBlockTable:
-            pass
+        if block_table is None:
 
-        self.block_table = _DummyBlockTable()
-        self.block_table.block_tables = [None]
+            class _DummyBlockTable:
+                pass
+
+            self.block_table = _DummyBlockTable()
+            self.block_table.block_tables = [None]
+        else:
+
+            class _TensorWrapper:
+                def __init__(self, tensor):
+                    self.cpu = tensor
+
+            class _BlockGroup:
+                def __init__(self, tensor):
+                    self.block_table = _TensorWrapper(tensor)
+
+            class _BlockTable:
+                def __init__(self, tensor):
+                    self._group = _BlockGroup(tensor)
+                    self.block_tables = [self._group.block_table]
+
+                def __getitem__(self, idx):
+                    assert idx == 0
+                    return self._group
+
+            self.block_table = _BlockTable(block_table)
 
 
 def get_omni_pcache_with_mm_tensors(feat_dims, seq_len) -> OmniTensorPrefixCache:
@@ -169,6 +191,94 @@ def test_update_with_multimodal_outputs(feat_dims):
         for slot_idx, new_output in zip(slot_mapping, new_mm_outputs):
             slot_states = mm_state_rows[slot_idx]
             assert torch.all(slot_states == new_output)
+
+
+def test_deferred_multimodal_cache_write_commits_on_completion():
+    cache = get_omni_pcache()
+    mm_key = "codes.audio"
+    block_table = torch.tensor(
+        [
+            [2, 3, 4, 5],
+            [6, 7, 8, 9],
+        ],
+        dtype=torch.long,
+    )
+    input_batch = MockInputBatch(
+        num_computed_tokens_cpu=torch.tensor([4, 0], dtype=torch.long),
+        block_table=block_table,
+    )
+
+    first_chunk = torch.arange(8, dtype=torch.long).reshape(4, 2)
+    cache.update_omni_tensor_prefix_cache(
+        hidden_states=None,
+        multimodal_outputs={mm_key: first_chunk},
+        num_tokens_unpadded=4,
+        slot_mapping=torch.arange(8, 12),
+        skip_mm_cache_keys={mm_key},
+    )
+
+    rows = cache.mm_outputs_cache[mm_key].view(-1, 2)
+    assert torch.all(rows[8:12] == 0)
+
+    cache.stage_deferred_mm_outputs(
+        query_start_loc=torch.tensor([0, 4], dtype=torch.long),
+        input_batch=input_batch,
+        multimodal_outputs={mm_key: first_chunk},
+        num_scheduled_tokens={"req1": 4, "req2": 0},
+        deferred_mm_cache_keys={mm_key},
+    )
+
+    second_chunk = torch.arange(8, 16, dtype=torch.long).reshape(4, 2)
+    input_batch.num_computed_tokens_cpu = torch.tensor([8, 0], dtype=torch.long)
+    cache.stage_deferred_mm_outputs(
+        query_start_loc=torch.tensor([0, 4], dtype=torch.long),
+        input_batch=input_batch,
+        multimodal_outputs={mm_key: second_chunk},
+        num_scheduled_tokens={"req1": 4, "req2": 0},
+        deferred_mm_cache_keys={mm_key},
+    )
+
+    cache.commit_deferred_mm_outputs({"req1"}, input_batch)
+
+    expected = torch.cat([first_chunk, second_chunk], dim=0)
+    rows = cache.mm_outputs_cache[mm_key].view(-1, 2)
+    assert torch.equal(rows[8:16], expected)
+
+
+def test_deferred_multimodal_cache_can_be_merged_on_full_block_hit():
+    cache = get_omni_pcache()
+    mm_key = "codes.audio"
+    block_table = torch.tensor(
+        [
+            [2, 3, 4, 5],
+            [6, 7, 8, 9],
+        ],
+        dtype=torch.long,
+    )
+    input_batch = MockInputBatch(
+        num_computed_tokens_cpu=torch.tensor([8, 0], dtype=torch.long),
+        block_table=block_table,
+    )
+    cached_codes = torch.arange(16, dtype=torch.long).reshape(8, 2)
+    cache.stage_deferred_mm_outputs(
+        query_start_loc=torch.tensor([0, 8], dtype=torch.long),
+        input_batch=input_batch,
+        multimodal_outputs={mm_key: cached_codes},
+        num_scheduled_tokens={"req1": 8, "req2": 0},
+        deferred_mm_cache_keys={mm_key},
+    )
+    cache.commit_deferred_mm_outputs({"req1"}, input_batch)
+
+    new_codes = torch.tensor([[99, 100]], dtype=torch.long)
+    cache.add_prefix_cached_new_req_id("req1")
+    merged = cache.get_merged_multimodal_states(
+        query_start_loc=torch.tensor([0, 1], dtype=torch.long),
+        input_batch=input_batch,
+        multimodal_outputs={mm_key: new_codes},
+        num_scheduled_tokens={"req1": 1, "req2": 0},
+    )
+
+    assert torch.equal(merged[mm_key]["req1"], torch.cat([cached_codes, new_codes], dim=0))
 
 
 ### Tests for Merging

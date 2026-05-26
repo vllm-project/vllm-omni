@@ -3,7 +3,7 @@
 """Unit tests for the Voxtral TTS demo text preprocessing helper.
 
 These tests intentionally cover only behavior ported into
-examples/online_serving/voxtral_tts/text_preprocess.py.
+examples/online_serving/text_to_speech/voxtral_tts/text_preprocess.py.
 """
 
 import importlib.util
@@ -13,7 +13,12 @@ from pathlib import Path
 import pytest
 
 _HELPER_PATH = (
-    Path(__file__).resolve().parents[4] / "examples" / "online_serving" / "voxtral_tts" / "text_preprocess.py"
+    Path(__file__).resolve().parents[4]
+    / "examples"
+    / "online_serving"
+    / "text_to_speech"
+    / "voxtral_tts"
+    / "text_preprocess.py"
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

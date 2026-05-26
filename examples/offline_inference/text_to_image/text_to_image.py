@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
+from vllm_omni.diffusion.data import logger
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
@@ -300,6 +300,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=("Custom system prompt. Used when --use-system-prompt is custom. "),
     )
+    parser.add_argument(
+        "--auxiliary-text-encoder",
+        type=str,
+        default=None,
+        help="Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
+    )
     current_omni_platform.pre_register_and_update(parser)
     from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
@@ -342,17 +348,6 @@ def main():
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
 
-    # assert args.ring_degree == 1, "Ring attention is not supported yet"
-    parallel_config = DiffusionParallelConfig(
-        ulysses_degree=args.ulysses_degree,
-        ring_degree=args.ring_degree,
-        ulysses_mode=args.ulysses_mode,
-        cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-        vae_patch_parallel_size=args.vae_patch_parallel_size,
-        enable_expert_parallel=args.enable_expert_parallel,
-    )
-
     profiler_enabled = args.profiler_config is not None
 
     # Prepare LoRA kwargs for Omni initialization
@@ -388,7 +383,13 @@ def main():
         "cache_backend": args.cache_backend,
         "cache_config": cache_config,
         "enable_cache_dit_summary": args.enable_cache_dit_summary,
-        "parallel_config": parallel_config,
+        "ulysses_degree": args.ulysses_degree,
+        "ring_degree": args.ring_degree,
+        "ulysses_mode": args.ulysses_mode,
+        "cfg_parallel_size": args.cfg_parallel_size,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "vae_patch_parallel_size": args.vae_patch_parallel_size,
+        "enable_expert_parallel": args.enable_expert_parallel,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",
@@ -397,6 +398,7 @@ def main():
         "profiler_config": args.profiler_config,
         "init_timeout": args.init_timeout,
         "stage_init_timeout": args.stage_init_timeout,
+        "auxiliary_text_encoder": args.auxiliary_text_encoder,
         **lora_args,
         **quant_kwargs,
     }

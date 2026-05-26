@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+import vllm.envs as envs
+from vllm.config import VllmConfig
+from vllm.config.kernel import IrOpPriorityConfig
 from vllm.logger import init_logger
 from vllm.platforms.cuda import CudaPlatformBase
 from vllm.platforms.interface import DeviceCapability
@@ -32,6 +35,20 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
     @classmethod
     def get_default_stage_config_path(cls) -> str:
         return "vllm_omni/model_executor/stage_configs"
+
+    @classmethod
+    def has_flash_attn_package(cls) -> bool:
+        from vllm_omni.diffusion.attention.backends.utils.fa import is_flash_attn_installed
+
+        # Turing/Tesla/T4 GPUs don't support flash attention well
+        gpu_name = cls.get_device_name()
+        if "Turing" in gpu_name or "Tesla" in gpu_name or "T4" in gpu_name:
+            return False
+
+        if not is_flash_attn_installed():
+            return False
+
+        return True
 
     @classmethod
     def get_diffusion_attn_backend_cls(
@@ -67,17 +84,17 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                     )
                 elif not packages_available:
                     logger.warning("Flash Attention packages not available. Falling back to TORCH_SDPA backend.")
-                logger.info("Defaulting to diffusion attention backend SDPA")
+                logger.debug("Defaulting to diffusion attention backend SDPA")
                 return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
             backend = DiffusionAttentionBackendEnum[backend_upper]
-            logger.info("Using diffusion attention backend '%s'", backend_upper)
+            logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
 
         if flash_attn_supported:
-            logger.info("Defaulting to diffusion attention backend FLASH_ATTN")
+            logger.debug("Defaulting to diffusion attention backend FLASH_ATTN")
             return DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
 
-        logger.info("Defaulting to diffusion attention backend SDPA")
+        logger.debug("Defaulting to diffusion attention backend SDPA")
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
@@ -97,7 +114,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def get_device_count(cls) -> int:
-        return torch.cuda.device_count()
+        return torch.accelerator.device_count()
 
     @classmethod
     def get_device_version(cls) -> str | None:
@@ -105,7 +122,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def synchronize(cls) -> None:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
@@ -115,3 +132,17 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return torch.cuda.get_device_name(device_id)
+
+    @classmethod
+    def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
+        """Copied from vllm/platforms/cuda/platform.py v0.20.0 with force using vllm_c kernels"""
+        default = ["vllm_c", "native"]  # Originally using "native" here when compiling
+
+        # Use oink if enabled for rms_norm
+        # TODO(Laurawly/luka): remove this env var,
+        #  users can just use IR op priority directly
+        rms_norm = default
+        if envs.VLLM_USE_OINK_OPS:
+            rms_norm = ["oink"] + default
+
+        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)

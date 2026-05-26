@@ -1,8 +1,9 @@
 # Document 1: Buildkite loads only this block on first parse. The next step resolves docs-only skip-ci
-# from git diff, then uploads document 2. When docs-only skip applies, image-build still runs if nightly-test
-# / main NIGHTLY so upload-nightly is not skipped together with test-ready/test-merge.
-#
-# Document 2: appended after `---`; same file, read by upload_pipeline_with_skip_ci.sh (not evaluated as a second pipeline by Buildkite).
+# from git diff, then uploads document 2. When docs-only skip applies, image-build still runs for the nightly
+# exception in upload_pipeline_with_skip_ci.sh (nightly-test label or main NIGHTLY=1); otherwise upload-nightly
+# can be skipped together with test-ready/test-merge. Weekly uploads also depend on image-build.
+
+# Document 2: appended after `---`; same file, read by upload_pipeline_with_skip_ci.sh (not evaluated as a second pipeline by Buildkite). Child uploads include test-ready.yml, test-merge.yml, test-nightly.yml, and test-weekly.yml.
 steps:
   - label: ":github: Resolve skip-ci & upload pipeline"
     key: upload-ci-pipeline
@@ -59,5 +60,17 @@ steps:
       ))
     commands:
       - buildkite-agent pipeline upload .buildkite/test-nightly.yml
+    agents:
+      queue: "cpu_queue_premerge"
+
+  # L5 Test — main+WEEKLY=1 (scheduled), or PR with weekly-test label
+  - label: "Upload Weekly Pipeline"
+    depends_on: image-build
+    key: upload-weekly-pipeline
+    if: >-
+      (build.branch == "main" && build.env("WEEKLY") == "1") ||
+      (build.branch != "main" && build.pull_request.labels includes "weekly-test")
+    commands:
+      - buildkite-agent pipeline upload .buildkite/test-weekly.yml
     agents:
       queue: "cpu_queue_premerge"

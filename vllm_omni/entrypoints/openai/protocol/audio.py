@@ -69,6 +69,13 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate",
     )
+    seed: int | None = Field(
+        default=None,
+        ge=0,
+        le=2**63 - 1,
+        description="Random seed for reproducible generation. When set, ensures "
+        "deterministic output for the same input text and seed value.",
+    )
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
@@ -93,6 +100,50 @@ class OpenAICreateSpeechRequest(BaseModel):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
         return v
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_higgs_audio_v2_unsupported_aliases(cls, data):
+        """Reject unsupported rich-input aliases for higgs_audio_v2 BEFORE pydantic strips them.
+
+        OpenAICreateSpeechRequest is a permissive schema (it accepts any extra
+        field that the OpenAI Speech API didn't promise to ban) but several
+        of those aliases pull a request out of the v1 higgs_audio_v2 scope.
+        Catching them at parse time lets the API return a deterministic 4xx
+        with a model-specific error message instead of silently dropping the
+        field and proceeding with a degraded request.
+        """
+        # Keys that are silently dropped by pydantic when posted to /v1/audio/speech
+        # (the schema doesn't declare them) but which a model-specific
+        # validator MUST be able to reject. Kept inline to avoid clashing
+        # with pydantic's ModelPrivateAttr discovery for class-level
+        # underscore-prefixed attributes.
+        higgs_audio_v2_reserved_keys = (
+            "messages",  # ChatML rich content (out of scope for v1)
+            "reference_audio",  # voice-cloning alias 1
+            "voice_prompt",  # voice-cloning alias 2
+            "speaker_audio",  # voice-cloning alias 3
+            "speakers",  # multi-speaker dialogue
+        )
+        if not isinstance(data, dict):
+            return data
+        model_id = data.get("model")
+        if not isinstance(model_id, str):
+            return data
+        # Match the "higgs_audio_v2" model_type label, the HF architecture id
+        # in pipeline_registry.hf_architectures, and the hyphenated HF repo id
+        # (e.g. "bosonai/higgs-audio-v2-generation-3B-base") by normalizing
+        # both underscores and hyphens out of the id before substring matching.
+        normalized = model_id.lower().replace("-", "").replace("_", "")
+        if "higgsaudiov2" not in normalized:
+            return data
+        offending = sorted(k for k in higgs_audio_v2_reserved_keys if k in data)
+        if offending:
+            raise ValueError(
+                "higgs_audio_v2 v1 does not support these rich-input fields: "
+                f"{offending}. Supply plain text via the 'input' field instead."
+            )
+        return data
+
     @model_validator(mode="after")
     def validate_embedding_constraints(self) -> "OpenAICreateSpeechRequest":
         if self.speaker_embedding is not None:
@@ -115,6 +166,53 @@ class OpenAICreateSpeechRequest(BaseModel):
                     "Speed adjustment is not supported when streaming (stream=true). Set speed=1.0 or omit it."
                 )
         return self
+
+
+class OpenAICreateAudioGenerateRequest(BaseModel):
+    """Request model for audio generation via diffusion models (e.g. Stable Audio)."""
+
+    input: str = Field(
+        description="Text prompt describing the audio to generate",
+    )
+    model: str | None = None
+    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    speed: float | None = Field(
+        default=1.0,
+        ge=0.25,
+        le=4.0,
+    )
+    stream_format: Literal["sse", "audio"] | None = "audio"
+    audio_length: float | None = Field(
+        default=None,
+        description="Audio length in seconds",
+    )
+    audio_start: float | None = Field(
+        default=0.0,
+        description="Audio start time in seconds",
+    )
+    negative_prompt: str | None = Field(
+        default=None,
+        description="Negative prompt for classifier-free guidance",
+    )
+    guidance_scale: float | None = Field(
+        default=None,
+        description="Guidance scale for diffusion models",
+    )
+    num_inference_steps: int | None = Field(
+        default=None,
+        description="Number of inference steps",
+    )
+    seed: int | None = Field(
+        default=None,
+        description="Random seed for reproducibility",
+    )
+
+    @field_validator("stream_format")
+    @classmethod
+    def validate_stream_format(cls, v: str) -> str:
+        if v == "sse":
+            raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
+        return v
 
 
 class CreateAudio(BaseModel):
@@ -142,7 +240,7 @@ class SpeechBatchItem(BaseModel):
     all other fields override the batch-level defaults when set."""
 
     input: str
-    voice: str | None = None
+    voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] | None = None
     speed: float | None = Field(default=None, ge=0.25, le=4.0)
@@ -161,7 +259,7 @@ class BatchSpeechRequest(BaseModel):
 
     model: str | None = None
     items: list[SpeechBatchItem] = Field(..., min_length=1)
-    voice: str | None = None
+    voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
@@ -194,7 +292,7 @@ class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
     model: str | None = None
-    voice: str | None = None
+    voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
     instructions: str | None = None

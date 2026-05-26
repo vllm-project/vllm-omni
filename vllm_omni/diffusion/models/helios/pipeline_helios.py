@@ -53,6 +53,8 @@ def calculate_shift(
 
 
 def optimized_scale(positive_flat, negative_flat):
+    positive_flat = positive_flat.float()
+    negative_flat = negative_flat.float()
     dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
     squared_norm = torch.sum(negative_flat**2, dim=1, keepdim=True) + 1e-8
     st_star = dot_product / squared_norm
