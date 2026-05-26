@@ -204,3 +204,7 @@ class OmniPlatform(Platform):
 class UnspecifiedOmniPlatform(OmniPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED
     device_type = ""
+
+    @classmethod
+    def get_device_count(cls) -> int:
+        return 0

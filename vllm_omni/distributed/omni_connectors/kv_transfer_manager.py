@@ -13,7 +13,8 @@ import torch
 from vllm.logger import init_logger
 
 from .factory import OmniConnectorFactory
-from .utils.config import ConnectorSpec
+from .utils.config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec
+from .utils.env import expand_env_int
 from .utils.initialization import KV_RANK_PORT_STRIDE
 from .utils.kv_utils import (
     KVTPTopology,
@@ -21,6 +22,7 @@ from .utils.kv_utils import (
     build_rank_aware_send_keys,
     get_kv_target_ranks,
     get_local_tp_rank,
+    get_omni_replica_id,
     get_tp_world_size,
     kv_zmq_port,
     merge_received_rank_shards,
@@ -105,7 +107,7 @@ class KVCacheTransferData:
                 t = tensor.detach().contiguous()
                 if cpu:
                     t = t.cpu()
-                elif device is None and t.is_cuda:
+                elif device is None and getattr(t.device, "type", "cpu") != "cpu":
                     device = t.device
                 nbytes = t.numel() * t.element_size()
                 tensors_desc.append(
@@ -142,10 +144,10 @@ class KVCacheTransferData:
         return b"".join([self._build_header_bytes(tensors_desc)] + chunks)
 
     def to_gpu_tensor(self) -> torch.Tensor:
-        """Convert to a packed GPU tensor for raw-data connectors."""
+        """Convert to a packed device tensor for raw-data connectors."""
         tensors_desc, chunks, data_offset, device = self._build_tensors_desc(cpu=False)
         if device is None:
-            raise RuntimeError("No CUDA tensors found, use to_bytes() instead")
+            raise RuntimeError("No device tensors found, use to_bytes() instead")
         header_prefix = self._build_header_bytes(tensors_desc)
         output = torch.empty(len(header_prefix) + data_offset, dtype=torch.uint8, device=device)
         output[: len(header_prefix)].copy_(torch.frombuffer(bytearray(header_prefix), dtype=torch.uint8))
@@ -168,19 +170,19 @@ class KVCacheTransferData:
         return json.loads(bytes(raw_mv[4 : 4 + header_len])), raw_mv[4 + header_len :]
 
     @staticmethod
-    def _load_header_from_tensor(gpu_tensor: torch.Tensor) -> tuple[dict[str, Any], int]:
-        if gpu_tensor.dtype != torch.uint8 or gpu_tensor.dim() != 1:
-            raise ValueError("Packed GPU KV payload must be a 1-D uint8 tensor")
+    def _load_header_from_tensor(tensor: torch.Tensor) -> tuple[dict[str, Any], int]:
+        if tensor.dtype != torch.uint8 or tensor.dim() != 1:
+            raise ValueError("Packed device KV payload must be a 1-D uint8 tensor")
 
-        total_bytes = int(gpu_tensor.numel())
+        total_bytes = int(tensor.numel())
         if total_bytes < 4:
             raise ValueError("Corrupted KV payload: missing 4-byte header length")
 
-        header_len = struct.unpack(">I", gpu_tensor[:4].cpu().numpy().tobytes())[0]
+        header_len = struct.unpack(">I", tensor[:4].cpu().numpy().tobytes())[0]
         if header_len > total_bytes - 4:
             raise ValueError(f"Corrupted KV payload: header_len={header_len} exceeds buffer size={total_bytes}")
 
-        header_bytes = gpu_tensor[4 : 4 + header_len].cpu().numpy().tobytes()
+        header_bytes = tensor[4 : 4 + header_len].cpu().numpy().tobytes()
         return json.loads(header_bytes), 4 + header_len
 
     @staticmethod
@@ -259,16 +261,21 @@ class KVCacheTransferData:
         return KVCacheTransferData._populate_caches(header, _get)
 
     @staticmethod
-    def from_bytes_gpu(gpu_tensor: torch.Tensor) -> dict[str, Any]:
-        """Reconstruct KV cache data from a packed GPU tensor."""
-        header, data_start = KVCacheTransferData._load_header_from_tensor(gpu_tensor)
-        data_len = int(gpu_tensor.numel()) - data_start
+    def from_bytes_device(tensor: torch.Tensor) -> dict[str, Any]:
+        """Reconstruct KV cache data from a packed device tensor."""
+        header, data_start = KVCacheTransferData._load_header_from_tensor(tensor)
+        data_len = int(tensor.numel()) - data_start
 
         def _get(info: dict) -> torch.Tensor:
             offset, nbytes = KVCacheTransferData._validate_tensor_span(info["n"], info, data_len)
-            return gpu_tensor[data_start + offset : data_start + offset + nbytes].clone()
+            return tensor[data_start + offset : data_start + offset + nbytes].clone()
 
         return KVCacheTransferData._populate_caches(header, _get)
+
+    @staticmethod
+    def from_bytes_gpu(tensor: torch.Tensor) -> dict[str, Any]:
+        """Compatibility alias for callers using the old GPU-specific name."""
+        return KVCacheTransferData.from_bytes_device(tensor)
 
 
 class OmniKVTransferManager:
@@ -404,8 +411,8 @@ class OmniKVTransferManager:
             if cfg and (c_type := cfg.get("type")):
                 try:
                     c_extra = {k: v for k, v in cfg.items() if k != "type"}
-                    if c_type == "MooncakeTransferEngineConnector":
-                        base_port = c_extra.get("zmq_port", 50051)
+                    if c_type in TRANSFER_ENGINE_CONNECTOR_NAMES:
+                        base_port = expand_env_int(c_extra.get("zmq_port", 50051), "zmq_port")
                         c_extra["from_stage"] = (
                             str(self.config.from_stage) if self.config.from_stage is not None else "0"
                         )
@@ -415,15 +422,26 @@ class OmniKVTransferManager:
                             stage_int = int(self.config.from_stage) if self.config.from_stage is not None else 0
                         except (TypeError, ValueError):
                             stage_int = 0
-                        zmq_port = kv_zmq_port(base_port, stage_int, self._tp_topo.local_rank)
+                        replica_id = get_omni_replica_id()
+                        zmq_port = kv_zmq_port(
+                            base_port,
+                            stage_int,
+                            self._tp_topo.local_rank,
+                            replica_id=replica_id,
+                        )
 
                         if self.config.need_send_cache:
                             c_extra["role"] = "sender"
                             c_extra["zmq_port"] = zmq_port
                         elif self.config.need_recv_cache:
                             c_extra["role"] = "receiver"
-                            c_extra.setdefault("sender_host", c_extra.get("host", "127.0.0.1"))
-                            c_extra.setdefault("sender_zmq_port", zmq_port)
+                            # Receiver-side sender endpoints are request-scoped.
+                            # They are attached by the orchestrator as
+                            # kv_sender_info and applied in update_sender_info().
+                            # Do not derive sender_host from this receiver's
+                            # local YAML host; on multi-node runs that points at
+                            # the wrong process. Explicit sender_* YAML values
+                            # are still preserved for standalone connector use.
 
                     logger.info(
                         "Initializing OmniConnector type=%s role=%s",
@@ -1051,8 +1069,8 @@ class OmniKVTransferManager:
                         managed_buffer = raw_data
                         try:
                             buf_tensor = raw_data.tensor
-                            if buf_tensor.is_cuda:
-                                data = KVCacheTransferData.from_bytes_gpu(buf_tensor)
+                            if getattr(buf_tensor.device, "type", "cpu") != "cpu":
+                                data = KVCacheTransferData.from_bytes_device(buf_tensor)
                                 raw_data.release()
                                 managed_buffer = None
                             else:
@@ -1068,7 +1086,10 @@ class OmniKVTransferManager:
                     elif isinstance(raw_data, (bytes, bytearray)):
                         data = KVCacheTransferData.from_bytes(raw_data)
                     elif isinstance(raw_data, torch.Tensor) and raw_data.dtype == torch.uint8 and raw_data.dim() == 1:
-                        data = KVCacheTransferData.from_bytes(raw_data.cpu().numpy().tobytes())
+                        if getattr(raw_data.device, "type", "cpu") != "cpu":
+                            data = KVCacheTransferData.from_bytes_device(raw_data)
+                        else:
+                            data = KVCacheTransferData.from_bytes(raw_data.numpy().tobytes())
                     else:
                         data = raw_data
 
@@ -1247,6 +1268,9 @@ class OmniKVTransferManager:
             get_cfg_group,
             get_classifier_free_guidance_rank,
             get_classifier_free_guidance_world_size,
+            get_sequence_parallel_rank,
+            get_sequence_parallel_world_size,
+            get_sp_group,
             get_world_group,
         )
 
@@ -1260,6 +1284,9 @@ class OmniKVTransferManager:
         cfg_size = 1
         cfg_rank = 0
         cfg_group = None
+        sp_size = 1
+        sp_rank = 0
+        sp_group = None
         try:
             cfg_size = get_classifier_free_guidance_world_size()
             cfg_rank = get_classifier_free_guidance_rank()
@@ -1269,7 +1296,16 @@ class OmniKVTransferManager:
             cfg_rank = 0
             cfg_group = None
 
-        if tp_active and cfg_size <= 1:
+        try:
+            sp_size = get_sequence_parallel_world_size()
+            sp_rank = get_sequence_parallel_rank()
+            sp_group = get_sp_group()
+        except Exception:
+            sp_size = 1
+            sp_rank = 0
+            sp_group = None
+
+        if tp_active and (cfg_size <= 1 and sp_size <= 1):
             logger.info(
                 "Rank-aware KV receive: rank %s independently receiving (from_tp=%s, to_tp=%s)",
                 topo.local_rank,
@@ -1278,16 +1314,45 @@ class OmniKVTransferManager:
             )
             return self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
 
-        if tp_active and cfg_size > 1 and cfg_group is not None:
+        if tp_active and (cfg_size > 1 or sp_size > 1):
             kv_payload: dict[str, object] | None = None
-            if cfg_rank == 0:
-                received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, torch.device("cpu"))
-                rank_payloads = self._build_cfg_rank_local_payloads(req, cfg_size) if received else [None] * cfg_size
-                kv_payload = rank_payloads[0]
-                for dst_rank in range(1, cfg_size):
-                    cfg_group.send_object(rank_payloads[dst_rank], dst_rank)
-            else:
+            is_owner = cfg_rank == 0 and sp_rank == 0
+
+            # step1: only owner need to receive
+            if is_owner:
+                received = self.receive_multi_kv_cache(
+                    req,
+                    cfg_kv_collect_func,
+                    torch.device("cpu"),
+                )
+                if received:
+                    if cfg_size > 1:  # build cfg-local payloads
+                        cfg_rank_payloads = self._build_cfg_rank_local_payloads(
+                            req,
+                            cfg_size,
+                        )
+                        kv_payload = cfg_rank_payloads[0]
+                        # send to other cfg
+                        for dst_cfg_rank in range(1, cfg_size):
+                            cfg_group.send_object(
+                                cfg_rank_payloads[dst_cfg_rank],
+                                dst_cfg_rank,
+                            )
+                    elif sp_size > 1:
+                        kv_payload = self._collect_request_kv_payload(req)
+                else:
+                    # Owner receive failed: send None sentinel to CFG followers to avoid deadlock
+                    if cfg_size > 1:
+                        for dst_cfg_rank in range(1, cfg_size):
+                            cfg_group.send_object(None, dst_cfg_rank)
+            elif sp_rank == 0 and cfg_size > 1:
                 kv_payload = cfg_group.recv_object(0)
+            # sp broadcast
+            if sp_size > 1 and sp_group is not None:
+                kv_payload = sp_group.broadcast_object(
+                    kv_payload,
+                    src=0,
+                )
 
             if not kv_payload:
                 return False

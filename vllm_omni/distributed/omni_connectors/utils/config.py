@@ -8,6 +8,13 @@ from .logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
 
+TRANSFER_ENGINE_CONNECTOR_NAMES = frozenset(
+    {
+        "MooncakeTransferEngineConnector",
+        "YuanrongTransferEngineConnector",
+    }
+)
+
 
 @dataclass
 class ConnectorSpec:

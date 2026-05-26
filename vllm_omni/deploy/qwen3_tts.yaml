@@ -9,8 +9,8 @@
 #   * Stage 1 (code2wav) sets max_num_batched_tokens=65536 for correctness:
 #     codec prefill length (Q * num_frames) exceeds the 32k default.
 #   * Stage 0 does not set enforce_eager — talker runs cudagraph by default.
-#     Stage 1 sets true because its codec generation loop is not
-#     cudagraph-compatible. NPU platform flips stage 0 to true where
+#     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
+#     set true to disable that path in eager mode. NPU platform flips stage 0 to true where
 #     cudagraph is not yet verified.
 async_chunk: true
 
@@ -34,7 +34,12 @@ stages:
     max_num_seqs: 10
     gpu_memory_utilization: 0.3
     trust_remote_code: true
-    enable_prefix_caching: false
+    # Prefix caching on by default. The HS opt-out (talker only consumes the
+    # last token's hidden state) and deferred mm-output writes added in this
+    # PR make per-step bookkeeping negligible, and any text repetition across
+    # requests (same voice or shared ref_audio) is a net throughput win.
+    # Disable explicitly if memory headroom is tight on a single-GPU deploy.
+    enable_prefix_caching: true
     async_scheduling: true
     max_num_batched_tokens: 512
     max_model_len: 4096
@@ -56,7 +61,7 @@ stages:
   - stage_id: 1
     max_num_seqs: 10
     gpu_memory_utilization: 0.3
-    enforce_eager: true
+    enforce_eager: false
     trust_remote_code: true
     enable_prefix_caching: false
     async_scheduling: true

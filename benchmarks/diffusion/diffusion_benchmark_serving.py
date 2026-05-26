@@ -6,31 +6,34 @@
 Benchmark online serving for diffusion models (Image/Video Generation).
 If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
-Supports multiple backends:
-    - vllm-omni: Uses /v1/chat/completions endpoint (default)
-    - openai: Uses /v1/images/generations endpoint
-    - v1/videos: Use /v1/videos endpoint
+Supports multiple endpoints:
+    - /v1/chat/completions: OpenAI chat-compatible image requests (e.g. t2i, Qwen i2i)
+    - /v1/images/edits: OpenAI image edit / IT2I (multipart; e.g. Hunyuan --bot-task think)
+    - /v1/images/generations: OpenAI image generation requests
+    - /v1/videos: Async video jobs
+
+Legacy --backend vllm-omni and openai are aliases for chat/completions and images/generations.
 
 Usage:
-    # Video (v1/videos backend)
+    # Video (/v1/videos endpoint)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend v1/videos --dataset vbench --task t2v --num-prompts 10 \
+        --endpoint /v1/videos --dataset vbench --task t2v --num-prompts 10 \
         --height 480 --width 640 --fps 16 --num-frames 80
 
     i2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend v1/videos --dataset vbench --task i2v --num-prompts 10
+        --endpoint /v1/videos --dataset vbench --task i2v --num-prompts 10
 
 
-    # Image (vllm-omni backend)
+    # Image (/v1/chat/completions endpoint)
     t2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset vbench --task t2i --num-prompts 10 \
+        --endpoint /v1/chat/completions --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024
 
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset random --task t2i --num-prompts 1 \
+        --endpoint /v1/chat/completions --dataset random --task t2i --num-prompts 1 \
         --max-concurrency 1 --enable-negative-prompt \
         --random-request-config '[
             {"width":512,"height":512,"num_inference_steps":20,"weight":0.15},
@@ -39,20 +42,25 @@ Usage:
             {"width":1536,"height":1536,"num_inference_steps":35,"weight":0.15}
         ]'
 
-    i2i:
+    ti2i (Hunyuan / OpenAI image edit API):
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset vbench --task i2i --num-prompts 10
+        --endpoint /v1/images/edits --dataset random --task ti2i --num-prompts 10 \
+        --bot-task think
 
-    # Image (openai backend)
+    i2i (chat-based models such as Qwen-Image-Edit):
+    python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+        --endpoint /v1/chat/completions --dataset vbench --task i2i --num-prompts 10
+
+    # Image (/v1/images/generations endpoint)
     t2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend openai --dataset vbench --task t2i --num-prompts 10 \
+        --endpoint /v1/images/generations --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024 --port 3000
 
     # Video (v1/videos)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend v1/videos --dataset random --task t2v --num-prompts 1 \
+        --endpoint /v1/videos --dataset random --task t2v --num-prompts 1 \
         --max-concurrency 1 --enable-negative-prompt \
         --random-request-config '[
             {"width":854,"height":480,"num_inference_steps":18,"num_frames":120,"fps":24,"weight":1}
@@ -80,7 +88,12 @@ from typing import Any
 import aiohttp
 import numpy as np
 import requests
-from backends import RequestFuncInput, RequestFuncOutput, backends_function_mapping
+from backends import (
+    RequestFuncInput,
+    RequestFuncOutput,
+    backends_function_mapping,
+    normalize_endpoint,
+)
 from PIL import Image
 from tqdm.asyncio import tqdm
 
@@ -127,7 +140,7 @@ class VBenchDataset(BaseDataset):
     def _load_data(self) -> list[dict[str, Any]]:
         if self.args.task == "t2v":
             return self._load_t2v_prompts()
-        elif self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
+        elif self.args.task in ["i2v", "ti2v", "ti2i", "i2i", "it2i"]:
             return self._load_i2v_data()
         else:
             return self._load_t2v_prompts()
@@ -519,7 +532,7 @@ class TraceDataset(BaseDataset):
             single = row.get("image_path")
             image_paths = [single] if single else None
 
-        if not image_paths and self.args.task in ["i2v", "i2i", "ti2v", "ti2i"]:
+        if not image_paths and self.args.task in ["i2v", "i2i", "ti2v", "ti2i", "it2i"]:
             raise ValueError(
                 f"Task {self.args.task} requires image input, but no image_path or image_paths found in trace row."
             )
@@ -580,7 +593,7 @@ class RandomDataset(BaseDataset):
             self._sampled_requests = None
 
         # Random image generate
-        if self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
+        if self.args.task in ["i2v", "ti2v", "ti2i", "i2i", "it2i"]:
             self._random_image_path = self._generate_random_image_paths()
         else:
             self._random_image_path = None
@@ -883,13 +896,23 @@ def wait_for_service(base_url: str, timeout: int = 120) -> None:
         time.sleep(1)
 
 
+def _default_endpoint_for_task(task: str) -> str:
+    if task in {"t2v", "i2v", "ti2v"}:
+        return "/v1/videos"
+    if task in {"i2i", "ti2i", "it2i"}:
+        return "/v1/images/edits"
+    if task == "t2i":
+        return "/v1/chat/completions"
+    raise ValueError(f"Unsupported task for endpoint resolution: {task}")
+
+
 async def benchmark(args):
     # Construct base_url if not provided
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
 
     VIDEO_TASKS = {"t2v", "i2v", "ti2v"}
-    IMAGE_TASKS = {"t2i", "i2i", "ti2i"}
+    IMAGE_TASKS = {"t2i", "i2i", "ti2i", "it2i"}
 
     if args.task in VIDEO_TASKS:
         task_type = "2v"
@@ -902,18 +925,23 @@ async def benchmark(args):
             f"Valid image tasks: {sorted(IMAGE_TASKS)}"
         )
 
-    valid_backends = sorted(backends_function_mapping[task_type].keys())
+    raw_endpoint = args.endpoint if args.endpoint is not None else args.backend
+    if raw_endpoint is None:
+        raw_endpoint = _default_endpoint_for_task(args.task)
+    args.endpoint = normalize_endpoint(raw_endpoint)
 
-    if args.backend not in valid_backends:
+    valid_endpoints = sorted(backends_function_mapping[task_type].keys())
+
+    if args.endpoint not in valid_endpoints:
         logger.error(
-            f"Invalid backend '{args.backend}' for task '{args.task}' (task type: '{task_type}').\n"
-            f"Valid backends for this task type: {valid_backends}\n"
-            f"Example usage: --task {args.task} --backend {valid_backends[0]}"
+            f"Invalid endpoint '{args.endpoint}' for task '{args.task}' (task type: '{task_type}').\n"
+            f"Valid endpoints for this task type: {valid_endpoints}\n"
+            f"Example usage: --task {args.task} --endpoint {valid_endpoints[0]}"
         )
-        raise ValueError("Backend validation failed. See log above for valid options.")
+        raise ValueError("Endpoint validation failed. See log above for valid options.")
 
-    # Setup API URL and request function based on backend
-    request_func, api_url = backends_function_mapping[task_type][args.backend]
+    # Setup API URL and request function based on endpoint.
+    request_func, api_url = backends_function_mapping[task_type][args.endpoint]
     api_url = f"{args.base_url}{api_url}"
 
     if args.dataset == "vbench":
@@ -928,6 +956,10 @@ async def benchmark(args):
     print("Loading requests...")
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
+
+    if args.endpoint == "/v1/images/edits":
+        for req in requests_list:
+            req.default_bot_task = args.bot_task
 
     # Limit concurrency
     if args.max_concurrency is not None:
@@ -976,15 +1008,17 @@ async def benchmark(args):
     metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
 
     # Add configuration info to metrics for JSON output
-    metrics["backend"] = args.backend
+    metrics["endpoint"] = args.endpoint
     metrics["model"] = args.model
     metrics["dataset"] = args.dataset
     metrics["task"] = args.task
+    if args.endpoint == "/v1/images/edits":
+        metrics["bot_task"] = args.bot_task
 
-    print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
+    print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
 
     # Section 1: Configuration
-    print("{:<40} {:<15}".format("Backend:", args.backend))
+    print("{:<40} {:<15}".format("Endpoint:", args.endpoint))
     print("{:<40} {:<15}".format("Model:", args.model))
     print("{:<40} {:<15}".format("Dataset:", args.dataset))
     print("{:<40} {:<15}".format("Task:", args.task))
@@ -1048,11 +1082,16 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8091, help="Server port.")
     parser.add_argument("--model", type=str, default="default", help="Model name.")
     parser.add_argument(
+        "--endpoint",
+        type=str,
+        default=None,
+        help=("Endpoint path to target. Leading '/' is optional, e.g. /v1/videos or v1/videos."),
+    )
+    parser.add_argument(
         "--backend",
         type=str,
-        default="vllm-omni",
-        choices=["vllm-omni", "openai", "v1/videos"],
-        help="Backend to target the benchmark to.",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--dataset",
@@ -1065,7 +1104,7 @@ if __name__ == "__main__":
         "--task",
         type=str,
         default="t2v",
-        choices=["t2v", "i2v", "ti2v", "ti2i", "i2i", "t2i"],
+        choices=["t2v", "i2v", "ti2v", "ti2i", "i2i", "it2i", "t2i"],
         help="Task type.",
     )
     parser.add_argument(
@@ -1172,8 +1211,14 @@ if __name__ == "__main__":
         default=1,
         help=(
             "Number of synthetic input images to attach for image-conditioned tasks "
-            "(i2v, ti2v, ti2i, i2i) when using random dataset."
+            "(i2v, ti2v, ti2i, i2i, it2i) when using random dataset."
         ),
+    )
+    parser.add_argument(
+        "--bot-task",
+        type=str,
+        default="think",
+        help=("bot_task form field for --endpoint /v1/images/edits (think, recaption, think_recaption, vanilla)."),
     )
 
     args = parser.parse_args()

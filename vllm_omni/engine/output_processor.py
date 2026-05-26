@@ -3,6 +3,9 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    split_routed_experts,
+)
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
@@ -230,7 +233,17 @@ class OmniRequestState(RequestState):
                 self.sent_tokens_offset = self.detokenizer.num_output_tokens()
 
         external_req_id = self.external_req_id
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, routed_experts)
+
+        # Split routing data into prompt and generation portions, matching
+        # upstream make_request_output behaviour.
+        prompt_routed_experts = None
+        gen_routed_experts = None
+        if routed_experts is not None:
+            prompt_len = len(self.prompt_token_ids) if self.prompt_token_ids else 0
+            num_gen = self.detokenizer.num_output_tokens() if self.detokenizer is not None else None
+            prompt_routed_experts, gen_routed_experts = split_routed_experts(routed_experts, prompt_len, num_gen)
+
+        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, gen_routed_experts)
 
         if self.parent_req is None:
             outputs = [output]
@@ -240,7 +253,13 @@ class OmniRequestState(RequestState):
                 return None
             external_req_id = self.parent_req.external_req_id
 
-        return self._new_request_output(external_req_id, outputs, finished, kv_transfer_params)
+        return self._new_request_output(
+            external_req_id,
+            outputs,
+            finished,
+            kv_transfer_params,
+            prompt_routed_experts,
+        )
 
     def _new_completion_output(
         self,
