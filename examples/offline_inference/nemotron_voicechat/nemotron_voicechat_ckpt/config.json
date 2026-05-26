@@ -1,4 +1,0 @@
-{
-  "model_type": "nemotron_voicechat",
-  "architectures": ["NemotronVoicechatForConditionalGeneration"]
-}
