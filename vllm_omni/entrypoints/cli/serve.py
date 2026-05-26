@@ -415,6 +415,24 @@ class OmniServeCommand(CLISubcommand):
             help="Enable cache-dit summary logging after diffusion forward passes.",
         )
         omni_config_group.add_argument(
+            "--diffusion-batching-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON config for diffusion continuous-batching policy. "
+                'Example: \'{"compute_unit_budget":10240}\'.'
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusion-batching-policy",
+            choices=["fixed", "compute_budget", "profile"],
+            default=None,
+            help=(
+                "Diffusion batching policy. 'compute_budget' uses a profiled compute-unit budget; "
+                "'profile' ramps batch size and logs data for profiling."
+            ),
+        )
+        omni_config_group.add_argument(
             "--step-execution",
             action="store_true",
             help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",

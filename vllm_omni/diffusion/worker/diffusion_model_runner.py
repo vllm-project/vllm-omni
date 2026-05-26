@@ -418,6 +418,30 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return {}
         return prepare_attn(input_batch)
 
+    def _log_batch_profile(
+        self,
+        states: list[DiffusionRequestState],
+        elapsed: float,
+    ) -> None:
+        batching_config = getattr(self.od_config, "diffusion_batching_config", None)
+        if batching_config is None or not getattr(batching_config, "uses_profiler", False):
+            return
+        if not states:
+            return
+
+        request_units = batching_config.request_compute_units(
+            states[0].req.sampling_params,
+            states[0].req.prompts,
+        )
+        logger.info(
+            "[DiffusionBatchProfiler] batch_size=%s request_compute_units=%s "
+            "total_compute_units=%s denoise_step_time=%.6f",
+            len(states),
+            request_units,
+            request_units * len(states),
+            elapsed,
+        )
+
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
@@ -441,7 +465,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
             ):
+                denoise_start = time.perf_counter()
                 noise_pred = self.pipeline.denoise_step(input_batch)
+                self._log_batch_profile(states, time.perf_counter() - denoise_start)
 
                 runner_output_list = []
                 pipeline_interrupted = getattr(self.pipeline, "interrupt", False)

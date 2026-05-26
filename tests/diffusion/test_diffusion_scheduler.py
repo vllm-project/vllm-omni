@@ -234,7 +234,7 @@ class TestRequestScheduler:
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 0
 
-    def test_incompatible_waiting_head_blocks_later_compatible_request(self) -> None:
+    def test_keyed_drr_starts_from_lower_cost_request_queue(self) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=3))
 
@@ -246,20 +246,20 @@ class TestRequestScheduler:
                 request_ids=["b"],
             )
         )
-        scheduler.add_request(_make_request("c"))
+        req_id_c = scheduler.add_request(_make_request("c"))
 
         first = scheduler.schedule()
 
-        assert _new_ids(first) == [req_id_a]
+        assert _new_ids(first) == [req_id_b]
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 2
 
-        scheduler.update_from_output(first, _make_request_output(req_id_a))
+        scheduler.update_from_output(first, _make_request_output(req_id_b))
         second = scheduler.schedule()
 
-        assert _new_ids(second) == [req_id_b]
-        assert second.num_running_reqs == 1
-        assert second.num_waiting_reqs == 1
+        assert _new_ids(second) == [req_id_a, req_id_c]
+        assert second.num_running_reqs == 2
+        assert second.num_waiting_reqs == 0
 
     def test_abort_request_for_waiting_and_running(self) -> None:
         req_id_a = self.scheduler.add_request(_make_request("a"))
@@ -652,7 +652,7 @@ class TestStepScheduler:
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 0
 
-    def test_step_batch_rejects_different_sampling_key(self) -> None:
+    def test_step_keyed_drr_avoids_head_of_line_blocking(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=3))
 
@@ -666,23 +666,139 @@ class TestStepScheduler:
                 ),
             )
         )
-        scheduler.add_request(_make_step_request("c"))
+        req_c = scheduler.add_request(_make_step_request("c"))
 
         sched_output = scheduler.schedule()
 
-        assert _new_ids(sched_output) == [req_a]
+        assert _new_ids(sched_output) == [req_b]
         assert sched_output.num_running_reqs == 1
         assert sched_output.num_waiting_reqs == 2
 
         scheduler.update_from_output(
             sched_output,
-            _make_step_output(req_a, step_index=4, finished=True),
+            _make_step_output(req_b, step_index=4, finished=True),
         )
         second = scheduler.schedule()
 
-        assert _new_ids(second) == [req_b]
-        assert second.num_running_reqs == 1
-        assert second.num_waiting_reqs == 1
+        assert _new_ids(second) == [req_a, req_c]
+        assert second.num_running_reqs == 2
+        assert second.num_waiting_reqs == 0
+
+    def test_compute_budget_batching_caps_1024_requests_from_512_profile(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=128,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        req_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"req-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=1024,
+                        width=1024,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(8)
+        ]
+
+        sched_output = scheduler.schedule()
+
+        # Qwen-Image packed latent units:
+        # 512x512 -> (512 / 16)^2 = 1024, profiled budget = 1024 * 10.
+        # 1024x1024 -> (1024 / 16)^2 = 4096, ceil(10240 / 4096) = 3.
+        assert _new_ids(sched_output) == req_ids[:3]
+        assert sched_output.num_running_reqs == 3
+        assert sched_output.num_waiting_reqs == 5
+
+    def test_compute_budget_batching_keeps_profiled_512_batch_size(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=128,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        req_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"req-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=512,
+                        width=512,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(12)
+        ]
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == req_ids[:10]
+        assert sched_output.num_running_reqs == 10
+        assert sched_output.num_waiting_reqs == 2
+
+    def test_compute_budget_batching_respects_max_num_seqs_hard_cap(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=4,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        req_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"req-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=512,
+                        width=512,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(8)
+        ]
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == req_ids[:4]
+        assert sched_output.num_running_reqs == 4
+        assert sched_output.num_waiting_reqs == 4
+
+    def test_profile_batching_policy_ramps_batch_size(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=4,
+                diffusion_batching_config={
+                    "policy": "profile",
+                    "profiler_interval": 1,
+                },
+            )
+        )
+
+        req_ids = [scheduler.add_request(_make_step_request(f"req-{i}")) for i in range(4)]
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == req_ids[:2]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 2
 
     def test_preempt_request_preserves_step_index(self) -> None:
         request = _make_step_request("preempt", num_inference_steps=3)

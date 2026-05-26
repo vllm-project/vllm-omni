@@ -1497,6 +1497,9 @@ class AsyncOmniEngine:
         devices = ",".join(str(i) for i in range(num_devices))
         model_class_name = kwargs.get("model_class_name", None)
         final_output_type = "audio" if model_class_name and supports_audio_output(model_class_name) else "image"
+        diffusion_batching_config = dict(kwargs.get("diffusion_batching_config") or {})
+        if kwargs.get("diffusion_batching_policy") is not None:
+            diffusion_batching_config["policy"] = kwargs["diffusion_batching_policy"]
 
         attention_config = None
         if (
@@ -1510,6 +1513,7 @@ class AsyncOmniEngine:
 
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
+            "diffusion_batching_config": diffusion_batching_config,
             "parallel_config": parallel_config,
             "model_class_name": kwargs.get("model_class_name", None),
             "additional_config": kwargs.get("additional_config", None),
