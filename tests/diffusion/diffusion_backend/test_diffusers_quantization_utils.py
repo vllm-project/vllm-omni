@@ -141,8 +141,7 @@ def test_builds_real_diffusers_torchao_config_when_available(monkeypatch):
         )
     )
 
-    from diffusers.quantizers import PipelineQuantizationConfig
-    from diffusers.quantizers.quantization_config import TorchAoConfig
+    from diffusers import PipelineQuantizationConfig, TorchAoConfig
     from torchao.quantization import Int8DynamicActivationInt8WeightConfig
 
     torchao_config = pipeline_config.quant_mapping["transformer"]

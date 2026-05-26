@@ -58,8 +58,7 @@ def _ensure_no_ignored_layers(quant_config: Any) -> None:
 
 
 def _get_diffusers_quantization_classes() -> tuple[type[Any], type[Any]]:
-    from diffusers.quantizers import PipelineQuantizationConfig
-    from diffusers.quantizers.quantization_config import TorchAoConfig
+    from diffusers import PipelineQuantizationConfig, TorchAoConfig
 
     return PipelineQuantizationConfig, TorchAoConfig
 
