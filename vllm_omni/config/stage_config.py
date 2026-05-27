@@ -661,6 +661,25 @@ class PlatformOverrides(NamedTuple):
     env: dict[str, Any] | None
 
 
+def _merge_runtime_env(
+    base_env: Any,
+    override_env: Any,
+    *,
+    stage_id: int,
+) -> Any:
+    """Merge runtime env overrides into base env when both are dicts."""
+    if isinstance(base_env, dict) and isinstance(override_env, dict):
+        return {**base_env, **override_env}
+    if base_env is not None:
+        logger.warning(
+            "Stage %s env override replaces base env entirely (base type=%s, override type=%s)",
+            stage_id,
+            type(base_env).__name__,
+            type(override_env).__name__,
+        )
+    return override_env
+
+
 def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
     """Return overrides, devices, and env from a platform stage entry.
 
@@ -703,16 +722,7 @@ def _apply_platform_overrides(
         if po.devices is not None:
             base.devices = po.devices
         if po.env is not None:
-            if isinstance(base.env, dict) and isinstance(po.env, dict):
-                base.env = {**base.env, **po.env}
-            else:
-                logger.warning(
-                    "Stage %s env override replaces base env entirely (base type=%s, override type=%s)",
-                    ps["stage_id"],
-                    type(base.env).__name__,
-                    type(po.env).__name__,
-                )
-                base.env = po.env
+            base.env = _merge_runtime_env(base.env, po.env, stage_id=ps["stage_id"])
         for key, val in po.overrides.items():
             if hasattr(base, key):
                 # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
@@ -965,7 +975,7 @@ class StageConfig:
 
         # CLI overrides take precedence over YAML defaults
         for key, value in self.runtime_overrides.items():
-            if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
+            if value is not None and key not in ("devices", "max_batch_size", "num_replicas", "env"):
                 engine_args[key] = value
 
         # Build runtime config from YAML defaults + CLI overrides
@@ -975,6 +985,9 @@ class StageConfig:
             runtime["devices"] = self.runtime_overrides["devices"]
         if self.runtime_overrides.get("num_replicas") is not None:
             runtime["num_replicas"] = self.runtime_overrides["num_replicas"]
+        cli_env = self.runtime_overrides.get("env")
+        if cli_env is not None:
+            runtime["env"] = _merge_runtime_env(runtime.get("env"), cli_env, stage_id=self.stage_id)
 
         # Legacy compat: migrate runtime.max_batch_size → engine_args.max_num_seqs
         legacy_mbs = runtime.pop("max_batch_size", None)
