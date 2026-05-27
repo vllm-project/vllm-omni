@@ -624,16 +624,14 @@ class QwenImageEditPlusPipeline(
         max_sequence_length: int = 1024,
     ) -> DiffusionOutput:
         """Forward pass for image editing with support for multiple images."""
-        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
-        # TODO: May be some data formatting operations on the API side. Hack for now.
         if len(req.prompts) > 1:
             logger.warning(
                 """This model only supports a single prompt, not a batched request.""",
                 """Taking only the first image for now.""",
             )
-        first_prompt = req.prompts[0]
-        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-        negative_prompt = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt")
+        first_prompt = req.canonical_prompts[0]
+        prompt = first_prompt["prompt"]
+        negative_prompt = first_prompt.get("negative_prompt")
         if negative_prompt is None:
             logger.warning(
                 "negative_prompt is not set. The official Qwen-Image-Edit model "
@@ -644,8 +642,7 @@ class QwenImageEditPlusPipeline(
 
         # Get preprocessed images from request (pre-processing is done in DiffusionEngine)
         if (
-            not isinstance(first_prompt, str)
-            and "vae_images" in (additional_information := first_prompt.get("additional_information", {}))
+            "vae_images" in (additional_information := first_prompt.get("additional_information", {}))
             and "condition_images" in additional_information
         ):
             condition_images = additional_information.get("condition_images")

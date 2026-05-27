@@ -629,12 +629,8 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         negative_pooled_prompt_embeds: torch.Tensor | None = None,
         max_sequence_length: int = 256,
     ) -> DiffusionOutput:
-        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
-        # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        negative_prompt = [
-            "" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts
-        ] or negative_prompt
+        prompt = req.get_prompt_texts() or prompt
+        negative_prompt = req.get_negative_prompt_texts() or [""] * len(prompt)
 
         height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor

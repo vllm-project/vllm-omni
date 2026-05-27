@@ -326,10 +326,8 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 """This model only supports a single prompt, not a batched request.""",
                 """Taking only the first image for now.""",
             )
-        # TODO: In online mode, sometimes it receives [{"prompts": None}, {...}], so cannot use .get("...", "")
-        # TODO: May be some data formatting operations on the API side. Hack for now.
-        first_prompt = req.prompts[0]
-        prompt = first_prompt if isinstance(req.prompts[0], str) else (req.prompts[0].get("prompt") or "")
+        first_prompt = req.canonical_prompts[0]
+        prompt = first_prompt["prompt"]
 
         max_hw = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
         if req.sampling_params.height is None and req.sampling_params.width is None:

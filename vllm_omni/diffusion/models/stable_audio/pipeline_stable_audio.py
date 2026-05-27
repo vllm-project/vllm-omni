@@ -402,13 +402,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
             DiffusionOutput containing generated audio
         """
         # Extract from request
-        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
-        # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
-            negative_prompt = None
-        elif req.prompts:
-            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+        prompt = req.get_prompt_texts() or prompt
+        negative_prompt = req.get_negative_prompt_texts()
         num_inference_steps = req.sampling_params.num_inference_steps
         if num_inference_steps is None:
             num_inference_steps = 100  # Default steps

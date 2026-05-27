@@ -497,6 +497,32 @@ class TestDiffusionEngine:
         with pytest.raises(DiffusionRequestAbortedError, match="Request req-abort aborted"):
             await engine.step(_make_request("req-abort"))
 
+    @pytest.mark.asyncio
+    async def test_step_refreshes_canonical_prompts_after_preprocess(self, mocker: MockerFixture) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._closed = False
+        engine._loop_started = True
+        engine.pre_process_func = lambda request: request
+        engine.async_add_req_and_wait_for_response = mocker.AsyncMock(return_value=DiffusionOutput(output=None))
+
+        req = _make_request("req-preprocess")
+
+        def preprocess(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+            request.prompts[0] = {
+                "prompt": "edited prompt",
+                "negative_prompt": None,
+                "additional_information": {"preprocessed_image": object()},
+            }
+            return request
+
+        engine.pre_process_func = preprocess
+
+        await engine.step(req)
+
+        submitted_req = engine.async_add_req_and_wait_for_response.call_args.args[0]
+        assert submitted_req.canonical_prompts[0]["prompt"] == "edited prompt"
+        assert "preprocessed_image" in submitted_req.canonical_prompts[0]["additional_information"]
+
     def test_abort_queue_marks_request_finished_aborted(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine._rpc_lock = threading.RLock()
