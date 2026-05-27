@@ -112,7 +112,6 @@ def main():
     print(f"  Video size: {width}x{height}")
     print(f"{'=' * 60}\n")
 
-    generation_start = time.perf_counter()
     # omni.generate() returns Generator[OmniRequestOutput, None, None]
 
     multi_modal_data = {"image": image}
@@ -123,6 +122,7 @@ def main():
 
         multi_modal_data["camera"] = {"poses": poses, "intrinsics": intrinsics}
 
+    generation_start = time.perf_counter()
     frames = omni.generate(
         {
             "prompt": args.prompt,

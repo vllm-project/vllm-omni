@@ -69,6 +69,7 @@ def generate_video(args: Namespace) -> list[np.ndarray]:
         "num_frames": args.num_frames,
         "fps": args.fps,
         "session_id": args.session_id,
+        "seed": args.seed,
     }
 
     video = []
@@ -157,8 +158,9 @@ def main():
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--num-frames", type=int, default=24)
-    parser.add_argument("--num-calls", type=int, default=2)
+    parser.add_argument("--num-calls", type=int, default=1)
     parser.add_argument("--num-skip-frames", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     args = parser.parse_args()
 
     frames = generate_video(args)

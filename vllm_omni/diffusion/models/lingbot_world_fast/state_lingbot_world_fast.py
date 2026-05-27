@@ -28,6 +28,7 @@ class LingbotWorldFastState:
     """
 
     def __init__(self) -> None:
+        self.is_initialized = False
         self.reset()
 
     # ------------------------------------------------------------------
@@ -36,6 +37,15 @@ class LingbotWorldFastState:
 
     def reset(self) -> None:
         """Clear all state."""
+
+        if self.is_initialized:
+            for cache in self.kv_cache:
+                del cache
+            for cache in self.crossattn_cache:
+                if isinstance(cache["k"], torch.Tensor):
+                    del cache["k"]
+                    del cache["v"]
+
         self.kv_cache: list[torch.Tensor] | None = None
         self.crossattn_cache: list[dict[str, bool | torch.Tensor | None]] | None = None
         self.current_start_frame: int = 0
