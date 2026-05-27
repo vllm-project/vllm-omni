@@ -4,6 +4,10 @@
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
+    ImageEditARDeltaChunk,
+    ImageEditImageChunk,
+    ImageEditStreamError,
+    ImageEditStreamResponse,
     ImageGenerationRequest,
     ImageGenerationResponse,
     ResponseFormat,
@@ -16,6 +20,10 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 
 __all__ = [
     "ImageData",
+    "ImageEditARDeltaChunk",
+    "ImageEditImageChunk",
+    "ImageEditStreamError",
+    "ImageEditStreamResponse",
     "ImageGenerationRequest",
     "ImageGenerationResponse",
     "ResponseFormat",

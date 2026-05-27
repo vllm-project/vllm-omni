@@ -41,6 +41,72 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ.setdefault("DIFFUSION_ATTENTION_BACKEND", "FLASH_ATTN")
 
+
+# ---------------------------------------------------------------------------
+# Inline field processing
+# ---------------------------------------------------------------------------
+def _process_inline_fields(obj: Any, parent_key: str = "") -> None:
+    """Recursively process '*-inline' fields into temp files."""
+
+    if isinstance(obj, list):
+        for item in obj:
+            _process_inline_fields(item, parent_key)
+        return
+
+    if not isinstance(obj, dict):
+        return
+
+    import atexit
+
+    import yaml
+
+    for key in list(obj.keys()):
+        value = obj[key]
+
+        if not key.endswith("-inline"):
+            _process_inline_fields(value, key)
+            continue
+
+        base_key = key[:-7]
+        full_key = f"{parent_key}.{key}" if parent_key else key
+
+        try:
+            if not isinstance(value, dict):
+                raise ValueError("must be a dict")
+
+            file_type = value.get("type")
+            content = value.get("content")
+
+            if file_type not in {"yaml", "jsonl"}:
+                raise ValueError(f"invalid type: {file_type}")
+
+            fd, path = tempfile.mkstemp(
+                suffix=f".{file_type}",
+                prefix=f"{base_key}_",
+            )
+
+            atexit.register(Path(path).unlink, missing_ok=True)
+
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                if file_type == "jsonl":
+                    items = content if isinstance(content, list) else [content]
+                    f.writelines(json.dumps(x, ensure_ascii=False) + "\n" for x in items)
+                else:
+                    yaml.dump(
+                        content,
+                        f,
+                        allow_unicode=True,
+                        sort_keys=False,
+                        indent=2,
+                    )
+
+            obj[base_key] = path
+            del obj[key]
+
+        except Exception as e:
+            print(f"Warning: failed processing '{full_key}': {e}")
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -102,11 +168,14 @@ def _resolve_refs(configs: list[dict[str, Any]], config_dir: Path) -> list[dict[
 
 
 def load_configs(config_path: str) -> list[dict[str, Any]]:
+    """Load benchmark configs from JSON file and process inline fields."""
     try:
         abs_path = Path(config_path).resolve()
         with open(abs_path, encoding="utf-8") as f:
             configs = json.load(f)
-        return _resolve_refs(configs, abs_path.parent)
+        configs = _resolve_refs(configs, abs_path.parent)
+        _process_inline_fields(configs)
+        return configs
     except json.JSONDecodeError as e:
         raise ValueError(f"JSON parsing error: {str(e)}")
     except FileNotFoundError:

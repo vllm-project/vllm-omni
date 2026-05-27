@@ -1,0 +1,98 @@
+# Dual-stage single-node deployment of Ming-flash-omni-2.0 text-to-image.
+#
+# Stage 0 (thinker, llm):  BailingMoeV2 LLM + vision/audio encoders, TP=2
+#                          on cards 0 and 1. Detects text-to-image requests
+#                          (auto-appended with <image><imagePatch>*256</image>
+#                          by serving_chat), replaces those positions with
+#                          learnable ``query_tokens_dict`` embeddings, runs
+#                          forward, and exports the final-layer hidden states
+#                          under ``multimodal_output["final_hidden_states"]``.
+#
+# Stage 1 (imagegen, diffusion): Qwen2 connector + ZImage DiT + VAE, TP=1 on
+#                                card 3. Consumes the thinker hidden states
+#                                shipped from stage 0 (sliced at <imagePatch>
+#                                positions by ``thinker2imagegen``) as DiT
+#                                conditioning, runs the Ming condition
+#                                encoder + 30-step FlowMatchEuler denoise
+#                                + VAE decode, emits a raw image tensor.
+#
+# Cross-stage transport: ``shared_memory_connector`` (intra-node). The
+# thinker's ``multimodal_output`` flows automatically; ``thinker2imagegen``
+# (custom_process_input_func) slices it and produces a list[dict] with the
+# conditioning tensor under ``extra[thinker_hidden_states]``. Msgpack
+# (``OmniMsgpackEncoder``) handles bf16/fp16 tensors natively.
+#
+# TODO(ming-flash-omni-2.0): stage 0 `thinker_config` / stage 1 `image_gen_config` target the
+# future unified MingFlashOmniConfig; today's BailingMM2Config checkpoint silently falls back.
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    # CFG prompt expansion: when a request carries ``negative_prompt``, one
+    # companion is spawned so both positive and negative hidden states reach
+    # the diffusion stage (consumed by MingImagePipeline as real CFG negatives).
+    prompt_expand_func: vllm_omni.model_executor.stage_input_processors.ming_flash_omni.expand_cfg_prompts
+    hf_config_name: thinker_config
+    runtime:
+      devices: "0,1,2,3"
+    engine_args:
+      model_stage: thinker
+      max_num_seqs: 2  # parent + 1 CFG-text companion (negative prompt)
+      model_arch: MingFlashOmniForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.85
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      tensor_parallel_size: 4
+    is_comprehension: true
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 1  # image-gen request: prefill only, no AR decode
+      seed: 42
+      detokenize: false
+    output_connectors:
+      to_stage_1: shared_memory_connector
+
+  - stage_id: 1
+    stage_type: diffusion
+    hf_config_name: image_gen_config
+    runtime:
+      devices: "4"
+    engine_args:
+      model_stage: dit
+      model_arch: MingImagePipeline  # resolved in vllm_omni/diffusion/registry.py
+      enforce_eager: true
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.ming_flash_omni.thinker2imagegen
+    final_output: true
+    final_output_type: image
+    is_comprehension: false
+    default_sampling_params:
+      seed: 42
+    input_connectors:
+      from_stage_0: shared_memory_connector
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+
+  connectors:
+    shared_memory_connector:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536  # 64KB threshold
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
