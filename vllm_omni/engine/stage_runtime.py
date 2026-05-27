@@ -340,12 +340,11 @@ class StageRuntime:
                     omni_kv_connector,
                     configured_stage_id,
                 )
-                if self._stage_configs:
-                    _inject_inferred_kv_tp_topology(
-                        engine_args_dict.get("omni_kv_config"),
-                        configured_stage_id,
-                        self._stage_configs,
-                    )
+                _inject_inferred_kv_tp_topology(
+                    engine_args_dict.get("omni_kv_config"),
+                    configured_stage_id,
+                    self._stage_configs,
+                )
                 stage_vllm_config, executor_class = build_vllm_config(
                     stage_cfg,
                     self._model,
