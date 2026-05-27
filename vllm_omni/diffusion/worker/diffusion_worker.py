@@ -210,15 +210,11 @@ class DiffusionWorker:
         world_size = self.od_config.num_gpus
         rank = self.rank
 
-        # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.od_config.master_port)
-        os.environ["LOCAL_RANK"] = str(self.local_rank)
-        os.environ["RANK"] = str(rank)
-        os.environ["WORLD_SIZE"] = str(world_size)
+        self._setup_distributed_env_vars(world_size=world_size, rank=rank)
 
-        # Setup device
-        self.device = current_omni_platform.get_torch_device(rank)
+        # Use local_rank (not rank) for device selection to support
+        # Ray's per-actor CUDA_VISIBLE_DEVICES remapping
+        self.device = current_omni_platform.get_torch_device(self.local_rank)
         current_omni_platform.set_device(self.device)
 
         # Create vllm_config for parallel configuration. Pass explicit device_config
@@ -260,6 +256,21 @@ class DiffusionWorker:
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
             )
             init_workspace_manager(self.device)
+
+    def _setup_distributed_env_vars(self, world_size: int, rank: int) -> None:
+        if getattr(self.od_config, "distributed_executor_backend", "mp") == "ray":
+            # Ray sets rendezvous details from the executor because rank 0 may
+            # live on a different host from the driver.
+            os.environ.setdefault("MASTER_ADDR", "localhost")
+            os.environ.setdefault("MASTER_PORT", str(self.od_config.master_port))
+        else:
+            # Multiprocessing workers inherit the parent environment, so avoid
+            # accidentally reusing unrelated distributed settings.
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = str(self.od_config.master_port)
+        os.environ["LOCAL_RANK"] = str(self.local_rank)
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
 
     def _create_profiler(self) -> WorkerProfiler | None:
         profiler_config = self.od_config.profiler_config
@@ -873,15 +884,17 @@ class WorkerWrapperBase:
         wake_event: mp.Event = None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        rank: int | None = None,
     ):
         """
         Initialize WorkerWrapperBase with support for worker extensions.
 
         Args:
-            gpu_id: GPU device ID
+            gpu_id: GPU device ID (used as local_rank)
             od_config: OmniDiffusionConfig configuration
             worker_extension_cls: Optional qualified name of worker extension class
             custom_pipeline_args: Optional arguments for custom pipeline initialization
+            rank: Global rank. If None, defaults to gpu_id.
         """
         self.gpu_id = gpu_id
         self.od_config = od_config
@@ -899,7 +912,7 @@ class WorkerWrapperBase:
         # sleep mode.
         self.worker = worker_class(
             local_rank=gpu_id,
-            rank=gpu_id,
+            rank=rank if rank is not None else gpu_id,
             od_config=od_config,
             skip_load_model=(self.custom_pipeline_args is not None),
         )

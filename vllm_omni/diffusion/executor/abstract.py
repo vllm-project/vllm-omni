@@ -36,7 +36,9 @@ class DiffusionExecutor(ABC):
                 )
             executor_class = distributed_executor_backend
         elif distributed_executor_backend == "ray":
-            raise NotImplementedError("ray backend is not yet supported.")
+            from vllm_omni.diffusion.executor.ray_executor import RayDiffusionExecutor
+
+            executor_class = RayDiffusionExecutor
         elif distributed_executor_backend == "mp":
             from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 
