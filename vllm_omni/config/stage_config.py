@@ -121,6 +121,38 @@ def strip_parent_engine_args(
     return result, sorted(overridden)
 
 
+def _apply_diffusion_parallel_runtime_overrides(
+    engine_args: dict[str, Any],
+    runtime_overrides: dict[str, Any],
+) -> None:
+    """Move diffusion parallel overrides into nested ``parallel_config``."""
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+    parallel_fields = frozenset(f.name for f in fields(DiffusionParallelConfig))
+    parallel_config = engine_args.get("parallel_config")
+    parallel_config_dict = dict(parallel_config) if parallel_config is not None else None
+    degree_overridden = False
+    sequence_parallel_explicit = runtime_overrides.get("sequence_parallel_size") is not None
+
+    for key in list(runtime_overrides.keys()):
+        value = runtime_overrides.get(key)
+        if value is None or key not in parallel_fields:
+            continue
+        if parallel_config_dict is None:
+            parallel_config_dict = {}
+        if key in ("ulysses_degree", "ring_degree"):
+            degree_overridden = True
+        parallel_config_dict[key] = runtime_overrides.pop(key)
+
+    if parallel_config_dict is not None and degree_overridden and not sequence_parallel_explicit:
+        ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
+        ring_degree = parallel_config_dict.get("ring_degree") or 1
+        parallel_config_dict["sequence_parallel_size"] = ulysses_degree * ring_degree
+
+    if parallel_config_dict is not None:
+        engine_args["parallel_config"] = parallel_config_dict
+
+
 class StageType(str, Enum):
     """Type of processing stage in the Omni pipeline."""
 
@@ -429,6 +461,18 @@ class StageDeployConfig:
     async_scheduling: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
+
+    # Diffusion parallel_config deploy override fields.
+    enable_expert_parallel: bool | None = None
+    ulysses_degree: int | None = None
+    ulysses_mode: str | None = None
+    ring_degree: int | None = None
+    sequence_parallel_size: int | None = None
+    cfg_parallel_size: int | None = None
+    vae_patch_parallel_size: int | None = None
+    use_hsdp: bool | None = None
+    hsdp_shard_size: int | None = None
+    hsdp_replicate_size: int | None = None
 
     # Compilation, profiling, tokenizer/config parsing, and model loading.
     compilation_config: dict[str, Any] | None = None
@@ -953,6 +997,7 @@ class StageConfig:
         """TODO(@lishunyang12): remove once engine consumes ResolvedStageConfig directly."""
         # Start with YAML engine_args defaults
         engine_args: dict[str, Any] = dict(self.yaml_engine_args)
+        runtime_overrides = dict(self.runtime_overrides)
 
         # Overlay topology-level fields
         engine_args["model_stage"] = self.model_stage
@@ -963,22 +1008,25 @@ class StageConfig:
         if self.hf_config_name:
             engine_args["hf_config_name"] = self.hf_config_name
 
+        if StageType(self.stage_type) == StageType.DIFFUSION:
+            _apply_diffusion_parallel_runtime_overrides(engine_args, runtime_overrides)
+
         # CLI overrides take precedence over YAML defaults
-        for key, value in self.runtime_overrides.items():
+        for key, value in runtime_overrides.items():
             if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
                 engine_args[key] = value
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)
         runtime.setdefault("process", True)
-        if self.runtime_overrides.get("devices") is not None:
-            runtime["devices"] = self.runtime_overrides["devices"]
-        if self.runtime_overrides.get("num_replicas") is not None:
-            runtime["num_replicas"] = self.runtime_overrides["num_replicas"]
+        if runtime_overrides.get("devices") is not None:
+            runtime["devices"] = runtime_overrides["devices"]
+        if runtime_overrides.get("num_replicas") is not None:
+            runtime["num_replicas"] = runtime_overrides["num_replicas"]
 
         # Legacy compat: migrate runtime.max_batch_size → engine_args.max_num_seqs
         legacy_mbs = runtime.pop("max_batch_size", None)
-        cli_mbs = self.runtime_overrides.get("max_batch_size")
+        cli_mbs = runtime_overrides.get("max_batch_size")
         if legacy_mbs is not None or cli_mbs is not None:
             warnings.warn(
                 "runtime.max_batch_size is deprecated and will be removed in a "
