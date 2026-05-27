@@ -199,6 +199,12 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
 
         # Qwen3 transformer backbone.
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        from vllm_omni.attention.fish_kvcache_attn import is_fish_kvcache_attn_enabled
+
+        if is_fish_kvcache_attn_enabled():
+            from vllm_omni.attention.fish_kvcache_backend import install_fish_kvcache_attn_backend
+
+            install_fish_kvcache_attn_backend(self.model)
 
         # Fish Speech uses interleaved (GPT-J) RoPE, not NeoX style.
         # vLLM's Qwen3Attention defaults to NeoX (is_neox_style=True).
@@ -672,14 +678,19 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         past_hidden = last_talker_hidden.reshape(bsz, -1).to(dtype=torch.bfloat16, device=dev)
 
         # Run Fast AR to predict all num_codebooks codes.
+        do_sample = kwargs.get("do_sample")
+        temperature = kwargs.get("temperature")
+        top_k = kwargs.get("top_k")
+        top_p = kwargs.get("top_p")
         audio_codes = self.fast_ar(
             slow_ar_hidden=past_hidden,
             semantic_token_id=input_ids.reshape(bsz),
-            do_sample=True,
-            temperature=0.8,
-            top_k=30,
-            top_p=0.9,
+            do_sample=True if do_sample is None else bool(do_sample),
+            temperature=0.8 if temperature is None else float(temperature),
+            top_k=30 if top_k is None else int(top_k),
+            top_p=0.9 if top_p is None else float(top_p),
             seed=seed,
+            generator=kwargs.get("generator"),
         )  # [B, num_codebooks]
 
         # Add codebook embeddings to the input embedding (from preprocess).

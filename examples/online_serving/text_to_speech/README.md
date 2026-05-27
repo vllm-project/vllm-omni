@@ -143,6 +143,26 @@ bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
 pip install fish-speech
 ```
 
+### Kvcache attention fast path
+
+Fish Speech S2 Pro uses a Triton decode-only kvcache attention fast path by
+default on CUDA builds. Set `VLLM_OMNI_FISH_KVCACHE_ATTN=0` to disable it, or
+`VLLM_OMNI_FISH_KVCACHE_ATTN=required` to fail fast if the fast path cannot be
+installed.
+
+```bash
+# Verify fast path availability.
+python - <<'PY'
+from vllm_omni.attention import fish_kvcache_attn
+
+print(fish_kvcache_attn.is_available())
+print(fish_kvcache_attn.load_error())
+PY
+
+# Optional: disable the runtime fast path.
+export VLLM_OMNI_FISH_KVCACHE_ATTN=0
+```
+
 ### Launch
 ```bash
 vllm serve fishaudio/s2-pro --omni --port 8091
