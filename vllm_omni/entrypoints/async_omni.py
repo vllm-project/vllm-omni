@@ -370,10 +370,16 @@ class AsyncOmni(EngineClient, OmniBase):
         except (asyncio.CancelledError, GeneratorExit):
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
+            # Cleanup BEFORE abort: self.abort() pops request_states, after
+            # which _log_summary_and_cleanup sees req_state=None and
+            # short-circuits without firing the failure counter. So fire the
+            # counter (G6 abort bucket) first while state is still live.
+            self._log_summary_and_cleanup(request_id)
             await self.abort(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
+            self._log_summary_and_cleanup(request_id)
             await self.abort(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
