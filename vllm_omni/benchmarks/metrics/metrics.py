@@ -25,6 +25,12 @@ class MultiModalsBenchmarkMetrics(BenchmarkMetrics):
     median_audio_duration_s: float = 0.0
     std_audio_duration_s: float = 0.0
     percentiles_audio_duration_s: list[tuple[float, float]] = None
+    # Streaming-audio continuity (see vllm_omni/benchmarks/audio_continuity.py).
+    mean_audio_underrun_s: float = 0.0
+    median_audio_underrun_s: float = 0.0
+    std_audio_underrun_s: float = 0.0
+    percentiles_audio_underrun_s: list[tuple[float, float]] = None
+    audio_continuity_ok_rate: float = 1.0
 
 
 def print_metrics(
@@ -83,6 +89,12 @@ def print_audio_metrics(selected_percentile_metrics, metrics: MultiModalsBenchma
     print("{:<40} {:<10.2f}".format("Total audio duration generated(s):", metrics.total_audio_duration_s))
     print("{:<40} {:<10}".format("Total audio frames generated:", metrics.total_audio_frames))
     print("{:<40} {:<10.2f}".format("Audio throughput(audio duration/s):", metrics.audio_throughput))
+    print(
+        "{:<40} {:<10.2%}".format(
+            "Streaming continuity OK rate:",
+            metrics.audio_continuity_ok_rate,
+        )
+    )
     for metric in selected_percentile_metrics:
         if metric.startswith("audio"):
             process_one_metric(metric, metrics)
@@ -100,17 +112,18 @@ def process_one_metric(
         "audio_ttfp": "Time to First Packet",
         "audio_rtf": "Real Time Factor",
         "audio_duration": "Audio Duration",
+        "audio_underrun": "Streaming Audio Underrun",
     }
 
     header = metric_header_map.get(metric_attribute_name, metric_attribute_name)
     print("{s:{c}^{n}}".format(s=header, n=50, c="-"))
 
     is_audio_rtf = metric_attribute_name == "audio_rtf"
-    is_audio_duration = metric_attribute_name == "audio_duration"
+    is_audio_duration_or_underrun = metric_attribute_name in ("audio_duration", "audio_underrun")
 
     suffix = "_ms"
     unit_suffix = " (ms)"
-    if is_audio_duration:
+    if is_audio_duration_or_underrun:
         suffix = "_s"
         unit_suffix = " (s)"
     elif is_audio_rtf:
@@ -172,6 +185,8 @@ def calculate_metrics(
     audio_rtfs: list[float] = []
     audio_duration: list[float] = []
     audio_frames: list[int] = []
+    audio_underruns: list[float] = []
+    audio_continuity_ok: list[bool] = []
     input_audio_duration = 0.0
     for i in range(len(outputs)):
         if outputs[i].success:
@@ -205,6 +220,8 @@ def calculate_metrics(
             audio_rtfs.append(getattr(outputs[i], "audio_rtf", 0.0))
             audio_duration.append(getattr(outputs[i], "audio_duration", 0.0))
             audio_frames.append(getattr(outputs[i], "audio_frames", 0.0))
+            audio_underruns.append(getattr(outputs[i], "audio_underrun_s", 0.0))
+            audio_continuity_ok.append(bool(getattr(outputs[i], "audio_continuity_ok", True)))
             e2els.append(outputs[i].latency)
             input_audio_duration += outputs[i].input_audio_duration
             completed += 1
@@ -332,6 +349,11 @@ def calculate_metrics(
         std_audio_rtf=np.std(audio_rtfs or 0),
         median_audio_rtf=np.median(audio_rtfs or 0),
         percentiles_audio_rtf=[(p, np.percentile(audio_rtfs or 0, p)) for p in selected_percentiles],
+        mean_audio_underrun_s=np.mean(audio_underruns or 0),
+        std_audio_underrun_s=np.std(audio_underruns or 0),
+        median_audio_underrun_s=np.median(audio_underruns or 0),
+        percentiles_audio_underrun_s=[(p, np.percentile(audio_underruns or 0, p)) for p in selected_percentiles],
+        audio_continuity_ok_rate=(sum(audio_continuity_ok) / len(audio_continuity_ok)) if audio_continuity_ok else 1.0,
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
         std_tpot_ms=np.std(tpots or 0) * 1000,
         median_tpot_ms=np.median(tpots or 0) * 1000,

@@ -141,10 +141,10 @@ def test_qwen_image_edit(omni_server: OmniServer, openai_client: OpenAIClientHan
 
 @pytest.mark.parametrize(
     "omni_server",
-    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2509"),
+    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2511"),
     indirect=True,
 )
-def test_qwen_image_edit_2509_single_image(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_qwen_image_edit_2511_single_image(omni_server: OmniServer, openai_client: OpenAIClientHandler):
     """Test Qwen-Image-Edit-2509 with a single image input.
 
     Regression: with tea_cache enabled and zero_cond_t=True, the TeaCache
@@ -176,10 +176,10 @@ def test_qwen_image_edit_2509_single_image(omni_server: OmniServer, openai_clien
 
 @pytest.mark.parametrize(
     "omni_server",
-    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2509"),
+    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2511"),
     indirect=True,
 )
-def test_qwen_image_edit_2509_two_images(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_qwen_image_edit_2511_two_images(omni_server: OmniServer, openai_client: OpenAIClientHandler):
     """Test Qwen-Image-Edit-2509 with two image inputs."""
     image_data_url_1 = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
     image_data_url_2 = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
