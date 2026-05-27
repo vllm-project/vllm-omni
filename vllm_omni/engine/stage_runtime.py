@@ -914,7 +914,7 @@ class DistStageRuntime(StageRuntime):
         except Exception:
             logger.exception("[DistStageRuntime] Failed to enqueue register message")
 
-    async def _build_remote_replica(self, stage_id: int, replica_id: int) -> StagePoolClient:
+    def _build_remote_replica(self, stage_id: int, replica_id: int) -> StagePoolClient:
         ctx = self._stage_remote_factory_contexts.get(stage_id)
         if ctx is None:
             raise ValueError(f"No factory context for stage {stage_id}")

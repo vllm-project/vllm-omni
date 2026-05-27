@@ -27,7 +27,7 @@ from vllm_omni.engine.stage_pool import StagePool
 
 logger = init_logger(__name__)
 
-RemoteReplicaFactory = Callable[[int, int], Awaitable[Any]]
+RemoteReplicaFactory = Callable[[int, int], Any]
 
 
 class MembershipController:
@@ -153,7 +153,7 @@ class MembershipController:
         if pool is None:
             logger.warning("[MembershipController] register: stage_id %d out of range", stage_id)
             return
-        client = await self._remote_replica_factory(stage_id, replica_id)
+        client = self._remote_replica_factory(stage_id, replica_id)
         input_addr = StagePool._client_input_addr(client)
         if input_addr is None:
             raise RuntimeError(f"remote replica factory for stage {stage_id} produced a client without input address")
