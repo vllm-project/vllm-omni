@@ -754,6 +754,8 @@ class DistStageRuntime(StageRuntime):
                 try:
                     runtime_cfg.num_replicas = self._omni_dp_size_local
                 except Exception:
+                    # TODO: make runtime config mutation typed so failed
+                    # omni_dp_size_local overrides cannot be silently lost.
                     if hasattr(runtime_cfg, "__setitem__"):
                         runtime_cfg["num_replicas"] = self._omni_dp_size_local
 
