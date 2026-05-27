@@ -120,6 +120,7 @@ class TestStageConfig:
                 "tensor_parallel_size": 2,
                 "devices": "0,1",
                 "max_batch_size": 64,
+                "env": {"HCCL_IF_BASE_PORT": 23000},
             },
         )
         with warnings.catch_warnings():
@@ -131,6 +132,8 @@ class TestStageConfig:
         assert omega_config.runtime.devices == "0,1"
         # max_batch_size is migrated to engine_args.max_num_seqs
         assert omega_config.engine_args.max_num_seqs == 64
+        assert dict(omega_config.runtime.env) == {"HCCL_IF_BASE_PORT": 23000}
+        assert "env" not in dict(omega_config.engine_args)
 
     def test_to_omegaconf_max_batch_size_deprecation(self):
         """Test that runtime.max_batch_size emits a FutureWarning."""
