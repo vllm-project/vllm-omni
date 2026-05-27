@@ -3,6 +3,7 @@ import os
 import threading
 import time
 import types
+from contextlib import contextmanager
 
 import pytest
 
@@ -189,10 +190,12 @@ def test_initialize_diffusion_replica_restores_device_visibility_after_local_ini
     old_env = os.environ.get(env_var)
     os.environ[env_var] = "0,1"
 
-    def _fake_setup_stage_devices(_stage_id, _runtime_cfg):
+    @contextmanager
+    def _fake_stage_runtime_setup(_stage_id, _runtime_cfg):
         current_omni_platform.set_device_control_env_var("1")
+        yield
 
-    monkeypatch.setattr(engine_mod, "setup_stage_devices", _fake_setup_stage_devices)
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _fake_stage_runtime_setup)
     monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
     monkeypatch.setattr(engine_mod, "initialize_diffusion_stage", lambda *_, **__: types.SimpleNamespace())
 
@@ -221,7 +224,11 @@ def test_initialize_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
 
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(engine_mod, "setup_stage_devices", lambda *_: None)
+    @contextmanager
+    def _noop_stage_runtime_setup(*_):
+        yield
+
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _noop_stage_runtime_setup)
     monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
 
     def _capture_initialize_diffusion_stage(
@@ -527,7 +534,11 @@ def test_initialize_llm_replica_passes_stage_init_timeout_to_complete_stage_hand
     prev_device_env = os.environ.get(device_env_var)
     os.environ[device_env_var] = "0"
 
-    monkeypatch.setattr(engine_mod, "setup_stage_devices", lambda *_: None)
+    @contextmanager
+    def _noop_stage_runtime_setup(*_):
+        yield
+
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _noop_stage_runtime_setup)
     monkeypatch.setattr(engine_mod, "build_engine_args_dict", lambda *_, **__: {})
     monkeypatch.setattr(engine_mod, "acquire_device_locks", lambda *_: [])
     monkeypatch.setattr(engine_mod, "spawn_stage_core", lambda **_: (fake_addresses, fake_proc, "ipc://handshake"))
