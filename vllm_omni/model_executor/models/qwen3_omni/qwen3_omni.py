@@ -237,14 +237,22 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         prompt_token_ids = tokenizer.encode(prompt_template)
 
+        # In non-async-chunk (full-payload) mode the engine treats each
+        # streaming TokensPrompt as a fresh decode, so mid-stream segment
+        # yields cause the thinker to emit duplicate responses and the
+        # talker to emit duplicate audio. Defer all audio to the final
+        # flush so the thinker sees one complete prompt.
+        async_chunk = getattr(model_config, "async_chunk", False)
+
         async for audio_chunk in audio_stream:
             buffer.write_audio(audio_chunk)
 
-            while (segment := buffer.read_audio()) is not None:
-                yield TokensPrompt(
-                    prompt_token_ids=prompt_token_ids,
-                    multi_modal_data={"audio": segment},
-                )
+            if async_chunk:
+                while (segment := buffer.read_audio()) is not None:
+                    yield TokensPrompt(
+                        prompt_token_ids=prompt_token_ids,
+                        multi_modal_data={"audio": segment},
+                    )
 
         remaining = buffer.flush()
         if remaining is not None and len(remaining) > 0:
@@ -412,13 +420,16 @@ class Qwen3OmniMoeForConditionalGeneration(
                 else:
                     codes = input_ids.reshape(1, 16, -1)
             else:
-                logger.warning(
-                    (
-                        "Input_ids length: %s is not divisible by 16, padding "
-                        "with zeros. This should only happen in warm up."
-                    ),
-                    input_ids.shape[0],
-                )
+                if seq_token_counts is None:
+                    logger.debug(
+                        "Code2Wav warmup input length %s is not divisible by 16; padding with zeros.",
+                        input_ids.shape[0],
+                    )
+                else:
+                    logger.warning_once(
+                        "Code2Wav input length is not divisible by 16; padding with zeros. "
+                        "This is expected only during cudagraph warmup."
+                    )
                 input_ids_flatten = input_ids.reshape(-1)
                 input_ids_flatten = torch.cat(
                     [
@@ -982,19 +993,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         """
         embed = payload.get("embed", {})
         meta = payload.get("meta", {})
-        ids = payload.get("ids", {})
 
         cached_thinker_decode_embeds = embed.get("cached_decode", None)
         thinker_decode_embed = embed.get("decode", None)
         start_index = meta.get("num_processed_tokens", 0)
-        thinker_output_token_ids = ids.get("output", [])
-        if start_index >= len(thinker_output_token_ids) - 1:
-            # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.
-            # Use the finished_flag to mark that all tokens output by thinker have been consumed.
-            if meta.get("eos_emitted", False):
-                return self.tts_pad_embed.to(device)
-            update_dict.setdefault("meta", {})["eos_emitted"] = True
-            return self.tts_eos_embed.to(device)
 
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
             cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
@@ -1003,10 +1005,20 @@ class Qwen3OmniMoeForConditionalGeneration(
                 thinker_decode_embed = thinker_decode_embed.to(device)
                 cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
                 update_dict.setdefault("embed", {})["cached_decode"] = cached_thinker_decode_embeds
-        else:
+
+        elif thinker_decode_embed is not None:
             thinker_embed = thinker_decode_embed
             if thinker_embed.device != device:
                 thinker_embed = thinker_embed.to(device)
+
+        else:
+            # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.
+            # Use the finished_flag to mark that all tokens output by thinker have been consumed.
+            if meta.get("eos_emitted", False):
+                return self.tts_pad_embed.to(device)
+            update_dict.setdefault("meta", {})["eos_emitted"] = True
+            return self.tts_eos_embed.to(device)
+
         update_dict.setdefault("embed", {})["decode"] = None
         return self.talker.text_projection(thinker_embed).to(device)
 
@@ -1274,6 +1286,22 @@ class Qwen3OmniMoeForConditionalGeneration(
         left_frames = int(extra.get("codec_left_context_frames", 0) or 0)
         return chunk_frames, left_frames
 
+    def _maybe_enable_code2wav_cudagraph(self) -> None:
+        """Enable the inner Code2Wav CUDA graph unless this stage runs in eager mode."""
+        if not self.code2wav or not hasattr(self.code2wav, "enable_cudagraph"):
+            return
+
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        if getattr(model_cfg, "enforce_eager", False):
+            logger.info("Code2Wav CUDA Graph disabled because enforce_eager is set")
+            return
+
+        chunk_frames, left_frames = self._get_codec_frame_config()
+        self.code2wav.enable_cudagraph(
+            codec_chunk_frames=chunk_frames,
+            codec_left_context_frames=left_frames,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for all components of the omni model."""
         loaded_weights = set()
@@ -1310,15 +1338,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             code2wav_loaded = add_prefix_to_loaded_weights(code2wav_loaded, "code2wav")
             loaded_weights.update(code2wav_loaded)
 
-            # Precompute SnakeBeta caches and enable CUDA graph for Code2Wav decoder
+            # Precompute SnakeBeta caches; Code2Wav CUDA graph follows the stage's
+            # enforce_eager setting, the same switch vLLM uses for outer graphs.
             try:
                 self.code2wav.precompute_snake_caches()
-                if hasattr(self.code2wav, "enable_cudagraph"):
-                    chunk_frames, left_frames = self._get_codec_frame_config()
-                    self.code2wav.enable_cudagraph(
-                        codec_chunk_frames=chunk_frames,
-                        codec_left_context_frames=left_frames,
-                    )
+                self._maybe_enable_code2wav_cudagraph()
             except Exception:
                 logger.warning(
                     "Failed to enable CUDA Graph for Code2Wav; falling back to eager.",

@@ -232,6 +232,7 @@ class AsyncOmni(EngineClient, OmniBase):
         priority: int = 0,
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
+        reasoning_parser_kwargs: dict[str, Any] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -937,6 +938,37 @@ class AsyncOmni(EngineClient, OmniBase):
     async def is_tracing_enabled(self) -> bool:
         """Check if tracing is enabled."""
         return False
+
+    async def notify_kv_transfer_request_rejected(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        *,
+        data_parallel_rank: int | None = None,
+    ) -> None:
+        """Notify engine that a KV-transfer request was rejected before admission.
+
+        Omni does not currently use KV-transfer pre-admission resources,
+        so this is a no-op.
+        """
+        logger.debug(
+            "KV-transfer request rejected (no-op in omni): request_id=%s",
+            request_id,
+        )
+
+    async def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
+        """Start a new weight update.
+
+        Omni does not currently support weight transfer, so this is a no-op.
+        """
+        logger.debug("Weight update start requested (no-op in omni)")
+
+    async def finish_weight_update(self) -> None:
+        """Finish the current weight update.
+
+        Omni does not currently support weight transfer, so this is a no-op.
+        """
+        logger.debug("Weight update finish requested (no-op in omni)")
 
     async def do_log_stats(self) -> None:
         """Log statistics.

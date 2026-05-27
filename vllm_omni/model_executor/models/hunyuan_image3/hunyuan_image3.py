@@ -27,17 +27,8 @@ from vllm.distributed import (
 )
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import FusedMoE as SharedFusedMoE
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
-
-try:
-    from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
-except ImportError:
-    # PyPI vllm 0.20.x neither exports `SharedFusedMoE` from the package top-level
-    # nor ships a `shared_fused_moe.py` submodule. The functionality lives on
-    # `FusedMoE` directly (which gained a `shared_experts` parameter), so alias
-    # the symbol — call sites only use the classmethod `make_expert_params_mapping`
-    # and `__init__(shared_experts=..., ...)` which are present on `FusedMoE`.
-    from vllm.model_executor.layers.fused_moe import FusedMoE as SharedFusedMoE
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -93,7 +84,7 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.tokenizer import get_tokenizer
+from vllm.tokenizers import get_tokenizer
 from vllm.utils.tensor_schema import TensorSchema
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -105,7 +96,16 @@ from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjecto
 logger = init_logger(__name__)
 
 
-@support_torch_compile
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        # positions is (3, num_tokens) for mRoPE, so the token dimension is
+        # the last dimension rather than dim 0.
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class HunyuanModel(HunYuanModel):
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads
@@ -1167,7 +1167,7 @@ def _hunyuan_image3_unpack_packed_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
-    num_experts: int,
+    num_experts: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unpack pre-computed ``(topk_weights, topk_indices)`` packed by
     :class:`HunyuanImage3SparseMoeBlock` into ``gating_output``.
@@ -1590,6 +1590,10 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         self._sampler: Sampler | None = None
         self._eos_token_id: int = tokenizer.eos_token_id
+        # Lazily built on first sample() call so we can pick up logits.device
+        # without guessing during init. See `sample()` for the comprehension
+        # fast path that uses this.
+        self._blocked_token_ids_tensor: torch.Tensor | None = None
 
         self._replace_rotary_embeddings()
         self._patch_moe_blocks()
@@ -1992,25 +1996,39 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         min_score = torch.finfo(logits.dtype).min
 
+        if self._is_comprehension:
+            # Comprehension path is stateless: we only need to mask a fixed
+            # set of blocked token ids on every step. Do it in one batched
+            # index_fill_ instead of a per-(req, id) Python loop of scalar
+            # GPU writes, and skip reading `output_token_ids` from CPU
+            # (unused here) so this branch never forces a D2H sync.
+            if self._blocked_token_ids_tensor is None and self._blocked_token_ids:
+                self._blocked_token_ids_tensor = torch.tensor(
+                    sorted(self._blocked_token_ids),
+                    dtype=torch.long,
+                    device=logits.device,
+                )
+            if self._blocked_token_ids_tensor is not None:
+                logits.index_fill_(-1, self._blocked_token_ids_tensor, min_score)
+            return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+        # Generation path retains the per-request stateful logic for forced
+        # stage-transition tokens and ratio-restriction.
         for req_idx in range(logits.shape[0]):
             decoded_tokens: list[int] = (
                 sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
             )
             last_token = decoded_tokens[-1] if decoded_tokens else -1
 
-            if self._is_comprehension:
-                for tid in self._blocked_token_ids:
-                    logits[req_idx, tid] = min_score
-            else:
-                forced = self._get_forced_token(decoded_tokens)
-                if forced is not None:
-                    logits[req_idx].fill_(min_score)
-                    logits[req_idx, forced] = 0
-                elif last_token == self._size_token_id:
-                    self._apply_ratio_restriction(logits, req_idx, min_score)
-                elif last_token in self._all_ratio_ids:
-                    logits[req_idx].fill_(min_score)
-                    logits[req_idx, self._eos_token_id] = 0
+            forced = self._get_forced_token(decoded_tokens)
+            if forced is not None:
+                logits[req_idx].fill_(min_score)
+                logits[req_idx, forced] = 0
+            elif last_token == self._size_token_id:
+                self._apply_ratio_restriction(logits, req_idx, min_score)
+            elif last_token in self._all_ratio_ids:
+                logits[req_idx].fill_(min_score)
+                logits[req_idx, self._eos_token_id] = 0
 
         return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
 

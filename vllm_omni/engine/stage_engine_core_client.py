@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 import multiprocessing.connection
+import os
 import socket
 import threading
 import weakref
@@ -20,9 +21,13 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    TRANSFER_ENGINE_CONNECTOR_NAMES,
+)
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     KV_TRANSFER_PORT_OFFSET,
 )
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
@@ -80,7 +85,8 @@ class StageEngineCoreClientBase(StageClientBase):
     def make_async_mp_client(
         vllm_config: Any,
         executor_class: type,
-        metadata: StageMetadata,
+        log_stats: bool = False,
+        metadata: StageMetadata | None = None,
         client_addresses: dict[str, str] | None = None,
         proc: Any = None,
         engine_manager: Any = None,
@@ -93,6 +99,7 @@ class StageEngineCoreClientBase(StageClientBase):
         client_args = dict(
             vllm_config=vllm_config,
             executor_class=executor_class,
+            log_stats=log_stats,
             metadata=metadata,
             client_addresses=client_addresses,
             proc=proc,
@@ -328,11 +335,13 @@ class StageEngineCoreClientBase(StageClientBase):
         if sender_host is not None:
             self._kv_sender_host = sender_host
 
+        connector_type = connector_config.get("type")
         sender_port = connector_config.get("sender_zmq_port")
-        if sender_port is None:
+        if connector_type in TRANSFER_ENGINE_CONNECTOR_NAMES or sender_port is None:
             base_port = connector_config.get("zmq_port")
             if base_port is None:
                 return
+            base_port = os.path.expandvars(str(base_port))
 
             omni_kv_config = getattr(self, "_omni_kv_config", None)
             from_stage = self.stage_id
@@ -342,7 +351,12 @@ class StageEngineCoreClientBase(StageClientBase):
             try:
                 # Orchestrator always reports rank-0's port; receiver
                 # workers add their own local_rank * KV_RANK_PORT_STRIDE.
-                sender_port = int(base_port) + KV_TRANSFER_PORT_OFFSET + int(from_stage)
+                sender_port = kv_zmq_port(
+                    int(base_port),
+                    int(from_stage),
+                    local_rank=0,
+                    replica_id=self.replica_id,
+                )
             except (TypeError, ValueError):
                 logger.warning(
                     "[StageEngineCoreClient] stage-%s [rep-%s] could not resolve sender_zmq_port "
@@ -384,7 +398,12 @@ class StageEngineCoreClientBase(StageClientBase):
         # rank-0 base port; receiver workers adjust per KV_RANK_PORT_STRIDE.
         return {
             "host": self._kv_sender_host,
-            "zmq_port": base_port + kv_transfer_port_offset + int(self.stage_id),
+            "zmq_port": kv_zmq_port(
+                base_port - KV_TRANSFER_PORT_OFFSET + kv_transfer_port_offset,
+                int(self.stage_id),
+                local_rank=0,
+                replica_id=self.replica_id,
+            ),
         }
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None:
@@ -441,7 +460,7 @@ class StageEngineCoreClientBase(StageClientBase):
             kwargs=kwargs,
         )
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown managed resources and any externally spawned subprocess."""
         child_procs: list[psutil.Process] = []
         if self._proc is not None and self._proc.pid is not None:
@@ -451,7 +470,7 @@ class StageEngineCoreClientBase(StageClientBase):
                 child_procs = []
 
         try:
-            super().shutdown()
+            super().shutdown(timeout=timeout)
         finally:
             if self._proc is not None and self._proc.is_alive():
                 self._proc.terminate()

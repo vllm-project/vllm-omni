@@ -30,7 +30,6 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
 
-from .autoencoder import AutoencoderKLConv3D
 from .hunyuan_image3_tokenizer import TokenizerWrapper
 from .hunyuan_image3_transformer import (
     CausalMMOutputWithPast,
@@ -343,7 +342,13 @@ class HunyuanImage3Pipeline(
         quant_config = od_config.quantization_config
         self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
         self.transformer = self.model
-        self.vae = AutoencoderKLConv3D.from_config(self.hf_config.vae)
+        # Lazy import to break circular dependency:
+        # autoencoder_kl_hunyuan -> hunyuan_image3/__init__ -> pipeline_hunyuan_image3 -> autoencoder_kl_hunyuan
+        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_hunyuan import (  # noqa: PLC0415
+            DistributedAutoencoderKLHunyuan,
+        )
+
+        self.vae = DistributedAutoencoderKLHunyuan.from_config(self.hf_config.vae)
         self.vae.use_spatial_tiling = self.od_config.vae_use_tiling
         self._pipeline = None
         self._tkwrapper = TokenizerWrapper(od_config.model)

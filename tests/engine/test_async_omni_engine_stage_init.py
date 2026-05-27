@@ -3,6 +3,7 @@ import os
 import threading
 import time
 import types
+from contextlib import contextmanager
 
 import pytest
 
@@ -171,18 +172,6 @@ def test_collect_initialized_clients_for_cleanup_deduplicates_clients():
     assert cleanup_clients == [shared, extra]
 
 
-def test_initialize_stages_rejects_non_diffusion_replicas_in_single_stage_mode():
-    engine = object.__new__(AsyncOmniEngine)
-    engine.single_stage_mode = True
-    engine.stage_configs = [types.SimpleNamespace(stage_id=0, runtime={"num_replicas": 2})]
-
-    with pytest.raises(
-        ValueError,
-        match="single_stage_mode only supports num_replicas > 1 for diffusion stages",
-    ):
-        engine._validate_single_stage_mode_replica_constraints()
-
-
 def test_initialize_diffusion_replica_restores_device_visibility_after_local_init(monkeypatch):
     import vllm_omni.engine.async_omni_engine as engine_mod
     from vllm_omni.platforms import current_omni_platform
@@ -201,10 +190,12 @@ def test_initialize_diffusion_replica_restores_device_visibility_after_local_ini
     old_env = os.environ.get(env_var)
     os.environ[env_var] = "0,1"
 
-    def _fake_setup_stage_devices(_stage_id, _runtime_cfg):
+    @contextmanager
+    def _fake_stage_runtime_setup(_stage_id, _runtime_cfg):
         current_omni_platform.set_device_control_env_var("1")
+        yield
 
-    monkeypatch.setattr(engine_mod, "setup_stage_devices", _fake_setup_stage_devices)
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _fake_stage_runtime_setup)
     monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
     monkeypatch.setattr(engine_mod, "initialize_diffusion_stage", lambda *_, **__: types.SimpleNamespace())
 
@@ -233,7 +224,11 @@ def test_initialize_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
 
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(engine_mod, "setup_stage_devices", lambda *_: None)
+    @contextmanager
+    def _noop_stage_runtime_setup(*_):
+        yield
+
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _noop_stage_runtime_setup)
     monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
 
     def _capture_initialize_diffusion_stage(
@@ -427,6 +422,7 @@ def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_rep
     engine.single_stage_mode = False
     engine._single_stage_id_filter = None
     engine._omni_master_server = None
+    engine._coordinator_runtime = None
     engine.stage_configs = [types.SimpleNamespace()]
 
     cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
@@ -471,6 +467,7 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
     engine.single_stage_mode = False
     engine._single_stage_id_filter = None
     engine._omni_master_server = None
+    engine._coordinator_runtime = None
     engine.stage_configs = [types.SimpleNamespace()]
 
     cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
@@ -537,7 +534,11 @@ def test_initialize_llm_replica_passes_stage_init_timeout_to_complete_stage_hand
     prev_device_env = os.environ.get(device_env_var)
     os.environ[device_env_var] = "0"
 
-    monkeypatch.setattr(engine_mod, "setup_stage_devices", lambda *_: None)
+    @contextmanager
+    def _noop_stage_runtime_setup(*_):
+        yield
+
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _noop_stage_runtime_setup)
     monkeypatch.setattr(engine_mod, "build_engine_args_dict", lambda *_, **__: {})
     monkeypatch.setattr(engine_mod, "acquire_device_locks", lambda *_: [])
     monkeypatch.setattr(engine_mod, "spawn_stage_core", lambda **_: (fake_addresses, fake_proc, "ipc://handshake"))

@@ -22,7 +22,9 @@ from vllm_omni.diffusion.sched.interface import (
 
 logger = init_logger(__name__)
 
-_KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey))
+# LoRA identity is derived from `sampling.lora_request`, not a same-named field
+# on sampling params, so it must be resolved separately from the bulk lookup.
+_KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {"lora_int_id"}
 
 
 def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey | None:
@@ -31,7 +33,11 @@ def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey 
         return None
 
     sampling = request.sampling_params
-    return SamplingParamsKey(**{name: getattr(sampling, name) for name in _KEY_FIELD_NAMES})
+    lora_request = getattr(sampling, "lora_request", None)
+    return SamplingParamsKey(
+        lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
+        **{name: getattr(sampling, name) for name in _KEY_FIELD_NAMES},
+    )
 
 
 class _BaseScheduler(SchedulerInterface):
@@ -70,8 +76,9 @@ class _BaseScheduler(SchedulerInterface):
 
     def _add_request_with_sched_req_id(self, sched_req_id: str, request: OmniDiffusionRequest) -> str:
         state = self._make_request_state(sched_req_id, request)
+        request_ids = self._request_ids_for_mapping(request)
+        self._register_request_ids(request_ids, sched_req_id)
         self._request_states[sched_req_id] = state
-        self._register_request_ids(request.request_ids, sched_req_id)
         self._waiting.append(sched_req_id)
         logger.debug("%s add_request: %s (waiting=%d)", self.__class__.__name__, sched_req_id, len(self._waiting))
         return sched_req_id
@@ -134,7 +141,7 @@ class _BaseScheduler(SchedulerInterface):
         self._pop_extra_request_state(sched_req_id)
         state = self._request_states.pop(sched_req_id, None)
         if state is not None:
-            self._unregister_request_ids(state.req.request_ids, sched_req_id)
+            self._unregister_request_ids(self._request_ids_for_mapping(state.req), sched_req_id)
         return state
 
     def preempt_request(self, sched_req_id: str) -> bool:
@@ -253,13 +260,22 @@ class _BaseScheduler(SchedulerInterface):
         return self._running_sampling_params_key
 
     def _register_request_ids(self, request_ids: list[str], sched_req_id: str) -> None:
-        for request_id in request_ids:
+        unique_request_ids = list(dict.fromkeys(request_ids))
+        for request_id in unique_request_ids:
             existing = self._request_id_to_sched_req_id.get(request_id)
             if existing is not None and existing != sched_req_id:
                 raise ValueError(f"request_id {request_id!r} is already mapped to active sched_req_id {existing!r}.")
+        for request_id in unique_request_ids:
             self._request_id_to_sched_req_id[request_id] = sched_req_id
 
     def _unregister_request_ids(self, request_ids: list[str], sched_req_id: str) -> None:
         for request_id in request_ids:
             if self._request_id_to_sched_req_id.get(request_id) == sched_req_id:
                 self._request_id_to_sched_req_id.pop(request_id, None)
+
+    @staticmethod
+    def _request_ids_for_mapping(request: OmniDiffusionRequest) -> list[str]:
+        request_ids = list(request.request_ids)
+        if request_id := getattr(request, "request_id", None):
+            request_ids.append(request_id)
+        return list(dict.fromkeys(request_ids))

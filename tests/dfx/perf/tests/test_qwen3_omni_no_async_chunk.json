@@ -3,31 +3,67 @@
         "test_name": "test_qwen3_omni",
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "extra_cli_args": ["--no-async-chunk"]
+            "extra_cli_args": [
+                "--no-async-chunk"
+            ]
         },
         "benchmark_params": [
             {
                 "dataset_name": "random",
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
-                "num_prompts": [4, 16, 32, 64, 128],
-                "max_concurrency": [1, 4, 8, 16, 32],
+                "num_prompts": [
+                    4,
+                    16,
+                    32,
+                    64,
+                    128
+                ],
+                "max_concurrency": [
+                    1,
+                    4,
+                    8,
+                    16,
+                    32
+                ],
                 "random_input_len": 2500,
                 "random_output_len": 900,
                 "ignore_eos": true,
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [1000, 3000, 5000, 7000, 9000],
-                    "mean_audio_ttfp_ms": [30000, 60000, 90000, 120000, 150000],
-                    "mean_audio_rtf": [0.35, 0.45, 0.55, 0.65, 0.75]
+                    "mean_ttft_ms": [
+                        400,
+                        300,
+                        400,
+                        600,
+                        900
+                    ],
+                    "mean_e2el_ms": [
+                        32000,
+                        34000,
+                        45000,
+                        61000,
+                        90000
+                    ],
+                    "mean_audio_rtf": [
+                        0.20,
+                        0.25,
+                        0.30,
+                        0.45,
+                        0.60
+                    ]
                 }
             },
             {
                 "dataset_name": "random-mm",
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
-                "num_prompts": [10],
-                "request_rate": [0.1],
+                "num_prompts": [
+                    10
+                ],
+                "request_rate": [
+                    0.1
+                ],
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
@@ -42,17 +78,27 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [2000],
-                    "mean_audio_ttfp_ms": [10000],
-                    "mean_audio_rtf": [0.25]
+                    "mean_ttft_ms": [
+                        500
+                    ],
+                    "mean_e2el_ms": [
+                        6000
+                    ],
+                    "mean_audio_rtf": [
+                        0.20
+                    ]
                 }
             },
             {
                 "dataset_name": "random-mm",
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
-                "num_prompts": [40],
-                "request_rate": [0.5],
+                "num_prompts": [
+                    40
+                ],
+                "request_rate": [
+                    0.5
+                ],
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
@@ -69,17 +115,27 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [6000],
-                    "mean_audio_ttfp_ms": [15000],
-                    "mean_audio_rtf": [0.45]
+                    "mean_ttft_ms": [
+                        300
+                    ],
+                    "mean_e2el_ms": [
+                        7000
+                    ],
+                    "mean_audio_rtf": [
+                        0.20
+                    ]
                 }
             },
             {
                 "dataset_name": "random-mm",
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
-                "num_prompts": [100],
-                "request_rate": [1.0],
+                "num_prompts": [
+                    100
+                ],
+                "request_rate": [
+                    1.0
+                ],
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
@@ -98,9 +154,15 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [12000],
-                    "mean_audio_ttfp_ms": [18000],
-                    "mean_audio_rtf": [0.9]
+                    "mean_ttft_ms": [
+                        700
+                    ],
+                    "mean_e2el_ms": [
+                        9000
+                    ],
+                    "mean_audio_rtf": [
+                        0.30
+                    ]
                 }
             }
         ]

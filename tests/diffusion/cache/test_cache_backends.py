@@ -127,6 +127,10 @@ class TestCacheDiTBackend:
         """Test HunyuanImage3 custom cache-dit enabler is registered."""
         assert "HunyuanImage3Pipeline" in CUSTOM_DIT_ENABLERS
 
+    def test_dreamid_custom_enabler_registered(self):
+        """Test DreamIDOmni custom cache-dit enabler is registered."""
+        assert "DreamIDOmniPipeline" in CUSTOM_DIT_ENABLERS
+
     @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
     @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
     def test_enable_hunyuan_pipeline_uses_model_transformer(self, mock_cache_dit, mock_block_adapter):
@@ -167,6 +171,47 @@ class TestCacheDiTBackend:
         backend = CacheDiTBackend({"Fn_compute_blocks": 2})
 
         with pytest.raises(ValueError, match="HunyuanImage3Pipeline"):
+            backend.enable(mock_pipeline)
+
+    @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
+    def test_enable_dreamid_pipeline_uses_fused_blocks(self, mock_cache_dit, mock_block_adapter):
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "DreamIDOmniPipeline"
+        mock_pipeline.transformer = Mock()
+        mock_pipeline.transformer.fused_blocks = Mock()
+
+        mock_cache_dit.enable_cache = Mock()
+        mock_cache_dit.refresh_context = Mock()
+
+        backend = CacheDiTBackend({"Fn_compute_blocks": 2})
+        backend.enable(mock_pipeline)
+
+        assert backend.enabled is True
+        assert backend._refresh_func is not None
+        mock_block_adapter.assert_called_once()
+        adapter_kwargs = mock_block_adapter.call_args.kwargs
+        assert adapter_kwargs["transformer"] is mock_pipeline.transformer
+        assert adapter_kwargs["blocks"] is mock_pipeline.transformer.fused_blocks
+        assert adapter_kwargs["forward_pattern"] == adapter_kwargs["forward_pattern"].__class__.Pattern_0
+        assert adapter_kwargs["has_separate_cfg"] is True
+        assert len(adapter_kwargs["params_modifiers"]) == 1
+        mock_cache_dit.enable_cache.assert_called_once()
+
+        backend.refresh(mock_pipeline, num_inference_steps=12)
+        mock_cache_dit.refresh_context.assert_called_once()
+        call_args = mock_cache_dit.refresh_context.call_args
+        assert call_args[0][0] is mock_pipeline.transformer
+        assert call_args[1]["num_inference_steps"] == 12
+
+    def test_enable_dreamid_pipeline_requires_fused_blocks(self):
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "DreamIDOmniPipeline"
+        mock_pipeline.transformer = Mock(spec=[])
+
+        backend = CacheDiTBackend({"Fn_compute_blocks": 2})
+
+        with pytest.raises(ValueError, match="DreamIDOmniPipeline"):
             backend.enable(mock_pipeline)
 
 
