@@ -775,7 +775,7 @@ def _launch_omni_core_engines(
     """Launch local engine cores using the omni registration flow.
 
     When ``omni_coordinator_address`` is provided, the spawned engine
-    subprocesses use :class:`OmniCoreEngineProcManager` and each
+    subprocesses use :class:`StageEngineCoreProcManager` and each
     instantiates an :class:`OmniCoordClientForStage` after the handshake
     completes so the head's :class:`OmniCoordinator` knows about them.
     """
@@ -841,9 +841,9 @@ def _launch_omni_core_engines(
         if omni_coordinator_address is not None:
             # Use the omni subclass so each spawned subprocess instantiates
             # an OmniCoordClientForStage and heartbeats to the coordinator.
-            from vllm_omni.engine.omni_core_engine_proc_manager import OmniCoreEngineProcManager
+            from vllm_omni.engine.stage_engine_core_proc_manager import StageEngineCoreProcManager
 
-            local_engine_manager: CoreEngineProcManager = OmniCoreEngineProcManager(
+            local_engine_manager: CoreEngineProcManager = StageEngineCoreProcManager(
                 local_engine_count=local_engine_count,
                 start_index=start_index,
                 local_start_index=local_start_index,
@@ -922,12 +922,12 @@ def launch_stage_replica(
 
     from vllm.utils.network_utils import get_open_zmq_ipc_path
 
-    from vllm_omni.engine.omni_core_engine_proc_manager import OmniCoreEngineProcManager
+    from vllm_omni.engine.stage_engine_core_proc_manager import StageEngineCoreProcManager
 
     addresses = get_engine_zmq_addresses(vllm_config)
     handshake_address = get_open_zmq_ipc_path()
     engines_to_handshake = [CoreEngine(index=0, local=True)]
-    engine_manager = OmniCoreEngineProcManager(
+    engine_manager = StageEngineCoreProcManager(
         local_engine_count=1,
         start_index=0,
         local_start_index=0,
@@ -977,7 +977,7 @@ def launch_headless_llm_replica(
     ``OmniMasterServer``. Keep that registration/manager wiring in the startup
     layer so the CLI only handles argument/config normalization.
     """
-    from vllm_omni.engine.omni_core_engine_proc_manager import OmniCoreEngineProcManager
+    from vllm_omni.engine.stage_engine_core_proc_manager import StageEngineCoreProcManager
 
     parallel_config = vllm_config.parallel_config
     local_engine_count = parallel_config.data_parallel_size_local
@@ -995,7 +995,7 @@ def launch_headless_llm_replica(
         replica_bind_address=replica_bind_address,
     )
 
-    manager = OmniCoreEngineProcManager(
+    manager = StageEngineCoreProcManager(
         local_engine_count=local_engine_count,
         start_index=dp_rank,
         local_start_index=0,

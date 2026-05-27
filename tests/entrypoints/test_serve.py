@@ -134,7 +134,7 @@ def _make_stage_cfg(stage_id: int, stage_type: str) -> SimpleNamespace:
 def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: MockerFixture) -> None:
     """LLM headless: each loop iteration registers with auto-assigned
     replica_id (master picks a free slot) and spawns one
-    ``OmniCoreEngineProcManager`` per local replica."""
+    ``StageEngineCoreProcManager`` per local replica."""
     from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
 
     stage_cfg = _make_stage_cfg(0, stage_type="llm")
@@ -174,7 +174,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
         ),
     )
     mock_manager_cls = mocker.patch(
-        "vllm_omni.engine.omni_core_engine_proc_manager.OmniCoreEngineProcManager",
+        "vllm_omni.engine.stage_engine_core_proc_manager.StageEngineCoreProcManager",
         return_value=engine_manager,
     )
     mocker.patch("signal.signal")
@@ -253,7 +253,7 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
         ],
     )
     mock_manager_cls = mocker.patch(
-        "vllm_omni.engine.omni_core_engine_proc_manager.OmniCoreEngineProcManager",
+        "vllm_omni.engine.stage_engine_core_proc_manager.StageEngineCoreProcManager",
         side_effect=[manager_a, manager_b],
     )
     mocker.patch("signal.signal")
