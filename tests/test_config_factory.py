@@ -135,6 +135,30 @@ class TestStageConfig:
         assert dict(omega_config.runtime.env) == {"HCCL_IF_BASE_PORT": 23000}
         assert "env" not in dict(omega_config.engine_args)
 
+    def test_to_omegaconf_env_override_merges_yaml_defaults(self):
+        """CLI env overrides merge into yaml_runtime.env instead of replacing it."""
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            yaml_runtime={
+                "env": {
+                    "HCCL_IF_BASE_PORT": 24000,
+                    "HCCL_HOST_SOCKET_PORT_RANGE": "24000-24199",
+                    "HCCL_NPU_SOCKET_PORT_RANGE": "24200-24399",
+                }
+            },
+            runtime_overrides={"env": {"HCCL_IF_BASE_PORT": 23000}},
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            omega_config = config.to_omegaconf()
+
+        assert dict(omega_config.runtime.env) == {
+            "HCCL_IF_BASE_PORT": 23000,
+            "HCCL_HOST_SOCKET_PORT_RANGE": "24000-24199",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24200-24399",
+        }
+
     def test_to_omegaconf_max_batch_size_deprecation(self):
         """Test that runtime.max_batch_size emits a FutureWarning."""
         config = StageConfig(
