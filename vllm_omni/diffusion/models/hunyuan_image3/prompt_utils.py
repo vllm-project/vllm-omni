@@ -219,7 +219,7 @@ def build_prompt(
     effective_sys_type = sys_type or preset_sys_type
 
     system_prompt = get_system_prompt(effective_sys_type, bot_task, custom_system_prompt)
-    sys_text = system_prompt or ""
+    sys_text = system_prompt.strip() if system_prompt is not None else ""
 
     has_image_input = task in ("i2t", "it2i")
     if has_image_input:
@@ -288,7 +288,7 @@ def build_prompt_tokens(
         )
 
     system_prompt = get_system_prompt(effective_sys_type, bot_task, custom_system_prompt)
-    sys_text = system_prompt or ""
+    sys_text = system_prompt.strip() if system_prompt is not None else ""
 
     ids: list[int] = [bos_id]
     if sys_text:
