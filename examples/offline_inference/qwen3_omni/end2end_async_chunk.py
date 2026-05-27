@@ -41,6 +41,7 @@ from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.media.audio import load_audio
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 logger = logging.getLogger(__name__)
@@ -382,13 +383,7 @@ async def run_all(args):
     print(f"[Info] Creating AsyncOmni with deploy_config={args.deploy_config}")
     async_omni = None
     try:
-        # ``from_cli_args`` expands vars(args) into kwargs and auto-captures
-        # ``_cli_explicit_keys`` from ``sys.argv[1:]`` so argparse defaults
-        # do not silently override deploy YAML values. Mirrors the
-        # ``EngineArgs.from_cli_args`` pattern used throughout vllm /
-        # vllm-omni. ``deploy_config=None`` (the default) falls through to
-        # the bundled ``vllm_omni/deploy/qwen3_omni_moe.yaml``.
-        async_omni = AsyncOmni.from_cli_args(args)
+        async_omni = AsyncOmni(**vars(args))
 
         # Use default sampling params from stage config (they are pre-configured
         # in the YAML for each stage).
@@ -594,6 +589,7 @@ def parse_args():
         default=16000,
         help="Sampling rate for audio loading.",
     )
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

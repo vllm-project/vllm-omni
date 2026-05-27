@@ -5,6 +5,9 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
+- **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
+
+See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, and MOSS-TTS-Nano.
 
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
@@ -26,6 +29,10 @@ vllm serve fishaudio/s2-pro --omni --port 8091
 
 # Voxtral TTS
 vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
+
+# CosyVoice3 (voice cloning only — supply ref_audio + ref_text per request)
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+    --omni --port 8091 --trust-remote-code
 ```
 
 ### Generate Speech
@@ -531,16 +538,18 @@ for result in response.json()["results"]:
 
 All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_batch_size` and queues the rest — no client-side throttling needed.
 
-For best throughput, set both stages' `max_num_seqs` to ≥4 via `--stage-overrides`:
+For best throughput, set both stages' `max_num_seqs` above 1 via `--stage-overrides`. On the current Qwen3-TTS CustomVoice benchmark, stage 1 performed best at `max_num_seqs: 10`:
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --omni --port 8091 --trust-remote-code --enforce-eager \
-    --stage-overrides '{"0":{"max_num_seqs":4,"gpu_memory_utilization":0.2},
-                        "1":{"max_num_seqs":4,"gpu_memory_utilization":0.2}}'
+    --stage-overrides '{"0":{"max_num_seqs":10,"gpu_memory_utilization":0.2},
+                        "1":{"max_num_seqs":10,"gpu_memory_utilization":0.2}}'
 ```
 
-The bundled `qwen3_tts.yaml` uses `max_num_seqs: 1` (single request) on both stages. Bumping to 4 yields roughly 4× throughput on the talker and lets stage 1 batch chunks across in-flight requests.
+The bundled `qwen3_tts.yaml` uses a multi-request default and lets stage 1 batch chunks across in-flight requests. For latency-sensitive deployments, avoid forcing stage 1 back to `max_num_seqs: 1`; benchmark before reducing it below `10`.
+
+The bundled config also sets `initial_codec_chunk_frames: 1`. This emits only the first audio chunk early for lower TTFA, then returns to the normal `codec_chunk_frames` window so Code2Wav does not repeatedly decode tiny overlapping chunks.
 
 ## Supported Models
 

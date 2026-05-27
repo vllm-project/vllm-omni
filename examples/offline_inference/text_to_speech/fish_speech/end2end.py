@@ -29,6 +29,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import AsyncOmni, Omni
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.model_executor.models.fish_speech.dac_utils import DAC_HOP_LENGTH, DAC_SAMPLE_RATE
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
@@ -266,6 +267,7 @@ def parse_args():
         default=False,
         help="Stream audio chunks as they arrive via AsyncOmni.",
     )
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

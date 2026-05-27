@@ -2,17 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import os
+import urllib.request
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 from vllm import SamplingParams
-from vllm.assets.audio import AudioAsset
 from vllm.multimodal.media.audio import load_audio
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
+from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+
+# Upstream zero-shot reference clip
+ZERO_SHOT_PROMPT_URL = "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
+
+
+def _default_ref_audio() -> str:
+    # Download the upstream zero_shot_prompt.wav into the current dir
+    dest = Path("zero_shot_prompt.wav")
+    if not dest.exists() or dest.stat().st_size == 0:
+        print(f"Downloading default reference audio to {dest}")
+        urllib.request.urlretrieve(ZERO_SHOT_PROMPT_URL, dest)
+
+    return str(dest)
 
 
 def run_e2e():
@@ -35,15 +50,22 @@ def run_e2e():
     parser.add_argument(
         "--prompt-text",
         type=str,
-        default="You are a helpful assistant.<|endofprompt|>Testing my voices. Why should I not?",
+        default="You are a helpful assistant.<|endofprompt|>希望你以后，能够做的比我还好呦!",
     )
-    parser.add_argument("--ref-audio", type=str, default="prompt.wav")
+    parser.add_argument(
+        "--ref-audio",
+        type=str,
+        default=None,
+        help="Path to reference audio for voice cloning. "
+        "If unset, downloads the upstream CosyVoice3 zero-shot prompt audio clip",
+    )
     parser.add_argument(
         "--tokenizer",
         type=str,
         required=True,
         help="Path to tokenizer directory (e.g., <model_path>/CosyVoice-BlankEN).",
     )
+    nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     # Ensure tokenizer directory exists
     if not os.path.exists(args.tokenizer):
@@ -64,24 +86,22 @@ def run_e2e():
     sampling_cfg = {"top_p": 0.8, "top_k": 25, "eos_token_id": 6561 + 1}
 
     print("Model initialized. Preparing inputs...")
-    if args.ref_audio:
-        if not os.path.exists(args.ref_audio):
-            raise FileNotFoundError(f"Audio file not found: {args.ref_audio}")
-        # Load at native sample rate
-        audio_signal, sr = load_audio(args.ref_audio, sr=None)
+    ref_audio_path = args.ref_audio or _default_ref_audio()
+    if not os.path.exists(ref_audio_path):
+        raise FileNotFoundError(f"Audio file not found: {ref_audio_path}")
+    # Load at native sample rate
+    audio_signal, sr = load_audio(ref_audio_path, sr=None)
 
-        # Validate sample rate before processing (similar to original CosyVoice)
-        min_sr = 16000
-        if sr < min_sr:
-            raise ValueError(
-                f"Audio sample rate {sr} Hz is too low. "
-                f"Minimum required: {min_sr} Hz. "
-                f"Please provide audio with sample rate >= {min_sr} Hz."
-            )
+    # Validate sample rate before processing (similar to original CosyVoice)
+    min_sr = 16000
+    if sr < min_sr:
+        raise ValueError(
+            f"Audio sample rate {sr} Hz is too low. "
+            f"Minimum required: {min_sr} Hz. "
+            f"Please provide audio with sample rate >= {min_sr} Hz."
+        )
 
-        audio_data = (audio_signal.astype(np.float32), sr)
-    else:
-        audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
+    audio_data = (audio_signal.astype(np.float32), sr)
 
     prompts = {
         "prompt": args.text,

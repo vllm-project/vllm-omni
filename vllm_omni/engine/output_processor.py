@@ -3,6 +3,9 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    split_routed_experts,
+)
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
@@ -230,7 +233,17 @@ class OmniRequestState(RequestState):
                 self.sent_tokens_offset = self.detokenizer.num_output_tokens()
 
         external_req_id = self.external_req_id
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, routed_experts)
+
+        # Split routing data into prompt and generation portions, matching
+        # upstream make_request_output behaviour.
+        prompt_routed_experts = None
+        gen_routed_experts = None
+        if routed_experts is not None:
+            prompt_len = len(self.prompt_token_ids) if self.prompt_token_ids else 0
+            num_gen = self.detokenizer.num_output_tokens() if self.detokenizer is not None else None
+            prompt_routed_experts, gen_routed_experts = split_routed_experts(routed_experts, prompt_len, num_gen)
+
+        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, gen_routed_experts)
 
         if self.parent_req is None:
             outputs = [output]
@@ -240,7 +253,13 @@ class OmniRequestState(RequestState):
                 return None
             external_req_id = self.parent_req.external_req_id
 
-        return self._new_request_output(external_req_id, outputs, finished, kv_transfer_params)
+        return self._new_request_output(
+            external_req_id,
+            outputs,
+            finished,
+            kv_transfer_params,
+            prompt_routed_experts,
+        )
 
     def _new_completion_output(
         self,
@@ -358,6 +377,24 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
         self.external_req_ids[req_state.external_req_id].append(request_id)
+
+    def remove_request(self, request_id: str) -> None:
+        """Rollback one previously registered request if it was never submitted."""
+        req_state = self.request_states.pop(request_id, None)
+        if req_state is None:
+            return
+
+        external_req_id = getattr(req_state, "external_req_id", None)
+        if external_req_id is not None:
+            request_ids = self.external_req_ids.get(external_req_id)
+            if request_ids is not None:
+                self.external_req_ids[external_req_id] = [rid for rid in request_ids if rid != request_id]
+                if not self.external_req_ids[external_req_id]:
+                    self.external_req_ids.pop(external_req_id, None)
+
+        parent_req = getattr(req_state, "parent_req", None)
+        if parent_req is not None:
+            self.parent_requests.pop(parent_req.request_id, None)
 
     def process_outputs(
         self,

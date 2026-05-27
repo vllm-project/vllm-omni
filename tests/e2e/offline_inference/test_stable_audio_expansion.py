@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import torch
 
+from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.assertions import assert_audio_valid
 from tests.helpers.mark import hardware_test
 from vllm_omni import Omni
@@ -23,6 +24,8 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+
+_MODEL_REPO = "stabilityai/stable-audio-open-1.0"
 
 _SAMPLE_RATE = 44100
 _CLIP_DURATION_S = 2.0
@@ -77,8 +80,15 @@ def test_stable_audio_quantization_and_teacache() -> None:
 
     CI should provide ``HF_TOKEN`` if the checkpoint is gated.
     """
+    skip_if_gated_repo_inaccessible(_MODEL_REPO)
+    # ``model_class_name`` must be passed explicitly: the default-stage-cfg
+    # factory in ``async_omni_engine.py`` reads it out of ``kwargs`` when
+    # deciding ``final_output_type`` (#2077), and at construction time the
+    # auto-resolution from ``model_index.json`` has not run yet. AudioX's
+    # offline test follows the same pattern.
     m = Omni(
         model="stabilityai/stable-audio-open-1.0",
+        model_class_name="StableAudioPipeline",
         quantization="fp8",
         cache_backend="tea_cache",
         cache_config={"rel_l1_thresh": 0.2},

@@ -1,5 +1,6 @@
 # tests/entrypoints/openai/test_serving_speech.py
 import asyncio
+import json
 import logging
 import os
 import struct
@@ -564,7 +565,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_success(self, client):
         """Upload a voice via speaker_embedding JSON."""
-        import json
 
         emb = [0.1] * 1024
         data = {
@@ -585,7 +585,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_appears_in_listing(self, client):
         """Embedding-uploaded voice appears in list with correct source."""
-        import json
 
         emb = [0.2] * 2048
         data = {
@@ -606,7 +605,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_and_audio_mutually_exclusive(self, client):
         """Providing both audio_sample and speaker_embedding returns 400."""
-        import json
 
         emb = [0.1] * 1024
         files = {"audio_sample": ("test.wav", b"fake", "audio/wav")}
@@ -632,7 +630,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_nan_rejected(self, client):
         """NaN values in speaker_embedding return 400."""
-        import json
 
         data = {
             "speaker_embedding": json.dumps([0.1] * 1023 + [float("nan")]),
@@ -642,6 +639,45 @@ class TestSpeechAPI:
         response = client.post("/v1/audio/voices", data=data)
         assert response.status_code == 400
         assert "finite" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_create_diffusion_speech_extra_params(self, mocker: MockerFixture):
+        """Test that extra_params are correctly applied to sampling_params_list in diffusion mode."""
+        # Mock the engine client
+        mock_engine = mocker.MagicMock()
+
+        # Mock default sampling params
+        mock_sampling_param = mocker.MagicMock()
+        mock_sampling_param.extra_args = {"existing_arg": "value"}
+        mock_engine.default_sampling_params_list = [mock_sampling_param]
+
+        # Mock generate to yield a valid OmniRequestOutput
+        async def mock_generate(*args, **kwargs):
+            yield create_mock_audio_output_for_test()
+
+        mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
+
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+
+        # Mock create_audio to avoid actual audio processing/saving
+        mocker.patch.object(
+            server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy", media_type="audio/wav")
+        )
+
+        req = OpenAICreateSpeechRequest(input="Hello", extra_params={"new_arg": 123, "existing_arg": "new_value"})
+
+        await server._create_diffusion_speech(req)
+
+        # Verify generate was called
+        mock_engine.generate.assert_called_once()
+
+        # Get the sampling_params_list passed to generate
+        kwargs = mock_engine.generate.call_args.kwargs
+        passed_params = kwargs["sampling_params_list"]
+
+        # Verify it was deepcopied and updated
+        assert passed_params is not mock_engine.default_sampling_params_list
+        assert passed_params[0].extra_args == {"existing_arg": "new_value", "new_arg": 123}
 
 
 class TestTTSMethods:
@@ -891,7 +927,6 @@ class TestTTSMethods:
 
     def test_upload_voice_embedding_wrong_dims_rejected(self, speech_server):
         """Embedding uploads must match the loaded Qwen3-TTS model before being stored."""
-        import json
 
         speech_server._tts_model_type = "qwen3_tts"
         speech_server.engine_client.model_config = SimpleNamespace(
@@ -2298,6 +2333,84 @@ class TestCosyVoice3Serving:
         assert generator == "generator"
         assert tts_params == {}
         cosyvoice3_server._build_cosyvoice3_prompt.assert_awaited_once()
+
+
+# ---- GLM-TTS Serving Tests ----
+
+
+@pytest.fixture
+def glm_tts_server(mocker: MockerFixture):
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    mock_engine_client.model_config = mocker.MagicMock(
+        model="zai-org/GLM-TTS",
+        hf_config=SimpleNamespace(min_token_text_ratio=2, max_token_text_ratio=20),
+    )
+    mock_engine_client.default_sampling_params_list = [
+        SimpleNamespace(max_tokens=2048, min_tokens=None, extra_args=None)
+    ]
+    mock_engine_client.tts_batch_max_items = 32
+    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(
+            engine_args=SimpleNamespace(model_stage="glm_tts"),
+            tts_args={},
+        )
+    ]
+
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    return OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+
+
+class TestGLMTTSServing:
+    def test_validate_glm_tts_requires_ref_audio(self, glm_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
+        error = glm_tts_server._validate_glm_tts_request(request)
+        assert error is not None
+        assert "ref_audio" in error
+
+    def test_validate_glm_tts_requires_ref_text(self, glm_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        error = glm_tts_server._validate_glm_tts_request(request)
+        assert error is not None
+        assert "ref_text" in error
+
+    def test_estimate_glm_tts_target_text_len_uses_tokenizer_tokens(
+        self,
+        glm_tts_server,
+        mocker: MockerFixture,
+    ):
+        class FakeTokenizer:
+            def encode(self, text):
+                assert text == "normalized target"
+                return [10, 20, 30]
+
+        mocker.patch(
+            "vllm_omni.model_executor.models.glm_tts.glm_tts.resolve_glm_tts_tokenizer_path",
+            return_value="resolved-tokenizer",
+        )
+        load_tokenizer = mocker.patch(
+            "vllm_omni.model_executor.models.glm_tts.glm_tts.load_glm_tts_tokenizer",
+            return_value=FakeTokenizer(),
+        )
+        mocker.patch(
+            "vllm_omni.model_executor.models.glm_tts.text_frontend.GLMTTSTextFrontend.text_normalize",
+            return_value="normalized target",
+        )
+
+        text_token_len = glm_tts_server._estimate_glm_tts_text_token_len("abcdef")
+
+        assert text_token_len == 3
+        load_tokenizer.assert_called_once()
 
 
 class TestTTSAsyncOffloading:

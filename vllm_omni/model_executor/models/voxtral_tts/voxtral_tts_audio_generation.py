@@ -3,7 +3,7 @@
 
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from functools import cached_property
 from math import ceil
@@ -57,6 +57,8 @@ from vllm.multimodal.processing.processor import (
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.tokenizers.mistral import MistralTokenizer
+
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 weight_norm = torch.nn.utils.parametrizations.weight_norm
 
@@ -195,6 +197,10 @@ def from_nested_dict(cls, d):
         kwargs[f.name] = value
 
     return cls(**kwargs)
+
+
+def _is_fp8_quant_config(quant_config) -> bool:
+    return quant_config is not None and quant_config.get_name() == "fp8"
 
 
 class FeedForward(nn.Module):
@@ -916,6 +922,28 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        quant_config = vllm_config.quant_config
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            component_configs = dict(quant_config.component_configs)
+            component_configs[maybe_prefix(prefix, "audio_tokenizer")] = None
+            component_configs[maybe_prefix(prefix, "acoustic_transformer")] = None
+            quant_config = ComponentQuantizationConfig(
+                component_configs=component_configs,
+                default_config=None,
+            )
+            vllm_config = replace(vllm_config, quant_config=quant_config)
+        elif _is_fp8_quant_config(quant_config):
+            quant_config = ComponentQuantizationConfig(
+                component_configs={
+                    maybe_prefix(prefix, "language_model"): quant_config,
+                    maybe_prefix(prefix, "audio_tokenizer"): None,
+                    maybe_prefix(prefix, "acoustic_transformer"): None,
+                },
+                default_config=None,
+            )
+            vllm_config = replace(vllm_config, quant_config=quant_config)
+            logger.info("Voxtral TTS FP8 routing: language_model=fp8, acoustic_transformer=bf16, audio_tokenizer=bf16")
+
         self.language_model = init_vllm_registered_model(
             vllm_config=vllm_config,
             hf_config=config.text_config,

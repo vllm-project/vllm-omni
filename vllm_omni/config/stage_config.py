@@ -10,7 +10,7 @@ import warnings
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
@@ -286,28 +286,23 @@ class _LazyPipelineRegistry:
 
         try:
             module = importlib.import_module(module_path)
-        except ImportError as exc:
-            logger.error(
-                "Failed to import pipeline module %r for %r: %s",
-                module_path,
-                model_type,
-                exc,
-            )
+            pipeline = getattr(module, var_name, None)
+            if pipeline is None:
+                logger.error(
+                    "Pipeline variable %r not found in module %r (registered for %r)",
+                    var_name,
+                    module_path,
+                    model_type,
+                )
+                return None
+            errors = pipeline.validate()
+            if errors:
+                logger.warning("Pipeline %s has issues: %s", pipeline.model_type, errors)
+            self._loaded[model_type] = pipeline
+            return pipeline
+        except Exception:
+            logger.exception("Failed to import pipeline module %r for %r", module_path, model_type)
             return None
-        pipeline = getattr(module, var_name, None)
-        if pipeline is None:
-            logger.error(
-                "Pipeline variable %r not found in module %r (registered for %r)",
-                var_name,
-                module_path,
-                model_type,
-            )
-            return None
-        errors = pipeline.validate()
-        if errors:
-            logger.warning("Pipeline %s has issues: %s", pipeline.model_type, errors)
-        self._loaded[model_type] = pipeline
-        return pipeline
 
     def __contains__(self, model_type: str) -> bool:
         if model_type in self._loaded:
@@ -353,14 +348,23 @@ class _LazyPipelineRegistry:
     def keys(self) -> set[str]:
         return set(self._get_lazy_map().keys()) | set(self._loaded.keys())
 
+    def _safe_get(self, key: str) -> PipelineConfig | None:
+        try:
+            return self[key]
+        except Exception:
+            logger.warning("Skipping pipeline %r because it failed to load.", key)
+        return None
+
     def values(self):
-        # Iterating values forces load of every lazy pipeline.
+        # Iterating forces a lazy import for each pipeline; failures are logged and skipped.
         for key in self.keys():
-            yield self[key]
+            if (p := self._safe_get(key)) is not None:
+                yield p
 
     def items(self):
         for key in self.keys():
-            yield key, self[key]
+            if (p := self._safe_get(key)) is not None:
+                yield key, p
 
     def __iter__(self):
         return iter(self.keys())
@@ -399,19 +403,43 @@ class StageDeployConfig:
     the top level of ``DeployConfig`` and propagated to every stage.
     """
 
+    # === Omni fields ===
+    # Stage identity and Omni runtime placement.
     stage_id: int
-    max_num_seqs: int = 64
-    gpu_memory_utilization: float = 0.9
-    tensor_parallel_size: int = 1
-    enforce_eager: bool = False
-    max_num_batched_tokens: int = 32768
-    max_model_len: int | None = None
-    async_scheduling: bool | None = None
-    devices: str = "0"
+    devices: str | None = None
+    num_replicas: int = 1
+    env: dict[str, Any] | None = None
+
+    # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
     input_connectors: dict[str, str] | None = None
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
+
+    # === vLLM EngineArgs fields ===
+    # Parallelism and scheduler/memory capacity.
+    tensor_parallel_size: int | None = None
+    gpu_memory_utilization: float | None = None
+    max_num_seqs: int | None = None
+    max_num_batched_tokens: int | None = None
+    max_model_len: int | None = None
+
+    # Execution, scheduling, and KV/cache behavior.
+    enforce_eager: bool | None = None
+    async_scheduling: bool | None = None
+    disable_hybrid_kv_cache_manager: bool | None = None
+    mm_processor_cache_gb: float | None = None
+
+    # Compilation, profiling, tokenizer/config parsing, and model loading.
+    compilation_config: dict[str, Any] | None = None
+    profiler_config: dict[str, Any] | None = None
+    skip_mm_profiling: bool | None = None
+    enable_flashinfer_autotune: bool | None = None
+    config_format: str | None = None
+    load_format: str | None = None
+    tokenizer_mode: str | None = None
+
+    # Pass-through vLLM EngineArgs fields that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -436,49 +464,67 @@ class DeployConfig:
     pipeline: str | None = None
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
-    trust_remote_code: bool = True
+    trust_remote_code: bool | None = None
     distributed_executor_backend: str | None = None
     dtype: str | None = None
     quantization: str | None = None
-    enable_prefix_caching: bool = False
+    enable_prefix_caching: bool | None = None
     enable_chunked_prefill: bool | None = None
-    data_parallel_size: int = 1
-    pipeline_parallel_size: int = 1
+    data_parallel_size: int | None = None
+    pipeline_parallel_size: int | None = None
 
 
-_STAGE_NON_ENGINE_KEYS = frozenset(
+_STAGE_RESERVED_KEYS = frozenset(
     {
         "stage_id",
         "devices",
+        "num_replicas",
+        "env",
         "output_connectors",
         "input_connectors",
         "default_sampling_params",
         "engine_extras",
+        "engine_args",
+        "runtime",
     }
 )
 
 # Fields on StageDeployConfig that are populated from engine_args dict
-_STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_NON_ENGINE_KEYS}
+_STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_RESERVED_KEYS}
 
 
 def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     """Parse a single stage entry from deploy YAML into StageDeployConfig."""
-    if "engine_args" in stage_data:
-        engine_args = dict(stage_data["engine_args"])
-        devices = stage_data.get("runtime", {}).get("devices", stage_data.get("devices", "0"))
-    else:
-        engine_args = {k: v for k, v in stage_data.items() if k not in _STAGE_NON_ENGINE_KEYS and k != "stage_id"}
-        devices = stage_data.get("devices", "0")
+    # Get the non-reserved keys for this stage
+    flat_args = {k: v for k, v in stage_data.items() if k not in _STAGE_RESERVED_KEYS}
+    runtime_cfg = dict(stage_data.get("runtime", {}))
+    devices = runtime_cfg.get("devices", stage_data.get("devices"))
+    num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
+    env = runtime_cfg.get("env", stage_data.get("env"))
 
-    kwargs: dict[str, Any] = {"stage_id": stage_data["stage_id"], "devices": devices}
+    if "engine_args" in stage_data:
+        for k, v in stage_data["engine_args"].items():
+            existing = flat_args.get(k)
+            # If we have multiple dictionaries, merge recursively.
+            if isinstance(v, dict) and isinstance(existing, dict):
+                flat_args[k] = _get_recursively_merged_dict(existing, v)
+            else:
+                flat_args[k] = v
+
+    kwargs: dict[str, Any] = {
+        "stage_id": stage_data["stage_id"],
+        "devices": devices,
+        "num_replicas": int(num_replicas),
+        "env": env,
+    }
     for name, f in _STAGE_DEPLOY_FIELDS.items():
-        if name in engine_args:
-            kwargs[name] = engine_args.pop(name)
+        if name in flat_args:
+            kwargs[name] = flat_args.pop(name)
 
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
-    kwargs["engine_extras"] = engine_args
+    kwargs["engine_extras"] = flat_args
     return StageDeployConfig(**kwargs)
 
 
@@ -487,24 +533,34 @@ _DEEP_MERGE_KEYS = frozenset({"default_sampling_params", "subtalker_sampling_par
 
 def _deep_merge_stage(base: dict, overlay: dict) -> dict:
     """Deep-merge ``_DEEP_MERGE_KEYS`` so thin overlays don't drop base keys."""
-    merged = dict(base)
-    for k, v in overlay.items():
-        if k in _DEEP_MERGE_KEYS:
-            base_val = merged.get(k)
-            if isinstance(v, dict) and isinstance(base_val, dict):
-                merged[k] = {**base_val, **v}
-                continue
-            # Deep-merge key but at least one side isn't a dict: surface the
-            # silent clobber so mismatched YAML types don't get past review.
-            if base_val is not None:
+    # Deep merge _DEEP_MERGE_KEYS recursively
+    base_merge_dict = {k: v for k, v in base.items() if k in _DEEP_MERGE_KEYS}
+    overlay_merge_dict = {k: v for k, v in overlay.items() if k in _DEEP_MERGE_KEYS}
+
+    # Get the merge dict; priority is base < overlay < merged sub
+    merged_subdict = _get_recursively_merged_dict(original=base_merge_dict, update=overlay_merge_dict)
+    merged_dict = {**base, **overlay, **merged_subdict}
+    return merged_dict
+
+
+def _get_recursively_merged_dict(original: dict, update: dict) -> dict:
+    """Recursively merge two dicts, returning a new dict."""
+    merged = original.copy()
+    for k, update_v in update.items():
+        orig_v = merged.get(k)
+        if isinstance(orig_v, dict) and isinstance(update_v, dict):
+            merged[k] = _get_recursively_merged_dict(orig_v, update_v)
+        else:
+            if orig_v is not None and (isinstance(orig_v, dict) != isinstance(update_v, dict)):
                 logger.warning(
                     "Deep-merge key %r has non-dict value (base=%s, overlay=%s); "
                     "overlay will fully replace base instead of merging.",
                     k,
-                    type(base_val).__name__,
-                    type(v).__name__,
+                    type(orig_v).__name__,
+                    type(update_v).__name__,
                 )
-        merged[k] = v
+
+            merged[k] = update_v
     return merged
 
 
@@ -599,16 +655,26 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     return DeployConfig(**kwargs)
 
 
-def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-    """Return ``(overrides, devices)`` from a platform stage entry.
+class PlatformOverrides(NamedTuple):
+    overrides: dict[str, Any]
+    devices: str | None
+    env: dict[str, Any] | None
+
+
+def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
+    """Return overrides, devices, and env from a platform stage entry.
 
     Handles both the nested layout (``engine_args:`` / ``runtime.devices``) and
     the flat layout. ``devices`` is ``None`` when no override is set.
     """
     if "engine_args" in ps:
-        return dict(ps["engine_args"]), ps.get("runtime", {}).get("devices")
-    overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices")}
-    return overrides, ps.get("devices")
+        overrides = dict(ps["engine_args"])
+        runtime_cfg = ps.get("runtime", {})
+        if "num_replicas" in runtime_cfg:
+            overrides["num_replicas"] = runtime_cfg["num_replicas"]
+        return PlatformOverrides(overrides, runtime_cfg.get("devices"), runtime_cfg.get("env"))
+    overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices", "env")}
+    return PlatformOverrides(overrides, ps.get("devices"), ps.get("env"))
 
 
 def _apply_platform_overrides(
@@ -633,11 +699,31 @@ def _apply_platform_overrides(
         base = base_by_id.get(ps["stage_id"])
         if base is None:
             continue
-        overrides, devices = _extract_platform_overrides(ps)
-        if devices is not None:
-            base.devices = devices
-        for key, val in overrides.items():
+        po = _extract_platform_overrides(ps)
+        if po.devices is not None:
+            base.devices = po.devices
+        if po.env is not None:
+            if isinstance(base.env, dict) and isinstance(po.env, dict):
+                base.env = {**base.env, **po.env}
+            else:
+                logger.warning(
+                    "Stage %s env override replaces base env entirely (base type=%s, override type=%s)",
+                    ps["stage_id"],
+                    type(base.env).__name__,
+                    type(po.env).__name__,
+                )
+                base.env = po.env
+        for key, val in po.overrides.items():
             if hasattr(base, key):
+                # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
+                # platform overlays don't silently clobber sibling keys (e.g.
+                # setting default_sampling_params={max_tokens: 2048} must not
+                # drop temperature / top_p / top_k from the base stage).
+                if key in _DEEP_MERGE_KEYS and isinstance(val, dict):
+                    base_val = getattr(base, key, None)
+                    if isinstance(base_val, dict):
+                        setattr(base, key, {**base_val, **val})
+                        continue
                 setattr(base, key, val)
             else:
                 base.engine_extras[key] = val
@@ -687,6 +773,15 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
 )
 
 
+def deploy_override_field_names() -> frozenset[str]:
+    """Return deploy-schema fields whose CLI defaults must not override YAML."""
+    return (
+        frozenset(_STAGE_DEPLOY_FIELDS)
+        | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
+        | frozenset({"async_chunk", "devices"})
+    )
+
+
 def _build_engine_args(
     ps: StagePipelineConfig,
     ds: StageDeployConfig | None,
@@ -722,7 +817,7 @@ def _build_engine_args(
     # Per-stage StageDeployConfig values override pipeline-wide settings.
     if ds is not None:
         for k, v in asdict(ds).items():
-            if k in _STAGE_NON_ENGINE_KEYS or v is None:
+            if k in _STAGE_RESERVED_KEYS or v is None:
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
@@ -803,7 +898,12 @@ def merge_pipeline_deploy(
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:
-            runtime["devices"] = ds.devices
+            if ds.devices is not None:
+                runtime["devices"] = ds.devices
+            runtime["num_replicas"] = ds.num_replicas
+            if ds.env is not None:
+                runtime["env"] = ds.env
+        runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
         result.append(
             StageConfig(
@@ -865,14 +965,16 @@ class StageConfig:
 
         # CLI overrides take precedence over YAML defaults
         for key, value in self.runtime_overrides.items():
-            if key not in ("devices", "max_batch_size"):
+            if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
                 engine_args[key] = value
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)
         runtime.setdefault("process", True)
-        if "devices" in self.runtime_overrides:
+        if self.runtime_overrides.get("devices") is not None:
             runtime["devices"] = self.runtime_overrides["devices"]
+        if self.runtime_overrides.get("num_replicas") is not None:
+            runtime["num_replicas"] = self.runtime_overrides["num_replicas"]
 
         # Legacy compat: migrate runtime.max_batch_size → engine_args.max_num_seqs
         legacy_mbs = runtime.pop("max_batch_size", None)
@@ -886,8 +988,6 @@ class StageConfig:
             )
             effective_mbs = int(cli_mbs or legacy_mbs or 1)
             engine_args.setdefault("max_num_seqs", effective_mbs)
-
-        engine_args.setdefault("max_num_seqs", 1)
 
         # Build full config dict
         config_dict: dict[str, Any] = {

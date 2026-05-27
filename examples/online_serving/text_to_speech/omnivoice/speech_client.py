@@ -6,6 +6,9 @@ Examples:
 
     # Specify language
     python speech_client.py --text "Bonjour, comment allez-vous?" --language French
+
+    # Use a specific uploaded/supported voice
+    python speech_client.py --text "Hello" --voice my_uploaded_voice
 """
 
 import argparse
@@ -21,15 +24,18 @@ def run_tts(args) -> None:
     payload = {
         "model": args.model,
         "input": args.text,
-        "voice": "default",
         "response_format": args.response_format,
     }
 
+    if args.voice:
+        payload["voice"] = args.voice
     if args.language:
         payload["language"] = args.language
 
     print(f"Model: {args.model}")
     print(f"Text: {args.text}")
+    if args.voice:
+        print(f"Voice: {args.voice}")
     if args.language:
         print(f"Language: {args.language}")
     print("Generating audio...")
@@ -68,6 +74,11 @@ def main():
     parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="API key")
     parser.add_argument("--model", "-m", default="k2-fsa/OmniVoice", help="Model name")
     parser.add_argument("--text", required=True, help="Text to synthesize")
+    parser.add_argument(
+        "--voice",
+        default=None,
+        help="Voice name (omit for auto voice; must match a supported or uploaded speaker if set)",
+    )
     parser.add_argument("--language", default=None, help="Language hint (e.g., English, Chinese, French)")
     parser.add_argument(
         "--response-format",

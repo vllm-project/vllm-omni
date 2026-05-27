@@ -359,8 +359,17 @@ def _validate_image_source(source: str) -> None:
 
 
 def _build_online_image_reference(source: str) -> str:
-    if _is_remote_image_source(source) or source.startswith("data:image"):
+    if source.startswith("data:image"):
         return source
+
+    if _is_remote_image_source(source):
+        response = requests.get(source, timeout=60)
+        response.raise_for_status()
+        mime_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip()
+        if not mime_type.startswith("image/"):
+            mime_type = guess_type(urlparse(source).path)[0] or "image/png"
+        encoded = b64encode(response.content).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
 
     image_path = Path(source)
     mime_type = guess_type(image_path.name)[0] or "image/png"
@@ -479,7 +488,10 @@ def _send_video_request_with_timeout(
         headers={"Accept": "application/json"},
         timeout=60,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise requests.HTTPError(f"{exc}; response body: {response.text}", response=response) from exc
     job_data = response.json()
     video_id = job_data["id"]
     openai_client._wait_until_video_completed(video_id, timeout_seconds=timeout_seconds)
@@ -572,7 +584,7 @@ def test_wan22_i2v_online_serving_generates_video(
     wan22_i2v_image_source: str | None,
     wan22_i2v_online_timeout_seconds: int,
 ) -> None:
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+    if not torch.cuda.is_available() or torch.accelerator.device_count() < 2:
         pytest.skip("Wan2.2 I2V similarity e2e test requires >= 2 CUDA GPUs.")
 
     _probe_binary("ffprobe")
@@ -597,7 +609,7 @@ def test_wan22_i2v_online_serving_generates_video(
 def test_wan22_i2v_serving_matches_diffusers_video_similarity(
     wan22_i2v_image_source: str | None,
 ) -> None:
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+    if not torch.cuda.is_available() or torch.accelerator.device_count() < 2:
         pytest.skip("Wan2.2 I2V similarity e2e test requires >= 2 CUDA GPUs.")
 
     _probe_binary("ffmpeg")

@@ -20,14 +20,15 @@ logger = init_logger(__name__)
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
+    "GLMTTSForConditionalGeneration": "glm_tts",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
-    "VoxCPMForConditionalGeneration": "voxcpm",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
     "CosyVoice3Model": "CosyVoice-BlankEN",
+    "GLMTTSForConditionalGeneration": "vq32k-phoneme-tokenizer",
 }
 
 
@@ -35,12 +36,12 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
-        from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
-        from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
-        from vllm_omni.transformers_utils.configs.voxcpm import VoxCPMConfig
+        from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+        from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
+        from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
@@ -57,8 +58,8 @@ def _register_omni_hf_configs() -> None:
     for model_type, config_cls in [
         ("qwen3_tts", Qwen3TTSConfig),
         ("cosyvoice3", CosyVoice3Config),
+        ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
-        ("voxcpm", VoxCPMConfig),
         ("voxcpm2", VoxCPM2Config),
     ]:
         try:
@@ -140,6 +141,7 @@ class OmniEngineArgs(EngineArgs):
     async_chunk: bool = False
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
+    force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
     task_type: str | None = None
     worker_cls: str = None
@@ -162,6 +164,10 @@ class OmniEngineArgs(EngineArgs):
 
     omni_master_address: str | None = None
     omni_master_port: int | None = None
+    # OmniCoordinator integration knobs (process-local).
+    omni_dp_size_local: int = 1
+    omni_lb_policy: str = "random"
+    omni_heartbeat_timeout: float = 30.0
     stage_configs_path: str | None = None
     output_modalities: list[str] | None = None
     log_stats: bool = False
@@ -302,6 +308,7 @@ class OmniEngineArgs(EngineArgs):
                             model_path,
                             allow_patterns=[
                                 f"{subfolder}/tokenizer*",
+                                f"{subfolder}/tokenization_*",
                                 f"{subfolder}/special_tokens*",
                                 f"{subfolder}/vocab*",
                                 f"{subfolder}/merges*",
@@ -438,10 +445,9 @@ class OrchestratorArgs:
     parallel_config: Any = None
 
     # === Multi-stage guards ===
-    # --tokenizer is captured here so it does not propagate to every stage
-    # uniformly (different stages often need different tokenizers, e.g.
-    # qwen3_omni thinker vs talker). Users wanting a per-stage tokenizer
-    # should set it in the deploy YAML.
+    # --tokenizer is captured by the orchestrator and forwarded to stages
+    # only when the stage does not define tokenizer/tokenizer_subdir itself.
+    # Users wanting a per-stage tokenizer should set it in the deploy YAML.
     tokenizer: str | None = None
 
 
@@ -456,48 +462,10 @@ SHARED_FIELDS: frozenset[str] = frozenset(
     }
 )
 
-_DEPLOY_ENGINE_ARG_OVERRIDE_FIELDS: frozenset[str] = frozenset(
-    {
-        # Capacity / scheduling.
-        "async_scheduling",
-        "max_model_len",
-        "max_num_batched_tokens",
-        "max_num_seqs",
-        # Memory / parallelism.
-        "data_parallel_size",
-        "gpu_memory_utilization",
-        "pipeline_parallel_size",
-        "tensor_parallel_size",
-        # Execution / loading.
-        "enforce_eager",
-        "distributed_executor_backend",
-        "dtype",
-        "quantization",
-        "trust_remote_code",
-        # Caching / chunking.
-        "async_chunk",
-        "enable_prefix_caching",
-        "enable_chunked_prefill",
-        # Model-specific engine extras.
-        "subtalker_sampling_params",
-    }
-)
-
-_DEPLOY_RUNTIME_OVERRIDE_FIELDS: frozenset[str] = frozenset(
-    {
-        "devices",
-    }
-)
-
 
 def orchestrator_field_names() -> frozenset[str]:
     """Return the names of every field on OrchestratorArgs."""
     return frozenset(f.name for f in fields(OrchestratorArgs))
-
-
-def deploy_override_field_names() -> frozenset[str]:
-    """Return kwargs whose parser defaults must not override deploy YAML."""
-    return _DEPLOY_ENGINE_ARG_OVERRIDE_FIELDS | _DEPLOY_RUNTIME_OVERRIDE_FIELDS
 
 
 def internal_blacklist_keys() -> frozenset[str]:
@@ -653,6 +621,8 @@ def nullify_stage_engine_defaults(parser: argparse.ArgumentParser) -> None:
     """Reset stage-level engine flag defaults to ``None``; preserve real
     default in help text. Only deploy-YAML override fields are touched.
     Idempotent."""
+    from vllm_omni.config.stage_config import deploy_override_field_names
+
     override_dests = deploy_override_field_names()
 
     for action in parser._actions:
