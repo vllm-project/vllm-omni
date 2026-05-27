@@ -512,9 +512,12 @@ class StageRuntime:
                 with self._stage_device_scope(plan.metadata.stage_id, plan.metadata.runtime_cfg):
                     vllm_config = plan.stage_vllm_config
                     executor_class = plan.executor_class
-                    assert vllm_config is not None
-                    assert executor_class is not None
-                    assert plan.engine_args_dict is not None
+                    if vllm_config is None:
+                        raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing vllm_config")
+                    if executor_class is None:
+                        raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing executor_class")
+                    if plan.engine_args_dict is None:
+                        raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing engine args")
                     lock_fds = acquire_device_locks(
                         plan.metadata.stage_id,
                         plan.engine_args_dict,
@@ -533,8 +536,10 @@ class StageRuntime:
                         pass
 
             logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
-            assert resources is not None
-            assert resources.addresses is not None
+            if resources is None:
+                raise RuntimeError(f"LLM stage {plan.metadata.stage_id} launcher returned no resources")
+            if resources.addresses is None:
+                raise RuntimeError(f"LLM stage {plan.metadata.stage_id} launcher returned no addresses")
             stage_client = StageEngineCoreClientBase.make_async_mp_client(
                 vllm_config=vllm_config,
                 executor_class=executor_class,
@@ -648,7 +653,8 @@ class StageRuntime:
             output_processor = None
             if plan.replicas[0].metadata.stage_type != "diffusion":
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
-                assert stage_vllm_config is not None
+                if stage_vllm_config is None:
+                    raise RuntimeError(f"Stage {plan.configured_stage_id} is missing vllm_config")
                 output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
 
             stage_pools.append(
@@ -798,7 +804,8 @@ class DistStageRuntime(StageRuntime):
         stage_init_timeout: int,
     ) -> StagePoolClient:
         """Wait for a configured remote replica and create its head-side client."""
-        assert self._omni_master_server is not None
+        if self._omni_master_server is None:
+            raise RuntimeError("OmniMasterServer is not running; cannot initialize remote replica")
         registered_stage_cfg = self._omni_master_server.get_stage_config(
             plan.metadata.stage_id,
             timeout_s=stage_init_timeout,
@@ -914,7 +921,8 @@ class DistStageRuntime(StageRuntime):
 
         Used by both initial remote slots and dynamic headless registrations.
         """
-        assert self._omni_master_server is not None
+        if self._omni_master_server is None:
+            raise RuntimeError("OmniMasterServer is not running; cannot create remote replica")
         stage_id = ctx.stage_id
         metadata = copy.deepcopy(ctx.base_metadata)
         metadata.replica_id = replica_id
@@ -935,8 +943,10 @@ class DistStageRuntime(StageRuntime):
                     replica_id=replica_id,
                 ) as remote_resources:
                     resources = remote_resources
-                assert resources is not None
-                assert resources.addresses is not None
+                if resources is None:
+                    raise RuntimeError(f"Remote diffusion stage {stage_id} returned no resources")
+                if resources.addresses is None:
+                    raise RuntimeError(f"Remote diffusion stage {stage_id} returned no addresses")
             except Exception:
                 self._cleanup_launched_resources(
                     stage_id=stage_id,
@@ -957,8 +967,10 @@ class DistStageRuntime(StageRuntime):
             )
             return client
 
-        assert ctx.vllm_config is not None
-        assert ctx.executor_class is not None
+        if ctx.vllm_config is None:
+            raise RuntimeError(f"Remote LLM stage {stage_id} is missing vllm_config")
+        if ctx.executor_class is None:
+            raise RuntimeError(f"Remote LLM stage {stage_id} is missing executor_class")
         vllm_config = copy.deepcopy(ctx.vllm_config)
         vllm_config.parallel_config.data_parallel_size_local = 0
         resources = None
@@ -971,8 +983,10 @@ class DistStageRuntime(StageRuntime):
                 replica_id=replica_id,
             ) as remote_resources:
                 resources = remote_resources
-            assert resources is not None
-            assert resources.addresses is not None
+            if resources is None:
+                raise RuntimeError(f"Remote LLM stage {stage_id} returned no resources")
+            if resources.addresses is None:
+                raise RuntimeError(f"Remote LLM stage {stage_id} returned no addresses")
             client_addresses = self._client_addresses_from_zmq(resources.addresses)
             replica_host = self._omni_master_server.get_replica_host(stage_id, replica_id)
             if replica_host:
