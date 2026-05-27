@@ -223,10 +223,42 @@ def _get_open_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_for_port(host: str, port: int, timeout: int = 1200) -> None:
-    """Block until the given host:port accepts connections or timeout expires."""
+def _format_log_tail(log_lines: list[str], max_lines: int = 80) -> str:
+    lines = log_lines[-max_lines:]
+    tail = "".join(lines).rstrip()
+    if tail:
+        return f"\nLast {len(lines)} server log lines:\n{tail}"
+    return ""
+
+
+def _forward_process_output(stream, log_lines: list[str]) -> None:
+    try:
+        for line in iter(stream.readline, ""):
+            log_lines.append(line)
+            print(line, end="")
+    finally:
+        stream.close()
+
+
+def _wait_for_server_ready(
+    host: str,
+    port: int,
+    proc: subprocess.Popen | None = None,
+    timeout: int = 1200,
+    log_lines: list[str] | None = None,
+) -> None:
+    """Block until host:port accepts connections, or fail if the server exits."""
     start = time.time()
     while time.time() - start < timeout:
+        if proc is not None:
+            ret = proc.poll()
+            if ret is not None:
+                raise RuntimeError(
+                    f"Server process exited with code {ret} before becoming "
+                    f"ready on {host}:{port}."
+                    f"{_format_log_tail(log_lines or [])}"
+                )
+
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(1)
@@ -235,7 +267,13 @@ def _wait_for_port(host: str, port: int, timeout: int = 1200) -> None:
         except Exception:
             pass
         time.sleep(2)
+
     raise RuntimeError(f"Server did not start on {host}:{port} within {timeout}s")
+
+
+def _wait_for_port(host: str, port: int, timeout: int = 1200) -> None:
+    """Block until the given host:port accepts connections or timeout expires."""
+    _wait_for_server_ready(host, port, timeout=timeout)
 
 
 def _kill_process_tree(pid: int) -> None:
@@ -326,12 +364,25 @@ class DiffusionServer:
         ] + self.serve_args
 
         print(f"Launching DiffusionServer: {' '.join(cmd)}")
+        self._log_lines: list[str] = []
+        self._log_thread: threading.Thread | None = None
         self.proc = subprocess.Popen(
             cmd,
             env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
             cwd=str(Path(__file__).parent.parent.parent.parent),
         )
-        _wait_for_port(self.host, self.port)
+        if self.proc.stdout is not None:
+            self._log_thread = threading.Thread(
+                target=_forward_process_output,
+                args=(self.proc.stdout, self._log_lines),
+                daemon=True,
+            )
+            self._log_thread.start()
+        _wait_for_server_ready(self.host, self.port, self.proc, log_lines=self._log_lines)
         print(f"DiffusionServer ready on {self.host}:{self.port}")
 
     def __enter__(self):
@@ -341,6 +392,8 @@ class DiffusionServer:
     def __exit__(self, *_):
         if self.proc:
             _kill_process_tree(self.proc.pid)
+        if getattr(self, "_log_thread", None) is not None:
+            self._log_thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------
