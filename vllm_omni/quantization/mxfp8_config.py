@@ -490,7 +490,12 @@ class VllmMxfp8OnlineLinearMethod(_VllmMxfp8OnlineBase):
     """
 
     def __init__(self) -> None:
-        """Initialize kernel directly without calling parent __init__ to avoid config dependency."""
+        """Initialize kernel directly without calling parent __init__ to avoid config dependency.
+
+        TODO: skipping super().__init__() couples this to vLLM internals. If the parent
+        adds required initialization, consider a version-aware assertion or calling
+        super().__init__() with a fallback config.
+        """
         from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
 
         self.kernel = init_mxfp8_linear_kernel()

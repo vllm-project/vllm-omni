@@ -73,7 +73,7 @@ class OmniINCConfig(INCConfig):
     def get_quant_method(self, layer, prefix: str):
         """Get quantization method, handling AutoRound MXFP8 as a special case."""
         # Check if this is an AutoRound MXFP8 checkpoint (data_type="mx_fp")
-        if hasattr(self, "data_type") and self.data_type == "mx_fp":
+        if hasattr(self, "data_type") and self.data_type == "mx_fp" and self.weight_bits == 8:
             from vllm.model_executor.layers.linear import LinearBase
 
             if isinstance(layer, LinearBase):
