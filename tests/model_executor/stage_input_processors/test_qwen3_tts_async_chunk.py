@@ -312,7 +312,7 @@ def test_streaming_ref_code_context_is_bounded_for_batchable_shapes():
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+        multimodal_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
         request=_req(rid, finished=False),
         is_finished=False,
     )

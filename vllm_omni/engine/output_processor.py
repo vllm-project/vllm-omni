@@ -394,6 +394,7 @@ class OmniRequestState(RequestState):
         outputs: list,
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        prompt_routed_experts: "np.ndarray | None" = None,
     ) -> RequestOutput | PoolingRequestOutput:
         """Create request output, handling no-detokenizer generation stages.
 
@@ -403,7 +404,7 @@ class OmniRequestState(RequestState):
         directly with ``prompt_logprobs=None``.
         """
         if self.logprobs_processor is not None:
-            return super()._new_request_output(external_req_id, outputs, finished, kv_transfer_params)
+            return super()._new_request_output(external_req_id, outputs, finished, kv_transfer_params, prompt_routed_experts)
 
         # No-detokenizer path: build RequestOutput directly.
         prompt_token_ids = self.prompt_token_ids
@@ -449,6 +450,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         log_stats: bool,
         stream_interval: int = 1,
         tracing_enabled: bool = False,
+        engine_core_output_type: str | None = None,
         output_modality: OutputModality = OutputModality.TEXT,
     ):
         """Initialize the multimodal output processor.
@@ -457,6 +459,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             tokenizer: Tokenizer for detokenizing text outputs
             log_stats: Whether to log statistics
             stream_interval: Stream interval for output generation
+            engine_core_output_type: Optional output type string (e.g.,
+                "image", "audio", "latent"). Converted to OutputModality
+                internally. Kept for backward compatibility with
+                stage_init_utils.
             output_modality: Type-safe output modality flag. Used to tag
                 multimodal outputs with the correct modality key when
                 per-output type info is unavailable.
@@ -467,7 +473,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             stream_interval=stream_interval,
             tracing_enabled=tracing_enabled,
         )
-        self.output_modality = output_modality
+        # Convert string-based engine_core_output_type to OutputModality
+        if engine_core_output_type is not None:
+            self.output_modality = OutputModality.from_string(engine_core_output_type)
+        else:
+            self.output_modality = output_modality
 
     def add_request(
         self,
