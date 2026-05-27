@@ -213,19 +213,40 @@ class StableAudio3Pipeline(
     def _build_pretransform(self, model_cfg: dict, sample_rate: int) -> AutoencoderPretransform:
         """Mirror factory.create_pretransform_from_config + create_autoencoder_from_config.
 
-        PORT_FROM: factory.py:93-113
+        PORT_FROM: stable-audio-3 factory.py:79-115 (verbatim adaptation).
         """
-        # TODO(stable-audio-3): replicate factory.create_autoencoder_from_config logic.
-        # Reads:
-        #   ae_cfg = model_cfg["pretransform"]["config"]
-        #   encoder = SAMEEncoder(**ae_cfg["encoder"]["config"])
-        #   decoder = SAMEDecoder(**ae_cfg["decoder"]["config"])
-        #   bottleneck = SoftNormBottleneck(**ae_cfg["bottleneck"]["config"])
-        #   patch_pretransform = PatchedPretransform(**ae_cfg["pretransform"]["config"])
-        #   ae = AudioAutoencoder(encoder, decoder, ..., pretransform=patch_pretransform,
-        #                          bottleneck=bottleneck, sample_rate=sample_rate)
-        #   return AutoencoderPretransform(ae, chunked=model_cfg["pretransform"].get("chunked", False))
-        raise NotImplementedError
+        pretransform_block = model_cfg["pretransform"]
+        # AE-only configs (SAME-S/SAME-L) have encoder/decoder at top; full SA3
+        # configs nest them inside pretransform.config.
+        if "encoder" in pretransform_block:
+            ae_cfg = pretransform_block
+        else:
+            ae_cfg = pretransform_block["config"]
+
+        encoder = SAMEEncoder(**ae_cfg["encoder"]["config"])
+        decoder = SAMEDecoder(**ae_cfg["decoder"]["config"])
+        bottleneck = SoftNormBottleneck(**ae_cfg["bottleneck"]["config"])
+        patch_pretransform = PatchedPretransform(**ae_cfg["pretransform"]["config"])
+
+        autoencoder = AudioAutoencoder(
+            encoder,
+            decoder,
+            io_channels=ae_cfg.get("io_channels"),
+            latent_dim=ae_cfg.get("latent_dim"),
+            downsampling_ratio=ae_cfg.get("downsampling_ratio"),
+            sample_rate=sample_rate,
+            bottleneck=bottleneck,
+            pretransform=patch_pretransform,
+            in_channels=ae_cfg.get("in_channels"),
+            out_channels=ae_cfg.get("out_channels"),
+            soft_clip=ae_cfg["decoder"].get("soft_clip", False),
+        )
+
+        return AutoencoderPretransform(
+            autoencoder,
+            chunked=pretransform_block.get("chunked", False),
+            iterate_batch=pretransform_block.get("iterate_batch", False),
+        )
 
     def _build_conditioner(self, conditioning_config: dict) -> MultiConditioner:
         """Build MultiConditioner from config.
@@ -255,22 +276,146 @@ class StableAudio3Pipeline(
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """vLLM-omni engine entry — text → audio.
 
-        Maps OmniDiffusionRequest fields onto upstream's generate_cond inputs.
-        PORT_FROM: stable_audio_3/interface/diffusion_cond.py generate_cond
-                   stable_audio_3/cli.py main() (the user-facing flow)
+        Mirrors stable-audio-3 model.py StableAudioModel.generate() for the
+        V1 text-to-audio path. Inpainting / audio-to-audio / RF-inversion are
+        deferred.
 
-        High-level:
-          1. Extract prompt + duration from req
-          2. Run MultiConditioner to get conditioning_tensors dict
-          3. Build initial noise latent [B, latent_dim, T_latent] where
-             T_latent = (duration * sample_rate) // downsampling_ratio
-          4. Build sigma schedule (default 8 steps)
-          5. Loop sampler — sample_diffusion(self.diffusion, x, sigmas)
-          6. Decode via self.pretransform.decode(latents)
-          7. Return DiffusionOutput(output=audio)
+        Steps:
+          1. Extract prompt + duration from OmniDiffusionRequest
+          2. Build conditioning batch dicts (per-prompt {prompt, seconds_*})
+          3. Run MultiConditioner → conditioning_tensors dict
+          4. Compute latent_sample_size from requested duration
+          5. Build initial noise [B, io_channels, latent_sample_size]
+          6. Route conditioning through ConditionedDiffusionModelWrapper.get_conditioning_inputs
+          7. Build sigma schedule (sigma_max=1.0, RF convention)
+          8. Run sample_diffusion with a closure that calls DiTWrapper with bound conditioning
+          9. Decode latents → audio via pretransform
+         10. Truncate to requested duration → DiffusionOutput
         """
-        # TODO(stable-audio-3): full inference loop. See docstring above.
-        raise NotImplementedError
+        # --- 1. Extract request params -----------------------------------
+        sampling_params = req.sampling_params
+        steps: int = sampling_params.num_inference_steps or 8
+        cfg_scale: float = sampling_params.guidance_scale or 6.0
+        seed = sampling_params.seed
+
+        extra = getattr(sampling_params, "extra_args", None) or {}
+        audio_start_s: float = extra.get("audio_start_in_s", 0.0)
+        audio_end_s: float | None = extra.get("audio_end_in_s")
+        duration: float = (audio_end_s - audio_start_s) if audio_end_s is not None else 30.0
+        sampler_type: str = extra.get("sampler_type", "dpmpp-3m-sde")
+
+        if duration > self.max_audio_seconds:
+            raise ValueError(
+                f"Requested duration {duration:.1f}s exceeds SA3 Medium max of "
+                f"{self.max_audio_seconds:.0f}s",
+            )
+
+        # --- 2. Parse prompts into per-batch dicts -----------------------
+        prompts = req.prompts or []
+        prompt_list: list[str] = []
+        negative_prompt_list: list[str | None] = []
+        for p in prompts:
+            if isinstance(p, str):
+                prompt_list.append(p)
+                negative_prompt_list.append(None)
+            else:
+                prompt_list.append(p.get("prompt") or "")
+                negative_prompt_list.append(p.get("negative_prompt"))
+
+        if not prompt_list:
+            raise ValueError("At least one prompt is required")
+
+        batch_size = len(prompt_list)
+        device = self.device
+
+        # Build the per-element conditioning dicts the MultiConditioner consumes.
+        conditioning_batch: list[dict[str, Any]] = [
+            {"prompt": p, "seconds_start": audio_start_s, "seconds_total": duration}
+            for p in prompt_list
+        ]
+        has_negative = any(np_ is not None for np_ in negative_prompt_list)
+        negative_conditioning_batch: list[dict[str, Any]] | None = (
+            [
+                {
+                    "prompt": np_ or "",
+                    "seconds_start": audio_start_s,
+                    "seconds_total": duration,
+                }
+                for np_ in negative_prompt_list
+            ]
+            if has_negative
+            else None
+        )
+
+        # --- 3. Run conditioner -------------------------------------------
+        conditioning_tensors = self.conditioner(conditioning_batch, device=device)
+        negative_conditioning_tensors: dict[str, Any] = (
+            self.conditioner(negative_conditioning_batch, device=device)
+            if negative_conditioning_batch is not None
+            else {}
+        )
+
+        # --- 4. Compute latent shape -------------------------------------
+        downsampling_ratio = self.pretransform.downsampling_ratio
+        audio_sample_size = int(duration * self.sample_rate)
+        # Round UP so audio_sample_size is a multiple of downsampling_ratio
+        audio_sample_size = (
+            (audio_sample_size + downsampling_ratio - 1) // downsampling_ratio
+        ) * downsampling_ratio
+        latent_sample_size = audio_sample_size // downsampling_ratio
+
+        # --- 5. Initial noise -------------------------------------------
+        if seed is not None:
+            torch.manual_seed(seed)
+        noise = torch.randn(
+            [batch_size, self.diffusion.io_channels, latent_sample_size],
+            device=device,
+        )
+
+        # --- 6. Route conditioning into the 6 ConditionedDiffusion buckets
+        cond_inputs = self.diffusion.get_conditioning_inputs(conditioning_tensors)
+        if negative_conditioning_tensors:
+            neg_inputs = self.diffusion.get_conditioning_inputs(
+                negative_conditioning_tensors, negative=True,
+            )
+            cond_inputs.update(neg_inputs)
+        cond_inputs["cfg_scale"] = cfg_scale
+
+        # Bind conditioning into a model closure the sampler can call as model(x, t)
+        def model_fn(x: torch.Tensor, t: torch.Tensor, **extra_args) -> torch.Tensor:
+            return self.diffusion.model(x, t, **cond_inputs, **extra_args)
+
+        # --- 7. Sigma schedule -------------------------------------------
+        # Optional sampling distribution shift (per checkpoint config).
+        dist_shift = getattr(self.diffusion, "sampling_dist_shift", None)
+        sigmas = build_schedule(
+            steps=steps,
+            sigma_max=1.0,
+            dist_shift=dist_shift,
+            fallback_seq_len=latent_sample_size,
+            device=device,
+        )
+
+        # --- 8. Run sampler ---------------------------------------------
+        self._guidance_scale = cfg_scale
+        self._num_timesteps = steps
+        latents = sample_diffusion(
+            model_fn, noise, sigmas, sampler_type=sampler_type,
+        )
+        self._current_timestep = None
+
+        # --- 9. Decode latents → audio ----------------------------------
+        audio = self.pretransform.decode(latents)
+
+        # --- 10. Trim + wrap ---------------------------------------------
+        target_samples = int(duration * self.sample_rate)
+        if audio.shape[-1] > target_samples:
+            audio = audio[..., :target_samples]
+
+        return DiffusionOutput(
+            output=audio,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     # ------------------------------------------------------------------ weight loading
 

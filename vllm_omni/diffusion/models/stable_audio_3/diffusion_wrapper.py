@@ -90,10 +90,101 @@ class ConditionedDiffusionModelWrapper(nn.Module):
     ) -> dict[str, Any]:
         """Slot per-id conditioner outputs into the 6 named buckets DiTWrapper expects.
 
-        PORT_FROM: diffusion.py:91-188 — pure data shuffling, no torch ops
-        beyond cat/squeeze. Direct port, no vllm-omni-specific changes.
+        PORT_FROM: stable-audio-3 models/diffusion.py:97-194 (verbatim).
+        Pure data shuffling, no torch ops beyond cat/squeeze.
         """
-        raise NotImplementedError
+        cross_attention_input = None
+        cross_attention_masks = None
+        global_cond = None
+        input_concat_cond = None
+        prepend_cond = None
+        prepend_cond_mask = None
+        local_add_cond = None
+        modular_local_cond = None
+
+        if len(self.cross_attn_cond_ids) > 0:
+            # Concatenate cross-attention inputs over the sequence dimension.
+            # Inputs are shape (batch, seq, channels).
+            cross_attention_input = []
+            cross_attention_masks = []
+
+            for key in self.cross_attn_cond_ids:
+                cross_attn_in, cross_attn_mask = conditioning_tensors[key]
+
+                # Add sequence dimension if missing
+                if len(cross_attn_in.shape) == 2:
+                    cross_attn_in = cross_attn_in.unsqueeze(1)
+                    cross_attn_mask = cross_attn_mask.unsqueeze(1)
+
+                cross_attention_input.append(cross_attn_in)
+                cross_attention_masks.append(cross_attn_mask)
+
+            cross_attention_input = torch.cat(cross_attention_input, dim=1)
+            cross_attention_masks = torch.cat(cross_attention_masks, dim=1)
+
+        if len(self.global_cond_ids) > 0:
+            # Concatenate global conditioning over the channel dimension.
+            # Inputs are shape (batch, channels).
+            global_conds = []
+            for key in self.global_cond_ids:
+                global_cond_input = conditioning_tensors[key][0]
+                global_conds.append(global_cond_input)
+
+            global_cond = torch.cat(global_conds, dim=-1)
+            if len(global_cond.shape) == 3:
+                global_cond = global_cond.squeeze(1)
+
+        if len(self.input_concat_ids) > 0:
+            # Concatenate input concat conditioning over the channel dim.
+            # Inputs are shape (batch, channels, seq).
+            input_concat_cond = torch.cat(
+                [conditioning_tensors[key][0] for key in self.input_concat_ids], dim=1,
+            )
+
+        if len(self.local_add_cond_ids) > 0:
+            # Concatenate local additive conditioning over the channel dim.
+            local_add_cond = torch.cat(
+                [conditioning_tensors[key][0] for key in self.local_add_cond_ids], dim=1,
+            )
+
+        if len(self.modular_local_cond_ids) > 0:
+            # Modular local conditioning stays as a dict (variable shape per id).
+            modular_local_cond = {}
+            for key in self.modular_local_cond_ids:
+                if key in conditioning_tensors:
+                    modular_local_cond[key] = conditioning_tensors[key][0]
+            if len(modular_local_cond) == 0:
+                modular_local_cond = None
+
+        if len(self.prepend_cond_ids) > 0:
+            # Concatenate prepend conditioning over the sequence dim.
+            prepend_conds = []
+            prepend_cond_masks = []
+            for key in self.prepend_cond_ids:
+                prepend_cond_input, prepend_cond_mask = conditioning_tensors[key]
+                prepend_conds.append(prepend_cond_input)
+                prepend_cond_masks.append(prepend_cond_mask)
+
+            prepend_cond = torch.cat(prepend_conds, dim=1)
+            prepend_cond_mask = torch.cat(prepend_cond_masks, dim=1)
+
+        if negative:
+            return {
+                "negative_cross_attn_cond": cross_attention_input,
+                "negative_cross_attn_mask": cross_attention_masks,
+                "negative_global_cond": global_cond,
+                "negative_input_concat_cond": input_concat_cond,
+            }
+        return {
+            "cross_attn_cond": cross_attention_input,
+            "cross_attn_mask": cross_attention_masks,
+            "global_cond": global_cond,
+            "input_concat_cond": input_concat_cond,
+            "local_add_cond": local_add_cond,
+            "modular_local_cond": modular_local_cond,
+            "prepend_cond": prepend_cond,
+            "prepend_cond_mask": prepend_cond_mask,
+        }
 
     def forward(
         self,
@@ -154,6 +245,26 @@ class DiTWrapper(nn.Module):
         scale_phi: float = 0.0,
         **kwargs,
     ) -> torch.Tensor:
-        """PORT_FROM: diffusion.py:206-252. Direct delegation to DiffusionTransformer."""
+        """Delegate to DiffusionTransformer with kwarg renaming.
+
+        PORT_FROM: stable-audio-3 models/diffusion.py:213-252 (verbatim).
+        Renames: cross_attn_mask → cross_attn_cond_mask, global_cond → global_embed.
+        """
         assert batch_cfg, "batch_cfg must be True for DiTWrapper"
-        raise NotImplementedError
+        return self.model(
+            x,
+            t,
+            cross_attn_cond=cross_attn_cond,
+            cross_attn_cond_mask=cross_attn_mask,
+            negative_cross_attn_cond=negative_cross_attn_cond,
+            negative_cross_attn_mask=negative_cross_attn_mask,
+            input_concat_cond=input_concat_cond,
+            prepend_cond=prepend_cond,
+            prepend_cond_mask=prepend_cond_mask,
+            cfg_scale=cfg_scale,
+            cfg_dropout_prob=cfg_dropout_prob,
+            scale_phi=scale_phi,
+            global_embed=global_cond,
+            local_add_cond=local_add_cond,
+            **kwargs,
+        )
