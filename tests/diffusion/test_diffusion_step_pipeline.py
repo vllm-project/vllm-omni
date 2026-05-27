@@ -211,15 +211,30 @@ class _DistributedStepPipeline(CFGParallelMixin):
     def prepare_encode(self, state, **kwargs):
         del kwargs
         state.timesteps = [torch.tensor(1.0, device=self.device)]
-        state.latents = torch.ones((1, 1), device=self.device)
+        if self.mode == "cfg_batched":
+            state.latents = torch.tensor([[float(state.sampling.seed)]], device=self.device)
+        else:
+            state.latents = torch.ones((1, 1), device=self.device)
         state.step_index = 0
         state.scheduler = self.scheduler
-        state.do_true_cfg = self.mode == "cfg"
+        state.do_true_cfg = self.mode in ("cfg", "cfg_batched")
         state.prompt_embeds = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
         return state
 
     def denoise_step(self, state, **kwargs):
         del kwargs
+        if self.mode == "cfg_batched":
+            positive_pred, negative_pred = _true_cfg_branch_predictions(state.latents)
+            positive_kwargs = {"x": positive_pred}
+            negative_kwargs = {"x": negative_pred}
+            return self.predict_noise_maybe_with_cfg(
+                do_true_cfg=state.do_true_cfg,
+                true_cfg_scale=state.true_cfg_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+            )
+
         if self.mode == "ulysses":
             sp_group = get_sp_group().ulysses_group
             seq_world_size = torch.distributed.get_world_size(sp_group)
@@ -255,7 +270,9 @@ class _DistributedStepPipeline(CFGParallelMixin):
 
     def step_scheduler(self, state, noise_pred, **kwargs):
         del kwargs
-        if self.mode == "cfg":
+        if self.mode == "cfg_batched":
+            state.latents = noise_pred
+        elif self.mode == "cfg":
             state.latents = self.scheduler_step_maybe_with_cfg(
                 noise_pred,
                 state.current_timestep,
@@ -422,6 +439,17 @@ def _expected_output_for_mode(mode: str) -> torch.Tensor:
     return torch.tensor([[2.0]])
 
 
+def _true_cfg_branch_predictions(latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return latents + 1.0, latents - 1.0
+
+
+def _expected_true_cfg_output(seed: int, true_cfg_scale: float) -> torch.Tensor:
+    latents = torch.tensor([[float(seed)]])
+    positive, negative = _true_cfg_branch_predictions(latents)
+    guided = negative + true_cfg_scale * (positive - negative)
+    return guided
+
+
 def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master_port: str):
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
     current_omni_platform.set_device(device)
@@ -458,6 +486,47 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
         assert output.result is not None
         torch.testing.assert_close(output.result.output, _expected_output_for_mode(mode), rtol=1e-5, atol=1e-5)
         assert "req-1" not in runner.state_cache
+    finally:
+        destroy_distributed_env()
+
+
+def _distributed_batched_cfg_step_worker(local_rank: int, world_size: int, master_port: str):
+    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
+    current_omni_platform.set_device(device)
+    _update_environment_variables(
+        {
+            "RANK": str(local_rank),
+            "LOCAL_RANK": str(local_rank),
+            "WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": master_port,
+        }
+    )
+    model_runner_module.set_forward_context = _noop_forward_context
+
+    try:
+        init_distributed_environment()
+        initialize_model_parallel(cfg_parallel_size=world_size)
+
+        runner = _make_distributed_runner("cfg_batched", device)
+        req_1_seed, req_1_scale = 10, 3.0
+        req_2_seed, req_2_scale = 20, 6.0
+        req_1 = _make_true_cfg_request("req-1", seed=req_1_seed, true_cfg_scale=req_1_scale)
+        req_2 = _make_true_cfg_request("req-2", seed=req_2_seed, true_cfg_scale=req_2_scale)
+        result = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_batch_scheduler_output([req_1, req_2], step_id=0),
+        )
+
+        output_1 = result.get_req_output("req-1")
+        output_2 = result.get_req_output("req-2")
+        assert output_1.finished is True
+        assert output_2.finished is True
+        assert output_1.result is not None
+        assert output_2.result is not None
+        torch.testing.assert_close(output_1.result.output, _expected_true_cfg_output(req_1_seed, req_1_scale))
+        torch.testing.assert_close(output_2.result.output, _expected_true_cfg_output(req_2_seed, req_2_scale))
+        assert runner.state_cache == {}
     finally:
         destroy_distributed_env()
 
@@ -553,8 +622,10 @@ class TestRunner:
         assert batched_runner.pipeline.denoise_calls == 1
 
     def test_batch_preserves_per_request_true_cfg_scale(self, monkeypatch):
-        req_1 = _make_true_cfg_request("req-1", seed=10, true_cfg_scale=3.0)
-        req_2 = _make_true_cfg_request("req-2", seed=20, true_cfg_scale=6.0)
+        req_1_seed, req_1_scale = 10, 3.0
+        req_2_seed, req_2_scale = 20, 6.0
+        req_1 = _make_true_cfg_request("req-1", seed=req_1_seed, true_cfg_scale=req_1_scale)
+        req_2 = _make_true_cfg_request("req-2", seed=req_2_seed, true_cfg_scale=req_2_scale)
 
         batched_runner = _make_runner()
         batched_runner.pipeline = _TrueCfgStepPipeline()
@@ -583,8 +654,14 @@ class TestRunner:
             assert separate.finished is True
             torch.testing.assert_close(batched_output.result.output, separate.result.output)
 
-        assert batched.get_req_output("req-1").result.output.item() == 15.0
-        assert batched.get_req_output("req-2").result.output.item() == 31.0
+        torch.testing.assert_close(
+            batched.get_req_output("req-1").result.output,
+            _expected_true_cfg_output(req_1_seed, req_1_scale),
+        )
+        torch.testing.assert_close(
+            batched.get_req_output("req-2").result.output,
+            _expected_true_cfg_output(req_2_seed, req_2_scale),
+        )
         assert batched_runner.pipeline.denoise_calls == 1
 
     def test_rejects_missing_cached_state(self):
@@ -1017,5 +1094,21 @@ def test_execute_stepwise_with_cfg_parallel():
     torch.multiprocessing.spawn(
         _distributed_step_worker,
         args=(world_size, "cfg", "29542"),
+        nprocs=world_size,
+    )
+
+
+@hardware_test(
+    res={"cuda": "L4"},
+    num_cards=2,
+)
+def test_execute_stepwise_batched_true_cfg_scales_with_cfg_parallel():
+    world_size = 2
+    if current_omni_platform.get_device_count() < world_size:
+        pytest.skip(f"Test requires {world_size} devices")
+
+    torch.multiprocessing.spawn(
+        _distributed_batched_cfg_step_worker,
+        args=(world_size, "29543"),
         nprocs=world_size,
     )

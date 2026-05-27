@@ -136,6 +136,23 @@ class TestCFGPipeline(CFGParallelMixin):
             torch.nn.init.normal_(param, mean=0.0, std=0.02)
 
 
+class CombineOnlyPipeline(CFGParallelMixin):
+    """Minimal pipeline for combine_cfg_noise tests."""
+
+
+def test_combine_cfg_noise_supports_per_row_scale():
+    """Vector CFG scales apply row-wise across the prediction batch."""
+    pipeline = CombineOnlyPipeline()
+    positive = torch.tensor([[[[2.0]]], [[[5.0]]]])
+    negative = torch.tensor([[[[1.0]]], [[[3.0]]]])
+    scale = torch.tensor([3.0, 6.0])
+
+    result = pipeline.combine_cfg_noise(positive, negative, scale, cfg_normalize=False)
+
+    expected = torch.tensor([[[[4.0]]], [[[15.0]]]])
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
 def _test_cfg_parallel_worker(
     local_rank: int,
     world_size: int,
@@ -199,12 +216,15 @@ def _test_cfg_parallel_worker(
     # Prepare kwargs for predict_noise_maybe_with_cfg
     positive_kwargs = {"x": positive_input}
     negative_kwargs = {"x": negative_input}
+    cfg_scale = test_config["cfg_scale"]
+    if isinstance(cfg_scale, list):
+        cfg_scale = torch.tensor(cfg_scale, device=device, dtype=dtype)
 
     with torch.no_grad():
         # Call predict_noise_maybe_with_cfg
         noise_pred = pipeline.predict_noise_maybe_with_cfg(
             do_true_cfg=True,
-            true_cfg_scale=test_config["cfg_scale"],
+            true_cfg_scale=cfg_scale,
             positive_kwargs=positive_kwargs,
             negative_kwargs=negative_kwargs,
             cfg_normalize=test_config["cfg_normalize"],
@@ -276,11 +296,14 @@ def _test_cfg_sequential_worker(
 
     positive_kwargs = {"x": positive_input}
     negative_kwargs = {"x": negative_input}
+    cfg_scale = test_config["cfg_scale"]
+    if isinstance(cfg_scale, list):
+        cfg_scale = torch.tensor(cfg_scale, device=device, dtype=dtype)
 
     with torch.no_grad():
         noise_pred = pipeline.predict_noise_maybe_with_cfg(
             do_true_cfg=True,
-            true_cfg_scale=test_config["cfg_scale"],
+            true_cfg_scale=cfg_scale,
             positive_kwargs=positive_kwargs,
             negative_kwargs=negative_kwargs,
             cfg_normalize=test_config["cfg_normalize"],
@@ -297,7 +320,14 @@ def _test_cfg_sequential_worker(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
-def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype, batch_size: int, cfg_normalize: bool):
+@pytest.mark.parametrize("cfg_scale", [7.5, [3.0, 6.0]])
+def test_predict_noise_maybe_with_cfg(
+    cfg_parallel_size: int,
+    dtype: torch.dtype,
+    batch_size: int,
+    cfg_normalize: bool,
+    cfg_scale: float | list[float],
+):
     """
     Test that predict_noise_maybe_with_cfg produces identical results
     with and without CFG parallel.
@@ -318,7 +348,7 @@ def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype
         "height": 16,
         "width": 16,
         "hidden_dim": 128,
-        "cfg_scale": 7.5,
+        "cfg_scale": cfg_scale,
         "cfg_normalize": cfg_normalize,
         "model_seed": 42,  # Fixed seed for model initialization
         "input_seed": 123,  # Fixed seed for input generation
@@ -379,14 +409,16 @@ def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype
         atol=atol,
         msg=(
             f"CFG parallel output differs from sequential CFG\n"
-            f"  dtype={dtype}, batch_size={batch_size}, cfg_normalize={cfg_normalize}\n"
+            f"  dtype={dtype}, batch_size={batch_size}, cfg_scale={cfg_scale}, "
+            f"cfg_normalize={cfg_normalize}\n"
             f"  Max diff: {(cfg_parallel_output - baseline_output).abs().max().item():.6e}"
         ),
     )
 
     print(
         f"✓ Test passed: cfg_size={cfg_parallel_size}, dtype={dtype}, "
-        f"batch_size={batch_size}, cfg_normalize={cfg_normalize}"
+        f"batch_size={batch_size}, cfg_scale={cfg_scale}, "
+        f"cfg_normalize={cfg_normalize}"
     )
 
 
