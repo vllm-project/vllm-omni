@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for classifier free guidance parallel size (max 4 branches).",
     )
     parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help=("Number of GPUs used for tensor parallelism (TP) inside the DiT."),
+    )
+    parser.add_argument(
         "--video-negative-prompt",
         default="jitter, bad hands, blur, distortion",
         help="Negative prompt for video.",
@@ -171,6 +177,7 @@ def main() -> None:
 
     parallel_config = DiffusionParallelConfig(
         cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
         use_hsdp=args.use_hsdp,
         hsdp_shard_size=args.hsdp_shard_size,
         hsdp_replicate_size=args.hsdp_replicate_size,
