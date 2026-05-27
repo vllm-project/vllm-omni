@@ -326,7 +326,16 @@ def observe_modality_at_finalize(
                 replica_label,
                 defs.compute_audio_rtf(gen_time_s, duration_s),
             )
-        # audio_underrun / continuity / skipped are emitted from the streaming
+        else:
+            # Request completed (finish_reason ∈ {stop, length} — error paths
+            # don't reach finalize) but no audio samples were produced. Covers
+            # silent `return None` skips in the talker→code2wav stage
+            # processors and the `parsed.append((0,0))` malformed-length path
+            # in qwen3-tts code2wav. raise-paths surface via the upstream
+            # vllm:request_success_total{finished_reason="error"} channel and
+            # never reach this branch.
+            mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
+        # audio_underrun / continuity are emitted from the streaming
         # path in observe_audio_streaming_finalize; finalize is too late for
         # the per-chunk timeline they need.
     elif output_type == "image":
