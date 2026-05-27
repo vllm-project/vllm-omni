@@ -100,7 +100,7 @@ from vllm_omni.engine.stage_init_utils import (
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
-    setup_stage_devices,
+    stage_runtime_setup,
     terminate_alive_proc,
 )
 from vllm_omni.engine.stage_pool import StagePool, StagePoolClient
@@ -875,50 +875,53 @@ class AsyncOmniEngine:
                     with llm_stage_launch_lock:
                         previous_visible_devices = os.environ.get(device_control_env)
                         try:
-                            setup_stage_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
-                            vllm_config = plan.stage_vllm_config
-                            executor_class = plan.executor_class
-                            assert vllm_config is not None
-                            assert executor_class is not None
-                            engine_args_dict = build_engine_args_dict(
-                                stage_cfg,
-                                self.model,
-                                stage_connector_spec=plan.stage_connector_spec,
-                                cli_tokenizer=getattr(self, "tokenizer", None),
-                            )
-                            lock_fds = acquire_device_locks(
+                            with stage_runtime_setup(
                                 plan.metadata.stage_id,
-                                engine_args_dict,
-                                stage_init_timeout,
-                            )
-                            if self.single_stage_mode and self._omni_master_server is not None:
-                                coord_router_addr: str | None = (
-                                    self._coordinator_runtime.router_address
-                                    if self._coordinator_runtime is not None
-                                    else None
+                                plan.metadata.runtime_cfg,
+                            ):
+                                vllm_config = plan.stage_vllm_config
+                                executor_class = plan.executor_class
+                                assert vllm_config is not None
+                                assert executor_class is not None
+                                engine_args_dict = build_engine_args_dict(
+                                    stage_cfg,
+                                    self.model,
+                                    stage_connector_spec=plan.stage_connector_spec,
+                                    cli_tokenizer=getattr(self, "tokenizer", None),
                                 )
-                                engine_manager, coordinator, addresses = launch_stack.enter_context(
-                                    launch_omni_core_engines(
+                                lock_fds = acquire_device_locks(
+                                    plan.metadata.stage_id,
+                                    engine_args_dict,
+                                    stage_init_timeout,
+                                )
+                                if self.single_stage_mode and self._omni_master_server is not None:
+                                    coord_router_addr: str | None = (
+                                        self._coordinator_runtime.router_address
+                                        if self._coordinator_runtime is not None
+                                        else None
+                                    )
+                                    engine_manager, coordinator, addresses = launch_stack.enter_context(
+                                        launch_omni_core_engines(
+                                            vllm_config=vllm_config,
+                                            executor_class=executor_class,
+                                            log_stats=False,
+                                            omni_master_server=self._omni_master_server,
+                                            stage_id=plan.metadata.stage_id,
+                                            stage_config=stage_cfg,
+                                            replica_id=plan.replica_id,
+                                            omni_coordinator_address=coord_router_addr,
+                                        )
+                                    )
+                                else:
+                                    addresses, proc, handshake_address = spawn_stage_core(
                                         vllm_config=vllm_config,
                                         executor_class=executor_class,
                                         log_stats=False,
-                                        omni_master_server=self._omni_master_server,
-                                        stage_id=plan.metadata.stage_id,
-                                        stage_config=stage_cfg,
-                                        replica_id=plan.replica_id,
-                                        omni_coordinator_address=coord_router_addr,
                                     )
+                                logger.info(
+                                    "[AsyncOmniEngine] Stage %s engine launch started",
+                                    plan.metadata.stage_id,
                                 )
-                            else:
-                                addresses, proc, handshake_address = spawn_stage_core(
-                                    vllm_config=vllm_config,
-                                    executor_class=executor_class,
-                                    log_stats=False,
-                                )
-                            logger.info(
-                                "[AsyncOmniEngine] Stage %s engine launch started",
-                                plan.metadata.stage_id,
-                            )
                         finally:
                             if previous_visible_devices is None:
                                 current_omni_platform.unset_device_control_env_var()
@@ -1017,68 +1020,71 @@ class AsyncOmniEngine:
                 with stage_launch_lock:
                     previous_visible_devices = os.environ.get(device_control_env)
                     try:
-                        setup_stage_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
-                        omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
-                        if omni_conn_cfg:
-                            inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                        inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self.stage_configs)
-                        if self.single_stage_mode:
-                            assert self._omni_master_server is not None
-                            od_config = build_diffusion_config(self.model, plan.stage_cfg, plan.metadata)
-                            lock_fds = acquire_diffusion_device_locks(
-                                plan.metadata.stage_id,
-                                od_config,
-                                stage_init_timeout,
-                            )
-                            handshake_address, request_address, response_address = register_stage_with_omni_master(
-                                omni_master_address=self._omni_master_server.address,
-                                omni_master_port=self._omni_master_server.port,
-                                omni_stage_id=plan.metadata.stage_id,
-                                omni_stage_config=plan.stage_cfg,
-                                return_addresses=True,
-                                replica_id=plan.replica_id,
-                            )
-                            logger.info(
-                                "[AsyncOmniEngine] Stage %s diffusion registration completed",
-                                plan.metadata.stage_id,
-                            )
-                            coord_router_addr: str | None = (
-                                self._coordinator_runtime.router_address
-                                if self._coordinator_runtime is not None
-                                else None
-                            )
-                            proc, _, _, _ = spawn_diffusion_proc(
-                                self.model,
-                                od_config,
-                                handshake_address=handshake_address,
-                                request_address=request_address,
-                                response_address=response_address,
-                                omni_coordinator_address=coord_router_addr,
-                                omni_stage_id=plan.metadata.stage_id,
-                                omni_replica_id=plan.replica_id,
-                            )
-                            complete_diffusion_handshake(proc, handshake_address, stage_init_timeout)
-                            logger.info(
-                                "[AsyncOmniEngine] Stage %s diffusion startup completed",
-                                plan.metadata.stage_id,
-                            )
-                            client = StageDiffusionClient.from_addresses(
-                                plan.metadata,
-                                request_address=request_address,
-                                response_address=response_address,
-                                proc=proc,
-                                batch_size=self.diffusion_batch_size,
-                            )
-                        else:
-                            client = initialize_diffusion_stage(
-                                plan.metadata.stage_id,
-                                self.model,
-                                plan.stage_cfg,
-                                plan.metadata,
-                                stage_init_timeout=stage_init_timeout,
-                                batch_size=self.diffusion_batch_size,
-                                use_inline=self.num_stages == 1 and plan.num_replicas == 1,
-                            )
+                        with stage_runtime_setup(
+                            plan.metadata.stage_id,
+                            plan.metadata.runtime_cfg,
+                        ):
+                            omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
+                            if omni_conn_cfg:
+                                inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
+                            inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self.stage_configs)
+                            if self.single_stage_mode:
+                                assert self._omni_master_server is not None
+                                od_config = build_diffusion_config(self.model, plan.stage_cfg, plan.metadata)
+                                lock_fds = acquire_diffusion_device_locks(
+                                    plan.metadata.stage_id,
+                                    od_config,
+                                    stage_init_timeout,
+                                )
+                                handshake_address, request_address, response_address = register_stage_with_omni_master(
+                                    omni_master_address=self._omni_master_server.address,
+                                    omni_master_port=self._omni_master_server.port,
+                                    omni_stage_id=plan.metadata.stage_id,
+                                    omni_stage_config=plan.stage_cfg,
+                                    return_addresses=True,
+                                    replica_id=plan.replica_id,
+                                )
+                                logger.info(
+                                    "[AsyncOmniEngine] Stage %s diffusion registration completed",
+                                    plan.metadata.stage_id,
+                                )
+                                coord_router_addr: str | None = (
+                                    self._coordinator_runtime.router_address
+                                    if self._coordinator_runtime is not None
+                                    else None
+                                )
+                                proc, _, _, _ = spawn_diffusion_proc(
+                                    self.model,
+                                    od_config,
+                                    handshake_address=handshake_address,
+                                    request_address=request_address,
+                                    response_address=response_address,
+                                    omni_coordinator_address=coord_router_addr,
+                                    omni_stage_id=plan.metadata.stage_id,
+                                    omni_replica_id=plan.replica_id,
+                                )
+                                complete_diffusion_handshake(proc, handshake_address, stage_init_timeout)
+                                logger.info(
+                                    "[AsyncOmniEngine] Stage %s diffusion startup completed",
+                                    plan.metadata.stage_id,
+                                )
+                                client = StageDiffusionClient.from_addresses(
+                                    plan.metadata,
+                                    request_address=request_address,
+                                    response_address=response_address,
+                                    proc=proc,
+                                    batch_size=self.diffusion_batch_size,
+                                )
+                            else:
+                                client = initialize_diffusion_stage(
+                                    plan.metadata.stage_id,
+                                    self.model,
+                                    plan.stage_cfg,
+                                    plan.metadata,
+                                    stage_init_timeout=stage_init_timeout,
+                                    batch_size=self.diffusion_batch_size,
+                                    use_inline=self.num_stages == 1 and plan.num_replicas == 1,
+                                )
                     finally:
                         if previous_visible_devices is None:
                             current_omni_platform.unset_device_control_env_var()
