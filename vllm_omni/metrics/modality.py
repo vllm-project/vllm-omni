@@ -229,6 +229,53 @@ def _resolve_video_duration_seconds(
     return n / f
 
 
+def _extract_mm_output(engine_outputs: Any) -> dict[str, Any]:
+    """Return the multimodal_output dict regardless of where it's nested.
+
+    Three shapes seen in the wild:
+      * ``engine_outputs.multimodal_output`` — synthesized on OmniRequestOutput
+        for some pipelines (often empty for AR audio)
+      * ``engine_outputs.outputs[0].multimodal_output`` — vllm CompletionOutput
+        nesting (where actual qwen3-omni audio data lives)
+      * neither — returns ``{}``
+    """
+    mm = getattr(engine_outputs, "multimodal_output", None)
+    if isinstance(mm, dict) and mm:
+        return mm
+    outs = getattr(engine_outputs, "outputs", None)
+    if outs:
+        nested = getattr(outs[0], "multimodal_output", None)
+        if isinstance(nested, dict):
+            return nested
+    return {}
+
+
+def _count_audio_frames(mm_out: dict[str, Any]) -> int:
+    """Sum the per-tensor sample count of audio chunks in mm_out["audio"].
+
+    Returns the total number of audio frames (samples) across all chunks.
+    For multi-dim tensors (e.g. shape [channels, samples]) the last axis is
+    treated as the sample dim; for 1-D tensors the only axis is the sample
+    dim; scalars count as 1.
+    """
+    audio_chunks = mm_out.get("audio") if isinstance(mm_out, dict) else None
+    if audio_chunks is None:
+        return 0
+    chunks = audio_chunks if isinstance(audio_chunks, list) else [audio_chunks]
+    n = 0
+    for t in chunks:
+        try:
+            ndim = getattr(t, "ndim", 0)
+            shape = getattr(t, "shape", None)
+            if ndim == 0 or shape is None or len(shape) == 0:
+                n += 1
+            else:
+                n += int(shape[-1])
+        except Exception:
+            continue
+    return n
+
+
 def observe_modality_at_finalize(
     mod_metrics: OmniModalityMetrics,
     *,
@@ -258,11 +305,18 @@ def observe_modality_at_finalize(
     stage_label = str(stage_id)
     replica_label = str(replica_id)
     gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
-    mm_out = getattr(engine_outputs, "multimodal_output", None) or {}
+    mm_out = _extract_mm_output(engine_outputs)
 
     if output_type == "audio":
         sample_rate = defs.resolve_audio_sample_rate(mm_out)
+        # Prefer the accumulator on stage_metrics (kept by
+        # OrchestratorAggregator.record_audio_generated_frames where the
+        # per-chunk wiring is active); fall back to deriving from the
+        # multimodal_output payload directly so the audio family series fire
+        # even when the per-chunk accumulator path didn't run.
         n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
+        if n_frames == 0:
+            n_frames = _count_audio_frames(mm_out)
         mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
         duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
         if duration_s > 0:

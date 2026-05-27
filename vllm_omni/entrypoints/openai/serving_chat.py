@@ -1028,6 +1028,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         include_usage, include_continuous_usage = should_include_usage(stream_options, self.enable_force_include_usage)
 
         last_metrics: dict[str, Any] | None = None
+        # Hold a strong reference to the audio request state so the
+        # streaming-finalize hook below survives the inner generator's
+        # _log_summary_and_cleanup, which pops request_states[request_id]
+        # before this outer block runs.
+        req_state_audio_ref: Any = None
         try:
             async for omni_res in result_generator:
                 final_output_type = omni_res.final_output_type
@@ -1606,6 +1611,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # also captures (stage, replica) for the streaming-continuity
                     # emit at request finalize.
                     req_state = self.engine_client.request_states.get(request_id)
+                    if req_state is not None and req_state_audio_ref is None:
+                        req_state_audio_ref = req_state
                     now_ts = time.time()
                     if req_state is not None and req_state.first_audio_ts is None:
                         req_state.first_audio_ts = now_ts
@@ -1659,21 +1666,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     continue
 
             # Emit audio_underrun_s + audio_continuity_ok_total once per
-            # request after the audio chunk stream is exhausted.
-            req_state_audio = self.engine_client.request_states.get(request_id)
+            # request after the audio chunk stream is exhausted. The
+            # captured reference (req_state_audio_ref) outlives the inner
+            # _log_summary_and_cleanup that pops request_states[request_id].
             if (
-                req_state_audio is not None
-                and req_state_audio.audio_chunk_arrivals_s
-                and req_state_audio.audio_emit_replica_id is not None
+                req_state_audio_ref is not None
+                and req_state_audio_ref.audio_chunk_arrivals_s
+                and req_state_audio_ref.audio_emit_replica_id is not None
             ):
                 observe_audio_streaming_finalize(
                     self.engine_client.mod_metrics,
-                    stage_id=req_state_audio.audio_emit_stage_id or 0,
-                    replica_id=req_state_audio.audio_emit_replica_id,
-                    chunk_arrival_times_s=req_state_audio.audio_chunk_arrivals_s,
-                    chunk_bytes=req_state_audio.audio_chunk_bytes,
+                    stage_id=req_state_audio_ref.audio_emit_stage_id or 0,
+                    replica_id=req_state_audio_ref.audio_emit_replica_id,
+                    chunk_arrival_times_s=req_state_audio_ref.audio_chunk_arrivals_s,
+                    chunk_bytes=req_state_audio_ref.audio_chunk_bytes,
                     sample_rate=(
-                        req_state_audio.audio_sample_rate
+                        req_state_audio_ref.audio_sample_rate
                         or _metric_defs.DEFAULT_AUDIO_SAMPLE_RATE
                     ),
                 )
