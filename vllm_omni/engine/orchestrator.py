@@ -171,6 +171,7 @@ class Orchestrator:
         coordinator_pub_address: str | None = None,
         load_balancer_factory: Callable[[], LoadBalancer] | None = None,
         remote_replica_factory: RemoteReplicaFactory | None = None,
+        transfer_emitter: Any = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -191,6 +192,10 @@ class Orchestrator:
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
         self._running_counter = running_counter
+        # Optional handle to OmniTransferMetrics for direct TX-side emit from
+        # _forward_to_next_stage. Optional so unit-test contexts that don't
+        # spin up a Prometheus registry continue to work.
+        self._transfer_emitter = transfer_emitter
 
         vllm_config_for_stats = next(
             (p.stage_vllm_config for p in stage_pools if p.stage_vllm_config is not None),
@@ -846,6 +851,7 @@ class Orchestrator:
                     stage_id,
                     output,
                     req_state,
+                    src_replica_id=replica_id,
                     is_streaming_session=req_state.streaming.enabled,
                     is_final_update=False,
                 )
@@ -856,6 +862,7 @@ class Orchestrator:
                         stage_id,
                         output,
                         req_state,
+                        src_replica_id=replica_id,
                         is_streaming_session=True,
                         is_final_update=True,
                     )
@@ -967,6 +974,43 @@ class Orchestrator:
         )
         return sp
 
+    def _emit_tx_edge(
+        self,
+        *,
+        from_stage: int,
+        from_replica: int,
+        to_stage: int,
+        to_pool: StagePool,
+        request_id: str,
+        tx_ms: float,
+    ) -> None:
+        """Emit per-edge transfer_tx_s + transfer_size_bytes histograms.
+
+        ``tx_ms`` is the orchestrator-side wall-clock spent in ``next_pool.
+        submit_*`` (serialize + queue submit to the receiving worker). Best-
+        effort size_bytes left at 0 — orchestrator doesn't have a cheap handle
+        on the serialized payload size; a follow-up can plumb that from the
+        connector adapter.
+        """
+        if self._transfer_emitter is None:
+            return
+        to_replica = to_pool.get_bound_replica_id(request_id)
+        if to_replica is None:
+            return
+        try:
+            self._transfer_emitter.observe_size(
+                from_stage, from_replica, to_stage, to_replica, 0
+            )
+            self._transfer_emitter.observe_tx_time(
+                from_stage, from_replica, to_stage, to_replica, tx_ms / 1000.0
+            )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] transfer_tx emit failed for edge %d->%d req=%s",
+                from_stage, to_stage, request_id,
+                exc_info=True,
+            )
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -974,6 +1018,7 @@ class Orchestrator:
         output: Any,
         req_state: OrchestratorRequestState,
         *,
+        src_replica_id: int | None = None,
         is_streaming_session: bool = False,
         is_final_update: bool = False,
     ) -> None:
@@ -986,6 +1031,7 @@ class Orchestrator:
         next_stage_resumable = is_streaming_session and not is_final_update
         already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
+        _t_submit_start = _time.perf_counter()
 
         if next_pool.stage_type == "diffusion":
             if next_client.custom_process_input_func is not None:
@@ -1051,6 +1097,15 @@ class Orchestrator:
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
             req_state.stage_submit_ts[next_logical] = _time.time()
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            self._emit_tx_edge(
+                from_stage=src_stage_id,
+                from_replica=src_replica_id if src_replica_id is not None else 0,
+                to_stage=next_logical,
+                to_pool=next_pool,
+                request_id=req_id,
+                tx_ms=_tx_ms,
+            )
             return
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
@@ -1090,6 +1145,15 @@ class Orchestrator:
                     await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
             req_state.stage_submit_ts[next_logical] = _time.time()
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            self._emit_tx_edge(
+                from_stage=src_stage_id,
+                from_replica=src_replica_id if src_replica_id is not None else 0,
+                to_stage=next_logical,
+                to_pool=next_pool,
+                request_id=req_id,
+                tx_ms=_tx_ms,
+            )
             return
 
         if req_state.pd_prefill_multimodal_output is not None:
@@ -1134,6 +1198,15 @@ class Orchestrator:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
         req_state.stage_submit_ts[next_logical] = _time.time()
+        _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+        self._emit_tx_edge(
+            from_stage=src_stage_id,
+            from_replica=src_replica_id if src_replica_id is not None else 0,
+            to_stage=next_logical,
+            to_pool=next_pool,
+            request_id=req_id,
+            tx_ms=_tx_ms,
+        )
 
     async def _prewarm_async_chunk_stages(
         self,
@@ -1158,6 +1231,7 @@ class Orchestrator:
             params = req_state.sampling_params_list[next_stage_id]
 
             req_state.stage_submit_ts[next_stage_id] = _time.time()
+            _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
                 await next_pool.submit_initial(
@@ -1199,6 +1273,20 @@ class Orchestrator:
                 )
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)
+
+            # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
+            # replica is stage 0's bound replica (single-replica thinker in
+            # all current configs); fall back to 0 if unknown.
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            src_replica = self.stage_pools[next_stage_id - 1].get_bound_replica_id(request_id)
+            self._emit_tx_edge(
+                from_stage=next_stage_id - 1,
+                from_replica=src_replica if src_replica is not None else 0,
+                to_stage=next_stage_id,
+                to_pool=next_pool,
+                request_id=request_id,
+                tx_ms=_tx_ms,
+            )
 
     def _build_kv_sender_info(
         self,

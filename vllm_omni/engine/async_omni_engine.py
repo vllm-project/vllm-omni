@@ -268,11 +268,17 @@ class AsyncOmniEngine:
         init_timeout: int = 600,
         diffusion_batch_size: int = 1,
         single_stage_mode: bool = False,
+        transfer_emitter: Any = None,
         **kwargs: Any,
     ) -> None:
         self.model = model
         self.diffusion_batch_size = diffusion_batch_size
         startup_timeout = int(init_timeout)
+        # Forwarded into Orchestrator so its _forward_to_next_stage path can
+        # emit per-edge transfer_tx_s / transfer_size_bytes histograms.
+        # Optional: when None, Orchestrator silently skips TX emit (existing
+        # RX path still works via OrchestratorAggregator).
+        self._transfer_emitter = transfer_emitter
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
@@ -1371,6 +1377,7 @@ class AsyncOmniEngine:
                 coordinator_pub_address=coordinator_pub_address,
                 load_balancer_factory=load_balancer_factory,
                 remote_replica_factory=remote_replica_factory,
+                transfer_emitter=self._transfer_emitter,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

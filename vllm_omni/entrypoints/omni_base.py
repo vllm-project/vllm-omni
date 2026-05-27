@@ -173,6 +173,10 @@ class OmniBase(PDDisaggregationMixin):
         self.tts_batch_max_items: int = kwargs.pop("tts_batch_max_items", 32)
 
         logger.info("[%s] Initializing with model %s", self.__class__.__name__, model)
+        # Construct transfer_metrics first so we can hand it to AsyncOmniEngine
+        # (which forwards it to the Orchestrator background thread for
+        # TX-side emit; see Orchestrator._forward_to_next_stage).
+        self.transfer_metrics = OmniTransferMetrics(model_name=model)
         st = time.time()
         self.engine = AsyncOmniEngine(
             model=model,
@@ -180,6 +184,7 @@ class OmniBase(PDDisaggregationMixin):
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
             diffusion_batch_size=diffusion_batch_size,
+            transfer_emitter=self.transfer_metrics,
             **kwargs,
         )
         self._shutdown_called = False
@@ -195,7 +200,6 @@ class OmniBase(PDDisaggregationMixin):
         self.request_states: dict[str, ClientRequestState] = {}
         self.prom_metrics = OmniPrometheusMetrics(model_name=model)
         self.mod_metrics = OmniModalityMetrics(model_name=model)
-        self.transfer_metrics = OmniTransferMetrics(model_name=model)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         if not self.output_modalities:
