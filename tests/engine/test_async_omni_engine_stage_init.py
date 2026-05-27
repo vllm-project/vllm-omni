@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import types
+from contextlib import contextmanager
 
 import pytest
 

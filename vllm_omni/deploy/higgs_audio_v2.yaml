@@ -1,0 +1,83 @@
+# Higgs-audio v2 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
+#
+# Phase-1 scope is plain text -> 24 kHz speech only; voice cloning, multi-speaker,
+# ChatML rich messages, and music/sound-event prompts are rejected by the
+# request validator with explicit 4xx (see
+# vllm_omni/entrypoints/openai/serving_speech.py and
+# vllm_omni/model_executor/models/higgs_audio_v2/higgs_audio_v2_tokenizer.py).
+#
+# Streaming is wired through the stage-input processor's async-chunk
+# callback, the shared-memory connector ``codec_streaming`` flag, and the
+# WAV/PCM streaming convention in serving_speech.py. To run a strictly
+# non-streaming smoke test, set ``codec_streaming: false`` in the connector
+# extras below.
+async_chunk: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 5000
+      connector_get_max_wait: 500
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+      initial_codec_chunk_frames: 1
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.6
+    # Disable cudagraph capture: the live audio-sampler dispatch is still
+    # iterating, and the host's flash-attn-hopper graph path tripped a CUDA
+    # driver vs runtime mismatch during capture on this image.
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 2048
+    # max_model_len covers prompt + max_new_tokens. Up to ~1500 codec
+    # frames per request fit comfortably under 4096.
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      # Upstream serve_engine defaults (temperature=1.0, top_p=0.95,
+      # top_k=50). Greedy (temperature=0) collapses the audio codebook
+      # argmax to a fixed value after a few steps; sampling with diversity
+      # is required for natural-sounding speech.
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 50
+      # Cap Stage-0 to 1024 audio frames (~40 s at 25 fps). The audio-eos
+      # natural stop (128012, forced by the talker's _apply_audio_mode_bias
+      # at ramp-completion) typically fires earlier and trims this.
+      max_tokens: 1024
+      seed: 42
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.25
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    # Prefill length is num_codebooks * num_frames; 8 * 8192 = 65536 covers
+    # the upper bound at the per-request 250-frame Stage-0 cap above plus
+    # headroom for batching multiple requests.
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0

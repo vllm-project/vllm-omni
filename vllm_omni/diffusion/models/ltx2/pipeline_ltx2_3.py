@@ -445,6 +445,26 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
     def _unpad_audio_latents(latents: torch.Tensor, num_frames: int) -> torch.Tensor:
         return latents[:, :num_frames]
 
+    @staticmethod
+    def _get_sp_padded_audio_latent_length(audio_latent_length: int, sp_size: int) -> int:
+        if sp_size > 1:
+            audio_latent_length += (sp_size - (audio_latent_length % sp_size)) % sp_size
+        return audio_latent_length
+
+    def _resolve_audio_latent_length(self, audio_latent_length: int, audio_latents: torch.Tensor | None) -> int:
+        if audio_latents is None or audio_latents.ndim != 4:
+            return audio_latent_length
+
+        provided_latent_length = audio_latents.shape[2]
+        sp_size = getattr(self.od_config.parallel_config, "sequence_parallel_size", 1) or 1
+        padded_latent_length = self._get_sp_padded_audio_latent_length(audio_latent_length, int(sp_size))
+
+        # Keep requested duration semantics when callers pass 4D latents that
+        # are already padded for SP; other 4D lengths retain shape inference.
+        if provided_latent_length in {audio_latent_length, padded_latent_length}:
+            return audio_latent_length
+        return provided_latent_length
+
     # ------------------------------------------------------------------
     # Latent preparation
     # ------------------------------------------------------------------
@@ -497,8 +517,10 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
         latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int, int]:
         original_latent_length = audio_latent_length
-        padded_latent_length = original_latent_length
         latent_mel_bins = num_mel_bins // self.audio_vae_mel_compression_ratio
+
+        sp_size = getattr(self.od_config.parallel_config, "sequence_parallel_size", 1) or 1
+        padded_latent_length = self._get_sp_padded_audio_latent_length(original_latent_length, int(sp_size))
 
         if latents is not None:
             if latents.ndim == 4:
@@ -508,6 +530,23 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
             latents = self._normalize_audio_latents(latents, self.audio_vae.latents_mean, self.audio_vae.latents_std)
             noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
             latents = noise_scale * noise + (1 - noise_scale) * latents
+
+            if latents.shape[1] not in {original_latent_length, padded_latent_length}:
+                raise ValueError(
+                    "Provided `audio_latents` has incompatible audio frame count "
+                    f"{latents.shape[1]}; expected {original_latent_length} or {padded_latent_length}."
+                )
+
+            if latents.shape[1] == original_latent_length and padded_latent_length > original_latent_length:
+                padding = torch.zeros(
+                    latents.shape[0],
+                    padded_latent_length - original_latent_length,
+                    latents.shape[2],
+                    dtype=latents.dtype,
+                    device=latents.device,
+                )
+                latents = torch.cat([latents, padding], dim=1)
+
             return latents.to(device=device, dtype=dtype), original_latent_length, padded_latent_length
 
         shape = (batch_size, num_channels_latents, padded_latent_length, latent_mel_bins)
@@ -783,8 +822,7 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
             self.audio_sampling_rate / self.audio_hop_length / float(self.audio_vae_temporal_compression_ratio)
         )
         audio_num_frames = round(duration_s * audio_latents_per_second)
-        if audio_latents is not None and audio_latents.ndim == 4:
-            _, _, audio_num_frames, _ = audio_latents.shape
+        audio_num_frames = self._resolve_audio_latent_length(audio_num_frames, audio_latents)
 
         num_mel_bins = self.audio_vae.config.mel_bins if self.audio_vae is not None else 64
         latent_mel_bins = num_mel_bins // self.audio_vae_mel_compression_ratio

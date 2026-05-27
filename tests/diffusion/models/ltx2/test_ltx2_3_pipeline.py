@@ -15,10 +15,27 @@ These tests verify:
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _make_ltx23_pipeline(sequence_parallel_size: int = 1):
+    from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+
+    pipeline = object.__new__(LTX23Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.audio_vae_temporal_compression_ratio = 4
+    pipeline.audio_vae_mel_compression_ratio = 4
+    pipeline.od_config = SimpleNamespace(parallel_config=SimpleNamespace(sequence_parallel_size=sequence_parallel_size))
+    pipeline.audio_vae = SimpleNamespace(
+        latents_mean=torch.tensor(0.0),
+        latents_std=torch.tensor(1.0),
+    )
+    return pipeline
 
 
 class TestPipelineIndependence:
@@ -228,3 +245,85 @@ class TestInitExports:
         for name in expected_classes:
             assert hasattr(ltx2, name), f"{name} not exported from ltx2 package"
             assert name in ltx2.__all__, f"{name} not in ltx2.__all__"
+
+
+class TestAudioLatentSPPadding:
+    def test_prepare_audio_latents_pads_generated_dummy_length_for_sp(self):
+        pipeline = _make_ltx23_pipeline(sequence_parallel_size=2)
+
+        latents, original_num_frames, padded_num_frames = pipeline.prepare_audio_latents(
+            batch_size=1,
+            num_channels_latents=8,
+            num_mel_bins=64,
+            audio_latent_length=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+        assert original_num_frames == 1
+        assert padded_num_frames == 2
+        assert latents.shape == (1, 2, 128)
+
+    def test_prepare_audio_latents_pads_provided_packed_sequence_dim_for_sp(self):
+        pipeline = _make_ltx23_pipeline(sequence_parallel_size=4)
+        latents = torch.arange(40, dtype=torch.float32).view(1, 10, 4)
+
+        padded, original_num_frames, padded_num_frames = pipeline.prepare_audio_latents(
+            batch_size=1,
+            num_channels_latents=2,
+            num_mel_bins=8,
+            audio_latent_length=10,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            latents=latents,
+        )
+
+        assert original_num_frames == 10
+        assert padded_num_frames == 12
+        assert padded.shape == (1, 12, 4)
+        torch.testing.assert_close(padded[:, :10], latents)
+        torch.testing.assert_close(padded[:, 10:], torch.zeros(1, 2, 4))
+
+    def test_prepare_audio_latents_accepts_already_padded_4d_latents_for_sp(self):
+        pipeline = _make_ltx23_pipeline(sequence_parallel_size=4)
+        latents = torch.arange(96, dtype=torch.float32).view(1, 2, 12, 4)
+
+        audio_latent_length = pipeline._resolve_audio_latent_length(10, latents)
+        padded, original_num_frames, padded_num_frames = pipeline.prepare_audio_latents(
+            batch_size=1,
+            num_channels_latents=2,
+            num_mel_bins=16,
+            audio_latent_length=audio_latent_length,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            latents=latents,
+        )
+
+        assert audio_latent_length == 10
+        assert original_num_frames == 10
+        assert padded_num_frames == 12
+        assert padded.shape == (1, 12, 8)
+        torch.testing.assert_close(padded, pipeline._pack_audio_latents(latents))
+
+    def test_resolve_audio_latent_length_preserves_legacy_4d_shape_inference(self):
+        pipeline = _make_ltx23_pipeline(sequence_parallel_size=4)
+        latents = torch.zeros(1, 2, 13, 4)
+
+        audio_latent_length = pipeline._resolve_audio_latent_length(10, latents)
+
+        assert audio_latent_length == 13
+
+    def test_prepare_audio_latents_rejects_incompatible_provided_length(self):
+        pipeline = _make_ltx23_pipeline(sequence_parallel_size=4)
+        latents = torch.zeros(1, 11, 4)
+
+        with pytest.raises(ValueError, match="incompatible audio frame count"):
+            pipeline.prepare_audio_latents(
+                batch_size=1,
+                num_channels_latents=2,
+                num_mel_bins=8,
+                audio_latent_length=10,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                latents=latents,
+            )
