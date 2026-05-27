@@ -39,6 +39,7 @@ class StageRequestStats:
     rx_in_flight_time_ms: float
     stage_stats: StageStats
     stage_id: int | None = None
+    replica_id: int | None = None
     final_output_type: str | None = None
     request_id: str | None = None
     postprocess_time_ms: float = 0.0
@@ -143,6 +144,14 @@ class OrchestratorAggregator:
         # contexts that don't have a Prometheus registry (e.g. unit tests).
         self._transfer_emitter = transfer_emitter
         self._replica_resolver = replica_resolver
+        # Snapshot of (stage_id -> replica_id) per request, captured at
+        # ``record_transfer_rx`` time from the receiving stage's own
+        # ``StageRequestStats.replica_id``. Survives pool-side
+        # ``release_binding`` so the transfer emit can resolve label values
+        # even when the downstream stage's binding has already been released
+        # by the orchestrator's cleanup path (e.g. final-stage cleanup races
+        # the omni_base finalize emit).
+        self._replica_cache: dict[tuple[int, str], int] = {}
 
     def init_run_state(self, wall_start_ts: float) -> None:
         # Per-run aggregates and timing state
@@ -225,6 +234,11 @@ class OrchestratorAggregator:
             from_stage = int(stats.stage_id) - 1
             to_stage = int(stats.stage_id)
             rid_key = str(stats.request_id)
+            # Snapshot the receiving (stage, replica) binding before the
+            # pool may release it on cleanup. Used by _resolve_edge_replicas
+            # as a fallback when get_bound_replica_id has already cleared.
+            if stats.replica_id is not None:
+                self._replica_cache[(to_stage, rid_key)] = int(stats.replica_id)
             evt = self._get_or_create_transfer_event(from_stage, to_stage, rid_key)
             # Accumulate rx metrics
             if evt.size_bytes == 0:
@@ -255,13 +269,21 @@ class OrchestratorAggregator:
     def _resolve_edge_replicas(
         self, from_stage: int, to_stage: int, request_id: str
     ) -> tuple[int, int] | None:
-        if self._replica_resolver is None:
-            return None
-        from_r = self._replica_resolver(from_stage, request_id)
-        to_r = self._replica_resolver(to_stage, request_id)
+        # Prefer the per-request replica snapshot captured by
+        # record_transfer_rx (survives pool binding release); fall back to the
+        # resolver callback (pool.get_bound_replica_id) when the cache
+        # misses, e.g. for the TX side that fires before the receiving stage
+        # has recorded its stats.
+        from_r = self._replica_cache.get((from_stage, request_id))
+        to_r = self._replica_cache.get((to_stage, request_id))
+        if (from_r is None or to_r is None) and self._replica_resolver is not None:
+            if from_r is None:
+                from_r = self._replica_resolver(from_stage, request_id)
+            if to_r is None:
+                to_r = self._replica_resolver(to_stage, request_id)
         if from_r is None or to_r is None:
             return None
-        return from_r, to_r
+        return int(from_r), int(to_r)
 
     def _emit_transfer_tx(
         self,
@@ -551,6 +573,10 @@ class OrchestratorAggregator:
             ),
         )
         self.e2e_events.append(per_req_record)
+        # Drop per-request replica snapshots once the request is finalized.
+        if self._replica_cache:
+            for cached_key in [k for k in self._replica_cache if k[1] == rid_key]:
+                self._replica_cache.pop(cached_key, None)
 
     def build_and_log_summary(self) -> dict[str, Any]:
         if not self.log_stats:

@@ -510,6 +510,7 @@ class StagePool:
             stage_gen_time_ms=stage_gen_time_ms,
             batch_id=batch_id,
             batch_size=1,
+            replica_id=replica_id,
             rx_decode_time_ms=0.0,
             rx_transfer_bytes=0,
             rx_in_flight_time_ms=0.0,
