@@ -10,7 +10,7 @@ import warnings
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
@@ -408,6 +408,7 @@ class StageDeployConfig:
     stage_id: int
     devices: str | None = None
     num_replicas: int = 1
+    env: dict[str, Any] | None = None
 
     # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
@@ -478,6 +479,7 @@ _STAGE_RESERVED_KEYS = frozenset(
         "stage_id",
         "devices",
         "num_replicas",
+        "env",
         "output_connectors",
         "input_connectors",
         "default_sampling_params",
@@ -498,6 +500,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     runtime_cfg = dict(stage_data.get("runtime", {}))
     devices = runtime_cfg.get("devices", stage_data.get("devices"))
     num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
+    env = runtime_cfg.get("env", stage_data.get("env"))
 
     if "engine_args" in stage_data:
         for k, v in stage_data["engine_args"].items():
@@ -512,6 +515,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
         "stage_id": stage_data["stage_id"],
         "devices": devices,
         "num_replicas": int(num_replicas),
+        "env": env,
     }
     for name, f in _STAGE_DEPLOY_FIELDS.items():
         if name in flat_args:
@@ -651,8 +655,14 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     return DeployConfig(**kwargs)
 
 
-def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-    """Return ``(overrides, devices)`` from a platform stage entry.
+class PlatformOverrides(NamedTuple):
+    overrides: dict[str, Any]
+    devices: str | None
+    env: dict[str, Any] | None
+
+
+def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
+    """Return overrides, devices, and env from a platform stage entry.
 
     Handles both the nested layout (``engine_args:`` / ``runtime.devices``) and
     the flat layout. ``devices`` is ``None`` when no override is set.
@@ -662,9 +672,9 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str
         runtime_cfg = ps.get("runtime", {})
         if "num_replicas" in runtime_cfg:
             overrides["num_replicas"] = runtime_cfg["num_replicas"]
-        return overrides, runtime_cfg.get("devices")
-    overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices")}
-    return overrides, ps.get("devices")
+        return PlatformOverrides(overrides, runtime_cfg.get("devices"), runtime_cfg.get("env"))
+    overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices", "env")}
+    return PlatformOverrides(overrides, ps.get("devices"), ps.get("env"))
 
 
 def _apply_platform_overrides(
@@ -689,10 +699,21 @@ def _apply_platform_overrides(
         base = base_by_id.get(ps["stage_id"])
         if base is None:
             continue
-        overrides, devices = _extract_platform_overrides(ps)
-        if devices is not None:
-            base.devices = devices
-        for key, val in overrides.items():
+        po = _extract_platform_overrides(ps)
+        if po.devices is not None:
+            base.devices = po.devices
+        if po.env is not None:
+            if isinstance(base.env, dict) and isinstance(po.env, dict):
+                base.env = {**base.env, **po.env}
+            else:
+                logger.warning(
+                    "Stage %s env override replaces base env entirely (base type=%s, override type=%s)",
+                    ps["stage_id"],
+                    type(base.env).__name__,
+                    type(po.env).__name__,
+                )
+                base.env = po.env
+        for key, val in po.overrides.items():
             if hasattr(base, key):
                 # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
                 # platform overlays don't silently clobber sibling keys (e.g.
@@ -880,6 +901,8 @@ def merge_pipeline_deploy(
             if ds.devices is not None:
                 runtime["devices"] = ds.devices
             runtime["num_replicas"] = ds.num_replicas
+            if ds.env is not None:
+                runtime["env"] = ds.env
         runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
         result.append(
