@@ -14,6 +14,7 @@ import dataclasses
 import json
 import os
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -1351,6 +1352,8 @@ class AsyncOmniEngine:
     ) -> None:
         """Create loop, initialize stages, then run Orchestrator."""
 
+        if sys.platform == "win32" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 

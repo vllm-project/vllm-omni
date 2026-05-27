@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.process import BaseProcess
@@ -765,12 +766,15 @@ def _perform_diffusion_handshake(
     with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
         poller = zmq.Poller()
         poller.register(handshake_socket, zmq.POLLIN)
-        poller.register(proc.sentinel, zmq.POLLIN)
+        if sys.platform != "win32":
+            poller.register(proc.sentinel, zmq.POLLIN)
 
         timeout_ms = handshake_timeout * 1000
         while True:
             events = dict(poller.poll(timeout=timeout_ms))
             if not events:
+                if proc.exitcode is not None:
+                    raise RuntimeError(f"StageDiffusionProc died during handshake (exit code {proc.exitcode})")
                 raise TimeoutError(
                     f"Timed out waiting for READY from StageDiffusionProc after {handshake_timeout}s. "
                     f"This typically indicates model loading or warmup is taking too long. "

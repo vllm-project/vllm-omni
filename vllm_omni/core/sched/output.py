@@ -1,10 +1,16 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
 from vllm_omni.engine import AdditionalInformationPayload
+
+
+def filter_new_request_data_kwargs(cls: type, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Keep scheduler data construction compatible across vLLM versions."""
+    accepted = {item.name for item in fields(cls)}
+    return {key: value for key, value in kwargs.items() if key in accepted}
 
 
 @dataclass
@@ -43,21 +49,22 @@ class OmniNewRequestData(NewRequestData):
         Returns:
             OmniNewRequestData instance with data from the request
         """
-        return cls(
-            req_id=request.request_id,
-            external_req_id=getattr(request, "external_req_id", None),
-            prompt_token_ids=request.prompt_token_ids,
-            mm_features=request.mm_features,
-            sampling_params=request.sampling_params,
-            pooling_params=request.pooling_params,
-            block_ids=block_ids,
-            num_computed_tokens=request.num_computed_tokens,
-            lora_request=request.lora_request,
-            prompt_embeds=getattr(request, "prompt_embeds", None),
-            prompt_is_token_ids=getattr(request, "prompt_is_token_ids", None),
-            prefill_token_ids=prefill_token_ids,
-            additional_information=getattr(request, "additional_information", None),
-        )
+        kwargs = {
+            "req_id": request.request_id,
+            "external_req_id": getattr(request, "external_req_id", None),
+            "prompt_token_ids": request.prompt_token_ids,
+            "mm_features": request.mm_features,
+            "sampling_params": request.sampling_params,
+            "pooling_params": request.pooling_params,
+            "block_ids": block_ids,
+            "num_computed_tokens": request.num_computed_tokens,
+            "lora_request": request.lora_request,
+            "prompt_embeds": getattr(request, "prompt_embeds", None),
+            "prompt_is_token_ids": getattr(request, "prompt_is_token_ids", None),
+            "prefill_token_ids": prefill_token_ids,
+            "additional_information": getattr(request, "additional_information", None),
+        }
+        return cls(**filter_new_request_data_kwargs(cls, kwargs))
 
 
 @dataclass

@@ -8,10 +8,11 @@ out of StageEngineCoreClient into reusable functions.
 
 from __future__ import annotations
 
-import fcntl
 import importlib
 import multiprocessing as mp
 import os
+import sys
+import tempfile
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
@@ -36,6 +37,45 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
 
 logger = init_logger(__name__)
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
+
+def _device_lock_path(device_id: str | int) -> str:
+    if sys.platform == "win32":
+        lock_dir = os.path.join(tempfile.gettempdir(), "vllm_omni_locks")
+        os.makedirs(lock_dir, exist_ok=True)
+        return os.path.join(lock_dir, f"vllm_omni_device_{device_id}_init.lock")
+    return f"/tmp/vllm_omni_device_{device_id}_init.lock"
+
+
+def _try_lock_fd(lock_fd: int) -> bool:
+    if sys.platform == "win32":
+        try:
+            os.lseek(lock_fd, 0, os.SEEK_SET)
+            os.write(lock_fd, b"\0")
+            os.lseek(lock_fd, 0, os.SEEK_SET)
+            msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def _unlock_fd(lock_fd: int) -> None:
+    if sys.platform == "win32":
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
 @dataclass
@@ -919,21 +959,20 @@ def acquire_device_locks(
         # Acquire locks
         wait_start = time.time()
         for device_id in devices_to_lock:
-            lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
+            lock_file = _device_lock_path(device_id)
             lock_acquired = False
 
             while not lock_acquired:
                 try:
                     lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o644)
-                    try:
-                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if _try_lock_fd(lock_fd):
                         os.ftruncate(lock_fd, 0)
                         os.write(lock_fd, f"{os.getpid()}\n".encode())
                         os.fsync(lock_fd)
                         lock_acquired = True
                         lock_fds.append(lock_fd)
                         logger.debug("Acquired exclusive lock for device %s", device_id)
-                    except BlockingIOError:
+                    else:
                         os.close(lock_fd)
                         if time.time() - wait_start > stage_init_timeout:
                             logger.warning(
@@ -968,7 +1007,7 @@ def release_device_locks(lock_fds: list[int]) -> None:
     """Release file locks acquired by acquire_device_locks."""
     for lock_fd in lock_fds:
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            _unlock_fd(lock_fd)
             os.close(lock_fd)
             logger.debug("Released initialization lock (fd=%s)", lock_fd)
         except (OSError, ValueError):

@@ -74,10 +74,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "name": getattr(connector_config, "name", None),
                 "extra": getattr(connector_config, "extra", {}),
             }
+        extra = dict(connector_config.get("extra", {}) or {})
+        stage_id = getattr(model_config, "stage_id", None)
+        if stage_id is not None:
+            extra.setdefault("stage_id", int(stage_id))
 
         connector_specs = ConnectorSpec(
             name=connector_config.get("name", "SharedMemoryConnector"),
-            extra=connector_config.get("extra", {}),
+            extra=extra,
         )
         return OmniConnectorFactory.create_connector(connector_specs)
 
@@ -139,6 +143,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._save_cond.notify()
 
     def _poll_single_request(self, request: Request):
+        if request.status == RequestStatus.RUNNING:
+            return False
+
         stage_id = self.connector.stage_id
         target_stage_id = stage_id - 1
         req_id = request.request_id

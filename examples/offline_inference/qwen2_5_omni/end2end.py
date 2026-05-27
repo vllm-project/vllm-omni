@@ -305,7 +305,7 @@ def main(args):
 
     # Get the query function and call it with appropriate parameters
     query_func = query_map[args.query_type]
-    if args.query_type == "mixed_modalities":
+    if args.query_type == "use_mixed_modalities":
         query_result = query_func(
             video_path=video_path,
             image_path=image_path,
@@ -315,7 +315,7 @@ def main(args):
         )
     elif args.query_type == "use_audio_in_video":
         query_result = query_func(video_path=video_path, num_frames=num_frames, sampling_rate=sampling_rate)
-    elif args.query_type == "multi_audios":
+    elif args.query_type == "use_multi_audios":
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     elif args.query_type == "use_image":
         query_result = query_func(image_path=image_path)
@@ -487,6 +487,11 @@ def parse_args():
         "--output-wav",
         default="output_audio",
         help="[Deprecated] Output wav directory (use --output-dir).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory for generated text and audio files.",
     )
     parser.add_argument(
         "--num-prompts",

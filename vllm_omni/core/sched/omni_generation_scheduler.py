@@ -28,7 +28,12 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_qwen3_omni_full_payload_input_coordinator,
 )
-from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData, OmniSchedulerOutput
+from vllm_omni.core.sched.output import (
+    OmniCachedRequestData,
+    OmniNewRequestData,
+    OmniSchedulerOutput,
+    filter_new_request_data_kwargs,
+)
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
@@ -315,21 +320,22 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 req_id = getattr(nr, "req_id", None)
                 request = self.requests.get(req_id) if req_id else None
                 # Build omni entry preserving all base fields
-                omni_nr = OmniNewRequestData(
-                    req_id=nr.req_id,
-                    external_req_id=(getattr(request, "external_req_id", None) if request else None),
-                    prompt_token_ids=nr.prompt_token_ids,
-                    mm_features=nr.mm_features,
-                    sampling_params=nr.sampling_params,
-                    pooling_params=nr.pooling_params,
-                    block_ids=nr.block_ids,
-                    num_computed_tokens=nr.num_computed_tokens,
-                    lora_request=nr.lora_request,
+                kwargs = {
+                    "req_id": nr.req_id,
+                    "external_req_id": (getattr(request, "external_req_id", None) if request else None),
+                    "prompt_token_ids": nr.prompt_token_ids,
+                    "mm_features": nr.mm_features,
+                    "sampling_params": nr.sampling_params,
+                    "pooling_params": nr.pooling_params,
+                    "block_ids": nr.block_ids,
+                    "num_computed_tokens": nr.num_computed_tokens,
+                    "lora_request": nr.lora_request,
                     # Enrich with omni payloads from the live request object
-                    prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
-                    prompt_is_token_ids=nr.prompt_is_token_ids,
-                    additional_information=(getattr(request, "additional_information", None) if request else None),
-                )
+                    "prompt_embeds": (getattr(request, "prompt_embeds", None) if request else None),
+                    "prompt_is_token_ids": getattr(nr, "prompt_is_token_ids", None),
+                    "additional_information": (getattr(request, "additional_information", None) if request else None),
+                }
+                omni_nr = OmniNewRequestData(**filter_new_request_data_kwargs(OmniNewRequestData, kwargs))
                 new_list.append(omni_nr)
 
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
@@ -494,21 +500,30 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = None
             routed_experts = None
 
-            # Diffusion request: completes in one step; mark finished and free resources
+            async_chunk_consumed = (
+                self.chunk_transfer_adapter is not None
+                and request.num_computed_tokens >= len(request.prompt_token_ids)
+            )
+            async_chunk_terminal = (
+                async_chunk_consumed
+                and request.request_id in self.chunk_transfer_adapter.finished_requests
+            )
+
+            # Diffusion request: completes in one step. In async_chunk mode,
+            # consuming one chunk is only a segment boundary; wait for the next
+            # upstream chunk unless the adapter has observed the terminal chunk.
             if (
                 request.status == RequestStatus.FINISHED_STOPPED
                 or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
-                or (
-                    self.chunk_transfer_adapter is not None
-                    and request.request_id in self.chunk_transfer_adapter.finished_requests
-                    and request.num_computed_tokens >= len(request.prompt_token_ids)
-                )
+                or async_chunk_terminal
             ):
                 request.status = RequestStatus.FINISHED_STOPPED
                 # Optional: set a stop_reason for front-end clarity
                 # (does not affect protocol)
                 request.stop_reason = request.stop_reason  # or "generation_done"
                 stopped = True
+            elif async_chunk_consumed:
+                request.status = RequestStatus.WAITING_FOR_CHUNK
 
             if stopped:
                 if (

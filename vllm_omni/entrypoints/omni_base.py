@@ -450,6 +450,7 @@ class OmniBase(PDDisaggregationMixin):
         images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         return OmniRequestOutput(
             request_id=req_id or "",
+            finished=finished,
             stage_id=stage_id,
             final_output_type=output_type,
             request_output=engine_outputs,
