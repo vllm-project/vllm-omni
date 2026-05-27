@@ -13,12 +13,16 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 try:
-    from dreamid_omni.modules.model import WanLayerNorm, WanRMSNorm
+    from dreamid_omni.modules.model import WanLayerNorm
 except ImportError:
     raise ImportError("Failed to import from dependency 'dreamid_omni'.")
 
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.models.dreamid_omni.wan2_2 import WanModel, rope_apply
+from vllm_omni.diffusion.models.dreamid_omni.wan2_2 import (
+    DistributedRMSNorm,
+    WanModel,
+    rope_apply,
+)
 
 logger = init_logger(__name__)
 
@@ -349,13 +353,16 @@ class FusionModel(nn.Module):
                 prefix=prefix,
             )
 
+        tp_size = get_tensor_model_parallel_world_size()
         for i, vid_block in enumerate(self.video_model.blocks):
             cross = vid_block.cross_attn
             block_prefix = f"video_model.blocks.{i}.cross_attn"
             cross.k_fusion = _make_kv_proj(vid_block.dim, f"{block_prefix}.k_fusion")
             cross.v_fusion = _make_kv_proj(vid_block.dim, f"{block_prefix}.v_fusion")
             cross.pre_attn_norm_fusion = WanLayerNorm(vid_block.dim, elementwise_affine=True)
-            cross.norm_k_fusion = WanRMSNorm(vid_block.dim, eps=1e-6) if vid_block.qk_norm else nn.Identity()
+            cross.norm_k_fusion = (
+                DistributedRMSNorm(vid_block.dim // tp_size, eps=1e-6) if vid_block.qk_norm else nn.Identity()
+            )
 
         for i, audio_block in enumerate(self.audio_model.blocks):
             cross = audio_block.cross_attn
@@ -363,7 +370,9 @@ class FusionModel(nn.Module):
             cross.k_fusion = _make_kv_proj(audio_block.dim, f"{block_prefix}.k_fusion")
             cross.v_fusion = _make_kv_proj(audio_block.dim, f"{block_prefix}.v_fusion")
             cross.pre_attn_norm_fusion = WanLayerNorm(audio_block.dim, elementwise_affine=True)
-            cross.norm_k_fusion = WanRMSNorm(audio_block.dim, eps=1e-6) if audio_block.qk_norm else nn.Identity()
+            cross.norm_k_fusion = (
+                DistributedRMSNorm(audio_block.dim // tp_size, eps=1e-6) if audio_block.qk_norm else nn.Identity()
+            )
 
     def _detach_blocks_from_backbones(self) -> None:
         """Keep offloadable blocks owned only by a single place.

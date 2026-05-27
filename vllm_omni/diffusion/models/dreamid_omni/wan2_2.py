@@ -6,7 +6,10 @@ import torch.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -24,13 +27,38 @@ try:
         MLPProj,
         ModulationAdd,
         WanLayerNorm,
-        WanRMSNorm,
         rope_apply,  # diff from  wan2.2
         rope_params,
         sinusoidal_embedding_1d,
     )
 except ImportError:
     raise ImportError("Failed to import from dependency 'dreamid_omni'.")
+
+
+class DistributedRMSNorm(nn.Module):
+    """RMSNorm that computes global RMS across tensor parallel ranks.
+
+    Mirrors `vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py::DistributedRMSNorm`
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tp_size = get_tensor_model_parallel_world_size()
+        x_dtype = x.dtype
+        x_float = x.float()
+        local_sum_sq = x_float.pow(2).sum(dim=-1, keepdim=True)
+        local_count = x.shape[-1]
+
+        if tp_size > 1:
+            local_sum_sq = tensor_model_parallel_all_reduce(local_sum_sq)
+            local_count = local_count * tp_size
+
+        rms = torch.sqrt(local_sum_sq / local_count + self.eps)
+        return (x_float / rms * self.weight.float()).to(x_dtype)
 
 
 class WanSelfAttention(nn.Module):
@@ -77,8 +105,8 @@ class WanSelfAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o" if prefix else "o",
         )
-        self.norm_q = WanRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(self.tp_kv_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = DistributedRMSNorm(self.tp_kv_dim, eps=eps) if qk_norm else nn.Identity()
         # Unified attention layer
         self.attn = Attention(
             num_heads=self.num_heads,
@@ -181,8 +209,8 @@ class WanT2VCrossAttention(nn.Module):
         self.num_kv_heads = self.num_heads
         self.tp_inner_dim = self.num_heads * self.head_dim
 
-        self.norm_q = WanRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
 
         self.o = RowParallelLinear(
             dim,

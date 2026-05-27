@@ -13,6 +13,10 @@ from PIL import Image, ImageOps
 from torch import nn
 from torchvision.transforms import Compose, Normalize
 from tqdm import tqdm
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -249,6 +253,24 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
         params_dict = dict(self.model.named_parameters())
         loaded_local: set[str] = set()
 
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
+
+        def _maybe_shard_weight(weight: torch.Tensor, param: torch.Tensor) -> torch.Tensor:
+            """Slice a checkpoint tensor to this rank's TP shard when the
+            param is a TP-local shape but the checkpoint stores the full one.
+            """
+            if tp_size <= 1 or weight.shape == param.shape:
+                return weight
+            if weight.ndim == 1 and weight.numel() == param.numel() * tp_size:
+                return weight.chunk(tp_size, dim=0)[tp_rank]
+            if weight.ndim == 2:
+                if weight.shape[0] == param.shape[0] * tp_size:
+                    return weight.chunk(tp_size, dim=0)[tp_rank]
+                if weight.shape[1] == param.shape[1] * tp_size:
+                    return weight.chunk(tp_size, dim=1)[tp_rank]
+            return weight
+
         for full_name, loaded_weight in weights:
             if not full_name.startswith(pipeline_prefix):
                 continue
@@ -276,8 +298,12 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
                 logger.warning(f"Skipping DreamID-Omni weight {full_name} -- not found in model parameters")
                 continue
             param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", None) or default_weight_loader
-            weight_loader(param, loaded_weight)
+            weight_loader = getattr(param, "weight_loader", None)
+            if weight_loader is not None:
+                # Parallel Linears handle TP sharding internally
+                weight_loader(param, loaded_weight)
+            else:
+                default_weight_loader(param, _maybe_shard_weight(loaded_weight, param))
             loaded_local.add(name)
 
         # Detach must happen before `DiffusersPipelineLoader._process_weights_after_loading`
