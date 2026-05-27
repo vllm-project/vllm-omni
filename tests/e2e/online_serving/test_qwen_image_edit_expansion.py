@@ -34,7 +34,7 @@ def _get_diffusion_feature_cases(model: str):
                 model=model,
                 server_args=[
                     "--cache-backend",
-                    "tea_cache",  # [TODO] may consider changing to cache_dit after #1779 is resolved. Currently cache_dit and layerwise offload cannot work together.
+                    "cache_dit",
                     "--enable-layerwise-offload",
                 ],
             ),
@@ -59,7 +59,7 @@ def _get_diffusion_feature_cases(model: str):
                 model=model,
                 server_args=[
                     "--cache-backend",
-                    "cache_dit",
+                    "tea_cache",
                     "--ring",
                     "2",
                 ],
