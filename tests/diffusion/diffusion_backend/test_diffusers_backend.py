@@ -79,8 +79,12 @@ def _patch_fake_diffusers_quantization_backends(mocker):
         pass
 
     mocker.patch(
-        "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils._get_diffusers_quantization_classes",
-        return_value=(FakePipelineQuantizationConfig, FakeTorchAoConfig),
+        "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils.PipelineQuantizationConfig",
+        FakePipelineQuantizationConfig,
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils.TorchAoConfig",
+        FakeTorchAoConfig,
     )
     mocker.patch(
         "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils._get_torchao_quant_type_cls",

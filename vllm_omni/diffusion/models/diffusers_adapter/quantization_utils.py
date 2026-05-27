@@ -14,11 +14,45 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from diffusers import PipelineQuantizationConfig, TorchAoConfig
+
 logger = logging.getLogger(__name__)
 
 _DIFFUSERS_DEFAULT_QUANT_COMPONENT = "transformer"
-_QuantizationValidator = Callable[[Any], None]
-_QuantizationBuilder = Callable[[Any], Any]
+_QuantizationConfigSpec = tuple[Callable[[Any], None], str]
+
+
+def ensure_supported_diffusers_quantization(quant_config: Any) -> None:
+    """Validate that a vLLM-Omni quantization config has a Diffusers mapping."""
+
+    method = _get_quant_method_name(quant_config)
+    validator, _ = _get_quantization_config_spec(method)
+    validator(quant_config)
+
+
+def apply_diffusers_quantization_config(od_config: Any, load_kwargs: dict[str, Any]) -> bool:
+    """Inject a courtesy-converted quantization_config into load kwargs.
+
+    ``diffusers_load_kwargs`` is the canonical Diffusers backend configuration
+    path, so an explicit ``quantization_config`` already present in
+    ``load_kwargs`` is never replaced. Returns whether a config was injected by
+    this helper.
+    """
+
+    quant_config = getattr(od_config, "quantization_config", None)
+    if quant_config is None:
+        return False
+
+    if "quantization_config" in load_kwargs:
+        logger.warning(
+            "Both vLLM-Omni quantization_config and diffusers_load_kwargs.quantization_config "
+            "were provided for the diffusers backend. Using the Diffusers-native "
+            "quantization_config from diffusers_load_kwargs."
+        )
+        return False
+
+    load_kwargs["quantization_config"] = _build_diffusers_quantization_config(quant_config)
+    return True
 
 
 def _normalize_method_name(method: Any) -> str:
@@ -41,26 +75,16 @@ def _get_quant_method_name(quant_config: Any) -> str:
     return _normalize_method_name(method)
 
 
-def _has_ignored_layers(quant_config: Any) -> bool:
+def _ensure_no_ignored_layers(quant_config: Any) -> None:
     ignored_layers = getattr(quant_config, "ignored_layers", None)
     if not ignored_layers:
         ignored_layers = getattr(quant_config, "modules_to_not_convert", None)
-    return bool(ignored_layers)
-
-
-def _ensure_no_ignored_layers(quant_config: Any) -> None:
-    if _has_ignored_layers(quant_config):
+    if ignored_layers:
         raise NotImplementedError(
             "Diffusers backend quantization conversion does not map vLLM "
             "ignored_layers/modules_to_not_convert names to Diffusers module "
             "names. Use diffusers_load_kwargs for a native Diffusers config."
         )
-
-
-def _get_diffusers_quantization_classes() -> tuple[type[Any], type[Any]]:
-    from diffusers import PipelineQuantizationConfig, TorchAoConfig
-
-    return PipelineQuantizationConfig, TorchAoConfig
 
 
 def _get_torchao_quant_type_cls(class_name: str) -> type[Any]:
@@ -80,7 +104,8 @@ def _get_torchao_quant_type_cls(class_name: str) -> type[Any]:
 
 
 def _build_torchao_pipeline_quant_config(torchao_quant_type_name: str) -> Any:
-    PipelineQuantizationConfig, TorchAoConfig = _get_diffusers_quantization_classes()
+    """Build a Diffusers config after the caller has validated the vLLM config."""
+
     quant_type_cls = _get_torchao_quant_type_cls(torchao_quant_type_name)
     return PipelineQuantizationConfig(
         quant_mapping={
@@ -91,11 +116,11 @@ def _build_torchao_pipeline_quant_config(torchao_quant_type_name: str) -> Any:
     )
 
 
-def ensure_supported_diffusers_quantization_components(component_names: set[str]) -> None:
+def _ensure_supported_diffusers_quantization_components(component_names: dict[str, Any]) -> None:
     if _DIFFUSERS_DEFAULT_QUANT_COMPONENT in component_names:
         return
 
-    available_components = ", ".join(sorted(component_names)) or "<none>"
+    available_components = ", ".join(sorted(component_names.keys())) or "<none>"
     raise NotImplementedError(
         "Diffusers backend quantization conversion currently only supports "
         f"pipelines with a '{_DIFFUSERS_DEFAULT_QUANT_COMPONENT}' component. "
@@ -127,11 +152,6 @@ def _validate_fp8_quant_config(quant_config: Any) -> None:
     _ensure_no_ignored_layers(quant_config)
 
 
-def _build_fp8_quant_config(quant_config: Any) -> Any:
-    _validate_fp8_quant_config(quant_config)
-    return _build_torchao_pipeline_quant_config("Float8DynamicActivationFloat8WeightConfig")
-
-
 def _validate_int8_quant_config(quant_config: Any) -> None:
     if getattr(quant_config, "is_checkpoint_int8_serialized", False):
         raise NotImplementedError(
@@ -148,64 +168,26 @@ def _validate_int8_quant_config(quant_config: Any) -> None:
     _ensure_no_ignored_layers(quant_config)
 
 
-def _build_int8_quant_config(quant_config: Any) -> Any:
-    _validate_int8_quant_config(quant_config)
-    return _build_torchao_pipeline_quant_config("Int8DynamicActivationInt8WeightConfig")
-
-
-_QUANTIZATION_CONFIG_BUILDERS: dict[str, tuple[_QuantizationValidator, _QuantizationBuilder]] = {
-    "fp8": (_validate_fp8_quant_config, _build_fp8_quant_config),
-    "int8": (_validate_int8_quant_config, _build_int8_quant_config),
+_QUANTIZATION_CONFIG_SPECS: dict[str, _QuantizationConfigSpec] = {
+    "fp8": (_validate_fp8_quant_config, "Float8DynamicActivationFloat8WeightConfig"),
+    "int8": (_validate_int8_quant_config, "Int8DynamicActivationInt8WeightConfig"),
 }
 
 
-def _get_quantization_config_builder(method: str) -> tuple[_QuantizationValidator, _QuantizationBuilder]:
-    builder = _QUANTIZATION_CONFIG_BUILDERS.get(method)
-    if builder is None:
+def _get_quantization_config_spec(method: str) -> _QuantizationConfigSpec:
+    spec = _QUANTIZATION_CONFIG_SPECS.get(method)
+    if spec is None:
         raise NotImplementedError(
             f"Diffusers backend quantization conversion does not support {method!r}. "
             "Use diffusers_load_kwargs for a native Diffusers quantization config, "
             "or use a native vLLM-Omni pipeline for this quantization method."
         )
-    return builder
+    return spec
 
 
-def ensure_supported_diffusers_quantization(quant_config: Any) -> None:
-    """Validate that a vLLM-Omni quantization config has a Diffusers mapping."""
-
-    method = _get_quant_method_name(quant_config)
-    validator, _ = _get_quantization_config_builder(method)
-    validator(quant_config)
-
-
-def build_diffusers_quantization_config(quant_config: Any) -> Any:
+def _build_diffusers_quantization_config(quant_config: Any) -> Any:
     """Build a Diffusers PipelineQuantizationConfig from a supported config."""
 
     method = _get_quant_method_name(quant_config)
-    _, builder = _get_quantization_config_builder(method)
-    return builder(quant_config)
-
-
-def apply_diffusers_quantization_config(od_config: Any, load_kwargs: dict[str, Any]) -> bool:
-    """Inject a courtesy-converted quantization_config into load kwargs.
-
-    ``diffusers_load_kwargs`` is the canonical Diffusers backend configuration
-    path, so an explicit ``quantization_config`` already present in
-    ``load_kwargs`` is never replaced. Returns whether a config was injected by
-    this helper.
-    """
-
-    quant_config = getattr(od_config, "quantization_config", None)
-    if quant_config is None:
-        return False
-
-    if "quantization_config" in load_kwargs:
-        logger.warning(
-            "Both vLLM-Omni quantization_config and diffusers_load_kwargs.quantization_config "
-            "were provided for the diffusers backend. Using the Diffusers-native "
-            "quantization_config from diffusers_load_kwargs."
-        )
-        return False
-
-    load_kwargs["quantization_config"] = build_diffusers_quantization_config(quant_config)
-    return True
+    _, torchao_quant_type_name = _get_quantization_config_spec(method)
+    return _build_torchao_pipeline_quant_config(torchao_quant_type_name)

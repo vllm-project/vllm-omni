@@ -55,22 +55,32 @@ For example: `--diffusers-load-kwargs '{"use_safetensors": true}'`.
 When a parameter is available in the vLLM-Omni interface, it will be adapted here.
 But if that parameter is simultaneously set in both the vLLM-Omni interface and `diffusers_load_kwargs`, the **latter** will take precedence.
 
-#### Quantization
+### `--diffusers-call-kwargs`
+
+Passed to `pipeline.__call__()`.
+
+This is suitable for sampling parameters not available through the vLLM-Omni interface (such as online serving payloads).
+
+When a parameter is available in the vLLM-Omni interface, it will be adapted here.
+But if that parameter is simultaneously set in both the vLLM-Omni interface and `diffusers_call_kwargs`, the **former** will take precedence (because it is set at request time).
+
+!!! note
+    In vLLM-Omni, the default values for some sampling parameters may be different from diffusers.
+    Consider referring to [`OmniDiffusionSamplingParams`](../../../vllm_omni/inputs/data.py) for the default sampling parameters in the vLLM-Omni interface,
+    and the corresponding [diffusers pipeline](https://huggingface.co/docs/diffusers/main/en/api/pipelines/overview)'s `__call__` function documentation.
+
+### Quantization
 
 `diffusers_load_kwargs` is the primary way to pass Diffusers-native loading
-options. For quantization, Diffusers expects `quantization_config` to be a
-`PipelineQuantizationConfig` object passed to
-`DiffusionPipeline.from_pretrained()`. This object form is mainly useful from
-Python/config paths that can pass Python objects; a raw JSON dict is not a
-Diffusers-native quantization config.
+options. For convenience, the diffusers backend also supports a small, verified
+set of vLLM-Omni quantization configs when `diffusers_load_kwargs` does not
+already contain `quantization_config`.
 
-For convenience, the diffusers backend also supports a small, verified set of
-vLLM-Omni quantization configs when `diffusers_load_kwargs` does not already
-contain `quantization_config`. Currently this covers online/dynamic `fp8` and
-online/dynamic `int8` for Diffusers pipelines that expose a `transformer`
-component. The converted config uses Diffusers/TorchAO dynamic quantization; it
-does not try to emulate native vLLM-Omni checkpoint or low-bit post-load
-quantization. This path requires `torchao` to be installed.
+Currently this covers online/dynamic `fp8` and online/dynamic `int8` for
+Diffusers pipelines that expose a `transformer` component. The converted config
+uses Diffusers/TorchAO dynamic quantization; it does not try to emulate native
+vLLM-Omni checkpoint or low-bit post-load quantization. This path requires
+`torchao` to be installed.
 
 For example, the CLI can request dynamic FP8 through the vLLM-Omni interface:
 
@@ -88,20 +98,6 @@ Layer-name skip lists such as `ignored_layers` are also not mapped because
 vLLM-Omni and Diffusers module names may differ. Use Diffusers-native
 configuration through `diffusers_load_kwargs` or a native vLLM-Omni pipeline
 for those cases.
-
-### `--diffusers-call-kwargs`
-
-Passed to `pipeline.__call__()`.
-
-This is suitable for sampling parameters not available through the vLLM-Omni interface (such as online serving payloads).
-
-When a parameter is available in the vLLM-Omni interface, it will be adapted here.
-But if that parameter is simultaneously set in both the vLLM-Omni interface and `diffusers_call_kwargs`, the **former** will take precedence (because it is set at request time).
-
-!!! note
-    In vLLM-Omni, the default values for some sampling parameters may be different from diffusers.
-    Consider referring to [`OmniDiffusionSamplingParams`](../../../vllm_omni/inputs/data.py) for the default sampling parameters in the vLLM-Omni interface,
-    and the corresponding [diffusers pipeline](https://huggingface.co/docs/diffusers/main/en/api/pipelines/overview)'s `__call__` function documentation.
 
 ### Attention Backends
 

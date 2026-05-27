@@ -25,9 +25,9 @@ from torch import nn
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import BasePipelineUtils, get_pipeline_utils
 from vllm_omni.diffusion.models.diffusers_adapter.quantization_utils import (
+    _ensure_supported_diffusers_quantization_components,
     apply_diffusers_quantization_config,
     ensure_supported_diffusers_quantization,
-    ensure_supported_diffusers_quantization_components,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -225,14 +225,18 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     ) -> None:
         config_load_kwargs = {k: load_kwargs[k] for k in _DIFFUSERS_CONFIG_LOAD_KWARGS if k in load_kwargs}
         pipeline_config = DiffusionPipeline.load_config(model_id, **config_load_kwargs)
-        component_names = {
-            name
-            for name, value in pipeline_config.items()
-            if isinstance(value, list) and len(value) > 0 and value[0] is not None
-        }
-
-        component_names = {name for name in component_names if name not in load_kwargs or load_kwargs[name] is not None}
-        ensure_supported_diffusers_quantization_components(component_names)
+        _ensure_supported_diffusers_quantization_components(
+            {
+                name: value
+                for name, value in pipeline_config.items()
+                if (
+                    isinstance(value, list)
+                    and len(value) > 0
+                    and value[0] is not None
+                    and (name not in load_kwargs or load_kwargs[name] is not None)
+                )
+            }
+        )
 
     # ------------------------------------------------------------------
     # Wrap settings, inputs, and outputs
