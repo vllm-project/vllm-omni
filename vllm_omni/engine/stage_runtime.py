@@ -754,10 +754,17 @@ class DistStageRuntime(StageRuntime):
                 try:
                     runtime_cfg.num_replicas = self._omni_dp_size_local
                 except Exception:
-                    # TODO: make runtime config mutation typed so failed
-                    # omni_dp_size_local overrides cannot be silently lost.
                     if hasattr(runtime_cfg, "__setitem__"):
-                        runtime_cfg["num_replicas"] = self._omni_dp_size_local
+                        try:
+                            runtime_cfg["num_replicas"] = self._omni_dp_size_local
+                            continue
+                        except Exception:
+                            pass
+                    logger.warning(
+                        "[DistStageRuntime] Failed to apply omni_dp_size_local=%s to stage %s runtime config",
+                        self._omni_dp_size_local,
+                        stage_id,
+                    )
 
     def _before_initialize_stage_replicas(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         self._start_omni_master_server(stage_plans)
