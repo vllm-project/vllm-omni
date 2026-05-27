@@ -155,9 +155,9 @@ class TestTtsRegionDetection:
     by sniffing for 4.5-specific BOS/EOS token ids (151703 / 151704); when
     those are absent it falls back to the 2.6 ids (151691 / 151692).
 
-    This is a regression guard: a single off-by-one or mis-prioritized
-    branch here causes the talker to receive an empty / wrong-region slice
-    and emit silent audio.
+    This is a regression guard: a single off-by-one or wrong branch
+    precedence here causes the talker to receive an empty / wrong-region
+    slice and emit silent audio.
     """
 
     def _run(self, prompt_token_ids, output_token_ids):
