@@ -1,28 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Stable Audio 3 (medium) text-to-audio pipeline for vLLM-Omni.
+"""Stable Audio 3 text-to-audio pipeline for vLLM-Omni.
 
-Issue: https://github.com/vllm-project/vllm-omni/issues/3787
-Reference impl: https://github.com/Stability-AI/stable-audio-3 (MIT)
+PORT_FROM: stable_audio_3/model.py StableAudioModel (top-level facade)
+           stable_audio_3/factory.py (component assembly)
+           stable_audio_3/interface/diffusion_cond.py generate_cond (inference loop)
+           stable_audio_3/cli.py (user-facing flow)
 
-This is a Path B (custom/no-diffusers) integration. The structure mirrors
-`vllm_omni/diffusion/models/stable_audio/pipeline_stable_audio.py` (Stable
-Audio Open 1.0), with three deltas:
+This pipeline IS the bridge between vllm-omni's engine and SA3's internals.
 
-  1. SAME autoencoder (in same_autoencoder.py) replaces AutoencoderOobleck.
-  2. Variable-length latents sized to the requested duration.
-  3. DiT ported in stable_audio_3_transformer.py — no diffusers fallback.
+Engine contract (from .claude/skills/add-diffusion-model/SKILL.md):
+  - subclass nn.Module + SupportAudioOutput + (later) SupportsComponentDiscovery
+  - implement forward(req: OmniDiffusionRequest) → DiffusionOutput
+  - define self.weights_sources so DiffusersPipelineLoader knows where to load
+  - implement load_weights() entry point
 
-SCOPE (v1): text-to-audio only. audio-to-audio editing and inpainting are
-deferred.
+Component layout (mirrors upstream factory.py's assembly):
+  self.diffusion = ConditionedDiffusionModelWrapper(...)
+       ↳ .conditioner = MultiConditioner({"prompt": T5GemmaConditioner,
+                                            "seconds_total": NumberConditioner, ...})
+       ↳ .model       = DiTWrapper(DiffusionTransformer(...))
+       ↳ .pretransform = AutoencoderPretransform(AudioAutoencoder(SAMEEncoder + SAMEDecoder
+                                                  + SoftNormBottleneck + PatchedPretransform))
 """
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterable
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -32,25 +40,41 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportAudioOutput
-from vllm_omni.diffusion.models.stable_audio_3.same_autoencoder import SAMEAutoencoder
-from vllm_omni.diffusion.models.stable_audio_3.stable_audio_3_transformer import (
-    StableAudio3DiTModel,
-    StableAudio3SchedulerWrapper,
+from vllm_omni.diffusion.models.interface import (
+    SupportAudioOutput,
+    SupportsComponentDiscovery,
+)
+from vllm_omni.diffusion.models.stable_audio_3.conditioners import (
+    MultiConditioner,
+    NumberConditioner,
+    T5GemmaConditioner,
+)
+from vllm_omni.diffusion.models.stable_audio_3.diffusion_wrapper import (
+    ConditionedDiffusionModelWrapper,
+    DiTWrapper,
+)
+from vllm_omni.diffusion.models.stable_audio_3.same_autoencoder import (
+    AudioAutoencoder,
+    AutoencoderPretransform,
+    PatchedPretransform,
+    SAMEDecoder,
+    SAMEEncoder,
+    SoftNormBottleneck,
+)
+from vllm_omni.diffusion.models.stable_audio_3.sampling import (
+    build_schedule,
+    sample_diffusion,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 
 logger = init_logger(__name__)
 
 
-def get_stable_audio_3_post_process_func(
-    od_config: OmniDiffusionConfig,
-):
-    """Post-process raw audio tensor → numpy array (factory for the registry)."""
+def get_stable_audio_3_post_process_func(od_config: OmniDiffusionConfig):
+    """Audio post-process factory — registered in registry.py."""
 
     def post_process_func(audio: torch.Tensor, output_type: str = "np"):
         if output_type in ("latent", "pt"):
@@ -61,293 +85,195 @@ def get_stable_audio_3_post_process_func(
 
 
 # ---------------------------------------------------------------------------
-# USER DECISION #3 — Text encoder choice
+# Pipeline
 # ---------------------------------------------------------------------------
-# Stable Audio Open 1.0 used T5 (T5EncoderModel + T5TokenizerFast) plus a
-# StableAudioProjectionModel for duration conditioning.
-#
-# SA3 may use the same stack or something different. Check the upstream
-# `model_index.json` or `text_encoder/` subfolder once you have the weights.
-#
-# Likely options:
-#   A. T5-base / T5-large       — same as SA Open 1.0, transformers handles loading
-#   B. CLAP / MuLan style         — joint audio-text, requires a different encoder
-#   C. Custom embedding-only      — upstream ships a projection-only model
-#
-# Set _TEXT_ENCODER_KIND below once known. The pipeline branches on this.
-# ---------------------------------------------------------------------------
-_TEXT_ENCODER_KIND: str = "t5"  # TODO(stable-audio-3): confirm against upstream model_index.json
 
 
-class StableAudio3Pipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMixin):
-    """Stable Audio 3 text-to-audio pipeline.
+class StableAudio3Pipeline(
+    nn.Module,
+    SupportAudioOutput,
+    SupportsComponentDiscovery,
+    DiffusionPipelineProfilerMixin,
+):
+    """Top-level text-to-audio pipeline for Stable Audio 3.
 
-    Engine contract:
-      - Inherits SupportAudioOutput  → engine routes outputs as audio waveforms
-      - Inherits DiffusionPipelineProfilerMixin → optional profiling
-      - Implements forward(req: OmniDiffusionRequest) → DiffusionOutput
-      - Defines self.weights_sources → DiffusersPipelineLoader knows where to load from
-      - Implements load_weights() → AutoWeightsLoader entry point
+    Initial scope (v1): text-to-audio only. audio-to-audio editing and
+    inpainting are deferred — slots reserved by ConditionedDiffusionModelWrapper
+    but no user-facing entry points.
     """
 
-    # Picked up by `supports_audio_output` in the diffusion engine.
+    # Engine routing markers
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 44100
+    max_audio_seconds: ClassVar[float] = 380.0  # SA3 Medium upper bound per issue #3787
 
-    # SA3 Medium per issue #3787:
-    #   - up to 380s clips (vs SA Open 1.0's ~47s)
-    #   - peak ~6.5 GB VRAM (Medium)
-    #   - requires Flash Attention 2
-    max_audio_seconds: ClassVar[float] = 380.0
+    # Component discovery for CPU offload / layerwise offload
+    # (per SupportsComponentDiscovery protocol; dotted paths supported)
+    _dit_modules: ClassVar[list[str]] = ["diffusion_model.model"]  # DiffusionTransformer (1.4B DiT)
+    _encoder_modules: ClassVar[list[str]] = ["conditioner"]  # MultiConditioner → T5Gemma + Number
+    _vae_modules: ClassVar[list[str]] = ["pretransform.model"]  # AudioAutoencoder (SAME)
+    _resident_modules: ClassVar[list[str]] = []  # nothing extra to pin
 
-    def __init__(
-        self,
-        *,
-        od_config: OmniDiffusionConfig,
-        prefix: str = "",
-    ) -> None:
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
         self.od_config = od_config
-
         self.device = get_local_device()
-        dtype = getattr(od_config, "dtype", torch.float16)
+        self.dtype = getattr(od_config, "dtype", torch.float16)
 
-        model = od_config.model
-        local_files_only = os.path.exists(model)
+        # ----------------------------------------------------------------
+        # Load model_config.json from the checkpoint root.
+        # SA3 ships {repo}/model_config.json + {repo}/model.safetensors.
+        # ----------------------------------------------------------------
+        model_path = od_config.model
+        local_files_only = os.path.exists(model_path)
+        config_path = os.path.join(model_path, "model_config.json")
+        with open(config_path) as f:
+            sa3_config = json.load(f)
+        self.sa3_config = sa3_config
 
-        # ------------------------------------------------------------------
-        # Weight loader hook — DiT weights live under `transformer/` subfolder.
-        # If upstream packages SA3 differently (single safetensors at root),
-        # switch to BAGEL's pattern: subfolder=None, prefix="" — and remove
-        # `fall_back_to_pt`.
-        # ------------------------------------------------------------------
+        sample_rate = sa3_config.get("sample_rate", 44100)
+        self.sample_rate = sample_rate
+
+        # ----------------------------------------------------------------
+        # Build the assembly tree (mirrors factory.create_diffusion_cond_from_config).
+        # PORT_FROM: factory.py:13-90
+        # ----------------------------------------------------------------
+        model_cfg = sa3_config["model"]
+        diffusion_cfg = model_cfg["diffusion"]
+        diffusion_objective = diffusion_cfg.get("diffusion_objective", "v")
+        diffusion_model_cfg = diffusion_cfg["config"]
+        modular_local_cond_configs = diffusion_cfg.get("modular_local_cond_configs", [])
+
+        # DiTWrapper(DiffusionTransformer(**config))
+        # PORT_FROM: factory.py:22-26
+        self.diffusion_model = DiTWrapper(
+            diffusion_objective=diffusion_objective,
+            modular_local_cond_configs=modular_local_cond_configs,
+            **diffusion_model_cfg,
+        )
+
+        # Pretransform = AutoencoderPretransform(AudioAutoencoder(...))
+        # PORT_FROM: factory.py:97-156 (create_pretransform_from_config)
+        self.pretransform = self._build_pretransform(model_cfg, sample_rate)
+
+        # MultiConditioner({id: T5Gemma | Number, ...})
+        # PORT_FROM: factory.py:115-156
+        self.conditioner = self._build_conditioner(model_cfg["conditioning"])
+
+        # Top-level wrapper
+        # PORT_FROM: factory.py:43-90
+        min_input_length = self.pretransform.downsampling_ratio * self.diffusion_model.model.patch_size
+        self.diffusion = ConditionedDiffusionModelWrapper(
+            self.diffusion_model,
+            self.conditioner,
+            min_input_length=min_input_length,
+            sample_rate=sample_rate,
+            cross_attn_cond_ids=diffusion_cfg.get("cross_attention_cond_ids", []),
+            global_cond_ids=diffusion_cfg.get("global_cond_ids", []),
+            input_concat_ids=diffusion_cfg.get("input_concat_ids", []),
+            local_add_cond_ids=diffusion_cfg.get("local_add_cond_ids", []),
+            modular_local_cond_ids=[c["id"] for c in modular_local_cond_configs],
+            prepend_cond_ids=diffusion_cfg.get("prepend_cond_ids", []),
+            pretransform=self.pretransform,
+            io_channels=model_cfg.get("io_channels"),
+            distribution_shift_options=diffusion_cfg.get("distribution_shift_options"),
+            sampling_distribution_shift_options=diffusion_cfg.get("sampling_distribution_shift_options"),
+            mask_padding_attention=diffusion_cfg.get("mask_padding_attention", False),
+            use_effective_length_for_schedule=diffusion_cfg.get("use_effective_length_for_schedule", False),
+            diffusion_objective=diffusion_objective,
+        )
+
+        # ----------------------------------------------------------------
+        # Weights sources — vllm-omni loader will populate self.diffusion after init.
+        # SA3 ships weights at the model root (no `transformer/` subfolder).
+        # Pattern 2 (BAGEL-style): subfolder=None, prefix="".
+        # ----------------------------------------------------------------
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer",
+                model_or_path=model_path,
+                subfolder=None,
                 revision=None,
-                prefix="transformer.",
-                fall_back_to_pt=True,
+                prefix="",
+                fall_back_to_pt=False,
             ),
         ]
 
-        # ------------------------------------------------------------------
-        # Text encoder + tokenizer
-        # ------------------------------------------------------------------
-        # TODO(stable-audio-3): implement encoder load based on _TEXT_ENCODER_KIND.
-        # See USER DECISION #3 above.
-        if _TEXT_ENCODER_KIND == "t5":
-            from transformers import T5EncoderModel, T5TokenizerFast
-
-            self.tokenizer = T5TokenizerFast.from_pretrained(
-                model, subfolder="tokenizer", local_files_only=local_files_only,
-            )
-            self.text_encoder = T5EncoderModel.from_pretrained(
-                model, subfolder="text_encoder",
-                torch_dtype=dtype, local_files_only=local_files_only,
-            ).to(self.device)
-        else:
-            raise NotImplementedError(
-                f"_TEXT_ENCODER_KIND={_TEXT_ENCODER_KIND!r} not yet wired. "
-                "Edit pipeline_stable_audio_3.py USER DECISION #3."
-            )
-
-        # ------------------------------------------------------------------
-        # Duration / projection model — TODO(stable-audio-3): verify whether
-        # SA3 keeps the StableAudioProjectionModel-style duration embedding
-        # or rolls its own. Until confirmed, leave as None and let the DiT
-        # consume raw duration scalars.
-        # ------------------------------------------------------------------
-        self.projection_model = None  # TODO(stable-audio-3): wire up
-
-        # ------------------------------------------------------------------
-        # VAE — SAME autoencoder (ported, see same_autoencoder.py)
-        # Variant selection comes from od_config.model_config so users can
-        # switch small_music / small_sfx / medium without code changes.
-        # ------------------------------------------------------------------
-        same_variant = (
-            getattr(od_config, "model_config", {}) or {}
-        ).get("same_variant", "medium")
-        self.vae = SAMEAutoencoder(variant=same_variant, dtype=torch.float32).to(self.device)
-
-        # ------------------------------------------------------------------
-        # DiT transformer (weights loaded later by the loader)
-        # ------------------------------------------------------------------
-        transformer_kwargs = get_transformer_config_kwargs(
-            od_config.tf_model_config, StableAudio3DiTModel,
-        )
-        self.transformer = StableAudio3DiTModel(od_config=od_config, **transformer_kwargs)
-
-        # ------------------------------------------------------------------
-        # Scheduler — TODO(stable-audio-3): confirm whether SA3 ships a custom
-        # scheduler or reuses one diffusers exposes. The wrapper lets us slot
-        # any standard step()/set_timesteps() scheduler.
-        # ------------------------------------------------------------------
-        # Placeholder: instantiating with None will fail at forward(); replace
-        # with the actual scheduler once upstream is inspected.
-        self.scheduler: StableAudio3SchedulerWrapper | None = None
-
-        # Rotary embedding dim — DiT-side detail
-        self.rotary_embed_dim = self.transformer.config.attention_head_dim // 2
-
-        # Cache backend (set by worker if cache-dit / teacache enabled)
-        self._cache_backend = None
-
-        # CFG / timestep tracking
+        # CFG / timestep tracking (for cache backends + profiler)
         self._guidance_scale: float | None = None
         self._num_timesteps: int | None = None
         self._current_timestep: torch.Tensor | None = None
+        self._cache_backend = None
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler,
         )
 
-    # -- standard CFG properties ----------------------------------------------
+    # ------------------------------------------------------------------ helpers
 
-    @property
-    def guidance_scale(self):
-        return self._guidance_scale
+    def _build_pretransform(self, model_cfg: dict, sample_rate: int) -> AutoencoderPretransform:
+        """Mirror factory.create_pretransform_from_config + create_autoencoder_from_config.
 
-    @property
-    def do_classifier_free_guidance(self):
-        return self._guidance_scale is not None and self._guidance_scale > 1.0
-
-    @property
-    def num_timesteps(self):
-        return self._num_timesteps
-
-    @property
-    def current_timestep(self):
-        return self._current_timestep
-
-    # -- validation -----------------------------------------------------------
-
-    def check_inputs(
-        self,
-        prompt: str | list[str] | None,
-        audio_start_in_s: float,
-        audio_end_in_s: float,
-        negative_prompt: str | list[str] | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-    ) -> None:
-        if audio_end_in_s < audio_start_in_s:
-            raise ValueError(
-                f"audio_end_in_s={audio_end_in_s} must be >= audio_start_in_s={audio_start_in_s}"
-            )
-        if audio_end_in_s - audio_start_in_s > self.max_audio_seconds:
-            raise ValueError(
-                f"Requested duration {audio_end_in_s - audio_start_in_s:.1f}s exceeds "
-                f"SA3 Medium max of {self.max_audio_seconds:.0f}s"
-            )
-        if prompt is None and prompt_embeds is None:
-            raise ValueError("Provide either `prompt` or `prompt_embeds`.")
-        if prompt is not None and prompt_embeds is not None:
-            raise ValueError("Provide only one of `prompt` or `prompt_embeds`.")
-
-    # -- encoding -------------------------------------------------------------
-
-    def encode_prompt(
-        self,
-        prompt: str | list[str],
-        device: torch.device,
-        do_classifier_free_guidance: bool,
-        negative_prompt: str | list[str] | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Encode text to embeddings.
-
-        Identical contract to SA Open 1.0's encode_prompt — copy that implementation
-        and adjust only if SA3 uses a non-T5 encoder (see USER DECISION #3).
+        PORT_FROM: factory.py:93-113
         """
-        # TODO(stable-audio-3): mirror SA Open 1.0's encode_prompt; key differences,
-        # if any, will be (a) tokenizer.model_max_length and (b) projection_model use.
-        raise NotImplementedError(
-            "encode_prompt: copy from "
-            "vllm_omni/diffusion/models/stable_audio/pipeline_stable_audio.py and adapt."
-        )
-
-    def encode_duration(
-        self,
-        audio_start_in_s: float,
-        audio_end_in_s: float,
-        device: torch.device,
-        do_classifier_free_guidance: bool,
-        batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode duration scalars → conditioning tensors.
-
-        SA Open 1.0 routes this through StableAudioProjectionModel. SA3 may
-        or may not — TODO(stable-audio-3): verify and either reuse the
-        projection model or implement a raw FourierFeatures embedding here.
-        """
+        # TODO(stable-audio-3): replicate factory.create_autoencoder_from_config logic.
+        # Reads:
+        #   ae_cfg = model_cfg["pretransform"]["config"]
+        #   encoder = SAMEEncoder(**ae_cfg["encoder"]["config"])
+        #   decoder = SAMEDecoder(**ae_cfg["decoder"]["config"])
+        #   bottleneck = SoftNormBottleneck(**ae_cfg["bottleneck"]["config"])
+        #   patch_pretransform = PatchedPretransform(**ae_cfg["pretransform"]["config"])
+        #   ae = AudioAutoencoder(encoder, decoder, ..., pretransform=patch_pretransform,
+        #                          bottleneck=bottleneck, sample_rate=sample_rate)
+        #   return AutoencoderPretransform(ae, chunked=model_cfg["pretransform"].get("chunked", False))
         raise NotImplementedError
 
-    def prepare_latents(
-        self,
-        batch_size: int,
-        num_channels_vae: int,
-        sample_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        generator: torch.Generator | list[torch.Generator] | None,
-        latents: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Sample initial latent noise of shape [B, 256, sample_size].
+    def _build_conditioner(self, conditioning_config: dict) -> MultiConditioner:
+        """Build MultiConditioner from config.
 
-        sample_size is computed per-request from the requested duration (see
-        USER DECISION #2 in stable_audio_3_transformer.py).
+        PORT_FROM: factory.py:115-156
         """
-        from diffusers.utils.torch_utils import randn_tensor
+        cond_dim = conditioning_config["cond_dim"]
+        default_keys = conditioning_config.get("default_keys", {})
+        pre_encoded_keys = conditioning_config.get("pre_encoded_keys", [])
 
-        shape = (batch_size, num_channels_vae, sample_size)
-        if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        else:
-            latents = latents.to(device)
-        assert self.scheduler is not None, "scheduler not initialised — see __init__ TODO"
-        return latents * self.scheduler.init_noise_sigma
+        conditioners: dict[str, nn.Module] = {}
+        for cinfo in conditioning_config["configs"]:
+            cid = cinfo["id"]
+            ctype = cinfo["type"]
+            ccfg = {"output_dim": cond_dim, **cinfo["config"]}
+            if ctype == "t5gemma":
+                conditioners[cid] = T5GemmaConditioner(**ccfg)
+            elif ctype == "number":
+                conditioners[cid] = NumberConditioner(**ccfg)
+            else:
+                raise ValueError(f"Unknown conditioner type: {ctype}")
 
-    # -- main entry -----------------------------------------------------------
+        return MultiConditioner(conditioners, default_keys=default_keys, pre_encoded_keys=pre_encoded_keys)
 
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-        prompt: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        audio_end_in_s: float | None = None,
-        audio_start_in_s: float = 0.0,
-        guidance_scale: float = 7.0,
-        num_waveforms_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        output_type: str = "np",
-    ) -> DiffusionOutput:
-        """Generate audio from text prompt(s).
+    # ------------------------------------------------------------------ inference entry
 
-        Once the encode_prompt / encode_duration / scheduler stubs above are
-        implemented, this body can be filled in by copying the corresponding
-        section from SA Open 1.0's `forward()` and adjusting:
+    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """vLLM-omni engine entry — text → audio.
 
-          - num_channels_vae uses self.vae.config.latent_channels (256 for SAME)
-          - sample_size is computed from the requested duration, NOT
-            self.transformer.config.sample_size (which may be None for SA3)
-          - VAE decode goes through SAMEAutoencoder.decode (chunked)
-          - rotary_embedding length uses the actual latent_size (variable)
+        Maps OmniDiffusionRequest fields onto upstream's generate_cond inputs.
+        PORT_FROM: stable_audio_3/interface/diffusion_cond.py generate_cond
+                   stable_audio_3/cli.py main() (the user-facing flow)
+
+        High-level:
+          1. Extract prompt + duration from req
+          2. Run MultiConditioner to get conditioning_tensors dict
+          3. Build initial noise latent [B, latent_dim, T_latent] where
+             T_latent = (duration * sample_rate) // downsampling_ratio
+          4. Build sigma schedule (default 8 steps)
+          5. Loop sampler — sample_diffusion(self.diffusion, x, sigmas)
+          6. Decode via self.pretransform.decode(latents)
+          7. Return DiffusionOutput(output=audio)
         """
-        # TODO(stable-audio-3): port forward() from SA Open 1.0 with the above changes.
+        # TODO(stable-audio-3): full inference loop. See docstring above.
         raise NotImplementedError
 
-    # -- weight loading -------------------------------------------------------
+    # ------------------------------------------------------------------ weight loading
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """AutoWeightsLoader entry — delegates to per-component load_weights.
-
-        Note: SA3's DiT defines its own `load_weights` with custom name
-        remapping (Pattern 2). AutoWeightsLoader will dispatch DiT-prefixed
-        names there automatically.
-        """
+        """AutoWeightsLoader entry — delegates to each component's load_weights."""
         return AutoWeightsLoader(self).load_weights(weights)
