@@ -1040,7 +1040,11 @@ class ImageKVCacheManager:
 
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
-        repeat_num = head_num_per_rank // kv_head_num_per_rank
+        if head_num_per_rank % kv_head_num_per_rank != 0:
+            raise ValueError(
+                f"Invalid GQA shape: q_heads={head_num_per_rank}, kv_heads={kv_head_num_per_rank}. "
+                "q_heads must be divisible by kv_heads."
+            )
         head_dim = query.shape[2]
 
         query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
@@ -1074,12 +1078,6 @@ class ImageKVCacheManager:
             else:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
-
-        key = repeat_kv(key, repeat_num)
-        value = repeat_kv(value, repeat_num)
-        if self.sp_size > 1:
-            joint_text_key = repeat_kv(joint_text_key, repeat_num)
-            joint_text_value = repeat_kv(joint_text_value, repeat_num)
 
         attention_mask = attention_mask.contiguous()
 

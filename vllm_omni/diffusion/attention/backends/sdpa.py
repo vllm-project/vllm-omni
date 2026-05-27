@@ -115,6 +115,7 @@ class SDPAImpl(AttentionImpl):
             dropout_p=0.0,
             is_causal=self.causal,
             scale=self.softmax_scale,
+            enable_gqa=query.shape[1] > key.shape[1],  # Enable GQA if num_kv_heads is used.
         )
         out = output.permute(0, 2, 1, 3)
         return out
