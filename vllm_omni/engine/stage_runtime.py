@@ -408,6 +408,7 @@ class StageRuntime:
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
         primary_exc: Exception | None = None
+        init_state_lock = threading.Lock()
 
         init_groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
         for plan in stage_plans:
@@ -418,19 +419,22 @@ class StageRuntime:
             """Initialize replicas in one scheduling group sequentially."""
             nonlocal primary_exc
             for stage_idx, replica in group:
-                if primary_exc is not None:
-                    return
+                with init_state_lock:
+                    if primary_exc is not None:
+                        return
                 try:
                     client = self._initialize_replica(
                         replica,
                         stage_init_timeout,
                         stage_launch_lock,
                     )
-                    initialized_clients_by_stage[stage_idx][replica.replica_id] = client
                 except Exception as exc:
-                    if primary_exc is None:
-                        primary_exc = exc
+                    with init_state_lock:
+                        if primary_exc is None:
+                            primary_exc = exc
                     return
+                with init_state_lock:
+                    initialized_clients_by_stage[stage_idx][replica.replica_id] = client
 
         inline_keys = [key for key in init_groups if key.startswith("inline:")]
         for key in inline_keys:
@@ -452,8 +456,9 @@ class StageRuntime:
                         try:
                             future.result()
                         except Exception as exc:
-                            if primary_exc is None:
-                                primary_exc = exc
+                            with init_state_lock:
+                                if primary_exc is None:
+                                    primary_exc = exc
 
         if primary_exc is not None:
             setattr(primary_exc, "_initialized_clients_by_stage", initialized_clients_by_stage)
