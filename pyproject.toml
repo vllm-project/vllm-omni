@@ -254,6 +254,7 @@ extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
 ]
 [tool.typos.default.extend-words]
+updator = "updator"
 ue = "ue"
 semantics = "semantics"
 fullset = "fullset"
