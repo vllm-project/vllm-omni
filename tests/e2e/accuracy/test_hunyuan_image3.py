@@ -77,9 +77,9 @@ THRESHOLDS = {
     "text_prefix_match": 10,  # First 10 characters must match exactly
     "cot_semantic_sim": 0.9,  # Full CoT semantic similarity
     # Image comparison
-    "clip_score": 85,  # CLIP image semantic similarity
-    "ssim": 0.20,  # Structural similarity
-    "psnr": 11.0,  # Peak signal-to-noise ratio (dB)
+    "clip_score": 90,  # CLIP image semantic similarity
+    "ssim": 0.26,  # Structural similarity
+    "psnr": 12.5,  # Peak signal-to-noise ratio (dB)
 }
 
 QUANT_PROMPT = "A brown and white dog is running on the grass."
