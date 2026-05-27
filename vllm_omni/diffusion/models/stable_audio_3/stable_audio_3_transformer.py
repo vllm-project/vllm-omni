@@ -67,7 +67,8 @@ class FourierFeatures(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # PORT_FROM: blocks.py:47-50
-        raise NotImplementedError
+        f = 2 * math.pi * x @ self.weight.T
+        return torch.cat([f.cos(), f.sin()], dim=-1)
 
 
 class ExpoFourierFeatures(nn.Module):
@@ -79,8 +80,23 @@ class ExpoFourierFeatures(nn.Module):
         self.min_freq = min_freq
         self.max_freq = max_freq
 
+    @torch.amp.autocast("cuda", enabled=False)
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+        # PORT_FROM: blocks.py:60-83
+        in_dtype = t.dtype
+        t = t.float()
+        if t.dim() == 1:
+            t = t.unsqueeze(-1)
+
+        half_dim = self.dim // 2
+        ramp = torch.linspace(0, 1, half_dim, device=t.device, dtype=torch.float32)
+        log_min = math.log(self.min_freq)
+        log_max = math.log(self.max_freq)
+        freqs = torch.exp(ramp * (log_max - log_min) + log_min)
+
+        args = t * freqs * 2 * math.pi
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        return embedding.to(in_dtype)
 
 
 # ---------------------------------------------------------------------------

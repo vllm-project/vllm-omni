@@ -62,11 +62,25 @@ class ResidualUnit(nn.Module):
 
     def __init__(self, in_channels: int, out_channels: int, dilation: int, depthwise: bool = False, bias: bool = True) -> None:
         super().__init__()
-        # PORT_FROM
-        raise NotImplementedError
+        self.dilation = dilation
+        padding = (dilation * (7 - 1)) // 2
+        self.layers = nn.Sequential(
+            get_activation("elu"),
+            WNConv1d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=7,
+                dilation=dilation,
+                padding=padding,
+                groups=1 if not depthwise else out_channels,
+                bias=bias,
+            ),
+            get_activation("elu"),
+            WNConv1d(in_channels=out_channels, out_channels=out_channels, kernel_size=1, bias=bias),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+        return x + self.layers(x)
 
 
 # ---------------------------------------------------------------------------
