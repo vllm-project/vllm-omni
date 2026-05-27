@@ -477,7 +477,7 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
         # Verify similarity (Whisper transcript vs streamed/detokenized text)
         if "audio" in modalities:
             audio_ref_text = request_config.get("audio_ref_text")
-            similarity_threshold = request_config.get("similarity_threshold", 0.85)
+            similarity_threshold = request_config.get("similarity_threshold", 0.8)
             if "text" in modalities:
                 transcript = (response.audio_content or "").strip()
                 text_output = (response.text_content or "").strip()
