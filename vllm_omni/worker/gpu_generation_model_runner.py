@@ -278,6 +278,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 slot_mappings=slot_mappings_by_group,
             )
+            self._maybe_attach_attention_metadata_extensions(
+                attn_metadata=attn_metadata,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                max_query_len=max_num_scheduled_tokens,
+                pad_attn=pad_attn,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+            )
 
             (
                 input_ids,
@@ -729,6 +737,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
+                )
+                self._maybe_attach_attention_metadata_extensions(
+                    attn_metadata=attn_metadata,
+                    num_reqs=num_reqs_padded,
+                    num_reqs_padded=num_reqs_padded,
+                    max_query_len=max_query_len,
+                    pad_attn=True,
+                    for_cudagraph_capture=is_graph_capturing,
                 )
 
         with self.maybe_dummy_run_with_lora(

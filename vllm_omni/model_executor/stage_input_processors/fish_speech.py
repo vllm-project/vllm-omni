@@ -3,7 +3,6 @@
 from typing import Any
 
 import torch
-from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import (
     CodesStruct,
@@ -11,7 +10,85 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
 )
 
-logger = init_logger(__name__)
+
+def _get_connector_extra(transfer_manager: Any) -> dict[str, Any]:
+    connector = getattr(transfer_manager, "connector", None)
+    raw_cfg = getattr(connector, "config", {}) or {}
+    return raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+
+
+def _use_tensor_code_payload(transfer_manager: Any) -> bool:
+    cfg = _get_connector_extra(transfer_manager)
+    return bool(cfg.get("fish_speech_tensor_codes", False))
+
+
+def _cfg_bool(cfg: dict[str, Any], key: str, default: bool = False) -> bool:
+    return bool(cfg.get(key, default))
+
+
+def _cfg_int(cfg: dict[str, Any], key: str, default: int = 0) -> int:
+    value = cfg.get(key, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid Fish Speech integer config {key}={value!r}") from exc
+
+
+def _cfg_float(cfg: dict[str, Any], key: str, default: float) -> float:
+    value = cfg.get(key, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid Fish Speech float config {key}={value!r}") from exc
+
+
+def _active_codec_requests(transfer_manager: Any) -> int:
+    return sum(1 for value in transfer_manager.code_prompt_token_ids.values() if len(value) > 0)
+
+
+def _ready_codec_requests(transfer_manager: Any, min_frames: int) -> int:
+    return sum(1 for value in transfer_manager.code_prompt_token_ids.values() if len(value) >= min_frames)
+
+
+def _select_backlog_chunk_size(
+    transfer_manager: Any,
+    cfg: dict[str, Any],
+    base_chunk_size: int,
+    current_length: int,
+) -> int:
+    backlog_chunk_size = _cfg_int(
+        cfg,
+        "fish_speech_backlog_codec_chunk_frames",
+        0,
+    )
+    if backlog_chunk_size <= base_chunk_size:
+        return base_chunk_size
+
+    capacity = max(1, int(getattr(transfer_manager, "scheduler_max_num_seqs", 1)))
+    active = _active_codec_requests(transfer_manager)
+    load_factor = min(active / capacity, 1.0)
+    threshold = _cfg_float(
+        cfg,
+        "fish_speech_backlog_load_threshold",
+        0.75,
+    )
+    if load_factor < threshold:
+        return base_chunk_size
+
+    ready_min = _cfg_int(
+        cfg,
+        "fish_speech_backlog_min_ready",
+        max(2, min(capacity, int(capacity * threshold))),
+    )
+    # Include the current request even when the caller has not yet committed
+    # the latest frame into the transfer-manager map.
+    ready = _ready_codec_requests(transfer_manager, base_chunk_size)
+    if current_length >= base_chunk_size:
+        ready = max(ready, 1)
+    if ready < ready_min:
+        return base_chunk_size
+
+    return backlog_chunk_size
 
 
 def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
@@ -21,11 +98,18 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
         return None
     if audio_codes.ndim == 2:
         frame = audio_codes[-1]
-        if frame.numel() == 0 or not bool(frame.any().item()):
+        valid = pooling_output.get("audio_code_valid")
+        if isinstance(valid, torch.Tensor) and valid.numel() > 0:
+            is_valid = bool(valid.reshape(-1)[-1].item())
+        elif valid is not None:
+            is_valid = bool(valid)
+        else:
+            is_valid = bool(frame.any().item())
+        if frame.numel() == 0 or not is_valid:
             return None
-        return frame.to(torch.long).reshape(-1)
+        return frame.to(device="cpu", dtype=torch.long).reshape(-1)
     if audio_codes.ndim == 1:
-        return audio_codes.to(torch.long).reshape(-1)
+        return audio_codes.to(device="cpu", dtype=torch.long).reshape(-1)
     raise ValueError(f"Invalid audio_codes shape for Fish Speech async_chunk: {tuple(audio_codes.shape)}")
 
 
@@ -74,20 +158,20 @@ def slow_ar_to_dac_decoder_async_chunk(
     """
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
+    cfg = _get_connector_extra(transfer_manager)
 
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)
         if frame is not None:
-            transfer_manager.code_prompt_token_ids[request_id].append(frame.detach().to(device="cpu", dtype=torch.long))
+            transfer_manager.code_prompt_token_ids[request_id].append(frame.detach())
     elif not finished:
         return None
 
-    connector = getattr(transfer_manager, "connector", None)
-    raw_cfg = getattr(connector, "config", {}) or {}
-    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
-    initial_chunk_size = int(cfg.get("initial_codec_chunk_frames", 0))
+    configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames", 0))
+
+    initial_chunk_size = configured_initial_chunk_size
 
     # Per-request override.
     additional_information = getattr(request, "additional_information", None)
@@ -100,7 +184,7 @@ def slow_ar_to_dac_decoder_async_chunk(
         if entry.list_data is not None and len(entry.list_data) == 1:
             initial_chunk_size = int(entry.list_data[0])
 
-    if chunk_size <= 0 or left_context_size_config < 0 or initial_chunk_size < 0:
+    if chunk_size <= 0 or left_context_size_config < 0 or configured_initial_chunk_size < 0 or initial_chunk_size < 0:
         raise ValueError(
             f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
             f"codec_left_context_frames={left_context_size_config}, "
@@ -110,6 +194,7 @@ def slow_ar_to_dac_decoder_async_chunk(
         initial_chunk_size = chunk_size
 
     length = len(transfer_manager.code_prompt_token_ids[request_id])
+    steady_chunk_size = _select_backlog_chunk_size(transfer_manager, cfg, chunk_size, length)
 
     if length <= 0:
         if finished:
@@ -119,9 +204,30 @@ def slow_ar_to_dac_decoder_async_chunk(
             )
         return None
 
-    in_initial_phase = initial_chunk_size > 0 and length <= chunk_size
+    single_initial_chunk = _cfg_bool(
+        cfg,
+        "fish_speech_single_initial_chunk",
+        False,
+    )
+    use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < steady_chunk_size
 
-    if in_initial_phase:
+    if single_initial_chunk and use_first_chunk:
+        if length <= initial_chunk_size:
+            if not finished and length < initial_chunk_size:
+                return None
+            context_length = length if finished and length < initial_chunk_size else initial_chunk_size
+        else:
+            adjusted = length - initial_chunk_size
+            if adjusted <= 0:
+                return None
+            if not finished and adjusted % steady_chunk_size != 0:
+                return None
+            chunk_length = adjusted % steady_chunk_size
+            context_length = chunk_length if chunk_length != 0 else steady_chunk_size
+        end_index = min(length, left_context_size_config + context_length)
+        left_context_size = max(0, int(end_index - context_length))
+        window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
+    elif initial_chunk_size > 0 and length <= chunk_size:
         already_sent = transfer_manager.put_req_chunk[request_id] * initial_chunk_size
         pending = length - already_sent
         if pending <= 0:
@@ -134,17 +240,23 @@ def slow_ar_to_dac_decoder_async_chunk(
     else:
         initial_coverage = (chunk_size // initial_chunk_size) * initial_chunk_size if initial_chunk_size > 0 else 0
         adjusted = length - initial_coverage
-        chunk_length = adjusted % chunk_size
+        chunk_length = adjusted % steady_chunk_size
         if chunk_length != 0 and not finished:
             return None
-        context_length = chunk_length if chunk_length != 0 else chunk_size
+        context_length = chunk_length if chunk_length != 0 else steady_chunk_size
         end_index = min(length, left_context_size_config + context_length)
         left_context_size = max(0, int(end_index - context_length))
         window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
-    # Pack into codebook-major flat codes.
+    # Pack into codebook-major codes. The tensor path avoids expanding codec
+    # indices into Python ints across the connector boundary; Stage1 schedules
+    # a single placeholder token and consumes the real codes from runtime info.
     stacked_frames = torch.stack(window_frames, dim=0)
-    code_predictor_codes = stacked_frames.transpose(0, 1).reshape(-1)
+    codes_qf = stacked_frames.transpose(0, 1).contiguous()
+    if _use_tensor_code_payload(transfer_manager):
+        code_predictor_codes = codes_qf
+    else:
+        code_predictor_codes = codes_qf.reshape(-1)
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),

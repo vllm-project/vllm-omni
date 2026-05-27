@@ -509,6 +509,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 slot_mappings=slot_mappings_by_group,
             )
+            self._maybe_attach_attention_metadata_extensions(
+                attn_metadata=attn_metadata,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                max_query_len=max_num_scheduled_tokens,
+                pad_attn=pad_attn,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+            )
 
             (
                 input_ids,
