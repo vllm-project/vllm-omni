@@ -213,7 +213,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self.chunk_transfer_adapter:
                 # Don't fall back: base scheduler doesn't handle async_chunk
                 # requests with empty prompt_token_ids.
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+                self.chunk_transfer_adapter.restore_queues(
+                    self.waiting,
+                    self.running,
+                    scheduler_requests=self.requests,
+                )
             else:
                 res = super().schedule()
                 if self.input_coordinator:
@@ -345,7 +349,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # otherwise they are permanently orphaned in the adapter's
             # internal deques and never scheduled again.
             if self.chunk_transfer_adapter:
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+                self.chunk_transfer_adapter.restore_queues(
+                    self.waiting,
+                    self.running,
+                    scheduler_requests=self.requests,
+                )
             if self.input_coordinator:
                 self.input_coordinator.restore_queues(self.waiting, self.running)
 
