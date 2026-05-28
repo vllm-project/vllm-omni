@@ -37,7 +37,7 @@ def run_e2e():
     parser.add_argument(
         "--stage-config",
         type=str,
-        default="vllm_omni/model_executor/stage_configs/omnivoice.yaml",
+        default="vllm_omni/deploy/omnivoice.yaml",
     )
     parser.add_argument(
         "--text",

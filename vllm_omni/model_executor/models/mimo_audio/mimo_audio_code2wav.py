@@ -20,10 +20,18 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_CODEC_PAD_TOKEN_ID, MiMoAudioConfig
+from vllm_omni.model_executor.models.mimo_audio.cuda_graph_decoder_wrapper import CUDAGraphMiMoDecoderWrapper
 from vllm_omni.model_executor.models.mimo_audio.modeling_audio_tokenizer import MiMoAudioTokenizer
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = logging.getLogger(__name__)
+
+# Minimum safe values for codec streaming parameters.  Mirrors the constants
+# in stage_input_processors/mimo_audio.py — keep in sync.
+_MIN_CODEC_CHUNK_FRAMES = 3
+_MIN_CODEC_LEFT_CONTEXT_FRAMES = 40  # must cover vocoder_attn_window_size[0]
+_DEFAULT_CODEC_CHUNK_FRAMES = 10
+_DEFAULT_CODEC_LEFT_CONTEXT_FRAMES = 40
 
 
 def flat_codec_group_element_count(group_size: int, audio_channels: int) -> int:
@@ -114,6 +122,8 @@ class MiMoAudioTokenizerWorker:
         self.audio_channels = self.config.audio_channels
         self.sample_rate = self.audio_tokenizer.config.sampling_rate
 
+        self.cuda_graph_wrapper: CUDAGraphMiMoDecoderWrapper | None = None
+
         # Warmup (skip for CPU due to potential shape mismatch issues)
         if device_str != "cpu":
             logger.info("[tokenizer worker] Running warmup encode/decode...")
@@ -128,6 +138,30 @@ class MiMoAudioTokenizerWorker:
                 )
             except Exception as e:
                 logger.warning("[tokenizer worker] Warmup failed (non-critical): %s", str(e))
+
+            cuda_graph_enabled = os.environ.get("MIMO_AUDIO_TOKENIZER_CUDA_GRAPH", "1") == "1"
+            if cuda_graph_enabled:
+                try:
+                    logger.info("[tokenizer worker] Initializing CUDA Graph decoder wrapper...")
+                    cg_start = time.monotonic()
+
+                    n_q = self.audio_tokenizer.config.num_quantizers
+                    cg_code_rows = sorted({self.audio_channels, n_q})
+                    self.cuda_graph_wrapper = CUDAGraphMiMoDecoderWrapper(
+                        self.audio_tokenizer,
+                        enabled=True,
+                        code_rows=cg_code_rows,
+                    )
+
+                    self.cuda_graph_wrapper.warmup(torch.device(device_str))
+                    logger.info(
+                        "[tokenizer worker] CUDA Graph decoder ready in %.2fs",
+                        time.monotonic() - cg_start,
+                    )
+                except Exception as e:
+                    logger.warning("[tokenizer worker] CUDA Graph warmup failed (non-critical): %s", str(e))
+                    self.cuda_graph_wrapper = None
+
         else:
             logger.info("[tokenizer worker] Skipping warmup for CPU device")
 
@@ -266,8 +300,13 @@ class MiMoAudioTokenizerWorker:
     ) -> torch.Tensor:
         """Decode audio tokens to waveform using the tokenizer's decoder"""
         tokens = tokens.to(self.device)
-        with torch.no_grad():
-            decoded_audio: torch.Tensor = self.audio_tokenizer.decode(tokens)
+
+        if self.cuda_graph_wrapper is not None and self.cuda_graph_wrapper.is_ready:
+            decoded_audio = self.cuda_graph_wrapper.decode(tokens)
+        else:
+            with torch.no_grad():
+                decoded_audio = self.audio_tokenizer.decode(tokens)
+
         decoded_audio = decoded_audio.float().reshape(-1).detach().cpu()
         return decoded_audio  # [samples] cpu
 
@@ -453,12 +492,37 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             if connector_cfg
             else None
         )
-        self._codec_chunk_frames = int(extra_cfg.get("codec_chunk_frames", 3)) if isinstance(extra_cfg, dict) else 3
-        if self._codec_chunk_frames <= 0:
-            raise ValueError(f"codec_chunk_frames must be positive, got {self._codec_chunk_frames}")
-        self._codec_left_context_frames = (
-            int(extra_cfg.get("codec_left_context_frames", 3)) if isinstance(extra_cfg, dict) else 3
+        raw_chunk = (
+            int(extra_cfg.get("codec_chunk_frames", _DEFAULT_CODEC_CHUNK_FRAMES))
+            if isinstance(extra_cfg, dict)
+            else _DEFAULT_CODEC_CHUNK_FRAMES
         )
+        if raw_chunk < _MIN_CODEC_CHUNK_FRAMES:
+            logger.warning(
+                "codec_chunk_frames=%d is below minimum %d; falling back to %d.",
+                raw_chunk,
+                _MIN_CODEC_CHUNK_FRAMES,
+                _DEFAULT_CODEC_CHUNK_FRAMES,
+            )
+            raw_chunk = _DEFAULT_CODEC_CHUNK_FRAMES
+        self._codec_chunk_frames = raw_chunk
+
+        raw_left = (
+            int(extra_cfg.get("codec_left_context_frames", _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES))
+            if isinstance(extra_cfg, dict)
+            else _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES
+        )
+        if raw_left < _MIN_CODEC_LEFT_CONTEXT_FRAMES:
+            logger.warning(
+                "codec_left_context_frames=%d is below minimum %d (must cover vocoder attention "
+                "window %s); falling back to %d to prevent voice instability.",
+                raw_left,
+                _MIN_CODEC_LEFT_CONTEXT_FRAMES,
+                getattr(self.config, "vocoder_attn_window_size", [40, 10]),
+                _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES,
+            )
+            raw_left = _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES
+        self._codec_left_context_frames = raw_left
 
     def load_weights(
         self,
@@ -673,9 +737,10 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         group_size = self.streamer_config.group_size
         audio_channels = self.streamer_config.audio_channels
 
-        hidden_list: list[torch.Tensor] = []
-        lengths: list[int] = []
-        valid_indices: list[int] = []
+        cg_wrapper = self._tokenizer_service.cuda_graph_wrapper
+        cg_ready = cg_wrapper is not None and cg_wrapper.is_ready
+
+        extracted: list[tuple[int, torch.Tensor]] = []
 
         for i, req_codes in enumerate(request_codes_list):
             if req_codes is None or req_codes.numel() == 0:
@@ -693,13 +758,33 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             if audio_codes is None or audio_codes.numel() == 0:
                 continue
 
+            extracted.append((i, audio_codes))
+
+        if not extracted:
+            return [empty] * num_req
+
+        valid_indices = [t[0] for t in extracted]
+        # CUDA graph decode is single-batch only; avoid duplicate decode_vq for len>1.
+        use_cuda_graph = cg_ready and len(extracted) == 1
+
+        if use_cuda_graph:
+            wav_out = cg_wrapper.decode(extracted[0][1].to(self.device))
+            wav = wav_out.squeeze(0).squeeze(0)
+            cfg = tokenizer.config
+            frames_per_token = cfg.avg_pooler * cfg.stride_size * cfg.hop_length
+            valid_len = extracted[0][1].shape[-1] * frames_per_token
+            if wav.numel() > valid_len:
+                wav = wav[:valid_len]
+            result: list[torch.Tensor] = [empty] * num_req
+            result[valid_indices[0]] = wav.to(dtype=torch.float32).reshape(-1)
+            return result
+
+        hidden_list: list[torch.Tensor] = []
+        lengths: list[int] = []
+        for _, audio_codes in extracted:
             hs = tokenizer.encoder.decode_vq(audio_codes.to(self.device))
             hidden_list.append(hs)
             lengths.append(hs.size(0))
-            valid_indices.append(i)
-
-        if not hidden_list:
-            return [empty] * num_req
 
         if len(hidden_list) == 1:
             packed_hs = hidden_list[0]
@@ -749,9 +834,10 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         group_size = self.streamer_config.group_size
         audio_channels = self.streamer_config.audio_channels
 
-        hidden_list: list[torch.Tensor] = []
-        lengths: list[int] = []
-        valid_indices: list[int] = []
+        cg_wrapper = self._tokenizer_service.cuda_graph_wrapper
+        cg_ready = cg_wrapper is not None and cg_wrapper.is_ready
+
+        extracted: list[tuple[int, torch.Tensor]] = []
         context_sizes: list[int] = []
 
         for i, req_codes in enumerate(request_codes_list):
@@ -770,10 +856,7 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             if audio_codes is None or audio_codes.numel() == 0:
                 continue
 
-            hs = tokenizer.encoder.decode_vq(audio_codes.to(self.device))
-            hidden_list.append(hs)
-            lengths.append(hs.size(0))
-            valid_indices.append(i)
+            extracted.append((i, audio_codes))
 
             num_flat = req_codes.numel() if req_codes.ndim == 1 else req_codes.shape[-1]
             elt_per_group = flat_codec_group_element_count(group_size, audio_channels)
@@ -793,8 +876,36 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
                 ctx = 0 if num_chunks <= chunk_sz else default_left_context_size
             context_sizes.append(ctx)
 
-        if not hidden_list:
+        if not extracted:
             return [empty] * num_req
+
+        valid_indices = [t[0] for t in extracted]
+        use_cuda_graph = cg_ready and len(extracted) == 1
+
+        cfg = tokenizer.config
+        frames_per_token = cfg.avg_pooler * cfg.stride_size * cfg.hop_length
+
+        if use_cuda_graph:
+            wav_out = cg_wrapper.decode(extracted[0][1].to(self.device))
+            wav = wav_out.squeeze(0).squeeze(0)
+            valid_len = extracted[0][1].shape[-1] * frames_per_token
+            if wav.numel() > valid_len:
+                wav = wav[:valid_len]
+            drop = context_sizes[0] * self.total_upsample
+            if drop > 0 and drop < wav.numel():
+                wav = wav[drop:]
+            elif drop >= wav.numel():
+                wav = wav[:0]
+            result: list[torch.Tensor] = [empty] * num_req
+            result[valid_indices[0]] = wav.to(dtype=torch.float32).reshape(-1)
+            return result
+
+        hidden_list: list[torch.Tensor] = []
+        lengths: list[int] = []
+        for _, audio_codes in extracted:
+            hs = tokenizer.encoder.decode_vq(audio_codes.to(self.device))
+            hidden_list.append(hs)
+            lengths.append(hs.size(0))
 
         if len(hidden_list) == 1:
             packed_hs = hidden_list[0]
@@ -803,9 +914,6 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         input_lengths = torch.tensor(lengths, device=self.device)
 
         recon_wav = tokenizer.decoder(packed_hs, input_lengths)
-
-        cfg = tokenizer.config
-        frames_per_token = cfg.avg_pooler * cfg.stride_size * cfg.hop_length
 
         result: list[torch.Tensor] = [empty] * num_req
         if len(valid_indices) == 1:

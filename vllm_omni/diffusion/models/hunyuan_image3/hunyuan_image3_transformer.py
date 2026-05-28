@@ -72,6 +72,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
@@ -471,8 +472,21 @@ class Resolution:
         return f"{self.h}x{self.w}"
 
 
+# Baked-in extras matching the official model's
+# `HunyuanImage3ImageProcessor.vae_reso_group` (image_processor.py:147-152).
+# These four aspect buckets sit at ratio_token indices 33-36 in the trained
+# model and the AR was trained to address them, so any deviation breaks the
+# ratio-token vocab → output-shape lookup.
+HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS: tuple[str, ...] = (
+    "1024x768",
+    "1280x720",
+    "768x1024",
+    "720x1280",
+)
+
+
 class ResolutionGroup:
-    def __init__(self, base_size=None, step=None, align=1):
+    def __init__(self, base_size=None, step=None, align=1, extra_resolutions=None):
         self.align = align
         self.base_size = base_size
         assert base_size % align == 0, f"base_size {base_size} is not divisible by align {align}"
@@ -485,6 +499,11 @@ class ResolutionGroup:
 
         self.step = step
         self.data = self._calc_by_step()
+
+        if extra_resolutions is not None:
+            for er in extra_resolutions:
+                if not any(r.ratio == er.ratio for r in self.data):
+                    self.data.append(er)
 
         self.ratio = np.array([x.ratio for x in self.data])
         self.attr = ["" for _ in range(len(self.data))]
@@ -850,7 +869,15 @@ class ImageKVCacheManager:
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
     """
 
-    def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int, scaling: float, image_token_len: int = 4097):
+    def __init__(
+        self,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        scaling: float,
+        image_token_len: int = 4097,
+        prefix: str = "",
+    ):
         """
         Args:
             image_token_len: Number of tokens per image (including special placeholders),
@@ -863,7 +890,9 @@ class ImageKVCacheManager:
         self.scaling = scaling
         # cache related
         self.image_token_len: int = image_token_len
-        self.image_kv_cache: tuple[torch.Tensor, torch.Tensor] = None
+        self.image_kv_cache_map: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.image_kv_cache_lens: torch.Tensor | None = None
+        self._injected_ar_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         self.sp_size = get_sequence_parallel_world_size()
         self.sp_rank = get_sequence_parallel_rank()
@@ -873,135 +902,141 @@ class ImageKVCacheManager:
             causal=False,
             softmax_scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
+            prefix=f"{prefix}.attn" if prefix else "",
         )
 
-    def _save_image_kv_caches(
+    @staticmethod
+    def _get_current_starts(
+        gen_timestep_scatter_index: torch.Tensor | None,
+        ar_kv_len: int = 0,
+    ) -> torch.Tensor:
+        assert gen_timestep_scatter_index is not None, (
+            "`gen_timestep_scatter_index` is required to locate the generated image timestep token for image KV reuse."
+        )
+        return gen_timestep_scatter_index[:, -1].to(dtype=torch.long) + ar_kv_len
+
+    def _cache_prompt_kv(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
         seq_len: int,
-    ) -> None:
-        bs, q_len, num_kv_heads, head_dim = key.shape
-        assert q_len == seq_len, f"for first-step, {q_len} != {seq_len}"
-
-        key = key.reshape(-1, num_kv_heads, head_dim)
-        value = value.reshape(-1, num_kv_heads, head_dim)
-
-        cached_prompt_len = seq_len - self.image_token_len - 1
-        cached_key = [key[:cached_prompt_len], key[seq_len - 1 : seq_len]]
-        cached_value = [value[:cached_prompt_len], value[seq_len - 1 : seq_len]]
-
-        if bs > 1:
-            assert bs == 2, "for cfg case, bs must be 2"
-            cached_key.append(key[seq_len : seq_len + cached_prompt_len])
-            cached_key.append(key[-1:])
-
-            cached_value.append(value[seq_len : seq_len + cached_prompt_len])
-            cached_value.append(value[-1:])
-
-        cached_key = torch.cat(cached_key, dim=0)
-        cached_value = torch.cat(cached_value, dim=0)
-        self.image_kv_cache_map = (cached_key, cached_value)
-
-    def _update_image_kv_caches(
-        self,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        seq_len: int,
+        shard_image_size: int | None = None,
+        gen_timestep_scatter_index: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cached_key, cached_value = self.image_kv_cache_map
+        """Cache prompt KV on first_step. Consumes _injected_ar_kv.
+
+        _injected_ar_kv is a per-batch list: [(k,v)] for bs=1,
+        [(pos_k,pos_v), (neg_k,neg_v)] for bs=2 CFG.
+        """
+
+        ar_kv_list = self._injected_ar_kv
+        self._injected_ar_kv = None
+
         bs, q_len, num_kv_heads, head_dim = key.shape
 
-        cached_prompt_len = cached_key.shape[0] // bs - 1
-        assert (cached_prompt_len + 1) == (seq_len - q_len), f"{cached_prompt_len + 1} != {seq_len - q_len}"
+        ar_kv_len = ar_kv_list[0][0].shape[0] if ar_kv_list is not None else 0
+        assert q_len + ar_kv_len == seq_len, f"q_len({q_len}) + ar_kv_len({ar_kv_len}) != seq_len({seq_len})"
 
-        key = key.reshape(-1, num_kv_heads, head_dim)
-        value = value.reshape(-1, num_kv_heads, head_dim)
+        if ar_kv_len > 0:
+            new_keys = []
+            new_values = []
+            for b in range(bs):
+                ar_k, ar_v = ar_kv_list[b]
+                ar_k = ar_k.reshape(1, ar_kv_len, num_kv_heads, head_dim)
+                ar_v = ar_v.reshape(1, ar_kv_len, num_kv_heads, head_dim)
+                k = torch.cat([ar_k, key[b : b + 1]], dim=1)
+                v = torch.cat([ar_v, value[b : b + 1]], dim=1)
+                new_keys.append(k)
+                new_values.append(v)
+            key = torch.cat(new_keys, dim=0)
+            value = torch.cat(new_values, dim=0)
 
-        new_key = [
-            cached_key[:cached_prompt_len],
-            key[:q_len],
-            cached_key[cached_prompt_len : cached_prompt_len + 1],
-        ]
-        new_value = [
-            cached_value[:cached_prompt_len],
-            value[:q_len],
-            cached_value[cached_prompt_len : cached_prompt_len + 1],
-        ]
+        cached_prompt_lens = self._get_current_starts(gen_timestep_scatter_index, ar_kv_len)
+        assert torch.all(cached_prompt_lens <= key.shape[1]), (
+            f"cached_prompt_lens({cached_prompt_lens.tolist()}) must be <= key length({key.shape[1]})"
+        )
+        if shard_image_size is not None:
+            expected_prompt_len = seq_len - shard_image_size
+            assert torch.all(cached_prompt_lens == expected_prompt_len), (
+                f"cached_prompt_lens({cached_prompt_lens.tolist()}) != "
+                f"seq_len({seq_len}) - shard_image_size({shard_image_size})"
+            )
 
-        if bs > 1:
-            assert bs == 2, "for cfg case, bs must be 2"
-            new_key.append(cached_key[cached_prompt_len + 1 : cached_prompt_len + 1 + cached_prompt_len])
-            new_key.append(key[q_len:])
-            new_key.append(cached_key[-1:])
+        max_cached_prompt_len = int(cached_prompt_lens.max().item())
+        cached_key = key.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
+        cached_value = value.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
+        for b in range(bs):
+            cached_prompt_len = int(cached_prompt_lens[b].item())
+            cached_key[b, :cached_prompt_len] = key[b, :cached_prompt_len]
+            cached_value[b, :cached_prompt_len] = value[b, :cached_prompt_len]
+        self.image_kv_cache_map = (cached_key, cached_value)
+        self.image_kv_cache_lens = cached_prompt_lens
+        return key, value
 
-            new_value.append(cached_value[cached_prompt_len + 1 : cached_prompt_len + 1 + cached_prompt_len])
-            new_value.append(value[q_len:])
-            new_value.append(cached_value[-1:])
+    def _reuse_prompt_kv(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        seq_len: int,
+        bs: int,
+        shard_image_size: int | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Reuse cached prompt KV in subsequent denoising steps.
 
-        new_key = torch.cat(new_key, dim=0)
-        new_value = torch.cat(new_value, dim=0)
-        new_key = new_key.reshape(bs, seq_len, num_kv_heads, head_dim)
-        new_value = new_value.reshape(bs, seq_len, num_kv_heads, head_dim)
+        Non-SP: concatenates cached prompt KV with current image KV.
+        SP: returns cached prompt KV only (used as joint_text).
+        """
+        cached_key, cached_value = self.image_kv_cache_map
+        _, q_len, _, _ = key.shape
+        assert cached_key.dim() == 4 and cached_key.shape[0] == bs
+        max_cached_prompt_len = cached_key.shape[1]
 
+        if shard_image_size is not None:
+            assert max_cached_prompt_len + q_len == seq_len, (
+                f"max_cached_prompt_len({max_cached_prompt_len}) + q_len({q_len}) != seq_len({seq_len})"
+            )
+            return cached_key.contiguous(), cached_value.contiguous()
+
+        assert max_cached_prompt_len + q_len == seq_len, (
+            f"max_cached_prompt_len({max_cached_prompt_len}) + q_len({q_len}) != seq_len({seq_len})"
+        )
+        assert self.image_kv_cache_lens is not None
+        if position_ids is not None:
+            assert position_ids.shape == (bs, q_len)
+            assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens), (
+                "The first current position must immediately follow each sample's cached prompt KV."
+            )
+        new_key = torch.cat([cached_key, key], dim=1)
+        new_value = torch.cat([cached_value, value], dim=1)
         return new_key.contiguous(), new_value.contiguous()
 
-    def _sp_save_prompt_kv_caches(
+    def _build_neg_ar_kv(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
         seq_len: int,
-        shard_image_size: int,
-    ) -> None:
-        """
-        We don't need to cached last token, since it all false and nevel attn to in non-first step.
-        With sp the key len is [text, image_shard], image_shard in rank include [image token, padding token]
-        The cache is [prompt0, prompt1], see _prepare_attention_mask_for_generation and
-        _update_model_kwargs_for_generation
-        """
-        bs, q_len, num_kv_heads, head_dim = key.shape
-        assert q_len == seq_len, f"for first-step, {q_len} != {seq_len}"
-        key = key.reshape(-1, num_kv_heads, head_dim)
-        value = value.reshape(-1, num_kv_heads, head_dim)
-        cached_prompt_len = seq_len - shard_image_size
-        if bs > 1:
-            assert bs == 2, "for cfg case, bs must be 2"
-
-        cached_key = []
-        cached_value = []
-        for b in range(bs):
-            base = b * seq_len
-            # cache text prompt
-            cached_key.append(key[base : base + cached_prompt_len])
-            cached_value.append(value[base : base + cached_prompt_len])
-
-        cached_key = torch.cat(cached_key, dim=0)
-        cached_value = torch.cat(cached_value, dim=0)
-        self.image_kv_cache_map = (cached_key, cached_value)
-
-    def _sp_get_prompt_kv_caches(
-        self,
-        key: torch.Tensor,
-        seq_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cached_key, cached_value = self.image_kv_cache_map
-        bs, q_len, kv_head_num, head_dim = key.shape
+        """Build neg AR KV from pos AR KV shared prefix + uncond text prefill tokens.
 
-        cached_prompt_len = cached_key.shape[0] // bs
+        After this call, _injected_ar_kv becomes [(pos_k,pos_v), (neg_k,neg_v)].
+        """
+        bs, q_len_actual, num_kv_heads, head_dim = key.shape
+        assert bs == 1
 
-        assert cached_prompt_len == seq_len - q_len
+        shared_prefix_len = seq_len - q_len_actual
+        if shared_prefix_len > 0 and self._injected_ar_kv is not None:
+            pos_key, pos_value = self._injected_ar_kv[0]
+            assert shared_prefix_len <= pos_key.shape[0]
+            pfx_k = pos_key[:shared_prefix_len].reshape(1, shared_prefix_len, num_kv_heads, head_dim)
+            pfx_v = pos_value[:shared_prefix_len].reshape(1, shared_prefix_len, num_kv_heads, head_dim)
+            key = torch.cat([pfx_k, key], dim=1)
+            value = torch.cat([pfx_v, value], dim=1)
 
-        joint_text_key = []
-        joint_text_value = []
-        for b in range(bs):
-            cache_base = b * cached_prompt_len
-            joint_text_key.append(cached_key[cache_base : cache_base + cached_prompt_len])
-            joint_text_value.append(cached_value[cache_base : cache_base + cached_prompt_len])
-
-        joint_text_key = torch.cat(joint_text_key, dim=0).reshape(bs, cached_prompt_len, kv_head_num, head_dim)
-        joint_text_value = torch.cat(joint_text_value, dim=0).reshape(bs, cached_prompt_len, kv_head_num, head_dim)
-
-        return joint_text_key.contiguous(), joint_text_value.contiguous()
+        neg_kv = (key.reshape(-1, num_kv_heads, head_dim), value.reshape(-1, num_kv_heads, head_dim))
+        self._injected_ar_kv = [self._injected_ar_kv[0], neg_kv]
+        return key, value
 
     def __call__(
         self,
@@ -1013,10 +1048,11 @@ class ImageKVCacheManager:
     ) -> torch.Tensor:
         self.image_token_len = kwargs.get("num_image_tokens")
         first_step = kwargs.get("first_step")
+        uncond_cfg_prefill = kwargs.get("uncond_cfg_prefill", False)
 
         query_lens = kwargs.get("query_lens")
         seq_lens = kwargs.get("seq_lens")
-        shard_image_size = kwargs.get("shard_image_size")
+        shard_image_size = kwargs.get("shard_image_size") if self.sp_size > 1 else None
         bs = len(query_lens)
         q_len = query_lens[0]
         seq_len = seq_lens[0]
@@ -1030,27 +1066,41 @@ class ImageKVCacheManager:
         query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
         key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
         value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
-        if first_step:
-            self.image_kv_cache_map = None
-            if self.sp_size <= 1:
-                self._save_image_kv_caches(key, value, seq_len)
-            else:
-                self._sp_save_prompt_kv_caches(key, value, seq_len, shard_image_size)
-                cached_prompt_len = self.image_kv_cache_map[0].shape[0] // bs
-                # joint text part
-                joint_text_query = query[:, :cached_prompt_len, :, :]
-                joint_text_key = key[:, :cached_prompt_len, :, :]
-                joint_text_value = value[:, :cached_prompt_len, :, :]
-                # image part
-                query = query[:, cached_prompt_len:, :, :]
-                key = key[:, cached_prompt_len:, :, :]
-                value = value[:, cached_prompt_len:, :, :]
+
+        if uncond_cfg_prefill:
+            key, value = self._build_neg_ar_kv(key, value, seq_len)
+            if self.sp_size > 1:
+                joint_text_query = query
+                joint_text_key = key
+                joint_text_value = value
+                query = query[:, :0, :, :]
+                key = key[:, :0, :, :]
+                value = value[:, :0, :, :]
+        elif first_step:
+            self.image_kv_cache_map = None  # reset first
+            self.image_kv_cache_lens = None
+            key, value = self._cache_prompt_kv(
+                key,
+                value,
+                seq_len,
+                shard_image_size,
+                kwargs.get("gen_timestep_scatter_index"),
+            )
+            if self.sp_size > 1:
+                local_prompt_len = seq_len - shard_image_size
+                join_query_len = query.shape[1] - shard_image_size
+                joint_text_query = query[:, :join_query_len, :, :]
+                joint_text_key = key[:, :local_prompt_len, :, :]
+                joint_text_value = value[:, :local_prompt_len, :, :]
+                query = query[:, join_query_len:, :, :]
+                key = key[:, local_prompt_len:, :, :]
+                value = value[:, local_prompt_len:, :, :]
         else:
             if self.sp_size <= 1:
-                key, value = self._update_image_kv_caches(key, value, seq_len)
+                key, value = self._reuse_prompt_kv(key, value, seq_len, bs, position_ids=kwargs.get("position_ids"))
             else:
                 joint_text_query = query[:, :0, :, :]
-                joint_text_key, joint_text_value = self._sp_get_prompt_kv_caches(key, seq_len)
+                joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
 
         key = repeat_kv(key, repeat_num)
         value = repeat_kv(value, repeat_num)
@@ -1060,9 +1110,12 @@ class ImageKVCacheManager:
 
         attention_mask = attention_mask.contiguous()
 
+        full_attn_spans = kwargs.get("full_attn_spans", None)
+
         if self.sp_size <= 1:
             attn_metadata = AttentionMetadata(
                 attn_mask=attention_mask,
+                full_attn_spans=full_attn_spans,
             )
         else:
             attn_metadata = AttentionMetadata(
@@ -1071,13 +1124,9 @@ class ImageKVCacheManager:
                 joint_value=joint_text_value,
                 joint_strategy="front",
                 attn_mask=attention_mask,
+                full_attn_spans=full_attn_spans,
             )
-        # Compute attention using unified attention layer
         attn_output = self.attn(query, key, value, attn_metadata)
-
-        # attn_output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0)
-
-        # attn_output = attn_output.transpose(1, 2).contiguous()  # [bs, q_len, heads, head_dim]
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
         return attn_output
 
@@ -1357,7 +1406,10 @@ class HunyuanImage3ImageProcessor:
     def __init__(self, config):
         self.config = config
 
-        self.reso_group = ResolutionGroup(base_size=config.image_base_size)
+        self.reso_group = ResolutionGroup(
+            base_size=config.image_base_size,
+            extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
+        )
         self.vae_processor = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -1635,6 +1687,7 @@ class HunYuanAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             scaling=self.scaling,
             image_token_len=4097,
+            prefix=f"{prefix}.image_attn",
         )
         self.image_rope2d_emb = HunYuanRotary2DEmbedder(
             num_heads=self.num_heads,
@@ -1788,6 +1841,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             custom_pos_emb=custom_pos_emb,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
@@ -1851,9 +1905,24 @@ class HunyuanImagePreprocessor(nn.Module):
         position_ids: torch.LongTensor,
         image_token_len: int,
         is_first_step: bool = False,
+        uncond_cfg_prefill: bool = False,
+        gen_timestep_scatter_index: torch.Tensor | None = None,
     ):
         # ---------- compute prompt length ----------
-        prompt_len = hidden_states.shape[1] - image_token_len - 1 if is_first_step else 0
+        if uncond_cfg_prefill:
+            prompt_len = hidden_states.shape[1]
+        elif is_first_step:
+            assert gen_timestep_scatter_index is not None, (
+                "`gen_timestep_scatter_index` is required to split prompt and "
+                "generated image tokens for sequence parallel image generation."
+            )
+            prompt_lens = gen_timestep_scatter_index[:, -1]
+            assert torch.all(prompt_lens == prompt_lens[0]), (
+                "Sequence parallel image generation requires the generated timestep position to match across the batch."
+            )
+            prompt_len = int(prompt_lens[0].item())
+        else:
+            prompt_len = 0
 
         # ---------- hidden_states ----------
         text_hidden_states = hidden_states[:, :prompt_len, :]
@@ -2040,6 +2109,44 @@ class HunyuanImage3Model(nn.Module):
                     return True
             return False
 
+        def is_scalar_quant_scale(name: str, tensor: torch.Tensor) -> bool:
+            return tensor.numel() == 1 and name.endswith((".input_scale", ".weight_scale", ".weight_scale_2"))
+
+        def load_split_param(
+            name: str,
+            tensor: torch.Tensor,
+            den: int,
+            split_param: list[tuple[str | int, int]],
+            func: Callable[[torch.Tensor], torch.Tensor] | None,
+        ) -> None:
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            if is_scalar_quant_scale(name, tensor):
+                for shard_id, _ in split_param:
+                    weight_loader(param, tensor, shard_id)
+                return
+
+            assert tensor.shape[0] % den == 0
+            units = tensor.shape[0] // den
+            offset = 0
+            tensor = func(tensor) if func else tensor
+            for shard_id, num in split_param:
+                new_offset = offset + num * units
+                weight_loader(param, tensor[offset:new_offset], shard_id)
+                offset = new_offset
+
+        def get_loaded_weight_shard(
+            name: str,
+            tensor: torch.Tensor,
+            offset: int,
+            den: int,
+        ) -> torch.Tensor:
+            if is_scalar_quant_scale(name, tensor):
+                return tensor
+            assert tensor.shape[0] % den == 0
+            units = tensor.shape[0] // den
+            return tensor[offset * units : offset * units + units]
+
         for name, loaded_weight in weights:
             # print(f"Loading weight name: {name}, tp_rank: {tp_rank}", flush=True)
             if contains_unexpected_keyword(name, unexpected_keywords):
@@ -2117,19 +2224,7 @@ class HunyuanImage3Model(nn.Module):
                 if is_pp_missing_parameter(name, self):
                     continue
 
-                assert loaded_weight.shape[0] % den == 0
-                units = loaded_weight.shape[0] // den
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                offset = 0
-                for shard_id, num in split_param:
-                    new_offset = offset + num * units
-                    if func:
-                        weight_loader(param, func(loaded_weight)[offset:new_offset], shard_id)
-                    else:
-                        weight_loader(param, loaded_weight[offset:new_offset], shard_id)
-                    offset = new_offset
-
+                load_split_param(name, loaded_weight, den, split_param, func)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -2159,12 +2254,11 @@ class HunyuanImage3Model(nn.Module):
                         continue
                     param = params_dict[name_mapped]
                     weight_loader = cast(Callable[..., bool], param.weight_loader)
-                    assert loaded_weight.shape[0] % den == 0
-                    units = loaded_weight.shape[0] // den
+                    loaded_weight_shard = get_loaded_weight_shard(name, loaded_weight, offset, den)
 
                     success = weight_loader(
                         param,
-                        loaded_weight[offset * units : offset * units + units],
+                        loaded_weight_shard,
                         name_mapped,
                         shard_id=shard_id,
                         expert_id=expert_id,
@@ -2225,6 +2319,9 @@ class HunyuanImage3Model(nn.Module):
         seq_lens: list[int] | None = None,
         num_image_tokens: int | None = None,
         gen_timestep_scatter_index: torch.Tensor | None = None,
+        uncond_cfg_prefill: bool = False,
+        ar_kv_reuse_len: int = 0,
+        full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -2266,6 +2363,8 @@ class HunyuanImage3Model(nn.Module):
                 position_ids,
                 num_image_tokens,
                 first_step,
+                uncond_cfg_prefill=uncond_cfg_prefill,
+                gen_timestep_scatter_index=gen_timestep_scatter_index,
             )
             assert len(set(query_lens)) == 1 and len(set(seq_lens)) == 1, (
                 "query_lens and seq_lens must be the same for sequence parallel"
@@ -2273,15 +2372,15 @@ class HunyuanImage3Model(nn.Module):
             prompt_size = text_hidden_states.shape[1]
             shard_image_size = image_hidden_states.shape[1]
 
-            if first_step:  # [image tokens, last token]
-                shard_padding_size = shard_image_size * sp_world_size - (num_image_tokens + 1)
-            else:  # [image tokens, last token]
+            if first_step:
+                shard_padding_size = shard_image_size * sp_world_size - (origin_query_len - prompt_size)
+            else:
                 shard_padding_size = shard_image_size * sp_world_size - num_image_tokens
             if first_step:
-                seq_lens = [prompt_size + shard_image_size for _ in seq_lens]
+                seq_lens = [prompt_size + shard_image_size + ar_kv_reuse_len for _ in seq_lens]
             else:
                 seq_lens = [x - y for x, y in zip(seq_lens, query_lens)]
-                seq_lens = [seq_len + shard_image_size - 1 for seq_len in seq_lens]
+                seq_lens = [seq_len + shard_image_size for seq_len in seq_lens]
             query_lens = [prompt_size + shard_image_size for _ in query_lens]
 
             if prompt_size > 0:
@@ -2295,10 +2394,6 @@ class HunyuanImage3Model(nn.Module):
                 hidden_states = image_hidden_states
                 position_ids = image_position_ids
                 custom_pos_emb = (image_custom_pos_emb_sin, image_custom_pos_emb_cos)
-
-            if not first_step:
-                assert torch.all(~attention_mask[..., -1]), "The last token should not be attended to"
-                attention_mask = attention_mask[..., :-1]  # we attention without last token
 
             if shard_padding_size > 0:
                 B, H, Q, K = attention_mask.shape
@@ -2331,6 +2426,8 @@ class HunyuanImage3Model(nn.Module):
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
                 shard_image_size=shard_image_size,
                 shard_padding_size=shard_padding_size,
+                uncond_cfg_prefill=uncond_cfg_prefill,
+                full_attn_spans=full_attn_spans,
             )
 
             hidden_states = layer_outputs[0]
@@ -2571,6 +2668,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             if key in model_kwargs and model_kwargs[key] is not None:
                 model_kwargs[key] = model_kwargs[key][s]
 
+        # List[List[...]] per-sample metadata indexed along the CFG batch dim
+        if isinstance(model_kwargs.get("full_attn_spans"), list):
+            model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"][s.start : s.stop]
+
         # custom_pos_emb: tuple of (cos, sin)
         if "custom_pos_emb" in model_kwargs and model_kwargs["custom_pos_emb"] is not None:
             cos, sin = model_kwargs["custom_pos_emb"]
@@ -2601,6 +2702,195 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             model_kwargs["vit_kwargs"] = {
                 k: v[s.start : s.stop] if isinstance(v, list) else v[s] for k, v in model_kwargs["vit_kwargs"].items()
             }
+
+    # ==========================================================
+    # Positive/ Negative Reuse Length
+    # ==========================================================
+    def _get_kv_reuse_len(self, model_kwargs, batch_size=1):
+        tokenizer_output = model_kwargs["tokenizer_output"]
+        # from positive prompt
+        think_recaption_end_pos = tokenizer_output.think_recaption_end_pos
+        if not think_recaption_end_pos or think_recaption_end_pos[0][0] is None:
+            return 0, None
+        pos_reuse_kv_len = think_recaption_end_pos[0][0]  # not reuse the last token </think> or <recaption>
+        # from negative prompt
+        if len(tokenizer_output.uncond_cfg_start_pos) > batch_size:
+            neg_reuse_kv_len = tokenizer_output.uncond_cfg_start_pos[batch_size][0]
+        else:  # no negative prompt in non-cfg case.
+            neg_reuse_kv_len = None
+        return pos_reuse_kv_len, neg_reuse_kv_len
+
+    # ==========================================================
+    # Negative CFG Prefill
+    # ==========================================================
+    def _maybe_run_negative_cfg_prefill(
+        self,
+        input_ids,
+        model_kwargs,
+        batch_size,
+        positive_reuse_len,
+        negative_reuse_len,
+        cfg_parallel_ready,
+        cfg_rank,
+        device,
+    ):
+        if cfg_parallel_ready and cfg_rank != 1:
+            return
+
+        assert negative_reuse_len is not None and negative_reuse_len > 0, (
+            "negative_reuse_len should be greater than 0 for running negative CFG prefill"
+        )
+
+        prefill_inputs = self._build_negative_cfg_prefill_inputs(
+            input_ids=input_ids,
+            model_kwargs=model_kwargs,
+            batch_size=batch_size,
+            negative_reuse_len=negative_reuse_len,
+            positive_reuse_len=positive_reuse_len,
+            cfg_parallel_ready=cfg_parallel_ready,
+        )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            import time
+
+            t0 = time.perf_counter()
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True):
+            self.model.forward_call(**prefill_inputs)
+        if logger.isEnabledFor(logging.DEBUG):
+            torch.accelerator.synchronize()
+            logger.debug("[CFG] Uncond prefill took %.3fs", time.perf_counter() - t0)
+
+        if cfg_parallel_ready:
+            self._keep_negative_kv_only()
+
+    # ==========================================================
+    # Build Negative CFG Prefill Inputs
+    # ==========================================================
+    def _build_negative_cfg_prefill_inputs(
+        self,
+        input_ids,
+        model_kwargs,
+        batch_size,
+        negative_reuse_len,
+        positive_reuse_len,
+        cfg_parallel_ready,
+    ):
+        assert batch_size == 1
+        seq_slice = slice(negative_reuse_len, positive_reuse_len)
+        prefill_seq_len = positive_reuse_len
+        prefill_query_len = positive_reuse_len - negative_reuse_len
+        assert prefill_query_len > 0, "prefill_query_len should be greater than 0"
+
+        if cfg_parallel_ready:
+            batch_slice = slice(None)
+            custom_pos_emb = model_kwargs["custom_pos_emb"]
+        else:
+            batch_slice = slice(batch_size, batch_size * 2)
+            custom_pos_emb = (
+                model_kwargs["custom_pos_emb"][0][batch_slice],
+                model_kwargs["custom_pos_emb"][1][batch_slice],
+            )
+
+        return dict(
+            input_ids=input_ids[batch_slice, seq_slice],
+            attention_mask=model_kwargs["attention_mask"][batch_slice, :, seq_slice, :prefill_seq_len],
+            position_ids=model_kwargs["position_ids"][batch_slice, seq_slice],
+            custom_pos_emb=custom_pos_emb,
+            mode="gen_image",
+            first_step=True,
+            uncond_cfg_prefill=True,
+            query_lens=[prefill_query_len],
+            seq_lens=[prefill_seq_len],
+            num_image_tokens=0,
+            ar_kv_reuse_len=negative_reuse_len,
+            full_attn_spans=model_kwargs["full_attn_spans"][batch_slice]
+            if model_kwargs.get("full_attn_spans")
+            else None,
+        )
+
+    # ==========================================================
+    # Keep Negative KV Only
+    # ==========================================================
+    def _keep_negative_kv_only(self):
+        for layer in self.model.model.layers:
+            mgr = layer.self_attn.image_attn
+            mgr._injected_ar_kv = [mgr._injected_ar_kv[1]]
+
+    # ==========================================================
+    # Truncate Prefix
+    # ==========================================================
+    def _truncate_reused_prefix(
+        self,
+        input_ids,
+        model_kwargs,
+        positive_reuse_len,
+    ):
+        input_ids = input_ids[:, positive_reuse_len:]
+        model_kwargs["query_lens"] = [q - positive_reuse_len for q in model_kwargs["query_lens"]]
+        model_kwargs["attention_mask"] = model_kwargs["attention_mask"][:, :, positive_reuse_len:, :]
+        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, positive_reuse_len:]
+
+        # Shift image_mask and gen_timestep_scatter_index to match truncated sequence
+        model_kwargs["image_mask"] = model_kwargs["image_mask"][:, positive_reuse_len:]
+        model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"] - positive_reuse_len
+        model_kwargs["ar_kv_reuse_offset"] = positive_reuse_len
+
+        # cond-image have computed in ar, we may skip it by index in the future.
+        model_kwargs.pop("cond_vae_images", None)
+        model_kwargs.pop("cond_vae_image_mask", None)
+        model_kwargs.pop("cond_vit_image_mask", None)
+        model_kwargs.pop("cond_timestep_scatter_index", None)
+        model_kwargs.pop("cond_timestep", None)
+        model_kwargs.pop("cond_vit_images", None)
+
+        return input_ids
+
+    def _maybe_handle_ar_kv_reuse(
+        self,
+        input_ids,
+        model_kwargs,
+        batch_size,
+        cfg_parallel_ready,
+        cfg_rank,
+        device,
+    ):
+        ar_kv_data = model_kwargs.pop("ar_kv_data", None)
+        if ar_kv_data is None:
+            return input_ids, 0
+
+        # 1. positive prefix len
+        positive_reuse_len, negative_reuse_len = self._get_kv_reuse_len(model_kwargs, batch_size)
+        logger.info(
+            f"Handling AR KV reuse with positive_reuse_len={positive_reuse_len}, "
+            f"negative_reuse_len={negative_reuse_len}"
+        )
+        if positive_reuse_len <= 0:
+            return input_ids, 0
+
+        # 2. inject positive kv
+        self.model.inject_ar_kv_into_layers(ar_kv_data, positive_reuse_len)
+
+        # 3. negative cfg prefill
+        if self.do_classifier_free_guidance:
+            self._maybe_run_negative_cfg_prefill(
+                input_ids=input_ids,
+                model_kwargs=model_kwargs,
+                batch_size=batch_size,
+                positive_reuse_len=positive_reuse_len,
+                negative_reuse_len=negative_reuse_len,
+                cfg_parallel_ready=cfg_parallel_ready,
+                cfg_rank=cfg_rank,
+                device=device,
+            )
+
+        # 4. truncate reused prefix
+        input_ids = self._truncate_reused_prefix(
+            input_ids=input_ids,
+            model_kwargs=model_kwargs,
+            positive_reuse_len=positive_reuse_len,
+        )
+
+        return input_ids, positive_reuse_len
 
     @torch.no_grad()
     def __call__(
@@ -2743,6 +3033,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             self._split_model_kwargs_for_cfg_parallel(model_kwargs, batch_size, cfg_rank)
         else:
             cfg_factor = 1 + self.do_classifier_free_guidance
+            cfg_rank = None
 
         b, _, q_len1, seq_len = attention_mask.shape
         query_lens = [q_len1] * b
@@ -2750,6 +3041,15 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         model_kwargs["query_lens"] = query_lens
         model_kwargs["seq_lens"] = seq_lens
         model_kwargs["attention_mask"] = attention_mask.to(latents.device)
+
+        # Attempt to reuse KV cache from the AR stage.
+        # Note: the reusable KV length may differ between positive and negative prompts.
+        input_ids, ar_kv_reuse_len = self._maybe_handle_ar_kv_reuse(
+            input_ids, model_kwargs, batch_size, cfg_parallel_ready, cfg_rank, device
+        )
+
+        # Store ar_kv_reuse_len in model_kwargs for use in forward method (SP mode)
+        model_kwargs["ar_kv_reuse_len"] = ar_kv_reuse_len
 
         # Sampling loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -2766,6 +3066,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                set_forward_context_denoise_step_idx(i)
                 if cfg_parallel_ready:
                     # CFG parallel: each rank forwards its own branch (no batch doubling)
                     latent_model_input = latents
@@ -2828,8 +3129,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                         model_output,
                         model_kwargs,
                     )
-                    if input_ids.shape[1] != model_kwargs["position_ids"].shape[1]:
-                        input_ids = torch.gather(input_ids, 1, index=model_kwargs["position_ids"])
+                    input_ids = None
                     attention_mask = model_kwargs.get("attention_mask")
                     b, _, q_len1, seq_len = attention_mask.shape
                     query_lens = [q_len1] * b
@@ -2850,6 +3150,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
+
+        set_forward_context_denoise_step_idx(None)
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor

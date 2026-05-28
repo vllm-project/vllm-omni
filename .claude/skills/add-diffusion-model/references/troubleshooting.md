@@ -68,7 +68,7 @@ out = out.reshape(batch, seq_len, -1)
 ### Different Output vs Diffusers Reference
 
 **Common causes**:
-1. **Attention backend difference**: FlashAttention vs SDPA may produce slightly different results. Set `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` to match diffusers
+1. **Attention backend difference**: FlashAttention vs SDPA may produce slightly different results. Force SDPA via `--diffusion-attention-backend TORCH_SDPA` (or `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA`) to match diffusers; for finer-grained per-role overrides see `--diffusion-attention-config.per_role.<role>.backend`
 2. **Float precision**: vLLM-Omni may use bfloat16 where diffusers uses float32 for some operations
 3. **Missing normalization**: Check all LayerNorm/RMSNorm are preserved
 4. **Scheduler rounding**: Some schedulers have numerical sensitivity

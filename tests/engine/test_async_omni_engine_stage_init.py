@@ -1,12 +1,15 @@
+import concurrent.futures
 import importlib
 import os
 import threading
 import time
 import types
+from contextlib import contextmanager
 
 import pytest
 
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
     ReplicaInitPlan,
@@ -170,18 +173,6 @@ def test_collect_initialized_clients_for_cleanup_deduplicates_clients():
     assert cleanup_clients == [shared, extra]
 
 
-def test_initialize_stages_rejects_non_diffusion_replicas_in_single_stage_mode():
-    engine = object.__new__(AsyncOmniEngine)
-    engine.single_stage_mode = True
-    engine.stage_configs = [types.SimpleNamespace(stage_id=0, runtime={"num_replicas": 2})]
-
-    with pytest.raises(
-        ValueError,
-        match="single_stage_mode only supports num_replicas > 1 for diffusion stages",
-    ):
-        engine._validate_single_stage_mode_replica_constraints()
-
-
 def test_initialize_diffusion_replica_restores_device_visibility_after_local_init(monkeypatch):
     import vllm_omni.engine.async_omni_engine as engine_mod
     from vllm_omni.platforms import current_omni_platform
@@ -200,10 +191,12 @@ def test_initialize_diffusion_replica_restores_device_visibility_after_local_ini
     old_env = os.environ.get(env_var)
     os.environ[env_var] = "0,1"
 
-    def _fake_setup_stage_devices(_stage_id, _runtime_cfg):
+    @contextmanager
+    def _fake_stage_runtime_setup(_stage_id, _runtime_cfg):
         current_omni_platform.set_device_control_env_var("1")
+        yield
 
-    monkeypatch.setattr(engine_mod, "setup_stage_devices", _fake_setup_stage_devices)
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _fake_stage_runtime_setup)
     monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
     monkeypatch.setattr(engine_mod, "initialize_diffusion_stage", lambda *_, **__: types.SimpleNamespace())
 
@@ -232,7 +225,11 @@ def test_initialize_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
 
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(engine_mod, "setup_stage_devices", lambda *_: None)
+    @contextmanager
+    def _noop_stage_runtime_setup(*_):
+        yield
+
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _noop_stage_runtime_setup)
     monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
 
     def _capture_initialize_diffusion_stage(
@@ -331,8 +328,8 @@ def test_initialize_stages_exposes_logical_stage_views_and_builds_top_level_inpu
         stage1_client_r0.default_sampling_params,
     ]
     assert engine.stage_metadata == [
-        {"final_output": False, "final_output_type": None, "stage_type": "llm"},
-        {"final_output": True, "final_output_type": None, "stage_type": "llm"},
+        StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm"),
+        StageRuntimeInfo(final_output=True, final_output_type=None, stage_type="llm"),
     ]
 
 
@@ -383,6 +380,44 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
     assert all(replica.num_replicas == 3 for replica in stage_plans[1].replicas)
 
 
+def test_initialize_stage_replicas_reuses_long_lived_executor(monkeypatch):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._stage_init_executor = None
+
+    cfg = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    stage_plans = [_make_llm_plan(0, configured_stage_id=0, vllm_config=cfg, num_replicas=1)]
+
+    created_executors = []
+
+    class FakeExecutor:
+        def __init__(self, *args, **kwargs):
+            self.shutdown_calls = []
+            created_executors.append(self)
+
+        def submit(self, fn, *args, **kwargs):
+            future = concurrent.futures.Future()
+            future.set_result(fn(*args, **kwargs))
+            return future
+
+        def shutdown(self, wait=False, cancel_futures=False):
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(
+        engine,
+        "_initialize_replica",
+        lambda plan, _stage_init_timeout, _stage_launch_lock: f"client-{plan.replica_id}",
+    )
+
+    first = engine._initialize_stage_replicas(stage_plans, stage_init_timeout=1)
+    second = engine._initialize_stage_replicas(stage_plans, stage_init_timeout=1)
+
+    assert first == {0: ["client-0"]}
+    assert second == {0: ["client-0"]}
+    assert len(created_executors) == 1
+    assert engine._stage_init_executor is created_executors[0]
+
+
 def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monkeypatch):
     engine = object.__new__(AsyncOmniEngine)
 
@@ -414,6 +449,42 @@ def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monk
     }
 
 
+def test_shutdown_closes_long_lived_stage_init_executor():
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine._weak_finalizer = None
+    engine._omni_master_server = None
+    engine._coordinator_runtime = None
+    engine.orchestrator_thread = types.SimpleNamespace(join=lambda timeout: None, is_alive=lambda: False)
+
+    class FakeQueue:
+        def __init__(self):
+            self.closed = False
+            self.sync_q = types.SimpleNamespace(put_nowait=lambda _msg: None)
+
+        def close(self):
+            self.closed = True
+
+    class FakeExecutor:
+        def __init__(self):
+            self.shutdown_calls = []
+
+        def shutdown(self, wait=False, cancel_futures=False):
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    engine.request_queue = FakeQueue()
+    engine.output_queue = FakeQueue()
+    engine.rpc_output_queue = FakeQueue()
+    engine._stage_init_executor = FakeExecutor()
+
+    engine.shutdown()
+
+    assert engine._stage_init_executor is None
+    assert engine.request_queue.closed is True
+    assert engine.output_queue.closed is True
+    assert engine.rpc_output_queue.closed is True
+
+
 def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_replica_failure(monkeypatch):
     import vllm_omni.engine.async_omni_engine as engine_mod
 
@@ -426,6 +497,7 @@ def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_rep
     engine.single_stage_mode = False
     engine._single_stage_id_filter = None
     engine._omni_master_server = None
+    engine._coordinator_runtime = None
     engine.stage_configs = [types.SimpleNamespace()]
 
     cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
@@ -470,6 +542,7 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
     engine.single_stage_mode = False
     engine._single_stage_id_filter = None
     engine._omni_master_server = None
+    engine._coordinator_runtime = None
     engine.stage_configs = [types.SimpleNamespace()]
 
     cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
@@ -536,7 +609,11 @@ def test_initialize_llm_replica_passes_stage_init_timeout_to_complete_stage_hand
     prev_device_env = os.environ.get(device_env_var)
     os.environ[device_env_var] = "0"
 
-    monkeypatch.setattr(engine_mod, "setup_stage_devices", lambda *_: None)
+    @contextmanager
+    def _noop_stage_runtime_setup(*_):
+        yield
+
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _noop_stage_runtime_setup)
     monkeypatch.setattr(engine_mod, "build_engine_args_dict", lambda *_, **__: {})
     monkeypatch.setattr(engine_mod, "acquire_device_locks", lambda *_: [])
     monkeypatch.setattr(engine_mod, "spawn_stage_core", lambda **_: (fake_addresses, fake_proc, "ipc://handshake"))
@@ -725,3 +802,158 @@ def test_inject_kv_stage_info_infers_receiver_tp_topology():
     assert stage1.engine_args["omni_kv_config"]["stage_id"] == 1
     assert stage1.engine_args["omni_kv_config"]["engine_input_source"] == [0]
     assert stage1.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
+
+
+def test_resolve_stage_configs_injects_global_diffusion_attention_when_missing(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    stage_cfg = types.SimpleNamespace(
+        stage_type="diffusion",
+        engine_args=types.SimpleNamespace(
+            diffusion_attention_config=None,
+            lora_path=None,
+            lora_scale=None,
+            enable_sleep_mode=None,
+            quantization_config=None,
+        ),
+    )
+
+    monkeypatch.setattr(
+        engine_mod,
+        "load_and_resolve_stage_configs",
+        lambda *args, **kwargs: ("dummy-config", [stage_cfg]),
+    )
+
+    _config_path, stage_configs = engine._resolve_stage_configs(
+        model="dummy-model",
+        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
+    )
+
+    diffusion_attention_config = stage_configs[0].engine_args.diffusion_attention_config
+    assert isinstance(diffusion_attention_config, AttentionConfig)
+    assert diffusion_attention_config.default is not None
+    assert diffusion_attention_config.default.backend == "FLASH_ATTN"
+
+
+def test_resolve_stage_configs_preserves_stage_diffusion_attention(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    existing_attention = AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA"))
+    stage_cfg = types.SimpleNamespace(
+        stage_type="diffusion",
+        engine_args=types.SimpleNamespace(
+            diffusion_attention_config=existing_attention,
+            lora_path=None,
+            lora_scale=None,
+            enable_sleep_mode=None,
+            quantization_config=None,
+        ),
+    )
+
+    monkeypatch.setattr(
+        engine_mod,
+        "load_and_resolve_stage_configs",
+        lambda *args, **kwargs: ("dummy-config", [stage_cfg]),
+    )
+
+    _config_path, stage_configs = engine._resolve_stage_configs(
+        model="dummy-model",
+        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
+    )
+
+    assert stage_configs[0].engine_args.diffusion_attention_config is existing_attention
+
+
+def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stage(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    stage_cfg = types.SimpleNamespace(
+        stage_type="llm",
+        engine_args=types.SimpleNamespace(
+            attention_config={"backend": "FLASH_ATTN"},
+            enable_sleep_mode=None,
+        ),
+    )
+
+    monkeypatch.setattr(
+        engine_mod,
+        "load_and_resolve_stage_configs",
+        lambda *args, **kwargs: ("dummy-config", [stage_cfg]),
+    )
+
+    _config_path, stage_configs = engine._resolve_stage_configs(
+        model="dummy-model",
+        kwargs={"diffusion_attention_backend": "TORCH_SDPA"},
+    )
+
+    assert stage_configs[0].engine_args.attention_config == {"backend": "FLASH_ATTN"}
+    assert not hasattr(stage_configs[0].engine_args, "diffusion_attention_config")
+
+
+def test_extract_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeypatch):
+    """ROCm default attention logic only applies to LLM stages, not diffusion."""
+    from vllm_omni.engine.stage_init_utils import extract_stage_metadata
+
+    monkeypatch.setattr("vllm_omni.engine.stage_init_utils.current_omni_platform.is_rocm", lambda: True)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="diffusion",
+        engine_args={},
+        runtime={},
+        engine_input_source=[],
+        final_output=False,
+        final_output_type=None,
+    )
+
+    metadata = extract_stage_metadata(stage_cfg)
+
+    assert metadata.stage_type == "diffusion"
+    assert "diffusion_attention_config" not in stage_cfg.engine_args
+
+
+def test_build_engine_args_dict_normalizes_diffusion_attention_config():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="diffusion",
+        engine_args={
+            "diffusion_attention_config": {
+                "default": {"backend": "FLASH_ATTN"},
+                "per_role": {"cross": {"backend": "TORCH_SDPA"}},
+            }
+        },
+        runtime={},
+    )
+
+    engine_args_dict = build_engine_args_dict(stage_cfg, model="dummy-model")
+
+    diffusion_attention_config = engine_args_dict["diffusion_attention_config"]
+    assert isinstance(diffusion_attention_config, AttentionConfig)
+    assert diffusion_attention_config.default is not None
+    assert diffusion_attention_config.default.backend == "FLASH_ATTN"
+    assert diffusion_attention_config.per_role["cross"].backend == "TORCH_SDPA"
+
+
+def test_build_engine_args_dict_uses_diffusion_attention_config_key():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="diffusion",
+        engine_args={
+            "diffusion_attention_config": {
+                "default": {"backend": "FLASH_ATTN"},
+            }
+        },
+        runtime={},
+    )
+
+    engine_args_dict = build_engine_args_dict(stage_cfg, model="dummy-model")
+
+    assert "attention_config" not in engine_args_dict
+    assert engine_args_dict["diffusion_attention_config"].default.backend == "FLASH_ATTN"

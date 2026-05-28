@@ -28,26 +28,28 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
 
     if multimodal_outputs:
         for k, v in multimodal_outputs.items():
-            if isinstance(v, torch.Tensor):
-                mm_cpu[k] = v.detach().to("cpu").contiguous()
-            elif isinstance(v, dict):
-                sub_dict: dict[str, torch.Tensor] = {}
-                for sk, sv in v.items():
-                    if isinstance(sv, torch.Tensor):
-                        sub_dict[str(sk)] = sv.detach().to("cpu").contiguous()
-                if sub_dict:
-                    mm_cpu[k] = sub_dict
-            elif isinstance(v, list) and len(v) > 0:
-                cpu_list = []
-                for elem in v:
-                    if isinstance(elem, torch.Tensor):
-                        cpu_list.append(elem.detach().to("cpu").contiguous())
-                    else:
-                        cpu_list.append(elem)
-                mm_cpu[k] = cpu_list
-            elif v is not None:
-                mm_cpu[k] = v
+            cpu_v = _to_cpu(v)
+            if cpu_v is not None:
+                mm_cpu[k] = cpu_v
     return mm_cpu
+
+
+def _to_cpu(value):
+    """Recursively detach + move tensors to CPU; preserve dict/list nesting."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to("cpu").contiguous()
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            cpu_v = _to_cpu(v)
+            if cpu_v is not None:
+                out[k] = cpu_v
+        return out or None
+    if isinstance(value, list):
+        if not value:
+            return value
+        return [_to_cpu(v) for v in value]
+    return value
 
 
 def to_payload_element(
@@ -66,18 +68,22 @@ def to_payload_element(
             if we need to avoid splitting nonempty lists prior to calling
             postprocess, which is the case for prefix cache.
         seq_len: Optional sequence length (i.e., dim 0 of hidden states).
-            This should be set to None in the prefix caching case, because
-            the condition that would be executed here is the same as the
-            criteria for being added to the multimodal outputs cache.
+            When set, a tensor whose first dimension equals seq_len is
+            sliced per request. The prefix cache passthrough also passes
+            the total scheduled token count here so 1D (seq_len,) metadata
+            that is intentionally not cached is still split per request.
     """
-    # Prefix cache won't hit this case because this is the condition
-    # for being a mm_cache_key in the multimodal outputs tensor.
+    # Cached per-token tensors are merged elsewhere; here a first dim
+    # equal to seq_len means a per-request slice is required.
     if seq_len is not None and isinstance(element, torch.Tensor) and element.shape[0] == seq_len:
         return element[start:end].contiguous()
     # Every other case is shared between prefix cache (passthrough data)
     # and running a model without prefix caching.
     elif isinstance(element, dict):
-        return {sk: sv[start:end].contiguous() for sk, sv in element.items()}
+        return {
+            sk: to_payload_element(sv, idx, start, end, pass_lists_through=pass_lists_through, seq_len=seq_len)
+            for sk, sv in element.items()
+        }
     elif isinstance(element, list):
         # For lists, clone tensors to avoid cross-request aliasing
         if pass_lists_through:

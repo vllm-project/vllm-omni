@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
@@ -369,7 +370,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
             results.append(comb)
         return _unwrap(tuple(results))
 
-    def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor | tuple[torch.Tensor, ...] | IntermediateTensors:
         """
         Forward pass through transformer to predict noise.
 
@@ -381,8 +382,11 @@ class CFGParallelMixin(metaclass=ABCMeta):
             multi-output models (e.g., video + audio). Multi-output models
             must also override combine_cfg_noise() and set self.scheduler
             to a composite scheduler that handles tuples.
+            Non-last Pipeline Parallel stages return `IntermediateTensors`
+            instead of final noise tensors wrapped in a tuple.
         """
-        return self.transformer(*args, **kwargs)[0]
+        result = self.transformer(*args, **kwargs)
+        return result if isinstance(result, IntermediateTensors) else result[0]
 
     def diffuse(
         self,

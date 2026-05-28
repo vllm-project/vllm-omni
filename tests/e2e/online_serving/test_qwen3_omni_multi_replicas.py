@@ -12,7 +12,6 @@ from tests.helpers.runtime import OmniResponse, OmniServerParams, dummy_messages
 from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 MULTI_REPLICA_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe_multi_replicas_4gpu.yaml")
@@ -87,7 +86,7 @@ def _assert_audio_outputs(responses: list[OmniResponse], *, expect_text: bool) -
         )
 
 
-@pytest.mark.core_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -104,7 +103,7 @@ def test_text_only_batch_uses_multi_replica_talker(omni_server, openai_client) -
     _assert_text_outputs(responses)
 
 
-@pytest.mark.core_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -121,7 +120,7 @@ def test_text_to_audio_stream_batch_uses_multi_replica_vocoder(omni_server, open
     _assert_audio_outputs(responses, expect_text=False)
 
 
-@pytest.mark.core_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)

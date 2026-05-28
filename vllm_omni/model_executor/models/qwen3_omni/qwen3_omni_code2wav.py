@@ -297,9 +297,9 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 single tensor with shape ``[1, waveform_len]``.
         """
         if not (left_context_size and seq_token_counts and len(left_context_size) == len(seq_token_counts)):
-            logger.warning(
+            logger.warning_once(
                 "chunked_decode_streaming: missing/invalid left_context_size or seq_token_counts; "
-                "defaulting to left_context_size=zeros(len=codes.shape[0])."
+                "defaulting to left_context_size=zeros(len(codes)). This is expected during cudagraph warmup."
             )
             left_context_size = [0] * codes.shape[0]
         # Decode chunk
