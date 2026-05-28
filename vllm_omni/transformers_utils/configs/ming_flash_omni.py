@@ -260,6 +260,61 @@ class BailingMM2Config(PretrainedConfig):
         return self.llm_config
 
 
+class MingImageGenConfig(PretrainedConfig):
+    """Configuration for Ming-flash-omni-2.0 image generation stage.
+
+    Mirrors the layout of the HF checkpoint at
+    https://huggingface.co/inclusionAI/Ming-flash-omni-2.0 where image-gen
+    components live in sibling subfolders (``connector/``, ``transformer/``,
+    ``vae/``, ``scheduler/``, ``mlp/``).
+    """
+
+    model_type = "ming_flash_omni_imagegen"
+
+    def __init__(
+        self,
+        connector_subfolder: str = "connector",
+        transformer_subfolder: str = "transformer",
+        vae_subfolder: str = "vae",
+        scheduler_subfolder: str = "scheduler",
+        mlp_subfolder: str = "mlp",
+        diffusion_c_input_dim: int = 2560,
+        thinker_hidden_size: int = 4096,
+        img_gen_scales: list[int] | None = None,
+        text_encoder_norm: bool = True,
+        # Default sampling parameters — match Ming's defaults in
+        # ``modeling_bailingmm2.py::generate`` (``image_gen_steps=30``,
+        # ``image_gen_cfg=2.0``).
+        num_inference_steps: int = 30,
+        guidance_scale: float = 2.0,
+        default_height: int = 1024,
+        default_width: int = 1024,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.connector_subfolder = connector_subfolder
+        self.transformer_subfolder = transformer_subfolder
+        self.vae_subfolder = vae_subfolder
+        self.scheduler_subfolder = scheduler_subfolder
+        self.mlp_subfolder = mlp_subfolder
+        self.diffusion_c_input_dim = diffusion_c_input_dim
+        self.thinker_hidden_size = thinker_hidden_size
+        self.img_gen_scales = img_gen_scales if img_gen_scales is not None else [16]
+        self.text_encoder_norm = text_encoder_norm
+        self.num_inference_steps = num_inference_steps
+        self.guidance_scale = guidance_scale
+        self.default_height = default_height
+        self.default_width = default_width
+
+    @property
+    def num_query_tokens(self) -> int:
+        """Total number of learnable query tokens appended to the thinker input.
+
+        For ``img_gen_scales=[16]`` this yields 256 tokens (a single 16x16 grid).
+        """
+        return sum(s * s for s in self.img_gen_scales)
+
+
 class MingFlashOmniTalkerConfig(PretrainedConfig):
     """Configuration class for Ming-flash-omni-2.0 talker (TTS) stage.
 
@@ -309,13 +364,14 @@ class MingFlashOmniConfig(PretrainedConfig):
     is_composition = True
     sub_configs: ClassVar = {
         "thinker_config": BailingMM2Config,
+        "image_gen_config": MingImageGenConfig,
         "talker_config": MingFlashOmniTalkerConfig,
     }
 
     def __init__(
         self,
         thinker_config: BailingMM2Config | dict[str, Any] | None = None,
-        image_gen_config: dict[str, Any] | None = None,
+        image_gen_config: MingImageGenConfig | dict[str, Any] | None = None,
         talker_config: MingFlashOmniTalkerConfig | dict[str, Any] | None = None,
         **kwargs,
     ):
@@ -326,8 +382,13 @@ class MingFlashOmniConfig(PretrainedConfig):
         else:
             self.thinker_config = thinker_config or BailingMM2Config()
 
-        # Image generation config (for future implementation)
-        self.image_gen_config = image_gen_config
+        # Image generation config
+        if isinstance(image_gen_config, dict):
+            self.image_gen_config = MingImageGenConfig(**image_gen_config)
+        elif image_gen_config is None:
+            self.image_gen_config = MingImageGenConfig()
+        else:
+            self.image_gen_config = image_gen_config
 
         # Talker config
         if isinstance(talker_config, dict):
@@ -342,6 +403,7 @@ class MingFlashOmniConfig(PretrainedConfig):
 # Register model_type -> config class for AutoConfig
 AutoConfig.register(BailingMoeV2Config.model_type, BailingMoeV2Config)
 AutoConfig.register(BailingMM2Config.model_type, BailingMM2Config)
+AutoConfig.register(MingImageGenConfig.model_type, MingImageGenConfig)
 AutoConfig.register(MingFlashOmniTalkerConfig.model_type, MingFlashOmniTalkerConfig)
 AutoConfig.register(MingFlashOmniConfig.model_type, MingFlashOmniConfig)
 

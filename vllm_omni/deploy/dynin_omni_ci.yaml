@@ -14,6 +14,7 @@ stage_args:
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       engine_output_type: latent
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.dynin_omni.token2text_to_token2image_full_payload
       trust_remote_code: true
       gpu_memory_utilization: 0.5
       enforce_eager: true
@@ -36,6 +37,7 @@ stage_args:
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       engine_output_type: latent
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.dynin_omni.token2image_to_token2audio_full_payload
       trust_remote_code: true
       gpu_memory_utilization: 0.2
       enforce_eager: true

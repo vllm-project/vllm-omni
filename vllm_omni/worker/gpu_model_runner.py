@@ -96,6 +96,7 @@ class OmniGPUModelRunner(GPUModelRunner):
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
+        self._prewarm_attention_capture_workspaces()
 
         # TODO move this model specific logic to a separate class
         # TTS model IS the talker (no .talker sub-attr); use getattr to support both Omni and TTS.
@@ -121,6 +122,45 @@ class OmniGPUModelRunner(GPUModelRunner):
             )
             self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
             self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+
+    def _prewarm_attention_capture_workspaces(self) -> None:
+        capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
+        if not capture_sizes:
+            return
+        from vllm_omni.attention.fish_kvcache_backend import prewarm_fish_kvcache_attn_capture_workspaces
+
+        prewarm_fish_kvcache_attn_capture_workspaces(
+            model_config=self.model_config,
+            device=self.device,
+            dtype=self.dtype,
+            capture_sizes=capture_sizes,
+        )
+
+    def _maybe_attach_attention_metadata_extensions(
+        self,
+        *,
+        attn_metadata: Any,
+        num_reqs: int,
+        num_reqs_padded: int,
+        max_query_len: int,
+        pad_attn: bool,
+        for_cudagraph_capture: bool = False,
+        num_scheduled_tokens_np: np.ndarray | None = None,
+    ) -> None:
+        from vllm_omni.attention.fish_kvcache_backend import maybe_attach_fish_kvcache_seq_lens_upper_bound
+
+        maybe_attach_fish_kvcache_seq_lens_upper_bound(
+            model_config=self.model_config,
+            attn_metadata=attn_metadata,
+            input_batch=self.input_batch,
+            optimistic_seq_lens_cpu=self.optimistic_seq_lens_cpu,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            max_query_len=max_query_len,
+            pad_attn=pad_attn,
+            for_cudagraph_capture=for_cudagraph_capture,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+        )
 
     def _build_model_sampler_output_token_ids(self) -> list[list[int]]:
         """Build decoded-token history for ``prefer_model_sampler`` models.
@@ -321,12 +361,15 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         # Remove finished requests from the cached states.
         # cleanup_finished_request lives on OmniConnectorModelRunnerMixin and
-        # is only safe to call once init_omni_connectors() has populated the
-        # mixin state. Archs that inherit the method via MRO without running
-        # that init must be skipped, so probe a mixin-owned attribute as the
-        # "state initialized" gate.
+        # is only safe to call once init_omni_connectors() has finished
+        # populating mixin state (it sets ``_omni_connector_initialized = True``
+        # at the very end).  Archs that inherit the method via MRO without
+        # running that init must be skipped, so gate on the explicit flag
+        # rather than probing private attribute names.
         cleanup_finished_request = (
-            getattr(self, "cleanup_finished_request", None) if hasattr(self, "_request_ids_mapping") else None
+            getattr(self, "cleanup_finished_request", None)
+            if getattr(self, "_omni_connector_initialized", False)
+            else None
         )
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -897,6 +940,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
+                )
+                self._maybe_attach_attention_metadata_extensions(
+                    attn_metadata=attn_metadata,
+                    num_reqs=num_reqs_padded,
+                    num_reqs_padded=num_reqs_padded,
+                    max_query_len=max_query_len,
+                    pad_attn=True,
+                    for_cudagraph_capture=is_graph_capturing,
                 )
 
         with self.maybe_dummy_run_with_lora(
