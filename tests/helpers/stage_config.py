@@ -332,15 +332,14 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
             {
                 "stage_id": 1,
-                "gpu_memory_utilization": 0.5,
                 "max_num_seqs": 5,
+                "gpu_memory_utilization": 0.5,
                 "max_model_len": 32768,
                 "default_sampling_params": {"max_tokens": 1000},
             },
             {
                 "stage_id": 2,
                 "max_num_seqs": 5,
-                "max_num_batched_tokens": 100000,
                 "default_sampling_params": {"max_tokens": 2000},
             },
         ],

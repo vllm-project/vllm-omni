@@ -399,6 +399,12 @@ def resolve_quant_config_from_disk(
         )
         return build_quant_config(qc_method, **qc_kwargs)
 
+    # AutoRound MXFP8 checkpoints use data_type="mx_fp" instead of
+    # is_checkpoint_*_serialized; rebuild so the offline path is selected.
+    if qc_kwargs.get("data_type") == "mx_fp":
+        logger.info("config.json declares data_type='mx_fp'; rebuilding as offline AutoRound MXFP8.")
+        return build_quant_config(qc_method, **qc_kwargs)
+
     if (
         "ignored_layers" in qc_kwargs
         and hasattr(quant_config, "ignored_layers")

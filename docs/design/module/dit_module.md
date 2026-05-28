@@ -169,14 +169,12 @@ class DiffusionRequestStatus(enum.IntEnum):
 
 @dataclass
 class DiffusionRequestState:
-    sched_req_id: str
+    request_id: str
     req: OmniDiffusionRequest
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
 ```
 
 **Design Features**:
-
-- **Scheduler-owned ID**: Each `OmniDiffusionRequest` is tracked by an internal `sched_req_id`, separated from public `request_id` values.
 
 - **Explicit lifecycle**: Requests move through waiting, running, optional preemption, and terminal states.
 
@@ -188,7 +186,6 @@ class DiffusionRequestState:
 class _BaseScheduler(SchedulerInterface):
     def __init__(self) -> None:
         self._request_states = {}
-        self._request_id_to_sched_req_id = {}
         self._waiting = deque()
         self._running = []
         self._finished_req_ids = set()
@@ -199,7 +196,8 @@ class _BaseScheduler(SchedulerInterface):
 
 - **Common state storage**: Shared request maps and waiting/running sets live in the base class.
 
-- **Shared cleanup logic**: Request-id registration, finish handling, and state removal are centralized instead of duplicated in each policy.
+- **Shared cleanup logic**: Duplicate-request checks, finish handling, and state removal are centralized instead of
+  duplicated in each policy.
 
 - **Current constraint boundary**: `_BaseScheduler` derives `max_num_running_reqs` from `max_num_seqs`, but request-mode diffusion is still clamped back to `1` by the engine. The step-wise path can keep this above `1` for compatible-request batching.
 
@@ -219,12 +217,12 @@ class RequestScheduler(_BaseScheduler):
 
 - **Single-request admission**: `RequestScheduler` still admits one active request at a time because request-mode execution completes a whole request per dispatch.
 
-- **Executor result feedback**: `update_from_output()` converts executor output into `FINISHED_COMPLETED` or `FINISHED_ERROR` and returns finished scheduler ids.
+- **Executor result feedback**: `update_from_output()` converts executor output into `FINISHED_COMPLETED` or `FINISHED_ERROR` and returns finished request ids.
 
 #### 2.5 Engine-Driven Execution Loop
 
 ```python
-sched_req_id = scheduler.add_request(request)
+request_id = scheduler.add_request(request)
 while True:
     sched_output = scheduler.schedule()
     output = executor.add_req(req)

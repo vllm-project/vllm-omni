@@ -59,6 +59,8 @@ class DiffusionAttentionBackendEnum(Enum, metaclass=_DiffusionBackendEnumMeta):
     FLASH_ATTN = "vllm_omni.diffusion.attention.backends.flash_attn.FlashAttentionBackend"
     TORCH_SDPA = "vllm_omni.diffusion.attention.backends.sdpa.SDPABackend"
     SAGE_ATTN = "vllm_omni.diffusion.attention.backends.sage_attn.SageAttentionBackend"
+    CUDNN_ATTN = "vllm_omni.diffusion.attention.backends.cudnn_attn.CuDNNAttentionBackend"
+    FLASHINFER_ATTN = "vllm_omni.diffusion.attention.backends.flashinfer_attn.FlashInferAttentionBackend"
 
     def get_path(self, include_classname: bool = True) -> str:
         """Get the class path for this backend (respects overrides).
