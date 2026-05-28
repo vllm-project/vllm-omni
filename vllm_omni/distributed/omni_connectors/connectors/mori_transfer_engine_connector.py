@@ -230,9 +230,7 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         #                ``sender_host`` / ``sender_zmq_port``.
         role = str(config.get("role", "sender")).lower()
         if role not in {"sender", "receiver"}:
-            raise ValueError(
-                f"Invalid role={role!r} for MoriTransferEngineConnector. Expected 'sender' or 'receiver'."
-            )
+            raise ValueError(f"Invalid role={role!r} for MoriTransferEngineConnector. Expected 'sender' or 'receiver'.")
         self.role = role
         self.can_put = role == "sender"
 
