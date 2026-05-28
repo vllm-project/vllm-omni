@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import lcm
 
 import torch
 import torch.distributed as dist
@@ -18,6 +19,63 @@ from vllm_omni.diffusion.forward_context import get_ulysses_mode
 
 def _ceil_div(n: int, d: int) -> int:
     return (n + d - 1) // d
+
+
+def _repeat_kv_heads(t: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Interleaved repeat of the head dim of (B, S, H, D) by n_rep.
+
+    Matches the semantics models use locally for GQA broadcast. The result is
+    contiguous so downstream all_to_all_4D reshape/transpose paths are happy.
+    """
+    if n_rep == 1:
+        return t
+    bsz, s, h, d = t.shape
+    return t[:, :, :, None, :].expand(bsz, s, h, n_rep, d).reshape(bsz, s, h * n_rep, d).contiguous()
+
+
+def _prepare_kv_for_strict_sharding(
+    k: torch.Tensor, v: torch.Tensor, *, q_head_cnt: int, world_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Minimally repeat K/V heads so the head dim divides ulysses world_size.
+
+    Returns K/V unchanged when ``kv_head_cnt`` already divides world_size and the
+    GQA pairing survives the head-dim all-to-all.
+
+    When repetition is required, picks ``m = lcm(world_size, kv_head_cnt)`` so
+    each rank gets a whole number of K/V heads. Falls back to expanding all the
+    way to ``q_head_cnt`` (MHA) when ``m`` doesn't divide ``q_head_cnt``.
+    """
+    kv_head_cnt = int(k.shape[2])
+    if kv_head_cnt == 0 or world_size <= 1 or kv_head_cnt % world_size == 0:
+        return k, v
+    m = lcm(world_size, kv_head_cnt)
+    if q_head_cnt > 0 and q_head_cnt % m == 0:
+        r = m // kv_head_cnt
+    else:
+        if q_head_cnt <= 0 or q_head_cnt % kv_head_cnt != 0:
+            raise ValueError(
+                "Ulysses-SP strict mode: cannot reconcile kv_head_cnt "
+                f"({kv_head_cnt}) with ulysses_degree ({world_size}) and "
+                f"q_head_cnt ({q_head_cnt}). q_head_cnt must be a multiple "
+                f"of {kv_head_cnt}."
+            )
+        r = q_head_cnt // kv_head_cnt
+    return _repeat_kv_heads(k, r), _repeat_kv_heads(v, r)
+
+
+def _expand_kv_to_match_q(k: torch.Tensor, v: torch.Tensor, *, q_head_cnt: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand K/V heads to ``q_head_cnt`` (full MHA expansion).
+
+    Used by the UAA path: independent head-dim padding of Q and K/V would
+    break GQA pairing across ranks, so we MHA-expand before the all-to-all.
+    """
+    kv_head_cnt = int(k.shape[2])
+    if kv_head_cnt == 0 or kv_head_cnt == q_head_cnt:
+        return k, v
+    if q_head_cnt % kv_head_cnt != 0:
+        raise ValueError(f"q_head_cnt ({q_head_cnt}) is not a multiple of kv_head_cnt ({kv_head_cnt})")
+    r = q_head_cnt // kv_head_cnt
+    return _repeat_kv_heads(k, r), _repeat_kv_heads(v, r)
 
 
 def _positive_divisors(n: int) -> list[int]:
@@ -249,6 +307,23 @@ class UlyssesParallelAttention:
             joint_head_cnt = int(joint_tensor_query.shape[-2])
             joint_orig_head_cnt = joint_head_cnt
 
+            # GQA: joint K/V may be compact (fewer heads than joint Q).
+            # In UAA we must MHA-expand before per-tensor head padding, since
+            # padding Q/K/V independently breaks GQA pairing across ranks. In
+            # strict mode we only repeat the minimum needed to make the head
+            # dim divisible by ulysses_world_size.
+            if mode == "advanced_uaa":
+                joint_tensor_key, joint_tensor_value = _expand_kv_to_match_q(
+                    joint_tensor_key, joint_tensor_value, q_head_cnt=joint_head_cnt
+                )
+            else:
+                joint_tensor_key, joint_tensor_value = _prepare_kv_for_strict_sharding(
+                    joint_tensor_key,
+                    joint_tensor_value,
+                    q_head_cnt=joint_head_cnt,
+                    world_size=ulysses_world_size,
+                )
+
             if mode == "advanced_uaa":
                 padded_joint_head_cnt = _ceil_div(joint_head_cnt, ulysses_world_size) * ulysses_world_size
                 joint_head_pad = padded_joint_head_cnt - joint_head_cnt
@@ -305,6 +380,17 @@ class UlyssesParallelAttention:
                 attn_metadata.joint_value = joint_tensor_value
 
         ulysses_world_size = self._sp_group.ulysses_world_size
+
+        # GQA: main K/V may be compact. Same reasoning as the joint branch
+        # above; see _prepare_kv_for_strict_sharding / _expand_kv_to_match_q.
+        q_head_cnt = int(query.shape[2])
+        if mode == "advanced_uaa":
+            key, value = _expand_kv_to_match_q(key, value, q_head_cnt=q_head_cnt)
+        else:
+            key, value = _prepare_kv_for_strict_sharding(
+                key, value, q_head_cnt=q_head_cnt, world_size=ulysses_world_size
+            )
+
         if mode == "advanced_uaa":
             if self._scatter_idx != 2 or self._gather_idx != 1:
                 raise ValueError(
@@ -335,16 +421,16 @@ class UlyssesParallelAttention:
             key, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, key, seq_lens=seq_lens, use_sync=self._use_sync)
             value, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, value, seq_lens=seq_lens, use_sync=self._use_sync)
         else:
-            # Strict mode: fail fast with actionable errors for head divisibility.
-            for name, t in (("query", query), ("key", key), ("value", value)):
-                head_cnt = int(t.shape[2])
-                if head_cnt % ulysses_world_size != 0:
-                    supported = _positive_divisors(head_cnt)
-                    raise ValueError(
-                        "Ulysses-SP strict mode requires head_cnt divisible by ulysses_degree. "
-                        f"{name}_head_cnt={head_cnt}, ulysses_degree={ulysses_world_size}. "
-                        f"Try ulysses_degree in {supported}, or set ulysses_mode='advanced_uaa'."
-                    )
+            # Strict mode: Q must divide ulysses_world_size; K/V were already
+            # reconciled above (compact GQA layout, with minimal repeat).
+            q_head_cnt = int(query.shape[2])
+            if q_head_cnt % ulysses_world_size != 0:
+                supported = _positive_divisors(q_head_cnt)
+                raise ValueError(
+                    "Ulysses-SP strict mode requires head_cnt divisible by ulysses_degree. "
+                    f"query_head_cnt={q_head_cnt}, ulysses_degree={ulysses_world_size}. "
+                    f"Try ulysses_degree in {supported}, or set ulysses_mode='advanced_uaa'."
+                )
 
             # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
             query = SeqAllToAll4D.apply(self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync)
