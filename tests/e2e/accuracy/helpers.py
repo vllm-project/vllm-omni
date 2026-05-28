@@ -1,7 +1,17 @@
+import json
 import os
+import re
+import shutil
+import subprocess
+import time
+from base64 import b64decode, b64encode
+from fractions import Fraction
+from hashlib import sha1
 from io import BytesIO
+from mimetypes import guess_type
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 import pytest
@@ -61,6 +71,274 @@ def model_output_dir(parent_dir: Path, model: str) -> Path:
     path = parent_dir / safe_model_name
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+_SSIM_RE = re.compile(r"All:(?P<score>[0-9.]+)")
+_PSNR_RE = re.compile(r"average:(?P<score>[0-9.]+)")
+
+
+def parse_video_metadata(payload: dict[str, Any]) -> dict[str, int | float]:
+    streams = payload.get("streams")
+    if not isinstance(streams, list) or not streams:
+        raise ValueError(f"ffprobe payload did not include video streams: {payload}")
+
+    stream = streams[0]
+    width = int(stream["width"])
+    height = int(stream["height"])
+    fps = float(Fraction(stream["avg_frame_rate"]))
+    frame_count_value = stream.get("nb_read_frames") or stream.get("nb_frames")
+    if frame_count_value is None:
+        raise ValueError(f"ffprobe payload did not include frame count: {payload}")
+    frame_count = int(frame_count_value)
+    return {
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "frame_count": frame_count,
+    }
+
+
+def parse_ssim_score(output: str) -> float:
+    match = _SSIM_RE.search(output)
+    if match is None:
+        raise ValueError(f"Could not parse SSIM score from ffmpeg output:\n{output}")
+    return float(match.group("score"))
+
+
+def parse_psnr_score(output: str) -> float:
+    match = _PSNR_RE.search(output)
+    if match is None:
+        raise ValueError(f"Could not parse PSNR score from ffmpeg output:\n{output}")
+    return float(match.group("score"))
+
+
+def probe_binary(binary: str, *, test_name: str = "video similarity e2e test") -> str:
+    resolved = shutil.which(binary)
+    if resolved is None:
+        pytest.skip(f"{binary} is required for {test_name}.")
+    return resolved
+
+
+def probe_video(path: Path) -> dict[str, int | float]:
+    probe_binary("ffprobe")
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate,nb_read_frames",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return parse_video_metadata(json.loads(result.stdout))
+
+
+def run_ffmpeg_similarity(filter_name: str, first: Path, second: Path) -> str:
+    probe_binary("ffmpeg")
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-i",
+            str(first),
+            "-i",
+            str(second),
+            "-lavfi",
+            f"[0:v][1:v]{filter_name}",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stderr
+
+
+def online_timeout_seconds(configured: int | None, *, default: int = 1200) -> int:
+    return int(configured) if configured is not None else default
+
+
+def is_remote_image_source(source: str) -> bool:
+    return source.startswith("http://") or source.startswith("https://")
+
+
+def validate_image_source(source: str) -> None:
+    if is_remote_image_source(source):
+        response = requests.get(source, timeout=60)
+        response.raise_for_status()
+        return
+
+    image_path = Path(source)
+    if not image_path.exists():
+        raise FileNotFoundError(f"Local image source does not exist: {image_path}")
+
+
+def build_online_image_reference(source: str) -> str:
+    if source.startswith("data:image"):
+        return source
+
+    if is_remote_image_source(source):
+        response = requests.get(source, timeout=60)
+        response.raise_for_status()
+        mime_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip()
+        if not mime_type.startswith("image/"):
+            mime_type = guess_type(urlparse(source).path)[0] or "image/png"
+        encoded = b64encode(response.content).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
+    image_path = Path(source)
+    mime_type = guess_type(image_path.name)[0] or "image/png"
+    encoded = b64encode(image_path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def materialize_image_source(source: str, output_dir: Path) -> str:
+    if not is_remote_image_source(source):
+        return source
+
+    from diffusers.utils import load_image
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_name = Path(urlparse(source).path).name or "input.png"
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", source_name)
+    if "." not in safe_name:
+        safe_name = f"{safe_name}.png"
+    image_path = output_dir / safe_name
+    if not image_path.exists():
+        image = load_image(source).convert("RGB")
+        image.save(image_path)
+    return str(image_path)
+
+
+def video_artifact_dir(result_root: Path, source: str) -> Path:
+    if is_remote_image_source(source):
+        source_name = Path(urlparse(source).path).stem or "remote"
+    else:
+        source_name = Path(source).stem or "local"
+
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", source_name)
+    digest = sha1(source.encode("utf-8")).hexdigest()[:8]
+    return result_root / f"{safe_name}-{digest}"
+
+
+def send_video_request_with_timeout(
+    openai_client,
+    request_config: dict[str, Any],
+    *,
+    timeout_seconds: int,
+) -> bytes:
+    form_data = request_config.get("form_data")
+    if not isinstance(form_data, dict):
+        raise ValueError("Video request_config must contain 'form_data'")
+
+    if not form_data.get("prompt"):
+        raise ValueError("Video request_config['form_data'] must contain 'prompt'")
+
+    normalized_form_data = {key: str(value) for key, value in form_data.items() if value is not None}
+
+    files: dict[str, tuple[str, BytesIO, str]] = {}
+    image_reference = request_config.get("image_reference")
+    if image_reference:
+        if image_reference.startswith("data:image"):
+            header, encoded = image_reference.split(",", 1)
+            content_type = header.split(";")[0].removeprefix("data:")
+            extension = content_type.split("/")[-1]
+            file_data = b64decode(encoded)
+            files["input_reference"] = (
+                f"reference.{extension}",
+                BytesIO(file_data),
+                content_type,
+            )
+        else:
+            normalized_form_data["image_reference"] = json.dumps({"image_url": image_reference})
+
+    start_time = time.perf_counter()
+    create_url = openai_client._build_url("/v1/videos")
+    response = requests.post(
+        create_url,
+        data=normalized_form_data,
+        files=files,
+        headers={"Accept": "application/json"},
+        timeout=60,
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise requests.HTTPError(f"{exc}; response body: {response.text}", response=response) from exc
+    job_data = response.json()
+    video_id = job_data["id"]
+    openai_client._wait_until_video_completed(video_id, timeout_seconds=timeout_seconds)
+    video_content = openai_client._download_video_content(video_id)
+    print(f"online_video_e2e_latency_s={time.perf_counter() - start_time:.3f}")
+    return video_content
+
+
+def assert_video_metadata(
+    metadata: dict[str, int | float],
+    *,
+    width: int,
+    height: int,
+    fps: int | float,
+    frame_count: int,
+) -> None:
+    assert metadata["width"] == width
+    assert metadata["height"] == height
+    assert metadata["fps"] == float(fps)
+    assert metadata["frame_count"] == frame_count
+
+
+def assert_video_similarity_metrics(
+    *,
+    label: str,
+    online_path: Path,
+    offline_path: Path,
+    ssim_threshold: float,
+    psnr_threshold: float,
+) -> None:
+    ssim_output = run_ffmpeg_similarity("ssim", online_path, offline_path)
+    psnr_output = run_ffmpeg_similarity("psnr", online_path, offline_path)
+    ssim_score = parse_ssim_score(ssim_output)
+    psnr_score = parse_psnr_score(psnr_output)
+
+    print(f"{label} similarity metrics:")
+    print(
+        "  SSIM:"
+        f" value={ssim_score:.6f},"
+        f" threshold>={ssim_threshold:.6f},"
+        " range=[0, 1],"
+        " higher_is_better=True,"
+        " interpretation=structural_similarity"
+    )
+    print(
+        "  PSNR:"
+        f" value={psnr_score:.6f} dB,"
+        f" threshold>={psnr_threshold:.6f} dB,"
+        " range=[0, +inf),"
+        " higher_is_better=True,"
+        " interpretation=pixel_error_in_decibels"
+    )
+    print(f"online_video={online_path}")
+    print(f"offline_video={offline_path}")
+
+    assert ssim_score >= ssim_threshold, (
+        f"SSIM below threshold: got {ssim_score:.6f}, expected >= {ssim_threshold:.6f}. "
+        f"online={online_path} offline={offline_path}"
+    )
+    assert psnr_score >= psnr_threshold, (
+        f"PSNR below threshold: got {psnr_score:.6f}, expected >= {psnr_threshold:.6f}. "
+        f"online={online_path} offline={offline_path}"
+    )
 
 
 def assert_similarity(

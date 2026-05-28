@@ -64,6 +64,21 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_origin_status = {}
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
 
+    @staticmethod
+    def _is_truthy_scalar(value: Any) -> bool:
+        if isinstance(value, torch.Tensor):
+            return value.numel() == 1 and bool(value.item())
+        return bool(value) if value is not None else False
+
+    @staticmethod
+    def _confirmed_num_computed_tokens(request: Request) -> int:
+        # vLLM async scheduling advances num_computed_tokens with output
+        # placeholders before the corresponding token is committed. Connector
+        # chunk send watermarks must use only committed tokens.
+        num_computed = int(getattr(request, "num_computed_tokens", 0))
+        num_placeholders = int(getattr(request, "num_output_placeholders", 0) or 0)
+        return max(0, num_computed - num_placeholders)
+
     @classmethod
     def create_connector(cls, model_config: Any):
         connector_config = getattr(model_config, "stage_connector_config", None)
@@ -119,16 +134,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request: Request object
         """
 
+        confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
+
         # If the request is preempted, skip the already saved chunks.
-        if request.num_computed_tokens < self.requests_num_chunks_sent.get(request.external_req_id, 0):
+        if confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(request.external_req_id, 0):
             logger.warning(
                 f"Enqueue save_async for request {request.external_req_id}, "
                 f"request.num_computed_tokens={request.num_computed_tokens}, "
+                f"request.num_output_placeholders={getattr(request, 'num_output_placeholders', 0)}, "
                 f"previous_chunks_sent={self.requests_num_chunks_sent.get(request.external_req_id, 0)}"
             )
             return
 
-        self.requests_num_chunks_sent[request.external_req_id] = request.num_computed_tokens
+        self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
         task = {
             "pooling_output": pooling_output,
             "request": request,
@@ -166,24 +184,36 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.get_req_chunk[req_id] += 1
 
             meta = payload_data.get("meta", {})
+            payload_finished = self._is_truthy_scalar(meta.get("finished"))
             if self.model_mode == "ar":
                 request.additional_information = payload_data
-                if meta.get("finished"):
+                if payload_finished:
                     self.finished_requests.add(req_id)
             else:
-                if meta.get("finished"):
+                if payload_finished:
                     self.finished_requests.add(req_id)
 
                 new_ids = payload_data.get("codes", {}).get("audio")
-                if isinstance(new_ids, torch.Tensor):
+                has_tensor_codes = isinstance(new_ids, torch.Tensor)
+                use_tensor_codes = has_tensor_codes and new_ids.ndim >= 2
+                if use_tensor_codes:
+                    request.prompt_token_ids = [0] if new_ids.numel() > 0 else []
+                elif has_tensor_codes:
                     new_ids = new_ids.tolist()
                 elif new_ids is None:
                     new_ids = []
-                request.prompt_token_ids = new_ids
+                    request.prompt_token_ids = new_ids
+                if not use_tensor_codes:
+                    request.prompt_token_ids = new_ids
                 prev_info = getattr(request, "additional_information", None)
                 info = dict(prev_info) if isinstance(prev_info, dict) else {}
                 for key, value in payload_data.items():
                     if key == "codes":
+                        if use_tensor_codes and isinstance(value, dict):
+                            existing_sub = info.get(key)
+                            merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
+                            merged_sub.update(value)
+                            info[key] = merged_sub
                         continue
                     if isinstance(value, dict):
                         existing_sub = info.get(key)
@@ -199,8 +229,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
-                if not new_ids and not meta.get("finished"):
-                    return True
+                has_new_ids = bool(new_ids.numel()) if use_tensor_codes else bool(new_ids)
+                if not has_new_ids and not payload_finished:
+                    # The base recv loop treats False as "not ready yet" and
+                    # requeues the request. Do not mark an empty non-terminal
+                    # chunk as ready, otherwise Stage1 can consume before the
+                    # first DAC frame arrives.
+                    return False
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
@@ -354,17 +389,28 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request.status = RequestStatus.PREEMPTED
             waiting_queue.prepend_requests([request])
 
-    def restore_queues(self, waiting_queue: Any, running_queue: list[Request]) -> None:
+    def restore_queues(
+        self,
+        waiting_queue: Any,
+        running_queue: list[Request],
+        scheduler_requests: dict[str, Request] | None = None,
+    ) -> None:
         """
         Restore requests waiting for chunk to the waiting and running queues.
         """
         # Add request waiting for chunk to the waiting and running queue
         for request in self.waiting_for_chunk_waiting_requests:
-            waiting_queue.add_request(request)
+            if scheduler_requests is None or request.request_id in scheduler_requests:
+                waiting_queue.add_request(request)
         self.waiting_for_chunk_waiting_requests = deque()
 
         if self.waiting_for_chunk_running_requests:
-            running_queue.extend(self.waiting_for_chunk_running_requests)
+            live_running_requests = [
+                request
+                for request in self.waiting_for_chunk_running_requests
+                if scheduler_requests is None or request.request_id in scheduler_requests
+            ]
+            running_queue.extend(live_running_requests)
         self.waiting_for_chunk_running_requests = deque()
 
     def postprocess_scheduler_output(
@@ -458,3 +504,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 continue
             if req_id in self.requests_origin_status:
                 request.status = self.requests_origin_status.pop(req_id)
+
+        request_ids = set(request_ids)
+
+        self.waiting_for_chunk_waiting_requests = deque(
+            request for request in self.waiting_for_chunk_waiting_requests if request.request_id not in request_ids
+        )
+        self.waiting_for_chunk_running_requests = deque(
+            request for request in self.waiting_for_chunk_running_requests if request.request_id not in request_ids
+        )
+
+        for req_id in request_ids:
+            self.requests_with_ready_chunks.discard(req_id)
+            self.finished_requests.discard(req_id)
+            self._finished_load_reqs.discard(req_id)
+            self._cancelled_load_reqs.add(req_id)
+
+        return []

@@ -115,37 +115,64 @@ def test_mxfp8_quant_config_structure():
 # ---------------------------------------------------------------------------
 
 
-def test_get_quant_method_npu_offline(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
-    """Offline (serialized) path on NPU must return NPUMxfp8LinearMethod."""
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8LinearMethod
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="Native MXFP8 offline only supported on NPU")
+def test_get_quant_method_offline_npu(mocker: MockerFixture):
+    """Offline (serialized) path must return NPUMxfp8LinearMethod on NPU."""
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
 
     config = DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True)
     layer = mocker.Mock(spec=LinearBase)
-    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
 
     method = config.get_quant_method(layer, "blocks.0.attn1.to_q")
-    assert isinstance(method, NPUMxfp8LinearMethod)
+    assert type(method).__name__ == "NPUMxfp8LinearMethod"
 
 
-def test_get_quant_method_npu_online(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
-    """Online (BF16 checkpoint) path on NPU must return NPUMxfp8OnlineLinearMethod."""
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8OnlineLinearMethod
+@pytest.mark.skipif(not current_omni_platform.is_xpu(), reason="XPU platform not available")
+def test_get_quant_method_offline_xpu_raises(mocker: MockerFixture):
+    """XPU offline mode must raise NotImplementedError (use AutoRound MXFP8 instead)."""
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    config = DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True)
+    layer = mocker.Mock(spec=LinearBase)
+
+    with pytest.raises(NotImplementedError, match="Native MXFP8 offline mode is not supported on XPU"):
+        config.get_quant_method(layer, "blocks.0.attn1.to_q")
+
+
+@pytest.mark.skipif(
+    not (current_omni_platform.is_npu() or current_omni_platform.is_xpu()), reason="MXFP8 only supported on NPU and XPU"
+)
+def test_get_quant_method_online(mocker: MockerFixture):
+    """Online (BF16 checkpoint) path must return platform-specific method on current platform."""
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    # Mock the vLLM online method to avoid config dependency for XPU
+    if current_omni_platform.is_xpu():
+        mock_inner = mocker.Mock()
+        mocker.patch(
+            "vllm_omni.quantization.mxfp8_config.VllmMxfp8OnlineLinearMethod.__init__",
+            lambda self: setattr(self, "_inner", mock_inner),
+        )
 
     config = DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=False)
     layer = mocker.Mock(spec=LinearBase)
-    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
 
     method = config.get_quant_method(layer, "blocks.0.attn1.to_q")
-    assert isinstance(method, NPUMxfp8OnlineLinearMethod)
+
+    if current_omni_platform.is_npu():
+        assert type(method).__name__ == "NPUMxfp8OnlineLinearMethod"
+    elif current_omni_platform.is_xpu():
+        assert type(method).__name__ == "VllmMxfp8OnlineLinearMethod"
 
 
-def test_get_quant_method_non_npu_raises(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
-    """Non-NPU platform must raise NotImplementedError (CUDA not yet supported)."""
+def test_get_quant_method_unsupported_platform_raises(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    """Unsupported platform (CUDA, ROCm) must raise NotImplementedError."""
     from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
 
     config = DiffusionMXFP8Config()
     layer = mocker.Mock(spec=LinearBase)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_xpu", lambda: False)
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
 
     with pytest.raises(NotImplementedError):
@@ -159,6 +186,8 @@ def test_get_quant_method_ignored_layer(mocker: MockerFixture, monkeypatch: pyte
     config = DiffusionMXFP8Config(ignored_layers=["proj_out"])
     layer = mocker.Mock(spec=LinearBase)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
 
     method = config.get_quant_method(layer, "proj_out")
     assert isinstance(method, UnquantizedLinearMethod)
