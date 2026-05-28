@@ -384,7 +384,7 @@ def test_manager_reception(kv_config, mock_connector, common_constants):
     req = OmniDiffusionRequest(
         prompts=["test_recv"],
         sampling_params=OmniDiffusionSamplingParams(),
-        request_ids=[req_id],
+        request_id=req_id,
     )
     # req.need_kv_receive = True # Implicitly handled by receive_kv_cache check? No, manager doesn't check it, runner does.
     # But receive_kv_cache in manager checks request_id. Which we need to fix in manager next.
@@ -428,7 +428,6 @@ def test_manager_reception_prefers_parent_request_id_for_batched_request(kv_conf
     req = OmniDiffusionRequest(
         prompts=["prompt-a", "prompt-b"],
         sampling_params=OmniDiffusionSamplingParams(),
-        request_ids=[f"{parent_req_id}-0", f"{parent_req_id}-1"],
         request_id=parent_req_id,
     )
 
@@ -454,7 +453,6 @@ def test_receive_multi_kv_cache_uses_parent_request_id_for_cfg_collection(kv_con
     req = OmniDiffusionRequest(
         prompts=["prompt-a", "prompt-b"],
         sampling_params=OmniDiffusionSamplingParams(),
-        request_ids=["req-parent-0", "req-parent-1"],
         request_id="req-parent",
     )
     req.sampling_params.cfg_kv_request_ids = {"cfg_text": "req-parent__cfg_text"}
@@ -516,7 +514,7 @@ def test_integration_flow(common_constants):
     req = OmniDiffusionRequest(
         prompts=["test_integ"],
         sampling_params=OmniDiffusionSamplingParams(),
-        request_ids=[req_id],
+        request_id=req_id,
     )
 
     # Receive
