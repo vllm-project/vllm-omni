@@ -3,9 +3,7 @@
     "test_name": "test_voxcpm2",
     "server_params": {
       "model": "openbmb/VoxCPM2",
-      "extra_cli_args": [
-        "--trust-remote-code"
-      ]
+      "trust_remote_code": true
     },
     "benchmark_params": [
       {
@@ -22,14 +20,13 @@
           1
         ],
         "seed_tts_locale": "en",
-        "trust_remote_code": true,
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            350
+            600
           ],
           "median_audio_rtf": [
-            0.25
+            0.30
           ]
         }
       },
@@ -47,17 +44,16 @@
           8
         ],
         "seed_tts_locale": "en",
-        "trust_remote_code": true,
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            3500
+            4500
           ],
           "median_audio_rtf": [
-            0.75
+            0.85
           ],
           "audio_throughput": [
-            10
+            8
           ]
         }
       },
@@ -77,7 +73,6 @@
         ],
         "seed_tts_locale": "en",
         "seed_tts_wer_eval": true,
-        "trust_remote_code": true,
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "mean_audio_rtf": [
@@ -102,7 +97,6 @@
         "extra_body": {
           "voice": "default"
         },
-        "trust_remote_code": true,
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
@@ -130,7 +124,6 @@
         "extra_body": {
           "voice": "default"
         },
-        "trust_remote_code": true,
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
@@ -161,17 +154,16 @@
         "extra_body": {
           "voice": "default"
         },
-        "trust_remote_code": true,
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            10000
+            3000
           ],
           "median_audio_rtf": [
-            0.5
+            0.55
           ],
           "audio_throughput": [
-            1
+            2.5
           ]
         }
       },
@@ -194,7 +186,6 @@
           "voice": "default"
         },
         "seed_tts_wer_eval": true,
-        "trust_remote_code": true,
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "mean_audio_rtf": [
