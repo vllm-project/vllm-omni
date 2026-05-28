@@ -361,12 +361,15 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         # Remove finished requests from the cached states.
         # cleanup_finished_request lives on OmniConnectorModelRunnerMixin and
-        # is only safe to call once init_omni_connectors() has populated the
-        # mixin state. Archs that inherit the method via MRO without running
-        # that init must be skipped, so probe a mixin-owned attribute as the
-        # "state initialized" gate.
+        # is only safe to call once init_omni_connectors() has finished
+        # populating mixin state (it sets ``_omni_connector_initialized = True``
+        # at the very end).  Archs that inherit the method via MRO without
+        # running that init must be skipped, so gate on the explicit flag
+        # rather than probing private attribute names.
         cleanup_finished_request = (
-            getattr(self, "cleanup_finished_request", None) if hasattr(self, "_request_ids_mapping") else None
+            getattr(self, "cleanup_finished_request", None)
+            if getattr(self, "_omni_connector_initialized", False)
+            else None
         )
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)

@@ -267,8 +267,8 @@ def test_base_voice_clone_normalizes_ref_audio_once_for_ref_code_and_speaker():
     model._normalize_ref_audio = lambda raw: normalize_calls.append(raw) or (ref_audio, 16000)
 
     ref_audio_ids = []
-    model._encode_ref_audio_to_code = lambda wav, _sr: (
-        ref_audio_ids.append(id(wav)) or torch.ones((2, 2), dtype=torch.long)
+    model._encode_ref_audio_batch = lambda wavs, sr, *, device: (
+        [ref_audio_ids.append(id(w)) or torch.ones((2, 2), dtype=torch.long) for w in wavs]
     )
     model._extract_speaker_embedding = lambda wav, _sr: (
         ref_audio_ids.append(id(wav)) or torch.ones(4, dtype=torch.bfloat16)
@@ -303,21 +303,16 @@ def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():
         )
     )
 
-    class FakeSpeechTokenizer:
-        def __init__(self):
-            self.calls = []
+    encode_calls = []
 
-        def encode(self, audios, *, sr, return_dict):
-            self.calls.append((audios, sr, return_dict))
-            return SimpleNamespace(
-                audio_codes=[
-                    torch.full((2, 2), 11, dtype=torch.long),
-                    torch.full((3, 2), 22, dtype=torch.long),
-                ]
-            )
+    def _fake_encode_batch(wavs, sr, *, device):
+        encode_calls.append((wavs, sr))
+        return [
+            torch.full((2, 2), 11, dtype=torch.long),
+            torch.full((3, 2), 22, dtype=torch.long),
+        ]
 
-    tok = FakeSpeechTokenizer()
-    model._ensure_speech_tokenizer_loaded = lambda: tok
+    model._encode_ref_audio_batch = _fake_encode_batch
 
     class FakeTextTokenizer:
         def __init__(self):
@@ -353,12 +348,11 @@ def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():
     )
 
     assert normalize_calls == ["a.wav", "b.wav"]
-    assert len(tok.calls) == 1
-    audios, sr, return_dict = tok.calls[0]
-    assert audios[0] is wav1
-    assert audios[1] is wav2
+    assert len(encode_calls) == 1
+    wavs, sr = encode_calls[0]
+    assert wavs[0] is wav1
+    assert wavs[1] is wav2
     assert sr == 16000
-    assert return_dict is True
     assert torch.equal(buf["r1"]["codes"][_PRECOMPUTED_REF_CODE_KEY], torch.full((2, 2), 11))
     assert torch.equal(buf["r2"]["codes"][_PRECOMPUTED_REF_CODE_KEY], torch.full((3, 2), 22))
     assert buf["r1"][_NORMALIZED_REF_AUDIO_KEY][0] is wav1
