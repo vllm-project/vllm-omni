@@ -17,15 +17,10 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def _make_request(
-    request_id: str,
-    *,
-    request_ids: list[str] | None = None,
-) -> OmniDiffusionRequest:
+def _make_request(request_id: str) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         prompts=[f"prompt_{request_id}"],
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
-        request_ids=request_ids or [request_id],
         request_id=request_id,
     )
 
@@ -79,15 +74,15 @@ def test_handle_finished_requests_ignores_already_drained_waiter() -> None:
     engine._finalize_finished_request.assert_not_called()
 
 
-def test_abort_parent_request_id_aborts_batched_scheduler_request() -> None:
+def test_abort_request_id_aborts_scheduler_request() -> None:
     engine = _make_engine()
-    request = _make_request("batch-parent", request_ids=["batch-parent-0", "batch-parent-1"])
-    sched_req_id = engine.scheduler.add_request(request)
+    request = _make_request("batch-parent")
+    request_id = engine.scheduler.add_request(request)
 
     engine.abort("batch-parent")
     engine._process_aborts_queue()
 
-    state = engine.scheduler.get_request_state(sched_req_id)
+    state = engine.scheduler.get_request_state(request_id)
     assert state is not None
     assert state.status == DiffusionRequestStatus.FINISHED_ABORTED
 

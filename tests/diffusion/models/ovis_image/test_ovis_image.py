@@ -167,6 +167,7 @@ def test_basic_generation(ovis_pipeline):
     # Setup request
     req = OmniDiffusionRequest(
         prompts=["A photo of a cat"],
+        request_id="ovis-basic",
         sampling_params=OmniDiffusionSamplingParams(
             height=256,
             width=256,
@@ -206,6 +207,7 @@ def test_guidance_scale(ovis_pipeline, monkeypatch: pytest.MonkeyPatch):
                 "negative_prompt": "bad quality",
             }
         ],
+        request_id="ovis-guidance",
         sampling_params=OmniDiffusionSamplingParams(
             height=256,
             width=256,
@@ -225,6 +227,7 @@ def test_resolution_check(ovis_pipeline):
     # Pass odd resolution
     req = OmniDiffusionRequest(
         prompts=["test"],
+        request_id="ovis-resolution",
         sampling_params=OmniDiffusionSamplingParams(
             height=250,  # Not divisible by 16 (8*2)
             width=250,
