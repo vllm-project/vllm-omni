@@ -16,7 +16,7 @@ import torch
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
-    uses_qwen3_omni_full_payload_input_coordinator,
+    uses_full_payload_input_coordinator,
 )
 
 # ------------------------------------------------------------------ #
@@ -92,47 +92,96 @@ class MockQueue:
 
 
 class TestFullPayloadCoordinatorSelection(unittest.TestCase):
-    def test_qwen3_omni_talker_and_code2wav_use_full_payload_input_coordinator(self):
-        for model_stage in ("talker", "code2wav"):
+    """Tests for the (model_arch, model_stage) whitelist gate.
+
+    The init_omni_connectors arch allowlist is keyed by ``model_arch`` and
+    is a superset of the stages registered here -- consumer-wait stages
+    must be registered explicitly in ``_FULL_PAYLOAD_INPUT_STAGES``, while
+    the init allowlist covers both producer- and consumer-side runners.
+    These tests pin which ``(arch, stage)`` pairs the gate fires for today.
+    """
+
+    # Expected whitelist (model_arch, model_stage).  Hardcoded to avoid the
+    # tautology of importing _FULL_PAYLOAD_INPUT_STAGES and asserting it
+    # against itself; any drift between this matrix and the whitelist will
+    # fail loudly here.
+    EXPECTED_FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
+        {
+            ("Qwen3OmniMoeForConditionalGeneration", "talker"),
+            ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
+            ("Qwen2_5OmniForConditionalGeneration", "talker"),
+            ("Qwen2_5OmniForConditionalGeneration", "code2wav"),
+            ("CovoAudioForConditionalGeneration", "code2wav"),
+            ("MiMoAudioModel", "code2wav"),
+            ("Qwen3TTSCode2Wav", "code2wav"),
+            ("CosyVoice3Model", "cosyvoice3_code2wav"),
+            ("DyninOmniForConditionalGeneration", "token2image"),
+            ("DyninOmniForConditionalGeneration", "token2audio"),
+        }
+    )
+
+    def test_whitelist_matches_expected_matrix(self):
+        """_FULL_PAYLOAD_INPUT_STAGES must equal the hardcoded expected matrix.
+
+        Catches both accidental additions (which would silently enable the
+        consumer-wait gate for a new arch) and accidental removals (which
+        would silently disable an enabled arch).
+        """
+        from vllm_omni.core.sched.omni_scheduling_coordinator import _FULL_PAYLOAD_INPUT_STAGES
+
+        self.assertEqual(
+            frozenset(_FULL_PAYLOAD_INPUT_STAGES),
+            self.EXPECTED_FULL_PAYLOAD_INPUT_STAGES,
+            msg="_FULL_PAYLOAD_INPUT_STAGES drifted from the expected matrix; "
+            "update EXPECTED_FULL_PAYLOAD_INPUT_STAGES if intentional.",
+        )
+
+    def test_all_whitelisted_arch_stage_pairs_fire_gate(self):
+        """Every (arch, stage) pair in the expected matrix must fire
+        the gate when stage_id > 0 and async_chunk=False.
+        """
+        for arch, stage in self.EXPECTED_FULL_PAYLOAD_INPUT_STAGES:
             model_config = SimpleNamespace(
                 stage_id=1,
                 async_chunk=False,
-                model_arch="Qwen3OmniMoeForConditionalGeneration",
-                model_stage=model_stage,
+                model_arch=arch,
+                model_stage=stage,
+            )
+            self.assertTrue(
+                uses_full_payload_input_coordinator(model_config),
+                msg=f"expected gate to fire for {arch}/{stage}",
             )
 
-            self.assertTrue(uses_qwen3_omni_full_payload_input_coordinator(model_config))
-
-    def test_async_chunk_and_non_qwen3_omni_do_not_use_full_payload_input_coordinator(self):
+    def test_other_arch_or_stage_or_mode_does_not_fire(self):
         cases = [
             SimpleNamespace(
-                stage_id=1,
-                async_chunk=True,
-                model_arch="Qwen3OmniMoeForConditionalGeneration",
-                model_stage="talker",
+                stage_id=1, async_chunk=True, model_arch="Qwen3OmniMoeForConditionalGeneration", model_stage="talker"
+            ),
+            SimpleNamespace(
+                stage_id=0, async_chunk=False, model_arch="Qwen3OmniMoeForConditionalGeneration", model_stage="thinker"
             ),
             SimpleNamespace(
                 stage_id=1,
-                async_chunk=False,
-                model_arch="Qwen3TTSForConditionalGeneration",
-                model_stage="code2wav",
-            ),
-            SimpleNamespace(
-                stage_id=1,
-                async_chunk=False,
-                model_arch="Qwen2_5OmniForConditionalGeneration",
-                model_stage="talker",
-            ),
-            SimpleNamespace(
-                stage_id=0,
                 async_chunk=False,
                 model_arch="Qwen3OmniMoeForConditionalGeneration",
-                model_stage="thinker",
+                model_stage="some_future_stage",
+            ),
+            SimpleNamespace(
+                stage_id=1, async_chunk=False, model_arch="Qwen3TTSForConditionalGeneration", model_stage="code2wav"
+            ),
+            SimpleNamespace(
+                stage_id=1, async_chunk=False, model_arch="MingFlashOmniForConditionalGeneration", model_stage="talker"
+            ),
+            SimpleNamespace(stage_id=1, async_chunk=False, model_arch=None, model_stage="talker"),
+            SimpleNamespace(
+                stage_id=1, async_chunk=False, model_arch="Qwen3OmniMoeForConditionalGeneration", model_stage=None
             ),
         ]
-
         for model_config in cases:
-            self.assertFalse(uses_qwen3_omni_full_payload_input_coordinator(model_config))
+            self.assertFalse(
+                uses_full_payload_input_coordinator(model_config),
+                msg=f"expected gate OFF for {model_config}",
+            )
 
 
 class TestChunkCoordinatorStateTransition(unittest.TestCase):

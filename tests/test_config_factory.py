@@ -1841,12 +1841,19 @@ class TestSentinelDefaultPrecedence:
         )
         assert async_stages[1].custom_process_input_func is None
 
-        # async_chunk=False → stage 0 has no streaming processor, stage 1's
-        # batch-end processor wires up.
+        # async_chunk=False → stage 0 ships the bulk codec via the
+        # worker-connector full-payload producer; stage 1 wires the
+        # ``_token_only`` placeholder so the orchestrator emits no
+        # legacy ``additional_information``-shaped input (PR3 sync-
+        # via-connector data plane).
         sync_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
-        assert "custom_process_next_stage_input_func" not in sync_stages[0].yaml_engine_args
+        assert (
+            sync_stages[0]
+            .yaml_engine_args["custom_process_next_stage_input_func"]
+            .endswith("talker2code2wav_full_payload")
+        )
         assert sync_stages[1].custom_process_input_func is not None
-        assert sync_stages[1].custom_process_input_func.endswith("talker2code2wav")
+        assert sync_stages[1].custom_process_input_func.endswith("talker2code2wav_token_only")
 
     def test_async_chunk_dispatches_qwen3_omni_processors(self):
         import runpy
@@ -1881,6 +1888,44 @@ class TestSentinelDefaultPrecedence:
             sync_stages[1]
             .yaml_engine_args["custom_process_next_stage_input_func"]
             .endswith("talker2code2wav_full_payload")
+        )
+
+    def test_ming_flash_omni_topology(self):
+        """Guard ming_flash_omni's PR3 cleanup: stage 0 has no full-payload
+        producer hook (the connector path was removed as fake -- arch is not
+        in ``_FULL_PAYLOAD_INPUT_STAGES``), and stage 1 still wires the
+        legacy ``thinker2talker`` (custom_process_input_func) plus the
+        ``thinker2talker_token_only`` placeholder (sync_process_input_func).
+        Merge under either async_chunk mode must not re-introduce a
+        stage-0 full-payload hook."""
+        from vllm_omni.config.stage_config import DeployConfig, merge_pipeline_deploy
+
+        pipeline = _PIPELINE_REGISTRY["ming_flash_omni"]
+
+        stage0, stage1 = pipeline.stages
+        assert stage0.custom_process_next_stage_input_func is None, (
+            "ming_flash_omni stage 0 must not declare a full-payload producer "
+            "(connector path is not active for this arch)."
+        )
+        assert stage1.custom_process_input_func is not None
+        assert stage1.custom_process_input_func.endswith("thinker2talker")
+        assert stage1.sync_process_input_func is not None
+        assert stage1.sync_process_input_func.endswith("thinker2talker_token_only")
+
+        # async_chunk=True must now be rejected: removing the fake hook means
+        # there is no next-stage input processor for the validator to accept.
+        # (Positive consequence -- users can't accidentally enable async_chunk
+        # on an arch that doesn't actually support it.)
+        import pytest as _pytest
+
+        with _pytest.raises(ValueError, match="async_chunk=True"):
+            merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=True))
+
+        # async_chunk=False merges cleanly and stage-0 yaml_engine_args carries
+        # no spurious full-payload hook.
+        merged = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
+        assert "custom_process_next_stage_input_func" not in merged[0].yaml_engine_args, (
+            "stage-0 full-payload hook unexpectedly re-appeared in yaml_engine_args"
         )
 
 
