@@ -27,6 +27,7 @@ class ResponseFormat(str, Enum):
 
     B64_JSON = "b64_json"
     URL = "url"  # Not implemented in PoC
+    FILE = "file"  # file response
 
 
 class ImageGenerationRequest(BaseModel):
