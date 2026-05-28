@@ -77,7 +77,7 @@ class DefaultAdapter:
                 os.path.join("transformer", "config.json"),
                 od_config.model,
             )
-            od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+            od_config.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
 
         loader = DiffusersPipelineLoader(LoadConfig(), od_config=od_config)
         # load_model will handle dtypes / device placement, put in .eval() mode
