@@ -149,6 +149,24 @@ class MultiVaePipeline(nn.Module, SupportsComponentDiscovery):
         self.audio_vae = nn.Linear(10, 10)
 
 
+class AuxiliaryProtocolPipeline(nn.Module, SupportsComponentDiscovery):
+    """Pipeline that declares connectors/vocoder via the protocol."""
+
+    _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["pipe.vae"]
+    _auxiliary_modules: ClassVar[list[str]] = ["pipe.connectors", "pipe.vocoder"]
+
+    def __init__(self):
+        super().__init__()
+        self.pipe = nn.Module()
+        self.pipe.transformer = nn.Linear(10, 10)
+        self.pipe.text_encoder = nn.Linear(10, 10)
+        self.pipe.vae = nn.Linear(10, 10)
+        self.pipe.connectors = nn.Linear(10, 10)
+        self.pipe.vocoder = nn.Linear(10, 10)
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -238,3 +256,20 @@ class TestProtocolDiscovery:
         assert len(result.vaes) == 2
         assert result.vaes[0] is pipeline.vae
         assert result.vaes[1] is pipeline.audio_vae
+
+    def test_declared_auxiliary_modules(self):
+        pipeline = AuxiliaryProtocolPipeline()
+        result = ModuleDiscovery.discover(pipeline)
+
+        assert result.auxiliary_names == ["pipe.connectors", "pipe.vocoder"]
+        assert result.auxiliaries[0] is pipeline.pipe.connectors
+        assert result.auxiliaries[1] is pipeline.pipe.vocoder
+
+    def test_protocol_pipeline_without_auxiliaries_defaults_to_empty(self):
+        # Pipelines that implement the protocol but do not declare
+        # _auxiliary_modules must NOT inherit the fallback attr scan.
+        pipeline = NestedPipeline()
+        result = ModuleDiscovery.discover(pipeline)
+
+        assert result.auxiliaries == []
+        assert result.auxiliary_names == []

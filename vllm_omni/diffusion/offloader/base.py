@@ -20,6 +20,30 @@ class OffloadStrategy(Enum):
     LAYER_WISE = "layer_wise"  # Block-level
 
 
+class OffloadGranularity(str, Enum):
+    """How aggressively `ModelLevelOffloadBackend` evicts pipeline components.
+
+    Set per-pipeline via `SupportsComponentDiscovery._offload_granularity`.
+    Defaults to ``GROUPED`` so existing pipelines are unaffected.
+
+    - ``GROUPED``: legacy 2-group mutual exclusion. DiTs and encoders evict
+      each other (and DiTs evict sibling DiTs), but encoders coexist on GPU
+      and VAEs/auxiliaries stay resident on GPU throughout. Suitable for
+      pipelines where non-DiT components are small enough to share GPU.
+    - ``STRICT``: full N-way mutual exclusion. Every declared offload
+      participant (dits, encoders, VAEs, auxiliaries) is moved to CPU at
+      `enable()`; each one is pulled to GPU only while running, evicting
+      everything else. The backend additionally wraps VAEs' ``.decode`` and
+      ``.encode`` so non-``forward`` entry points also trigger the swap.
+      Required for pipelines where multiple non-DiT components cannot
+      coexist on GPU (e.g. LTX2's text_encoder + connectors + vae +
+      audio_vae + vocoder).
+    """
+
+    GROUPED = "grouped"
+    STRICT = "strict"
+
+
 @dataclass
 class OffloadConfig:
     strategy: OffloadStrategy

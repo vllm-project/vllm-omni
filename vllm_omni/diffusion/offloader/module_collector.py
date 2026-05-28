@@ -18,7 +18,10 @@ class PipelineModules:
     dit_names: list[str]
     encoders: list[nn.Module]
     encoder_names: list[str]
-    vaes: list[nn.Module]
+    vaes: list[nn.Module] = field(default_factory=list)
+    vae_names: list[str] = field(default_factory=list)
+    auxiliaries: list[nn.Module] = field(default_factory=list)
+    auxiliary_names: list[str] = field(default_factory=list)
     resident_modules: list[nn.Module] = field(default_factory=list)
     resident_names: list[str] = field(default_factory=list)
 
@@ -27,9 +30,11 @@ class ModuleDiscovery:
     """Discovers pipeline components.
 
     If the pipeline implements :class:`SupportsComponentDiscovery`,
-    its ``_dit_modules``, ``_encoder_modules``, and ``_vae_modules``
-    class variables are used directly.  Otherwise, falls back to
-    scanning well-known attribute names.
+    its ``_dit_modules``, ``_encoder_modules``, ``_vae_modules``,
+    ``_resident_modules``, and ``_auxiliary_modules`` class variables
+    are used directly.  Otherwise, falls back to scanning well-known
+    attribute names for dits/encoders/VAEs only; auxiliaries must be
+    declared via the protocol.
     """
 
     # Fallback attribute names for pipelines that do not implement
@@ -97,7 +102,7 @@ class ModuleDiscovery:
 
     @staticmethod
     def discover(pipeline: nn.Module) -> PipelineModules:
-        """Discover DiT, encoder, and VAE modules from pipeline.
+        """Discover DiT, encoder, VAE, auxiliary, and resident modules.
 
         Args:
             pipeline: Diffusion pipeline model
@@ -111,16 +116,31 @@ class ModuleDiscovery:
             enc_attrs = pipeline._encoder_modules
             vae_attrs = pipeline._vae_modules
             res_attrs = pipeline._resident_modules
+            aux_attrs = pipeline._auxiliary_modules
         else:
             dit_attrs = ModuleDiscovery._FALLBACK_DIT_ATTRS
             enc_attrs = ModuleDiscovery._FALLBACK_ENCODER_ATTRS
             vae_attrs = ModuleDiscovery._FALLBACK_VAE_ATTRS
             res_attrs = []
+            aux_attrs = []
 
         dit_modules, dit_names = ModuleDiscovery._collect_modules(pipeline, dit_attrs, warn_missing=declared)
         encoders, encoder_names = ModuleDiscovery._collect_modules(pipeline, enc_attrs, warn_missing=declared)
-        vaes, _ = ModuleDiscovery._collect_modules(pipeline, vae_attrs, warn_missing=declared)
+        vaes, vae_names = ModuleDiscovery._collect_modules(pipeline, vae_attrs, warn_missing=declared)
         residents, resident_names = ModuleDiscovery._collect_modules(pipeline, res_attrs, warn_missing=declared)
+        aux_candidates, aux_candidate_names = ModuleDiscovery._collect_modules(
+            pipeline, aux_attrs, warn_missing=declared
+        )
+
+        already_seen: set[int] = {id(m) for m in (*dit_modules, *encoders, *vaes, *residents)}
+        auxiliaries: list[nn.Module] = []
+        auxiliary_names: list[str] = []
+        for module, name in zip(aux_candidates, aux_candidate_names):
+            if id(module) in already_seen:
+                continue
+            already_seen.add(id(module))
+            auxiliaries.append(module)
+            auxiliary_names.append(name)
 
         return PipelineModules(
             dits=dit_modules,
@@ -128,6 +148,9 @@ class ModuleDiscovery:
             encoders=encoders,
             encoder_names=encoder_names,
             vaes=vaes,
+            vae_names=vae_names,
+            auxiliaries=auxiliaries,
+            auxiliary_names=auxiliary_names,
             resident_modules=residents,
             resident_names=resident_names,
         )

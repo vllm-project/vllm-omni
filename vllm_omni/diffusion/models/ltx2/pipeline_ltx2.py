@@ -39,6 +39,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.offloader.base import OffloadGranularity
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.lora.request import LoRARequest
 
@@ -185,6 +186,8 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             ),
         ]
 
+        cpu_offload = getattr(od_config, "enable_cpu_offload", False)
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             model,
             subfolder="tokenizer",
@@ -198,32 +201,38 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 subfolder="text_encoder",
                 torch_dtype=dtype,
                 local_files_only=local_files_only,
-            ).to(self.device)
+            )
         self.connectors = LTX2TextConnectors.from_pretrained(
             model,
             subfolder="connectors",
             torch_dtype=dtype,
             local_files_only=local_files_only,
-        ).to(self.device)
-
+        )
         self.vae = AutoencoderKLLTX2Video.from_pretrained(
             model,
             subfolder="vae",
             torch_dtype=dtype,
             local_files_only=local_files_only,
-        ).to(self.device)
+        )
         self.audio_vae = AutoencoderKLLTX2Audio.from_pretrained(
             model,
             subfolder="audio_vae",
             torch_dtype=dtype,
             local_files_only=local_files_only,
-        ).to(self.device)
+        )
         self.vocoder = LTX2Vocoder.from_pretrained(
             model,
             subfolder="vocoder",
             torch_dtype=dtype,
             local_files_only=local_files_only,
-        ).to(self.device)
+        )
+
+        if not cpu_offload:
+            self.text_encoder = self.text_encoder.to(self.device)
+            self.connectors = self.connectors.to(self.device)
+            self.vae = self.vae.to(self.device)
+            self.audio_vae = self.audio_vae.to(self.device)
+            self.vocoder = self.vocoder.to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
         quant_config = getattr(self.od_config, "quantization_config", None)
@@ -658,7 +667,7 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
     @property
     def do_classifier_free_guidance(self):
-        return self._guidance_scale > 1.0
+        return self._guidance_scale > 1.0 if self._guidance_scale is not None else False
 
     @property
     def num_timesteps(self):
@@ -1106,6 +1115,7 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
             audio_latents = audio_latents.to(self.audio_vae.dtype)
             generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
+
             audio = self.vocoder(generated_mel_spectrograms)
 
         if not return_dict:
@@ -1124,6 +1134,8 @@ class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
     _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["pipe.vae", "pipe.audio_vae"]
+    _auxiliary_modules: ClassVar[list[str]] = ["pipe.connectors", "pipe.vocoder"]
+    _offload_granularity: ClassVar[OffloadGranularity] = OffloadGranularity.STRICT
 
     def __init__(
         self,

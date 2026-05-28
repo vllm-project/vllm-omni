@@ -27,6 +27,7 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.offloader.base import OffloadGranularity
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.lora.request import LoRARequest
 
@@ -739,6 +740,8 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
     _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["pipe.vae", "pipe.audio_vae"]
+    _auxiliary_modules: ClassVar[list[str]] = ["pipe.connectors", "pipe.vocoder"]
+    _offload_granularity: ClassVar[OffloadGranularity] = OffloadGranularity.STRICT
 
     def __init__(
         self,

@@ -10,6 +10,8 @@ from typing import (
     runtime_checkable,
 )
 
+from vllm_omni.diffusion.offloader.base import OffloadGranularity
+
 if TYPE_CHECKING:
     import torch
 
@@ -70,17 +72,25 @@ class SupportsComponentDiscovery(Protocol):
     (e.g. ``"pipe.transformer"``).
 
     Attributes:
-        _dit_modules: Denoising submodules (on GPU during diffusion).
-        _encoder_modules: Encoder submodules (offloaded during diffusion).
-        _vae_modules: VAE(s) (always on GPU).
+        _dit_modules: Denoising submodules.
+        _encoder_modules: Encoder submodules.
+        _vae_modules: VAE(s).
         _resident_modules: Extra modules pinned on GPU during layerwise
             offloading.  Optional, defaults to ``[]``.
+        _auxiliary_modules: Extra offload-participating submodules that
+            do not fit the dit/encoder/vae categories (e.g. connectors,
+            vocoders).  Optional, defaults to ``[]``. Only honored under
+            ``OffloadGranularity.STRICT``.
+        _offload_granularity: Mutual-exclusion granularity for
+            model-level offloading. See :class:`OffloadGranularity`.
     """
 
     _dit_modules: ClassVar[list[str]]
     _encoder_modules: ClassVar[list[str]]
     _vae_modules: ClassVar[list[str]]
     _resident_modules: ClassVar[list[str]] = []
+    _auxiliary_modules: ClassVar[list[str]] = []
+    _offload_granularity: ClassVar[OffloadGranularity] = OffloadGranularity.GROUPED
 
 
 def supports_step_execution(pipeline: object) -> bool:

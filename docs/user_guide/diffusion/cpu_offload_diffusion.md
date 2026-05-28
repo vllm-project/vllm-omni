@@ -14,11 +14,11 @@ Both strategies use pinned memory for faster CPU-GPU transfers. The strategies a
 
 ### How It Works
 
-Model-level offloading implements mutual exclusion between DiT transformer and encoder modules using pre forward hooks:
+Model-level offloading uses pre-forward hooks to swap pipeline components between CPU and GPU. The granularity is per-pipeline (see [Granularity modes](#granularity-modes) below); the default behavior — used by all pipelines unless they opt in — is **2-group mutual exclusion** between the DiT and the encoders:
 
-- **When encoders run**: DiT transformer is offloaded to CPU
-- **When DiT runs**: Encoders are offloaded to CPU, if more than one dit models, only one loaded on GPU, others get offloaded to CPU.
-- **VAE**: Stays resident on GPU
+- **When encoders run**: DiT transformer is offloaded to CPU.
+- **When DiT runs**: encoders are offloaded to CPU; if there is more than one DiT, only one is loaded on GPU and the others are offloaded.
+- **VAE**: stays resident on GPU.
 
 Before each module's forward pass, the hook automatically moves it to GPU while offloading the other module group to CPU. Transfers use pinned memory for speed.
 
@@ -57,15 +57,16 @@ class MyPipeline(nn.Module, SupportsComponentDiscovery):
         self.transformer = ...     # DiT — stays on GPU during denoising
         self.text_encoder = ...    # Encoder — offloaded to CPU during denoising
         self.vision_model = ...    # Encoder — offloaded to CPU during denoising
-        self.vae = ...             # VAE — always on GPU
+        self.vae = ...             # VAE — always on GPU (in default GROUPED mode)
 ```
 
 - `_dit_modules`: attribute names of denoising submodules (kept on GPU
   during the diffusion loop).
 - `_encoder_modules`: attribute names of encoder/vision submodules
   (offloaded to CPU during the diffusion loop).
-- `_vae_modules`: attribute names of VAE(s) (always kept on GPU, not
-  part of the mutual exclusion hooks).
+- `_vae_modules`: attribute names of VAE(s). In default GROUPED mode
+  they stay resident on GPU; under STRICT mode (see below) they
+  participate in the swap as well.
 - `_resident_modules`: attribute names of small submodules that must
   stay on GPU during layerwise offloading (e.g. embedders, connectors).
   Optional — defaults to `[]`.
@@ -75,6 +76,45 @@ All attribute names support dotted paths for nested submodules
 
 Both DiT and encoder lists are needed because the offload hooks use
 mutual exclusion: when one group runs, the other moves to CPU.
+
+### Granularity modes
+
+The backend's eviction granularity is set per-pipeline via
+`_offload_granularity` on `SupportsComponentDiscovery`:
+
+```python
+from vllm_omni.diffusion.offloader.base import OffloadGranularity
+
+class MyPipeline(nn.Module, SupportsComponentDiscovery):
+    ...
+    _offload_granularity: ClassVar[OffloadGranularity] = OffloadGranularity.STRICT
+```
+
+Two modes:
+
+- `OffloadGranularity.GROUPED` (default): the 2-group behavior described
+  above. Suitable for the vast majority of pipelines, where the non-DiT
+  components (encoders, VAEs) are small enough to coexist on GPU during
+  the encoder phase. No change vs. the historical behavior.
+
+- `OffloadGranularity.STRICT` (opt-in): full N-way mutual exclusion
+  across DiT, encoder, VAE, and auxiliary modules. Every declared
+  offload participant is moved to CPU at `enable()`, then pulled to
+  GPU only while running, evicting everything else. Because VAEs are
+  typically invoked via `.decode()` / `.encode()` rather than
+  `__call__`, the backend additionally wraps those methods on each
+  declared VAE so the device-swap fires on those non-`forward` entry
+  points. Use this when no two non-DiT components fit on the GPU
+  simultaneously (LTX2 is the canonical example: `text_encoder`,
+  `connectors`, `vae`, `audio_vae`, and `vocoder` all cycle through GPU
+  one at a time).
+
+  STRICT-mode pipelines can additionally declare
+  `_auxiliary_modules: ClassVar[list[str]] = [...]` for non-DiT/encoder/VAE
+  participants (e.g. `pipe.connectors`, `pipe.vocoder`) that should
+  also be in the rotation. Auxiliaries are ignored under GROUPED mode.
+  See `vllm_omni/diffusion/models/ltx2/pipeline_ltx2.py` for a full
+  example.
 
 ### Limitations
 - Cold start latency increases
@@ -160,15 +200,20 @@ The offloader discovers pipeline components in two ways:
 
 1. **Protocol-based** (preferred): If the pipeline implements
     `SupportsComponentDiscovery`, its `_dit_modules`, `_encoder_modules`,
-    `_vae_modules`, and `_resident_modules` class variables are used
-    directly.  All attribute names support dotted paths (e.g.
-    `"pipe.transformer"`, `"bagel.time_embedder"`) for nested submodules.
+    `_vae_modules`, `_auxiliary_modules`, `_resident_modules`, and
+    `_offload_granularity` class variables are used directly.  All
+    attribute names support dotted paths (e.g. `"pipe.transformer"`,
+    `"bagel.time_embedder"`) for nested submodules.
 
 2. **Fallback attribute scan**: Otherwise, the offloader scans for
     well-known attribute names:
     - **DiT modules**: `transformer`, `transformer_2`, `dit`, `sr_dit`, `language_model`, `transformer_blocks`, `model`
-    - **Encoders**: `text_encoder`, `text_encoder_2`, `text_encoder_3`, `image_encoder`
+    - **Encoders**: `text_encoder`, `text_encoder_2`, `text_encoder_3`, `image_encoder`, `mllm`
     - **VAE**: `vae`, `audio_vae`
+
+    Auxiliary modules are an opt-in category and are only honored when
+    the pipeline implements `SupportsComponentDiscovery` and declares
+    `_offload_granularity = OffloadGranularity.STRICT`.
 
 **Hook System**
 
