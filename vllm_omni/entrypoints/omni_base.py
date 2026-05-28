@@ -486,13 +486,6 @@ class OmniBase(PDDisaggregationMixin):
         self.prom_metrics.set_running(running)
         self.prom_metrics.set_waiting(max(0, total - running))
 
-        diffusion_metrics = getattr(engine_outputs, "metrics", None)
-        if finished and isinstance(diffusion_metrics, dict) and diffusion_metrics:
-            replica_for_diffusion = result.replica_id if result.replica_id is not None else 0
-            self.prom_metrics.observe_diffusion_metrics(
-                stage_id, replica_for_diffusion, diffusion_metrics,
-            )
-
         images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         return OmniRequestOutput(
             request_id=req_id or "",

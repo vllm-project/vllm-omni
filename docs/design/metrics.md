@@ -3,10 +3,8 @@
 This document describes how vLLM-Omni exposes Prometheus metrics for
 multi-stage pipelines, the constraints that shaped the design, and how
 the pipeline-level metrics coexist with upstream vLLM per-engine
-metrics.
-
-The `vllm_omni:*` surface is locked to 23 families by
-[RFC #3545](https://github.com/vllm-project/vllm-omni/issues/3545).
+metrics. This iteration covers the text and audio surface; diffusion /
+image / video families land in a follow-up.
 
 ## Objectives
 
@@ -16,12 +14,9 @@ The `vllm_omni:*` surface is locked to 23 families by
   backed by an AR LLM engine, and reshape their `engine` label into
   `stage` + `replica` so multi-replica deployments gain per-replica
   visibility automatically.
-- Expose per-stage diffusion-internal timing breakdowns (preprocess /
-  exec / postprocess) for pipelines that include a diffusion engine.
 - Expose per-modality SLO metrics that the upstream `vllm:*` families do
   not capture — audio TTFP / RTF / duration / frames / streaming
-  continuity / silent-loss, image counts / generation time, video
-  duration / RTF / generation time.
+  continuity / silent-loss.
 - Expose per-replica-edge cross-stage transfer metrics so the slack
   between E2E latency and the sum of per-stage `gen_time` (queueing,
   serialization, network) becomes attributable.
@@ -50,13 +45,12 @@ stale collectors from prior instantiations within the same process.
 vLLM-Omni runs multiple engine instances (stages × replicas) within a
 single process, coordinated by an Orchestrator. The pipeline needs its
 own metrics — aggregate request counts, end-to-end latency across all
-stages, diffusion timing breakdowns, per-modality SLO signals, and
-cross-stage transfer attribution — that do not exist in upstream vLLM.
-All pipeline-level metrics use the `vllm:omni_` prefix to distinguish
-them from upstream per-engine metrics. The `unregister_vllm_metrics()`
-function is monkey-patched to a no-op at import time (see
-`vllm_omni/patch.py`) so that these metrics are not destroyed during
-engine initialization.
+stages, per-modality SLO signals, and cross-stage transfer attribution —
+that do not exist in upstream vLLM. All pipeline-level metrics use the
+`vllm:omni_` prefix to distinguish them from upstream per-engine
+metrics. The `unregister_vllm_metrics()` function is monkey-patched to
+a no-op at import time (see `vllm_omni/patch.py`) so that these metrics
+are not destroyed during engine initialization.
 
 Upstream per-engine metrics retain the `vllm:` prefix but are now
 registered by `OmniPrometheusStatLogger`, a thin subclass of upstream's
@@ -89,10 +83,10 @@ registered by `OmniPrometheusStatLogger`, a thin subclass of upstream's
      OmniBase           OmniBase     Orchestrator    Orchestrator
    (request life-     (finalize +   (record_trans-  (per-(stage,
     cycle, success/    streaming     fer_tx/rx        replica)
-    fail counter,      hooks via     hooks via        scheduler/
-    diffusion-         observe_*     emit hook in     iteration
-    internal           APIs)         OrchestratorAg-  stats)
-    timing)                          gregator)
+    fail counter)      hooks via     hooks via        scheduler/
+                       observe_*     emit hook in     iteration
+                       APIs)         OrchestratorAg-  stats)
+                                     gregator)
 ```
 
 ### Data Flow
@@ -120,14 +114,7 @@ requests progress:
 - `request_failed()` — recorded by the cleanup path when a request
   exits without natural completion. Internally maps to
   `finished_reason="abort"` so a single Counter family covers both
-  natural and aborted completion (G6).
-
-- `observe_diffusion_metrics(stage_id, replica_id, metrics)` — recorded
-  when a diffusion stage finishes. The metrics dict carries the engine's
-  legacy millisecond keys (`preprocess_time_ms` /
-  `diffusion_engine_exec_time_ms` / `postprocess_time_ms`); the observe
-  call converts them to seconds at the emit boundary and exposes them as
-  the `_s`-suffixed families with `{model_name, stage, replica}` labels.
+  natural and aborted completion.
 
 **Path 2: Audio modality metrics (`vllm:omni_audio_*`)**
 
@@ -139,8 +126,10 @@ sites:
 - `observe_modality_at_finalize(...)` — called from
   `omni_base._process_single_result` inside the existing `e2e_done`
   finalize guard. For `output_type == "audio"` it emits
-  `audio_frames_total`, `audio_duration_s`, `audio_rtf`. Sample rate is
-  resolved from `engine_outputs.multimodal_output` via
+  `audio_frames_total`, `audio_duration_s`, `audio_rtf` (or
+  `audio_skipped_requests_total{reason="no_audio_data"}` when no audio
+  was produced). Sample rate is resolved from
+  `engine_outputs.multimodal_output` via
   `definitions.resolve_audio_sample_rate(...)` (fallback chain mirrors
   `serving_chat.py`'s audio response path).
 
@@ -160,28 +149,7 @@ sites:
   Per-chunk PCM byte counts and arrival timestamps are recorded by the
   same audio branch that updates `first_audio_ts`.
 
-The remaining audio family — `audio_skipped_requests_total{reason}` —
-is wired through `OmniModalityMetrics.inc_audio_skipped(...)` for the
-silent-loss path (e.g. code2wav rejecting malformed codec input and
-returning `200 OK` with empty audio).
-
-**Path 3: Visual modality metrics (`vllm:omni_image_*` / `video_*`)**
-
-The same `OmniModalityMetrics` instance also serves the five visual
-families. They are emitted from `observe_modality_at_finalize`:
-
-- `output_type == "image"`: increments `image_num_total` by
-  `len(engine_outputs.images)` and observes `image_generation_s` from
-  the stage's `stage_gen_time_ms / 1000`.
-- `output_type == "video"`: observes `video_generation_s`; also
-  `video_duration_s` and `video_rtf` when `num_frames` and `fps` can be
-  extracted from `multimodal_output["video"]` (or fallback attributes on
-  `engine_outputs`). Heterogeneous video pipelines (i2v / t2v / cogvideo
-  / hunyuan / wan) may surface those fields under different keys; the
-  helper `_resolve_video_duration_seconds` walks a small fallback chain
-  and skips the observation when neither shape applies.
-
-**Path 4: Cross-stage transfer metrics (`vllm:omni_transfer_*`)**
+**Path 3: Cross-stage transfer metrics (`vllm:omni_transfer_*`)**
 
 `OmniTransferMetrics` registers four Histogram families with
 `{model_name, from_stage, from_replica, to_stage, to_replica}` labels.
@@ -206,12 +174,7 @@ missing, or the resolver returns `None` for either side, the emit is
 skipped silently (the underlying `TransferEdgeStats` accumulation is
 unaffected).
 
-> The TX-side hook is wired up but only fires once
-> `try_send_via_connector` is invoked from the main code path; until
-> then only the RX-side families (`transfer_rx_s` + `transfer_in_flight_s`)
-> accumulate observations.
-
-**Path 5: Per-engine metrics (`vllm:*`, G7 wrap)**
+**Path 4: Per-engine metrics (`vllm:*`, stage/replica wrap)**
 
 The Orchestrator instantiates `OmniPrometheusStatLogger` (a thin
 subclass of upstream `vllm.v1.metrics.loggers.PrometheusStatLogger`)
@@ -221,9 +184,6 @@ metric families (TTFT, ITL, TPOT, KV cache usage, etc.) using the same
 upstream code path — but with the `engine` label reshaped into
 `stage` + `replica` so multi-replica deployments produce distinct
 series per replica. See the next section for the wrap mechanics.
-
-For diffusion-only pipelines that have no AR engine,
-`SchedulerStats` is never produced and `vllm:*` metrics are absent.
 
 ### Shared State Between Threads
 
@@ -242,8 +202,7 @@ All `vllm:omni_*` collectors are registered once when their owning
 class (`OmniPrometheusMetrics` / `OmniModalityMetrics` /
 `OmniTransferMetrics`) is imported. Per-`(stage, replica)` labels are
 bound lazily on first observation to avoid registering label sets for
-combinations that never produce data (e.g. a diffusion pipeline has
-no audio metrics).
+combinations that never produce data.
 
 The `prometheus_client` default registry holds all collectors.
 FastAPI's `/metrics` endpoint serves the default registry, so
@@ -251,7 +210,7 @@ FastAPI's `/metrics` endpoint serves the default registry, so
 scrape response alongside `http_*` and `process_*` metrics from the
 instrumentator and the Python client runtime.
 
-## OmniPrometheusStatLogger Wrap (G7)
+## OmniPrometheusStatLogger Wrap
 
 Upstream `PrometheusStatLogger.__init__` hard-codes
 `labelnames = ["model_name", "engine"]` as a local variable, references
@@ -335,7 +294,7 @@ emission to at most once per second. Between intervals it returns
 fresh enough for Prometheus scrapes (typically 15-30s intervals) while
 eliminating the per-step overhead.
 
-## Metric Definitions (RFC-locked 23 families)
+## Metric Definitions
 
 ### Pipeline (4)
 
@@ -343,7 +302,7 @@ eliminating the per-step overhead.
 |--------|------|--------|-------------|
 | `vllm:omni_num_requests_running` | Gauge | `model_name` | Requests currently executing across all stages |
 | `vllm:omni_num_requests_waiting` | Gauge | `model_name` | Requests queued but not yet scheduled |
-| `vllm:omni_requests_success_total` | Counter | `model_name`, `finished_reason` | Total requests by completion reason ({stop, length, abort, ...}); aborts include the previous "fail" path (G6) |
+| `vllm:omni_requests_success_total` | Counter | `model_name`, `finished_reason` | Total requests by completion reason ({stop, length, abort, ...}); aborts cover client-disconnect / cancellation paths in addition to upstream `FinishReason.ABORT` |
 | `vllm:omni_e2e_request_latency_s` | Histogram | `model_name` | Pipeline-global end-to-end latency in seconds |
 
 ### Audio (7)
@@ -360,35 +319,9 @@ Labels: `{model_name, stage, replica}` plus the listed extra label.
 | `vllm:omni_audio_continuity_ok_total` | Counter | `threshold_ms` | Incremented when the request's worst underrun stayed below `threshold_ms` |
 | `vllm:omni_audio_skipped_requests_total` | Counter | `reason` | Silent-loss counter — code2wav rejected malformed codec input and returned `200 OK` with empty audio |
 
-### Visual — diffusion-internal (3)
-
-Sourced from the diffusion engine's per-request metrics dict; the
-emit-time observe converts the legacy millisecond keys to seconds.
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `vllm:omni_diffusion_preprocess_s` | Histogram | `model_name`, `stage`, `replica` | tokenizer + text_encoder + vae.encode |
-| `vllm:omni_diffusion_exec_s` | Histogram | same | Per-request executor work time (sum of denoise steps) |
-| `vllm:omni_diffusion_postprocess_s` | Histogram | same | vae.decode |
-
-### Visual — business semantics (5)
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `vllm:omni_image_num_total` | Counter | `model_name`, `stage`, `replica` | Cumulative images generated |
-| `vllm:omni_image_generation_s` | Histogram | same | Per-request image stage generation time (image has no RTF — no content duration) |
-| `vllm:omni_video_duration_s` | Histogram | same | Video content duration (`num_frames / fps`) when extractable from `multimodal_output["video"]` |
-| `vllm:omni_video_rtf` | Histogram | same | Real-time factor; uses `RTF_BUCKETS` |
-| `vllm:omni_video_generation_s` | Histogram | same | Per-request video stage generation time |
-
 ### Cross-stage transfer (4)
 
 Labels: `{model_name, from_stage, from_replica, to_stage, to_replica}`.
-
-> `model_name` is included on the transfer family for consistency with
-> the rest of the omni surface, even though RFC §3.2.6 originally listed
-> only the four stage/replica labels. PromQL joins on `model_name` work
-> uniformly across modality and transfer families.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -399,7 +332,7 @@ Labels: `{model_name, from_stage, from_replica, to_stage, to_replica}`.
 
 ### LLM stage-level (wrapped `vllm:*`)
 
-After the G7 wrap, every upstream `vllm:*` family — TTFT, ITL, TPOT,
+After the wrap, every upstream `vllm:*` family — TTFT, ITL, TPOT,
 e2e latency, KV cache usage, scheduler running/waiting, request
 success counts, etc. — carries `{model_name, stage, replica}` labels.
 For the full upstream catalog see
@@ -414,8 +347,8 @@ note that metrics depending on features unsupported in vLLM-Omni
   - `SECONDS_BUCKETS` (0.05 s – 300 s) for e2e / generation / TTFP
     style values.
   - `SECONDS_FAST_BUCKETS` (0.001 s – 60 s) for fine-grained
-    diffusion-internal and transfer values that need millisecond-level
-    resolution.
+    cross-stage transfer and audio-underrun values that need
+    millisecond-level resolution.
 - Counters use the `_total` suffix (auto-appended by `prometheus_client`).
 - Sizes use the `_bytes` suffix.
 - All omni-specific families are prefixed `vllm:omni_`. The upstream

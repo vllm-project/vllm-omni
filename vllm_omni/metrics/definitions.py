@@ -1,12 +1,12 @@
 """Single source of truth for vLLM-Omni Prometheus + bench CLI metric naming.
 
 Consumed by:
-- vllm_omni.metrics.prometheus (server-side /metrics families)
-- vllm_omni.metrics.modality (audio/image/video families)
+- vllm_omni.metrics.prometheus (server-side /metrics pipeline families)
+- vllm_omni.metrics.modality (audio families)
 - vllm_omni.metrics.transfer (cross-stage transfer families)
 - vllm_omni.benchmarks.metrics.metrics (bench CLI MultiModalsBenchmarkMetrics)
 
-Naming conventions for the 23 ``vllm_omni:*`` families exposed here:
+Naming conventions for the ``vllm_omni:*`` families exposed here:
 time-bearing metrics use the ``_s`` suffix (values in seconds), counters use
 ``_total`` (auto-suffixed by the prometheus client), sizes use ``_bytes``.
 """
@@ -23,13 +23,6 @@ AUDIO_TTFP = "audio_ttfp"
 AUDIO_DURATION = "audio_duration"
 AUDIO_RTF = "audio_rtf"
 AUDIO_FRAMES = "audio_frames"
-
-IMAGE_NUM = "image_num"
-IMAGE_GENERATION = "image_generation"
-
-VIDEO_DURATION = "video_duration"
-VIDEO_RTF = "video_rtf"
-VIDEO_GENERATION = "video_generation"
 
 
 # ============================================================================
@@ -58,24 +51,6 @@ AUDIO_SKIPPED_REQUESTS = METRIC_PREFIX + "audio_skipped_requests"
 
 
 # ============================================================================
-# Visual family (diffusion-internal timings + image / video business semantics)
-# ============================================================================
-# Diffusion-internal: timing decomposition of one diffusion-stage request,
-# in seconds. PromQL recipe for per-step latency:
-#   diffusion_exec_s / on(model_name, stage, replica) num_inference_steps
-DIFFUSION_PREPROCESS_S = METRIC_PREFIX + "diffusion_preprocess_s"
-DIFFUSION_EXEC_S = METRIC_PREFIX + "diffusion_exec_s"
-DIFFUSION_POSTPROCESS_S = METRIC_PREFIX + "diffusion_postprocess_s"
-
-# Business semantics: per-request stage timings + counts.
-IMAGE_NUM_METRIC = METRIC_PREFIX + IMAGE_NUM
-IMAGE_GENERATION_S = METRIC_PREFIX + IMAGE_GENERATION + "_s"
-VIDEO_DURATION_S = METRIC_PREFIX + VIDEO_DURATION + "_s"
-VIDEO_RTF_METRIC = METRIC_PREFIX + VIDEO_RTF
-VIDEO_GENERATION_S = METRIC_PREFIX + VIDEO_GENERATION + "_s"
-
-
-# ============================================================================
 # Cross-stage Transfer family (per-physical-hop TX/RX/in-flight timings)
 # ============================================================================
 TRANSFER_SIZE_BYTES = METRIC_PREFIX + "transfer_size_bytes"
@@ -90,8 +65,8 @@ TRANSFER_IN_FLIGHT_S = METRIC_PREFIX + "transfer_in_flight_s"
 PIPELINE_LABELS = ("model_name",)
 SUCCESS_LABELS = ("model_name", "finished_reason")
 
-# Per-stage / per-replica label set used by audio/image/video families and by
-# the OmniPrometheusStatLogger wrap which relabels upstream ``engine`` into
+# Per-stage / per-replica label set used by the audio families and by the
+# OmniPrometheusStatLogger wrap which relabels upstream ``engine`` into
 # ``stage`` + ``replica``.
 STAGE_LABELS = ("model_name", "stage", "replica")
 
@@ -120,19 +95,18 @@ TRANSFER_LABELS = (
 # Histogram buckets
 # ============================================================================
 # Seconds bucket for e2e / generation / TTFP-style metrics that range from
-# ~10 ms to several minutes (long video generation).
+# ~10 ms to several minutes.
 SECONDS_BUCKETS = (
     0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0,
 )
 
-# Seconds bucket for fine-grained metrics (transfer / diffusion-internal /
-# audio-underrun) that need millisecond-level resolution. Covers ~1 ms to 1
-# minute so diffusion stages with long executor work still fit.
+# Seconds bucket for fine-grained metrics (cross-stage transfer + audio
+# underrun) that need millisecond-level resolution.
 SECONDS_FAST_BUCKETS = (
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 60.0,
 )
 
-# RTF SLO red line is 1.0 (TTS / video gen must run faster than playback).
+# RTF SLO red line is 1.0 — TTS must generate faster than playback.
 RTF_BUCKETS = (
     0.1, 0.25, 0.5, 0.75, 0.9, 1.0, 1.25, 1.5, 2.0, 5.0, 10.0,
 )
@@ -165,13 +139,6 @@ def compute_audio_rtf(stage_gen_time_s: float, audio_duration_s: float) -> float
     if audio_duration_s <= 0:
         return 0.0
     return stage_gen_time_s / audio_duration_s
-
-
-def compute_video_rtf(stage_gen_time_s: float, video_duration_s: float) -> float:
-    """Same definition as audio RTF."""
-    if video_duration_s <= 0:
-        return 0.0
-    return stage_gen_time_s / video_duration_s
 
 
 # ============================================================================

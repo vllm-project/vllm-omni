@@ -30,8 +30,7 @@ def _sample_value(output: str, line_prefix: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Family registration — 7 audio + 5 visual families served from modality.py
-# (diffusion-internal *_s lives in prometheus.py)
+# Family registration — 7 audio families served from modality.py
 # ---------------------------------------------------------------------------
 
 
@@ -43,11 +42,6 @@ _EXPECTED_FAMILIES = [
     defs.AUDIO_UNDERRUN_S,
     defs.AUDIO_CONTINUITY_OK,
     defs.AUDIO_SKIPPED_REQUESTS,
-    defs.IMAGE_NUM_METRIC,
-    defs.IMAGE_GENERATION_S,
-    defs.VIDEO_DURATION_S,
-    defs.VIDEO_RTF_METRIC,
-    defs.VIDEO_GENERATION_S,
 ]
 
 
@@ -61,20 +55,10 @@ class TestRegistration:
         mod.observe_audio_underrun("s", "r", 0.01)
         mod.inc_audio_continuity_ok("s", "r", 100)
         mod.inc_audio_skipped("s", "r", "malformed_codec")
-        mod.inc_image_num("s", "r", 1)
-        mod.observe_image_generation("s", "r", 0.5)
-        mod.observe_video_duration("s", "r", 2.0)
-        mod.observe_video_rtf("s", "r", 0.6)
-        mod.observe_video_generation("s", "r", 1.0)
 
         out = generate_latest(REGISTRY).decode()
         for name in _EXPECTED_FAMILIES:
             assert f"# HELP {name}" in out, f"missing family: {name}"
-
-    def test_image_ttfp_intentionally_dropped(self) -> None:
-        # image is non-streaming, so no image_ttfp_s family is exposed.
-        out = generate_latest(REGISTRY).decode()
-        assert "vllm:omni_image_ttfp" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -173,55 +157,6 @@ class TestAudio:
 
 
 # ---------------------------------------------------------------------------
-# Image observe API
-# ---------------------------------------------------------------------------
-
-
-class TestImage:
-    def test_image_num_inc(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "diffusion_num", "0"
-        mod.inc_image_num(stage, replica, 4)
-        out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.IMAGE_NUM_METRIC}_total{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
-        assert _sample_value(out, prefix) == 4.0
-
-    def test_image_generation_observed(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "diffusion_gen", "0"
-        mod.observe_image_generation(stage, replica, 2.7)
-        out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.IMAGE_GENERATION_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
-        assert _sample_value(out, prefix) == 2.7
-
-
-# ---------------------------------------------------------------------------
-# Video observe API
-# ---------------------------------------------------------------------------
-
-
-class TestVideo:
-    def test_video_generation_observed(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "diffusion_video_gen", "0"
-        mod.observe_video_generation(stage, replica, 5.2)
-        out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.VIDEO_GENERATION_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
-        assert _sample_value(out, prefix) == 5.2
-
-    def test_video_duration_observed(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "diffusion_video_dur", "0"
-        mod.observe_video_duration(stage, replica, 4.0)
-        out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.VIDEO_DURATION_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
-        assert _sample_value(out, prefix) == 4.0
-
-    def test_video_rtf_observed(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "diffusion_video_rtf", "0"
-        mod.observe_video_rtf(stage, replica, 0.7)
-        out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.VIDEO_RTF_METRIC}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
-        assert _sample_value(out, prefix) == 0.7
-
-
-# ---------------------------------------------------------------------------
 # Stub-driven routing tests for the finalize / streaming helpers.
 # ---------------------------------------------------------------------------
 
@@ -245,20 +180,8 @@ class _StubModMetrics:
     def inc_audio_continuity_ok(self, s, r, threshold_ms):
         self.calls.append(("inc_audio_continuity_ok", s, r, threshold_ms))
 
-    def inc_image_num(self, s, r, n):
-        self.calls.append(("inc_image_num", s, r, n))
-
-    def observe_image_generation(self, s, r, t):
-        self.calls.append(("observe_image_generation", s, r, t))
-
-    def observe_video_generation(self, s, r, t):
-        self.calls.append(("observe_video_generation", s, r, t))
-
-    def observe_video_duration(self, s, r, d):
-        self.calls.append(("observe_video_duration", s, r, d))
-
-    def observe_video_rtf(self, s, r, rtf):
-        self.calls.append(("observe_video_rtf", s, r, rtf))
+    def inc_audio_skipped(self, s, r, reason):
+        self.calls.append(("inc_audio_skipped", s, r, reason))
 
 
 class _Bag:
@@ -291,7 +214,7 @@ class TestObserveModalityAtFinalize:
         assert not any(c[0] == "observe_audio_underrun" for c in stub.calls)
         assert not any(c[0] == "inc_audio_continuity_ok" for c in stub.calls)
 
-    def test_audio_path_zero_frames_skips_duration_and_rtf(self):
+    def test_audio_path_zero_frames_emits_skipped(self):
         stub = _StubModMetrics()
         observe_modality_at_finalize(
             stub,
@@ -306,6 +229,7 @@ class TestObserveModalityAtFinalize:
         assert ("inc_audio_frames", "1", "0", 0) in stub.calls
         assert not any(c[0] == "observe_audio_duration" for c in stub.calls)
         assert not any(c[0] == "observe_audio_rtf" for c in stub.calls)
+        assert ("inc_audio_skipped", "1", "0", "no_audio_data") in stub.calls
 
     def test_audio_uses_resolved_sample_rate_from_multimodal_output(self):
         stub = _StubModMetrics()
@@ -321,66 +245,20 @@ class TestObserveModalityAtFinalize:
         )
         assert ("observe_audio_duration", "1", "0", 1.0) in stub.calls
 
-    def test_image_path_no_ttfp_no_clock_skew_lookup(self):
+    def test_non_audio_output_type_skipped(self):
+        # Image / video / text output types are out of scope for this module.
         stub = _StubModMetrics()
-        observe_modality_at_finalize(
-            stub,
-            output_type="image",
-            stage_id=2,
-            replica_id=1,
-            stage_metrics=_Bag(stage_gen_time_ms=2000.0),
-            engine_outputs=_Bag(images=["img1", "img2", "img3"]),
-            request_arrival_ts=10.0,
-            finalize_ts=12.5,
-        )
-        assert ("inc_image_num", "2", "1", 3) in stub.calls
-        assert ("observe_image_generation", "2", "1", 2.0) in stub.calls
-        # image is non-streaming, so finalize must not emit image_ttfp.
-        assert not any(c[0].startswith("observe_image_ttfp") for c in stub.calls)
-
-    def test_video_path_only_generation_when_no_duration(self):
-        stub = _StubModMetrics()
-        observe_modality_at_finalize(
-            stub,
-            output_type="video",
-            stage_id=2,
-            replica_id=0,
-            stage_metrics=_Bag(stage_gen_time_ms=5200.0),
-            engine_outputs=_Bag(),
-            request_arrival_ts=0.0,
-            finalize_ts=5.3,
-        )
-        assert stub.calls == [("observe_video_generation", "2", "0", 5.2)]
-
-    def test_video_path_emits_duration_and_rtf_when_num_frames_and_fps_present(self):
-        stub = _StubModMetrics()
-        observe_modality_at_finalize(
-            stub,
-            output_type="video",
-            stage_id=2,
-            replica_id=0,
-            stage_metrics=_Bag(stage_gen_time_ms=2000.0),
-            engine_outputs=_Bag(multimodal_output={"video": {"num_frames": 48, "fps": 24}}),
-            request_arrival_ts=0.0,
-            finalize_ts=2.0,
-        )
-        # 48 / 24 = 2.0s; gen 2.0s → rtf 1.0
-        assert ("observe_video_generation", "2", "0", 2.0) in stub.calls
-        assert ("observe_video_duration", "2", "0", 2.0) in stub.calls
-        assert ("observe_video_rtf", "2", "0", 1.0) in stub.calls
-
-    def test_text_path_no_calls(self):
-        stub = _StubModMetrics()
-        observe_modality_at_finalize(
-            stub,
-            output_type="text",
-            stage_id=0,
-            replica_id=0,
-            stage_metrics=_Bag(stage_gen_time_ms=100.0),
-            engine_outputs=_Bag(),
-            request_arrival_ts=0.0,
-            finalize_ts=0.1,
-        )
+        for output_type in ("text", "image", "video"):
+            observe_modality_at_finalize(
+                stub,
+                output_type=output_type,
+                stage_id=0,
+                replica_id=0,
+                stage_metrics=_Bag(stage_gen_time_ms=100.0),
+                engine_outputs=_Bag(),
+                request_arrival_ts=0.0,
+                finalize_ts=0.1,
+            )
         assert stub.calls == []
 
     def test_replica_id_none_skipped(self):

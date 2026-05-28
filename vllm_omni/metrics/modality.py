@@ -1,25 +1,23 @@
-"""OmniModalityMetrics — per-modality Prometheus families.
+"""OmniModalityMetrics — per-modality Prometheus families (audio path only).
 
-Audio / image / video business-semantic metric families (7 audio + 6 visual
-families total). Text-path metrics (TTFT / ITL / TPOT / e2e) are NOT here —
-they come from the upstream ``vllm:*{stage="thinker", ...}`` families
-exposed via the ``OmniPrometheusStatLogger`` wrap.
+7 audio business-semantic metric families. Text-path metrics (TTFT / ITL /
+TPOT / e2e) are NOT here — they come from the upstream
+``vllm:*{stage="thinker", ...}`` families exposed via the
+``OmniPrometheusStatLogger`` wrap.
 
 Contents:
 - Audio family declarations (Histograms + Counters)
-- Image / Video family declarations
-- ``OmniModalityMetrics``: label-bound observe API per modality
+- ``OmniModalityMetrics``: label-bound observe API for the audio family
 - ``observe_modality_at_finalize``: dispatcher called from omni_base's e2e
-  finalize hook; routes by ``output_type`` and emits the relevant audio /
-  image / video families.
+  finalize hook; currently handles the audio path only.
 - ``observe_audio_first_packet``: TTFP emit from the streaming SSE first
   audio packet.
 - ``observe_audio_streaming_finalize``: emits ``audio_underrun_s`` +
   ``audio_continuity_ok_total`` at SSE close using accumulated per-chunk
   arrival timestamps.
-- ``_extract_mm_output`` / ``_count_audio_frames`` /
-  ``_resolve_video_duration_seconds``: shape-tolerant helpers for the
-  heterogeneous multimodal_output payloads emitted by different pipelines.
+- ``_extract_mm_output`` / ``_count_audio_frames``: shape-tolerant helpers
+  for the heterogeneous multimodal_output payloads emitted by different
+  audio pipelines.
 """
 
 from __future__ import annotations
@@ -82,45 +80,6 @@ _audio_skipped_family = Counter(
 )
 
 
-# ----------------------------------------------------------------------------
-# Visual family — business semantics (image counts + per-request stage gen
-# times + video RTF). Diffusion-internal timings (preprocess / exec /
-# postprocess) live in prometheus.py because they are sourced from the engine
-# outputs dict, not from a finalize-time hook.
-# ----------------------------------------------------------------------------
-_image_num_family = Counter(
-    defs.IMAGE_NUM_METRIC,
-    "Cumulative image count; throughput recovered via rate().",
-    labelnames=_stage_labels,
-)
-_image_generation_family = Histogram(
-    defs.IMAGE_GENERATION_S,
-    "Per-request total image-generation stage time in seconds. Image has no "
-    "RTF (no content duration) so generation time is exposed directly.",
-    labelnames=_stage_labels,
-    buckets=defs.SECONDS_BUCKETS,
-)
-_video_duration_family = Histogram(
-    defs.VIDEO_DURATION_S,
-    "Video content duration in seconds (num_frames / fps).",
-    labelnames=_stage_labels,
-    buckets=defs.SECONDS_BUCKETS,
-)
-_video_rtf_family = Histogram(
-    defs.VIDEO_RTF_METRIC,
-    "Video real-time factor (stage_gen_time_s / video_duration_s).",
-    labelnames=_stage_labels,
-    buckets=defs.RTF_BUCKETS,
-)
-_video_generation_family = Histogram(
-    defs.VIDEO_GENERATION_S,
-    "Per-request total video-generation stage time in seconds. Complements "
-    "video_rtf (reverse-computing from RTF is imprecise).",
-    labelnames=_stage_labels,
-    buckets=defs.SECONDS_BUCKETS,
-)
-
-
 class OmniModalityMetrics:
     """Per-modality observe API. Stage/replica are passed at observe time
     because a single OmniModalityMetrics instance per pipeline serves all
@@ -176,69 +135,6 @@ class OmniModalityMetrics:
             replica=replica,
             reason=reason or "unknown",
         ).inc()
-
-    # ---- Image ------------------------------------------------------------
-
-    def inc_image_num(self, stage: str, replica: str, n_images: int) -> None:
-        if n_images <= 0:
-            return
-        _image_num_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica
-        ).inc(n_images)
-
-    def observe_image_generation(
-        self, stage: str, replica: str, gen_time_seconds: float
-    ) -> None:
-        _image_generation_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica
-        ).observe(gen_time_seconds)
-
-    # ---- Video ------------------------------------------------------------
-
-    def observe_video_duration(self, stage: str, replica: str, duration_s: float) -> None:
-        _video_duration_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica
-        ).observe(duration_s)
-
-    def observe_video_rtf(self, stage: str, replica: str, rtf: float) -> None:
-        _video_rtf_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica
-        ).observe(rtf)
-
-    def observe_video_generation(
-        self, stage: str, replica: str, gen_time_seconds: float
-    ) -> None:
-        _video_generation_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica
-        ).observe(gen_time_seconds)
-
-
-def _resolve_video_duration_seconds(
-    engine_outputs: Any,
-    multimodal_output: dict[str, Any],
-) -> float:
-    """Best-effort `num_frames / fps` extraction from heterogeneous video pipelines.
-
-    Diffusion video stages expose num_frames + fps via multimodal_output or
-    engine_outputs attributes in shapes that differ across pipelines (i2v /
-    t2v / hunyuan / wan). Returns 0.0 when either signal is missing — caller
-    skips the observation rather than emitting a wrong sample.
-    """
-    video_meta = multimodal_output.get("video") if multimodal_output else None
-    if isinstance(video_meta, dict):
-        num_frames = video_meta.get("num_frames") or video_meta.get("frames")
-        fps = video_meta.get("fps") or video_meta.get("frame_rate")
-    else:
-        num_frames = getattr(engine_outputs, "num_frames", None)
-        fps = getattr(engine_outputs, "fps", None) or getattr(engine_outputs, "frame_rate", None)
-    try:
-        n = float(num_frames or 0)
-        f = float(fps or 0)
-    except (TypeError, ValueError):
-        return 0.0
-    if n <= 0 or f <= 0:
-        return 0.0
-    return n / f
 
 
 def _extract_mm_output(engine_outputs: Any) -> dict[str, Any]:
@@ -299,7 +195,7 @@ def observe_modality_at_finalize(
     request_arrival_ts: float,
     finalize_ts: float,
 ) -> None:
-    """Route per-modality observations for a finalized request.
+    """Route audio-path observations for a finalized request.
 
     Used by ``omni_base._process_single_result`` inside the e2e_done finalize
     guard so it fires once per request. Skips text path (covered by upstream
@@ -311,7 +207,7 @@ def observe_modality_at_finalize(
     """
     if replica_id is None or stage_metrics is None or output_type is None:
         return
-    if output_type not in ("audio", "image", "video"):
+    if output_type != "audio":
         return
 
     stage_label = str(stage_id)
@@ -319,51 +215,36 @@ def observe_modality_at_finalize(
     gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
     mm_out = _extract_mm_output(engine_outputs)
 
-    if output_type == "audio":
-        sample_rate = defs.resolve_audio_sample_rate(mm_out)
-        # Prefer the accumulator on stage_metrics (kept by
-        # OrchestratorAggregator.record_audio_generated_frames where the
-        # per-chunk wiring is active); fall back to deriving from the
-        # multimodal_output payload directly so the audio family series fire
-        # even when the per-chunk accumulator path didn't run.
-        n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
-        if n_frames == 0:
-            n_frames = _count_audio_frames(mm_out)
-        mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
-        duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
-        if duration_s > 0:
-            mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
-            mod_metrics.observe_audio_rtf(
-                stage_label,
-                replica_label,
-                defs.compute_audio_rtf(gen_time_s, duration_s),
-            )
-        else:
-            # Request completed (finish_reason ∈ {stop, length} — error paths
-            # don't reach finalize) but no audio samples were produced. Covers
-            # silent `return None` skips in the talker→code2wav stage
-            # processors and the `parsed.append((0,0))` malformed-length path
-            # in qwen3-tts code2wav. raise-paths surface via the upstream
-            # vllm:request_success_total{finished_reason="error"} channel and
-            # never reach this branch.
-            mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
-        # audio_underrun / continuity are emitted from the streaming
-        # path in observe_audio_streaming_finalize; finalize is too late for
-        # the per-chunk timeline they need.
-    elif output_type == "image":
-        n_images = len(getattr(engine_outputs, "images", []) or [])
-        mod_metrics.inc_image_num(stage_label, replica_label, n_images)
-        mod_metrics.observe_image_generation(stage_label, replica_label, gen_time_s)
-    else:  # video
-        mod_metrics.observe_video_generation(stage_label, replica_label, gen_time_s)
-        duration_s = _resolve_video_duration_seconds(engine_outputs, mm_out)
-        if duration_s > 0:
-            mod_metrics.observe_video_duration(stage_label, replica_label, duration_s)
-            mod_metrics.observe_video_rtf(
-                stage_label,
-                replica_label,
-                defs.compute_video_rtf(gen_time_s, duration_s),
-            )
+    sample_rate = defs.resolve_audio_sample_rate(mm_out)
+    # Prefer the accumulator on stage_metrics (kept by
+    # OrchestratorAggregator.record_audio_generated_frames where the
+    # per-chunk wiring is active); fall back to deriving from the
+    # multimodal_output payload directly so the audio family series fire
+    # even when the per-chunk accumulator path didn't run.
+    n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
+    if n_frames == 0:
+        n_frames = _count_audio_frames(mm_out)
+    mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
+    duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
+    if duration_s > 0:
+        mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
+        mod_metrics.observe_audio_rtf(
+            stage_label,
+            replica_label,
+            defs.compute_audio_rtf(gen_time_s, duration_s),
+        )
+    else:
+        # Request completed (finish_reason ∈ {stop, length} — error paths
+        # don't reach finalize) but no audio samples were produced. Covers
+        # silent `return None` skips in the talker→code2wav stage
+        # processors and the `parsed.append((0,0))` malformed-length path
+        # in qwen3-tts code2wav. raise-paths surface via the upstream
+        # vllm:request_success_total{finished_reason="error"} channel and
+        # never reach this branch.
+        mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
+    # audio_underrun / continuity are emitted from the streaming path in
+    # observe_audio_streaming_finalize; finalize is too late for the
+    # per-chunk timeline they need.
 
 
 def observe_audio_first_packet(
