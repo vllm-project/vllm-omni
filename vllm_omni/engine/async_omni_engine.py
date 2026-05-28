@@ -354,6 +354,7 @@ class AsyncOmniEngine:
         self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
+        self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
 
@@ -1167,35 +1168,37 @@ class AsyncOmniEngine:
                 primary_exc = exc
                 break
 
-        # --- 2) LLM replicas: parallel init via a scoped ThreadPoolExecutor. ---
+        # --- 2) LLM replicas: parallel init via a long-lived ThreadPoolExecutor. ---
         if primary_exc is None and llm_replicas:
             future_to_replica: dict[concurrent.futures.Future[StagePoolClient], tuple[int, int]] = {}
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, len(llm_replicas)),
-                thread_name_prefix="stage-init",
-            ) as init_executor:
-                for stage_idx, replica in llm_replicas:
-                    future = init_executor.submit(
-                        self._initialize_replica,
-                        replica,
-                        stage_init_timeout,
-                        stage_launch_lock,
-                    )
-                    future_to_replica[future] = (stage_idx, replica.replica_id)
+            if getattr(self, "_stage_init_executor", None) is None:
+                self._stage_init_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max(1, len(llm_replicas)),
+                    thread_name_prefix="stage-init",
+                )
+            init_executor = self._stage_init_executor
+            for stage_idx, replica in llm_replicas:
+                future = init_executor.submit(
+                    self._initialize_replica,
+                    replica,
+                    stage_init_timeout,
+                    stage_launch_lock,
+                )
+                future_to_replica[future] = (stage_idx, replica.replica_id)
 
-                for future in concurrent.futures.as_completed(future_to_replica):
-                    stage_idx, replica_id = future_to_replica[future]
-                    try:
-                        initialized_clients_by_stage[stage_idx][replica_id] = future.result()
-                    except concurrent.futures.CancelledError:
-                        continue
-                    except Exception as exc:
-                        if primary_exc is None:
-                            primary_exc = exc
-                            for other_future in future_to_replica:
-                                if other_future is future:
-                                    continue
-                                other_future.cancel()
+            for future in concurrent.futures.as_completed(future_to_replica):
+                stage_idx, replica_id = future_to_replica[future]
+                try:
+                    initialized_clients_by_stage[stage_idx][replica_id] = future.result()
+                except concurrent.futures.CancelledError:
+                    continue
+                except Exception as exc:
+                    if primary_exc is None:
+                        primary_exc = exc
+                        for other_future in future_to_replica:
+                            if other_future is future:
+                                continue
+                            other_future.cancel()
 
         if primary_exc is not None:
             setattr(primary_exc, "_initialized_clients_by_stage", initialized_clients_by_stage)
@@ -2423,6 +2426,11 @@ class AsyncOmniEngine:
             self.orchestrator_thread.join(timeout=10)
             if self.orchestrator_thread.is_alive():
                 logger.warning("[AsyncOmniEngine] Orchestrator thread did not exit in time")
+
+        stage_init_executor = getattr(self, "_stage_init_executor", None)
+        if stage_init_executor is not None:
+            stage_init_executor.shutdown(wait=False, cancel_futures=True)
+            self._stage_init_executor = None
 
         for q in (self.request_queue, self.output_queue, self.rpc_output_queue):
             try:
