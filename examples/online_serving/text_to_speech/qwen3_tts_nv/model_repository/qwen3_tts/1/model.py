@@ -131,8 +131,8 @@ class TritonPythonModel:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
-        from vllm_omni.model_executor.models.qwen3_tts_nv.qwen3_tts_talker_nv import (
-            Qwen3TTSTalkerForConditionalGenerationNv,
+        from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+            Qwen3TTSPromptEmbedsBuilder,
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -144,9 +144,7 @@ class TritonPythonModel:
         talker_cfg = getattr(hf_cfg, "talker_config", None)
         self._codec_language_id = getattr(talker_cfg, "codec_language_id", None)
         self._spk_is_dialect = getattr(talker_cfg, "spk_is_dialect", None)
-        self._estimate_prompt_len = (
-            Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information
-        )
+        self._estimate_prompt_len = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information
 
     def _build_stage_config_file(self) -> str:
         stage_cfg = {

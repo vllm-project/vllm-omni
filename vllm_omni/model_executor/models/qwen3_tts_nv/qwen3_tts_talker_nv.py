@@ -19,13 +19,13 @@
 """Inference-only Qwen3TTS Talker model compatible with HuggingFace weights."""
 
 import bisect
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import Any
 
 import torch
 from torch import nn
-from transformers import AutoTokenizer, PretrainedConfig
+from transformers import PretrainedConfig
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -49,8 +49,26 @@ from vllm.model_executor.models.utils import (
 )
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    Qwen3TTSPromptEmbedsBuilder,
+)
 
 logger = init_logger(__name__)
+
+
+def _unsupported_encode_ref_audio_batch(*_args: Any, **_kwargs: Any) -> list[torch.Tensor]:
+    """Placeholder for ``Qwen3TTSPromptEmbedsBuilder.encode_ref_audio_batch``.
+
+    The NV talker variant only supports ``task_type="CustomVoice"``, which
+    never invokes the ref-audio codec encoder. We must still pass *some*
+    callable because the builder requires the keyword arg; raising here
+    surfaces accidental use of a Base/voice-clone code path explicitly
+    instead of failing later with a confusing ``'NoneType' is not callable``.
+    """
+    raise NotImplementedError(
+        "Qwen3TTSTalkerForConditionalGenerationNv only supports task_type='CustomVoice'; "
+        "ref-audio codec encoding (used by 'Base'/voice-clone) is not available."
+    )
 
 
 # ── RoPE helpers for the native code predictor ──────────────────────
@@ -785,10 +803,6 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
             "last_talker_hidden",
         }
 
-        # HF AutoTokenizer, loaded eagerly so prefill preprocess has no
-        # first-call latency spike.
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True, padding_side="left")
-
         # Transformer backbone — vLLM's reusable Qwen3Model. The talker
         # has Qwen3-style decoder layers, so we delegate the entire
         # backbone (decoder layers, final norm, and a per-rank
@@ -860,6 +874,32 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         # step. Declared here so the address is stable across CUDA graph
         # replays; actual value is populated from weights in ``load_weights``.
         self._tts_pad_text_embed = torch.zeros(1, config.hidden_size, dtype=dtype)
+
+        # Shared prefill-prompt builder. Wraps embedding tables + tokenizers
+        # so the prompt-layout logic stays in one place (also used by the AR
+        # talker variant). NV currently only supports ``task_type="CustomVoice"``,
+        # so the Base-only dependencies (``speaker_encoder``, ``speaker_cache``,
+        # ``residual_code_embeddings`` for ICL, and ``encode_ref_audio_batch``
+        # for ref-audio codec extraction) are unused. ``encode_ref_audio_batch``
+        # is a required keyword arg on the builder, so we pass a stub that
+        # raises a clear error if any unsupported Base/voice-clone path ever
+        # reaches it. ``_tts_pad_text_embed`` is passed by reference; its
+        # contents are populated in ``_init_runtime_buffers`` once weights are
+        # loaded and the builder reads it lazily on each ``build_prompt_embeds``
+        # call.
+        self._prompt_builder = Qwen3TTSPromptEmbedsBuilder(
+            config=hf_config,
+            talker_config=config,
+            model_path=self.model_path,
+            text_embedding=self.text_embedding,
+            text_projection=self.text_projection,
+            codec_embed=self.code_predictor.get_group0_embeddings,
+            residual_code_embeddings=lambda: self.code_predictor.get_group_embeddings(),
+            speaker_encoder=None,
+            tts_pad_embed=self._tts_pad_text_embed,
+            encode_ref_audio_batch=_unsupported_encode_ref_audio_batch,
+            speaker_cache=None,
+        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Get group-0 codec embeddings for input ids."""
@@ -1075,216 +1115,6 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
     def _build_assistant_text(text: str) -> str:
         return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
 
-    @staticmethod
-    def estimate_prompt_len_from_additional_information(
-        additional_information: dict[str, Any] | None,
-        *,
-        task_type: str,
-        tokenize_prompt: Callable[[str], list[int]],
-        codec_language_id: Mapping[str, int] | None,
-        spk_is_dialect: Mapping[str, object] | None = None,
-    ) -> int:
-        """Compute the Stage-0 placeholder ``prompt_token_ids`` length.
-
-        This is a length-only mirror of :meth:`_build_prompt_embeds` — it
-        must match the embedding sequence that will actually be produced by
-        :meth:`preprocess` during prefill, otherwise the vLLM scheduler will
-        either truncate or over-schedule the prefill span.
-
-        The NV talker only supports ``task_type="CustomVoice"`` with the
-        non-streaming text layout, so the formula is just:
-
-        * ``role_len``         = 3                  (``<|im_start|>assistant\\n``)
-        * ``codec_input_len``  = ``prefill_len + 1 (speaker) + 2 (pad, bos)``
-        * ``codec_prefix_len`` = ``codec_input_len - 1``
-        * ``text_body_len``    = ``assistant_len - 8 + 1`` (full text + ``tts_eos``)
-        * ``tail_len``         = 1                  (``(tts_pad, codec_bos)``)
-
-        where ``prefill_len`` is 4 if the language (or speaker's dialect
-        fallback) resolves in ``codec_language_id``, else 3.
-
-        Args:
-            additional_information: Same dict that will be passed through the
-                request. Only ``text``, ``language`` and ``speaker`` are
-                inspected (all accepted as either scalars or ``[value]``).
-            task_type: Must be ``"CustomVoice"`` — anything else raises.
-            tokenize_prompt: Callable that returns the HF token IDs for a
-                given string (e.g. ``lambda s: tokenizer(s)["input_ids"]``).
-            codec_language_id: ``talker_config.codec_language_id`` mapping.
-            spk_is_dialect: Optional ``talker_config.spk_is_dialect`` mapping
-                for the Auto/Chinese + dialect-voice fallback.
-
-        Returns:
-            Exact prefill length (in codec-time positions) that
-            :meth:`_build_prompt_embeds` will produce for this request.
-        """
-        if task_type != "CustomVoice":
-            raise ValueError(f"Qwen3-TTS NV talker only supports task_type='CustomVoice', got {task_type!r}.")
-
-        def _first(x: object, default: object) -> object:
-            if isinstance(x, list):
-                return x[0] if x else default
-            return x if x is not None else default
-
-        info: dict[str, Any] = additional_information or {}
-        text = _first(info.get("text"), "")
-        language = _first(info.get("language"), "Auto")
-        speaker = _first(info.get("speaker"), "")
-
-        if not isinstance(text, str) or not text:
-            raise ValueError(
-                "estimate_prompt_len_from_additional_information requires non-empty additional_information['text']."
-            )
-        if not isinstance(speaker, str) or not speaker:
-            raise ValueError(
-                "estimate_prompt_len_from_additional_information requires "
-                "additional_information['speaker'] (CustomVoice only)."
-            )
-        if not isinstance(language, str):
-            language = "Auto"
-
-        lang_map: Mapping[str, int] = codec_language_id or {}
-        dialect_map: Mapping[str, object] = spk_is_dialect or {}
-        language_id: int | None = None
-        if language.lower() != "auto":
-            language_id = lang_map.get(language.lower())
-        if language_id is None and language.lower() in ("auto", "chinese"):
-            dialect = dialect_map.get(speaker.lower().strip())
-            if isinstance(dialect, str) and dialect:
-                language_id = lang_map.get(dialect)
-        prefill_len = 4 if language_id is not None else 3
-
-        # Mirrors _build_prompt_embeds: role (3) + codec_prefix
-        # (codec_input_len - 1) + (text_body_len = assistant_len - 8 + 1)
-        # + tail (1) = prefill_len + assistant_len - 1.
-        assistant_len = len(tokenize_prompt(Qwen3TTSTalkerForConditionalGenerationNv._build_assistant_text(text)))
-        if assistant_len < 8:
-            raise ValueError(f"Unexpected assistant prompt length: {assistant_len}")
-        return prefill_len + assistant_len - 1
-
-    def _build_prompt_embeds(
-        self,
-        *,
-        text: str,
-        speaker: str,
-        language: str | None,
-    ) -> torch.Tensor:
-        """Build the full prefill embedding sequence for CustomVoice + non-streaming.
-
-        Mirrors the HuggingFace ``Qwen3TTSForConditionalGeneration.generate``
-        layout (``task_type='CustomVoice'``, ``non_streaming_mode=True``):
-
-        1. Role header ``<|im_start|>assistant\\n``   -> projected text embeds.
-        2. Codec control prefix (``codec_think[_eos/_bos/_nothink]`` + optional
-           language_id + speaker_id + ``codec_pad`` + ``codec_bos``), mixed
-           with ``tts_pad``/``tts_bos`` on the text side.
-        3. Full synthesis text + ``tts_eos`` on the text side, ``codec_pad``
-           on the codec side.
-        4. Final ``(tts_pad, codec_bos)`` tail position.
-
-        Returns:
-            ``[prompt_len, hidden]`` bfloat16 tensor on the model's device.
-        """
-        tc = self.config  # talker config
-        hf = self.hf_config  # parent Qwen3TTSConfig
-        device = next(self.parameters()).device
-        speaker_key = speaker.lower().strip()
-
-        input_ids = self.tokenizer(
-            self._build_assistant_text(text),
-            return_tensors="pt",
-            padding=False,
-        )["input_ids"].to(device=device)
-
-        # tts special-token projected embeddings (bos / eos / pad).
-        tts_tokens = torch.tensor(
-            [[hf.tts_bos_token_id, hf.tts_eos_token_id, hf.tts_pad_token_id]],
-            device=device,
-            dtype=torch.long,
-        )
-        tts_bos_embed, tts_eos_embed, tts_pad_embed = self.text_projection(self.text_embedding(tts_tokens)).chunk(
-            3, dim=1
-        )
-
-        # Codec control prefix: choose with/without language_id.
-        language_id: int | None = None
-        lang_map = getattr(tc, "codec_language_id", None) or {}
-        if isinstance(language, str) and language.lower() != "auto":
-            language_id = lang_map.get(language.lower())
-        # Dialect fallback (official behavior): if Chinese/Auto + speaker is a
-        # known dialect voice, promote language_id to that dialect.
-        if language_id is None and isinstance(language, str) and language.lower() in ("auto", "chinese"):
-            spk_is_dialect = getattr(tc, "spk_is_dialect", None) or {}
-            dialect = spk_is_dialect.get(speaker_key)
-            if isinstance(dialect, str) and dialect:
-                language_id = lang_map.get(dialect)
-
-        if language_id is None:
-            codec_prefill = [
-                tc.codec_nothink_id,
-                tc.codec_think_bos_id,
-                tc.codec_think_eos_id,
-            ]
-        else:
-            codec_prefill = [
-                tc.codec_think_id,
-                tc.codec_think_bos_id,
-                int(language_id),
-                tc.codec_think_eos_id,
-            ]
-
-        codec_input_0 = self.code_predictor.codec_embedding(
-            torch.tensor([codec_prefill], device=device, dtype=torch.long)
-        )
-        codec_input_1 = self.code_predictor.codec_embedding(
-            torch.tensor(
-                [[tc.codec_pad_id, tc.codec_bos_id]],
-                device=device,
-                dtype=torch.long,
-            )
-        )
-
-        spk_map = {k.lower(): v for k, v in (getattr(tc, "spk_id", None) or {}).items()}
-        if speaker_key not in spk_map:
-            raise ValueError(f"Unsupported CustomVoice speaker: {speaker!r} (known: {sorted(spk_map) or '<none>'})")
-        speaker_embed = self.code_predictor.codec_embedding(
-            torch.tensor([[spk_map[speaker_key]]], device=device, dtype=torch.long)
-        )
-
-        codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
-
-        role_embed = self.text_projection(self.text_embedding(input_ids[:, :3]))
-        codec_prefix = torch.cat(
-            (
-                tts_pad_embed.expand(-1, codec_input.shape[1] - 2, -1),
-                tts_bos_embed,
-            ),
-            dim=1,
-        )
-        codec_prefix = codec_prefix + codec_input[:, :-1]
-        talker_prompt = torch.cat((role_embed, codec_prefix), dim=1)
-
-        # Non-streaming: full synth text in prefill + (tts_pad, codec_bos) tail.
-        text_all = self.text_projection(self.text_embedding(input_ids[:, 3:-5]))
-        text_all = torch.cat([text_all, tts_eos_embed], dim=1)
-        pad_ids = torch.full(
-            (1, int(text_all.shape[1])),
-            int(tc.codec_pad_id),
-            device=device,
-            dtype=torch.long,
-        )
-        tail_codec_bos = torch.tensor([[tc.codec_bos_id]], device=device, dtype=torch.long)
-        talker_prompt = torch.cat(
-            [
-                talker_prompt,
-                text_all + self.code_predictor.codec_embedding(pad_ids),
-                tts_pad_embed + self.code_predictor.codec_embedding(tail_codec_bos),
-            ],
-            dim=1,
-        )
-
-        return talker_prompt.squeeze(0).to(dtype=torch.bfloat16).contiguous()
-
     def preprocess(
         self,
         input_ids: torch.Tensor,
@@ -1365,8 +1195,20 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
             prompt_embeds_cpu = info_dict.get("talker_prompt_embeds")
             is_first = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
             if is_first:
-                full = self._build_prompt_embeds(text=text, speaker=speaker, language=language)
-                prompt_embeds_cpu = full.detach().to("cpu").contiguous()
+                # The shared builder accesses ``info_dict[k][0]``, so always
+                # pass list-wrapped scalars regardless of what the runner
+                # provided (NV's ``_first_str`` already validated them above).
+                builder_info = {
+                    **info_dict,
+                    "text": [text],
+                    "speaker": [speaker],
+                    "language": [language],
+                }
+                talker_prompt, _, _, _ = self._prompt_builder.build_prompt_embeds(
+                    task_type="CustomVoice",
+                    info_dict=builder_info,
+                )
+                prompt_embeds_cpu = talker_prompt.to(dtype=torch.bfloat16).detach().to("cpu").contiguous()
                 offset = 0
                 info_update: dict[str, Any] = {
                     "talker_prompt_embeds": prompt_embeds_cpu,

@@ -30,6 +30,9 @@ import torch
 import torch.nn as nn
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    Qwen3TTSPromptEmbedsBuilder,
+)
 from vllm_omni.model_executor.models.qwen3_tts_nv import qwen3_tts_talker_nv as nv
 from vllm_omni.model_executor.models.qwen3_tts_nv.qwen3_tts_talker_nv import (
     Qwen3TTSTalkerForConditionalGenerationNv,
@@ -462,37 +465,17 @@ def _make_tokenizer(token_count: int):
     return lambda s: [0] * token_count
 
 
-def test_estimate_prompt_len_rejects_non_customvoice():
-    with pytest.raises(ValueError, match="CustomVoice"):
-        Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
-            {"text": "hi", "speaker": "alice"},
-            task_type="OTHER",
-            tokenize_prompt=_make_tokenizer(10),
-            codec_language_id=None,
-        )
-
-
-def test_estimate_prompt_len_requires_text_and_speaker():
-    with pytest.raises(ValueError, match="text"):
-        Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
-            {"speaker": "alice"},
-            task_type="CustomVoice",
-            tokenize_prompt=_make_tokenizer(10),
-            codec_language_id=None,
-        )
-    with pytest.raises(ValueError, match="speaker"):
-        Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
-            {"text": "hello"},
-            task_type="CustomVoice",
-            tokenize_prompt=_make_tokenizer(10),
-            codec_language_id=None,
-        )
+# The NV talker no longer wraps ``estimate_prompt_len_from_additional_information``;
+# production callers (``runtime.py``, ``serving_speech.py``) and ``preprocess`` now
+# invoke :class:`Qwen3TTSPromptEmbedsBuilder` directly. The tests below pin the
+# CustomVoice math against the shared builder to guard the prefill-length contract
+# the NV talker relies on.
 
 
 def test_estimate_prompt_len_no_language_id_uses_prefill_3():
     """No language_id -> prefill_len=3, total = 3 + assistant_len - 1."""
     assistant_len = 12
-    out = Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
+    out = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
         {"text": "hi", "speaker": "alice", "language": "Auto"},
         task_type="CustomVoice",
         tokenize_prompt=_make_tokenizer(assistant_len),
@@ -505,11 +488,12 @@ def test_estimate_prompt_len_no_language_id_uses_prefill_3():
 def test_estimate_prompt_len_with_language_id_uses_prefill_4():
     """Resolved language_id -> prefill_len=4."""
     assistant_len = 12
-    out = Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
+    out = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
         {"text": "hi", "speaker": "alice", "language": "English"},
         task_type="CustomVoice",
         tokenize_prompt=_make_tokenizer(assistant_len),
         codec_language_id={"english": 1},
+        spk_is_dialect=None,
     )
     assert out == 4 + assistant_len - 1
 
@@ -517,7 +501,7 @@ def test_estimate_prompt_len_with_language_id_uses_prefill_4():
 def test_estimate_prompt_len_dialect_fallback_promotes_to_4():
     """Auto language + speaker registered as a dialect resolves a language_id."""
     assistant_len = 12
-    out = Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
+    out = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
         {"text": "hi", "speaker": "shanghainese_voice", "language": "Auto"},
         task_type="CustomVoice",
         tokenize_prompt=_make_tokenizer(assistant_len),
@@ -529,7 +513,7 @@ def test_estimate_prompt_len_dialect_fallback_promotes_to_4():
 
 def test_estimate_prompt_len_unwraps_list_values():
     assistant_len = 12
-    out = Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
+    out = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
         {
             "text": ["hi"],
             "speaker": ["alice"],
@@ -538,17 +522,19 @@ def test_estimate_prompt_len_unwraps_list_values():
         task_type="CustomVoice",
         tokenize_prompt=_make_tokenizer(assistant_len),
         codec_language_id={"english": 1},
+        spk_is_dialect=None,
     )
     assert out == 3 + assistant_len - 1
 
 
 def test_estimate_prompt_len_short_assistant_raises():
     with pytest.raises(ValueError, match="assistant prompt length"):
-        Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
+        Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
             {"text": "hi", "speaker": "alice"},
             task_type="CustomVoice",
             tokenize_prompt=_make_tokenizer(5),
             codec_language_id=None,
+            spk_is_dialect=None,
         )
 
 
