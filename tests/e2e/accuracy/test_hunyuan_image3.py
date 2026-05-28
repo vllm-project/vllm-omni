@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import requests
 import torch
 import yaml
 from PIL import Image
@@ -27,6 +28,7 @@ from tests.e2e.accuracy.helpers import (
     model_output_dir,
 )
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner, OmniServer
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens, resolve_stop_token_ids
 
 os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
@@ -75,9 +77,9 @@ THRESHOLDS = {
     "text_prefix_match": 10,  # First 10 characters must match exactly
     "cot_semantic_sim": 0.9,  # Full CoT semantic similarity
     # Image comparison
-    "clip_score": 85,  # CLIP image semantic similarity
-    "ssim": 0.20,  # Structural similarity
-    "psnr": 11.0,  # Peak signal-to-noise ratio (dB)
+    "clip_score": 90,  # CLIP image semantic similarity
+    "ssim": 0.26,  # Structural similarity
+    "psnr": 12.5,  # Peak signal-to-noise ratio (dB)
 }
 
 QUANT_PROMPT = "A brown and white dog is running on the grass."
@@ -92,82 +94,87 @@ QUANT_FP8_ENV = "HUNYUAN_IMAGE3_FP8_MODEL"
 QUANT_NVFP4_ENV = "HUNYUAN_IMAGE3_NVFP4_MODEL"
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 # fmt: off
-_BASE_CONFIG = {
-    "stage_args": [
+_DEPLOY_CONFIG = {
+    "pipeline": "hunyuan_image_3_moe",
+    "async_chunk": False,
+    "trust_remote_code": True,
+    "connectors": {
+        "shared_memory_connector": {
+            "name": "SharedMemoryConnector",
+            "extra": {"shm_threshold_bytes": 65536},
+        },
+    },
+    "stages": [
         {
-            "stage_id": 0, "stage_type": "llm",
-            "runtime": {"process": True, "devices": AR_DEVICES, "max_batch_size": 1, "requires_multimodal_data": True},
-            "engine_args": {
-                "model_stage": "AR", "model_arch": "HunyuanImage3ForCausalMM",
-                "worker_cls": "vllm_omni.worker.gpu_ar_worker.GPUARWorker",
-                "scheduler_cls": "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler",
-                "gpu_memory_utilization": 0.95, "enforce_eager": True, "trust_remote_code": True,
-                "engine_output_type": "latent", "enable_prefix_caching": False,
-                "max_num_batched_tokens": 32768, "tensor_parallel_size": AR_TP_SIZE, "pipeline_parallel_size": 1,
-                "hf_overrides": {"rope_parameters": {"mrope_section": [0, 32, 32], "rope_type": "default"}},
-            },
-            "is_comprehension": False, "final_output": True, "final_output_type": "text",
-            "default_sampling_params": {
-                "temperature": 0.0, "top_p": 1, "top_k": -1, "max_tokens": 8192,
-                "stop_token_ids": [128025], "detokenize": True, "skip_special_tokens": False,
+            "stage_id": 0,
+            "is_comprehension": False,
+            "final_output": True,
+            "final_output_type": "text",
+            "max_num_seqs": 1,
+            "gpu_memory_utilization": 0.95,
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "max_num_batched_tokens": 32768,
+            "devices": AR_DEVICES,
+            "tensor_parallel_size": AR_TP_SIZE,
+            "hf_overrides": {
+                "rope_parameters": {"mrope_section": [0, 32, 32], "rope_type": "default"},
             },
             "output_connectors": {"to_stage_1": "shared_memory_connector"},
+            "default_sampling_params": {
+                "temperature": 0.0,
+                "top_p": 1,
+                "top_k": -1,
+                "max_tokens": 8192,
+                "stop_token_ids": [128025],
+                "detokenize": True,
+                "skip_special_tokens": False,
+            },
         },
         {
-            "stage_id": 1, "stage_type": "diffusion",
-            "runtime": {"process": True, "devices": DIT_DEVICES, "max_batch_size": 1, "requires_multimodal_data": True},
-            "engine_args": {
-                "model_stage": "dit", "model_arch": "HunyuanImage3ForCausalMM",
-                "enforce_eager": True, "trust_remote_code": True, "distributed_executor_backend": "mp",
-                "parallel_config": {"tensor_parallel_size": DIT_TP_SIZE, "enable_expert_parallel": True},
-            },
-            "engine_input_source": [0],
-            "custom_process_input_func": "vllm_omni.model_executor.stage_input_processors.hunyuan_image3.ar2diffusion",
-            "final_output": True, "final_output_type": "image",
-            "default_sampling_params": {"num_inference_steps": NUM_INFERENCE_STEPS, "guidance_scale": GUIDANCE_SCALE},
+            "stage_id": 1,
+            "max_num_seqs": 1,
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "devices": DIT_DEVICES,
+            "distributed_executor_backend": "mp",
+            "parallel_config": {"tensor_parallel_size": DIT_TP_SIZE, "enable_expert_parallel": True},
             "input_connectors": {"from_stage_0": "shared_memory_connector"},
+            "default_sampling_params": {
+                "num_inference_steps": NUM_INFERENCE_STEPS,
+                "guidance_scale": GUIDANCE_SCALE,
+            },
         },
     ],
-    "runtime": {
-        "enabled": True,
-        "connectors": {"shared_memory_connector": {
-            "name": "SharedMemoryConnector",
-            "extra": {"shm_threshold_bytes": 65536}
-        }},
-        "edges": [{"from": 0, "to": 1}],
-    },
+    "edges": [{"from": 0, "to": 1}],
 }
 # fmt: on
 
 _QUANT_DIT_CONFIG = {
-    "stage_args": [
+    "pipeline": "hunyuan_image_3_moe",
+    "async_chunk": False,
+    "trust_remote_code": True,
+    "stages": [
         {
             "stage_id": 0,
-            "stage_type": "diffusion",
-            "runtime": {
-                "devices": "0,1",
-                "max_batch_size": 1,
+            "model_stage": "dit",
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "devices": "0,1",
+            "distributed_executor_backend": "mp",
+            "force_cutlass_fp8": True,
+            "moe_backend": "cutlass",
+            "parallel_config": {
+                "tensor_parallel_size": 2,
+                "enable_expert_parallel": True,
             },
-            "engine_args": {
-                "model_stage": "dit",
-                "enforce_eager": True,
-                "trust_remote_code": True,
-                "distributed_executor_backend": "mp",
-                "force_cutlass_fp8": True,
-                "moe_backend": "cutlass",
-                "parallel_config": {
-                    "tensor_parallel_size": 2,
-                    "enable_expert_parallel": True,
-                },
-                "omni_kv_config": {"need_recv_cache": True},
-            },
+            "omni_kv_config": {"need_recv_cache": True},
             "final_output": True,
             "final_output_type": "image",
             "is_comprehension": False,
             "default_sampling_params": {"seed": SEED},
         }
     ],
-    "runtime": {"enabled": True},
 }
 
 
@@ -211,9 +218,9 @@ COT_REF = ("首先，我分析所有输入图像：图像1是一个圆形的logo
 
 
 def _make_config(enable_kv_reuse: bool, path: Path) -> None:
-    config = copy.deepcopy(_BASE_CONFIG)
-    config["stage_args"][0]["engine_args"]["omni_kv_config"] = {"need_send_cache": enable_kv_reuse}
-    config["stage_args"][1]["engine_args"]["omni_kv_config"] = {"need_recv_cache": enable_kv_reuse}
+    config = copy.deepcopy(_DEPLOY_CONFIG)
+    config["stages"][0]["omni_kv_config"] = {"need_send_cache": enable_kv_reuse}
+    config["stages"][1]["omni_kv_config"] = {"need_recv_cache": enable_kv_reuse}
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
@@ -227,15 +234,14 @@ def _quant_tensor_parallel_size() -> int:
 
 def _make_quant_dit_config(path: Path) -> None:
     config = copy.deepcopy(_QUANT_DIT_CONFIG)
-    config["stage_args"][0]["runtime"]["devices"] = _quant_devices()
-    config["stage_args"][0]["engine_args"]["parallel_config"]["tensor_parallel_size"] = _quant_tensor_parallel_size()
+    config["stages"][0]["devices"] = _quant_devices()
+    config["stages"][0]["parallel_config"]["tensor_parallel_size"] = _quant_tensor_parallel_size()
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
-def _run_offline(stage_configs_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
     from transformers import AutoTokenizer
 
-    from tests.helpers.runtime import OmniRunner
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
     from vllm_omni.platforms import current_omni_platform
 
@@ -251,7 +257,7 @@ def _run_offline(stage_configs_path: str, output_path: Path) -> tuple[Image.Imag
     system_prompt_type = result.system_prompt_type
 
     ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
-    with OmniRunner(MODEL_PATH, stage_configs_path=stage_configs_path) as runner:
+    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path) as runner:
         params_list = list(runner.omni.default_sampling_params_list)
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
@@ -308,6 +314,107 @@ def _run_offline(stage_configs_path: str, output_path: Path) -> tuple[Image.Imag
     return image, cot_text, elapsed
 
 
+def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+    from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
+
+    server_args = [
+        "--stage-configs-path",
+        stage_configs_path,
+        "--stage-init-timeout",
+        "300",
+        "--init-timeout",
+        "900",
+    ]
+    try:
+        with OmniServer(MODEL_PATH, server_args, use_omni=True) as omni_server:
+            images = download_images(TEST_IMAGE_URLS)
+            t0 = time.perf_counter()
+            response = requests.post(
+                f"http://{omni_server.host}:{omni_server.port}/v1/images/edits",
+                data={
+                    "model": omni_server.model,
+                    "prompt": PROMPT,
+                    "n": 1,
+                    "response_format": "b64_json",
+                    "num_inference_steps": NUM_INFERENCE_STEPS,
+                    "guidance_scale": GUIDANCE_SCALE,
+                    "seed": SEED,
+                    "sys_type": "en_unified",
+                    "bot_task": "think_recaption",
+                    "size": "1280x720",
+                },
+                files=[
+                    ("image", (f"image_{i}.png", pil_to_png_bytes(img), "image/png")) for i, img in enumerate(images)
+                ],
+                timeout=600,
+            )
+            elapsed = time.perf_counter() - t0
+            if not response.ok:
+                print(f"[ONLINE] HTTP {response.status_code} response body: {response.text}")
+            response.raise_for_status()
+            payload = response.json()
+            assert len(payload["data"]) == 1
+            image = decode_base64_image(payload["data"][0]["b64_json"])
+            image.load()
+            image.save(output_path / "image_online.png")
+            cot_text = payload.get("cot_output") or ""
+            (output_path / "cot_online.txt").write_text(cot_text, encoding="utf-8")
+            return image, cot_text, elapsed
+    finally:
+        gc.collect()
+        if torch.accelerator.is_available():
+            torch.accelerator.empty_cache()
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < AR_TP_SIZE + DIT_TP_SIZE,
+    reason=f"Needs {AR_TP_SIZE + DIT_TP_SIZE}+ GPUs ({AR_TP_SIZE} AR + {DIT_TP_SIZE} DiT)",
+)
+def test_image_to_image_alignment_online(accuracy_artifact_root: Path, accuracy_assets_root: Path) -> None:
+    """Online API test: same pipeline, same seed as offline → PSNR >= 10 dB."""
+    if importlib.util.find_spec("FlagEmbedding") is None:
+        raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
+    from tabulate import tabulate
+
+    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-online")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        _make_config(True, tmp / "online.yaml")
+        online_image, online_cot, _ = _run_online(str(tmp / "online.yaml"), output_dir)
+
+    online_cot = online_cot.lstrip("\n")
+    scorer = SemanticSimilarityScorer()
+    clip_scorer = CLIPScorer()
+    cot_results = scorer.text_similarity(online_cot, COT_REF)
+    image_ref = Image.open(str(accuracy_assets_root / "hunyuan_image_ref.png")).convert("RGB")
+    image_clip_score = clip_scorer.image_image_score(online_image, image_ref)
+    ssim_value, psnr_value = compute_image_ssim_psnr(prediction=online_image, reference=image_ref, compare_mode="RGB")
+
+    table = [
+        ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", 0.9644],
+        ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", 29],
+        ["Image-Image similarity", f"{image_clip_score:.4f}", 94.5538],
+        ["SSIM", f"{ssim_value:.4f}", 0.242],
+        ["PSNR (dB)", f"{psnr_value:.2f}", 14.1],
+    ]
+    print("[ONLINE] " + tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
+
+    assert cot_results["cot_semantic_sim"] >= THRESHOLDS["cot_semantic_sim"], (
+        f"[ONLINE] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} below threshold {THRESHOLDS['cot_semantic_sim']}"
+    )
+    assert cot_results["text_prefix_match_count"] >= THRESHOLDS["text_prefix_match"], (
+        f"[ONLINE] COT prefix match {cot_results['text_prefix_match_count']} below threshold {THRESHOLDS['text_prefix_match']}"
+    )
+    assert image_clip_score >= THRESHOLDS["clip_score"], (
+        f"[ONLINE] Image-Image similarity {image_clip_score:.4f} below threshold {THRESHOLDS['clip_score']}"
+    )
+    assert ssim_value >= THRESHOLDS["ssim"], f"[ONLINE] SSIM {ssim_value:.4f} below threshold {THRESHOLDS['ssim']}"
+    assert psnr_value >= THRESHOLDS["psnr"], (
+        f"[ONLINE] PSNR {psnr_value:.2f} dB below threshold {THRESHOLDS['psnr']} dB"
+    )
+
+
 def _extract_image(outputs) -> Image.Image:
     assert outputs, "Pipeline produced no outputs"
     for output in outputs:
@@ -324,7 +431,7 @@ def _extract_image(outputs) -> Image.Image:
 
 def _run_dit_model(
     model: str,
-    stage_config_path: str,
+    deploy_config_path: str,
     output_path: Path,
     *,
     nvfp4_backend: str | None = None,
@@ -338,7 +445,7 @@ def _run_dit_model(
         os.environ["VLLM_NVFP4_GEMM_BACKEND"] = nvfp4_backend
 
     try:
-        with OmniRunner(model, stage_configs_path=stage_config_path, mode="text-to-image") as runner:
+        with OmniRunner(model, deploy_config=deploy_config_path, mode="text-to-image") as runner:
             generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
             params = OmniDiffusionSamplingParams(
                 height=QUANT_HEIGHT,
@@ -426,17 +533,17 @@ def test_quantized_dit_matches_bf16_accuracy(
     quant_model = os.environ[case.model_env]
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        stage_config_path = Path(tmpdir) / "hunyuan_image3_quant_dit.yaml"
-        _make_quant_dit_config(stage_config_path)
+        deploy_config_path = Path(tmpdir) / "hunyuan_image3_quant_dit.yaml"
+        _make_quant_dit_config(deploy_config_path)
 
         bf16_image, bf16_time = _run_dit_model(
             bf16_model,
-            str(stage_config_path),
+            str(deploy_config_path),
             output_dir / "bf16.png",
         )
         quant_image, quant_time = _run_dit_model(
             quant_model,
-            str(stage_config_path),
+            str(deploy_config_path),
             output_dir / f"{case.name}.png",
             nvfp4_backend=case.nvfp4_backend,
         )

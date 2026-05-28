@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
@@ -73,8 +72,25 @@ class OmniCachedRequestData(CachedRequestData):
 
 
 @dataclass
+class OmniChunkRecvHandle:
+    """Minimal identifier carried from scheduler to runner for chunk-recv
+    registration.
+
+    The runner's ``register_chunk_recv`` only consumes ``request_id`` and
+    ``external_req_id`` from each pending request, so we ship just those
+    two fields instead of the full Request object.  Concrete typing
+    keeps msgspec serialization deterministic across IPC (default,
+    PD-disagg, multi-node executor variants) and avoids the
+    ``list[Any]`` fallback path.
+    """
+
+    request_id: str
+    external_req_id: str | None = None
+
+
+@dataclass
 class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
-    pending_input_registrations: list[Any] = field(default_factory=list)
+    pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)

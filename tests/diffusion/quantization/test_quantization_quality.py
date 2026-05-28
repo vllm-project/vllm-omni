@@ -71,7 +71,7 @@ class QualityTestConfig:
     prompt: str  # generation prompt
     max_lpips: float  # fail threshold — higher = more lenient
     model: str | None = None  # HF model name
-    quantization: str | None = None  # quantization method, e.g. "fp8"
+    quantization: str | dict[str, object] | None = None  # quantization method/config, e.g. "fp8"
     baseline_model: str | None = None  # explicit BF16/local baseline path
     quantized_model: str | None = None  # explicit quantized/local model path
     height: int = 1024
@@ -118,9 +118,57 @@ QUALITY_CONFIGS = [
     QualityTestConfig(
         id="fp8_z_image",
         model="Tongyi-MAI/Z-Image-Turbo",
-        quantization="fp8",
+        quantization={
+            "method": "fp8",
+            "ignored_layers": [
+                "img_mlp",
+                *[
+                    f"layers.{layer_id}.{suffix}"
+                    for layer_id in range(15, 30)
+                    for suffix in (
+                        "attention.to_qkv",
+                        "attention.to_out.0",
+                        "feed_forward.w13",
+                        "feed_forward.w2",
+                    )
+                ],
+                *[
+                    f"model.layers.{layer_id}.{suffix}"
+                    for layer_id in range(28, 36)
+                    for suffix in (
+                        "self_attn.q_proj",
+                        "self_attn.k_proj",
+                        "self_attn.v_proj",
+                        "self_attn.o_proj",
+                        "mlp.gate_proj",
+                        "mlp.up_proj",
+                        "mlp.down_proj",
+                    )
+                ],
+            ],
+        },
         task="t2i",
-        prompt="a cup of coffee on a wooden table, morning light",
+        prompt=(
+            "A breathtaking twilight scene atop a floating archipelago of crystalline islands suspended in an "
+            "endless nebula-drenched sky, where waterfalls of liquid starlight cascade from the edges of each "
+            "island into the cosmic abyss below. The largest island hosts an ancient, overgrown observatory "
+            "crafted from pearlescent white stone and living silverwood trees whose bioluminescent leaves pulse "
+            "with soft cerulean and violet light. At the observatory's center stands a solitary figure—a young "
+            "astronomer in flowing robes woven from woven moonlight and deep-space fabric, their face illuminated "
+            "by the glow of a holographic star chart hovering above an altar of polished obsidian. The sky swirls "
+            "with the birth of a new galaxy: ribbons of magenta and gold gas clouds twist around nascent stars, "
+            "while distant supernovae bloom like cosmic flowers in the far reaches of the void. Below, the abyss "
+            "reveals faint echoes of forgotten civilizations—ghostly silhouettes of submerged cities shimmering "
+            "in layers of atmospheric haze. Cinematic volumetric lighting cuts through the scene as twin moons—one "
+            "copper-hued, one opalescent—rise on opposite horizons, casting long, intersecting shadows across "
+            "moss-covered ruins and crystalline flora that refract light into prismatic halos. Hyper-detailed, "
+            "photorealistic rendering with the atmospheric depth of Roger Deakins' cinematography, the "
+            "architectural grandeur of Zaha Hadid, and the cosmic wonder of James Jean's illustrations. Shot on "
+            "a mythical 150mm lens with shallow depth of field, 8K resolution, Unreal Engine 5 realism, subsurface "
+            "scattering on organic elements, and ray-traced reflections dancing across every water droplet in the "
+            "starlight waterfalls. Ethereal, melancholic, and transcendent mood—like a moment of quiet revelation "
+            "at the edge of existence."
+        ),
         max_lpips=0.15,
         num_inference_steps=20,
     ),
@@ -391,12 +439,6 @@ _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUA
 
 def _quality_param(c: QualityTestConfig):
     marks = list(_marks)
-    if c.id == "fp8_z_image":
-        marks.append(
-            pytest.mark.skip(
-                reason="Z-Image FP8 quality gate temporarily disabled: https://github.com/vllm-project/vllm-omni/issues/3531"
-            )
-        )
     if c.id == "fp8_qwen_image":
         marks.append(
             pytest.mark.skip(reason="Qwen-Image FP8 quality gate temporarily disabled (see CI / issue tracker).")

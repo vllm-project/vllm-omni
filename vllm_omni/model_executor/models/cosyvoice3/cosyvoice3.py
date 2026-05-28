@@ -784,12 +784,14 @@ class CosyVoice3Model(
                             else:
                                 self._stream_vocoder_cache_by_req[req_id] = new_cache_state
                 else:
+                    token_offset = max(0, meta.talker_prefill_offset or 0) if meta else 0
                     tts_speech = self.code2wav.forward(
                         token=token.unsqueeze(0),
                         prompt_token=speech_token[:1],
                         prompt_feat=speech_feat[:1],
                         embedding=embedding[:1],
                         n_timesteps=10,
+                        token_offset_tokens=token_offset,
                     )
 
                 audio = tts_speech.reshape(-1).to(dtype=torch.float32)

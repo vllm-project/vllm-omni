@@ -21,10 +21,12 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from contextlib import ExitStack
 
 import pytest
+import torch
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -150,3 +152,101 @@ async def test_generate_after_list_loras_inline_mode():
         assert last_output is not None
         assert isinstance(last_output, OmniRequestOutput)
         assert last_output.images, "Expected at least one generated image"
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.asyncio
+async def test_sleep_memory_reclaimed_custom_pipeline():
+    """sleep(level=1) must physically reclaim CuMemAllocator-tracked memory for
+    custom_pipeline.
+
+    Regression test for: custom pipelines constructed under ``with target_device:``
+    (CUDA default-device context) caused safetensors >=0.20.0 to use a
+    direct-to-GPU fast path (cudaMalloc via the driver API) that bypasses
+    CuMemAllocator, leaving weights invisible to sleep() and pinned in GPU
+    memory after the call.
+
+    The fix moves custom_pipeline init outside the CUDA context so all weights
+    go through the caching allocator and are therefore fully reclaimed by
+    sleep(level=1).  A non-zero ``CuMemAllocator.get_current_usage()`` after
+    sleep is the direct signal that the bypass is still occurring.
+    """
+    with ExitStack() as after:
+        engine = AsyncOmni(
+            model=MODEL,
+            custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
+            worker_extension_cls=WORKER_EXTENSION_CLASS,
+            enforce_eager=True,
+            enable_sleep_mode=True,
+        )
+        after.callback(engine.shutdown)
+
+        assert not await engine.is_sleeping(), "Engine should be awake after creation"
+
+        # Measure global VRAM before sleep (driver view; includes inline worker
+        # thread since inline mode runs in the same process).
+        torch.accelerator.synchronize()
+        free_before, total = torch.cuda.mem_get_info()
+        used_before_gib = (total - free_before) / 1024**3
+
+        # Measure CuMemAllocator-tracked usage before sleep.  In inline mode
+        # the worker runs in a thread pool inside this process, so the allocator
+        # singleton is shared and can be read directly.
+        allocator = None
+        tracked_before = 0
+        try:
+            from vllm.device_allocator.cumem import CuMemAllocator
+
+            allocator = CuMemAllocator.get_instance()
+            tracked_before = allocator.get_current_usage()
+        except Exception:
+            pass
+
+        # Put the engine to sleep; all weights should be offloaded via the pool.
+        acks = await engine.sleep(level=1)
+        await asyncio.sleep(0.5)  # allow the CUDA driver to settle
+        torch.accelerator.synchronize()
+
+        # Measure after sleep.
+        free_after, _ = torch.cuda.mem_get_info()
+        used_after_gib = (total - free_after) / 1024**3
+        drop_gib = used_before_gib - used_after_gib
+
+        # --- Primary assertion: allocator reports zero tracked memory. ---
+        # If this fails it means weights were allocated outside the CuMem pool
+        # (safetensors direct-to-GPU bypass) — the exact regression this test
+        # is designed to catch.
+        if allocator is not None:
+            tracked_after = allocator.get_current_usage()
+            assert tracked_after == 0, (
+                f"CuMemAllocator still tracks {tracked_after / 1024**3:.3f} GiB "
+                f"after sleep(level=1) on custom_pipeline path "
+                f"(was {tracked_before / 1024**3:.3f} GiB before sleep). "
+                "Weights were allocated outside the CuMem pool via the "
+                "safetensors direct-to-GPU fast path — loader-context fix "
+                "may not be applied."
+            )
+
+        # --- Secondary assertion: physical VRAM or ACK freed_bytes confirms
+        # reclamation at the driver level.
+        total_freed_bytes = sum(
+            (ack.freed_bytes if hasattr(ack, "freed_bytes") else ack.get("freed_bytes", 0))
+            for ack in acks
+            if ack is not None
+        )
+        freed_gib = total_freed_bytes / 1024**3
+        assert freed_gib > 0 or drop_gib > 0, (
+            f"Expected GPU memory to be reclaimed after sleep(level=1) on "
+            f"custom_pipeline + enable_sleep_mode=True. "
+            f"CuMemAllocator tracked before={tracked_before / 1024**3:.3f} GiB, "
+            f"ACK freed={freed_gib:.3f} GiB, global VRAM drop={drop_gib:.3f} GiB."
+        )
+
+        # Engine must report it is sleeping.
+        assert await engine.is_sleeping()
+
+        # Wake up and confirm the engine is functional again.
+        await engine.wake_up()
+        assert not await engine.is_sleeping()

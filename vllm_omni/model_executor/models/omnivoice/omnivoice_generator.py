@@ -13,6 +13,8 @@ via FlashAttention/SageAttention/SDPA backends.
 from __future__ import annotations
 
 import math
+import threading
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -22,6 +24,184 @@ from vllm.logger import init_logger
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Triton kernels (inference-only; graceful fallback when triton is absent)
+# ---------------------------------------------------------------------------
+
+_TRITON_AVAILABLE = False
+try:
+    import triton
+    import triton.language as tl
+
+    try:
+        from triton.language.extra.libdevice import rsqrt  # noqa: F401
+    except ModuleNotFoundError:
+        from triton.language.extra.cuda.libdevice import rsqrt  # noqa: F401
+
+    def _calculate_settings(n: int) -> tuple[int, int]:
+        MAX_FUSED_SIZE = 65536
+        BLOCK_SIZE = triton.next_power_of_2(n)
+        if BLOCK_SIZE > MAX_FUSED_SIZE:
+            raise RuntimeError(f"n={n} exceeds max Triton block size {MAX_FUSED_SIZE}")
+        num_warps = 4
+        if BLOCK_SIZE >= 32768:
+            num_warps = 32
+        elif BLOCK_SIZE >= 8192:
+            num_warps = 16
+        elif BLOCK_SIZE >= 2048:
+            num_warps = 8
+        return BLOCK_SIZE, num_warps
+
+    @triton.jit
+    def _rms_norm_fwd_kernel(
+        Y_ptr,  # noqa: N803
+        Y_stride,  # noqa: N803
+        X_ptr,  # noqa: N803
+        X_stride,  # noqa: N803
+        W_ptr,  # noqa: N803
+        n_cols,
+        eps,
+        BLOCK_SIZE: tl.constexpr,  # noqa: N803
+    ):
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        x = tl.load(X_ptr + row * X_stride + cols, mask=mask, other=0.0)
+        w = tl.load(W_ptr + cols, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+        ms = tl.sum(x_f32 * x_f32, axis=0) / n_cols
+        rstd = rsqrt(ms + eps)
+        y = (x_f32 * rstd).to(x.dtype) * w
+        tl.store(Y_ptr + row * Y_stride + cols, y, mask=mask)
+
+    def triton_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        shape = x.shape
+        n_cols = shape[-1]
+        x2d = x.contiguous().view(-1, n_cols)
+        w = weight.contiguous()
+        BLOCK_SIZE, num_warps = _calculate_settings(n_cols)
+        y = torch.empty_like(x2d)
+        _rms_norm_fwd_kernel[(x2d.shape[0],)](
+            y,
+            y.stride(0),
+            x2d,
+            x2d.stride(0),
+            w,
+            n_cols,
+            eps,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
+        return y.view(*shape)
+
+    @triton.jit
+    def _swiglu_fwd_kernel(
+        gate_ptr,
+        up_ptr,
+        out_ptr,
+        stride,
+        n_cols: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,  # noqa: N803
+    ):
+        pid = tl.program_id(0).to(tl.int64)
+        gate_ptr += pid * stride
+        up_ptr += pid * stride
+        out_ptr += pid * stride
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        gate = tl.load(gate_ptr + cols, mask=mask, other=0).to(tl.float32)
+        up = tl.load(up_ptr + cols, mask=mask, other=0)
+        silu_gate = gate * tl.sigmoid(gate)
+        out = silu_gate.cast(up.dtype) * up
+        tl.store(out_ptr + cols, out, mask=mask)
+
+    def triton_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        gate = gate.contiguous()
+        up = up.contiguous()
+        shape = gate.shape
+        n_cols = shape[-1]
+        g2d = gate.view(-1, n_cols)
+        u2d = up.view(-1, n_cols)
+        out = torch.empty_like(g2d)
+        BLOCK_SIZE, num_warps = _calculate_settings(n_cols)
+        _swiglu_fwd_kernel[(g2d.shape[0],)](
+            g2d,
+            u2d,
+            out,
+            out.stride(0),
+            n_cols=n_cols,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
+        return out.view(*shape)
+
+    @triton.jit
+    def _fused_add_rms_norm_fwd_kernel(
+        Y_ptr,  # noqa: N803
+        Y_stride,  # noqa: N803
+        S_ptr,  # noqa: N803
+        S_stride,  # noqa: N803
+        X_ptr,  # noqa: N803
+        X_stride,  # noqa: N803
+        R_ptr,  # noqa: N803
+        R_stride,  # noqa: N803
+        W_ptr,  # noqa: N803
+        n_cols,
+        eps,
+        BLOCK_SIZE: tl.constexpr,  # noqa: N803
+    ):
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        x = tl.load(X_ptr + row * X_stride + cols, mask=mask, other=0.0)
+        r = tl.load(R_ptr + row * R_stride + cols, mask=mask, other=0.0)
+        dtype = x.dtype
+        s_f32 = x.to(tl.float32) + r.to(tl.float32)
+        s = s_f32.to(dtype)
+        tl.store(S_ptr + row * S_stride + cols, s, mask=mask)
+        w = tl.load(W_ptr + cols, mask=mask, other=0.0)
+        ms = tl.sum(s_f32 * s_f32, axis=0) / n_cols
+        rstd = rsqrt(ms + eps)
+        y = (s_f32 * rstd).to(dtype) * w
+        tl.store(Y_ptr + row * Y_stride + cols, y, mask=mask)
+
+    def triton_fused_add_rms_norm(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = x.shape
+        n_cols = shape[-1]
+        x2d = x.contiguous().view(-1, n_cols)
+        r2d = residual.contiguous().view(-1, n_cols)
+        w = weight.contiguous()
+        BLOCK_SIZE, num_warps = _calculate_settings(n_cols)
+        y = torch.empty_like(x2d)
+        s = torch.empty_like(x2d)
+        _fused_add_rms_norm_fwd_kernel[(x2d.shape[0],)](
+            y,
+            y.stride(0),
+            s,
+            s.stride(0),
+            x2d,
+            x2d.stride(0),
+            r2d,
+            r2d.stride(0),
+            w,
+            n_cols,
+            eps,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
+        return y.view(*shape), s.view(*shape)
+
+    _TRITON_AVAILABLE = True
+    logger.debug("OmniVoice Triton kernels loaded")
+except Exception:
+    logger.debug("Triton not available; using PyTorch fallback for OmniVoice kernels")
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +243,8 @@ class OmniVoiceRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _TRITON_AVAILABLE:
+            return triton_rms_norm(x, self.weight, self.eps)
         variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
         return self.weight * x.to(self.weight.dtype)
@@ -158,6 +340,8 @@ class OmniVoiceMLP(nn.Module):
         self.down_proj = nn.Linear(config.llm_intermediate_size, config.llm_hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _TRITON_AVAILABLE:
+            return self.down_proj(triton_swiglu(self.gate_proj(x), self.up_proj(x)))
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -181,13 +365,22 @@ class OmniVoiceTransformerBlock(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, attention_mask=attention_mask, cos=cos, sin=sin)
-        hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if _TRITON_AVAILABLE:
+            # Fused: (attn_out + residual) + RMSNorm in one kernel
+            hidden_states, residual = triton_fused_add_rms_norm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
         return hidden_states
 
 
@@ -220,6 +413,214 @@ def _apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor)
     x2 = x[..., x.shape[-1] // 2 :]
     rotated = torch.cat([-x2, x1], dim=-1)
     return x * torch.cat([cos, cos], dim=-1) + rotated * torch.cat([sin, sin], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# CUDA Graph wrapper
+# ---------------------------------------------------------------------------
+
+
+class _OmniVoiceCUDAGraphForward:
+    """Pre-captures CUDA graphs for predefined sequence-length buckets.
+
+    Memory layout: all graphs share a single per-instance pool handle, which
+    isolates OmniVoice CUDA memory from other vllm modules.  Sequential replay
+    (one step at a time) means pool sharing is safe.
+    """
+
+    # Default bucket count is 10; 16 gives modest headroom for edge cases
+    # (seq_len > max bucket or non-CFG batch) without unbounded GPU growth.
+    _MAX_LAZY_GRAPHS: int = 16
+
+    def __init__(self, generator: OmniVoiceGenerator, capture_sizes: list[int]) -> None:
+        self._gen = generator
+        self._capture_sizes = sorted(capture_sizes)
+        # Pre-warmed graphs keyed by (two_b, bucket); fixed set, never evicted.
+        self._graphs: dict[tuple[int, int], dict] = {}
+        # Lazy-captured graphs for oversized / non-CFG shapes; capped via LRU.
+        self._lazy_graphs: OrderedDict[tuple[int, int], dict] = OrderedDict()
+        self._lock = threading.Lock()
+        # Per-instance pool handle: isolates OmniVoice CUDA memory from other
+        # vllm modules while still allowing safe re-use across sequential replays.
+        self._pool_handle: int | None = None
+
+    def _find_bucket(self, seq_len: int) -> int | None:
+        for bucket in self._capture_sizes:
+            if bucket >= seq_len:
+                return bucket
+        return None
+
+    def _pad_inputs(
+        self,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        bucket: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        S = input_ids.shape[-1]
+        if S == bucket:
+            return input_ids, audio_mask, attention_mask
+
+        two_b = input_ids.shape[0]
+        num_cb = input_ids.shape[1]
+
+        ids_padded = torch.zeros(two_b, num_cb, bucket, dtype=input_ids.dtype, device=input_ids.device)
+        ids_padded[:, :, :S] = input_ids
+
+        mask_padded = torch.zeros(two_b, bucket, dtype=torch.bool, device=audio_mask.device)
+        mask_padded[:, :S] = audio_mask
+
+        if attention_mask is not None:
+            attn_padded = torch.zeros(
+                two_b,
+                1,
+                bucket,
+                bucket,
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            attn_padded[:, :, :S, :S] = attention_mask
+        else:
+            attn_padded = None
+
+        return ids_padded, mask_padded, attn_padded
+
+    def _capture_for_key(
+        self,
+        key: tuple[int, int],
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> dict:
+        _, bucket = key
+        device = input_ids.device
+
+        self._gen._ensure_rope(bucket, device)
+        model_dtype = self._gen.text_embedding.weight.dtype
+        static_cos = self._gen._rope_cos[:bucket].to(device=device, dtype=model_dtype).contiguous()
+        static_sin = self._gen._rope_sin[:bucket].to(device=device, dtype=model_dtype).contiguous()
+
+        static_input_ids = input_ids.clone()
+        static_audio_mask = audio_mask.clone()
+        static_attn_mask = attention_mask.clone() if attention_mask is not None else None
+
+        with torch.no_grad():
+            _ = self._gen._step_forward(
+                static_input_ids,
+                static_audio_mask,
+                static_attn_mask,
+                static_cos,
+                static_sin,
+            )
+        torch.accelerator.synchronize(device)
+
+        # Lazy-init per-instance pool handle: isolates OmniVoice CUDA Graph
+        # memory from other vllm modules (unlike get_global_graph_pool which
+        # shares a single pool across all captured graphs and can cause memory
+        # aliasing when two graphs replay concurrently).
+        if self._pool_handle is None:
+            self._pool_handle = torch.cuda.graph_pool_handle()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.no_grad():
+            with torch.cuda.graph(graph, pool=self._pool_handle):
+                static_output = self._gen._step_forward(
+                    static_input_ids,
+                    static_audio_mask,
+                    static_attn_mask,
+                    static_cos,
+                    static_sin,
+                )
+
+        entry = {
+            "graph": graph,
+            "static_input_ids": static_input_ids,
+            "static_audio_mask": static_audio_mask,
+            "static_attn_mask": static_attn_mask,
+            "static_cos": static_cos,
+            "static_sin": static_sin,
+            "static_output": static_output,
+        }
+        logger.info("OmniVoice CUDA Graph captured for key %s", key)
+        return entry
+
+    def warmup(self, device: torch.device) -> None:
+        """Pre-capture graphs for all bucket sizes with B=1 (two_b=2 for CFG)."""
+        if not torch.cuda.is_available():
+            return
+        logger.info(
+            "OmniVoice CUDA Graph warmup: capturing %d bucket sizes %s",
+            len(self._capture_sizes),
+            self._capture_sizes,
+        )
+        two_b = 2
+        num_cb = self._gen.config.num_audio_codebook
+        for bucket in self._capture_sizes:
+            key = (two_b, bucket)
+            dummy_ids = torch.zeros(two_b, num_cb, bucket, dtype=torch.long, device=device)
+            dummy_mask = torch.zeros(two_b, bucket, dtype=torch.bool, device=device)
+            dummy_attn = torch.ones(two_b, 1, bucket, bucket, dtype=torch.bool, device=device)
+            self._graphs[key] = self._capture_for_key(key, dummy_ids, dummy_mask, dummy_attn)
+        logger.info("OmniVoice CUDA Graph warmup complete (%d graphs)", len(self._graphs))
+
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if torch.cuda.is_current_stream_capturing():
+            seq_len = input_ids.shape[-1]
+            self._gen._ensure_rope(seq_len, input_ids.device)
+            dtype = self._gen.text_embedding.weight.dtype
+            cos = self._gen._rope_cos[:seq_len].to(device=input_ids.device, dtype=dtype)
+            sin = self._gen._rope_sin[:seq_len].to(device=input_ids.device, dtype=dtype)
+            return self._gen._step_forward(input_ids, audio_mask, attention_mask, cos, sin)
+
+        seq_len = input_ids.shape[-1]
+        two_b = input_ids.shape[0]
+        bucket = self._find_bucket(seq_len) if two_b == 2 else None
+
+        if bucket is None:
+            # Lazy capture: oversized sequence or non-unit batch (no pre-warmed bucket).
+            # Lock prevents concurrent threads from double-capturing the same key.
+            # _lazy_graphs is capped at _MAX_LAZY_GRAPHS with LRU eviction to
+            # prevent unbounded GPU memory growth when seq_len varies widely.
+            key = (two_b, seq_len)
+            ids_in, mask_in, attn_in = input_ids, audio_mask, attention_mask
+            with self._lock:
+                entry = self._lazy_graphs.get(key)
+                if entry is None:
+                    entry = self._capture_for_key(key, ids_in, mask_in, attn_in)
+                    if len(self._lazy_graphs) >= self._MAX_LAZY_GRAPHS:
+                        evicted_key, _ = self._lazy_graphs.popitem(last=False)
+                        logger.warning("OmniVoice CUDA Graph lazy cache full; evicted key %s", evicted_key)
+                    self._lazy_graphs[key] = entry
+        else:
+            key = (two_b, bucket)
+            ids_in, mask_in, attn_in = self._pad_inputs(input_ids, audio_mask, attention_mask, bucket)
+            with self._lock:
+                entry = self._graphs.get(key)
+                if entry is None:
+                    entry = self._capture_for_key(key, ids_in, mask_in, attn_in)
+                    self._graphs[key] = entry
+
+        entry["static_input_ids"].copy_(ids_in)
+        entry["static_audio_mask"].copy_(mask_in)
+        if attn_in is not None and entry["static_attn_mask"] is not None:
+            entry["static_attn_mask"].copy_(attn_in)
+
+        entry["graph"].replay()
+
+        output = entry["static_output"]
+        if bucket is not None and bucket != seq_len:
+            output = output[:, :, :seq_len, :]
+        return output
+
+    def clear(self) -> None:
+        with self._lock:
+            self._graphs.clear()
+            self._lazy_graphs.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +678,11 @@ class OmniVoiceGenerator(nn.Module):
         # Precompute RoPE
         self._rope_cos = None
         self._rope_sin = None
+
+        # CUDA Graph (bucket-size pre-capture; lazy fallback for oversized shapes)
+        self._cuda_graph_fwd: _OmniVoiceCUDAGraphForward | None = (
+            _OmniVoiceCUDAGraphForward(self, config.cuda_graph_capture_sizes) if config.enable_cuda_graph else None
+        )
 
     def _ensure_rope(self, seq_len: int, device: torch.device) -> None:
         """Lazily compute RoPE cos/sin if needed."""
@@ -364,6 +770,20 @@ class OmniVoiceGenerator(nn.Module):
             self.config.audio_vocab_size,
         ).permute(0, 2, 1, 3)  # [B, 8, S, 1025]
 
+    def _step_forward(
+        self,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Single unmasking-step forward using pre-cast RoPE tensors (CUDA graph safe)."""
+        hidden_states = self._prepare_embeddings(input_ids, audio_mask)
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask=attention_mask, cos=cos, sin=sin)
+        return self._get_logits(self.norm(hidden_states))
+
     @torch.inference_mode()
     def forward(
         self,
@@ -440,10 +860,12 @@ class OmniVoiceGenerator(nn.Module):
 
         # Main iterative loop
         for step in range(num_step):
-            # Prepare embeddings and run transformer
-            inputs_embeds = self._prepare_embeddings(input_ids, audio_mask)
-            hidden_states = self._transformer_forward(inputs_embeds, attention_mask)
-            batch_logits = self._get_logits(hidden_states).to(torch.float32)
+            if self._cuda_graph_fwd is not None and input_ids.is_cuda:
+                batch_logits = self._cuda_graph_fwd(input_ids, audio_mask, attention_mask).to(torch.float32)
+            else:
+                inputs_embeds = self._prepare_embeddings(input_ids, audio_mask)
+                hidden_states = self._transformer_forward(inputs_embeds, attention_mask)
+                batch_logits = self._get_logits(hidden_states).to(torch.float32)
             # batch_logits: [2*B, 8, S, 1025]
 
             for i in range(B):
@@ -586,3 +1008,6 @@ class OmniVoiceGenerator(nn.Module):
             )
         else:
             logger.info("Generator: all %d weights loaded", len(loaded_keys))
+
+        if self._cuda_graph_fwd is not None:
+            self._cuda_graph_fwd.warmup(device)

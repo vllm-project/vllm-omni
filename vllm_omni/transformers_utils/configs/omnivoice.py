@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """OmniVoice configuration for vLLM-Omni two-stage pipeline."""
 
+import os
+
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
@@ -80,6 +82,14 @@ class OmniVoiceConfig(PretrainedConfig):
 
         # Serving
         self.speculative_config = None
+        # Precedence: config.json > OMNIVOICE_CUDA_GRAPH env var > default (enabled).
+        # Read once at init; changing OMNIVOICE_CUDA_GRAPH at runtime has no effect.
+        self.enable_cuda_graph = getattr(self, "enable_cuda_graph", os.environ.get("OMNIVOICE_CUDA_GRAPH", "1") != "0")
+        self.cuda_graph_capture_sizes = getattr(
+            self,
+            "cuda_graph_capture_sizes",
+            [128, 192, 256, 320, 384, 448, 512, 640, 768, 1024],
+        )
 
 
 AutoConfig.register("omnivoice", OmniVoiceConfig)

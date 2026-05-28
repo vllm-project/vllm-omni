@@ -241,12 +241,15 @@ extend-ignore-identifiers-re = [
     ".*MoBA",
     ".*temperal_downsample",
     ".*_nd",
+    ".*nd$",
+    ".*EmbedND$",
     ".*nothink.*",
     ".*NOTHINK.*",
     ".*nin.*",
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
     ".*[Nn][Dd]3.*",
+    "byt5.*",
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
@@ -259,3 +262,4 @@ Vai = "Vai"
 tockens = "tockens"
 CANN = "CANN"
 ND = "ND"
+byt5 = "byt5"
