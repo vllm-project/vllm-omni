@@ -47,8 +47,8 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
 
-#Before #41804 issue fixed, PyTorch RMSNorm replaced vLLM RMSNorm for Qwen-Image.
-RMSNorm = nn.RMSNorm 
+# Before #41804 issue fixed, PyTorch RMSNorm replaced vLLM RMSNorm for Qwen-Image.
+RMSNorm = nn.RMSNorm
 
 
 class ImageRopePrepare(nn.Module):
