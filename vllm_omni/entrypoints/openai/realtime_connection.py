@@ -120,6 +120,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         full_text = ""
         prompt_token_ids_len = 0
         completion_tokens_len = 0
+        last_prompt_token_ids_len = 0  # detect Stage-0 segment rollover
         self._realtime_audio_ref = None
 
         # Coerce cumulative outputs to delta outputs; this ensures
@@ -143,6 +144,18 @@ class RealtimeConnection(VllmRealtimeConnection):
                     first_output = output.outputs[0]
                     new_token_ids = list(first_output.token_ids)
                     new_tokens_len = len(new_token_ids)
+
+                    cur_prompt_token_ids_len = len(output.prompt_token_ids or [])
+                    # Stage-0 segment rollover: buffer_realtime_audio may yield
+                    # multiple TokensPrompt segments and the second segment's
+                    # prompt_token_ids include the first segment's decoded output.
+                    # Clear accumulated full_text at the boundary so the
+                    # carried-over prefix is not duplicated in the final
+                    # TranscriptionDone.text.
+                    stage_id = getattr(output, "stage_id", None)
+                    if stage_id == 0 and cur_prompt_token_ids_len > last_prompt_token_ids_len > 0:
+                        full_text = ""
+                    last_prompt_token_ids_len = cur_prompt_token_ids_len
 
                     if not prompt_token_ids_len and output.prompt_token_ids:
                         prompt_token_ids_len = len(output.prompt_token_ids)

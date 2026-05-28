@@ -324,6 +324,16 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             "gate_proj",
             "up_proj",
         ],
+        "attn_qkv_proj": [
+            "attn_q_proj",
+            "attn_k_proj",
+            "attn_v_proj",
+        ],
+        "qkv": [
+            "q",
+            "k",
+            "v",
+        ],
     }
 
     @classmethod

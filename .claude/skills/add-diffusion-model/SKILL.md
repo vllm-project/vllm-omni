@@ -515,15 +515,15 @@ After adding parallelism support, update:
 
 ### Step 11: Add CPU Offload Support
 
-Implement `SupportsModuleOffload` on your pipeline class to enable
+Implement `SupportsComponentDiscovery` on your pipeline class to enable
 `--enable-cpu-offload` and `--enable-layerwise-offload`. The protocol
 declares which submodules the offloader should manage:
 
 ```python
 from typing import ClassVar
-from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 
-class YourPipeline(nn.Module, SupportsModuleOffload):
+class YourPipeline(nn.Module, SupportsComponentDiscovery):
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -540,7 +540,7 @@ class YourPipeline(nn.Module, SupportsModuleOffload):
 All attribute names support dotted paths for nested submodules
 (e.g. `"pipe.transformer"`, `"bagel.time_embedder"`).
 
-Pipelines without `SupportsModuleOffload` fall back to scanning
+Pipelines without `SupportsComponentDiscovery` fall back to scanning
 well-known attribute names (`transformer`, `text_encoder`, `vae`,
 etc.), which fails for non-standard names.
 

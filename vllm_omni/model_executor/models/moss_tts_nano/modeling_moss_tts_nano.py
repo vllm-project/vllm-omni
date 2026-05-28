@@ -160,7 +160,7 @@ class MossTTSNanoForGeneration(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         with self._lock:
             if self._lm is not None:
-                return set()
+                return None
             _patch_torchaudio_load()
 
             try:
@@ -233,7 +233,7 @@ class MossTTSNanoForGeneration(nn.Module):
         # iterator so the underlying stream is closed cleanly.
         for _ in weights:
             pass
-        return set()
+        return None
 
     # ------------------------------------------------------------------
     # Dummy run support

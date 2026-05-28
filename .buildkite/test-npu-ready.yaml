@@ -1,0 +1,21 @@
+steps:
+  - group: ":card_index_dividers: TTS Model Test"
+    key: ready-tts-group
+    depends_on: upload-ready-pipeline
+    steps:
+      - label: ":sound: TTS · Qwen3-TTS CustomVoice Test"
+        agents:
+          queue: "ascend-a2b3"
+          resource_class: "npu-1"
+        image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+        plugins:
+          - kubernetes:
+              podSpecPatch:
+                imagePullSecrets:
+                  - name: swr-secret
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m 'core_model' --run-level 'core_model'

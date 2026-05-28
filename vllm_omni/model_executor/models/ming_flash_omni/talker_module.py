@@ -30,6 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase, Qwen2Config, Qwen2Model, StaticCache
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb
 
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
@@ -479,7 +480,7 @@ class CFMGraphExecutor:
         self.sde_rnd_placeholder = torch.empty_like(sde_rnd)
 
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
+        with torch.cuda.graph(self.graph, pool=current_platform.get_global_graph_pool()):
             self.gen_lat_placeholder = self.cfm.sample(
                 self.last_hidden_state_placeholder,
                 self.his_lat_placeholder,

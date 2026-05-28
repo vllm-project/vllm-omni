@@ -102,6 +102,24 @@ def parse_args() -> argparse.Namespace:
         choices=["unipc", "euler"],
         help="Sampling solver for Wan2.2 pipelines. Use 'euler' for Lightning/Distill setups.",
     )
+    parser.add_argument(
+        "--diffusion-kv-cache-dtype",
+        type=str,
+        default=None,
+        help="Diffusion attention KV cache dtype (e.g. float8_e4m3fn). Separate from vLLM --kv-cache-dtype.",
+    )
+    parser.add_argument(
+        "--diffusion-kv-cache-skip-steps",
+        type=str,
+        default=None,
+        help="Diffusion KV-cache quantization skip-step selector, e.g. '0-9,20,25-30'.",
+    )
+    parser.add_argument(
+        "--diffusion-kv-cache-skip-layers",
+        type=str,
+        default=None,
+        help="Diffusion KV-cache quantization skip-layer selector, e.g. '0,1,4-8'.",
+    )
     parser.add_argument("--output", type=str, default="i2v_output.mp4", help="Path to save the video (mp4).")
     parser.add_argument("--fps", type=int, default=None, help="Frames per second for the output video.")
     parser.add_argument(
@@ -124,6 +142,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="Disable torch.compile and force eager execution.",
+    )
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=24000,
+        help="Sample rate for audio output when saved (default: 24000).",
+    )
+    parser.add_argument(
+        "--cache-backend",
+        type=str,
+        default=None,
+        choices=["cache_dit", "tea_cache"],
+        help=(
+            "Cache backend to use for acceleration. "
+            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
+            "Default: None (no cache acceleration)."
+        ),
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8", "gguf"],
+        help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
+    )
+
+    # Distributed and parallel execution
     parser.add_argument(
         "--ulysses-degree",
         type=int,
@@ -156,28 +210,6 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for VAE patch/tile parallelism (decode).",
     )
     parser.add_argument(
-        "--enforce-eager",
-        action="store_true",
-        help="Disable torch.compile and force eager execution.",
-    )
-    parser.add_argument(
-        "--audio-sample-rate",
-        type=int,
-        default=24000,
-        help="Sample rate for audio output when saved (default: 24000).",
-    )
-    parser.add_argument(
-        "--cache-backend",
-        type=str,
-        default=None,
-        choices=["cache_dit", "tea_cache"],
-        help=(
-            "Cache backend to use for acceleration. "
-            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
-            "Default: None (no cache acceleration)."
-        ),
-    )
-    parser.add_argument(
         "--use-hsdp",
         action="store_true",
         help=("Enable Hybrid Sharded Data Parallel to shard model weights across GPUs. "),
@@ -201,9 +233,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
+        "--pipeline-parallel-size",
+        type=int,
+        default=1,
+        help="Number of pipeline parallel stages.",
     )
     parser.add_argument(
         "--profiler-config",
@@ -301,14 +334,18 @@ def main():
         use_hsdp=args.use_hsdp,
         hsdp_shard_size=args.hsdp_shard_size,
         hsdp_replicate_size=args.hsdp_replicate_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
     )
-    omni = Omni(
+    omni_kwargs = dict(
         model=args.model,
         enable_layerwise_offload=args.enable_layerwise_offload,
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
+        diffusion_kv_cache_dtype=args.diffusion_kv_cache_dtype,
+        diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
+        diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
@@ -318,6 +355,9 @@ def main():
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
     )
+    if args.quantization is not None:
+        omni_kwargs["quantization"] = args.quantization
+    omni = Omni(**omni_kwargs)
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
@@ -330,9 +370,13 @@ def main():
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Frames: {args.num_frames}")
     print(f"  Solver: {args.sample_solver}")
+    print(f"  diffusion_kv_cache_dtype(config): {args.diffusion_kv_cache_dtype}")
+    print(f"  diffusion_kv_cache_skip_steps(config): {args.diffusion_kv_cache_skip_steps}")
+    print(f"  diffusion_kv_cache_skip_layers(config): {args.diffusion_kv_cache_skip_layers}")
     print(
         f"  Parallel configuration: cfg_parallel_size={args.cfg_parallel_size},"
-        f" tensor_parallel_size={args.tensor_parallel_size}, vae_patch_parallel_size={args.vae_patch_parallel_size}"
+        f" tensor_parallel_size={args.tensor_parallel_size}, vae_patch_parallel_size={args.vae_patch_parallel_size},"
+        f" pipeline_parallel_size={args.pipeline_parallel_size}"
     )
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
