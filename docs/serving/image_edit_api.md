@@ -53,7 +53,7 @@ result = client.images.edit(
     output_format='jpeg',
     # url格式
     extra_body={
-        "url": [input_image_url1,input_image_url],
+        "url": [input_image_url,input_image_url],
         "num_inference_steps": 50,
         "guidance_scale": 1,
         "seed": 777,
