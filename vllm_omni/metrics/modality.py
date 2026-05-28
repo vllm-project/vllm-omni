@@ -192,8 +192,6 @@ def observe_modality_at_finalize(
     replica_id: int | None,
     stage_metrics: Any,
     engine_outputs: Any,
-    request_arrival_ts: float,
-    finalize_ts: float,
 ) -> None:
     """Route audio-path observations for a finalized request.
 
@@ -216,11 +214,10 @@ def observe_modality_at_finalize(
     mm_out = _extract_mm_output(engine_outputs)
 
     sample_rate = defs.resolve_audio_sample_rate(mm_out)
-    # Prefer the accumulator on stage_metrics (kept by
-    # OrchestratorAggregator.record_audio_generated_frames where the
-    # per-chunk wiring is active); fall back to deriving from the
-    # multimodal_output payload directly so the audio family series fire
-    # even when the per-chunk accumulator path didn't run.
+    # `stage_metrics.audio_generated_frames` is the legacy per-chunk
+    # accumulator field on StageRequestStats. No production path currently
+    # fills it, so the fallback below is the live source — but we leave the
+    # field lookup in place in case the accumulator gets re-wired upstream.
     n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
     if n_frames == 0:
         n_frames = _count_audio_frames(mm_out)

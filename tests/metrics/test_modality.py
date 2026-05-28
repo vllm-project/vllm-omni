@@ -202,8 +202,6 @@ class TestObserveModalityAtFinalize:
             replica_id=0,
             stage_metrics=stage_metrics,
             engine_outputs=engine_outputs,
-            request_arrival_ts=100.0,
-            finalize_ts=100.5,
         )
         # 24000 frames / 24000 Hz = 1.0s duration; gen 0.5s → rtf 0.5
         assert ("inc_audio_frames", "1", "0", 24000) in stub.calls
@@ -223,8 +221,6 @@ class TestObserveModalityAtFinalize:
             replica_id=0,
             stage_metrics=_Bag(stage_gen_time_ms=300.0, audio_generated_frames=0),
             engine_outputs=_Bag(multimodal_output={}),
-            request_arrival_ts=100.0,
-            finalize_ts=100.3,
         )
         assert ("inc_audio_frames", "1", "0", 0) in stub.calls
         assert not any(c[0] == "observe_audio_duration" for c in stub.calls)
@@ -240,8 +236,6 @@ class TestObserveModalityAtFinalize:
             replica_id=0,
             stage_metrics=_Bag(stage_gen_time_ms=1000.0, audio_generated_frames=16000),
             engine_outputs=_Bag(multimodal_output={"sample_rate": 16000}),
-            request_arrival_ts=0.0,
-            finalize_ts=1.0,
         )
         assert ("observe_audio_duration", "1", "0", 1.0) in stub.calls
 
@@ -256,8 +250,6 @@ class TestObserveModalityAtFinalize:
                 replica_id=0,
                 stage_metrics=_Bag(stage_gen_time_ms=100.0),
                 engine_outputs=_Bag(),
-                request_arrival_ts=0.0,
-                finalize_ts=0.1,
             )
         assert stub.calls == []
 
@@ -270,8 +262,6 @@ class TestObserveModalityAtFinalize:
             replica_id=None,
             stage_metrics=_Bag(stage_gen_time_ms=500.0, audio_generated_frames=240),
             engine_outputs=_Bag(multimodal_output={}),
-            request_arrival_ts=0.0,
-            finalize_ts=0.5,
         )
         assert stub.calls == []
 
@@ -284,8 +274,6 @@ class TestObserveModalityAtFinalize:
             replica_id=0,
             stage_metrics=None,
             engine_outputs=_Bag(multimodal_output={}),
-            request_arrival_ts=0.0,
-            finalize_ts=0.5,
         )
         assert stub.calls == []
 

@@ -475,8 +475,6 @@ class OmniBase(PDDisaggregationMixin):
                     replica_id=result.replica_id,
                     stage_metrics=_m,
                     engine_outputs=engine_outputs,
-                    request_arrival_ts=req_start_ts.get(req_id, wall_start_ts),
-                    finalize_ts=now,
                 )
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
