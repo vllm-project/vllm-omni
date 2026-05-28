@@ -1041,7 +1041,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             if in_context_mode:
                 ref_code = None
                 if isinstance(voice_clone_prompt, dict):
-                    ref_code = _first(voice_clone_prompt.get("ref_code"), None)
+                    # Do NOT apply `_first(...)` here. `_first` unwraps the singleton-list
+                    # batching convention used at the top level of `additional_information`;
+                    # values inside `voice_clone_prompt` are per-item payloads. `ref_code`
+                    # is a `[num_frames, num_codebooks]` 2D list, so `_first` would strip
+                    # its outer dim and report `num_codebooks` (~8) instead of `num_frames`
+                    # (~hundreds), silently truncating the prefill embeddings downstream.
+                    ref_code = voice_clone_prompt.get("ref_code")
 
                 ref_code_len: int | None = None
                 if isinstance(ref_code, list):
