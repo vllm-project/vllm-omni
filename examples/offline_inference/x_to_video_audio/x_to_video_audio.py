@@ -4,6 +4,7 @@
 import argparse
 import re
 import time
+from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -42,6 +43,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for classifier free guidance parallel size (max 4 branches).",
     )
     parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help=("Number of GPUs used for tensor parallelism (TP) inside the DiT."),
+    )
+    parser.add_argument(
         "--video-negative-prompt",
         default="jitter, bad hands, blur, distortion",
         help="Negative prompt for video.",
@@ -52,6 +59,13 @@ def parse_args() -> argparse.Namespace:
         help="Negative prompt for audio.",
     )
     parser.add_argument("--output", default="dreamid_output.mp4", help="Output video path.")
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8", "int8"],
+        help=("Online (dynamic) quantization method for the DreamID-Omni transformer. "),
+    )
     parser.add_argument(
         "--enable-cpu-offload",
         action="store_true",
@@ -100,6 +114,27 @@ def load_image_and_audio(image_paths, audio_paths):
     return image, audio
 
 
+def _extract_peak_memory_mb(result: Any) -> float:
+    """Pull worker-reported peak VRAM (MiB) generation result.
+
+    Mirrors vllm_omni/entrypoints/openai/serving_video.py:_extract_peak_memory_mb.
+    """
+    if isinstance(result, list):
+        result = result[0] if result else None
+    if result is None:
+        return 0.0
+    val = getattr(result, "peak_memory_mb", 0.0)
+    if not val:
+        inner = getattr(result, "request_output", None)
+        if isinstance(inner, list):
+            inner = inner[0] if inner else None
+        val = getattr(inner, "peak_memory_mb", 0.0)
+    try:
+        return float(val or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def main() -> None:
     args = parse_args()
     if args.prompt is None and args.prompt_file is None:
@@ -142,6 +177,7 @@ def main() -> None:
 
     parallel_config = DiffusionParallelConfig(
         cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
         use_hsdp=args.use_hsdp,
         hsdp_shard_size=args.hsdp_shard_size,
         hsdp_replicate_size=args.hsdp_replicate_size,
@@ -162,7 +198,7 @@ def main() -> None:
             "scm_steps_policy": "dynamic",
         }
 
-    omni = Omni(
+    omni_kwargs = dict(
         model=args.model,
         parallel_config=parallel_config,
         model_type=args.model_type,
@@ -171,6 +207,9 @@ def main() -> None:
         cache_backend=args.cache_backend,
         cache_config=cache_config,
     )
+    if args.quantization is not None:
+        omni_kwargs["quantization"] = args.quantization
+    omni = Omni(**omni_kwargs)
     start = time.perf_counter()
     outputs = omni.generate(prompt, sampling_params)
     elapsed = time.perf_counter() - start
@@ -208,6 +247,9 @@ def main() -> None:
         f.write(video_bytes)
     print(f"Saved generated video to {output_path}")
     print(f"Total time: {elapsed:.2f}s")
+    peak_mb = _extract_peak_memory_mb(outputs)
+    if peak_mb:
+        print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
 
 
 if __name__ == "__main__":

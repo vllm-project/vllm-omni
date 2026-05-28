@@ -112,6 +112,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             num_computed_tokens = request.num_computed_tokens
             required_tokens = len(request.prompt_token_ids) - num_computed_tokens
+            if not self.scheduler_config.enable_chunked_prefill and required_tokens > token_budget:
+                # If chunked_prefill is disabled,
+                # we can stop the scheduling here.
+                break
+            # async_chunk: don't schedule placeholder tokens when no new chunk is available.
             if required_tokens <= 0:
                 if (
                     self.chunk_transfer_adapter is not None
@@ -213,7 +218,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self.chunk_transfer_adapter:
                 # Don't fall back: base scheduler doesn't handle async_chunk
                 # requests with empty prompt_token_ids.
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+                self.chunk_transfer_adapter.restore_queues(
+                    self.waiting,
+                    self.running,
+                    scheduler_requests=self.requests,
+                )
             else:
                 res = super().schedule()
                 if self.input_coordinator:
@@ -345,7 +354,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # otherwise they are permanently orphaned in the adapter's
             # internal deques and never scheduled again.
             if self.chunk_transfer_adapter:
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+                self.chunk_transfer_adapter.restore_queues(
+                    self.waiting,
+                    self.running,
+                    scheduler_requests=self.requests,
+                )
             if self.input_coordinator:
                 self.input_coordinator.restore_queues(self.waiting, self.running)
 
