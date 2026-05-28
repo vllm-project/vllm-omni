@@ -393,16 +393,19 @@ def test_nullify_stage_engine_defaults_resets_inherited_defaults():
 def test_non_override_flags_keep_real_defaults_after_nullify():
     import argparse
 
+    from vllm_omni.config.stage_config import deploy_override_field_names
     from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hsdp-shard-size", type=int, default=-1, help="HSDP shard size.")
+    parser.add_argument("--batch-timeout", type=int, default=10, help="Batch timeout.")
     parser.add_argument("--max-num-seqs", type=int, default=64, help="Max num seqs.")
     nullify_stage_engine_defaults(parser)
 
-    hsdp = next(a for a in parser._actions if a.dest == "hsdp_shard_size")
+    assert "batch_timeout" not in deploy_override_field_names()
+
+    batch_timeout = next(a for a in parser._actions if a.dest == "batch_timeout")
     max_num_seqs = next(a for a in parser._actions if a.dest == "max_num_seqs")
-    assert hsdp.default == -1
+    assert batch_timeout.default == 10
     assert max_num_seqs.default is None
 
 

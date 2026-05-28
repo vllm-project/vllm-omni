@@ -59,10 +59,18 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Scope full-payload connector init to Qwen3-Omni: other generation
-        # models (e.g. Bagel DiT) retain their pre-existing runner setup
-        # so this refactor does not perturb them.
-        if getattr(self.model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
+        # Mirrors the init allowlist in gpu_ar_model_runner.py.
+        _OMNI_CONNECTOR_INIT_ARCHS = {
+            "Qwen3OmniMoeForConditionalGeneration",
+            "Qwen2_5OmniForConditionalGeneration",
+            "CovoAudioForConditionalGeneration",
+            "MiMoAudioModel",
+            "Qwen3TTSTalkerForConditionalGeneration",
+            "Qwen3TTSCode2Wav",
+            "CosyVoice3Model",
+            "DyninOmniForConditionalGeneration",
+        }
+        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(
                 vllm_config=self.vllm_config,
                 model_config=self.model_config,
@@ -278,6 +286,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 slot_mappings=slot_mappings_by_group,
             )
+            self._maybe_attach_attention_metadata_extensions(
+                attn_metadata=attn_metadata,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                max_query_len=max_num_scheduled_tokens,
+                pad_attn=pad_attn,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+            )
 
             (
                 input_ids,
@@ -291,7 +307,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 num_tokens_padded,
                 intermediate_tensors,
             )
-
             # [Omni] Pass token counts per request for code2wav output slicing
             model_kwargs["seq_token_counts"] = tokens
 
@@ -729,6 +744,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
+                )
+                self._maybe_attach_attention_metadata_extensions(
+                    attn_metadata=attn_metadata,
+                    num_reqs=num_reqs_padded,
+                    num_reqs_padded=num_reqs_padded,
+                    max_query_len=max_query_len,
+                    pad_attn=True,
+                    for_cudagraph_capture=is_graph_capturing,
                 )
 
         with self.maybe_dummy_run_with_lora(

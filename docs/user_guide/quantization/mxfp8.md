@@ -7,26 +7,28 @@ using the OCP MX format: groups of 32 K-dimension elements share a single
 `float8_e8m0fnu` exponent scale. This gives better accuracy than channel-wise
 FP8 while keeping the same 8-bit weight footprint.
 
-This method supports two modes:
+This method supports three modes:
 
 | Mode | Description |
 |------|-------------|
 | **Online** | BF16 weights are quantized to MXFP8 at load time — no pre-processing needed |
-| **Offline** | msModelSlim-exported MXFP8 weights converted to diffusers format via `merge_mxfp8_checkpoint.py` — weights and scales are loaded directly from the preprocessed checkpoint |
+| **Offline (Native)** | msModelSlim-exported MXFP8 weights converted to diffusers format via `merge_mxfp8_checkpoint.py` — weights and scales are loaded directly from the preprocessed checkpoint |
+| **Offline (AutoRound)** | AutoRound MXFP8 checkpoints with `data_type="mx_fp"` — auto-detected from `config.json` |
 
 ## Hardware Support
 
-| Device | Support |
-|--------|---------|
-| NVIDIA Blackwell GPU (SM 100+) | ⭕ |
-| NVIDIA Ada/Hopper GPU (SM 89+) | ⭕ |
-| NVIDIA Ampere GPU (SM 80+) | ⭕ |
-| AMD ROCm | ⭕ |
-| Intel XPU | ⭕ |
-| Ascend NPU (Atlas 950 A5) | ✅ |
+| Device | Online | Offline (Native) | Offline (AutoRound) |
+|--------|--------|------------------|---------------------|
+| NVIDIA Blackwell GPU (SM 100+) | ⭕ | ⭕ | ⭕ |
+| NVIDIA Ada/Hopper GPU (SM 89+) | ⭕ | ⭕ | ⭕ |
+| NVIDIA Ampere GPU (SM 80+) | ⭕ | ⭕ | ⭕ |
+| AMD ROCm | ⭕ | ⭕ | ⭕ |
+| Intel XPU | ✅ | ❌ | ✅ |
+| Ascend NPU (Atlas 950 A5) | ✅ | ✅ | ⭕ |
 
-Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
-guide.
+Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
+
+**Note**: Intel XPU only supports AutoRound MXFP8 for offline mode. Use AutoRound quantized checkpoints or online mode for XPU.
 
 ## Model Type Support
 
@@ -82,9 +84,9 @@ python text_to_video.py --model <your-model> --quantization mxfp8
 vllm serve <your-model> --omni --quantization mxfp8
 ```
 
-### Offline Mode
+### Offline Mode (Native)
 
-Offline mode loads a pre-quantized checkpoint from msModelSlim. A preprocessing
+Native offline mode loads a pre-quantized checkpoint from msModelSlim. A preprocessing
 step converts the raw quantized output to the diffusers format expected by
 vLLM-Omni and injects the quantization config into `transformer/config.json` so
 that vLLM-Omni auto-detects the offline path without a `--quantization` flag.
@@ -159,9 +161,40 @@ omni = Omni(model="/path/to/Wan2.2-TI2V-5B-MXFP8")
 ```
 
 !!! note
-    No `--quantization` flag is needed for offline mode. The preprocessing
+    No `--quantization` flag is needed for native offline mode. The preprocessing
     script injects `quantization_config` into each `transformer/config.json`,
     which vLLM-Omni reads automatically to activate the offline MXFP8 method.
+
+### Offline Mode (AutoRound)
+
+AutoRound MXFP8 checkpoints declare `quant_method="auto-round"` with `data_type="mx_fp"` in their `config.json`. These are automatically detected and use the `IncMxfp8OfflineLinearMethod` backend.
+
+To use an AutoRound MXFP8 checkpoint:
+
+```bash
+python text_to_video.py --model <autoround-mxfp8-model>
+
+# Online serving
+vllm serve <autoround-mxfp8-model> --omni
+```
+
+Python API:
+
+```python
+omni = Omni(model="<autoround-mxfp8-model>")
+```
+
+!!! note
+    AutoRound MXFP8 checkpoints are auto-detected from `config.json` and do not require a `--quantization` flag. The config must include:
+    ```json
+    {
+      "quantization_config": {
+        "quant_method": "auto-round",
+        "data_type": "mx_fp",
+        ...
+      }
+    }
+    ```
 
 ## Parameters
 

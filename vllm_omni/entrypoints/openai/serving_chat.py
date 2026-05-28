@@ -4,6 +4,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Any, Final, cast
@@ -410,8 +411,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         engine_prompt_image = None
 
                 # Override the prompts produced by chat-template preprocessing.
+                is_img2img = engine_prompt_image is not None
                 tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
-                if engine_prompt_image:
+                if is_img2img:
                     tprompt["modalities"] = ["img2img"]
                 else:
                     tprompt["modalities"] = ["image"]
@@ -428,6 +430,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     mm_processor_kwargs["target_h"] = height
                 if width is not None:
                     mm_processor_kwargs["target_w"] = width
+                # Pass output modalities so model-specific MM processors can
+                # detect image-generation requests and apply their own prompt
+                # rewrites (e.g. query-token expansion, placeholder injection).
+                mm_processor_kwargs["modalities"] = ["img2img"] if is_img2img else ["image"]
                 tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:
                     tprompt["multi_modal_data"] = engine_prompt_image
@@ -441,6 +447,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         else [f"{request_id}-{k}-0"]
                         for k, v in engine_prompt_image.items()
                     }
+
+                # Forward image_gen extra_args from diffusion-stage sampling
+                # params into the prompt dict so that thinker2imagegen can
+                # access them (e.g. byte5_text for ByT5 glyph rendering).
+                if hasattr(request, "sampling_params_list") and request.sampling_params_list:
+                    for sp_raw in request.sampling_params_list:
+                        ea = (
+                            (sp_raw.get("extra_args") or {})
+                            if isinstance(sp_raw, dict)
+                            else (getattr(sp_raw, "extra_args", None) or {})
+                        )
+                        ig = ea.get("image_gen") or {}
+                        if ig:
+                            tprompt["image_gen_extra_args"] = ig
+                            break
 
                 engine_prompts = [tprompt]
                 # Store height/width for applying to diffusion stage sampling params later
@@ -770,13 +791,31 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[SamplingParams]:
-        final_sampling_params_list = []
-        for sampling_params in sampling_params_list:
+    def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[Any]:
+        """Convert request dicts to stage-typed sampling params objects.
+
+        For diffusion stages, build ``OmniDiffusionSamplingParams`` so
+        downstream ``StageDiffusionClient._sampling_params_to_dict`` (which
+        requires a dataclass) works. For LLM stages build ``SamplingParams``.
+        """
+        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        final_sampling_params_list: list[Any] = []
+        for idx, sampling_params in enumerate(sampling_params_list):
+            stage_type = get_stage_type(stage_configs[idx]) if idx < len(stage_configs) else "llm"
+            target_cls = OmniDiffusionSamplingParams if stage_type == "diffusion" else SamplingParams
             if isinstance(sampling_params, dict):
-                final_sampling_params_list.append(SamplingParams(**sampling_params))
-            elif isinstance(sampling_params, SamplingParams):
+                final_sampling_params_list.append(target_cls(**sampling_params))
+            elif isinstance(sampling_params, target_cls):
                 final_sampling_params_list.append(sampling_params)
+            elif isinstance(sampling_params, SamplingParams | OmniDiffusionSamplingParams):
+                # Cross-typed (e.g. user passed SamplingParams but this is a
+                # diffusion stage) — rebuild via a dict round-trip so we end
+                # up with the correct target class.
+                as_dict = {
+                    f.name: getattr(sampling_params, f.name)
+                    for f in (fields(sampling_params) if is_dataclass(sampling_params) else [])
+                } or sampling_params.__dict__
+                final_sampling_params_list.append(target_cls(**as_dict))
             else:
                 raise ValueError(f"Invalid sampling params: {sampling_params}")
         return final_sampling_params_list

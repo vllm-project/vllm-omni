@@ -173,6 +173,199 @@ class TestStageConfig:
         for name in deploy_override_field_names() - {"devices"}:
             assert name not in engine_args
 
+    def test_to_omegaconf_diffusion_parallel_overrides_replace_nested_values(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "parallel_config": {
+                    "pipeline_parallel_size": 1,
+                    "data_parallel_size": 1,
+                    "tensor_parallel_size": 4,
+                    "enable_expert_parallel": False,
+                    "ulysses_degree": 1,
+                    "ring_degree": 1,
+                    "ulysses_mode": "strict",
+                    "sequence_parallel_size": 1,
+                    "cfg_parallel_size": 1,
+                    "vae_patch_parallel_size": 1,
+                    "use_hsdp": False,
+                    "hsdp_shard_size": -1,
+                    "hsdp_replicate_size": 1,
+                }
+            },
+            runtime_overrides={
+                "pipeline_parallel_size": 2,
+                "data_parallel_size": 3,
+                "tensor_parallel_size": 8,
+                "enable_expert_parallel": True,
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+                "ulysses_mode": "advanced_uaa",
+                "sequence_parallel_size": 8,
+                "cfg_parallel_size": 2,
+                "vae_patch_parallel_size": 2,
+                "use_hsdp": True,
+                "hsdp_shard_size": 8,
+                "hsdp_replicate_size": 2,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.engine_args.parallel_config.pipeline_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.data_parallel_size == 3
+        assert omega_config.engine_args.parallel_config.tensor_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.enable_expert_parallel is True
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.ulysses_mode == "advanced_uaa"
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.cfg_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.vae_patch_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.use_hsdp is True
+        assert omega_config.engine_args.parallel_config.hsdp_shard_size == 8
+        assert omega_config.engine_args.parallel_config.hsdp_replicate_size == 2
+        assert "pipeline_parallel_size" not in omega_config.engine_args
+        assert "data_parallel_size" not in omega_config.engine_args
+        assert "tensor_parallel_size" not in omega_config.engine_args
+        assert "enable_expert_parallel" not in omega_config.engine_args
+        assert "ulysses_degree" not in omega_config.engine_args
+        assert "ring_degree" not in omega_config.engine_args
+        assert "ulysses_mode" not in omega_config.engine_args
+        assert "sequence_parallel_size" not in omega_config.engine_args
+        assert "cfg_parallel_size" not in omega_config.engine_args
+        assert "vae_patch_parallel_size" not in omega_config.engine_args
+        assert "use_hsdp" not in omega_config.engine_args
+        assert "hsdp_shard_size" not in omega_config.engine_args
+        assert "hsdp_replicate_size" not in omega_config.engine_args
+
+    def test_to_omegaconf_diffusion_parallel_overrides_create_parallel_config(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            runtime_overrides={
+                "pipeline_parallel_size": 2,
+                "data_parallel_size": 3,
+                "tensor_parallel_size": 8,
+                "enable_expert_parallel": True,
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+                "ulysses_mode": "advanced_uaa",
+                "sequence_parallel_size": 8,
+                "cfg_parallel_size": 2,
+                "vae_patch_parallel_size": 2,
+                "use_hsdp": True,
+                "hsdp_shard_size": 8,
+                "hsdp_replicate_size": 2,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.engine_args.parallel_config.pipeline_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.data_parallel_size == 3
+        assert omega_config.engine_args.parallel_config.tensor_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.enable_expert_parallel is True
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.ulysses_mode == "advanced_uaa"
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.cfg_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.vae_patch_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.use_hsdp is True
+        assert omega_config.engine_args.parallel_config.hsdp_shard_size == 8
+        assert omega_config.engine_args.parallel_config.hsdp_replicate_size == 2
+        assert "pipeline_parallel_size" not in omega_config.engine_args
+        assert "data_parallel_size" not in omega_config.engine_args
+        assert "tensor_parallel_size" not in omega_config.engine_args
+        assert "enable_expert_parallel" not in omega_config.engine_args
+        assert "ulysses_degree" not in omega_config.engine_args
+        assert "ring_degree" not in omega_config.engine_args
+        assert "ulysses_mode" not in omega_config.engine_args
+        assert "sequence_parallel_size" not in omega_config.engine_args
+        assert "cfg_parallel_size" not in omega_config.engine_args
+        assert "vae_patch_parallel_size" not in omega_config.engine_args
+        assert "use_hsdp" not in omega_config.engine_args
+        assert "hsdp_shard_size" not in omega_config.engine_args
+        assert "hsdp_replicate_size" not in omega_config.engine_args
+
+    def test_to_omegaconf_diffusion_parallel_degree_overrides_recompute_sequence_parallel_size(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "parallel_config": {
+                    "sequence_parallel_size": 1,
+                    "ulysses_degree": 1,
+                    "ring_degree": 1,
+                }
+            },
+            runtime_overrides={
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 8
+        assert "ulysses_degree" not in omega_config.engine_args
+        assert "ring_degree" not in omega_config.engine_args
+        assert "sequence_parallel_size" not in omega_config.engine_args
+
+    def test_to_omegaconf_diffusion_parallel_explicit_sequence_parallel_size_is_preserved(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "parallel_config": {
+                    "sequence_parallel_size": 1,
+                    "ulysses_degree": 1,
+                    "ring_degree": 1,
+                }
+            },
+            runtime_overrides={
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+                "sequence_parallel_size": 16,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 16
+
+    def test_to_omegaconf_llm_parallel_overrides_remain_top_level(self):
+        config = StageConfig(
+            stage_id=0,
+            model_stage="thinker",
+            stage_type=StageType.LLM,
+            runtime_overrides={
+                "pipeline_parallel_size": 2,
+                "data_parallel_size": 3,
+                "tensor_parallel_size": 8,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.engine_args.pipeline_parallel_size == 2
+        assert omega_config.engine_args.data_parallel_size == 3
+        assert omega_config.engine_args.tensor_parallel_size == 8
+        assert "pipeline_parallel_size" in omega_config.engine_args
+        assert "data_parallel_size" in omega_config.engine_args
+        assert "tensor_parallel_size" in omega_config.engine_args
+        assert "parallel_config" not in omega_config.engine_args
+
 
 class TestModelPipeline:
     """Tests for ModelPipeline class."""
@@ -828,17 +1021,14 @@ class TestDeployConfigLoading:
     def test_deploy_override_fields_include_deploy_schema_fields(self):
         expected_fields = {
             "async_chunk",
+            # StageDeployConfig: stage placement and runtime fields.
+            "devices",
+            # StageDeployConfig: vLLM EngineArgs fields.
             "async_scheduling",
             "compilation_config",
             "config_format",
-            "data_parallel_size",
-            "devices",
             "disable_hybrid_kv_cache_manager",
-            "distributed_executor_backend",
-            "dtype",
-            "enable_chunked_prefill",
             "enable_flashinfer_autotune",
-            "enable_prefix_caching",
             "enforce_eager",
             "gpu_memory_utilization",
             "load_format",
@@ -846,13 +1036,30 @@ class TestDeployConfigLoading:
             "max_num_batched_tokens",
             "max_num_seqs",
             "mm_processor_cache_gb",
-            "pipeline_parallel_size",
             "profiler_config",
-            "quantization",
             "skip_mm_profiling",
             "subtalker_sampling_params",
             "tensor_parallel_size",
             "tokenizer_mode",
+            # StageDeployConfig: diffusion parallel_config deploy override fields.
+            "cfg_parallel_size",
+            "enable_expert_parallel",
+            "hsdp_replicate_size",
+            "hsdp_shard_size",
+            "ring_degree",
+            "sequence_parallel_size",
+            "ulysses_degree",
+            "ulysses_mode",
+            "use_hsdp",
+            "vae_patch_parallel_size",
+            # DeployConfig: pipeline-wide engine settings.
+            "data_parallel_size",
+            "distributed_executor_backend",
+            "dtype",
+            "enable_chunked_prefill",
+            "enable_prefix_caching",
+            "pipeline_parallel_size",
+            "quantization",
             "trust_remote_code",
         }
 
@@ -1634,12 +1841,19 @@ class TestSentinelDefaultPrecedence:
         )
         assert async_stages[1].custom_process_input_func is None
 
-        # async_chunk=False → stage 0 has no streaming processor, stage 1's
-        # batch-end processor wires up.
+        # async_chunk=False → stage 0 ships the bulk codec via the
+        # worker-connector full-payload producer; stage 1 wires the
+        # ``_token_only`` placeholder so the orchestrator emits no
+        # legacy ``additional_information``-shaped input (PR3 sync-
+        # via-connector data plane).
         sync_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
-        assert "custom_process_next_stage_input_func" not in sync_stages[0].yaml_engine_args
+        assert (
+            sync_stages[0]
+            .yaml_engine_args["custom_process_next_stage_input_func"]
+            .endswith("talker2code2wav_full_payload")
+        )
         assert sync_stages[1].custom_process_input_func is not None
-        assert sync_stages[1].custom_process_input_func.endswith("talker2code2wav")
+        assert sync_stages[1].custom_process_input_func.endswith("talker2code2wav_token_only")
 
     def test_async_chunk_dispatches_qwen3_omni_processors(self):
         import runpy
@@ -1674,6 +1888,44 @@ class TestSentinelDefaultPrecedence:
             sync_stages[1]
             .yaml_engine_args["custom_process_next_stage_input_func"]
             .endswith("talker2code2wav_full_payload")
+        )
+
+    def test_ming_flash_omni_topology(self):
+        """Guard ming_flash_omni's PR3 cleanup: stage 0 has no full-payload
+        producer hook (the connector path was removed as fake -- arch is not
+        in ``_FULL_PAYLOAD_INPUT_STAGES``), and stage 1 still wires the
+        legacy ``thinker2talker`` (custom_process_input_func) plus the
+        ``thinker2talker_token_only`` placeholder (sync_process_input_func).
+        Merge under either async_chunk mode must not re-introduce a
+        stage-0 full-payload hook."""
+        from vllm_omni.config.stage_config import DeployConfig, merge_pipeline_deploy
+
+        pipeline = _PIPELINE_REGISTRY["ming_flash_omni"]
+
+        stage0, stage1 = pipeline.stages
+        assert stage0.custom_process_next_stage_input_func is None, (
+            "ming_flash_omni stage 0 must not declare a full-payload producer "
+            "(connector path is not active for this arch)."
+        )
+        assert stage1.custom_process_input_func is not None
+        assert stage1.custom_process_input_func.endswith("thinker2talker")
+        assert stage1.sync_process_input_func is not None
+        assert stage1.sync_process_input_func.endswith("thinker2talker_token_only")
+
+        # async_chunk=True must now be rejected: removing the fake hook means
+        # there is no next-stage input processor for the validator to accept.
+        # (Positive consequence -- users can't accidentally enable async_chunk
+        # on an arch that doesn't actually support it.)
+        import pytest as _pytest
+
+        with _pytest.raises(ValueError, match="async_chunk=True"):
+            merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=True))
+
+        # async_chunk=False merges cleanly and stage-0 yaml_engine_args carries
+        # no spurious full-payload hook.
+        merged = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
+        assert "custom_process_next_stage_input_func" not in merged[0].yaml_engine_args, (
+            "stage-0 full-payload hook unexpectedly re-appeared in yaml_engine_args"
         )
 
 

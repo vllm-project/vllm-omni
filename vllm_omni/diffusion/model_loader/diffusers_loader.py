@@ -301,10 +301,25 @@ class DiffusersPipelineLoader:
         if load_format is None:
             load_format = "default"
         self.od_config = od_config
-        # CPU offload + FP8: load weights on device for FP8 quantization
+        # CPU offload + quantization: for offline-quantized models (e.g., AutoRound MXFP8),
+        # weights are already quantized in the checkpoint — load directly on CPU.
+        # For online quantization, load on device so quantization can run on accelerator,
+        # then move back to CPU afterward.
+        offload_after_quant = False
         if load_device == "cpu" and od_config.quantization_config is not None:
-            load_device = device.type
-            logger.info(f"Quantization enabled with CPU offload, using {load_device} for weight loading")
+            quant_cfg = od_config.quantization_config
+            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
+                quant_cfg, "is_checkpoint_quantized", False
+            )
+            if not is_offline:
+                load_device = device.type
+                offload_after_quant = True
+                logger.info(
+                    "Online quantization with CPU offload, using %s for weight loading (will offload back to CPU)",
+                    load_device,
+                )
+            else:
+                logger.info("Offline-quantized model with CPU offload, loading weights directly on CPU")
 
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):
@@ -313,19 +328,34 @@ class DiffusersPipelineLoader:
                     od_config, target_device=device, load_format=load_format, custom_pipeline_name=custom_pipeline_name
                 )
             else:
-                with target_device:
-                    if load_format == "default":
-                        model = initialize_model(od_config)
-                    elif load_format == "diffusers":
-                        model = DiffusersAdapterPipeline(od_config=od_config, device=target_device)
-                    elif load_format == "custom_pipeline":
-                        from vllm_omni.diffusion.config import set_current_diffusion_config
+                if load_format == "custom_pipeline":
+                    # NOTE: Custom pipelines call HuggingFace `from_pretrained(...).to(device)`
+                    # internally. If we construct them under `with target_device:` (CUDA),
+                    # safetensors takes a direct-to-GPU fast path that calls `cudaMalloc`
+                    # via the driver API and BYPASSES PyTorch's caching allocator.
+                    # That makes those bytes invisible to CuMemAllocator, so `sleep()`
+                    # cannot offload/unmap them and GPU memory stays pinned.
+                    #
+                    # Fix: build the custom pipeline on CPU first (no default device
+                    # context), then explicitly move it to the target device. The
+                    # subsequent `.to(target_device)` issues `torch.empty(..., device=cuda)`
+                    # + `copy_`, which goes through the caching allocator and is fully
+                    # tracked by CuMemAllocator.
+                    from vllm_omni.diffusion.config import set_current_diffusion_config
 
-                        model_cls = resolve_obj_by_qualname(custom_pipeline_name)
-                        with set_current_diffusion_config(od_config):
-                            model = model_cls(od_config=od_config)
-                    else:
-                        raise ValueError(f"Unknown load_format: {load_format}")
+                    model_cls = resolve_obj_by_qualname(custom_pipeline_name)
+                    with set_current_diffusion_config(od_config):
+                        model = model_cls(od_config=od_config)
+                    if target_device.type != "cpu":
+                        model.to(target_device)
+                else:
+                    with target_device:
+                        if load_format == "default":
+                            model = initialize_model(od_config)
+                        elif load_format == "diffusers":
+                            model = DiffusersAdapterPipeline(od_config=od_config, device=target_device)
+                        else:
+                            raise ValueError(f"Unknown load_format: {load_format}")
                 logger.debug("Loading weights on %s ...", load_device)
                 if load_format == "diffusers":
                     # DiffusersAdapterPipeline.load_weights() calls
@@ -341,6 +371,10 @@ class DiffusersPipelineLoader:
             # Process weights after loading for quantization (e.g., FP8 online quantization)
             # This is needed for vLLM's quantization methods that need to transform weights
             self._process_weights_after_loading(model, target_device)
+
+            if offload_after_quant:
+                model.to("cpu")
+                logger.info("Quantization complete, offloaded model back to CPU")
 
         return model.eval()
 

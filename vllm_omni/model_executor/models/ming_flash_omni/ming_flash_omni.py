@@ -126,15 +126,21 @@ class MingFlashOmniForConditionalGeneration(
             self.make_empty_intermediate_tensors = self.thinker.make_empty_intermediate_tensors
 
         elif self.model_stage == "imagegen":
-            # TODO: Implement image generator stage
+            # Image generation is a separate diffusion stage; it does not run
+            # through this AR wrapper. See
+            # ``vllm_omni/diffusion/models/ming_flash_omni/pipeline_ming_imagegen.py``
+            # and ``model_arch: MingImagePipeline`` in the stage YAML.
             raise NotImplementedError(
-                "Image generation stage is not yet implemented. Please use model_stage='thinker' for now."
+                "Image generation stage is not implemented in this AR wrapper. "
+                "Use stage_type: diffusion with model_arch: MingImagePipeline "
+                "for the imagegen stage (see stage_configs/ming_flash_omni.yaml)."
             )
 
         else:
             raise ValueError(
                 f"Invalid model_stage: {self.model_stage!r}. Must be one of: 'thinker', 'imagegen'. "
-                f"For the talker stage, use MingFlashOmniTalkerForConditionalGeneration directly."
+                f"For the talker stage, use MingFlashOmniTalkerForConditionalGeneration directly. "
+                f"For image generation use stage_type: diffusion with model_arch: MingImagePipeline."
             )
 
     def forward(
@@ -177,9 +183,43 @@ class MingFlashOmniForConditionalGeneration(
         raise NotImplementedError("get_mrope_input_positions not available on current stage")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stripped = ((name.removeprefix("thinker."), value) for name, value in weights)
-        thinker_loaded = self.thinker.load_weights(stripped)
-        return add_prefix_to_loaded_weights(thinker_loaded, "thinker")
+        loaded_weights: set[str] = set()
+        thinker_weights: list[tuple[str, torch.Tensor]] = []
+
+        for name, value in weights:
+            if name.startswith("thinker."):
+                thinker_weights.append((name, value))
+            elif name.startswith("imagegen."):
+                # Imagegen weights are loaded by MingImagePipeline (diffusion
+                # stage) from its own checkpoint subfolders; silently drop
+                # them here so the AR wrapper does not try to load them.
+                continue
+            elif name.startswith("talker."):
+                # Talker weights are loaded by
+                # MingFlashOmniTalkerForConditionalGeneration directly; drop.
+                continue
+            else:
+                # Weights without prefix go to thinker by default
+                thinker_weights.append((name, value))
+
+        if self.model_stage == "thinker" and thinker_weights:
+            stripped = ((name.removeprefix("thinker."), value) for name, value in thinker_weights)
+            thinker_loaded = self.thinker.load_weights(stripped)
+            thinker_loaded = add_prefix_to_loaded_weights(thinker_loaded, "thinker")
+            loaded_weights.update(thinker_loaded)
+
+            # ``query_tokens_dict.*`` parameters are pre-loaded inside
+            # ``MingFlashOmniThinker.__init__`` from
+            # ``<model>/mlp/model.safetensors`` (not the main shard index),
+            # so vllm's default loader does not see them via the standard
+            # ``load_weights`` path. Report them as loaded here to satisfy the
+            # post-load completeness check.
+            query_tokens_module = getattr(self.thinker, "query_tokens_dict", None)
+            if query_tokens_module is not None:
+                for scale_name, _param in query_tokens_module.items():
+                    loaded_weights.add(f"thinker.query_tokens_dict.{scale_name}")
+
+        return loaded_weights
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

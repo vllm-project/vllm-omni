@@ -37,6 +37,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_cfg_group,
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -44,6 +50,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .pipeline_ltx2 import (
     _get_prompt_field,
+    _VideoAudioScheduler,
     calculate_shift,
     create_transformer_from_config,
     load_transformer_config,
@@ -104,7 +111,7 @@ def get_ltx2_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class LTX23Pipeline(nn.Module, ProgressBarMixin):
+class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
     """Fully independent LTX-2.3 pipeline.
 
     Key differences from LTX2Pipeline:
@@ -114,6 +121,9 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
     - Transformer: passes sigma for prompt_adaln
     - CPU offloading: text encoder, connectors, VAE, vocoder stay on CPU
     """
+
+    # Audio is diffused jointly with video; warmup must size audio tokens.
+    support_audio_output = True
 
     def __init__(
         self,
@@ -550,6 +560,12 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
             return latents.to(device=device, dtype=dtype), original_latent_length, padded_latent_length
 
         shape = (batch_size, num_channels_latents, padded_latent_length, latent_mel_bins)
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
+
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         latents = self._pack_audio_latents(latents)
         return latents, original_latent_length, padded_latent_length
@@ -631,6 +647,121 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
         if callable(cache_context):
             return cache_context(context_name)
         return nullcontext()
+
+    # ------------------------------------------------------------------
+    # CFG helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _combine_x0_space_cfg(
+        sample: torch.Tensor,
+        positive_noise_pred: torch.Tensor,
+        negative_noise_pred: torch.Tensor,
+        sigma: torch.Tensor,
+        guidance_scale: float,
+    ) -> torch.Tensor:
+        x0_cond = sample - positive_noise_pred * sigma
+        x0_uncond = sample - negative_noise_pred * sigma
+        x0_guided = x0_cond + (guidance_scale - 1) * (x0_cond - x0_uncond)
+        return (sample - x0_guided) / sigma
+
+    def predict_noise(self, **kwargs):
+        with self._transformer_cache_context("cond_uncond"):
+            noise_pred_video, noise_pred_audio = self.transformer(**kwargs)
+        return noise_pred_video.float(), noise_pred_audio.float()
+
+    def combine_cfg_noise(
+        self,
+        positive_noise_pred,
+        negative_noise_pred,
+        true_cfg_scale,
+        cfg_normalize=False,
+        *,
+        video_latents: torch.Tensor | None = None,
+        audio_latents: torch.Tensor | None = None,
+        video_sigma: torch.Tensor | None = None,
+        audio_sigma: torch.Tensor | None = None,
+    ):
+        if video_latents is None or audio_latents is None or video_sigma is None or audio_sigma is None:
+            raise ValueError("LTX23Pipeline applies CFG in x0-space and requires video/audio latents and sigmas.")
+
+        video_pos, audio_pos = positive_noise_pred
+        video_neg, audio_neg = negative_noise_pred
+        video_combined = self._combine_x0_space_cfg(
+            video_latents,
+            video_pos,
+            video_neg,
+            video_sigma,
+            true_cfg_scale,
+        )
+        audio_combined = self._combine_x0_space_cfg(
+            audio_latents,
+            audio_pos,
+            audio_neg,
+            audio_sigma,
+            true_cfg_scale,
+        )
+        if cfg_normalize:
+            video_combined = self.cfg_normalize_function(video_pos, video_combined)
+            audio_combined = self.cfg_normalize_function(audio_pos, audio_combined)
+        return video_combined, audio_combined
+
+    def predict_noise_with_parallel_cfg(
+        self,
+        true_cfg_scale: float,
+        positive_kwargs: dict[str, Any],
+        negative_kwargs: dict[str, Any],
+        cfg_normalize: bool = True,
+        output_slice: int | None = None,
+        *,
+        video_latents: torch.Tensor | None = None,
+        audio_latents: torch.Tensor | None = None,
+        video_sigma: torch.Tensor | None = None,
+        audio_sigma: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        def maybe_slice(pred: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+            if output_slice is None:
+                return pred
+            return pred[0][:, :output_slice], pred[1][:, :output_slice]
+
+        cfg_world_size = get_classifier_free_guidance_world_size()
+        if cfg_world_size != 2:
+            raise ValueError(f"LTX23Pipeline parallel CFG requires cfg_parallel_size 2, but got {cfg_world_size}.")
+
+        cfg_group = get_cfg_group()
+        cfg_rank = get_classifier_free_guidance_rank()
+        branch_kwargs = positive_kwargs if cfg_rank == 0 else negative_kwargs
+        local_video_pred, local_audio_pred = maybe_slice(self.predict_noise(**branch_kwargs))
+
+        gathered_video = cfg_group.all_gather(local_video_pred, separate_tensors=True)
+        gathered_audio = cfg_group.all_gather(local_audio_pred, separate_tensors=True)
+        positive_noise_pred = (gathered_video[0], gathered_audio[0])
+        negative_noise_pred = (gathered_video[1], gathered_audio[1])
+
+        return self.combine_cfg_noise(
+            positive_noise_pred,
+            negative_noise_pred,
+            true_cfg_scale,
+            cfg_normalize,
+            video_latents=video_latents,
+            audio_latents=audio_latents,
+            video_sigma=video_sigma,
+            audio_sigma=audio_sigma,
+        )
+
+    def _synchronize_cfg_parallel_step_output(
+        self,
+        latents: tuple[torch.Tensor, torch.Tensor],
+        do_true_cfg: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not (do_true_cfg and get_classifier_free_guidance_world_size() > 1):
+            return latents
+
+        latents = tuple(tensor.contiguous() for tensor in latents)
+        device = next((tensor.device for tensor in latents if tensor.is_cuda), None)
+        if device is not None:
+            torch.cuda.current_stream(device).synchronize()
+        return latents
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -750,6 +881,12 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
         self._attention_kwargs = attention_kwargs
         self._interrupt = False
         self._current_timestep = None
+        cfg_world_size = get_classifier_free_guidance_world_size()
+        if self.do_classifier_free_guidance and cfg_world_size not in (1, 2):
+            raise ValueError(
+                f"LTX23Pipeline supports CFG parallelism with cfg_parallel_size 1 or 2, but got {cfg_world_size}."
+            )
+        cfg_parallel_ready = self.do_classifier_free_guidance and cfg_world_size > 1
 
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
@@ -795,6 +932,21 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
         self.connectors.to("cpu")
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
+
+        positive_connector_prompt_embeds = connector_prompt_embeds
+        positive_connector_audio_prompt_embeds = connector_audio_prompt_embeds
+        positive_connector_attention_mask = connector_attention_mask
+        negative_connector_prompt_embeds = None
+        negative_connector_audio_prompt_embeds = None
+        negative_connector_attention_mask = None
+        if self.do_classifier_free_guidance:
+            split_batch = batch_size * num_videos_per_prompt
+            negative_connector_prompt_embeds = connector_prompt_embeds[:split_batch]
+            positive_connector_prompt_embeds = connector_prompt_embeds[split_batch:]
+            negative_connector_audio_prompt_embeds = connector_audio_prompt_embeds[:split_batch]
+            positive_connector_audio_prompt_embeds = connector_audio_prompt_embeds[split_batch:]
+            negative_connector_attention_mask = connector_attention_mask[:split_batch]
+            positive_connector_attention_mask = connector_attention_mask[split_batch:]
 
         # ---- Prepare latents ----
         latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
@@ -851,6 +1003,7 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
             self.scheduler.config.get("max_shift", 2.05),
         )
         audio_scheduler = copy.deepcopy(self.scheduler)
+        video_audio_scheduler = _VideoAudioScheduler(self.scheduler, audio_scheduler)
         _ = retrieve_timesteps(audio_scheduler, num_inference_steps, device, timesteps, sigmas=sigmas, mu=mu)
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
@@ -877,9 +1030,9 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
             audio_latents.device,
         )
 
-        # ---- CFG: duplicate coords for batch=2 ----
+        # ---- CFG: duplicate coords for single-rank batch=2 CFG ----
         # Connector outputs are already batch=2 (neg+pos concatenated before connector call)
-        if self.do_classifier_free_guidance:
+        if self.do_classifier_free_guidance and not cfg_parallel_ready:
             video_coords = video_coords.repeat((2,) + (1,) * (video_coords.ndim - 1))
             audio_coords = audio_coords.repeat((2,) + (1,) * (audio_coords.ndim - 1))
 
@@ -894,60 +1047,112 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
 
                 self._current_timestep = t
 
-                # Duplicate latents for CFG (uncond + cond)
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                latent_model_input = latent_model_input.to(connector_prompt_embeds.dtype)
-                audio_latent_model_input = (
-                    torch.cat([audio_latents] * 2) if self.do_classifier_free_guidance else audio_latents
-                )
-                audio_latent_model_input = audio_latent_model_input.to(connector_prompt_embeds.dtype)
-                ts = t.expand(latent_model_input.shape[0])
-
-                with self._transformer_cache_context("cond_uncond"):
-                    noise_pred_video, noise_pred_audio = self.transformer(
-                        hidden_states=latent_model_input,
-                        audio_hidden_states=audio_latent_model_input,
-                        encoder_hidden_states=connector_prompt_embeds,
-                        audio_encoder_hidden_states=connector_audio_prompt_embeds,
-                        timestep=ts,
-                        sigma=ts,  # LTX-2.3: sigma for prompt_adaln
-                        encoder_attention_mask=connector_attention_mask,
-                        audio_encoder_attention_mask=connector_attention_mask,
-                        num_frames=latent_num_frames,
-                        height=latent_height,
-                        width=latent_width,
-                        fps=frame_rate,
-                        audio_num_frames=padded_audio_num_frames,
-                        video_coords=video_coords,
-                        audio_coords=audio_coords,
-                        attention_kwargs=attention_kwargs,
-                        return_dict=False,
+                if cfg_parallel_ready:
+                    latent_model_input = latents.to(positive_connector_prompt_embeds.dtype)
+                    audio_latent_model_input = audio_latents.to(positive_connector_prompt_embeds.dtype)
+                    ts = t.expand(latent_model_input.shape[0])
+                    positive_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "audio_hidden_states": audio_latent_model_input,
+                        "encoder_hidden_states": positive_connector_prompt_embeds,
+                        "audio_encoder_hidden_states": positive_connector_audio_prompt_embeds,
+                        "timestep": ts,
+                        "sigma": ts,
+                        "encoder_attention_mask": positive_connector_attention_mask,
+                        "audio_encoder_attention_mask": positive_connector_attention_mask,
+                        "num_frames": latent_num_frames,
+                        "height": latent_height,
+                        "width": latent_width,
+                        "fps": frame_rate,
+                        "audio_num_frames": padded_audio_num_frames,
+                        "video_coords": video_coords,
+                        "audio_coords": audio_coords,
+                        "attention_kwargs": attention_kwargs,
+                        "return_dict": False,
+                    }
+                    negative_kwargs = {
+                        **positive_kwargs,
+                        "encoder_hidden_states": negative_connector_prompt_embeds,
+                        "audio_encoder_hidden_states": negative_connector_audio_prompt_embeds,
+                        "encoder_attention_mask": negative_connector_attention_mask,
+                        "audio_encoder_attention_mask": negative_connector_attention_mask,
+                    }
+                    noise_pred_video, noise_pred_audio = self.predict_noise_with_parallel_cfg(
+                        true_cfg_scale=guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                        video_latents=latents,
+                        audio_latents=audio_latents,
+                        video_sigma=self.scheduler.sigmas[i],
+                        audio_sigma=audio_scheduler.sigmas[i],
                     )
 
-                noise_pred_video = noise_pred_video.float()
-                noise_pred_audio = noise_pred_audio.float()
+                    latents, audio_latents = self.scheduler_step_maybe_with_cfg(
+                        (noise_pred_video, noise_pred_audio),
+                        (t, t),
+                        (latents, audio_latents),
+                        do_true_cfg=self.do_classifier_free_guidance,
+                        per_request_scheduler=video_audio_scheduler,
+                    )
+                    latents, audio_latents = self._synchronize_cfg_parallel_step_output(
+                        (latents, audio_latents),
+                        do_true_cfg=self.do_classifier_free_guidance,
+                    )
+                else:
+                    latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                    latent_model_input = latent_model_input.to(connector_prompt_embeds.dtype)
+                    audio_latent_model_input = (
+                        torch.cat([audio_latents] * 2) if self.do_classifier_free_guidance else audio_latents
+                    )
+                    audio_latent_model_input = audio_latent_model_input.to(connector_prompt_embeds.dtype)
+                    ts = t.expand(latent_model_input.shape[0])
 
-                # CFG in x0-space (delta formulation matching diffusers)
-                if self.do_classifier_free_guidance:
-                    noise_pred_video_uncond, noise_pred_video_cond = noise_pred_video.chunk(2)
-                    # Convert velocity to x0: x0 = sample - velocity * sigma
-                    x0_video_cond = latents - noise_pred_video_cond * self.scheduler.sigmas[i]
-                    x0_video_uncond = latents - noise_pred_video_uncond * self.scheduler.sigmas[i]
-                    video_cfg_delta = (guidance_scale - 1) * (x0_video_cond - x0_video_uncond)
-                    x0_video_guided = x0_video_cond + video_cfg_delta
+                    with self._transformer_cache_context("cond_uncond"):
+                        noise_pred_video, noise_pred_audio = self.transformer(
+                            hidden_states=latent_model_input,
+                            audio_hidden_states=audio_latent_model_input,
+                            encoder_hidden_states=connector_prompt_embeds,
+                            audio_encoder_hidden_states=connector_audio_prompt_embeds,
+                            timestep=ts,
+                            sigma=ts,  # LTX-2.3: sigma for prompt_adaln
+                            encoder_attention_mask=connector_attention_mask,
+                            audio_encoder_attention_mask=connector_attention_mask,
+                            num_frames=latent_num_frames,
+                            height=latent_height,
+                            width=latent_width,
+                            fps=frame_rate,
+                            audio_num_frames=padded_audio_num_frames,
+                            video_coords=video_coords,
+                            audio_coords=audio_coords,
+                            attention_kwargs=attention_kwargs,
+                            return_dict=False,
+                        )
 
-                    noise_pred_audio_uncond, noise_pred_audio_cond = noise_pred_audio.chunk(2)
-                    x0_audio_cond = audio_latents - noise_pred_audio_cond * audio_scheduler.sigmas[i]
-                    x0_audio_uncond = audio_latents - noise_pred_audio_uncond * audio_scheduler.sigmas[i]
-                    audio_cfg_delta = (guidance_scale - 1) * (x0_audio_cond - x0_audio_uncond)
-                    x0_audio_guided = x0_audio_cond + audio_cfg_delta
+                    noise_pred_video = noise_pred_video.float()
+                    noise_pred_audio = noise_pred_audio.float()
 
-                    # Convert x0 back to velocity: v = (sample - x0) / sigma
-                    noise_pred_video = (latents - x0_video_guided) / self.scheduler.sigmas[i]
-                    noise_pred_audio = (audio_latents - x0_audio_guided) / audio_scheduler.sigmas[i]
+                    if self.do_classifier_free_guidance:
+                        noise_pred_video_uncond, noise_pred_video_cond = noise_pred_video.chunk(2)
+                        noise_pred_video = self._combine_x0_space_cfg(
+                            latents,
+                            noise_pred_video_cond,
+                            noise_pred_video_uncond,
+                            self.scheduler.sigmas[i],
+                            guidance_scale,
+                        )
 
-                latents = self.scheduler.step(noise_pred_video, t, latents, return_dict=False)[0]
-                audio_latents = audio_scheduler.step(noise_pred_audio, t, audio_latents, return_dict=False)[0]
+                        noise_pred_audio_uncond, noise_pred_audio_cond = noise_pred_audio.chunk(2)
+                        noise_pred_audio = self._combine_x0_space_cfg(
+                            audio_latents,
+                            noise_pred_audio_cond,
+                            noise_pred_audio_uncond,
+                            audio_scheduler.sigmas[i],
+                            guidance_scale,
+                        )
+
+                    latents = self.scheduler.step(noise_pred_video, t, latents, return_dict=False)[0]
+                    audio_latents = audio_scheduler.step(noise_pred_audio, t, audio_latents, return_dict=False)[0]
 
                 pbar.update()
 
