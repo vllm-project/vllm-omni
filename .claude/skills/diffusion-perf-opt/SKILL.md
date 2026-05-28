@@ -21,6 +21,9 @@ Before proposing changes, ask for the optimization scene if it is not already kn
 - Current enabled strategies: USP/SP, CFG parallel, HSDP/FSDP, VAE patch parallel, torch.compile, profiler options.
 - Optimization target: latency, throughput, memory, cost, or quality-preserving speed.
 - Precision/quality tolerance: bf16/fp8/quantization/sparsity/approximate attention allowed or not.
+- Quality validation method: exact-output comparison when feasible, or metrics
+  such as SSIM, PSNR, LPIPS, cosine similarity, MAE, MSE, temporal flicker
+  checks, baseline self-run variance, and reviewable output artifacts.
 
 ## Workflow
 
@@ -79,7 +82,19 @@ Before proposing changes, ask for the optimization scene if it is not already kn
    - Record latency, stage timings, memory, output quality, and logs.
    - Report comparison tables in ms. Include at least end-to-end client time, server `inference_time`, server stage generation time if available, `vae.encode`, `diffuse`, `vae.decode`, and peak memory.
 
-6. **Collect diagnostic trace only after narrowing hypotheses.**
+6. **Enforce the quality and precision gate for every optimization.**
+   - Do not mark an optimization ready until quality is checked on the same
+     workload: model, prompt/media, seed, shape, steps, scheduler, dtype,
+     backend, parallelism, and output encoding.
+   - For math-preserving changes, require exact/near-exact agreement or show
+     that differences are within baseline self-run variance.
+   - For precision, quantization, approximate attention, sparse/custom kernels,
+     or backend changes, include reviewable artifacts and metrics such as SSIM,
+     PSNR, LPIPS, cosine similarity, MAE, MSE, and temporal flicker checks.
+   - If quality tolerance is not stated, default to quality-preserving behavior.
+     Failed or inconclusive quality validation blocks a ready-to-merge claim.
+
+7. **Collect diagnostic trace only after narrowing hypotheses.**
    - Use torch profiler for a small number of requests.
    - Run two separate diagnostic traces instead of mixing concerns:
      - **Operator/shape trace**: enable `torch_profiler_record_shapes=True` and keep stack collection disabled. Use this to rank CUDA kernels, NCCL collectives, attention/MLP/norm/RoPE work, and shape-specific hot operators.
@@ -91,15 +106,16 @@ Before proposing changes, ask for the optimization scene if it is not already kn
    - Diagnostic reports must be written to disk and preserve: server command, profiler config, warmup/request/polling commands, trace artifact paths, rank analyzed, analyzer output or summary, and the decision about whether additional ranks are necessary.
    - Analyze both rank-level balance and device-level free bubbles when additional ranks are opened.
 
-7. **Analyze host, communication, and operators.**
+8. **Analyze host, communication, and operators.**
    - Find GPU idle/free intervals and map each large gap to the enclosing CPU/Python code.
    - Separate real GPU idle from profiler overhead such as CUPTI `Command Buffer Full`.
    - Compare NCCL kernel time to user annotations; annotations can overcount nested intervals.
    - Rank operator work by total CUDA time and by repeated small-kernel launch count.
 
-8. **Produce an optimization plan.**
+9. **Produce an optimization plan.**
    - Classify candidates as P0/P1/P2.
    - For each candidate, state necessity, expected benefit, implementation path, validation plan, and quality risk.
+   - Include a concrete quality/precision validation gate for each candidate.
    - Do not implement high-risk operator rewrites before proving the operator is a bottleneck for the target shapes.
    - End the plan with a user-facing candidate selection table. The assistant
      should not automatically choose a risky optimization just because it is
@@ -124,7 +140,13 @@ Before proposing changes, ask for the optimization scene if it is not already kn
 - **P1:** meaningful code changes with contained risk. Examples: cross-attention KV caching, VAE gather/broadcast reduction, AdaLayerNorm/RMSNorm/RoPE fusion after trace evidence.
 - **P2:** high implementation or quality risk. Examples: FA to LA replacement, custom Triton/CUDA fused kernels, FP8/quantization, sparsity/Rainfusion-style acceleration.
 
-Every implemented optimization needs A/B validation and quality regression. A/B means same workload and hardware before/after. Quality regression means checking generated image/video stability, artifacts, temporal flicker, and seed behavior when precision or approximate kernels change.
+Every implemented optimization needs A/B validation and a passing
+quality/precision gate, including math-preserving changes such as padding trim,
+layout cleanup, cache reuse, or host/runtime cleanup. Use objective metrics
+when available, keep reviewable artifacts, and compare against baseline
+self-run variance for precision, quantization, approximate kernels, or backend
+changes. If quality validation fails or is inconclusive, do not present the
+optimization as ready to merge.
 
 ## Optimization Layers
 

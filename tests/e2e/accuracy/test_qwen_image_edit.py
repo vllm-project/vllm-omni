@@ -20,7 +20,7 @@ pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 
 SINGLE_MODEL = "Qwen/Qwen-Image-Edit"
-MULTIPLE_MODEL = "Qwen/Qwen-Image-Edit-2509"
+MULTIPLE_MODEL = "Qwen/Qwen-Image-Edit-2511"
 WIDTH = 512
 HEIGHT = 512
 NUM_INFERENCE_STEPS = 20

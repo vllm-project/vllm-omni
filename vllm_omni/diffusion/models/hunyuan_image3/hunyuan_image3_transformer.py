@@ -891,6 +891,7 @@ class ImageKVCacheManager:
         # cache related
         self.image_token_len: int = image_token_len
         self.image_kv_cache_map: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.image_kv_cache_lens: torch.Tensor | None = None
         self._injected_ar_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         self.sp_size = get_sequence_parallel_world_size()
@@ -904,12 +905,23 @@ class ImageKVCacheManager:
             prefix=f"{prefix}.attn" if prefix else "",
         )
 
+    @staticmethod
+    def _get_current_starts(
+        gen_timestep_scatter_index: torch.Tensor | None,
+        ar_kv_len: int = 0,
+    ) -> torch.Tensor:
+        assert gen_timestep_scatter_index is not None, (
+            "`gen_timestep_scatter_index` is required to locate the generated image timestep token for image KV reuse."
+        )
+        return gen_timestep_scatter_index[:, -1].to(dtype=torch.long) + ar_kv_len
+
     def _cache_prompt_kv(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
         seq_len: int,
         shard_image_size: int | None = None,
+        gen_timestep_scatter_index: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Cache prompt KV on first_step. Consumes _injected_ar_kv.
 
@@ -939,12 +951,26 @@ class ImageKVCacheManager:
             key = torch.cat(new_keys, dim=0)
             value = torch.cat(new_values, dim=0)
 
-        image_size = shard_image_size if self.sp_size > 1 else (self.image_token_len + 1)
-        cached_prompt_len = seq_len - image_size
+        cached_prompt_lens = self._get_current_starts(gen_timestep_scatter_index, ar_kv_len)
+        assert torch.all(cached_prompt_lens <= key.shape[1]), (
+            f"cached_prompt_lens({cached_prompt_lens.tolist()}) must be <= key length({key.shape[1]})"
+        )
+        if shard_image_size is not None:
+            expected_prompt_len = seq_len - shard_image_size
+            assert torch.all(cached_prompt_lens == expected_prompt_len), (
+                f"cached_prompt_lens({cached_prompt_lens.tolist()}) != "
+                f"seq_len({seq_len}) - shard_image_size({shard_image_size})"
+            )
 
-        cached_key = key[:, :cached_prompt_len].reshape(-1, num_kv_heads, head_dim)
-        cached_value = value[:, :cached_prompt_len].reshape(-1, num_kv_heads, head_dim)
+        max_cached_prompt_len = int(cached_prompt_lens.max().item())
+        cached_key = key.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
+        cached_value = value.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
+        for b in range(bs):
+            cached_prompt_len = int(cached_prompt_lens[b].item())
+            cached_key[b, :cached_prompt_len] = key[b, :cached_prompt_len]
+            cached_value[b, :cached_prompt_len] = value[b, :cached_prompt_len]
         self.image_kv_cache_map = (cached_key, cached_value)
+        self.image_kv_cache_lens = cached_prompt_lens
         return key, value
 
     def _reuse_prompt_kv(
@@ -954,42 +980,36 @@ class ImageKVCacheManager:
         seq_len: int,
         bs: int,
         shard_image_size: int | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Reuse cached prompt KV in subsequent denoising steps.
 
-        Non-SP: returns [cached_prompt, new_image, zero_eoi] shaped [bs, seq_len, ...].
-        SP: returns cached prompt only shaped [bs, cached_prompt_len, ...] (used as joint_text).
+        Non-SP: concatenates cached prompt KV with current image KV.
+        SP: returns cached prompt KV only (used as joint_text).
         """
         cached_key, cached_value = self.image_kv_cache_map
-        _, q_len, num_kv_heads, head_dim = key.shape
-        cached_prompt_len = cached_key.shape[0] // bs
+        _, q_len, _, _ = key.shape
+        assert cached_key.dim() == 4 and cached_key.shape[0] == bs
+        max_cached_prompt_len = cached_key.shape[1]
 
         if shard_image_size is not None:
-            assert cached_prompt_len == seq_len - q_len
-            result_k = cached_key.reshape(bs, cached_prompt_len, num_kv_heads, head_dim)
-            result_v = cached_value.reshape(bs, cached_prompt_len, num_kv_heads, head_dim)
-            return result_k.contiguous(), result_v.contiguous()
+            assert max_cached_prompt_len + q_len == seq_len, (
+                f"max_cached_prompt_len({max_cached_prompt_len}) + q_len({q_len}) != seq_len({seq_len})"
+            )
+            return cached_key.contiguous(), cached_value.contiguous()
 
-        assert cached_prompt_len + 1 == seq_len - q_len, f"{cached_prompt_len + 1} != {seq_len - q_len}"
-
-        key = key.reshape(-1, num_kv_heads, head_dim)
-        value = value.reshape(-1, num_kv_heads, head_dim)
-        zero_eoi = torch.zeros(1, num_kv_heads, head_dim, device=key.device, dtype=key.dtype)
-
-        new_key, new_value = [], []
-        for b in range(bs):
-            cache_base = b * cached_prompt_len
-            img_base = b * q_len
-            new_key.append(cached_key[cache_base : cache_base + cached_prompt_len])
-            new_key.append(key[img_base : img_base + q_len])
-            new_key.append(zero_eoi)
-            new_value.append(cached_value[cache_base : cache_base + cached_prompt_len])
-            new_value.append(value[img_base : img_base + q_len])
-            new_value.append(zero_eoi)
-
-        new_key = torch.cat(new_key).reshape(bs, seq_len, num_kv_heads, head_dim)
-        new_value = torch.cat(new_value).reshape(bs, seq_len, num_kv_heads, head_dim)
+        assert max_cached_prompt_len + q_len == seq_len, (
+            f"max_cached_prompt_len({max_cached_prompt_len}) + q_len({q_len}) != seq_len({seq_len})"
+        )
+        assert self.image_kv_cache_lens is not None
+        if position_ids is not None:
+            assert position_ids.shape == (bs, q_len)
+            assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens), (
+                "The first current position must immediately follow each sample's cached prompt KV."
+            )
+        new_key = torch.cat([cached_key, key], dim=1)
+        new_value = torch.cat([cached_value, value], dim=1)
         return new_key.contiguous(), new_value.contiguous()
 
     def _build_neg_ar_kv(
@@ -1032,7 +1052,7 @@ class ImageKVCacheManager:
 
         query_lens = kwargs.get("query_lens")
         seq_lens = kwargs.get("seq_lens")
-        shard_image_size = kwargs.get("shard_image_size")
+        shard_image_size = kwargs.get("shard_image_size") if self.sp_size > 1 else None
         bs = len(query_lens)
         q_len = query_lens[0]
         seq_len = seq_lens[0]
@@ -1058,7 +1078,14 @@ class ImageKVCacheManager:
                 value = value[:, :0, :, :]
         elif first_step:
             self.image_kv_cache_map = None  # reset first
-            key, value = self._cache_prompt_kv(key, value, seq_len, shard_image_size)
+            self.image_kv_cache_lens = None
+            key, value = self._cache_prompt_kv(
+                key,
+                value,
+                seq_len,
+                shard_image_size,
+                kwargs.get("gen_timestep_scatter_index"),
+            )
             if self.sp_size > 1:
                 local_prompt_len = seq_len - shard_image_size
                 join_query_len = query.shape[1] - shard_image_size
@@ -1070,7 +1097,7 @@ class ImageKVCacheManager:
                 value = value[:, local_prompt_len:, :, :]
         else:
             if self.sp_size <= 1:
-                key, value = self._reuse_prompt_kv(key, value, seq_len, bs)
+                key, value = self._reuse_prompt_kv(key, value, seq_len, bs, position_ids=kwargs.get("position_ids"))
             else:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
@@ -1814,6 +1841,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             custom_pos_emb=custom_pos_emb,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
@@ -1878,12 +1906,21 @@ class HunyuanImagePreprocessor(nn.Module):
         image_token_len: int,
         is_first_step: bool = False,
         uncond_cfg_prefill: bool = False,
+        gen_timestep_scatter_index: torch.Tensor | None = None,
     ):
         # ---------- compute prompt length ----------
         if uncond_cfg_prefill:
             prompt_len = hidden_states.shape[1]
         elif is_first_step:
-            prompt_len = hidden_states.shape[1] - image_token_len - 1
+            assert gen_timestep_scatter_index is not None, (
+                "`gen_timestep_scatter_index` is required to split prompt and "
+                "generated image tokens for sequence parallel image generation."
+            )
+            prompt_lens = gen_timestep_scatter_index[:, -1]
+            assert torch.all(prompt_lens == prompt_lens[0]), (
+                "Sequence parallel image generation requires the generated timestep position to match across the batch."
+            )
+            prompt_len = int(prompt_lens[0].item())
         else:
             prompt_len = 0
 
@@ -2327,6 +2364,7 @@ class HunyuanImage3Model(nn.Module):
                 num_image_tokens,
                 first_step,
                 uncond_cfg_prefill=uncond_cfg_prefill,
+                gen_timestep_scatter_index=gen_timestep_scatter_index,
             )
             assert len(set(query_lens)) == 1 and len(set(seq_lens)) == 1, (
                 "query_lens and seq_lens must be the same for sequence parallel"
@@ -2334,15 +2372,15 @@ class HunyuanImage3Model(nn.Module):
             prompt_size = text_hidden_states.shape[1]
             shard_image_size = image_hidden_states.shape[1]
 
-            if first_step:  # [image tokens, last token]
-                shard_padding_size = shard_image_size * sp_world_size - (num_image_tokens + 1)
-            else:  # [image tokens, last token]
+            if first_step:
+                shard_padding_size = shard_image_size * sp_world_size - (origin_query_len - prompt_size)
+            else:
                 shard_padding_size = shard_image_size * sp_world_size - num_image_tokens
             if first_step:
                 seq_lens = [prompt_size + shard_image_size + ar_kv_reuse_len for _ in seq_lens]
             else:
                 seq_lens = [x - y for x, y in zip(seq_lens, query_lens)]
-                seq_lens = [seq_len + shard_image_size - 1 for seq_len in seq_lens]
+                seq_lens = [seq_len + shard_image_size for seq_len in seq_lens]
             query_lens = [prompt_size + shard_image_size for _ in query_lens]
 
             if prompt_size > 0:
@@ -2356,10 +2394,6 @@ class HunyuanImage3Model(nn.Module):
                 hidden_states = image_hidden_states
                 position_ids = image_position_ids
                 custom_pos_emb = (image_custom_pos_emb_sin, image_custom_pos_emb_cos)
-
-            if not first_step:
-                assert torch.all(~attention_mask[..., -1]), "The last token should not be attended to"
-                attention_mask = attention_mask[..., :-1]  # we attention without last token
 
             if shard_padding_size > 0:
                 B, H, Q, K = attention_mask.shape
@@ -3091,15 +3125,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # Scheduler step (all ranks compute locally in CFG parallel)
                 latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
                 if i != len(timesteps) - 1 and should_compute:
-                    offset = model_kwargs.get("ar_kv_reuse_offset", 0)
                     model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa
                         model_output,
                         model_kwargs,
                     )
-                    if input_ids.shape[1] != model_kwargs["position_ids"].shape[1]:
-                        # Select using relative positions
-                        index = model_kwargs["position_ids"] - offset
-                        input_ids = torch.gather(input_ids, 1, index=index)
+                    input_ids = None
                     attention_mask = model_kwargs.get("attention_mask")
                     b, _, q_len1, seq_len = attention_mask.shape
                     query_lens = [q_len1] * b
