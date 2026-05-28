@@ -4,7 +4,6 @@ import base64
 import copy
 import hashlib
 import io
-import os
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from functools import lru_cache
@@ -16,14 +15,14 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer
+from transformers import AutoFeatureExtractor, AutoTokenizer
 from transformers.activations import ACT2FN
-from transformers.utils.hub import cached_file
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
 from vllm.multimodal.audio import AudioResampler
@@ -36,7 +35,8 @@ from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
-from .qwen3_tts_tokenizer import Qwen3TTSTokenizer
+from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
+from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Encoder
 
 logger = init_logger(__name__)
 
@@ -459,7 +459,23 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         # Tokenizer for prompt building.
         self._tokenizer = None
-        self._speech_tokenizer: Qwen3TTSTokenizer | None = None
+
+        tokenizer_config = Qwen3TTSTokenizerV2Config.from_pretrained(
+            self.model_path,
+            subfolder="speech_tokenizer",
+        )
+        self.encoder = Qwen3TTSTokenizerV2Encoder._from_config(
+            tokenizer_config.encoder_config,
+        )
+        self.encoder.eval()
+        self.encoder.to(dtype=torch.bfloat16)
+        self._encoder_valid_num_quantizers = int(tokenizer_config.encoder_valid_num_quantizers)
+        self._encoder_downsample_rate = int(tokenizer_config.encode_downsample_rate)
+
+        self._encoder_feature_extractor = AutoFeatureExtractor.from_pretrained(
+            self.model_path,
+            subfolder="speech_tokenizer",
+        )
 
         self._speaker_cache = get_speaker_cache()
         self._ref_audio_artifact_cache_max_entries = 256
@@ -1393,53 +1409,35 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         cache[key] = cached
         return cached
 
-    def _ensure_speech_tokenizer_loaded(self) -> Qwen3TTSTokenizer:
-        if self._speech_tokenizer is not None:
-            return self._speech_tokenizer
-        speech_tokenizer_path = cached_file(self.model_path, "speech_tokenizer/config.json")
-        if speech_tokenizer_path is None:
-            raise ValueError(f"{self.model_path}/speech_tokenizer/config.json not found")
-        # Ensure the HF feature extractor config is present. Transformers'
-        # AutoFeatureExtractor does not proactively fetch this file.
-        preprocessor_config_path = cached_file(self.model_path, "speech_tokenizer/preprocessor_config.json")
-        if preprocessor_config_path is None:
-            raise ValueError(f"{self.model_path}/speech_tokenizer/preprocessor_config.json not found")
-        speech_tokenizer_dir = os.path.dirname(speech_tokenizer_path)
-        tok = Qwen3TTSTokenizer.from_pretrained(
-            speech_tokenizer_dir,
-            torch_dtype=torch.bfloat16,
-        )
-        # Only move encoder to GPU; the decoder is unused by Talker (which
-        # only calls tok.encode()) and would otherwise waste bf16 VRAM.
-        # NOTE: after this point the tokenizer instance is encode-only;
-        # calling tok.decode() will fail because tok.model.decoder is None.
-        dev = next(self.parameters()).device
-        if dev.type != "cpu":
-            try:
-                del tok.model.decoder
-                tok.model.decoder = None
-                tok.model.encoder.to(dev)
-                tok.device = dev
-            except Exception as e:
-                raise RuntimeError(f"Failed to move speech tokenizer encoder to {dev}: {e}") from e
-        else:
-            tok.device = dev
-        self._speech_tokenizer = tok
-        return tok
+    def _encode_ref_audio_batch(self, wavs: list[np.ndarray], sr: int, *, device: torch.device) -> list[torch.Tensor]:
+        fe = self._encoder_feature_extractor
+        target_sr = int(fe.sampling_rate)
+        if int(sr) != target_sr:
+            resampler = AudioResampler(target_sr=target_sr)
+            wavs = [resampler.resample(w.astype(np.float32), orig_sr=int(sr)) for w in wavs]
 
-    def _encode_ref_audio_to_code(self, wav: np.ndarray, sr: int) -> torch.Tensor:
-        tok = self._ensure_speech_tokenizer_loaded()
-        enc = tok.encode(wav, sr=int(sr), return_dict=True)
-        ref_code = getattr(enc, "audio_codes", None)
-        if isinstance(ref_code, list):
-            ref_code = ref_code[0] if ref_code else None
-        if isinstance(ref_code, torch.Tensor):
-            # 12Hz: likely [T, Q] or [B, T, Q]
-            if ref_code.ndim == 3:
-                ref_code = ref_code[0]
-            out = ref_code.to(device=next(self.parameters()).device, dtype=torch.long)
-            return out
-        raise ValueError("SpeechTokenizer.encode did not return audio_codes tensor")
+        inputs = fe(
+            raw_audio=wavs,
+            sampling_rate=target_sr,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(device).to(torch.bfloat16)
+
+        input_values = inputs["input_values"].squeeze(1)
+        padding_mask = inputs["padding_mask"].squeeze(1)
+
+        with torch.inference_mode():
+            encoded = self.encoder.encode(
+                input_values=input_values.unsqueeze(1),
+                return_dict=True,
+            )
+
+        audio_codes = encoded.audio_codes[:, : self._encoder_valid_num_quantizers]
+        downsample = self._encoder_downsample_rate
+        return [
+            code[..., : -(-mask.sum() // downsample)].transpose(0, 1).to(device=device, dtype=torch.long)
+            for code, mask in zip(audio_codes, padding_mask)
+        ]
 
     @staticmethod
     def _make_ref_audio_cache_key(wav: np.ndarray, sr: int) -> str:
@@ -1524,18 +1522,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if ids.ndim != 2 or ids.numel() == 0:
             return None
         return ids.to(device=device, dtype=torch.long).contiguous()
-
-    @staticmethod
-    def _split_ref_code_batch(ref_codes: object, expected: int) -> list[object] | None:
-        if isinstance(ref_codes, torch.Tensor):
-            if ref_codes.ndim == 3 and int(ref_codes.shape[0]) == expected:
-                return [ref_codes[i] for i in range(expected)]
-            if expected == 1:
-                return [ref_codes]
-            return None
-        if isinstance(ref_codes, (list, tuple)) and len(ref_codes) == expected:
-            return list(ref_codes)
-        return None
 
     @staticmethod
     def _voice_clone_prompt_dict(raw: object) -> dict[str, object] | None:
@@ -1663,16 +1649,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if not groups:
             return
 
-        tok = self._ensure_speech_tokenizer_loaded()
         for sr, items in groups.items():
             wavs = [wav for _, wav, _ in items]
             try:
-                enc = tok.encode(wavs, sr=int(sr), return_dict=True)
-                ref_codes = self._split_ref_code_batch(getattr(enc, "audio_codes", None), len(items))
+                ref_codes = self._encode_ref_audio_batch(wavs, int(sr), device=device)
             except Exception as exc:
                 logger.debug("Qwen3-TTS batched ref_code encode failed; falling back to serial path: %s", exc)
-                continue
-            if ref_codes is None:
                 continue
             for (info_dict, wav, item_sr), ref_code in zip(items, ref_codes, strict=True):
                 ref_code_t = self._coerce_ref_code_tensor(ref_code, device=device)
@@ -1982,7 +1964,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     ref_code_len = int(ref_code_t.shape[0])
                 else:
                     wav_np, sr = _get_ref_audio()
-                    ref_code_t = self._encode_ref_audio_to_code(wav_np, sr).to(device=input_ids.device)
+                    ref_code_t = self._encode_ref_audio_batch([wav_np], int(sr), device=input_ids.device)[0]
                     ref_code_len = int(ref_code_t.shape[0])
                     self._put_ref_audio_artifacts(cache_key, ref_code=ref_code_t)
             if isinstance(ref_code_t, torch.Tensor):
@@ -2240,6 +2222,43 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             # Some checkpoints do not include speaker_encoder weights; keep the
             # eagerly initialized module and satisfy the strict loader check.
             loaded |= {name for name, _ in self.named_parameters() if name.startswith("speaker_encoder.")}
+        # Load speech tokenizer encoder weights from speech_tokenizer/
+        # subfolder.  Skip decoder weights — the Talker only uses the
+        # encoder for ref_audio encoding.
+        model_loader = DefaultModelLoader(self.vllm_config.load_config)
+        source = DefaultModelLoader.Source(
+            model_or_path=self.model_path,
+            revision=self.vllm_config.model_config.revision,
+            subfolder="speech_tokenizer",
+        )
+        subfolder_weights = model_loader._get_weights_iterator(source)
+        enc_loaded = AutoWeightsLoader(
+            self,
+            skip_prefixes=["decoder."],
+        ).load_weights(subfolder_weights)
+        loaded |= enc_loaded
+
+        # AutoWeightsLoader only loads parameters; the encoder's VQ
+        # codebook state (embed, embed_sum, cluster_usage, initialized)
+        # are registered as buffers. Load them from the checkpoint
+        # directly so the quantizer produces correct codes.
+        encoder_buffers = dict(self.encoder.named_buffers())
+        source2 = DefaultModelLoader.Source(
+            model_or_path=self.model_path,
+            revision=self.vllm_config.model_config.revision,
+            subfolder="speech_tokenizer",
+        )
+        for name, tensor in model_loader._get_weights_iterator(source2):
+            if not name.startswith("encoder."):
+                continue
+            buf_name = name[len("encoder.") :]
+            if buf_name in encoder_buffers:
+                encoder_buffers[buf_name].copy_(tensor)
+                loaded.add(name)
+
+        device = self.vllm_config.device_config.device
+        self.encoder.to(device=device, dtype=torch.bfloat16)
+
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         self._build_stacked_codec_embed()
         return loaded
