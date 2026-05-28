@@ -535,9 +535,97 @@ def thinker2talker(
     return talker_inputs
 
 
+# ming_flash_omni is not in ``_OMNI_CONNECTOR_INIT_ARCHS`` or
+# ``_FULL_PAYLOAD_INPUT_STAGES``, so the worker connector is not
+# initialised for this arch and the consumer never waits on a connector
+# payload.  Data flows through ``additional_information`` written by
+# ``thinker2talker_token_only`` (wired as ``sync_process_input_func``
+# in the pipeline) or the legacy ``thinker2talker`` (wired as
+# ``custom_process_input_func``).
+
+
+def thinker2talker_token_only(
+    source_outputs: list[Any],
+    prompt: OmniTokensPrompt | TextPrompt | None = None,
+    _requires_multimodal_data: bool = False,
+) -> list[OmniTokensPrompt]:
+    """Sync-side builder for the non-async-chunk thinker→talker path.
+
+    Ports the legacy ``thinker2talker`` body to the new stage-input-processor signature
+    (``source_outputs`` instead of ``stage_list, engine_input_source``).
+    Body is otherwise identical: extracts the
+    generated text from each thinker output and packages it with the
+    request's voice/speaker additional_information for the talker.
+    """
+    if not isinstance(prompt, list):
+        prompt = [prompt]
+
+    talker_inputs: list[OmniTokensPrompt] = []
+    for i, source_output in enumerate(source_outputs):
+        output = source_output.outputs[0]
+
+        generated_text = output.text if hasattr(output, "text") and output.text else ""
+
+        original_prompt = prompt[i] if i < len(prompt) else None
+        additional_info: dict[str, Any] = {}
+        if original_prompt is not None and hasattr(original_prompt, "additional_information"):
+            additional_info = original_prompt.additional_information or {}
+
+        spk_emb = additional_info.get("spk_emb", None)
+        if isinstance(spk_emb, list) and spk_emb and not hasattr(spk_emb[0], "device"):
+            import torch
+
+            spk_emb = torch.tensor(spk_emb, dtype=torch.float32).unsqueeze(0)
+
+        talker_info = {
+            "ming_task": "omni",
+            "text": generated_text,
+            "spk_emb": spk_emb,
+            "voice_name": additional_info.get("voice_name", "DB30"),
+            "prompt_text": additional_info.get("prompt_text", None),
+            "prompt_wav_lat": additional_info.get("prompt_wav_lat", None),
+            "prompt_wav_emb": additional_info.get("prompt_wav_emb", None),
+            "max_text_length": additional_info.get("max_text_length", 50),
+        }
+
+        talker_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=[0],
+                additional_information=talker_info,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+
+    return talker_inputs
+
+
+thinker2talker_token_only._is_sync_input = True
+
+
+def thinker2talker_full_payload(
+    transfer_manager,
+    pooling_output,
+    request,
+):
+    """Producer-side payload builder — no-op.
+
+    ming_flash_omni's thinker emits no heavy tensor to ship via the
+    worker connector (the bridge passes text only, and speaker metadata
+    arrives through the USER request's additional_information).
+    ming_flash_omni is not in ``_OMNI_CONNECTOR_INIT_ARCHS`` so this
+    function is never invoked at runtime; it is retained for forward
+    compatibility with the connector path.
+    """
+    del transfer_manager, pooling_output, request
+    return None
+
+
 __all__ = [
     "CFG_TEXT_SUFFIX",
     "expand_cfg_prompts",
     "thinker2imagegen",
     "thinker2talker",
+    "thinker2talker_full_payload",
+    "thinker2talker_token_only",
 ]
