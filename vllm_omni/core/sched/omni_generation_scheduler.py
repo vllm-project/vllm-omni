@@ -486,6 +486,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = None
             routed_experts = None
 
+            is_segment_finished = False
+
             # Diffusion request: completes in one step; mark finished and free resources
             if (
                 request.status == RequestStatus.FINISHED_STOPPED
@@ -513,6 +515,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     routed_experts = model_runner_output.routed_experts_dict[req_id]
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
+                is_segment_finished = True
+                if is_segment_finished and not finished:
+                    adapter = self.chunk_transfer_adapter
+                    if adapter:
+                        adapter.segment_finished_requests.discard(req_id)
                 if finished:
                     kv_transfer_params = self._free_request(request)
                     if self.chunk_transfer_adapter is not None:
@@ -691,6 +698,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
+        if session in self.skipped_waiting:
+            self.skipped_waiting.remove_requests((session,))
+            self._enqueue_waiting_request(session)
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)

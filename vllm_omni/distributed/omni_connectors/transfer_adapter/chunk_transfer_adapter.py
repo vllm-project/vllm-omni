@@ -144,7 +144,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request: Request object
             is_segment_finished: whether the segment of request is finished
         """
-        is_finished = request.is_finished()
+        is_finished = request.is_finished() and not request.resumable
         # A fully finished request also finishes the current streaming segment;
         # the inverse is not true.
         is_segment_finished = is_segment_finished or is_finished
@@ -204,17 +204,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
             if self.model_mode == "ar":
                 request.additional_information = payload_data
-                if chunk_id > 0:
+                if chunk_id > 0 and request.resumable:
                     # For new streaming input segment, we should update prompt from payload
                     construct_next_stage_streaming_input_prompt(payload_data, request)
 
                 if payload_finished:
                     self.finished_requests.add(req_id)
+                    request.resumable = False
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
             else:
                 if payload_finished:
                     self.finished_requests.add(req_id)
+                    request.resumable = False
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
 

@@ -28,6 +28,7 @@ stages:
     trust_remote_code: true
     enable_prefix_caching: false
     devices: "0"
+    async_scheduling: false
     default_sampling_params:
       temperature: 0.4
       top_p: 0.9
@@ -39,6 +40,7 @@ stages:
   - stage_id: 1
     max_num_batched_tokens: 32768
     max_num_seqs: 64
+    async_scheduling: false
     gpu_memory_utilization: 0.6
     trust_remote_code: true
     enable_prefix_caching: false

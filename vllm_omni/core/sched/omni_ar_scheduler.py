@@ -428,6 +428,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 finish_reason = request.get_finished_reason()
                 is_segment_finished = request.is_finished() and request.resumable
                 finished = self._handle_stopped_request(request)
+                if is_segment_finished and not finished:
+                    if self.chunk_transfer_adapter:
+                        if self.vllm_config.model_config.stage_id != 0:
+                            # Downstream async-chunk stages receive real payloads from the
+                            # connector. This update only resumes polling for the next segment.
+                            self.chunk_transfer_adapter.segment_finished_requests.discard(request.request_id)
+                    request.discard_latest_async_tokens = True
+                    request.num_output_placeholders = 0
+                    request.spec_token_ids = []
+                    request._output_token_ids.clear()
                 if finished:
                     kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
@@ -644,6 +654,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
                     self.num_waiting_for_streaming_input -= 1
                 session.status = RequestStatus.WAITING
+                if session in self.skipped_waiting:
+                    self.skipped_waiting.remove_requests((session,))
+                    self._enqueue_waiting_request(session)
 
                 if self.log_stats:
                     session.record_event(EngineCoreEventType.QUEUED)
