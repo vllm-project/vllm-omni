@@ -389,17 +389,28 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request.status = RequestStatus.PREEMPTED
             waiting_queue.prepend_requests([request])
 
-    def restore_queues(self, waiting_queue: Any, running_queue: list[Request]) -> None:
+    def restore_queues(
+        self,
+        waiting_queue: Any,
+        running_queue: list[Request],
+        scheduler_requests: dict[str, Request] | None = None,
+    ) -> None:
         """
         Restore requests waiting for chunk to the waiting and running queues.
         """
         # Add request waiting for chunk to the waiting and running queue
         for request in self.waiting_for_chunk_waiting_requests:
-            waiting_queue.add_request(request)
+            if scheduler_requests is None or request.request_id in scheduler_requests:
+                waiting_queue.add_request(request)
         self.waiting_for_chunk_waiting_requests = deque()
 
         if self.waiting_for_chunk_running_requests:
-            running_queue.extend(self.waiting_for_chunk_running_requests)
+            live_running_requests = [
+                request
+                for request in self.waiting_for_chunk_running_requests
+                if scheduler_requests is None or request.request_id in scheduler_requests
+            ]
+            running_queue.extend(live_running_requests)
         self.waiting_for_chunk_running_requests = deque()
 
     def postprocess_scheduler_output(
@@ -493,3 +504,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 continue
             if req_id in self.requests_origin_status:
                 request.status = self.requests_origin_status.pop(req_id)
+
+        request_ids = set(request_ids)
+
+        self.waiting_for_chunk_waiting_requests = deque(
+            request for request in self.waiting_for_chunk_waiting_requests if request.request_id not in request_ids
+        )
+        self.waiting_for_chunk_running_requests = deque(
+            request for request in self.waiting_for_chunk_running_requests if request.request_id not in request_ids
+        )
+
+        for req_id in request_ids:
+            self.requests_with_ready_chunks.discard(req_id)
+            self.finished_requests.discard(req_id)
+            self._finished_load_reqs.discard(req_id)
+            self._cancelled_load_reqs.add(req_id)
+
+        return []

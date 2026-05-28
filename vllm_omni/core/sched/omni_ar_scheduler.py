@@ -232,7 +232,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finally:
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+                self.chunk_transfer_adapter.restore_queues(
+                    self.waiting,
+                    self.running,
+                    scheduler_requests=self.requests,
+                )
             if self.input_coordinator:
                 self.input_coordinator.restore_queues(self.waiting, self.running)
         try:

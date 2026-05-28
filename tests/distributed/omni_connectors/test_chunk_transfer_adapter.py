@@ -533,6 +533,52 @@ def test_finish_requests_restores_status(build_adapter):
     assert req_id not in adapter.requests_origin_status
 
 
+def test_finish_requests_removes_zombies_from_chunk_waiting_deques(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    zombie = _req("req-zombie", RequestStatus.WAITING_FOR_CHUNK)
+    other = _req("req-live", RequestStatus.WAITING_FOR_CHUNK)
+    adapter.waiting_for_chunk_waiting_requests = deque([zombie, other])
+    adapter.waiting_for_chunk_running_requests = deque([other, zombie])
+    adapter.requests_with_ready_chunks.add("req-zombie")
+    adapter.finished_requests.add("req-zombie")
+    requests_map = {
+        "req-zombie": zombie,
+        "req-live": other,
+    }
+
+    adapter.finish_requests(
+        ["req-zombie"],
+        RequestStatus.FINISHED_ABORTED,
+        requests_map,
+    )
+
+    assert [req.request_id for req in adapter.waiting_for_chunk_waiting_requests] == ["req-live"]
+    assert [req.request_id for req in adapter.waiting_for_chunk_running_requests] == ["req-live"]
+    assert "req-zombie" not in adapter.requests_with_ready_chunks
+    assert "req-zombie" not in adapter.finished_requests
+
+
+def test_restore_queues_skips_requests_missing_from_scheduler_requests(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    zombie = _req("req-zombie", RequestStatus.WAITING_FOR_CHUNK)
+    live = _req("req-live", RequestStatus.WAITING_FOR_CHUNK)
+    waiting_queue = DummyWaitingQueue()
+    running_queue = []
+    adapter.waiting_for_chunk_waiting_requests = deque([zombie, live])
+    adapter.waiting_for_chunk_running_requests = deque([zombie, live])
+
+    adapter.restore_queues(
+        waiting_queue,
+        running_queue,
+        scheduler_requests={"req-live": live},
+    )
+
+    assert [req.request_id for req in waiting_queue] == ["req-live"]
+    assert [req.request_id for req in running_queue] == ["req-live"]
+    assert not adapter.waiting_for_chunk_waiting_requests
+    assert not adapter.waiting_for_chunk_running_requests
+
+
 # ---------------------------------------------------------------
 # Scheduler trigger tests
 # ---------------------------------------------------------------
