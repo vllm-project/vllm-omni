@@ -82,6 +82,72 @@ def test_get_streaming_codec_delta_len_increments_and_finishes(_streaming_contex
     assert state.talker2code2wav_last_seq_len == 0
 
 
+def test_streaming_input_prefill_chunk_is_cached() -> None:
+    transfer_manager = SimpleNamespace()
+    request = SimpleNamespace(
+        external_req_id="rt-1",
+        output_token_ids=[100],
+        all_token_ids=[151644, 872, 100],
+        prompt_token_ids=[151644, 872],
+        resumable=True,
+        additional_information=None,
+    )
+    thinker_emb = torch.ones(2, 3)
+    thinker_hid = torch.full((2, 3), 2.0)
+
+    payload = q3._construct_thinker2talker_streaming_input_async_chunk(
+        False,
+        request,
+        thinker_emb,
+        thinker_hid,
+        transfer_manager,
+    )
+
+    assert payload is None
+    cached = transfer_manager._pending_streaming_prefills["rt-1"]
+    assert torch.equal(cached["embed"]["prefill"], thinker_emb)
+    assert torch.equal(cached["hidden_states"]["output"], thinker_hid)
+    assert cached["ids"]["all"] == request.all_token_ids
+    assert cached["ids"]["prompt"] == request.prompt_token_ids
+
+
+def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
+    transfer_manager = SimpleNamespace(
+        _pending_streaming_prefills={
+            "rt-2": {
+                "embed": {"prefill": torch.ones(2, 3)},
+                "hidden_states": {"output": torch.full((2, 3), 2.0)},
+                "ids": {"all": [151644, 872, 100], "prompt": [151644, 872]},
+            }
+        }
+    )
+    request = SimpleNamespace(
+        external_req_id="rt-2",
+        output_token_ids=[101],
+        all_token_ids=[151644, 872, 100, 101],
+        prompt_token_ids=[151644, 872],
+        resumable=True,
+        additional_information=None,
+    )
+    thinker_emb = torch.full((1, 3), 3.0)
+    thinker_hid = torch.full((1, 3), 4.0)
+
+    payload = q3._construct_thinker2talker_streaming_input_async_chunk(
+        False,
+        request,
+        thinker_emb,
+        thinker_hid,
+        transfer_manager,
+    )
+
+    assert payload is not None
+    assert payload.embed.prefill.shape == (3, 3)
+    assert payload.hidden_states.output.shape == (3, 3)
+    assert payload.ids.all == [151644, 872, 100]
+    assert payload.ids.prompt == [151644, 872]
+    assert "rt-2" not in transfer_manager._pending_streaming_prefills
+
+
 def test_talker2code2wav_full_payload_filters_by_output_token_ids() -> None:
     request = SimpleNamespace(
         request_id="codec",

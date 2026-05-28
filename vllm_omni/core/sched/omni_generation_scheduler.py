@@ -108,9 +108,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 break
             # async_chunk: don't schedule placeholder tokens when no new chunk is available.
             if required_tokens <= 0:
-                if (
-                    self.chunk_transfer_adapter is not None
-                    and request.request_id in self.chunk_transfer_adapter.finished_requests
+                if self.chunk_transfer_adapter is not None and (
+                    request.request_id in self.chunk_transfer_adapter.finished_requests
+                    or request.request_id in self.chunk_transfer_adapter.segment_finished_requests
                 ):
                     self._pending_finish_reqs.append(request)
                 req_index += 1
@@ -160,7 +160,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # async_chunk: wait for the first upstream chunk (don't start with placeholders).
             if self.chunk_transfer_adapter is not None and len(request.prompt_token_ids) == 0:
-                if request.request_id in self.chunk_transfer_adapter.finished_requests:
+                if (
+                    request.request_id in self.chunk_transfer_adapter.finished_requests
+                    or request.request_id in self.chunk_transfer_adapter.segment_finished_requests
+                ):
                     self.waiting.pop_request()
                     self._pending_finish_reqs.append(request)
                     continue
@@ -489,7 +492,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
                 or (
                     self.chunk_transfer_adapter is not None
-                    and request.request_id in self.chunk_transfer_adapter.finished_requests
+                    and (
+                        request.request_id in self.chunk_transfer_adapter.finished_requests
+                        or request.request_id in self.chunk_transfer_adapter.segment_finished_requests
+                    )
                     and request.num_computed_tokens >= len(request.prompt_token_ids)
                 )
             ):
@@ -669,4 +675,22 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         Do not expend prompt id using update.
         """
-        self._replace_session_with_streaming_update(session, update)
+        self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
+        session._output_token_ids.clear()
+        session._all_token_ids.clear()
+        new_prompt = update.prompt_token_ids or ()
+        session._all_token_ids.extend(new_prompt)
+        session.num_computed_tokens = 0
+        session.prompt_token_ids = update.prompt_token_ids or ()
+        session.additional_information = update.additional_information or None
+        # Update block hashes for the new tokens.
+        session.update_block_hashes()
+        session.num_prompt_tokens = len(session.prompt_token_ids)
+        session.arrival_time = update.arrival_time
+        session.sampling_params = update.sampling_params
+        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
+        session.status = RequestStatus.WAITING
+
+        if self.log_stats:
+            session.record_event(EngineCoreEventType.QUEUED)
