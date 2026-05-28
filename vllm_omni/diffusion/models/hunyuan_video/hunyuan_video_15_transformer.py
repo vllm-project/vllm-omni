@@ -837,9 +837,10 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in original_name:
                     continue
-                lookup_name = original_name.replace(weight_name, param_name)
-                if lookup_name not in params_dict:
-                    break
+                maybe_lookup_name = original_name.replace(weight_name, param_name)
+                if maybe_lookup_name not in params_dict:
+                    continue
+                lookup_name = maybe_lookup_name
                 param = params_dict[lookup_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
