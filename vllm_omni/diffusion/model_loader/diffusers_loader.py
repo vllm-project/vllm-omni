@@ -301,10 +301,25 @@ class DiffusersPipelineLoader:
         if load_format is None:
             load_format = "default"
         self.od_config = od_config
-        # CPU offload + FP8: load weights on device for FP8 quantization
+        # CPU offload + quantization: for offline-quantized models (e.g., AutoRound MXFP8),
+        # weights are already quantized in the checkpoint — load directly on CPU.
+        # For online quantization, load on device so quantization can run on accelerator,
+        # then move back to CPU afterward.
+        offload_after_quant = False
         if load_device == "cpu" and od_config.quantization_config is not None:
-            load_device = device.type
-            logger.info(f"Quantization enabled with CPU offload, using {load_device} for weight loading")
+            quant_cfg = od_config.quantization_config
+            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
+                quant_cfg, "is_checkpoint_quantized", False
+            )
+            if not is_offline:
+                load_device = device.type
+                offload_after_quant = True
+                logger.info(
+                    "Online quantization with CPU offload, using %s for weight loading (will offload back to CPU)",
+                    load_device,
+                )
+            else:
+                logger.info("Offline-quantized model with CPU offload, loading weights directly on CPU")
 
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):
@@ -341,6 +356,10 @@ class DiffusersPipelineLoader:
             # Process weights after loading for quantization (e.g., FP8 online quantization)
             # This is needed for vLLM's quantization methods that need to transform weights
             self._process_weights_after_loading(model, target_device)
+
+            if offload_after_quant:
+                model.to("cpu")
+                logger.info("Quantization complete, offloaded model back to CPU")
 
         return model.eval()
 
