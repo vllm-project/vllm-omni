@@ -1,4 +1,4 @@
-# GLM-Image for text-to-image and image editing on 2× A800 80GB
+# GLM-Image for text-to-image and image editing
 
 ## Summary
 
