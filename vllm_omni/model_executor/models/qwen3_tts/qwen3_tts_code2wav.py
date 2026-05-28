@@ -545,7 +545,8 @@ class Qwen3TTSCode2Wav(nn.Module):
                 continue
             wav = wav[start : min(end, wav.shape[0])]
             if wav.shape[0] > 0:
-                audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
+                # Decoder already runs in fp32, so the .to(float32) is a redundant dispatch.
+                audios[idx] = (wav if wav.dtype == torch.float32 else wav.to(torch.float32)).reshape(-1)
 
         for req_id, finished in zip(ref_context_request_ids, finished_flags, strict=False):
             if req_id is not None and finished:
