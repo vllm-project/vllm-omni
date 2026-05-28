@@ -6,13 +6,13 @@ Consumed by:
 - vllm_omni.metrics.transfer (cross-stage transfer families)
 - vllm_omni.benchmarks.metrics.metrics (bench CLI MultiModalsBenchmarkMetrics)
 
-RFC: https://github.com/vllm-project/vllm-omni/issues/3545 — locked set of
-23 ``vllm_omni:*`` families. Time-bearing metrics use the ``_s`` suffix
-(values in seconds), counters use ``_total`` (auto-suffixed by the
-prometheus client), sizes use ``_bytes``.
+Naming conventions for the 23 ``vllm_omni:*`` families exposed here:
+time-bearing metrics use the ``_s`` suffix (values in seconds), counters use
+``_total`` (auto-suffixed by the prometheus client), sizes use ``_bytes``.
 """
 
-# vllm:omni_ avoids upstream's unregister_vllm_metrics() stripping; matches PR #3362.
+# vllm:omni_ avoids upstream's unregister_vllm_metrics() stripping, which
+# removes every collector whose ``_name`` does not start with ``vllm``.
 METRIC_PREFIX = "vllm:omni_"
 
 
@@ -33,21 +33,20 @@ VIDEO_GENERATION = "video_generation"
 
 
 # ============================================================================
-# Pipeline-level metric families (RFC: Pipeline request counts + latency)
+# Pipeline-level metric families (request counts + e2e latency)
 # ============================================================================
 NUM_REQUESTS_RUNNING = METRIC_PREFIX + "num_requests_running"
 NUM_REQUESTS_WAITING = METRIC_PREFIX + "num_requests_waiting"
 E2E_REQUEST_LATENCY_S = METRIC_PREFIX + "e2e_request_latency_s"
 
-# G6: per-finished_reason Counter that replaces the original
-# num_requests_success / num_requests_fail pair from PR #3362. finished_reason ∈
-# {stop, length, abort, ...}; aborts include the "fail" path that previously
-# used a separate counter. Counter auto-suffixes _total at exposition time.
+# Per-finished_reason Counter; finished_reason ∈ {stop, length, abort, ...}.
+# Aborts include client disconnect / cancellation paths. Counter auto-suffixes
+# ``_total`` at exposition time.
 REQUESTS_SUCCESS = METRIC_PREFIX + "requests_success"
 
 
 # ============================================================================
-# Audio family (RFC: Audio path)
+# Audio family (per-stage + per-replica audio path metrics)
 # ============================================================================
 AUDIO_TTFP_S = METRIC_PREFIX + AUDIO_TTFP + "_s"
 AUDIO_DURATION_S = METRIC_PREFIX + AUDIO_DURATION + "_s"
@@ -59,7 +58,7 @@ AUDIO_SKIPPED_REQUESTS = METRIC_PREFIX + "audio_skipped_requests"
 
 
 # ============================================================================
-# Visual family (RFC: Visual diffusion-internal + business semantics)
+# Visual family (diffusion-internal timings + image / video business semantics)
 # ============================================================================
 # Diffusion-internal: timing decomposition of one diffusion-stage request,
 # in seconds. PromQL recipe for per-step latency:
@@ -77,7 +76,7 @@ VIDEO_GENERATION_S = METRIC_PREFIX + VIDEO_GENERATION + "_s"
 
 
 # ============================================================================
-# Cross-stage Transfer family (RFC: Cross-stage transfer)
+# Cross-stage Transfer family (per-physical-hop TX/RX/in-flight timings)
 # ============================================================================
 TRANSFER_SIZE_BYTES = METRIC_PREFIX + "transfer_size_bytes"
 TRANSFER_TX_S = METRIC_PREFIX + "transfer_tx_s"
@@ -92,14 +91,13 @@ PIPELINE_LABELS = ("model_name",)
 SUCCESS_LABELS = ("model_name", "finished_reason")
 
 # Per-stage / per-replica label set used by audio/image/video families and by
-# the OmniPrometheusStatLogger wrap (G7) which relabels upstream `engine` into
-# `stage` + `replica`.
+# the OmniPrometheusStatLogger wrap which relabels upstream ``engine`` into
+# ``stage`` + ``replica``.
 STAGE_LABELS = ("model_name", "stage", "replica")
 
-# Audio continuity Counter carries an extra `threshold_ms` label so multiple
-# threshold buckets can be tracked simultaneously. (RFC keeps the suffix as
-# `_ms` for this label because it names a numeric threshold *value* in ms,
-# not a time-bearing metric.)
+# Audio continuity Counter carries an extra ``threshold_ms`` label so multiple
+# threshold buckets can be tracked simultaneously. The ``_ms`` suffix names a
+# numeric threshold *value* in ms, not a time-bearing metric.
 AUDIO_CONTINUITY_LABELS = ("model_name", "stage", "replica", "threshold_ms")
 
 # Audio skipped-requests Counter carries a `reason` label so the silent-loss
@@ -149,8 +147,8 @@ BYTES_BUCKETS = (
 # ============================================================================
 # Audio-continuity defaults
 # ============================================================================
-# Default underrun threshold (matches PR #3618 bench-side default and the
-# commonly-cited "audible gap" threshold for streaming TTS).
+# Default underrun threshold — kept aligned with the bench-side default and
+# the commonly-cited "audible gap" threshold for streaming TTS.
 AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S = 0.1
 
 

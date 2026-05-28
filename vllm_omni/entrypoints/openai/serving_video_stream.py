@@ -574,9 +574,9 @@ class OmniStreamingVideoHandler:
 
                     if t_first_audio is None:
                         t_first_audio = _time.monotonic()
-                        # Phase 3.3: observe audio_ttfp_seconds. Hook here rather
-                        # than at the OpenAI SSE path because this WebSocket route
-                        # is the canonical real-time entrypoint for video+audio.
+                        # Observe audio_ttfp_seconds. Hook here rather than at
+                        # the OpenAI SSE path because this WebSocket route is
+                        # the canonical real-time entrypoint for video+audio.
                         req_state = (
                             self._engine_client.request_states.get(request_id)
                             if self._engine_client is not None

@@ -37,8 +37,8 @@ _waiting_family = Gauge(
 _completion_family = Counter(
     defs.REQUESTS_SUCCESS,
     "Total requests by completion reason "
-    "(stop / length / abort / ...). Aborts include the 'fail' path "
-    "that previously had its own num_requests_fail counter (G6).",
+    "(stop / length / abort / ...). Aborts cover client-disconnect / "
+    "cancellation paths in addition to upstream FinishReason.ABORT.",
     labelnames=list(defs.SUCCESS_LABELS),
 )
 _e2e_latency_family = Histogram(
@@ -119,7 +119,7 @@ class OmniPrometheusMetrics:
                 )
                 self._diffusion_by_replica[cache_key] = bound
             # Source values are in milliseconds (legacy engine_outputs dict
-            # keys); RFC families expose seconds.
+            # keys); the exposed families use seconds.
             bound.observe(float(value) / 1000.0)
 
 

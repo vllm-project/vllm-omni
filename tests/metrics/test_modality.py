@@ -30,8 +30,8 @@ def _sample_value(output: str, line_prefix: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Family registration — RFC §3545 locked set (7 audio + 5 visual families
-# served from modality.py; diffusion-internal *_s lives in prometheus.py)
+# Family registration — 7 audio + 5 visual families served from modality.py
+# (diffusion-internal *_s lives in prometheus.py)
 # ---------------------------------------------------------------------------
 
 
@@ -72,7 +72,7 @@ class TestRegistration:
             assert f"# HELP {name}" in out, f"missing family: {name}"
 
     def test_image_ttfp_intentionally_dropped(self) -> None:
-        # RFC removed image_ttfp_s (image is non-streaming).
+        # image is non-streaming, so no image_ttfp_s family is exposed.
         out = generate_latest(REGISTRY).decode()
         assert "vllm:omni_image_ttfp" not in out
 
@@ -335,7 +335,7 @@ class TestObserveModalityAtFinalize:
         )
         assert ("inc_image_num", "2", "1", 3) in stub.calls
         assert ("observe_image_generation", "2", "1", 2.0) in stub.calls
-        # RFC dropped image_ttfp_s — finalize must not emit it.
+        # image is non-streaming, so finalize must not emit image_ttfp.
         assert not any(c[0].startswith("observe_image_ttfp") for c in stub.calls)
 
     def test_video_path_only_generation_when_no_duration(self):

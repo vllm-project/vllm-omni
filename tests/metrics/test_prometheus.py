@@ -72,7 +72,7 @@ class TestMetricObservation:
             assert f"# HELP {name}" in scrape_output, f"missing metric family: {name}"
 
     def test_counter_values(self, scrape_output: str) -> None:
-        # Per-reason buckets sourced from the merged completion Counter (G6).
+        # Per-reason buckets sourced from the merged completion Counter.
         stop = _sample_value(
             scrape_output,
             f'vllm:omni_requests_success_total{{finished_reason="stop",model_name="{_MODEL}"}}',

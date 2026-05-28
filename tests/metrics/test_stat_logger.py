@@ -118,10 +118,10 @@ class TestRelabelGauge:
         )
 
     def test_labels_positional_passthrough(self, registry):
-        # Phase 2.4 double-rewrite guard: Phase 2.2b's per_engine_labelvalues
-        # setter rewrites the values to 3-tuple [model_name, stage, replica]
-        # BEFORE create_metric_per_engine fans them into .labels(*values). The
-        # mixin must detect that args length already matches the rewritten
+        # Double-rewrite guard: the per_engine_labelvalues setter rewrites
+        # the values to 3-tuple [model_name, stage, replica] BEFORE
+        # create_metric_per_engine fans them into .labels(*values). The mixin
+        # must detect that args length already matches the rewritten
         # labelnames and pass through, otherwise it would re-interpret
         # args[engine_label_index] as an engine_idx and splice (stage, replica)
         # again, blowing label count to 4.
@@ -321,9 +321,9 @@ class TestChildNoRecursion:
 
 
 # ---------------------------------------------------------------------------
-# OmniPrometheusStatLogger — focused on the wrap mechanics (full PrometheusStatLogger
-# init requires a real VllmConfig and is exercised by the orchestrator integration
-# test in Phase 2.3).
+# OmniPrometheusStatLogger — focused on the wrap mechanics (full
+# PrometheusStatLogger init requires a real VllmConfig and is exercised by
+# the orchestrator integration tests).
 # ---------------------------------------------------------------------------
 
 
@@ -387,8 +387,8 @@ class TestOmniPrometheusStatLogger:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2.4 — helper-class wraps for upstream's spec_decoding / kv_connector
-# / perf_metrics sub-collectors. Without these, OmniPrometheusStatLogger
+# Helper-class wraps for upstream's spec_decoding / kv_connector /
+# perf_metrics sub-collectors. Without these, OmniPrometheusStatLogger
 # crashes at startup with `Incorrect label count` because each helper builds
 # its internal Counter/Gauge/Histogram families with raw 2-element labelnames
 # (passed via constructor arg) while consuming the rewritten 3-element
@@ -427,11 +427,11 @@ class TestHelperClassWraps:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2.4 double-rewrite guard. The mixin's positional-args path used to
-# unconditionally splice (stage, replica) at engine_label_index. After Phase
-# 2.2b started rewriting per_engine_labelvalues to 3-tuples *before* feeding
-# them into create_metric_per_engine, that splice ran a second time on the
-# already-rewritten values, blowing the label count to 4. The guard now
+# Double-rewrite guard. The mixin's positional-args path used to
+# unconditionally splice (stage, replica) at engine_label_index. Because
+# per_engine_labelvalues is rewritten to 3-tuples *before* feeding into
+# create_metric_per_engine, that splice would run a second time on the
+# already-rewritten values and blow the label count to 4. The guard now
 # detects len(args) == len(self._labelnames) and short-circuits to passthrough.
 # ---------------------------------------------------------------------------
 

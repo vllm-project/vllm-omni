@@ -454,8 +454,8 @@ class OmniBase(PDDisaggregationMixin):
                     req_start_ts.get(req_id, wall_start_ts),
                 )
                 e2e_seconds = now - req_start_ts.get(req_id, wall_start_ts)
-                # G6: extract finished_reason from upstream CompletionOutput
-                # so the per-reason completion Counter is labelled correctly.
+                # Extract finished_reason from upstream CompletionOutput so
+                # the per-reason completion Counter is labelled correctly.
                 completion_outputs = getattr(engine_outputs, "outputs", None) or []
                 fr = (
                     getattr(completion_outputs[0], "finish_reason", None)
@@ -466,8 +466,8 @@ class OmniBase(PDDisaggregationMixin):
                     e2e_seconds, finished_reason=fr,
                 )
 
-                # Modality observe (Phase 3.2). Inside the same finalize guard so
-                # it fires once per request and inherits the try/except isolation.
+                # Modality observe inside the same finalize guard so it fires
+                # once per request and inherits the try/except isolation.
                 observe_modality_at_finalize(
                     self.mod_metrics,
                     output_type=output_type,

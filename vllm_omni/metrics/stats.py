@@ -138,10 +138,10 @@ class OrchestratorAggregator:
             tuple[int, int, str], TransferEdgeStats
         ] = {}  # Key: (from_stage, to_stage, request_id)
         self.e2e_events: list[RequestE2EStats] = []
-        # Phase 4 G3: emit per-physical-transfer Histogram observations to
-        # Prometheus alongside the existing TransferEdgeStats accumulation.
-        # Both deps are optional so OrchestratorAggregator stays usable in
-        # contexts that don't have a Prometheus registry (e.g. unit tests).
+        # Emit per-physical-transfer Histogram observations to Prometheus
+        # alongside the existing TransferEdgeStats accumulation. Both deps
+        # are optional so OrchestratorAggregator stays usable in contexts
+        # that don't have a Prometheus registry (e.g. unit tests).
         self._transfer_emitter = transfer_emitter
         self._replica_resolver = replica_resolver
         # Snapshot of (stage_id -> replica_id) per request, captured at
@@ -212,7 +212,7 @@ class OrchestratorAggregator:
             evt.size_bytes += int(size_bytes)
             evt.tx_time_ms += float(tx_time_ms)
             evt.used_shm = evt.used_shm or bool(used_shm)
-            # Phase 4 G3: emit per-physical-transfer Histogram observations.
+            # Emit per-physical-transfer Histogram observations to Prometheus.
             self._emit_transfer_tx(
                 from_stage=int(from_stage),
                 to_stage=int(to_stage),
@@ -246,7 +246,7 @@ class OrchestratorAggregator:
                 evt.size_bytes = int(stats.rx_transfer_bytes)
             evt.rx_decode_time_ms += float(stats.rx_decode_time_ms)
             evt.in_flight_time_ms += float(stats.rx_in_flight_time_ms)
-            # Phase 4 G3: emit per-physical-receive Histogram observations.
+            # Emit per-physical-receive Histogram observations to Prometheus.
             self._emit_transfer_rx(
                 from_stage=from_stage,
                 to_stage=to_stage,
@@ -259,11 +259,11 @@ class OrchestratorAggregator:
             return None
 
     # ------------------------------------------------------------------
-    # Prometheus emit hooks (Phase 4 G3). Both helpers are no-ops when
-    # transfer_emitter or replica_resolver is None, or when the resolver
-    # cannot find a (stage_id, request_id) -> replica_id mapping. We
-    # deliberately fail-safe (skip) rather than emit a series with a wrong
-    # or invented replica label.
+    # Prometheus emit hooks. Both helpers are no-ops when transfer_emitter
+    # or replica_resolver is None, or when the resolver cannot find a
+    # (stage_id, request_id) -> replica_id mapping. We deliberately
+    # fail-safe (skip) rather than emit a series with a wrong or invented
+    # replica label.
     # ------------------------------------------------------------------
 
     def _resolve_edge_replicas(

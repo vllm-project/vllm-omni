@@ -1,13 +1,25 @@
 """OmniModalityMetrics — per-modality Prometheus families.
 
-Audio / image / video business-semantic metric families. Text-path metrics
-(TTFT / ITL / TPOT / e2e) are NOT here — they come from the upstream
-``vllm:*{stage="thinker", ...}`` families exposed by ``OmniPrometheusStatLogger``
-(G7 wrap).
+Audio / image / video business-semantic metric families (7 audio + 6 visual
+families total). Text-path metrics (TTFT / ITL / TPOT / e2e) are NOT here —
+they come from the upstream ``vllm:*{stage="thinker", ...}`` families
+exposed via the ``OmniPrometheusStatLogger`` wrap.
 
-Family count and layout match the locked RFC
-https://github.com/vllm-project/vllm-omni/issues/3545 ("vllm_omni:* complete
-set"): 7 audio + 6 visual business / generation families.
+Contents:
+- Audio family declarations (Histograms + Counters)
+- Image / Video family declarations
+- ``OmniModalityMetrics``: label-bound observe API per modality
+- ``observe_modality_at_finalize``: dispatcher called from omni_base's e2e
+  finalize hook; routes by ``output_type`` and emits the relevant audio /
+  image / video families.
+- ``observe_audio_first_packet``: TTFP emit from the streaming SSE first
+  audio packet.
+- ``observe_audio_streaming_finalize``: emits ``audio_underrun_s`` +
+  ``audio_continuity_ok_total`` at SSE close using accumulated per-chunk
+  arrival timestamps.
+- ``_extract_mm_output`` / ``_count_audio_frames`` /
+  ``_resolve_video_duration_seconds``: shape-tolerant helpers for the
+  heterogeneous multimodal_output payloads emitted by different pipelines.
 """
 
 from __future__ import annotations
@@ -65,7 +77,7 @@ _audio_continuity_ok_family = Counter(
 _audio_skipped_family = Counter(
     defs.AUDIO_SKIPPED_REQUESTS,
     "Silent-loss counter — code2wav rejected malformed codec input and "
-    "returned 200 OK with empty audio. Refs RFC §3.2.3.",
+    "returned 200 OK with empty audio.",
     labelnames=list(defs.AUDIO_SKIPPED_LABELS),
 )
 
@@ -389,9 +401,9 @@ def observe_audio_streaming_finalize(
     """Emit audio_underrun_s + audio_continuity_ok_total at request end.
 
     Reuses the math from ``vllm_omni.benchmarks.audio_continuity`` so the
-    server-side and bench-side definitions stay aligned (RFC G4). Caller is
-    responsible for collecting per-chunk arrival timestamps and byte sizes
-    during the streaming response.
+    server-side and bench-side definitions stay aligned. Caller is responsible
+    for collecting per-chunk arrival timestamps and byte sizes during the
+    streaming response.
     """
     if replica_id is None or not chunk_arrival_times_s:
         return

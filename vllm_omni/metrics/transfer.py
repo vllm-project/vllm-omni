@@ -1,4 +1,4 @@
-"""OmniTransferMetrics — cross-stage transfer Prometheus families (RFC G3).
+"""OmniTransferMetrics — cross-stage transfer Prometheus families.
 
 Four families with ``{model_name, from_stage, from_replica, to_stage,
 to_replica}`` labels. Each ``observe_*()`` call corresponds to one physical

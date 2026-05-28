@@ -1,12 +1,21 @@
 """OmniPrometheusStatLogger — wrap upstream PrometheusStatLogger.
 
-Goal (RFC §3.2.7): rewrite the upstream `engine` single-label scheme into a
-`stage` + `replica` two-label scheme so that the ~37 `vllm:*` metric families
-automatically gain per-(stage, replica) visibility for multi-replica deployments.
+Rewrites the upstream ``engine`` single-label scheme into a ``stage`` +
+``replica`` two-label scheme so the ~37 ``vllm:*`` metric families gain
+per-(stage, replica) visibility for multi-replica deployments.
 
-Phase 2.1 ships only the three wrapper metric classes + the process-level
-engine→(stage, replica) map. The OmniPrometheusStatLogger subclass that wires
-everything together lands in Phase 2.2.
+Contents:
+- ``_ENGINE_INDEX_MAP``: process-wide engine_idx → (stage_name, replica_id)
+  lookup, populated by ``OmniPrometheusStatLogger.__init__``.
+- ``_RelabelMixin``: rewrites ``labelnames`` at family creation and translates
+  ``.labels()`` calls; applied via ``_RelabelGauge`` / ``_RelabelCounter`` /
+  ``_RelabelHistogram``.
+- ``_OmniPerfMetricsProm`` / ``_OmniSpecDecodingProm`` / ``_OmniKVConnectorProm``:
+  helper-class wraps so the upstream sub-collectors construct their internal
+  families through the relabel mixin too.
+- ``OmniPrometheusStatLogger``: the subclass that wires everything together
+  and rewrites ``per_engine_labelvalues`` from 2-tuple to 3-tuple at setter
+  time.
 """
 
 from __future__ import annotations
@@ -176,13 +185,13 @@ class OmniPrometheusStatLogger(PrometheusStatLogger):
     """Wrap upstream PrometheusStatLogger to expose per-(stage, replica) labels.
 
     Replaces the upstream single ``engine`` label with two labels ``stage`` and
-    ``replica`` so that the ~37 ``vllm:*`` metric families gain per-replica
-    visibility for multi-replica deployments. See RFC §3.2.7.
+    ``replica`` so the ~37 ``vllm:*`` metric families gain per-replica
+    visibility for multi-replica deployments.
 
     The orchestrator builds ``stage_replica_map`` from the static stage_pools
     config; flat engine_idx values map 1:1 to (stage_name, replica_id) tuples.
-    Dynamic add/remove of replicas at runtime is intentionally not supported
-    in this iteration — see RFC §3.4 risks.
+    Dynamic add/remove of replicas at runtime is intentionally not supported —
+    the map is built once at construction and never mutated afterward.
     """
 
     # Inject our wrapper metric classes into upstream's class-level slots so
