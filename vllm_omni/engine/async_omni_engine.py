@@ -1557,21 +1557,30 @@ class AsyncOmniEngine:
         if stage0_pool.stage_type == "diffusion" or self._stage_pool_replica_count(stage0_pool) <= 1:
             return None
 
-        # This synchronous request path can safely pre-bind local in-process
-        # replicas. Distributed head mode still uses the async picker inside
-        # StagePool.submit_initial().
-        if self._stage_pool_is_distributed(stage0_pool):
-            logger.debug(
-                "[AsyncOmniEngine] Skipping stage-0 multimodal cache scoping for distributed routing req=%s",
-                request_id,
-            )
-            return None
-
         prompts = prompt if isinstance(prompt, list) else [prompt]
         if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
             return None
 
-        replica_id = stage0_pool.select_replica_id(request_id)
+        if self._stage_pool_is_distributed(stage0_pool):
+            preselect_replica_id = getattr(stage0_pool, "preselect_replica_id", None)
+            if not callable(preselect_replica_id):
+                logger.debug(
+                    "[AsyncOmniEngine] Skipping stage-0 multimodal cache scoping for distributed routing "
+                    "without preselect support req=%s",
+                    request_id,
+                )
+                return None
+            replica_id = preselect_replica_id(request_id)
+            if replica_id is None:
+                logger.debug(
+                    "[AsyncOmniEngine] Skipping stage-0 multimodal cache scoping for distributed routing "
+                    "because no serviceable replica is available yet req=%s",
+                    request_id,
+                )
+                return None
+        else:
+            replica_id = stage0_pool.select_replica_id(request_id)
+
         for p in prompts:
             self._ensure_stage_replica_mm_uuids(
                 p,
@@ -1942,6 +1951,10 @@ class AsyncOmniEngine:
             "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
+            "extras": {
+                "auxiliary_text_encoder": kwargs.get("auxiliary_text_encoder", None),
+                "default_llama_model_id": kwargs.get("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
+            },
             **(
                 {
                     "profiler_config": asdict(kwargs["profiler_config"])

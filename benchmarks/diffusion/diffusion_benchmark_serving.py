@@ -7,9 +7,12 @@ Benchmark online serving for diffusion models (Image/Video Generation).
 If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
 Supports multiple endpoints:
-    - /v1/chat/completions: OpenAI chat-compatible image requests
+    - /v1/chat/completions: OpenAI chat-compatible image requests (e.g. t2i, Qwen i2i)
+    - /v1/images/edits: OpenAI image edit / IT2I (multipart; e.g. Hunyuan --bot-task think)
     - /v1/images/generations: OpenAI image generation requests
     - /v1/videos: Async video jobs
+
+Legacy --backend vllm-omni and openai are aliases for chat/completions and images/generations.
 
 Usage:
     # Video (/v1/videos endpoint)
@@ -39,7 +42,19 @@ Usage:
             {"width":1536,"height":1536,"num_inference_steps":35,"weight":0.15}
         ]'
 
-    i2i:
+    ti2i (Hunyuan / OpenAI image edit API):
+    python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+        --endpoint /v1/images/edits --dataset random --task ti2i --num-prompts 10 \
+        --bot-task think
+
+    python benchmarks/diffusion/diffusion_benchmark_serving.py \
+      --endpoint /v1/images/edits \
+      --dataset custom \
+      --dataset-path custom_requests.jsonl \
+      --task ti2i \
+      --bot-task think
+
+    i2i (chat-based models such as Qwen-Image-Edit):
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
         --endpoint /v1/chat/completions --dataset vbench --task i2i --num-prompts 10
 
@@ -132,7 +147,7 @@ class VBenchDataset(BaseDataset):
     def _load_data(self) -> list[dict[str, Any]]:
         if self.args.task == "t2v":
             return self._load_t2v_prompts()
-        elif self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
+        elif self.args.task in ["i2v", "ti2v", "ti2i", "i2i", "it2i"]:
             return self._load_i2v_data()
         else:
             return self._load_t2v_prompts()
@@ -524,7 +539,7 @@ class TraceDataset(BaseDataset):
             single = row.get("image_path")
             image_paths = [single] if single else None
 
-        if not image_paths and self.args.task in ["i2v", "i2i", "ti2v", "ti2i"]:
+        if not image_paths and self.args.task in ["i2v", "i2i", "ti2v", "ti2i", "it2i"]:
             raise ValueError(
                 f"Task {self.args.task} requires image input, but no image_path or image_paths found in trace row."
             )
@@ -558,6 +573,135 @@ class TraceDataset(BaseDataset):
         return [self[i] for i in range(len(self))]
 
 
+class CustomDataset(BaseDataset):
+    """
+    Custom dataset that loads requests from a JSONL file.
+
+    Each line in the JSONL file should be a JSON object with the following fields:
+    - prompt (required): The text prompt for the request
+    - width (optional): Image/video width
+    - height (optional): Image height
+    - num_inference_steps (optional): Number of diffusion steps
+    - seed (optional): Random seed
+    - image_paths (optional): List of input image paths for i2i/i2v/ti2i tasks
+    - image_urls (optional): List of input image URLs (alternative to image_paths)
+
+    Example JSONL for ti2i:
+    {"prompt": "Add sunset lighting", "width": 1024, "height": 1024, "image_urls": ["https://example.com/image.jpg"]}
+    """
+
+    def __init__(self, args, api_url: str, model: str):
+        super().__init__(args, api_url, model)
+        self.dataset_path = args.dataset_path
+        if not self.dataset_path:
+            raise ValueError("--dataset-path must be provided when using 'custom' dataset")
+        self.load_data()
+
+    def load_data(self) -> None:
+        """Load data from JSONL file."""
+        import pandas as pd
+
+        if not self.dataset_path.endswith(".jsonl"):
+            raise ValueError("Custom dataset must be a JSONL file")
+
+        try:
+            df = pd.read_json(path_or_buf=self.dataset_path, lines=True)
+        except Exception as e:
+            raise ValueError(f"Failed to load JSONL file {self.dataset_path}: {e}")
+
+        if "prompt" not in df.columns:
+            raise ValueError("JSONL file must contain a 'prompt' column")
+
+        self.data = df.to_dict("records")
+        print(f"Loaded {len(self.data)} requests from {self.dataset_path}")
+
+    def _resolve_image_paths(self, item: dict) -> list[str] | None:
+        # Handle local file paths
+        if "image_paths" in item and item["image_paths"]:
+            paths = item["image_paths"]
+            if isinstance(paths, str):
+                paths = [paths]
+
+            # Verify all paths exist
+            valid_paths = []
+            for path in paths:
+                if os.path.exists(path):
+                    valid_paths.append(path)
+                else:
+                    raise ValueError(f"Image file not found: {path}")
+
+            return valid_paths if valid_paths else None
+
+        # Handle URLs - download to temp files
+        if "image_urls" in item and item["image_urls"]:
+            urls = item["image_urls"]
+            if isinstance(urls, str):
+                urls = [urls]
+
+            downloaded_paths = []
+            for url in urls:
+                try:
+                    response = requests.get(url, timeout=30)
+                    response.raise_for_status()
+
+                    # Create temp file with appropriate extension
+                    suffix = os.path.splitext(url)[1] or ".png"
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                        tmp.write(response.content)
+                        downloaded_paths.append(tmp.name)
+                except Exception as e:
+                    raise ValueError(f"Failed to download image from {url}: {e}")
+
+            return downloaded_paths if downloaded_paths else None
+
+        return None
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx: int) -> RequestFuncInput:
+        item = self.data[idx]
+
+        # Extract fields with fallback to args defaults
+        prompt = item["prompt"]
+        width = item.get("width", self.args.width)
+        height = item.get("height", self.args.height)
+        num_inference_steps = item.get("num_inference_steps", self.args.num_inference_steps)
+        seed = item.get("seed", self.args.seed)
+        reserved_keys = {"prompt", "width", "height", "num_inference_steps", "seed", "image_paths", "image_urls"}
+        extra_body = {k: v for k, v in item.items() if k not in reserved_keys}
+
+        # Handle image paths/URLs
+        image_paths = self._resolve_image_paths(item)
+
+        return RequestFuncInput(
+            prompt=prompt,
+            api_url=self.api_url,
+            model=self.model,
+            seed=seed,
+            image_paths=image_paths,
+            extra_body=extra_body,
+            width=width,
+            height=height,
+            num_inference_steps=num_inference_steps,
+        )
+
+    def get_requests(self) -> list[RequestFuncInput]:
+        """Get all requests, cycling through data if num_prompts > dataset size."""
+        num_requests = getattr(self.args, "num_prompts", len(self.data))
+
+        if num_requests <= len(self.data):
+            return [self[i] for i in range(num_requests)]
+
+        # Cycle through the dataset to reach num_prompts
+        requests = []
+        for i in range(num_requests):
+            idx = i % len(self.data)
+            requests.append(self[idx])
+
+        return requests
+
+
 class RandomDataset(BaseDataset):
     def __init__(self, args, api_url: str, model: str, enable_negative_prompt: bool = False):
         super().__init__(args, api_url, model)
@@ -585,7 +729,7 @@ class RandomDataset(BaseDataset):
             self._sampled_requests = None
 
         # Random image generate
-        if self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
+        if self.args.task in ["i2v", "ti2v", "ti2i", "i2i", "it2i"]:
             self._random_image_path = self._generate_random_image_paths()
         else:
             self._random_image_path = None
@@ -891,7 +1035,9 @@ def wait_for_service(base_url: str, timeout: int = 120) -> None:
 def _default_endpoint_for_task(task: str) -> str:
     if task in {"t2v", "i2v", "ti2v"}:
         return "/v1/videos"
-    if task in {"t2i", "i2i", "ti2i"}:
+    if task in {"i2i", "ti2i", "it2i"}:
+        return "/v1/images/edits"
+    if task == "t2i":
         return "/v1/chat/completions"
     raise ValueError(f"Unsupported task for endpoint resolution: {task}")
 
@@ -902,7 +1048,7 @@ async def benchmark(args):
         args.base_url = f"http://{args.host}:{args.port}"
 
     VIDEO_TASKS = {"t2v", "i2v", "ti2v"}
-    IMAGE_TASKS = {"t2i", "i2i", "ti2i"}
+    IMAGE_TASKS = {"t2i", "i2i", "ti2i", "it2i"}
 
     if args.task in VIDEO_TASKS:
         task_type = "2v"
@@ -940,12 +1086,18 @@ async def benchmark(args):
         dataset = TraceDataset(args, api_url, args.model)
     elif args.dataset == "random":
         dataset = RandomDataset(args, api_url, args.model, args.enable_negative_prompt)
+    elif args.dataset == "custom":
+        dataset = CustomDataset(args, api_url, args.model)
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
     print("Loading requests...")
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
+
+    if args.endpoint == "/v1/images/edits":
+        for req in requests_list:
+            req.default_bot_task = args.bot_task
 
     # Limit concurrency
     if args.max_concurrency is not None:
@@ -998,6 +1150,8 @@ async def benchmark(args):
     metrics["model"] = args.model
     metrics["dataset"] = args.dataset
     metrics["task"] = args.task
+    if args.endpoint == "/v1/images/edits":
+        metrics["bot_task"] = args.bot_task
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
 
@@ -1081,14 +1235,14 @@ if __name__ == "__main__":
         "--dataset",
         type=str,
         default="vbench",
-        choices=["vbench", "trace", "random"],
+        choices=["vbench", "trace", "random", "custom"],
         help="Dataset to use.",
     )
     parser.add_argument(
         "--task",
         type=str,
         default="t2v",
-        choices=["t2v", "i2v", "ti2v", "ti2i", "i2i", "t2i"],
+        choices=["t2v", "i2v", "ti2v", "ti2i", "i2i", "it2i", "t2i"],
         help="Task type.",
     )
     parser.add_argument(
@@ -1195,8 +1349,14 @@ if __name__ == "__main__":
         default=1,
         help=(
             "Number of synthetic input images to attach for image-conditioned tasks "
-            "(i2v, ti2v, ti2i, i2i) when using random dataset."
+            "(i2v, ti2v, ti2i, i2i, it2i) when using random dataset."
         ),
+    )
+    parser.add_argument(
+        "--bot-task",
+        type=str,
+        default="think",
+        help=("bot_task form field for --endpoint /v1/images/edits (think, recaption, think_recaption, vanilla)."),
     )
 
     args = parser.parse_args()

@@ -115,6 +115,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoListResponse,
     VideoResponse,
 )
+from vllm_omni.entrypoints.openai.realtime.world.camera_serving import ServingRealtimeWorldCamera
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
@@ -377,6 +378,11 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
+    if args.ws_max_size is not None:
+        uvicorn_kwargs["ws_max_size"] = args.ws_max_size
+    if args.ws is not None:
+        uvicorn_kwargs["ws"] = args.ws
+
     async with build_async_omni(
         args,
         client_config=client_config,
@@ -586,6 +592,7 @@ async def omni_init_app_state(
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.args = args
+    state.sleeping_stages = set()
 
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -629,6 +636,10 @@ async def omni_init_app_state(
         )
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
+
+        state.openai_serving_world_camera = ServingRealtimeWorldCamera.create_policy_server(
+            engine_client=engine_client, model_name=model_name
+        )
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
@@ -947,9 +958,12 @@ async def omni_init_app_state(
         stage_configs=state.stage_configs,
     )
 
+    state.openai_serving_world_camera = ServingRealtimeWorldCamera.create_policy_server(
+        engine_client=engine_client, model_name=model_name
+    )
+
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
-    state.sleeping_stages = set()
 
 
 def Omnivideo(request: Request) -> OmniOpenAIServingVideo | None:
@@ -1406,6 +1420,21 @@ async def realtime_websocket(websocket: WebSocket):
     await connection.handle_connection()
 
 
+@router.websocket("/v1/realtime/world/camera")
+async def realtime_world_camera_openpi(websocket: WebSocket):
+    from vllm_omni.entrypoints.openai.realtime.world.camera_connection import WorldCameraRealtimeConnection
+
+    serving = getattr(websocket.app.state, "openai_serving_world_camera", None)
+
+    if serving is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "World Model policy not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    connection = WorldCameraRealtimeConnection(websocket, serving)
+    await connection.handle_connection()
+
+
 # Health and Model endpoints for diffusion mode
 
 
@@ -1535,6 +1564,12 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 # Keep /images validation semantics: invalid LoRA should fail with 400.
                 _parse_lora_request(request.lora)
                 extra_body["lora"] = request.lora
+            if request.bot_task is not None:
+                extra_body["bot_task"] = request.bot_task
+            if request.use_system_prompt is not None:
+                extra_body["use_system_prompt"] = request.use_system_prompt
+            if request.system_prompt is not None:
+                extra_body["system_prompt"] = request.system_prompt
 
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=request.prompt,
@@ -1546,8 +1581,9 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                     status_code=generation_result.error.code if generation_result.error else 400,
                     content=generation_result.model_dump(),
                 )
-            flat_images, _, _ = generation_result
+            flat_images, _, _, _ = generation_result
             image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in flat_images]
+
             return ImageGenerationResponse(created=int(time.time()), data=image_data)
 
         # Build params - pass through user values directly
@@ -1560,6 +1596,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             extra_args["use_system_prompt"] = request.use_system_prompt
         if request.system_prompt is not None:
             extra_args["system_prompt"] = request.system_prompt
+        if request.bot_task is not None:
+            extra_args["bot_task"] = request.bot_task
         if extra_args:
             gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
@@ -1727,6 +1765,7 @@ async def edit_images(
         )
     try:
         # 2. Build prompt & images params
+        cot_output = None
         prompt: OmniTextPrompt = {"prompt": prompt}
         if negative_prompt is not None:
             prompt["negative_prompt"] = negative_prompt
@@ -1937,7 +1976,7 @@ async def edit_images(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     detail=generation_result.message,
                 )
-            images, _, _ = generation_result
+            images, _, _, cot_output = generation_result
         else:
             # Single-stage diffusion: use the direct path.
             result = await _generate_with_async_omni(
@@ -1967,6 +2006,7 @@ async def edit_images(
             data=image_data,
             output_format=output_format,
             size=size_str,
+            cot_output=cot_output,
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:

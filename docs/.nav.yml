@@ -80,6 +80,8 @@ nav:
       - Quantized KV Cache: user_guide/quantization/quantized_kvcache.md
       - FP8 W8A8: user_guide/quantization/fp8.md
       - Int8 W8A8: user_guide/quantization/int8.md
+      - MXFP8 W8A8: user_guide/quantization/mxfp8.md
+      - MXFP4 W4A4: user_guide/quantization/mxfp4.md
       - ModelOpt: user_guide/quantization/modelopt.md
       - GGUF: user_guide/quantization/gguf.md
       - AutoRound: user_guide/quantization/autoround.md

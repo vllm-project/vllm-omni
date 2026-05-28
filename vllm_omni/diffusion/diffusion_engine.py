@@ -76,6 +76,13 @@ def supports_multimodal_input(od_config: OmniDiffusionConfig) -> tuple[bool, boo
     return supports_image_input, supports_audio_input
 
 
+def supports_camera_pos_input(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "support_camera_pos_input", False))
+
+
 def image_color_format(model_class_name: str) -> str:
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     return getattr(model_cls, "color_format", "RGB")
@@ -708,33 +715,43 @@ class DiffusionEngine:
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
-        sampling_kwargs: dict[str, Any] = {
-            "height": height,
-            "width": width,
-            "num_inference_steps": num_inference_steps,
-            # Keep warmup path minimal and robust across text encoders.
-            # Some models may fail when warmup implicitly triggers
-            # classifier-free guidance with an empty negative prompt.
-            "guidance_scale": 0.0,
-            "num_outputs_per_prompt": 1,
-            # Disable CFG for warmup to avoid triggering CFG parallel
-            # validation when cfg_parallel_size > 1.
-            "extra_args": {"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
-        }
-        
-        if self.stream_batch:
-            # Stream-batch requires chunk_frames/num_frames and a source video
-            chunk_frames = 8
-            sampling_kwargs["chunk_frames"] = chunk_frames
-            sampling_kwargs["num_frames"] = chunk_frames
-            prompt.setdefault("multi_modal_data", {})["video"] = [
-                torch.zeros(3, height, width, dtype=torch.float32) for _ in range(chunk_frames)
-            ]
+            audio_duration_sec = 4
+            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
+            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
+        else:
+            dummy_audio = None
 
+        if supports_camera_pos_input(self.od_config.model_class_name):
+            camera_pos_len = 64
+            # Shape [N x 4]
+            intrinsics = np.random.rand(camera_pos_len, 4)
+            # Shape [N x 4 x 4]
+            poses = np.array([np.identity(4) for _ in range(camera_pos_len)])
+
+            dummy_camera_pos = {"intrinsics": intrinsics, "poses": poses}
+        else:
+            dummy_camera_pos = None
+
+        prompt: OmniTextPrompt = {
+            "prompt": "dummy run",
+            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio, "camera": dummy_camera_pos},
+        }
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_ids=["dummy_req_id"],
-            sampling_params=OmniDiffusionSamplingParams(**sampling_kwargs),
+            sampling_params=OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                # Keep warmup path minimal and robust across text encoders.
+                # Some models may fail when warmup implicitly triggers
+                # classifier-free guidance with an empty negative prompt.
+                guidance_scale=0.0,
+                num_outputs_per_prompt=1,
+                # Disable CFG for warmup to avoid triggering CFG parallel
+                # validation when cfg_parallel_size > 1.
+                extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
+            ),
         )
         logger.info("dummy run to warm up the model")
         request = self.pre_process_func(req) if self.pre_process_func is not None else req

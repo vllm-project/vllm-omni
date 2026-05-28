@@ -797,7 +797,7 @@ class TestSendChunkCachesMapping(unittest.TestCase):
 
 
 class TestLocalPayloadCacheLifecycle(unittest.TestCase):
-    """Unit tests for the local payload cache API (RFC §2.4)."""
+    """Unit tests for the local payload cache API"""
 
     def _make_host(self) -> MixinHost:
         host = MixinHost()

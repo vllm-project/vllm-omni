@@ -22,7 +22,9 @@ from vllm_omni.diffusion.sched.interface import (
 
 logger = init_logger(__name__)
 
-_KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey))
+# LoRA identity is derived from `sampling.lora_request`, not a same-named field
+# on sampling params, so it must be resolved separately from the bulk lookup.
+_KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {"lora_int_id"}
 
 
 def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey | None:
@@ -31,7 +33,11 @@ def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey 
         return None
 
     sampling = request.sampling_params
-    return SamplingParamsKey(**{name: getattr(sampling, name) for name in _KEY_FIELD_NAMES})
+    lora_request = getattr(sampling, "lora_request", None)
+    return SamplingParamsKey(
+        lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
+        **{name: getattr(sampling, name) for name in _KEY_FIELD_NAMES},
+    )
 
 
 class _BaseScheduler(SchedulerInterface):
