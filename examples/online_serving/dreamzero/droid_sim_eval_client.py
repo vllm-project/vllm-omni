@@ -4,9 +4,8 @@
 
 """Run one or more DROID sim-eval rollouts against the vLLM DreamZero server.
 
-This script is the vLLM/OpenPI adaptation of the upstream DreamZero sim-eval
-client:
-`third_party/dreamzero/eval_utils/run_sim_eval.py`
+This script is the vLLM/OpenPI adaptation of the upstream DreamZero
+`eval_utils/run_sim_eval.py` sim-eval client.
 
 Behavior intentionally kept close to upstream:
 - same DROID observation extraction (`external_cam`, `external_cam_2`,
