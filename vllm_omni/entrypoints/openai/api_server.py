@@ -1053,8 +1053,19 @@ async def omni_init_app_state(
         else None
     )
 
+    # Forced aligner / word timestamps (issue #3631). Default-off; the
+    # CLI helper returns None when --forced-aligner is not set, in
+    # which case the streaming layer keeps emitting raw binary frames.
+    from vllm_omni.utils.forced_aligner import build_forced_aligner_config
+
+    forced_aligner_config = build_forced_aligner_config(args)
+
     state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+        engine_client,
+        state.openai_serving_models,
+        request_logger=request_logger,
+        model_name=model_name,
+        forced_aligner_config=forced_aligner_config,
     )
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first

@@ -169,6 +169,51 @@ class OmniEngineArgs(EngineArgs):
             )
         except argparse.ArgumentError:
             pass
+        # Forced aligner / word timestamps (issue #3631). Single flag;
+        # passing a model path enables the feature, omitting disables.
+        try:
+            parser.add_argument(
+                "--forced-aligner",
+                type=str,
+                default=None,
+                help=(
+                    "Enable streaming TTS word timestamps via a forced aligner. "
+                    "Pass the aligner model path/name, e.g. "
+                    "'Qwen/Qwen3-ForcedAligner-0.6B'. Disabled when omitted."
+                ),
+            )
+        except argparse.ArgumentError:
+            pass
+        try:
+            parser.add_argument(
+                "--forced-aligner-config",
+                type=str,
+                default=None,
+                help=(
+                    "Optional YAML file for forced aligner settings. "
+                    "The --forced-aligner flag, when set, overrides the YAML model field."
+                ),
+            )
+        except argparse.ArgumentError:
+            pass
+        try:
+            parser.add_argument(
+                "--forced-aligner-device",
+                type=str,
+                default=None,
+                help="Optional CUDA device for the forced aligner, e.g. 'cuda:1' or '1'.",
+            )
+        except argparse.ArgumentError:
+            pass
+        try:
+            parser.add_argument(
+                "--forced-aligner-gpu-memory-utilization",
+                type=float,
+                default=None,
+                help="Optional gpu_memory_utilization override for the forced aligner LLM.",
+            )
+        except argparse.ArgumentError:
+            pass
         return parser
 
     omni_master_address: str | None = None
@@ -182,6 +227,16 @@ class OmniEngineArgs(EngineArgs):
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
+
+    # Forced aligner / word timestamps (issue #3631). Single flag —
+    # passing a model path enables the feature, omitting disables.
+    # Heavy knobs (gpu_memory_utilization, dtype, max_model_len) live
+    # on ForcedAlignerConfig defaults; override via deploy yaml when
+    # needed instead of cluttering the CLI.
+    forced_aligner: str | None = None
+    forced_aligner_config: str | None = None
+    forced_aligner_device: str | None = None
+    forced_aligner_gpu_memory_utilization: float | None = None
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:

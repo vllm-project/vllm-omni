@@ -219,6 +219,37 @@ class OmniServeCommand(CLISubcommand):
             help="Default task type for TTS models (CustomVoice, VoiceDesign, or Base). "
             "If not specified, will be inferred from model path.",
         )
+        omni_config_group.add_argument(
+            "--forced-aligner",
+            type=str,
+            default=None,
+            help=(
+                "Enable streaming TTS word timestamps via a forced aligner. "
+                "Pass the aligner model path/name, e.g. 'Qwen/Qwen3-ForcedAligner-0.6B'. "
+                "Disabled when omitted."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--forced-aligner-config",
+            type=str,
+            default=None,
+            help=(
+                "Optional YAML file for forced aligner settings. "
+                "The --forced-aligner flag, when set, overrides the YAML model field."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--forced-aligner-device",
+            type=str,
+            default=None,
+            help="Optional CUDA device for the forced aligner, e.g. 'cuda:1' or '1'.",
+        )
+        omni_config_group.add_argument(
+            "--forced-aligner-gpu-memory-utilization",
+            type=float,
+            default=None,
+            help="Optional gpu_memory_utilization override for the forced aligner LLM.",
+        )
         # TODO(@lishunyang12): deprecate once all models migrate to --deploy-config
         omni_config_group.add_argument(
             "--stage-configs-path",
