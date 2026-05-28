@@ -189,7 +189,7 @@ class DiffusionWorker:
         self.lora_manager: DiffusionLoRAManager | None = None
         # Worker-side cache of (lora_request, lora_scale) per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
-        # requests, which only carry their sched_req_id in subsequent ticks.
+        # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
@@ -391,12 +391,12 @@ class DiffusionWorker:
         homogeneity is enforced by the scheduler via ``SamplingParamsKey``,
         so any scheduled request id resolves to the active LoRA identity.
         """
-        for sched_req_id in scheduler_output.finished_req_ids:
-            self._step_lora_state.pop(sched_req_id, None)
+        for request_id in scheduler_output.finished_req_ids:
+            self._step_lora_state.pop(request_id, None)
 
         for new_req in scheduler_output.scheduled_new_reqs:
             sampling = new_req.req.sampling_params
-            self._step_lora_state[new_req.sched_req_id] = (
+            self._step_lora_state[new_req.request_id] = (
                 sampling.lora_request,
                 sampling.lora_scale,
             )
@@ -406,8 +406,8 @@ class DiffusionWorker:
 
         lora_request: LoRARequest | None = None
         lora_scale = 1.0
-        for sched_req_id in scheduler_output.scheduled_req_ids:
-            entry = self._step_lora_state.get(sched_req_id)
+        for request_id in scheduler_output.scheduled_request_ids:
+            entry = self._step_lora_state.get(request_id)
             if entry is not None:
                 lora_request, lora_scale = entry
                 break

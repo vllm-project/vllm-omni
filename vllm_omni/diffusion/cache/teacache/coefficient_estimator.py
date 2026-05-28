@@ -202,6 +202,7 @@ class TeaCacheCoefficientEstimator:
         self.hook.start_collection()
         req = OmniDiffusionRequest(
             prompts=[prompt],
+            request_id="teacache-coefficient-estimator",
             sampling_params=OmniDiffusionSamplingParams(
                 num_inference_steps=generate_kwargs.get("num_inference_steps", 20),
                 seed=generate_kwargs.get("seed", 42),
