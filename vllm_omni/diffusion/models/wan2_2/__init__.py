@@ -17,10 +17,10 @@ from .pipeline_wan2_2_i2v import (
     get_wan22_i2v_post_process_func,
     get_wan22_i2v_pre_process_func,
 )
-from .pipeline_wan2_2_ti2v import (
-    Wan22TI2VPipeline,
-    get_wan22_ti2v_post_process_func,
-    get_wan22_ti2v_pre_process_func,
+from .pipeline_wan2_2_s2v import (
+    Wan22S2VPipeline,
+    get_wan22_s2v_post_process_func,
+    get_wan22_s2v_pre_process_func,
 )
 from .pipeline_wan2_2_vace import (
     Wan22VACEPipeline,
@@ -42,9 +42,9 @@ __all__ = [
     "WanI2VDMD2Pipeline",
     "get_wan22_i2v_post_process_func",
     "get_wan22_i2v_pre_process_func",
-    "Wan22TI2VPipeline",
-    "get_wan22_ti2v_post_process_func",
-    "get_wan22_ti2v_pre_process_func",
+    "Wan22S2VPipeline",
+    "get_wan22_s2v_post_process_func",
+    "get_wan22_s2v_pre_process_func",
     "Wan22VACEPipeline",
     "get_wan22_vace_post_process_func",
     "get_wan22_vace_pre_process_func",

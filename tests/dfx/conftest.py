@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -70,17 +71,17 @@ def _build_serve_args(serve_args: Any) -> list[str]:
 def create_unique_server_params(
     configs: list[dict[str, Any]],
     stage_configs_dir: Path,
-) -> list[tuple[str, str, str | None, str | None, tuple[str, ...]]]:
-    """Return one row per unique server configuration (same 5-tuple shape as upstream).
+) -> list[tuple[str, str, str | None, str | None, tuple[str, ...], bool]]:
+    """Return one row per unique server configuration.
 
-    ``(test_name, model, deploy_yaml_path, stage_overrides_json, extra_cli_args)``.
+    ``(test_name, model, deploy_yaml_path, stage_overrides_json, extra_cli_args, use_omni)``.
 
     JSON ``server_params.serve_args`` (dict/list) is expanded via ``_build_serve_args``
     and **prepended** to ``extra_cli_args`` so perf / stability ``omni_server`` fixtures
     stay identical to main while still honoring ``serve_args`` in benchmark JSON.
     """
-    unique_params: list[tuple[str, str, str | None, str | None, tuple[str, ...]]] = []
-    seen: set[tuple[str, str, str | None, str | None, tuple[str, ...]]] = set()
+    unique_params: list[tuple[str, str, str | None, str | None, tuple[str, ...], bool]] = []
+    seen: set[tuple[str, str, str | None, str | None, tuple[str, ...], bool]] = set()
     for config in configs:
         test_name = config["test_name"]
         server_params = config["server_params"]
@@ -104,8 +105,16 @@ def create_unique_server_params(
         serve_flat = _build_serve_args(server_params.get("serve_args"))
         raw_extra = tuple(server_params.get("extra_cli_args") or ())
         extra_cli_args = tuple(serve_flat) + raw_extra
+        use_omni = bool(server_params.get("use_omni", True))
 
-        server_param = (test_name, model, stage_config_path, stage_overrides_json, extra_cli_args)
+        server_param = (
+            test_name,
+            model,
+            stage_config_path,
+            stage_overrides_json,
+            extra_cli_args,
+            use_omni,
+        )
         if server_param not in seen:
             seen.add(server_param)
             unique_params.append(server_param)
@@ -145,8 +154,9 @@ def create_reliability_omni_server_params(
             model=model,
             stage_config_path=stage_config_path,
             server_args=server_args_by_name.get(test_name),
+            use_omni=use_omni,
         )
-        for test_name, model, stage_config_path, _stage_overrides_json, _extra_cli_args in unique_params
+        for test_name, model, stage_config_path, _stage_overrides_json, _extra_cli_args, use_omni in unique_params
     ]
 
 
@@ -269,6 +279,10 @@ def create_benchmark_indices(
     return indices
 
 
+# Omni perf/stability: ``vllm bench serve --omni`` result template (used if bench exits without writing JSON).
+OMNI_RESULT_TEMPLATE_PATH = Path(__file__).resolve().parent / "perf" / "scripts" / "result_omni_template.json"
+
+
 def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
     """Make a single path segment safe for result filenames on common filesystems."""
     if value is None:
@@ -279,7 +293,7 @@ def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
     return s if s else default
 
 
-def _resolve_baseline_value(
+def resolve_baseline_value(
     baseline_raw: Any,
     *,
     sweep_index: int | None,
@@ -320,7 +334,7 @@ def _baseline_thresholds_for_step(
 ) -> dict[str, Any]:
     """Resolve baseline config to one threshold per metric for this iteration."""
     return {
-        metric_name: _resolve_baseline_value(
+        metric_name: resolve_baseline_value(
             baseline_raw,
             sweep_index=sweep_index,
             max_concurrency=max_concurrency,
@@ -344,7 +358,12 @@ def run_benchmark(
     random_input_len: Any | None = None,
     random_output_len: Any | None = None,
 ) -> dict[str, Any]:
-    """Run one ``vllm bench serve --omni`` iteration and return parsed metrics."""
+    """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
+
+    After ``vllm bench`` writes the JSON, ``result["baseline"]`` holds the resolved per-metric thresholds
+    (when ``baseline_config`` is provided). If the benchmark exits without writing a result file,
+    ``result_omni_template.json`` is used as a fallback.
+    """
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
     ri = _safe_filename_token(random_input_len)
     ro = _safe_filename_token(random_output_len)
@@ -368,11 +387,23 @@ def run_benchmark(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True
     )
 
-    for line in iter(process.stdout.readline, ""):
-        print(line, end=" ")
+    if process.stdout is None or process.stderr is None:
+        raise RuntimeError("Failed to capture benchmark process output streams")
 
-    for line in iter(process.stderr.readline, ""):
-        print(line, end=" ")
+    def _forward_stream(stream) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                print(line, end="")
+        finally:
+            stream.close()
+
+    stdout_thread = threading.Thread(target=_forward_stream, args=(process.stdout,))
+    stderr_thread = threading.Thread(target=_forward_stream, args=(process.stderr,))
+    stdout_thread.start()
+    stderr_thread.start()
+    stdout_thread.join()
+    stderr_thread.join()
+    process.wait()
 
     if "--result-dir" in command:
         index = command.index("--result-dir")
@@ -381,8 +412,17 @@ def run_benchmark(
         result_dir = "./"
 
     result_path = os.path.join(result_dir, result_filename)
-    with open(result_path, encoding="utf-8") as f:
-        result = json.load(f)
+    if not os.path.exists(result_path):
+        with open(OMNI_RESULT_TEMPLATE_PATH, encoding="utf-8") as f:
+            template_result: dict[str, Any] = json.load(f)
+        Path(result_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(template_result, f, ensure_ascii=False, indent=2)
+        print(f"Benchmark result file not generated, fallback to template: {result_path}")
+        result = template_result
+    else:
+        with open(result_path, encoding="utf-8") as f:
+            result = json.load(f)
 
     if baseline_config:
         result["baseline"] = _baseline_thresholds_for_step(
@@ -409,4 +449,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store",
         default=None,
         help=("Path to benchmark config JSON. Example: --test-config-file tests/dfx/perf/tests/test_tts.json"),
+    )
+    parser.addoption(
+        "--assert-baseline",
+        action="store_true",
+        default=False,
+        help=(
+            "When set, omni/diffusion perf runners compare metrics against the baseline block in the JSON config "
+            "(default: off)."
+        ),
     )

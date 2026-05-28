@@ -18,6 +18,8 @@ stages:
     max_num_seqs: 1
     gpu_memory_utilization: 0.6
     enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
     max_num_batched_tokens: 32768
     devices: "0"
     default_sampling_params:
@@ -32,8 +34,11 @@ stages:
   # Stage 1: Diffusion (DiT + VAE)
   # Receives prior_token_ids from AR, performs denoising + VAE decode.
   - stage_id: 1
+    max_num_batched_tokens: 32768
     max_num_seqs: 1
     enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
     devices: "1"
     default_sampling_params:
       seed: 42
@@ -41,3 +46,40 @@ stages:
       guidance_scale: 1.5
       height: 1024
       width: 1024
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        devices: "0,1,2,3"
+        env:
+          # When multiple business processes share a single NPU simultaneously,
+          # port conflict issues may occur. You can refer to the link below to set different parameters for different processes,
+          # replacing the default parameter configuration.
+          # https://www.hiascend.com/document/detail/zh/canncommercial/850/maintenref/envvar/envref_07_0143.html
+          HCCL_IF_BASE_PORT: 23000
+          HCCL_HOST_SOCKET_PORT_RANGE: "23000-23199"
+          HCCL_NPU_SOCKET_PORT_RANGE: "23200-23399"
+        async_scheduling: true
+        enforce_eager: false
+        distributed_executor_backend: "mp"
+        enable_prefix_caching: true
+        tensor_parallel_size: 4
+        sequence_parallel_size: 1
+        compilation_config:
+          cudagraph_capture_sizes: [1, 2]
+          cudagraph_mode: "FULL_DECODE_ONLY"
+        worker_cls: vllm_omni.platforms.npu.worker.npu_ar_worker.NPUARWorker
+        scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      - stage_id: 1
+        devices: "0,1,2,3"
+        env:
+          HCCL_IF_BASE_PORT: 24000
+          HCCL_HOST_SOCKET_PORT_RANGE: "24000-24199"
+          HCCL_NPU_SOCKET_PORT_RANGE: "24200-24399"
+        distributed_executor_backend: "mp"
+        parallel_config:
+          tensor_parallel_size: 1
+          sequence_parallel_size: 4
+          ulysses_degree: 4
+          ring_degree: 1

@@ -38,7 +38,7 @@ class TestGenerator2Tokenizer:
         audio = torch.tensor([10, 20, 30, 40])
         stage = _make_stage([_make_output([audio])])
 
-        result = generator2tokenizer([stage], engine_input_source=[0])
+        result = generator2tokenizer(stage.engine_outputs)
 
         assert len(result) == 1
         assert result[0]["prompt_token_ids"] == [10, 20, 30, 40]
@@ -49,27 +49,15 @@ class TestGenerator2Tokenizer:
         audio = torch.tensor([[1, 2, 3], [4, 5, 6]])  # (2, 3)
         stage = _make_stage([_make_output([audio])])
 
-        result = generator2tokenizer([stage], engine_input_source=[0])
+        result = generator2tokenizer(stage.engine_outputs)
 
         assert result[0]["prompt_token_ids"] == [1, 2, 3, 4, 5, 6]
-
-    def test_empty_engine_input_source_raises(self):
-        """Empty engine_input_source raises ValueError."""
-        stage = _make_stage([_make_output([torch.tensor([1])])])
-        with pytest.raises(ValueError, match="cannot be empty"):
-            generator2tokenizer([stage], engine_input_source=[])
-
-    def test_invalid_stage_id_raises(self):
-        """Stage id beyond stage_list length raises IndexError."""
-        stage = _make_stage([_make_output([torch.tensor([1])])])
-        with pytest.raises(IndexError, match="Invalid stage_id"):
-            generator2tokenizer([stage], engine_input_source=[5])
 
     def test_no_outputs_yet_raises(self):
         """Stage with engine_outputs=None raises RuntimeError."""
         stage = _make_stage(engine_outputs=None)
-        with pytest.raises(RuntimeError, match="no outputs yet"):
-            generator2tokenizer([stage], engine_input_source=[0])
+        with pytest.raises(TypeError):
+            generator2tokenizer(stage.engine_outputs)
 
 
 # ---- Helpers for generator2tokenizer_async_chunk (streaming) ----
@@ -126,8 +114,8 @@ def test_flush_tail_when_finished():
     )
 
     assert payload is not None
-    assert payload["meta"]["finished"].item() is True
-    codes = payload["codes"]["audio"]
+    assert payload.meta.finished.item() is True
+    codes = payload.codes.audio
     # Format: [ctx_frames, context_length, ...flat_codes]
     assert len(codes) >= 2  # At least ctx_frames + context_length header
     ctx_frames = codes[0]
@@ -149,8 +137,8 @@ def test_eof_marker_when_finished_with_no_frames():
         request=request,
     )
 
-    assert payload["codes"] == {"audio": []}
-    assert payload["meta"]["finished"].item() is True
+    assert payload.codes.audio.tolist() == []
+    assert payload.meta.finished.item() is True
 
 
 def test_normal_chunk_emission():
@@ -174,7 +162,7 @@ def test_normal_chunk_emission():
 
     # A chunk should be emitted
     assert payload is not None
-    codes = payload["codes"]["audio"]
+    codes = payload.codes.audio
     ctx_frames = codes[0]
     context_length = codes[1]
     assert ctx_frames == 20  # 25 - 5(chunk_size_at_begin)
@@ -201,7 +189,7 @@ def test_small_initial_chunks():
         )
 
     assert payload is not None
-    codes = payload["codes"]["audio"]
+    codes = payload.codes.audio
     ctx_frames = codes[0]
     context_length = codes[1]
     assert ctx_frames == 0
@@ -250,19 +238,16 @@ def test_context_handling_format():
         )
 
     assert payload is not None
-    codes = payload["codes"]["audio"]
-    # First two elements are ctx_frames and context_length
-    ctx_frames = codes[0]
-    context_length = codes[1]
+    codes = payload.codes.audio
+    # codes is a 1-D long tensor: [ctx_frames, context_length, ...flat_codes]
+    ctx_frames = int(codes[0].item())
+    context_length = int(codes[1].item())
     flat_codes = codes[2:]
-    # The window has ctx_frames + context_length frames
-    assert isinstance(ctx_frames, int)
-    assert isinstance(context_length, int)
     assert ctx_frames >= 0
     assert context_length > 0
     # flat_codes = total_window_frames * codebook_dim
     total_window_frames = ctx_frames + context_length
-    assert len(flat_codes) == total_window_frames * 2  # codebook_dim=2
+    assert flat_codes.numel() == total_window_frames * 2  # codebook_dim=2
 
 
 def test_none_pooling_output_not_finished_returns_none():

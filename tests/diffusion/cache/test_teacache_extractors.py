@@ -303,7 +303,10 @@ class TestFluxExtractor(BaseExtractorTest):
         """Use the SDPA backend so FLUX can be instantiated in CPU tests."""
         from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 
-        with patch("vllm_omni.diffusion.attention.layer.get_attn_backend", return_value=SDPABackend):
+        with patch(
+            "vllm_omni.diffusion.attention.layer.get_attn_backend_for_role",
+            return_value=(SDPABackend, None),
+        ):
             yield
 
     def get_extractor(self):

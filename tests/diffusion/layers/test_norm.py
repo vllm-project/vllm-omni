@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -298,6 +299,55 @@ def test_rmsnorm_numerical_correctness():
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
 
 
+# ── RMSNorm compile-path regression tests ──
+
+
+def test_rmsnorm_forward_cuda_does_not_call_fused_during_compile(mocker: MockerFixture) -> None:
+    """Regression: _forward_fused must not be called during torch.compile tracing.
+
+    Under HSDP, RMSNorm.weight is a DTensor. Accessing .data on a DTensor inside
+    _forward_fused during tracing produces an orphan all-gather node outside the
+    compile boundary, causing inductor's compute_ancestors to raise KeyError.
+    The is_compiling() guard in forward_cuda/forward_hip prevents this by routing
+    to forward_native during tracing.
+
+    If someone removes the guard, this test will catch the regression by asserting
+    that _forward_fused was not called while is_compiling() returns True.
+    """
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    norm = RMSNorm(hidden_size=64)
+    x = torch.randn(2, 4, 64)
+
+    mock_fused = mocker.patch.object(norm, "_forward_fused", wraps=norm._forward_fused)
+    mocker.patch("torch.compiler.is_compiling", return_value=True)
+
+    out = norm.forward_cuda(x)
+
+    mock_fused.assert_not_called()
+    assert out.shape == x.shape
+
+
+def test_rmsnorm_forward_hip_does_not_call_fused_during_compile(mocker: MockerFixture) -> None:
+    """Regression: same guard must be present in forward_hip.
+
+    forward_hip is the entry point on ROCm (AMD GPU). It must behave identically
+    to forward_cuda with respect to the is_compiling() guard.
+    """
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    norm = RMSNorm(hidden_size=64)
+    x = torch.randn(2, 4, 64)
+
+    mock_fused = mocker.patch.object(norm, "_forward_fused", wraps=norm._forward_fused)
+    mocker.patch("torch.compiler.is_compiling", return_value=True)
+
+    out = norm.forward_hip(x)
+
+    mock_fused.assert_not_called()
+    assert out.shape == x.shape
+
+
 def test_rmsnorm_matches_reference_implementation():
     """Verify RMSNorm matches a reference implementation."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -451,3 +501,97 @@ def test_rmsnorm_with_single_element_batch():
     out = norm(x)
 
     assert out.shape == (1, 1, hidden_size)
+
+
+# ── Fused vs Native correctness tests ──
+
+
+def test_rmsnorm_fused_native_parity_cuda():
+    """Verify fused and native RMSNorm produce identical results on CUDA.
+
+    The fused kernel uses vllm._custom_ops.rms_norm while native uses pure PyTorch.
+    Both should produce numerically equivalent results.
+    """
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    hidden_size = 128
+    eps = 1e-6
+    torch.manual_seed(42)
+
+    for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+        torch.manual_seed(42)
+        norm = RMSNorm(hidden_size, eps=eps).cuda()
+        norm.weight.data = norm.weight.data.to(dtype)
+
+        x = torch.randn(4, 8, hidden_size, dtype=dtype, device="cuda")
+
+        out_fused = norm._forward_fused(x)
+        out_native = norm.forward_native(x)
+
+        torch.testing.assert_close(out_fused, out_native, atol=1e-3, rtol=1e-3)
+
+
+def test_rmsnorm_fused_native_parity_large_tensor():
+    """Verify fused and native RMSNorm parity with large tensors.
+
+    Tests realistic tensor sizes used in diffusion models.
+    """
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    hidden_size = 4096
+    batch_size = 16
+    seq_len = 1024
+    eps = 1e-6
+
+    for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+        torch.manual_seed(123)
+        norm = RMSNorm(hidden_size, eps=eps).cuda()
+        norm.weight.data = norm.weight.data.to(dtype)
+
+        x = torch.randn(batch_size, seq_len, hidden_size, dtype=dtype, device="cuda")
+
+        out_fused = norm._forward_fused(x)
+        out_native = norm.forward_native(x)
+
+        torch.testing.assert_close(out_fused, out_native, atol=1e-2, rtol=1e-2)
+
+
+def test_rmsnorm_fused_native_parity_2d_input():
+    """Verify fused and native RMSNorm parity with 2D input tensors."""
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    hidden_size = 256
+    batch_size = 32
+    eps = 1e-6
+
+    for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+        torch.manual_seed(456)
+        norm = RMSNorm(hidden_size, eps=eps).cuda()
+        norm.weight.data = norm.weight.data.to(dtype)
+
+        x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+
+        out_fused = norm._forward_fused(x)
+        out_native = norm.forward_native(x)
+
+        torch.testing.assert_close(out_fused, out_native, atol=1e-3, rtol=1e-3)
+
+
+def test_rmsnorm_fused_native_parity_custom_weight():
+    """Verify fused and native RMSNorm parity with non-default weights."""
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    hidden_size = 64
+    eps = 1e-6
+
+    for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+        torch.manual_seed(789)
+        norm = RMSNorm(hidden_size, eps=eps).cuda()
+        norm.weight.data = torch.randn(hidden_size, dtype=dtype, device="cuda")
+
+        x = torch.randn(2, 4, hidden_size, dtype=dtype, device="cuda")
+
+        out_fused = norm._forward_fused(x)
+        out_native = norm.forward_native(x)
+
+        torch.testing.assert_close(out_fused, out_native, atol=1e-3, rtol=1e-3)

@@ -34,6 +34,16 @@ Video example (text-to-video):
         --height 720 --width 1280 \
         --num-frames 81 --num-inference-steps 40 --seed 42
 
+LTX-2 example (text-to-video; audio output is generated but not scored by LPIPS):
+    python benchmarks/diffusion/quantization_quality.py \
+        --model Lightricks/LTX-Video-2 \
+        --task t2v \
+        --quantization fp8 int8 \
+        --prompts \
+            "A serene lakeside sunrise with mist over the water" \
+        --height 704 --width 1216 \
+        --num-frames 121 --num-inference-steps 40 --seed 42
+
 Multiple quantization methods:
     python benchmarks/diffusion/quantization_quality.py \
         --model Tongyi-MAI/Z-Image-Turbo \
@@ -148,10 +158,11 @@ def _build_omni_kwargs(args, quantization=None):
 def _generate_image(omni, args, prompt, seed):
     """Generate a single image and return (PIL.Image, time_seconds, memory_gib)."""
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.outputs import OmniRequestOutput
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.reset_peak_memory_stats()
     start = time.perf_counter()
     outputs = omni.generate(
         {"prompt": prompt},
@@ -163,10 +174,11 @@ def _generate_image(omni, args, prompt, seed):
         ),
     )
     elapsed = time.perf_counter() - start
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
-    first = outputs[0]
-    req_out = first.request_output[0] if hasattr(first, "request_output") else first
+    req_out = OmniRequestOutput.unwrap_result(outputs)
+    if not req_out.images:
+        raise ValueError("Could not extract image output from result.")
     img = req_out.images[0]
     return img, elapsed, peak_mem
 
@@ -178,7 +190,7 @@ def _generate_video(omni, args, prompt, seed):
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.reset_peak_memory_stats()
     start = time.perf_counter()
     outputs = omni.generate(
         {"prompt": prompt, "negative_prompt": ""},
@@ -192,7 +204,7 @@ def _generate_video(omni, args, prompt, seed):
         ),
     )
     elapsed = time.perf_counter() - start
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
     first = outputs[0]
     if hasattr(first, "request_output") and isinstance(first.request_output, list):
@@ -202,8 +214,17 @@ def _generate_video(omni, args, prompt, seed):
         else:
             frames = inner
     elif hasattr(first, "images") and first.images:
-        frames = first.images
+        frames = first.images[0]
     else:
+        raise ValueError("Could not extract video frames from output.")
+
+    # LTX-2 (and similar audio+video models) may surface a dict or (video, audio) tuple
+    if isinstance(frames, dict):
+        frames = frames.get("video") or frames.get("frames")
+    elif isinstance(frames, tuple) and len(frames) == 2:
+        frames = frames[0]
+
+    if frames is None:
         raise ValueError("Could not extract video frames from output.")
 
     if isinstance(frames, torch.Tensor):
@@ -223,13 +244,15 @@ def _generate_video(omni, args, prompt, seed):
     return frames_array, elapsed, peak_mem
 
 
-def _unload_omni(omni):
-    """Delete Omni instance and free GPU memory."""
-    del omni
+def _free_gpu_memory():
+    """Force GC and release cached GPU memory.
+
+    Must be called AFTER the caller has dropped (i.e., via `del`)
+    every reference to the Omni instance"""
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.accelerator.empty_cache()
+        torch.accelerator.synchronize()
 
 
 def run_benchmark(args):
@@ -265,7 +288,9 @@ def run_benchmark(args):
 
     bl_avg_time = np.mean([v[1] for v in baseline_outputs.values()])
     bl_mem = baseline_outputs[prompts[0]][2]  # use first prompt's memory
-    _unload_omni(omni_bl)
+    omni_bl.shutdown()
+    del omni_bl
+    _free_gpu_memory()
 
     # Save baseline outputs
     bl_dir = output_dir / "baseline"
@@ -305,7 +330,9 @@ def run_benchmark(args):
 
         qt_avg_time = np.mean([v[1] for v in qt_outputs.values()])
         qt_mem = qt_outputs[prompts[0]][2]
-        _unload_omni(omni_qt)
+        omni_qt.shutdown()
+        del omni_qt
+        _free_gpu_memory()
 
         # Save quantized outputs
         qt_dir = output_dir / config_label.replace(" ", "_")
