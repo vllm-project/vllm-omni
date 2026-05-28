@@ -40,8 +40,8 @@ _EXPECTED_FAMILIES = [
     defs.AUDIO_RTF_METRIC,
     defs.AUDIO_FRAMES_METRIC,
     defs.AUDIO_UNDERRUN_S,
-    defs.AUDIO_CONTINUITY_OK,
-    defs.AUDIO_SKIPPED_REQUESTS,
+    defs.AUDIO_CONTINUITY_OK_METRIC,
+    defs.AUDIO_SKIPPED_REQUESTS_METRIC,
 ]
 
 
@@ -126,12 +126,12 @@ class TestAudio:
         # Counter family auto-suffixes _total at exposition.
         v100 = _sample_value(
             out,
-            f'{defs.AUDIO_CONTINUITY_OK}_total{{model_name="{_MODEL}",'
+            f'{defs.AUDIO_CONTINUITY_OK_METRIC}_total{{model_name="{_MODEL}",'
             f'replica="{replica}",stage="{stage}",threshold_ms="100"}}',
         )
         v200 = _sample_value(
             out,
-            f'{defs.AUDIO_CONTINUITY_OK}_total{{model_name="{_MODEL}",'
+            f'{defs.AUDIO_CONTINUITY_OK_METRIC}_total{{model_name="{_MODEL}",'
             f'replica="{replica}",stage="{stage}",threshold_ms="200"}}',
         )
         assert v100 == 1.0
@@ -144,12 +144,12 @@ class TestAudio:
         out = generate_latest(REGISTRY).decode()
         good = _sample_value(
             out,
-            f'{defs.AUDIO_SKIPPED_REQUESTS}_total{{model_name="{_MODEL}",'
+            f'{defs.AUDIO_SKIPPED_REQUESTS_METRIC}_total{{model_name="{_MODEL}",'
             f'reason="malformed_codec",replica="{replica}",stage="{stage}"}}',
         )
         unknown = _sample_value(
             out,
-            f'{defs.AUDIO_SKIPPED_REQUESTS}_total{{model_name="{_MODEL}",'
+            f'{defs.AUDIO_SKIPPED_REQUESTS_METRIC}_total{{model_name="{_MODEL}",'
             f'reason="unknown",replica="{replica}",stage="{stage}"}}',
         )
         assert good == 1.0

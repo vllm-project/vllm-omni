@@ -67,13 +67,13 @@ _audio_underrun_family = Histogram(
     buckets=defs.SECONDS_FAST_BUCKETS,
 )
 _audio_continuity_ok_family = Counter(
-    defs.AUDIO_CONTINUITY_OK,
+    defs.AUDIO_CONTINUITY_OK_METRIC,
     "Incremented when the request's worst underrun stayed below threshold_ms. "
     "Pair with requests_success_total to compute streaming-continuity health rate.",
     labelnames=list(defs.AUDIO_CONTINUITY_LABELS),
 )
 _audio_skipped_family = Counter(
-    defs.AUDIO_SKIPPED_REQUESTS,
+    defs.AUDIO_SKIPPED_REQUESTS_METRIC,
     "Silent-loss counter — code2wav rejected malformed codec input and "
     "returned 200 OK with empty audio.",
     labelnames=list(defs.AUDIO_SKIPPED_LABELS),

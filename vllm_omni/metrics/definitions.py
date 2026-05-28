@@ -23,6 +23,9 @@ AUDIO_TTFP = "audio_ttfp"
 AUDIO_DURATION = "audio_duration"
 AUDIO_RTF = "audio_rtf"
 AUDIO_FRAMES = "audio_frames"
+AUDIO_UNDERRUN = "audio_underrun"
+AUDIO_CONTINUITY_OK = "audio_continuity_ok"
+AUDIO_SKIPPED_REQUESTS = "audio_skipped_requests"
 
 
 # ============================================================================
@@ -45,9 +48,9 @@ AUDIO_TTFP_S = METRIC_PREFIX + AUDIO_TTFP + "_s"
 AUDIO_DURATION_S = METRIC_PREFIX + AUDIO_DURATION + "_s"
 AUDIO_RTF_METRIC = METRIC_PREFIX + AUDIO_RTF
 AUDIO_FRAMES_METRIC = METRIC_PREFIX + AUDIO_FRAMES
-AUDIO_UNDERRUN_S = METRIC_PREFIX + "audio_underrun_s"
-AUDIO_CONTINUITY_OK = METRIC_PREFIX + "audio_continuity_ok"
-AUDIO_SKIPPED_REQUESTS = METRIC_PREFIX + "audio_skipped_requests"
+AUDIO_UNDERRUN_S = METRIC_PREFIX + AUDIO_UNDERRUN + "_s"
+AUDIO_CONTINUITY_OK_METRIC = METRIC_PREFIX + AUDIO_CONTINUITY_OK
+AUDIO_SKIPPED_REQUESTS_METRIC = METRIC_PREFIX + AUDIO_SKIPPED_REQUESTS
 
 
 # ============================================================================

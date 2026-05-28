@@ -48,8 +48,4 @@ class OmniSchedulerMixin:
         if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S:
             return None
         self._last_stats_time = now
-        return SchedulerStats(
-            kv_cache_usage=self.kv_cache_manager.usage,
-            num_running_reqs=len(self.running),
-            num_waiting_reqs=len(self.waiting),
-        )
+        return super().make_stats(*args, **kwargs)
