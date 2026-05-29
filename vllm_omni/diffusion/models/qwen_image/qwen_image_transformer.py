@@ -43,12 +43,10 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
-
-# Before #41804 issue fixed, PyTorch RMSNorm replaced vLLM RMSNorm for Qwen-Image.
-RMSNorm = nn.RMSNorm
 
 
 def _join_prefix(prefix: str, suffix: str) -> str:
