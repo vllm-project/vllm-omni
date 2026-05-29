@@ -673,8 +673,13 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         span_len = input_ids.shape[0]
         update_dict: OmniPayload = {}
-        if span_len > 1:
-            # prefill
+        # Prefix caching can reduce a new request's remaining prefill span to a
+        # single token. Use the runner-provided phase flag instead of span_len.
+        is_prefill = bool(payload.get("_omni_is_prefill", span_len > 1))
+        if is_prefill:
+            num_computed_tokens = payload.get("_omni_num_computed_tokens")
+            if num_computed_tokens is not None:
+                meta["num_processed_tokens"] = int(num_computed_tokens)
             input_ids, input_embeds, update_dict = self.talker_preprocess_prefill(input_ids, input_embeds, payload)
             code_predictor_codes = torch.zeros(
                 (input_embeds.shape[0], self.talker.num_code_groups),
