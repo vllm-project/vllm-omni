@@ -11,6 +11,12 @@ Cache backends are instantiated directly via their constructors and configured v
 """
 
 from vllm_omni.diffusion.cache.base import CacheBackend
+from vllm_omni.diffusion.cache.prompt_embed_cache import (
+    PromptEmbedCache,
+    install_prompt_embed_cache,
+    resolve_prompt_embed_cache_config,
+    uninstall_prompt_embed_cache,
+)
 from vllm_omni.diffusion.cache.teacache import (
     CacheContext,
     TeaCacheConfig,
@@ -24,4 +30,8 @@ __all__ = [
     "CacheContext",
     "TeaCacheBackend",
     "apply_teacache_hook",
+    "PromptEmbedCache",
+    "install_prompt_embed_cache",
+    "resolve_prompt_embed_cache_config",
+    "uninstall_prompt_embed_cache",
 ]
