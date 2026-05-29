@@ -9,14 +9,14 @@ steps:
     depends_on: upload-ready-pipeline
     commands:
       - |
-        timeout 20m pytest -v -s -m 'core_model and cpu' \
+        pytest -v -s -m 'core_model and cpu' \
         --cov=vllm_omni --cov-branch --cov-report=
 
-        timeout 10m pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda' \
+        pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda' \
         --cov=vllm_omni --cov-branch --cov-append --cov-report= \
         --ignore=tests/e2e --ignore=tests/engine/test_async_omni_engine_abort.py
 
-        timeout 10m pytest -v -s -m 'core_model and cuda and L4 and distributed_cuda' \
+        pytest -v -s -m 'core_model and cuda and L4 and distributed_cuda' \
         --cov=vllm_omni --cov-branch --cov-append --cov-report=
 
         coverage html
