@@ -10,8 +10,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
 logger = logging.getLogger(__name__)
 
 
@@ -24,9 +22,14 @@ class CfgCompanionTracker:
         self._companion_to_parent: dict[str, str] = {}  # companion -> parent
         self._done: dict[str, set[str]] = {}  # parent -> completed companion ids
         self._pending_parents: dict[str, dict[str, Any]] = {}  # parent -> deferred result
+        self._companion_outputs: dict[str, Any] = {}  # companion_id -> engine output
 
     def is_companion(self, req_id: str) -> bool:
         return req_id in self._companion_ids
+
+    def get_parent_id(self, req_id: str) -> str | None:
+        """Return the parent request id for a companion, or None."""
+        return self._companion_to_parent.get(req_id)
 
     def has_companions(self, parent_id: str) -> bool:
         return parent_id in self._companion_map
@@ -50,20 +53,19 @@ class CfgCompanionTracker:
         self._companion_ids.add(companion_id)
         self._companion_to_parent[companion_id] = parent_id
 
-    def attach_cfg_request_ids(self, parent_id: str, sampling_params: Any) -> Any:
-        cfg_ids = self.get_companion_request_ids(parent_id)
-        if not cfg_ids:
-            return sampling_params
+    def set_companion_output(self, companion_id: str, output: Any) -> None:
+        """Stash companion engine output for the parent to bundle at forward time."""
+        self._companion_outputs[companion_id] = output
 
-        if isinstance(sampling_params, OmniDiffusionSamplingParams):
-            sampling_params = sampling_params.clone()
-            sampling_params.cfg_kv_request_ids = cfg_ids
-            logger.info(
-                "Attaching cfg_kv_request_ids=%s to request %s",
-                cfg_ids,
-                parent_id,
-            )
-        return sampling_params
+    def pop_companion_outputs(self, parent_id: str) -> list[Any]:
+        """Pop companion outputs (role-registration order) for bundling into set_engine_outputs."""
+        role_map = self._companion_map.get(parent_id, {})
+        outputs = []
+        for cid in role_map.values():
+            out = self._companion_outputs.pop(cid, None)
+            if out is not None:
+                outputs.append(out)
+        return outputs
 
     def on_companion_completed(self, companion_id: str) -> str | None:
         """Mark done. Returns parent_id only if parent is pending and all companions finished."""
@@ -99,6 +101,7 @@ class CfgCompanionTracker:
         for companion_id in companion_ids:
             self._companion_ids.discard(companion_id)
             self._companion_to_parent.pop(companion_id, None)
+            self._companion_outputs.pop(companion_id, None)
         self._done.pop(parent_id, None)
         self._pending_parents.pop(parent_id, None)
         return companion_ids

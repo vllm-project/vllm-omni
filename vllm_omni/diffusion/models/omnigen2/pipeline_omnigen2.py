@@ -8,7 +8,7 @@ import os
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL.Image
@@ -32,6 +32,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
     OmniGen2RotaryPosEmbed,
     OmniGen2Transformer2DModel,
@@ -620,7 +621,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class OmniGen2Pipeline(CFGParallelMixin, nn.Module):
+class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
     """
     Pipeline for text-to-image generation using OmniGen2.
 
@@ -633,6 +634,10 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module):
     Args:
         od_config (OmniDiffusionConfig): The OmniDiffusion configuration.
     """
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["mllm"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     def __init__(
         self,
@@ -1260,14 +1265,19 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module):
         if "ref_image_hidden_states" in set(inspect.signature(self.transformer.forward).parameters.keys()):
             optional_kwargs["ref_image_hidden_states"] = ref_image_hidden_states
 
-        model_pred = self.transformer(
-            latents,
-            timestep,
-            prompt_embeds,
-            freqs_cis,
-            prompt_attention_mask,
-            **optional_kwargs,
-        )
+        with torch.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        ):
+            model_pred = self.transformer(
+                latents,
+                timestep,
+                prompt_embeds,
+                freqs_cis,
+                prompt_attention_mask,
+                **optional_kwargs,
+            )
         return model_pred
 
     def predict_noise(self, **kwargs):

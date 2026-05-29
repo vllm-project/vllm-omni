@@ -32,7 +32,6 @@ classifiers = [
 # Dependencies are now managed dynamically via setup.py based on detected hardware platform.
 # This allows automatic installation of the correct platform-specific dependencies (CUDA/ROCm/CPU/XPU/NPU)
 # without requiring extras like [cuda]. See requirements/ directory for platform-specific dependencies.
-# Note: vllm is intentionally excluded due to entrypoints overwrite issue.
 
 [project.optional-dependencies]
 
@@ -49,28 +48,32 @@ dev = [
     "soundfile>=0.13.1",
     "imageio[ffmpeg]>=0.6.0",
     "opencv-python>=4.12.0.88",
-    "mooncake-transfer-engine==0.3.8.post1",
+    "mooncake-transfer-engine-cuda13>=0.3.9",
     "av", # for ComfyUI tests
     "openpyxl>=3.0.0", # for nightly CI
     "pyttsx3>=2.99",
     "opencc>=1.2.0",
     "mistune>=3.2.0", # for example tests
     "torchmetrics>=1.4.0", # for accuracy similarity metrics
+    "ray[default]", # for RL test
+    "jiwer>=3.0.0",
+    "zhon>=2.0.0",
+    "zhconv>=1.4.2",
+    "scipy>=1.10.0",
+    "funasr>=1.0.0",
+    "lpips>=0.1.4", # for quantization fp8
+    "orjson>=3.11.7", # to make v1/embeddings API fast
+    "voxcpm>=2.0.2", # for VoxCPM2 path-locating in tests
+    "torchdiffeq>=0.2.5" # for covo_audio Test
 ]
 
 demo = [
     "gradio>=6.7.0",
 ]
 
-# Seed-TTS serve benchmark WER (BytedanceSpeech/seed-tts-eval run_wer.py protocol).
-seed-tts-eval = [
-    "jiwer>=3.0.0",
-    "zhon>=2.0.0",
-    "zhconv>=1.4.2",
-    "scipy>=1.10.0",
-    "soundfile>=0.12.0",
-    "transformers>=4.36.0",
-    "funasr>=1.0.0",
+# Local-test-only extras
+local = [
+    "FlagEmbedding",
 ]
 
 docs = [
@@ -96,7 +99,6 @@ Documentation = "https://vllm-omni.readthedocs.io"
 "Bug Tracker" = "https://github.com/vllm-project/vllm-omni/issues"
 
 [project.scripts]
-vllm = "vllm_omni.entrypoints.cli.main:main"
 vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 
 
@@ -127,12 +129,13 @@ exclude = [
 
 [tool.ruff.lint]
 select = [
-    "E",  # pycodestyle errors
-    "W",  # pycodestyle warnings
-    "F",  # pyflakes
-    "I",  # isort (handled separately, but included for compatibility)
-    "N",  # pep8-naming
-    "UP", # pyupgrade
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort (handled separately, but included for compatibility)
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "TID251", # flake8-tidy-imports.banned-api
 ]
 ignore = [
     "E203",  # whitespace before ':' (conflicts with black)
@@ -146,6 +149,15 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "examples/**" = ["E501"]  # Allow long lines in examples
 "tests/**" = ["E501"]  # Allow long lines in tests
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
+"torch.cuda.max_memory_allocated".msg = "Use torch.accelerator.max_memory_allocated"
+"torch.cuda.reset_peak_memory_stats".msg = "Use torch.accelerator.reset_peak_memory_stats"
+"torch.cuda.device_count".msg = "Use torch.accelerator.device_count"
+"torch.cuda.current_device".msg = "Use torch.accelerator.current_device_index"
+"torch.cuda.empty_cache".msg  = "Use torch.accelerator.empty_cache"
+"torch.cuda.synchronize".msg = "Use torch.accelerator.synchronize"
 
 [tool.mypy]
 python_version = "3.12, 3.13"
@@ -175,10 +187,13 @@ addopts = [
 markers = [
     # ci/cd required
     "core_model: L1&L2 tests (run in each PR)",
-    "advanced_model: L3&L4 level tests (run in each merge or nightly)",
+    "advanced_model: L3 level tests (run on each merge)",
+    "full_model: L4 level tests (run nightly)",
+    "local_model: tests (run locally)",
     # function module markers
     "diffusion: Diffusion model tests",
     "omni: Omni model tests",
+    "tts: TTS model tests",
     "cache: Cache backend tests",
     "parallel: Parallelism/distributed tests",
     "example: Doc example code tests",
@@ -226,14 +241,25 @@ extend-ignore-identifiers-re = [
     ".*MoBA",
     ".*temperal_downsample",
     ".*_nd",
+    ".*nd$",
+    ".*EmbedND$",
     ".*nothink.*",
     ".*NOTHINK.*",
     ".*nin.*",
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
+    ".*[Nn][Dd]3.*",
+    "byt5.*",
+]
+extend-ignore-re = [
+    "\\.\\.\\.n,d->\\.\\.\\.nd",
 ]
 [tool.typos.default.extend-words]
 ue = "ue"
 semantics = "semantics"
 fullset = "fullset"
 Vai = "Vai"
+tockens = "tockens"
+CANN = "CANN"
+ND = "ND"
+byt5 = "byt5"

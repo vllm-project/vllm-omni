@@ -235,7 +235,7 @@ class VideoGenerationResponse(BaseModel):
 
 
 class VideoError(BaseModel):
-    code: str = Field(..., description="A machine-readable error code that was returned.")
+    code: int | str = Field(..., description="A machine-readable error code that was returned.")
     message: str = Field(..., description="A human-readable description of the error that was returned.")
 
 

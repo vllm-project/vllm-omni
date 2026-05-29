@@ -11,15 +11,6 @@ set -o pipefail
 export PYTHONPATH=".."
 
 # Print ROCm version
-echo "--- Confirming Clean Initial State"
-while true; do
-        sleep 3
-        if grep -q clean /opt/amdgpu/etc/gpu_state; then
-                echo "GPUs state is \"clean\""
-                break
-        fi
-done
-
 echo "--- ROCm info"
 rocminfo
 
@@ -51,25 +42,14 @@ cleanup_docker() {
 # Call the cleanup docker function
 cleanup_docker
 
-echo "--- Resetting GPUs"
-
-echo "reset" > /opt/amdgpu/etc/gpu_state
-
-while true; do
-        sleep 3
-        if grep -q clean /opt/amdgpu/etc/gpu_state; then
-                echo "GPUs state is \"clean\""
-                break
-        fi
-done
-
 echo "--- Pulling container"
-## Temporary change to use AMD Docker Hub to store the vllm-ci image
+## Temporary change to use AMD Docker Hub to store the vllm-omni image
 # to bypass the rate limit issue with ECR Public Gallery.
+# Images are now stored in a separate repository for vllm-omni, instead of vllm-ci.
 # TODO: @tjtanaa point back to ECR Public Gallery
 # once the amd agents are configured to use ECR Public Gallery.
 # image_name="public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-rocm-omni"
-image_name="rocm/vllm-ci:${BUILDKITE_COMMIT}-rocm-omni"
+image_name="rocm/vllm-omni:${BUILDKITE_COMMIT}"
 container_name="rocm_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 10; echo)"
 
 # TODO: @tjtanaa uncomment this once the amd agents are configured to use ECR Public Gallery.

@@ -29,7 +29,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalHiFTGenerator,
 )
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
-from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
+from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 logger = init_logger(__name__)
 
@@ -292,6 +292,7 @@ class CosyVoice3Code2Wav(nn.Module):
         prompt_feat: torch.Tensor,
         embedding: torch.Tensor,
         n_timesteps: int = 10,
+        token_offset_tokens: int = 0,
     ) -> torch.Tensor:
         """Generate audio waveform from speech tokens."""
         feat = self._forward_mel(
@@ -300,7 +301,7 @@ class CosyVoice3Code2Wav(nn.Module):
             prompt_feat=prompt_feat,
             embedding=embedding,
             n_timesteps=n_timesteps,
-            token_offset_tokens=0,
+            token_offset_tokens=token_offset_tokens,
             streaming=False,
             finalize=True,
         )

@@ -58,6 +58,31 @@ class SupportsStepExecution(Protocol):
         """Decode output after denoise loop."""
 
 
+@runtime_checkable
+class SupportsComponentDiscovery(Protocol):
+    """Declares which submodules serve as pipeline components.
+
+    Used by the framework to locate DiT, encoder, and VAE modules for
+    CPU offload, HSDP sharding, and other operations that need to know
+    the pipeline's internal structure.
+
+    All attribute names support dotted paths for nested submodules
+    (e.g. ``"pipe.transformer"``).
+
+    Attributes:
+        _dit_modules: Denoising submodules (on GPU during diffusion).
+        _encoder_modules: Encoder submodules (offloaded during diffusion).
+        _vae_modules: VAE(s) (always on GPU).
+        _resident_modules: Extra modules pinned on GPU during layerwise
+            offloading.  Optional, defaults to ``[]``.
+    """
+
+    _dit_modules: ClassVar[list[str]]
+    _encoder_modules: ClassVar[list[str]]
+    _vae_modules: ClassVar[list[str]]
+    _resident_modules: ClassVar[list[str]] = []
+
+
 def supports_step_execution(pipeline: object) -> bool:
     """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
 

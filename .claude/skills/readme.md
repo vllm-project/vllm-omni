@@ -18,6 +18,9 @@ include:
 
 - `add-diffusion-model`: guides integration of a new diffusion model into
   `vllm-omni`
+- `diffusion-perf-opt`: guides diffusion model performance optimization,
+  including profiling traces, parallel strategies, stage timing analysis, and
+  benchmark-driven tuning
 - `add-omni-model`: covers addition of new omni-modality model support
 - `add-tts-model`: covers integration of new TTS models and related serving
   workflows

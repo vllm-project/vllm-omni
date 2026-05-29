@@ -3,15 +3,64 @@
 # More info: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 # Default owners (fallback reviewers for all files)
-# later, we can add more reviewers here
-* @hsliuustc0106
+* @Gaohan123 @hsliuustc0106 @ywang96
 
-# Assign reviewers by directory
-/.github/ @owner1
-/tests/ @owner1
-/docs/ @owner1
+# Repository operations
+/.github/ @hsliuustc0106
 
-# Example: reviewers for specific directories
-# /examples/offline_inference/ @offline-inference-team
-# /vllm_omni/core/ @core-team
-# /vllm_omni/model_executor/ @model-team
+# Documentation and Recipes
+/docs/ @hsliuustc0106 @Gaohan123 @david6666666
+/recipes @hsliuustc0106 @Gaohan123 @david6666666
+
+# Skills
+/.claude/ @hsliuustc0106
+
+# Tests
+/tests/ @yenuo26
+
+# CI
+/.buildkite/ @yenuo26 @congw729
+
+# Engine and model_executor
+/vllm_omni/core/ @tzhouam @yinpeiqi @fake0fan
+/vllm_omni/engine/ @tzhouam @yinpeiqi @fake0fan
+/vllm_omni/entrypoints/ @tzhouam @yinpeiqi @fake0fan
+/vllm_omni/model_executor/ @tzhouam @gcanlin
+/vllm_omni/worker/ @tzhouam @gcanlin
+
+# Diffusion
+/vllm_omni/diffusion/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @david6666666
+/vllm_omni/lora/ @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @yuanheng-zhao
+
+# Diffusion CPU offloading
+/vllm_omni/diffusion/offloader/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @yuanheng-zhao
+
+# Omni and TTS support
+/vllm_omni/transformers_utils/ @tzhouam @yuanheng-zhao
+/vllm_omni/model_executor/models/ @linyueqian @ZeldaHuang @princepride @yuanheng-zhao @amy-why-3459 @Bounty-hunter
+
+# Benchmarks
+/benchmarks/accuracy/ @david6666666
+/benchmarks/build_dataset/ @linyueqian @yuanheng-zhao
+/benchmarks/diffusion/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa
+/benchmarks/distributed/ @princepride
+/benchmarks/glm_image/ @princepride @JaredforReal
+/benchmarks/tts/ @linyueqian @ZeldaHuang @princepride
+
+# Usability and Observability
+/vllm_omni/deploy/ @tzhouam @lishunyang12
+/vllm_omni/metrics/ @lishunyang12
+/vllm_omni/profiler/ @gcanlin
+
+# ComfyUI
+/apps/ @fhfuih
+
+# Large Scale Serving
+/vllm_omni/distributed/ @princepride @yuanheng-zhao @xuechendi @natureofnature @fake0fan
+
+# Quantization and configuration
+/vllm_omni/config/ @lishunyang12
+/vllm_omni/quantization/ @david6666666 @Isotr0py @lishunyang12
+
+# Hardware plugins and accelerators
+/vllm_omni/platforms/ @gcanlin @tjtanaa @xuechendi

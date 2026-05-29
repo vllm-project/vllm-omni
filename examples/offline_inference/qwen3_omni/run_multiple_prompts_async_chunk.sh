@@ -17,7 +17,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 python "${SCRIPT_DIR}/end2end_async_chunk.py" \
     --query-type text \
     --txt-prompts "${SCRIPT_DIR}/text_prompts_10.txt" \
-    --stage-configs-path "${REPO_ROOT}/vllm_omni/model_executor/stage_configs/qwen3_omni_moe_async_chunk.yaml" \
+    --deploy-config "${REPO_ROOT}/vllm_omni/deploy/qwen3_omni_moe.yaml" \
     --output-dir output_audio_async_chunk \
     --max-in-flight 2 \
     "$@"

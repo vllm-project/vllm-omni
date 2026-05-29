@@ -13,12 +13,10 @@ exercise Z-Image's supported feature combinations:
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
 PROMPT = "A high-detail studio photo of an orange tabby cat sitting on a laptop keyboard."
@@ -100,13 +98,11 @@ def _get_diffusion_feature_cases():
                 ],
             ),
             id="layerwise_hsdp",
-            marks=[*FOUR_CARD_MARKS, pytest.mark.skip(reason="issue #2435")],
+            marks=[*FOUR_CARD_MARKS],
         ),
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(),

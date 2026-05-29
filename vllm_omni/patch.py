@@ -12,12 +12,13 @@ from vllm.v1.engine import EngineCoreOutputs as _OriginalEngineCoreOutputs
 from vllm.v1.engine import EngineCoreRequest as _OriginalEngineCoreRequest
 from vllm.v1.request import Request as _OriginalRequest
 from vllm.v1.request import RequestStatus
+from vllm.v1.request import StreamingUpdate as _OriginalStreamingUpdate
 
 import vllm_omni.logger  # noqa: F401
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
-from vllm_omni.request import OmniRequest
+from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
@@ -101,7 +102,15 @@ if not hasattr(RequestStatus, "WAITING_FOR_CHUNK"):
     # as a non-finished state and remains compatible with existing comparisons.
     extend_enum(RequestStatus, "WAITING_FOR_CHUNK", -1)
 
-for module_name, module in sys.modules.items():
+if not hasattr(RequestStatus, "WAITING_FOR_INPUT"):
+    # Full-payload stage handoff uses a distinct waiting state so the
+    # scheduler can restore the request once non-stage-0 inputs arrive.
+    extend_enum(RequestStatus, "WAITING_FOR_INPUT", -2)
+
+# Snapshot sys.modules: `hasattr` below can trigger lazy submodule imports
+# (e.g. transformers' `_LazyModule.__getattr__`), which mutate sys.modules
+# during iteration and raise `dictionary changed size during iteration`.
+for module_name, module in list(sys.modules.items()):
     # only do patch on module of vllm, pass others
     if "vllm" not in module_name:
         continue
@@ -115,5 +124,7 @@ for module_name, module in sys.modules.items():
         module.MRotaryEmbedding = OmniMRotaryEmbedding
     if hasattr(module, "Request") and module.Request == _OriginalRequest:
         module.Request = OmniRequest
+    if hasattr(module, "StreamingUpdate") and module.StreamingUpdate == _OriginalStreamingUpdate:
+        module.StreamingUpdate = OmniStreamingUpdate
     if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
         module.EngineCoreRequest = OmniEngineCoreRequest

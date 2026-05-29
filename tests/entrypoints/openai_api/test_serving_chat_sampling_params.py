@@ -38,7 +38,7 @@ def default_comprehension_params():
         temperature=0.4,
         top_p=0.9,
         top_k=1,
-        max_tokens=2048,
+        max_tokens=4353,
         seed=42,
         repetition_penalty=1.05,
     )
@@ -100,6 +100,10 @@ def mock_request(mocker: MockerFixture):
     request.stop_token_ids = None
     request.frequency_penalty = None
     request.presence_penalty = None
+    # Must be real Python objects (not MagicMock) so the code's explicit-field
+    # and extra_body checks work correctly.
+    request.model_fields_set = set()
+    request.extra_body = {}
     return request
 
 
@@ -142,7 +146,7 @@ def test_preserves_yaml_defaults_when_no_request_params(serving_chat, mock_reque
     assert comprehension_params.temperature == 0.4
     assert comprehension_params.top_p == 0.9
     assert comprehension_params.top_k == 1  # YAML custom param preserved
-    assert comprehension_params.max_tokens == 2048
+    assert comprehension_params.max_tokens == 4353
     assert comprehension_params.seed == 42
     assert comprehension_params.repetition_penalty == 1.05  # YAML custom param preserved
 
@@ -150,6 +154,7 @@ def test_preserves_yaml_defaults_when_no_request_params(serving_chat, mock_reque
 def test_request_temperature_overrides_yaml_default(serving_chat, mock_request):
     """Test that request temperature overrides YAML default."""
     mock_request.temperature = 0.8
+    mock_request.model_fields_set = {"temperature"}
 
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
@@ -162,6 +167,7 @@ def test_request_temperature_overrides_yaml_default(serving_chat, mock_request):
 def test_request_top_p_overrides_yaml_default(serving_chat, mock_request):
     """Test that request top_p overrides YAML default."""
     mock_request.top_p = 0.95
+    mock_request.model_fields_set = {"top_p"}
 
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
@@ -173,6 +179,7 @@ def test_request_top_p_overrides_yaml_default(serving_chat, mock_request):
 def test_request_max_tokens_overrides_yaml_default(serving_chat, mock_request):
     """Test that request max_tokens overrides YAML default."""
     mock_request.max_tokens = 100
+    mock_request.model_fields_set = {"max_tokens"}
 
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
@@ -183,12 +190,13 @@ def test_max_tokens_uses_yaml_default_when_not_specified(serving_chat, mock_requ
     """Test that max_tokens falls back to YAML default when not in request."""
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
-    assert result[0].max_tokens == 2048
+    assert result[0].max_tokens == 4353
 
 
 def test_request_seed_overrides_yaml_default(serving_chat, mock_request):
     """Test that request seed overrides YAML default."""
     mock_request.seed = 123
+    mock_request.model_fields_set = {"seed"}
 
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
@@ -200,6 +208,7 @@ def test_request_seed_overrides_yaml_default(serving_chat, mock_request):
 def test_request_frequency_penalty_overrides(serving_chat, mock_request):
     """Test that request frequency_penalty is applied."""
     mock_request.frequency_penalty = 0.5
+    mock_request.model_fields_set = {"frequency_penalty"}
 
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
@@ -209,6 +218,7 @@ def test_request_frequency_penalty_overrides(serving_chat, mock_request):
 def test_request_presence_penalty_overrides(serving_chat, mock_request):
     """Test that request presence_penalty is applied."""
     mock_request.presence_penalty = 0.3
+    mock_request.model_fields_set = {"presence_penalty"}
 
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
@@ -235,6 +245,7 @@ def test_multiple_params_override_together(serving_chat, mock_request):
     mock_request.temperature = 0.7
     mock_request.top_p = 0.85
     mock_request.seed = 999
+    mock_request.model_fields_set = {"max_tokens", "temperature", "top_p", "seed"}
 
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
@@ -275,6 +286,7 @@ def test_apply_request_overrides_applies_values(serving_chat, mock_request, defa
     """Test that _apply_request_overrides applies non-None request values."""
     mock_request.temperature = 0.8
     mock_request.seed = 123
+    mock_request.model_fields_set = {"temperature", "seed"}
 
     result = serving_chat._apply_request_overrides(default_comprehension_params, mock_request)
 
@@ -304,6 +316,8 @@ def test_apply_overrides_empty_stop_list_preserves_default(serving_chat, mocker)
     request.stop_token_ids = None
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.model_fields_set = {"stop"}
+    request.extra_body = {}
 
     result = serving_chat._apply_request_overrides(default_params, request)
 
@@ -325,6 +339,8 @@ def test_apply_overrides_nonempty_stop_list_overrides_default(serving_chat, mock
     request.stop_token_ids = None
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.model_fields_set = {"stop"}
+    request.extra_body = {}
 
     result = serving_chat._apply_request_overrides(default_params, request)
 
@@ -367,6 +383,8 @@ def test_apply_overrides_nonempty_stop_token_ids_overrides_default(serving_chat,
     request.stop_token_ids = [100]  # non-empty list — should override
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.model_fields_set = {"stop_token_ids"}
+    request.extra_body = {}
 
     result = serving_chat._apply_request_overrides(default_params, request)
 
@@ -392,6 +410,8 @@ def test_apply_overrides_mixed_empty_and_nonempty_lists(serving_chat, mocker):
     request.stop_token_ids = [100, 200]  # non-empty — SHOULD override
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.model_fields_set = {"temperature", "stop", "stop_token_ids"}
+    request.extra_body = {}
 
     result = serving_chat._apply_request_overrides(default_params, request)
 
@@ -415,6 +435,8 @@ def test_apply_overrides_none_scalar_still_preserves_default(serving_chat, mocke
     request.stop_token_ids = None
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.model_fields_set = set()
+    request.extra_body = {}
 
     result = serving_chat._apply_request_overrides(default_params, request)
 
@@ -442,6 +464,8 @@ def test_apply_overrides_both_lists_empty_preserves_defaults(serving_chat, mocke
     request.stop_token_ids = []
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.model_fields_set = {"stop", "stop_token_ids"}
+    request.extra_body = {}
 
     result = serving_chat._apply_request_overrides(default_params, request)
 
@@ -511,3 +535,174 @@ def test_get_comprehension_stage_index_raises_when_not_found(mocker: MockerFixtu
 
     with pytest.raises(ValueError, match="No comprehension stage"):
         instance._get_comprehension_stage_index()
+
+
+# =============================================================================
+# Tests for _resolve_height_width_from_extra_body
+# =============================================================================
+
+
+class TestResolveHeightWidth:
+    def test_explicit_height_width(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"height": 512, "width": 768})
+        assert h == 512
+        assert w == 768
+
+    def test_size_string(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "768x512"})
+        assert w == 768
+        assert h == 512
+
+    def test_size_string_uppercase(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "768X512"})
+        assert w == 768
+        assert h == 512
+
+    def test_size_fallback_when_height_missing(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "512x512", "width": 1024})
+        # height is None -> size fallback fires and sets BOTH width and height
+        assert h == 512
+        assert w == 512
+
+    def test_empty_extra_body(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({})
+        assert h is None
+        assert w is None
+
+    def test_invalid_size_format_ignored(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "invalid"})
+        assert h is None
+        assert w is None
+
+
+# =============================================================================
+# Tests for _apply_request_overrides with GLM-Image (target_h/w injection)
+# =============================================================================
+
+
+class TestApplyRequestOverridesGLMImage:
+    """Test target_h/w injection for GLM-Image AR stage.
+
+    max_tokens is NOT computed dynamically — it comes from the deploy YAML
+    default (e.g. 4353). _apply_request_overrides only injects target_h/w
+    into extra_args so the model can build M-RoPE position grids.
+    """
+
+    @pytest.fixture
+    def glm_serving_chat(self, mock_engine_client, mocker: MockerFixture):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        instance = object.__new__(OmniOpenAIServingChat)
+        instance.engine_client = mock_engine_client
+        instance._extract_diffusion_prompt_and_images_from_messages = mocker.MagicMock(return_value=("a cat", []))
+        return instance
+
+    @pytest.fixture
+    def glm_request(self, mocker: MockerFixture):
+        req = mocker.MagicMock()
+        req.temperature = None
+        req.top_p = None
+        req.top_k = None
+        req.max_tokens = None
+        req.min_tokens = None
+        req.seed = None
+        req.ignore_eos = None
+        req.stop = None
+        req.stop_token_ids = None
+        req.frequency_penalty = None
+        req.presence_penalty = None
+        req.extra_body = {"height": 1024, "width": 1024}
+        req.model_fields_set = set()
+        return req
+
+    def test_t2i_injects_target_h_w(self, glm_serving_chat, glm_request, default_comprehension_params):
+        """t2i mode: target_h/w injected into extra_args, max_tokens unchanged."""
+        result = glm_serving_chat._apply_request_overrides(default_comprehension_params, glm_request)
+        assert result.extra_args["target_h"] == 1024
+        assert result.extra_args["target_w"] == 1024
+        # max_tokens stays at YAML default (not dynamically computed)
+        assert result.max_tokens == 4353
+
+    def test_i2i_injects_target_h_w(
+        self, glm_serving_chat, glm_request, default_comprehension_params, mocker: MockerFixture
+    ):
+        """i2i mode: target_h/w injected, max_tokens unchanged."""
+        glm_serving_chat._extract_diffusion_prompt_and_images_from_messages = mocker.MagicMock(
+            return_value=("edit this", ["fake_image"])
+        )
+        result = glm_serving_chat._apply_request_overrides(default_comprehension_params, glm_request)
+        assert result.extra_args["target_h"] == 1024
+        assert result.extra_args["target_w"] == 1024
+        # max_tokens stays at YAML default regardless of t2i/i2i
+        assert result.max_tokens == 4353
+
+    def test_user_max_tokens_preserved(self, glm_serving_chat, glm_request, default_comprehension_params):
+        """User-provided max_tokens is respected (not overridden by dynamic computation)."""
+        glm_request.max_tokens = 500
+        glm_request.model_fields_set = {"max_tokens"}
+
+        result = glm_serving_chat._apply_request_overrides(default_comprehension_params, glm_request)
+        assert result.max_tokens == 500
+        assert result.extra_args["target_h"] == 1024
+        assert result.extra_args["target_w"] == 1024
+
+    def test_no_height_width_preserves_default(
+        self, glm_serving_chat, mocker: MockerFixture, default_comprehension_params
+    ):
+        """When no height/width in extra_body, keep YAML default max_tokens, no target_h/w."""
+        req = mocker.MagicMock()
+        req.temperature = None
+        req.top_p = None
+        req.top_k = None
+        req.max_tokens = None
+        req.min_tokens = None
+        req.seed = None
+        req.ignore_eos = None
+        req.stop = None
+        req.stop_token_ids = None
+        req.frequency_penalty = None
+        req.presence_penalty = None
+        req.extra_body = {}
+        req.model_fields_set = set()
+
+        result = glm_serving_chat._apply_request_overrides(default_comprehension_params, req)
+        assert result.max_tokens == 4353  # YAML default
+        # No target_h/w injected when dimensions not provided
+        assert not result.extra_args or "target_h" not in (result.extra_args or {})
+
+    def test_size_string_parsed_for_glm_image(
+        self, glm_serving_chat, mocker: MockerFixture, default_comprehension_params
+    ):
+        """'size' in extra_body is parsed as fallback for height/width."""
+        req = mocker.MagicMock()
+        req.temperature = None
+        req.top_p = None
+        req.top_k = None
+        req.max_tokens = None
+        req.min_tokens = None
+        req.seed = None
+        req.ignore_eos = None
+        req.stop = None
+        req.stop_token_ids = None
+        req.frequency_penalty = None
+        req.presence_penalty = None
+        req.extra_body = {"size": "512x512"}
+        req.model_fields_set = set()
+
+        result = glm_serving_chat._apply_request_overrides(default_comprehension_params, req)
+        assert result.extra_args["target_h"] == 512
+        assert result.extra_args["target_w"] == 512
+        # max_tokens stays at YAML default (not dynamically computed)
+        assert result.max_tokens == 4353

@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Any
 
 import torch
+import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.platforms import Platform
 
@@ -20,6 +21,7 @@ class OmniPlatformEnum(Enum):
     NPU = "npu"
     XPU = "xpu"
     MUSA = "musa"
+    OOT = "oot"
     UNSPECIFIED = "unspecified"
 
 
@@ -49,6 +51,9 @@ class OmniPlatform(Platform):
     def is_musa(self) -> bool:
         return self._omni_enum == OmniPlatformEnum.MUSA
 
+    def is_out_of_tree(self) -> bool:
+        return self._omni_enum == OmniPlatformEnum.OOT
+
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         raise NotImplementedError
@@ -69,6 +74,13 @@ class OmniPlatform(Platform):
 
     @classmethod
     def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
+        return None
+
+    @classmethod
+    def get_diffusion_packed_modules_mapping(
+        cls,
+        model_class: type[nn.Module],
+    ) -> dict[str, list[str]] | None:
         return None
 
     @classmethod
@@ -96,6 +108,30 @@ class OmniPlatform(Platform):
     def supports_torch_inductor(cls) -> bool:
         """Check if the platform supports torch.compile with inductor backend."""
         raise NotImplementedError
+
+    @classmethod
+    def has_flash_attn_package(cls) -> bool:
+        """Check if a Flash Attention package is available and usable on this platform."""
+        return False
+
+    @classmethod
+    def get_diffusion_worker_cls(cls) -> str:
+        """Get the diffusion worker class path for this platform.
+
+        Returns a fully qualified class path string that will be resolved
+        and instantiated by WorkerWrapperBase. The class must be compatible
+        with the DiffusionWorker interface.
+        """
+        return "vllm_omni.diffusion.worker.diffusion_worker.DiffusionWorker"
+
+    @classmethod
+    def get_diffusion_model_runner_cls(cls) -> str:
+        """Get the diffusion model runner class path for this platform.
+
+        Returns a fully qualified class path string. The class must be
+        compatible with the DiffusionModelRunner interface.
+        """
+        return "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
@@ -168,3 +204,7 @@ class OmniPlatform(Platform):
 class UnspecifiedOmniPlatform(OmniPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED
     device_type = ""
+
+    @classmethod
+    def get_device_count(cls) -> int:
+        return 0

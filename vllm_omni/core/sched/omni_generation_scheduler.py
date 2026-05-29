@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import time
 from collections import defaultdict
+from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
@@ -11,27 +14,45 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+)
 from vllm.v1.metrics.perf import PerfStats
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.omni_scheduling_coordinator import (
+    OmniSchedulingCoordinator,
+    uses_full_payload_input_coordinator,
+)
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
-from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 
 logger = init_logger(__name__)
 
 
-class OmniGenerationScheduler(VLLMScheduler):
+class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+        self._pending_finish_reqs: list[Request] = []
+        self.input_coordinator: OmniSchedulingCoordinator | None = None
+        if uses_full_payload_input_coordinator(model_config):
+            self.input_coordinator = OmniSchedulingCoordinator(
+                scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
+                stage_id=getattr(model_config, "stage_id", 0),
+                async_chunk=False,
+            )
+        self._latest_omni_connector_output: OmniConnectorOutput | None = None
 
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
@@ -61,6 +82,8 @@ class OmniGenerationScheduler(VLLMScheduler):
         # Temporary queue: preserve waiting order, do not disturb non-diffusion requests
         skipped_waiting_requests = create_request_queue(self.policy)
         req_index = 0
+        self._consume_pending_connector_output(model_mode="generation")
+        self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 
@@ -79,23 +102,19 @@ class OmniGenerationScheduler(VLLMScheduler):
 
             num_computed_tokens = request.num_computed_tokens
             required_tokens = len(request.prompt_token_ids) - num_computed_tokens
+            if not self.scheduler_config.enable_chunked_prefill and required_tokens > token_budget:
+                # If chunked_prefill is disabled,
+                # we can stop the scheduling here.
+                break
             # async_chunk: don't schedule placeholder tokens when no new chunk is available.
             if required_tokens <= 0:
                 if (
                     self.chunk_transfer_adapter is not None
                     and request.request_id in self.chunk_transfer_adapter.finished_requests
                 ):
-                    # Upstream may finish with no terminal tokens; append one pad token so we can emit FINISHED.
-                    if len(request.prompt_token_ids) <= num_computed_tokens:
-                        request.prompt_token_ids.append(0)
-                        try:
-                            request._all_token_ids.append(0)  # type: ignore[attr-defined]
-                        except Exception:
-                            pass
-                    required_tokens = len(request.prompt_token_ids) - num_computed_tokens
-                else:
-                    req_index += 1
-                    continue
+                    self._pending_finish_reqs.append(request)
+                req_index += 1
+                continue
             num_new_tokens = min(required_tokens, token_budget)
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
@@ -113,8 +132,6 @@ class OmniGenerationScheduler(VLLMScheduler):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             cached_prompt_token_ids[request.request_id] = request.prompt_token_ids
-            if request.num_cached_tokens < 0:
-                request.num_cached_tokens = num_computed_tokens
             cached_additional_information[request.request_id] = getattr(request, "additional_information", None)
             token_budget -= num_new_tokens
             scheduled_running_reqs.append(request)
@@ -140,18 +157,13 @@ class OmniGenerationScheduler(VLLMScheduler):
                 # Pop the finished request from waiting queue and don't schedule it
                 self.waiting.pop_request()
                 continue
-            # Count the number of prefix cached tokens.
-            if request.num_cached_tokens < 0:
-                request.num_cached_tokens = request.num_computed_tokens
 
             # async_chunk: wait for the first upstream chunk (don't start with placeholders).
             if self.chunk_transfer_adapter is not None and len(request.prompt_token_ids) == 0:
                 if request.request_id in self.chunk_transfer_adapter.finished_requests:
-                    request.prompt_token_ids.append(0)
-                    try:
-                        request._all_token_ids.append(0)  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
+                    self.waiting.pop_request()
+                    self._pending_finish_reqs.append(request)
+                    continue
                 else:
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
@@ -184,8 +196,6 @@ class OmniGenerationScheduler(VLLMScheduler):
 
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
-            if request.num_cached_tokens < 0:
-                request.num_cached_tokens = 0
             token_budget -= num_new_tokens
             scheduled_new_reqs.append(request)
 
@@ -198,10 +208,16 @@ class OmniGenerationScheduler(VLLMScheduler):
             if self.chunk_transfer_adapter:
                 # Don't fall back: base scheduler doesn't handle async_chunk
                 # requests with empty prompt_token_ids.
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+                self.chunk_transfer_adapter.restore_queues(
+                    self.waiting,
+                    self.running,
+                    scheduler_requests=self.requests,
+                )
             else:
                 res = super().schedule()
-                return res
+                if self.input_coordinator:
+                    self.input_coordinator.restore_queues(self.waiting, self.running)
+                return self._wrap_omni_scheduler_output(res)
 
         # Compute common prefix blocks (aligned with v1)
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
@@ -303,6 +319,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                     lora_request=nr.lora_request,
                     # Enrich with omni payloads from the live request object
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
+                    prompt_is_token_ids=nr.prompt_is_token_ids,
                     additional_information=(getattr(request, "additional_information", None) if request else None),
                 )
                 new_list.append(omni_nr)
@@ -320,9 +337,15 @@ class OmniGenerationScheduler(VLLMScheduler):
             # otherwise they are permanently orphaned in the adapter's
             # internal deques and never scheduled again.
             if self.chunk_transfer_adapter:
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+                self.chunk_transfer_adapter.restore_queues(
+                    self.waiting,
+                    self.running,
+                    scheduler_requests=self.requests,
+                )
+            if self.input_coordinator:
+                self.input_coordinator.restore_queues(self.waiting, self.running)
 
-        return scheduler_output
+        return self._wrap_omni_scheduler_output(scheduler_output)
 
     def finish_requests(self, request_ids, finished_status: RequestStatus) -> list[tuple[str, int]]:
         """Handles the finish signal from outside the scheduler.
@@ -340,7 +363,20 @@ class OmniGenerationScheduler(VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
-        return super().finish_requests(request_ids, finished_status)
+        finished = super().finish_requests(request_ids, finished_status)
+        if self.input_coordinator is not None:
+            for request_id, _ in finished:
+                self._free_input_coordinator_request(request_id)
+        return finished
+
+    def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
+        if self.input_coordinator is None:
+            return super()._free_request(request, delay_free_blocks)
+
+        try:
+            return super()._free_request(request, delay_free_blocks)
+        finally:
+            self._free_input_coordinator_request(request.request_id)
 
     """
     Scheduler for the diffusion model.
@@ -434,6 +470,10 @@ class OmniGenerationScheduler(VLLMScheduler):
                     request_id=req_id,
                 )
 
+            # Free encoder inputs only after the step has actually executed.
+            if request.has_encoder_inputs:
+                self._free_encoder_inputs(request)
+
             stopped = False
             new_logprobs = None
             new_token_ids = generated_token_ids
@@ -460,7 +500,11 @@ class OmniGenerationScheduler(VLLMScheduler):
                 stopped = True
 
             if stopped:
-                routed_experts = self._get_routed_experts(request)
+                if (
+                    model_runner_output.routed_experts_dict is not None
+                    and req_id in model_runner_output.routed_experts_dict
+                ):
+                    routed_experts = model_runner_output.routed_experts_dict[req_id]
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
@@ -495,11 +539,6 @@ class OmniGenerationScheduler(VLLMScheduler):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
-                # Add EngineCoreOutput for this Request.
-                num_cached = request.num_cached_tokens
-                if num_cached < 0:
-                    logger.warning("Negative num_cached_tokens (%d) for request %s, clamping to 0", num_cached, req_id)
-                    num_cached = 0
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
@@ -510,10 +549,9 @@ class OmniGenerationScheduler(VLLMScheduler):
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
+                        prefill_stats=request.take_prefill_stats(),
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
-                        num_cached_tokens=num_cached,
-                        num_external_computed_tokens=request.num_external_computed_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
@@ -521,6 +559,36 @@ class OmniGenerationScheduler(VLLMScheduler):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        # Finish async_chunk requests that schedule() collected because their
+        # upstream completed with no remaining codec tokens.
+        for request in self._pending_finish_reqs:
+            if request.is_finished():
+                continue
+            request.status = RequestStatus.FINISHED_STOPPED
+            finish_reason = request.get_finished_reason()
+            finished = self._handle_stopped_request(request)
+            kv_transfer_params = None
+            if finished:
+                kv_transfer_params = self._free_request(request)
+                if self.chunk_transfer_adapter is not None:
+                    self.chunk_transfer_adapter.cleanup(
+                        request.request_id,
+                        getattr(request, "external_req_id", None),
+                    )
+            outputs[request.client_index].append(
+                EngineCoreOutput(
+                    request_id=request.request_id,
+                    new_token_ids=[],
+                    finish_reason=finish_reason,
+                    stop_reason=request.stop_reason,
+                    events=request.take_events(),
+                    kv_transfer_params=kv_transfer_params,
+                    trace_headers=request.trace_headers,
+                )
+            )
+            stopped_running_reqs.add(request)
+        self._pending_finish_reqs.clear()
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
@@ -535,12 +603,6 @@ class OmniGenerationScheduler(VLLMScheduler):
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
-                num_cached = request.num_cached_tokens
-                if num_cached < 0:
-                    logger.warning(
-                        "Negative num_cached_tokens (%d) for request %s, clamping to 0", num_cached, request.request_id
-                    )
-                    num_cached = 0
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=request.request_id,
@@ -548,7 +610,6 @@ class OmniGenerationScheduler(VLLMScheduler):
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
-                        num_cached_tokens=num_cached,
                     )
                 )
                 if self.chunk_transfer_adapter is not None:
@@ -598,4 +659,14 @@ class OmniGenerationScheduler(VLLMScheduler):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        self._capture_omni_connector_output(model_runner_output)
+
         return engine_core_outputs
+
+    def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
+        """
+        Override: Just replace the existing session with the next streaming update.
+
+        Do not expend prompt id using update.
+        """
+        self._replace_session_with_streaming_update(session, update)
