@@ -975,7 +975,6 @@ def _make_stream_request(
     num_chunks: int = 1,
     chunk_frames: int = 1,
 ) -> OmniDiffusionRequest:
-    """``num_chunks`` is a test-helper shorthand for ``num_frames / chunk_frames``."""
     num_frames = num_chunks * chunk_frames
     video = [torch.zeros(3, 8, 8) for _ in range(num_frames)]
     return OmniDiffusionRequest(
@@ -986,6 +985,7 @@ def _make_stream_request(
         sampling_params=OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
             chunk_frames=chunk_frames,
+            num_chunks=num_chunks,
             num_frames=num_frames,
         ),
         request_ids=[req_id],
@@ -1016,18 +1016,19 @@ def _ranks(sched_output) -> list[tuple[str, list[int]] | None]:
     if sched_output.assignment is None:
         return []
     return [
-        (t.sched_req_id, list(t.chunk_indices)) if t is not None else None
+        (t.sched_req_id, list(t.chunk_indices)) if t.chunk_indices else None
         for t in sched_output.assignment
     ]
 
 
 def _layout(sched_output, sched_req_id: str) -> tuple[int, int, int] | None:
-    if sched_output.rank0_layouts is None:
+    if sched_output.assignment is None:
         return None
-    layout = sched_output.rank0_layouts.get(sched_req_id)
-    if layout is None:
-        return None
-    return (len(layout.finished_idxs), layout.n_circulating, len(layout.new_idxs))
+    for task in sched_output.assignment:
+        if task.sched_req_id == sched_req_id:
+            layout = task.layout
+            return (len(layout.finished_idxs), len(layout.circulating_idxs), len(layout.new_idxs))
+    return None
 
 
 class TestStreamBatchScheduler:
@@ -1212,7 +1213,6 @@ class TestStreamBatchScheduler:
         scheduler = self._make_scheduler(pp_size=2)
         out = scheduler.schedule()
         assert out.assignment is None
-        assert out.rank0_layouts is None
         assert out.scheduled_req_ids == []
 
     def test_fifo_two_requests(self) -> None:

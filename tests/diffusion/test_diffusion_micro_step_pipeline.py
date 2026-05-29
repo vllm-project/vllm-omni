@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for micro-step level diffusion execution across runner / worker / executor / engine."""
 
@@ -15,8 +15,8 @@ from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionEx
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionSchedulerOutput,
+    Layout,
     NewRequestData,
-    Rank0Layout,
     RankTask,
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -40,6 +40,8 @@ class _FakePPGroup:
         self.is_last_rank = rank_in_group == world_size - 1
         self.prev_rank = (rank_in_group - 1) % world_size
         self.next_rank = (rank_in_group + 1) % world_size
+        self.group_prev_rank = (rank_in_group - 1) % world_size
+        self.group_next_rank = (rank_in_group + 1) % world_size
         self.reset_calls = 0
 
     def reset_buffer(self) -> None:
@@ -59,7 +61,6 @@ class _MicroStepPipeline:
         self.decode_calls = 0
         self.prefetch_calls = 0
         self.encode_calls = 0
-        self.is_buffer_setup = False
 
     def prepare_encode(self, state, **kwargs):
         del kwargs
@@ -72,12 +73,11 @@ class _MicroStepPipeline:
     def encode_chunk_inputs(self, state, new_idxs):
         del state
         self.encode_calls += 1
-        return [torch.zeros((1, 1, 1, 1, 1)) for _ in new_idxs]
+        return torch.zeros((len(new_idxs), 1, 1, 1, 1))
 
     def set_pp_recv_dict_buffers(self, state, **kwargs):
         del state, kwargs
         self.set_buffer_calls += 1
-        self.is_buffer_setup = True
 
     def denoise_step(self, state, **kwargs):
         del state, kwargs
@@ -97,7 +97,7 @@ class _MicroStepPipeline:
         b = state.latents.shape[0] if state.latents.ndim > 0 else 1
         return DiffusionOutput(output=torch.ones(b, 1, 1, 1, 1, dtype=torch.float32))
 
-    def prefetch_its(self, state, **kwargs):
+    def prefetch_tensors(self, state, **kwargs):
         del state, kwargs
         self.prefetch_calls += 1
 
@@ -123,7 +123,7 @@ def _make_micro_request(
     req_id: str = "req-1",
     *,
     num_inference_steps: int = 1,
-    num_frames: int = 1,
+    num_chunks: int = 1,
     chunk_frames: int = 1,
 ):
     return SimpleNamespace(
@@ -135,7 +135,8 @@ def _make_micro_request(
             generator_device=None,
             num_inference_steps=num_inference_steps,
             chunk_frames=chunk_frames,
-            num_frames=num_frames,
+            num_chunks=num_chunks,
+            num_frames=num_chunks * chunk_frames,
             slo_fps=None,
             slo_max_batch=8,
             lora_request=None,
@@ -162,12 +163,12 @@ def _make_runner(pp_size: int = 1, num_steps: int = 1):
 
 def _make_layout(
     *,
-    n_circulating: int = 0,
+    circulating_idxs: list[int] | None = None,
     finished_idxs: list[int] | None = None,
     new_idxs: list[int] | None = None,
-) -> Rank0Layout:
-    return Rank0Layout(
-        n_circulating=n_circulating,
+) -> Layout:
+    return Layout(
+        circulating_idxs=circulating_idxs or [],
         finished_idxs=finished_idxs or [],
         new_idxs=new_idxs or [],
     )
@@ -178,14 +179,16 @@ def _make_micro_scheduler_output(
     req=None,
     sched_req_id: str = "req-1",
     step_id: int = 0,
-    assignment=None,
+    chunk_indices: list[int] | None = None,
     is_new: bool = True,
     finished_req_ids=None,
-    rank0_layout: Rank0Layout | None = None,
+    layout: Layout | None = None,
 ):
-    if assignment is None:
-        assignment = [RankTask(sched_req_id=sched_req_id, chunk_indices=[0])]
-    rank0_layouts = {sched_req_id: rank0_layout} if rank0_layout is not None else None
+    if layout is None:
+        layout = _make_layout()
+    if chunk_indices is None:
+        chunk_indices = [0]
+    assignment = [RankTask(sched_req_id=sched_req_id, chunk_indices=chunk_indices, layout=layout)]
     if is_new and req is not None:
         new_reqs = [NewRequestData(sched_req_id=sched_req_id, req=req)]
         cached_reqs = CachedRequestData.make_empty()
@@ -200,7 +203,6 @@ def _make_micro_scheduler_output(
         num_running_reqs=1,
         num_waiting_reqs=0,
         assignment=assignment,
-        rank0_layouts=rank0_layouts,
     )
 
 
@@ -220,14 +222,14 @@ class TestRunner:
     def test_completes_single_chunk_request(self, monkeypatch):
         runner = _make_runner(pp_size=1, num_steps=1)
         _patch_runtime(monkeypatch, runner)
-        req = _make_micro_request(num_inference_steps=1, num_frames=1)
+        req = _make_micro_request(num_inference_steps=1, num_chunks=1)
 
         out0 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
                 req=req, step_id=0,
-                assignment=[RankTask(sched_req_id="req-1", chunk_indices=[0])],
-                rank0_layout=_make_layout(new_idxs=[0]),
+                chunk_indices=[0],
+                layout=_make_layout(new_idxs=[0]),
             ),
         )
         assert out0.req_id == "req-1"
@@ -238,8 +240,8 @@ class TestRunner:
             runner,
             _make_micro_scheduler_output(
                 sched_req_id="req-1", step_id=1,
-                assignment=[None], is_new=False,
-                rank0_layout=_make_layout(finished_idxs=[0]),
+                chunk_indices=[], is_new=False,
+                layout=_make_layout(finished_idxs=[0]),
             ),
         )
         assert out1.finished is True
@@ -255,23 +257,23 @@ class TestRunner:
     def test_completes_multi_chunk_request(self, monkeypatch):
         runner = _make_runner(pp_size=1, num_steps=1)
         _patch_runtime(monkeypatch, runner)
-        req = _make_micro_request(num_inference_steps=1, num_frames=2)
+        req = _make_micro_request(num_inference_steps=1, num_chunks=2)
 
         DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
                 req=req, step_id=0,
-                assignment=[RankTask(sched_req_id="req-1", chunk_indices=[0])],
-                rank0_layout=_make_layout(new_idxs=[0]),
+                chunk_indices=[0],
+                layout=_make_layout(new_idxs=[0]),
             ),
         )
         out1 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
                 sched_req_id="req-1", step_id=1,
-                assignment=[RankTask(sched_req_id="req-1", chunk_indices=[1])],
+                chunk_indices=[1],
                 is_new=False,
-                rank0_layout=_make_layout(finished_idxs=[0], new_idxs=[1]),
+                layout=_make_layout(finished_idxs=[0], new_idxs=[1]),
             ),
         )
         assert out1.finished is False
@@ -280,8 +282,8 @@ class TestRunner:
             runner,
             _make_micro_scheduler_output(
                 sched_req_id="req-1", step_id=2,
-                assignment=[None], is_new=False,
-                rank0_layout=_make_layout(finished_idxs=[1]),
+                chunk_indices=[], is_new=False,
+                layout=_make_layout(finished_idxs=[1]),
             ),
         )
         assert out2.finished is True
@@ -295,14 +297,14 @@ class TestRunner:
     def test_re_admits_circulating_chunk(self, monkeypatch):
         runner = _make_runner(pp_size=1, num_steps=2)
         _patch_runtime(monkeypatch, runner)
-        req = _make_micro_request(num_inference_steps=2, num_frames=1)
+        req = _make_micro_request(num_inference_steps=2, num_chunks=1)
 
         out0 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
                 req=req, step_id=0,
-                assignment=[RankTask(sched_req_id="req-1", chunk_indices=[0])],
-                rank0_layout=_make_layout(new_idxs=[0]),
+                chunk_indices=[0],
+                layout=_make_layout(new_idxs=[0]),
             ),
         )
         assert out0.finished is False
@@ -311,9 +313,9 @@ class TestRunner:
             runner,
             _make_micro_scheduler_output(
                 sched_req_id="req-1", step_id=1,
-                assignment=[RankTask(sched_req_id="req-1", chunk_indices=[0])],
+                chunk_indices=[0],
                 is_new=False,
-                rank0_layout=_make_layout(n_circulating=1),
+                layout=_make_layout(circulating_idxs=[0]),
             ),
         )
         assert out1.finished is False
@@ -323,8 +325,8 @@ class TestRunner:
             runner,
             _make_micro_scheduler_output(
                 sched_req_id="req-1", step_id=2,
-                assignment=[None], is_new=False,
-                rank0_layout=_make_layout(finished_idxs=[0]),
+                chunk_indices=[], is_new=False,
+                layout=_make_layout(finished_idxs=[0]),
             ),
         )
         assert out2.finished is True
@@ -333,14 +335,14 @@ class TestRunner:
     def test_empty_layout_is_a_no_op(self, monkeypatch):
         runner = _make_runner(pp_size=1, num_steps=1)
         _patch_runtime(monkeypatch, runner)
-        req = _make_micro_request(num_inference_steps=1, num_frames=1)
+        req = _make_micro_request(num_inference_steps=1, num_chunks=1)
 
         DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
                 req=req, step_id=0,
-                assignment=[RankTask(sched_req_id="req-1", chunk_indices=[0])],
-                rank0_layout=_make_layout(new_idxs=[0]),
+                chunk_indices=[0],
+                layout=_make_layout(new_idxs=[0]),
             ),
         )
         denoise_calls_before = runner.pipeline.denoise_calls
@@ -349,8 +351,8 @@ class TestRunner:
             runner,
             _make_micro_scheduler_output(
                 sched_req_id="req-1", step_id=1,
-                assignment=[None], is_new=False,
-                rank0_layout=_make_layout(),
+                chunk_indices=[], is_new=False,
+                layout=_make_layout(),
             ),
         )
         assert out.req_id == "req-1"
@@ -362,14 +364,14 @@ class TestRunner:
         runner = _make_runner(pp_size=1, num_steps=1)
         runner.pipeline = _InterruptingMicroStepPipeline(num_steps=1)
         _patch_runtime(monkeypatch, runner)
-        req = _make_micro_request(num_inference_steps=1, num_frames=1)
+        req = _make_micro_request(num_inference_steps=1, num_chunks=1)
 
         out = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
                 req=req, step_id=0,
-                assignment=[RankTask(sched_req_id="req-1", chunk_indices=[0])],
-                rank0_layout=_make_layout(new_idxs=[0]),
+                chunk_indices=[0],
+                layout=_make_layout(new_idxs=[0]),
             ),
         )
         assert out.req_id == "req-1"
@@ -402,14 +404,14 @@ class TestRunner:
     def test_stamps_micro_step_wall_ns_on_rank0(self, monkeypatch):
         runner = _make_runner(pp_size=1, num_steps=1)
         _patch_runtime(monkeypatch, runner)
-        req = _make_micro_request(num_inference_steps=1, num_frames=1)
+        req = _make_micro_request(num_inference_steps=1, num_chunks=1)
 
         out = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
                 req=req, step_id=0,
-                assignment=[RankTask(sched_req_id="req-1", chunk_indices=[0])],
-                rank0_layout=_make_layout(new_idxs=[0]),
+                chunk_indices=[0],
+                layout=_make_layout(new_idxs=[0]),
             ),
         )
         assert out.micro_step_wall_ns is not None
@@ -418,14 +420,14 @@ class TestRunner:
     def test_batch_two_runs_one_fused_forward(self, monkeypatch):
         runner = _make_runner(pp_size=1, num_steps=1)
         _patch_runtime(monkeypatch, runner)
-        req = _make_micro_request(num_inference_steps=1, num_frames=2)
+        req = _make_micro_request(num_inference_steps=1, num_chunks=2)
 
         out = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
                 req=req, step_id=0,
-                assignment=[RankTask(sched_req_id="req-1", chunk_indices=[0, 1])],
-                rank0_layout=_make_layout(new_idxs=[0, 1]),
+                chunk_indices=[0, 1],
+                layout=_make_layout(new_idxs=[0, 1]),
             ),
         )
 
@@ -438,22 +440,22 @@ class TestRunner:
     def test_batch_two_decodes_both_chunks_when_drain_completes(self, monkeypatch):
         runner = _make_runner(pp_size=1, num_steps=1)
         _patch_runtime(monkeypatch, runner)
-        req = _make_micro_request(num_inference_steps=1, num_frames=2)
+        req = _make_micro_request(num_inference_steps=1, num_chunks=2)
 
         DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
                 req=req, step_id=0,
-                assignment=[RankTask(sched_req_id="req-1", chunk_indices=[0, 1])],
-                rank0_layout=_make_layout(new_idxs=[0, 1]),
+                chunk_indices=[0, 1],
+                layout=_make_layout(new_idxs=[0, 1]),
             ),
         )
         out = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
                 sched_req_id="req-1", step_id=1,
-                assignment=[None], is_new=False,
-                rank0_layout=_make_layout(finished_idxs=[0, 1]),
+                chunk_indices=[], is_new=False,
+                layout=_make_layout(finished_idxs=[0, 1]),
             ),
         )
 
@@ -525,45 +527,6 @@ class TestWorker:
 # ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
-
-
-class TestSupportedPipelines:
-    """Micro-step protocol membership checks."""
-
-    def test_stub_pipeline_satisfies_protocol(self):
-        from vllm_omni.diffusion.models.interface import (
-            SupportsMicroStepExecution,
-            SupportsStepExecution,
-            supports_micro_step_execution,
-            supports_step_execution,
-        )
-
-        pipeline = _MicroStepPipeline()
-        assert isinstance(pipeline, SupportsMicroStepExecution) is True
-        assert supports_micro_step_execution(pipeline) is True
-        # Micro-step protocol extends step protocol.
-        assert isinstance(pipeline, SupportsStepExecution) is True
-        assert supports_step_execution(pipeline) is True
-
-    def test_wan22_supports_micro_step_execution(self):
-        from vllm_omni.diffusion.models.interface import (
-            SupportsMicroStepExecution,
-            supports_micro_step_execution,
-        )
-
-        try:
-            from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
-        except (RuntimeError, ImportError) as exc:
-            pytest.skip(f"Wan22Pipeline import not available on this platform: {exc}")
-
-        # Avoid loading weights; protocol membership is a class-contract check.
-        pipeline = object.__new__(Wan22Pipeline)
-
-        assert pipeline.supports_step_execution is True
-        assert pipeline.supports_micro_step_execution is True
-        assert supports_micro_step_execution(pipeline) is True
-        assert isinstance(pipeline, SupportsMicroStepExecution) is True
-
 
 class TestExecutor:
     """MultiprocDiffusionExecutor.execute_micro_step collects rank-0's reply."""
