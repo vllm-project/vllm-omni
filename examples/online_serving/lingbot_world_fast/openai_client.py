@@ -93,7 +93,10 @@ def generate_video(args: Namespace) -> list[np.ndarray]:
 
         with ws_sync.connect(endpoint, max_size=None, ping_interval=None, ping_timeout=None) as ws:
             # 1. Server sends CameraServerConfig on connect.
-            _unpack(ws.recv())
+            server_config: dict = _unpack(ws.recv())
+            print("Server Configuration:")
+            for key, val in server_config.items():
+                print(f"\t{key}: {val}")
 
             # 2. Send request.
             print(

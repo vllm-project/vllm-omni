@@ -41,8 +41,7 @@ CONFIG = {
     "timesteps_index": [0, 179, 358, 679],
     "sample_shift": 10.0,
     "max_area": 480 * 832,
-    "max_sequence_length": 512,
-    "chunk_size": 3,
+    "latent_frames_per_chunk": 3,
     "t5_checkpoint": "models_t5_umt5-xxl-enc-bf16.pth",
     "t5_tokenizer": "google/umt5-xxl",
     "vae_checkpoint": "Wan2.1_VAE.pth",
@@ -200,7 +199,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         num_frames = max(25, num_frames)
 
         c2ws = camera.get("poses")
-        chunk_size = CONFIG["chunk_size"]
+        latent_frames_per_chunk = CONFIG["latent_frames_per_chunk"]
         max_area = CONFIG["max_area"]
 
         # Fresh:     4N+1 pixel frames → N+1 latents, the first slot is the anchor.
@@ -235,9 +234,9 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
             img = None
             h, w, lat_h, lat_w = self.state.h, self.state.w, self.state.lat_h, self.state.lat_w
 
-        new_lat_f = int(new_lat_f - (new_lat_f % chunk_size))
+        new_lat_f = int(new_lat_f - (new_lat_f % latent_frames_per_chunk))
         new_lat_f = max(new_lat_f, 1)
-        max_seq_len = chunk_size * lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
+        max_seq_len = latent_frames_per_chunk * lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
         seed_g = req.sampling_params.generator
         if seed_g is None:
@@ -369,9 +368,9 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         ):
             # sample videos
             latent = noise
-            latents_chunk = latent.split(chunk_size, dim=1)  # [c, f, h, w]
-            condition_chunk = y.split(chunk_size, dim=1)
-            c2ws_plucker_emb_chunk = c2ws_plucker_emb.split(chunk_size, dim=2)
+            latents_chunk = latent.split(latent_frames_per_chunk, dim=1)  # [c, f, h, w]
+            condition_chunk = y.split(latent_frames_per_chunk, dim=1)
+            c2ws_plucker_emb_chunk = c2ws_plucker_emb.split(latent_frames_per_chunk, dim=2)
             num_inference_chunk = len(latents_chunk)
             pred_latent_chunks = []
             for chunk_id in tqdm(range(num_inference_chunk)):
@@ -392,7 +391,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
                     "local_end_index": self.state.local_end_index,
                     "global_end_index": self.state.global_end_index,
                     "crossattn_cache": self.state.get_crossattn_caches(),
-                    "current_start": start_token_offset + chunk_id * chunk_size * frame_seqlen,
+                    "current_start": start_token_offset + chunk_id * latent_frames_per_chunk * frame_seqlen,
                     "max_attention_size": total_kv_size,
                 }
 

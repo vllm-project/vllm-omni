@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bagel online serving startup script
+# Lingbot World Fast online serving startup script
 
 MODEL="${MODEL:-../../offline_inference/lingbot_world_fast/lingbot_world/lingbot-world-base-cam/Lingbot-World-Fast}"
 PORT="${PORT:-8091}"

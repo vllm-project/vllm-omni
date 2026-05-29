@@ -338,7 +338,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(
         self,
-        model_type="t2v",
+        model_type="",
         control_type="cam",
         patch_size=(1, 2, 2),
         text_len=512,
@@ -360,8 +360,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         Initialize the diffusion model backbone.
 
         Args:
-            model_type (`str`, *optional*, defaults to 't2v'):
-                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video)
+            model_type (`str`, *optional*, defaults to ''):
             control_type (`str`, *optional*, defaults to 'cam'):
                Type of conditioning control signal - 'cam' (6-dim camera Plucker
                embeddings) or 'act' (7-dim action embeddings including WASD movement)
@@ -399,9 +398,9 @@ class WanModelFast(ModelMixin, ConfigMixin):
 
         super().__init__()
 
-        assert model_type in ["t2v", "i2v"]
         self.model_type = model_type
 
+        self.task_type = "i2v"
         self.patch_size = patch_size
         self.text_len = text_len
         self.in_dim = in_dim
@@ -514,7 +513,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
 
-        if self.model_type == "i2v":
+        if self.task_type == "i2v":
             assert y is not None
 
         # params

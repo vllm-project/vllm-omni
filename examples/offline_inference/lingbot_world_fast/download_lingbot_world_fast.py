@@ -67,7 +67,7 @@ def main(output_dir: str):
         "ffn_dim": 13824,
         "freq_dim": 256,
         "in_dim": 36,
-        "model_type": "i2v",
+        "model_type": "lingbot_world_fast",
         "num_heads": 40,
         "num_layers": 40,
         "out_dim": 16,
