@@ -80,6 +80,12 @@ def run_e2e():
         default=600,
         help="Stage initialization timeout in seconds",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for generation",
+    )
     nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
 
@@ -122,7 +128,7 @@ def run_e2e():
     if mm_processor_kwargs:
         prompts["mm_processor_kwargs"] = mm_processor_kwargs
 
-    sampling_params_list = [OmniDiffusionSamplingParams()]
+    sampling_params_list = [OmniDiffusionSamplingParams(extra_args={"seed": args.seed})]
 
     print(f"Generating speech for: {args.text}")
 
