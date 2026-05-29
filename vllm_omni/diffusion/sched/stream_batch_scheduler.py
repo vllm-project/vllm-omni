@@ -1,11 +1,10 @@
 """Temporal-pipeline-parallel scheduler for streaming chunked diffusion.
 
 Each ``schedule()`` call corresponds to one micro-step. The pipeline is modeled
-as ``pp_size`` per-rank chunk queues plus a transient ``returning`` queue.
-At each schedule(), chunks at rank N-1 drain (finished -> Layout finished
-slice, otherwise -> returning), queues shift one rank, and rank 0 receives the
-returning chunks plus B fresh admits drawn from the source video frames in
-``prompts[0]["multi_modal_data"]["video"]``.
+as ``pp_size`` per-rank chunk queues. At each schedule(), chunks at rank N-1
+drain (finished -> Layout finished slice, otherwise -> circulating back to
+rank 0), queues shift one rank, and rank 0 receives the circulating chunks
+plus B fresh admits up to the request's output chunk target.
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -33,26 +31,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _video_frame_count(request: OmniDiffusionRequest) -> int:
-    """Number of frames currently in ``prompts[0]["multi_modal_data"]["video"]``."""
-    if not request.prompts:
-        return 0
-    prompt = request.prompts[0]
-    if isinstance(prompt, str):
-        return 0
-    multi_modal = prompt.get("multi_modal_data") or {}
-    video = multi_modal.get("video")
-    if video is None:
-        return 0
-    if isinstance(video, torch.Tensor):
-        return int(video.shape[0])
-    if isinstance(video, list):
-        return len(video)
-    raise TypeError(
-        f"multi_modal_data['video'] must be a Tensor or list of Tensors; got {type(video).__name__}."
-    )
-
-
 @dataclass
 class _InFlightChunk:
     chunk_idx: int
@@ -64,21 +42,16 @@ class _Progress:
     sched_req_id: str
     pp_size: int
     chunk_frames: int
-    num_frames: int
+    num_chunks: int
     num_steps: int
 
-    frames_committed: int = 0
     next_chunk_idx: int = 0
     batch_size: int = 0
-    
+
     # chunks that will be processed by rank r at the current micro-step
     chunks_at: list[deque[_InFlightChunk]] = field(default_factory=list)
     # rank r's layout — constructed at rank 0 and shifted forward each step
     layouts_at: list[Layout] = field(default_factory=list)
-
-    @property
-    def output_chunks_target(self) -> int:
-        return self.num_frames // self.chunk_frames
 
 
 @dataclass
@@ -87,6 +60,7 @@ class _SLOReqState:
     max_batch: int
     chunk_frames: int
     batch_size: int = 1
+    warmed_up: bool = False
 
 
 class _SLOController:
@@ -116,9 +90,14 @@ class _SLOController:
         st = self._reqs.get(sched_req_id)
         return st.batch_size if st is not None else 1
 
+    def mark_warmed_up(self, sched_req_id: str) -> None:
+        st = self._reqs.get(sched_req_id)
+        if st is not None:
+            st.warmed_up = True
+
     def observe(self, sched_req_id: str, latency_ns: int | None, b_current: int | None) -> None:
         st = self._reqs.get(sched_req_id)
-        if st is None or latency_ns is None or latency_ns <= 0 or b_current is None or b_current <= 0:
+        if st is None or not st.warmed_up or latency_ns is None or latency_ns <= 0 or b_current is None or b_current <= 0:
             return
 
         budget = (b_current * st.chunk_frames / st.slo_fps) * 1e9
@@ -146,12 +125,11 @@ class StreamBatchScheduler(_BaseScheduler):
     Per micro-step:
       1. Promote waiting requests (handled by the base class).
       2. Drain rank N-1: finished chunks -> finished slice in
-         Layout, otherwise -> returning queue.
+         Layout, otherwise -> circulating back to rank 0.
       3. Shift per-rank queues by one (rank r <- rank r-1).
-      4. Rank 0 = returning + B fresh admits, where
-         `B = min(B_target, queue_chunks_available, output_chunks_remaining)`.
-      5. Emit per-rank assignment with Layout attached to every RankTask. Flip
-         req state RUNNING -> BLOCKED when admission is starved on input.
+      4. Rank 0 = circulating + B fresh admits, where
+         `B = min(B_target, output_chunks_remaining)`.
+      5. Emit per-rank assignment with Layout attached to every RankTask.
     """
 
     def __init__(self) -> None:
@@ -184,8 +162,8 @@ class StreamBatchScheduler(_BaseScheduler):
             raise ValueError(
                 f"chunk_frames must be a positive int when stream_batch=True, got {sampling.chunk_frames}"
             )
-        if sampling.num_frames is None or sampling.num_frames <= 0:
-            raise ValueError(f"num_frames must be a positive int, got {sampling.num_frames}")
+        if sampling.num_chunks is None or sampling.num_chunks <= 0:
+            raise ValueError(f"num_chunks must be a positive int, got {sampling.num_chunks}")
         if sampling.num_inference_steps is None or sampling.num_inference_steps <= 0:
             raise ValueError(
                 f"num_inference_steps must be a positive int, got {sampling.num_inference_steps}"
@@ -216,13 +194,13 @@ class StreamBatchScheduler(_BaseScheduler):
     def _init_progress(self, sched_req_id: str, req: OmniDiffusionRequest) -> None:
         sampling = req.sampling_params
         chunk_frames = sampling.chunk_frames
-        num_frames = sampling.num_frames
+        num_chunks = sampling.num_chunks
         num_steps = sampling.num_inference_steps
 
         self._progress[sched_req_id] = _Progress(
             sched_req_id=sched_req_id,
             chunk_frames=chunk_frames,
-            num_frames=num_frames,
+            num_chunks=num_chunks,
             num_steps=num_steps,
             pp_size=self.pp_size,
             chunks_at=[deque() for _ in range(self.pp_size)],
@@ -241,8 +219,8 @@ class StreamBatchScheduler(_BaseScheduler):
 
         logger.debug(
             "StreamBatchScheduler initialized progress for %s "
-            "(chunk_frames=%d, num_frames=%d, num_steps=%d, slo_fps=%s, pp_size=%d)",
-            sched_req_id, chunk_frames, num_frames, num_steps, sampling.slo_fps, self.pp_size,
+            "(chunk_frames=%d, num_chunks=%d, num_steps=%d, slo_fps=%s, pp_size=%d)",
+            sched_req_id, chunk_frames, num_chunks, num_steps, sampling.slo_fps, self.pp_size,
         )
 
     def _advance_chunk_pipeline(self, progress: _Progress) -> None:
@@ -272,18 +250,14 @@ class StreamBatchScheduler(_BaseScheduler):
         for chunk in circulating:
             progress.chunks_at[0].append(chunk)
 
-        state = self.get_request_state(progress.sched_req_id)
-        available_frames = _video_frame_count(state.req) if state is not None else 0
-        queue_chunks = max(0, (available_frames - progress.frames_committed) // progress.chunk_frames)
-        output_chunks_remaining = progress.output_chunks_target - progress.next_chunk_idx
+        output_chunks_remaining = progress.num_chunks - progress.next_chunk_idx
         b_target = self._slo.get_target(progress.sched_req_id)
-        batch_size = min(b_target, queue_chunks, output_chunks_remaining)
+        batch_size = min(b_target, output_chunks_remaining)
 
         new_idxs: list[int] = []
         for _ in range(batch_size):
             chunk_idx = progress.next_chunk_idx
             progress.next_chunk_idx += 1
-            progress.frames_committed += progress.chunk_frames
             progress.chunks_at[0].append(_InFlightChunk(chunk_idx=chunk_idx))
             new_idxs.append(chunk_idx)
         progress.batch_size = batch_size
@@ -295,19 +269,8 @@ class StreamBatchScheduler(_BaseScheduler):
             new_idxs=new_idxs,
         )
 
-        # 5. Flip RUNNING -> BLOCKED if input-starved and we still owe output.
-        if (
-            batch_size == 0
-            and output_chunks_remaining > 0
-            and queue_chunks == 0
-            and progress.sched_req_id in self._running
-        ):
-            self.block_request(progress.sched_req_id)
-            logger.debug(
-                "StreamBatchScheduler: %s BLOCKED on input "
-                "(committed_frames=%d, target_frames=%d, available_frames=%d)",
-                progress.sched_req_id, progress.frames_committed, progress.num_frames, available_frames,
-            )
+        if finished_idxs:
+            self._slo.mark_warmed_up(progress.sched_req_id)
 
     def _build_assignment(self) -> list[RankTask]:
         assert len(self._progress) <= 1 #TODO: support multiple requests

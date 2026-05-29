@@ -976,13 +976,10 @@ class PipelineGroupCoordinator(GroupCoordinator):
         send_size_tensor = torch.tensor(
             [payload_tensor.numel()], device=self.device, dtype=torch.int64
         )
-        # batch_isend_irecv (not plain isend) — plain P2P on size-2 PG
-        # triggers lazy sub-comm creation that requires the peer present.
-        ops = [
-            torch.distributed.P2POp(torch.distributed.isend, send_size_tensor, self.next_rank, send_group),
-            torch.distributed.P2POp(torch.distributed.isend, payload_tensor, self.next_rank, send_group),
+        handles = [
+            torch.distributed.isend(send_size_tensor, dst=self.next_rank, group=send_group),
+            torch.distributed.isend(payload_tensor, dst=self.next_rank, group=send_group),
         ]
-        handles = list(torch.distributed.batch_isend_irecv(ops))
         return handles, [send_size_tensor, payload_tensor]
 
     def _recv_dict_schema(self) -> list[tuple[str, Any]]:
@@ -993,15 +990,9 @@ class PipelineGroupCoordinator(GroupCoordinator):
             self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group
         )
         recv_size_tensor = torch.empty(1, device=self.device, dtype=torch.int64)
-        for req in torch.distributed.batch_isend_irecv(
-            [torch.distributed.P2POp(torch.distributed.irecv, recv_size_tensor, self.prev_rank, recv_group)]
-        ):
-            req.wait()
+        torch.distributed.recv(recv_size_tensor, src=self.prev_rank, group=recv_group)
         recv_payload = torch.empty(int(recv_size_tensor.item()), device=self.device, dtype=torch.uint8)
-        for req in torch.distributed.batch_isend_irecv(
-            [torch.distributed.P2POp(torch.distributed.irecv, recv_payload, self.prev_rank, recv_group)]
-        ):
-            req.wait()
+        torch.distributed.recv(recv_payload, src=self.prev_rank, group=recv_group)
         return pickle.loads(recv_payload.cpu().numpy().tobytes())
 
     def pipeline_send(self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1) -> None:
@@ -1071,6 +1062,11 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         compute_done = self._record_compute_event()
         comms = self.comms_stream
+        group = (
+            self.device_groups[self.rank_in_group % 2]
+            if self.world_size == 2
+            else self.device_group
+        )
         with self._comms_stream_ctx():
             if comms is not None and compute_done is not None:
                 comms.wait_event(compute_done)
@@ -1080,7 +1076,9 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 tensor = tensor.contiguous()
                 if tensor.is_cuda and comms is not None:
                     tensor.record_stream(comms)
-                handles.append(self._pipeline_isend(tensor))
+                handles.append(
+                    torch.distributed.isend(tensor, dst=self.next_rank, group=group)
+                )
         return handles
 
     def pipeline_irecv_tensor_dict(
@@ -1118,6 +1116,11 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         tensor_dict: dict[str, Any] = {}
         handles: list[torch.distributed.Work] = []
+        group = (
+            self.device_groups[(self.rank_in_group + 1) % 2]
+            if self.world_size == 2
+            else self.device_group
+        )
         with self._comms_stream_ctx():
             for k, value in metadata_list:
                 if isinstance(value, TensorMetadata):
@@ -1131,7 +1134,9 @@ class PipelineGroupCoordinator(GroupCoordinator):
                     tensor = buffers[k]
                     if tensor.is_cuda and comms is not None:
                         tensor.record_stream(comms)
-                    handles.append(self._pipeline_irecv(tensor))
+                    handles.append(
+                        torch.distributed.irecv(tensor, src=self.prev_rank, group=group)
+                    )
                     _update_nested_dict(tensor_dict, k, tensor)
                 else:
                     _update_nested_dict(tensor_dict, k, value)
@@ -1158,16 +1163,12 @@ class PipelineGroupCoordinator(GroupCoordinator):
         return self.recv_buffer[name][idx]
 
     def _pipeline_irecv(self, tensor: torch.tensor):
-        # batch_isend_irecv (not plain irecv) — plain P2P on size-2 PG
-        # triggers lazy sub-comm creation that requires the peer present.
         group = self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group
-        op = torch.distributed.P2POp(torch.distributed.irecv, tensor, self.prev_rank, group)
-        return torch.distributed.batch_isend_irecv([op])[0]
+        return torch.distributed.irecv(tensor, src=self.prev_rank, group=group)
 
     def _pipeline_isend(self, tensor: torch.tensor):
         group = self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group
-        op = torch.distributed.P2POp(torch.distributed.isend, tensor, self.next_rank, group)
-        return torch.distributed.batch_isend_irecv([op])[0]
+        return torch.distributed.isend(tensor, dst=self.next_rank, group=group)
 
     def set_skip_tensor_recv_buffer(
         self,

@@ -542,6 +542,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 layout = task.layout
 
                 if is_new_request:
+                    state.extra.pop("chunks", None)
                     pp_group.reset_buffer()
                     self.pipeline.prepare_encode(state)
                     self.pipeline.set_pp_recv_dict_buffers(state)
@@ -558,6 +559,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     self._prepare_chunk_latents(state, layout, is_first_rank=pp_group.is_first_rank)
 
                 if chunk_idxs:
+                    state.extra["current_chunk_idxs"] = chunk_idxs
+                    
                     chunks: list[ChunkState] = [
                         self._get_or_create_chunk(state, idx)[0] for idx in chunk_idxs
                     ]
@@ -627,10 +630,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             pieces.append(chunk.latents)
 
         if layout.new_idxs:
+            for idx in layout.new_idxs:
+                self._get_or_create_chunk(state, idx)
             encoded = self.pipeline.encode_chunk_inputs(state, layout.new_idxs)
             for i, idx in enumerate(layout.new_idxs):
-                chunk, _ = self._get_or_create_chunk(state, idx)
-                chunk.latents = encoded[i : i + 1]
+                state.extra["chunks"][idx].latents = encoded[i : i + 1]
             pieces.append(encoded)
 
         state.latents = torch.cat(pieces, dim=0) if pieces else None
@@ -642,17 +646,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             state.latents = state.latents[:n_finished]
             decoded = self.pipeline.post_decode(state)
             state.latents = saved
-            
+
             state.extra.setdefault("decoded_chunks", []).append(decoded)
-            state.extra["num_chunks_decoded"] = (
-                state.extra.get("num_chunks_decoded", 0) + n_finished
+            state.extra["chunks_decoded"] = (
+                state.extra.get("chunks_decoded", 0) + n_finished
             )
 
-        output_chunks_target = state.sampling.num_frames // state.sampling.chunk_frames
-
-        if state.extra.get("num_chunks_decoded", 0) >= output_chunks_target:
+        if state.extra.get("chunks_decoded", 0) >= state.sampling.num_chunks:
             return self._merge_chunk_outputs(state.extra["decoded_chunks"])
-        
+
         return None
 
     def _update_state_after(self, state: DiffusionRequestState, layout: Layout, finished: bool = False):
@@ -664,18 +666,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     
     @staticmethod
     def _merge_chunk_outputs(chunks: list[DiffusionOutput]) -> DiffusionOutput:
-        """Merge decoded chunk outputs into a single video tensor.
+        """Merge decoded chunk outputs along the temporal axis.
 
-        Each entry's ``.output`` is ``[B_i, C, T, H, W]``. 
-        Concat along the batch dim then unroll into the temporal axis ``[1, C, total_chunks * T, H, W]``.
+        Supports both:
+          - 5D ``[B, C, T, H, W]`` (Wan-style): time axis = dim 2.
+          - 4D ``[C, T, H, W]`` (lingbot-style): time axis = dim 1.
 
         NOTE: This is a temporary solution until streaming output is supported.
         """
 
         try:
-            cat0 = torch.cat([c.output for c in chunks], dim=0)
-            B, C, T, H, W = cat0.shape
-            merged = cat0.permute(1, 0, 2, 3, 4).reshape(1, C, B * T, H, W)
+            outputs = [c.output for c in chunks]
+            time_dim = outputs[0].dim() - 3
+            merged = torch.cat(outputs, dim=time_dim)
         except Exception as e:
             return DiffusionOutput(error=f"Failed to merge {len(chunks)} chunk outputs: {e}")
         return DiffusionOutput(output=merged)

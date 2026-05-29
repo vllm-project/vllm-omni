@@ -41,6 +41,7 @@ from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.diffusion.registry import apply_required_sampling_overrides
 
 logger = init_logger(__name__)
 
@@ -599,6 +600,10 @@ class DiffusionEngine:
         return DiffusionEngine(config, scheduler=scheduler)
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
+        apply_required_sampling_overrides(
+            request.sampling_params, self.od_config.model_class_name,
+        )
+
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -627,6 +632,9 @@ class DiffusionEngine:
         return await self.get_result(sched_req_id)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        apply_required_sampling_overrides(
+            request.sampling_params, self.od_config.model_class_name,
+        )
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")

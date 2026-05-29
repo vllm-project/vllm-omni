@@ -280,22 +280,40 @@ class PipelineParallelMixin:
         latents: torch.Tensor | tuple[torch.Tensor, ...],
         do_true_cfg: bool,
         per_request_scheduler: Any | list[Any] | None = None,
+        generator: torch.Generator | None = None,
         batch_size: int = 1,
+        receive_latents: bool = True,
+        buf_idx: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
         Drop-in replacement for scheduler_step_maybe_with_cfg that also handles PP.
 
-        Only the last rank runs the scheduler (it already has noise_pred) and
-        sends the result back to rank 0.
+        Only the last rank runs the scheduler (it already has noise_pred); the result
+        is sent to rank 0 which needs it for the next forward pass.
+
+        If `receive_latents` is True, returns a ``AsyncLatents`` on rank 0 that transparently defers
+        ``handle.wait()`` until the tensor is actually consumed (via attribute
+        access or a torch operation), keeping the rank non-blocking after the
+        ``irecv`` is posted.
         """
         if get_pipeline_parallel_world_size() == 1:
-            return self._scheduler_step_local(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
+            return self._scheduler_step_local(
+                noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator,
+            )
 
         pp_group = get_pp_group()
         if pp_group.is_last_rank:
-            latents = self._scheduler_step_local(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
+            latents = self._scheduler_step_local(
+                noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator,
+            )
             self._pp_send_work = pp_group.pipeline_isend_tensor_dict(
                 {"latents": latents}, name="latents", batch_size=batch_size,
+            )
+        if pp_group.is_first_rank and receive_latents:
+            latents = AsyncLatents(
+                *pp_group.pipeline_irecv_tensor_dict(
+                    name="latents", buf_idx=buf_idx, batch_size=batch_size,
+                )
             )
         return latents
 
@@ -306,18 +324,19 @@ class PipelineParallelMixin:
         latents: torch.Tensor,
         do_true_cfg: bool,
         per_request_scheduler: Any | list[Any] | None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Run scheduler.step on this rank — single call or per-chunk loop."""
         if not isinstance(per_request_scheduler, list):
             return super().scheduler_step_maybe_with_cfg(
-                noise_pred, t, latents, do_true_cfg, per_request_scheduler,
+                noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator=generator,
             )
         new_rows: list[torch.Tensor] = []
         for i, sched in enumerate(per_request_scheduler):
             t_i = t[i] if t.ndim > 0 else t
             new_rows.append(
                 super().scheduler_step_maybe_with_cfg(
-                    noise_pred[i:i + 1], t_i, latents[i:i + 1], do_true_cfg, sched,
+                    noise_pred[i:i + 1], t_i, latents[i:i + 1], do_true_cfg, sched, generator=generator,
                 )
             )
         return torch.cat(new_rows, dim=0)

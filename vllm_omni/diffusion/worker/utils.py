@@ -125,6 +125,7 @@ class ChunkState:
     latents: torch.Tensor | None = None
     step_index: int = 0
     scheduler: Any | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 class BaseRunnerOutput(ABC):
