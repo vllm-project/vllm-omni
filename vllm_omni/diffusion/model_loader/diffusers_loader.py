@@ -328,19 +328,34 @@ class DiffusersPipelineLoader:
                     od_config, target_device=device, load_format=load_format, custom_pipeline_name=custom_pipeline_name
                 )
             else:
-                with target_device:
-                    if load_format == "default":
-                        model = initialize_model(od_config)
-                    elif load_format == "diffusers":
-                        model = DiffusersAdapterPipeline(od_config=od_config, device=target_device)
-                    elif load_format == "custom_pipeline":
-                        from vllm_omni.diffusion.config import set_current_diffusion_config
+                if load_format == "custom_pipeline":
+                    # NOTE: Custom pipelines call HuggingFace `from_pretrained(...).to(device)`
+                    # internally. If we construct them under `with target_device:` (CUDA),
+                    # safetensors takes a direct-to-GPU fast path that calls `cudaMalloc`
+                    # via the driver API and BYPASSES PyTorch's caching allocator.
+                    # That makes those bytes invisible to CuMemAllocator, so `sleep()`
+                    # cannot offload/unmap them and GPU memory stays pinned.
+                    #
+                    # Fix: build the custom pipeline on CPU first (no default device
+                    # context), then explicitly move it to the target device. The
+                    # subsequent `.to(target_device)` issues `torch.empty(..., device=cuda)`
+                    # + `copy_`, which goes through the caching allocator and is fully
+                    # tracked by CuMemAllocator.
+                    from vllm_omni.diffusion.config import set_current_diffusion_config
 
-                        model_cls = resolve_obj_by_qualname(custom_pipeline_name)
-                        with set_current_diffusion_config(od_config):
-                            model = model_cls(od_config=od_config)
-                    else:
-                        raise ValueError(f"Unknown load_format: {load_format}")
+                    model_cls = resolve_obj_by_qualname(custom_pipeline_name)
+                    with set_current_diffusion_config(od_config):
+                        model = model_cls(od_config=od_config)
+                    if target_device.type != "cpu":
+                        model.to(target_device)
+                else:
+                    with target_device:
+                        if load_format == "default":
+                            model = initialize_model(od_config)
+                        elif load_format == "diffusers":
+                            model = DiffusersAdapterPipeline(od_config=od_config, device=target_device)
+                        else:
+                            raise ValueError(f"Unknown load_format: {load_format}")
                 logger.debug("Loading weights on %s ...", load_device)
                 if load_format == "diffusers":
                     # DiffusersAdapterPipeline.load_weights() calls

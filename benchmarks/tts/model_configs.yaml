@@ -32,8 +32,11 @@ models:
         task_type: Base
 
   openbmb/VoxCPM2:
-    supported_tasks: [voice_clone]
+    supported_tasks: [voice_clone, default_voice]
+    trust_remote_code: true
     backend: openai-audio-speech
     endpoint: /v1/audio/speech
     task_extra_body:
       voice_clone: {}
+      default_voice:
+        voice: default

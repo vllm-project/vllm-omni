@@ -19,6 +19,8 @@ The full set of backends and their platform defaults is in the **Backend Options
 | `FLASHINFER_ATTN` | Calls FlashInfer's dense `single_prefill_with_kv_cache` directly with `custom_mask` for non-causal masked attention. Used as Blackwell fallback when cuDNN is unavailable. Requires `flashinfer`. |
 | `TORCH_SDPA` | PyTorch `scaled_dot_product_attention` with the default backend dispatcher. Most conservative; always available. |
 | `SAGE_ATTN` | SageAttention 2.2 — INT8-quantized attention with FP16 accumulation. Lossy but typically visually indistinguishable on diffusion outputs. Requires `sageattention`. |
+| `SAGE_ATTN_3` | Requires `sageattn3` from `SageAttention/sageattention3_blackwell`. CUDA only, intended for Blackwell GPUs, with GQA/MQA requests falling back to PyTorch SDPA. |
+
 
 ## Configuration
 
@@ -185,6 +187,29 @@ Quick check:
 python -c "import sageattention; print(sageattention.__file__)"
 ```
 
+## SageAttention3 Installation
+
+vLLM-Omni expects SageAttention3 to be installed into the same Python environment as vLLM-Omni.
+
+Build from source:
+
+```bash
+git clone https://github.com/thu-ml/SageAttention.git
+cd SageAttention/sageattention3_blackwell
+python setup.py install
+```
+
+Quick check:
+
+```bash
+python -c "import sageattn3; print(sageattn3.__file__)"
+```
+
+Notes:
+
+- `SAGE_ATTN_3` is only selected on CUDA when `sageattn3` is importable and the GPU is Blackwell-class.
+- SageAttention3's Blackwell kernel assumes `Hq == Hkv`. In vLLM-Omni, GQA/MQA diffusion requests fall back to PyTorch SDPA for correctness.
+
 ## Usage Examples
 
 ### Default (auto-route)
@@ -233,6 +258,20 @@ DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN python examples/offline_inference/text_to_
     --num-inference-steps 30 --seed 42 --guidance-scale 5.0 \
     --tensor-parallel-size 2 \
     --output outputs/wan22_sage.mp4
+```
+
+### Enable SageAttention3
+
+Example:
+
+```bash
+DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN_3 python examples/offline_inference/text_to_video/text_to_video.py \
+    --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v \
+    --prompt "A dog running across a field of golden wheat." \
+    --height 480 --width 832 --num-frames 33 \
+    --num-inference-steps 30 --seed 42 --guidance-scale 6.0 \
+    --tensor-parallel-size 2 \
+    --output outputs/hv15_sage3.mp4
 ```
 
 ### Mixed backends across roles
