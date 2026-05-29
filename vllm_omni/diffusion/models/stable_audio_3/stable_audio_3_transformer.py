@@ -115,7 +115,7 @@ except ImportError as e:
     index_first_axis = None
 
 
-def precompute_varlen_metadata(padding_mask: torch.Tensor):
+def precompute_varlen_metadata(padding_mask: torch.Tensor) -> dict | None:
     """
     Precompute varlen attention metadata once to avoid recomputation in every attention layer.
 
@@ -1810,7 +1810,12 @@ class DiffusionTransformer(nn.Module):
 
         return output
 
-    def apg_project(self, v0, v1, padding_mask=None):
+    def apg_project(
+        self,
+        v0: torch.Tensor,
+        v1: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Project v0 into components parallel and orthogonal to v1.
 
