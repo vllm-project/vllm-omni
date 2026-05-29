@@ -191,7 +191,16 @@ def test_performance_benchmark(omni_server, benchmark_params, request):
         raise ValueError("The number of prompts does not match the QPS or max_concurrency")
 
     args = ["--host", host, "--port", str(port)]
-    exclude_keys = {"request_rate", "baseline", "num_prompts", "max_concurrency", "task", "enabled", "eval_phase"}
+    exclude_keys = {
+        "request_rate",
+        "baseline",
+        "num_prompts",
+        "max_concurrency",
+        "task",
+        "enabled",
+        "eval_phase",
+        "trust_remote_code",
+    }
 
     for key, value in params.items():
         if key in exclude_keys or value is None:
@@ -206,6 +215,14 @@ def test_performance_benchmark(omni_server, benchmark_params, request):
             args.extend([arg_name, json_str])
         elif not isinstance(value, bool):
             args.extend([arg_name, str(value)])
+
+    for config in BENCHMARK_CONFIGS:
+        if config.get("test_name") != test_name:
+            continue
+        server_params = config.get("server_params") or {}
+        if server_params.get("trust_remote_code") or params.get("trust_remote_code"):
+            args.append("--trust-remote-code")
+        break
 
     # QPS / request-rate sweep
     for i, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
