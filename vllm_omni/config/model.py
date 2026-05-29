@@ -5,11 +5,78 @@ from pydantic import ConfigDict, TypeAdapter
 from vllm.config import ModelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
-from vllm.transformers_utils.config import get_hf_text_config
+from vllm.transformers_utils.config import (
+    get_hf_text_config,
+    thinker_uses_mrope,
+)
+from vllm.transformers_utils.model_arch_config_convertor import (
+    ModelArchConfigConvertorBase,
+)
 
 import vllm_omni.model_executor.models as me_models
 
 logger = init_logger(__name__)
+
+
+class OmniModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    """Config convertor for Omni multi-stage models.
+
+    Pre-quantized checkpoints (e.g. modelopt FP8) store quantization
+    config in a stage-specific sub-config (e.g.
+    thinker_config.text_config.quantization_config) with correct relative
+    prefixes.  The legacy hf_quant_config.json sits at the top level with
+    "thinker."-prefixed names that don't match vllm-omni's module names.
+
+    This convertor accepts an optional *stage_config_name* so that only
+    the relevant stage's quantization config is surfaced.
+    """
+
+    def __init__(
+        self,
+        hf_config,
+        hf_text_config,
+        stage_config_name: str | None = None,
+    ):
+        super().__init__(hf_config, hf_text_config)
+        self.stage_config_name = stage_config_name
+
+    def get_quantization_config(self):
+        # When a stage_config_name is set, look for quantization config
+        # in that stage's text_config first (has correct relative prefixes).
+        if self.stage_config_name is not None:
+            stage_cfg = getattr(self.hf_config, self.stage_config_name, None)
+            if stage_cfg is not None:
+                text_cfg = getattr(stage_cfg, "text_config", None)
+                if text_cfg is not None:
+                    quant_cfg = self._normalize_quantization_config(text_cfg)
+                    if quant_cfg is not None:
+                        return quant_cfg
+
+            # Fall back to top-level quantization_config
+            top_quant = super().get_quantization_config()
+            if top_quant is not None:
+                block_names = top_quant.get("block_name_to_quantize")
+                if block_names is not None:
+                    # NOTE: This assumes stage_config_name follows the HF
+                    # ``<stage>_config`` convention (e.g. thinker_config →
+                    # prefix "thinker.").  removesuffix is a no-op when
+                    # the suffix doesn't match, so a non-standard name
+                    # would just use itself as prefix — safe but worth
+                    # verifying if new stage names are introduced.
+                    hf_prefix = self.stage_config_name.removesuffix("_config") + "."
+                    if isinstance(block_names, str):
+                        block_names = [b.strip() for b in block_names.split(",")]
+                    if isinstance(block_names, list) and not any(b.startswith(hf_prefix) for b in block_names):
+                        # This stage is not listed → no quantization.
+                        return None
+                return top_quant
+
+            # For non-thinker stages (talker, code2wav) whose text_config
+            # has no quantization_config, return None so quantization is
+            # not applied to stages that were not quantized.
+            return None
+
+        return super().get_quantization_config()
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -64,9 +131,12 @@ class OmniModelConfig(ModelConfig):
             "extra": {},
         }
     )
+    subtalker_sampling_params: dict[str, Any] | None = None
     omni_kv_config: dict | None = None
     codec_frame_rate_hz: float | None = None
     task_type: str | None = None
+    enable_sleep_mode: bool = False
+    has_sampling_extra_args: bool = False
 
     @property
     def registry(self):
@@ -79,6 +149,18 @@ class OmniModelConfig(ModelConfig):
         return super().architectures
 
     @property
+    def uses_mrope(self) -> bool:
+        if self.hf_config_name is not None:
+            # talker_config/thinker_config/etc
+            stage_config = getattr(self.hf_config, self.hf_config_name, None)
+            if stage_config is None:
+                # Check the named sub-config's text_config directly.
+                # Handles mrope resolution of stage-specific cls
+                # (e.g., talker runs as a standalone cls)
+                return thinker_uses_mrope(self.hf_config)
+        return super().uses_mrope
+
+    @property
     def embedding_size(self):
         if self.hf_config_name is not None:
             stage_config = getattr(self.hf_config, self.hf_config_name, None)
@@ -86,6 +168,20 @@ class OmniModelConfig(ModelConfig):
             if override is not None:
                 return override
         return super().embedding_size
+
+    def get_model_arch_config(self):
+        # For multi-stage omni models, use a stage-aware convertor so that
+        # only the correct stage's quantization config is surfaced.
+        # Without this, a pre-quantized thinker checkpoint would also
+        # apply quantization to the talker/code2wav stages.
+        if self.hf_config_name is not None:
+            convertor = OmniModelArchConfigConvertor(
+                self.hf_config,
+                self.hf_text_config,
+                stage_config_name=self.hf_config_name,
+            )
+            return convertor.convert()
+        return super().get_model_arch_config()
 
     def draw_hf_text_config(self):
         # transformers' get_text_config method is used to get the text config from thinker_config.
@@ -129,6 +225,12 @@ class OmniModelConfig(ModelConfig):
         new_hf_text_config = self.draw_hf_text_config()
         if new_hf_text_config is not self.hf_text_config:
             self.hf_text_config = new_hf_text_config
+            # Recalculate model_arch_config since it derives head counts,
+            # hidden size, etc. from hf_text_config.  Without this the
+            # FlashAttentionMetadataBuilder uses the wrong num_heads_q /
+            # num_heads_kv (from the thinker) for talker stages, causing
+            # FA3 scheduler_metadata shape mismatches at runtime.
+            self.model_arch_config = self.get_model_arch_config()
             # Recalculate dependent attributes
             self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
             # Recalculate max_model_len since it depends on hf_text_config

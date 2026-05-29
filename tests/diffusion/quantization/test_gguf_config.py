@@ -9,16 +9,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.layers.quantization.gguf import UNQUANTIZED_TYPES
+from vllm.model_executor.layers.quantization.gguf import UNQUANTIZED_TYPES, UnquantizedLinearMethod
 
-from vllm_omni.diffusion.quantization import (
-    DiffusionGgufConfig,
-    get_diffusion_quant_config,
-)
-from vllm_omni.diffusion.quantization.gguf import (
+from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization.gguf_config import (
+    DiffusionGGUFConfig,
     DiffusionGGUFLinearMethod,
-    UnquantizedLinearMethod,
-    _GGUFConfig,
     dequant_gemm_gguf,
 )
 
@@ -26,7 +22,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def test_gguf_config_creation_and_delegation():
-    config = DiffusionGgufConfig(
+    config = DiffusionGGUFConfig(
         gguf_model="weights.gguf",
         unquantized_modules=["proj_out"],
     )
@@ -34,37 +30,36 @@ def test_gguf_config_creation_and_delegation():
     assert config.gguf_model == "weights.gguf"
     assert config.unquantized_modules == ["proj_out"]
     assert config.get_name() == "gguf"
-    assert isinstance(config.get_vllm_quant_config(), _GGUFConfig)
 
 
-def test_get_diffusion_quant_config_builds_gguf_config():
-    config = get_diffusion_quant_config(
+def test_build_quant_config_builds_gguf_config():
+    config = build_quant_config(
         "gguf",
         gguf_model="repo/model-Q4_0.gguf",
         unquantized_modules=["norm_out"],
     )
 
-    assert isinstance(config, DiffusionGgufConfig)
+    assert isinstance(config, DiffusionGGUFConfig)
     assert config.gguf_model == "repo/model-Q4_0.gguf"
     assert config.unquantized_modules == ["norm_out"]
 
 
 def test_gguf_vllm_config_returns_diffusion_linear_method_for_linear_layers():
     linear = object.__new__(LinearBase)
-    method = _GGUFConfig(unquantized_modules=[]).get_quant_method(linear, "transformer.img_in")
+    method = DiffusionGGUFConfig(unquantized_modules=[]).get_quant_method(linear, "transformer.img_in")
 
     assert isinstance(method, DiffusionGGUFLinearMethod)
 
 
 def test_gguf_vllm_config_respects_unquantized_modules():
     linear = object.__new__(LinearBase)
-    method = _GGUFConfig(unquantized_modules=["proj_out"]).get_quant_method(linear, "transformer.proj_out")
+    method = DiffusionGGUFConfig(unquantized_modules=["proj_out"]).get_quant_method(linear, "transformer.proj_out")
 
     assert isinstance(method, UnquantizedLinearMethod)
 
 
 def test_gguf_vllm_config_returns_none_for_non_linear_layers():
-    method = _GGUFConfig(unquantized_modules=[]).get_quant_method(torch.nn.LayerNorm(4), "norm")
+    method = DiffusionGGUFConfig(unquantized_modules=[]).get_quant_method(torch.nn.LayerNorm(4), "norm")
 
     assert method is None
 
@@ -81,7 +76,7 @@ def test_dequant_gemm_gguf_uses_plain_matmul_for_unquantized_types():
 
 def test_diffusion_gguf_linear_method_applies_bias_on_unquantized_weight():
     qweight_type = next(iter(UNQUANTIZED_TYPES))
-    method = DiffusionGGUFLinearMethod(_GGUFConfig(unquantized_modules=[]))
+    method = DiffusionGGUFLinearMethod(DiffusionGGUFConfig(unquantized_modules=[]))
     layer = SimpleNamespace(
         qweight=torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32),
         qweight_type=SimpleNamespace(weight_type=qweight_type),
@@ -97,7 +92,7 @@ def test_diffusion_gguf_linear_method_applies_bias_on_unquantized_weight():
 
 def test_diffusion_gguf_linear_method_concatenates_sharded_outputs():
     qweight_type = next(iter(UNQUANTIZED_TYPES))
-    method = DiffusionGGUFLinearMethod(_GGUFConfig(unquantized_modules=[]))
+    method = DiffusionGGUFLinearMethod(DiffusionGGUFConfig(unquantized_modules=[]))
     qweight = torch.nn.Parameter(
         torch.tensor(
             [

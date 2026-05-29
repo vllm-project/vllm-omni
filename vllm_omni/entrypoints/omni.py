@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
 
+from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import OmniBase
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
@@ -33,7 +34,7 @@ class Omni(OmniBase):
         for stage_id, params in enumerate(sampling_params_list):
             sp = copy.deepcopy(params)
             stage_meta = self.engine.get_stage_metadata(stage_id)
-            if stage_meta.get("stage_type") != "diffusion" and hasattr(sp, "output_kind"):
+            if stage_meta.stage_type != "diffusion" and hasattr(sp, "output_kind"):
                 sp.output_kind = RequestOutputKind.FINAL_ONLY
             effective_params.append(sp)
         return effective_params
@@ -66,6 +67,13 @@ class Omni(OmniBase):
         py_generator: bool = False,
         use_tqdm: bool | Callable[..., tqdm] = True,
     ) -> Generator[OmniRequestOutput, None, None] | list[OmniRequestOutput]:
+        # Expand sampling params for PD disaggregation (user may provide N-1 params)
+        if (
+            sampling_params_list is not None
+            and isinstance(sampling_params_list, Sequence)
+            and not isinstance(sampling_params_list, (str, bytes))
+        ):
+            sampling_params_list = self._maybe_expand_sampling_params(list(sampling_params_list))
         sampling_params_list = self.resolve_sampling_params_list(sampling_params_list)
         try:
             if py_generator:
@@ -125,10 +133,17 @@ class Omni(OmniBase):
                 req_state.metrics = metrics
                 self.request_states[req_id] = req_state
 
+                # PD disaggregation: modify stage-0 (prefill) sampling params per request
+                req_sp_list = list(sampling_params_list)
+                pd_pair = self._get_pd_separation_pair()
+                if pd_pair is not None:
+                    p_id = pd_pair[0]
+                    req_sp_list[p_id] = self._prepare_prefill_sampling_params(req_id, req_sp_list[p_id])
+
                 self.engine.add_request(
                     request_id=req_id,
                     prompt=prompt,
-                    sampling_params_list=sampling_params_list,
+                    sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id,
                 )
                 submit_ts = time.time()
@@ -152,6 +167,8 @@ class Omni(OmniBase):
                     logger.warning("[Omni] Received output for unknown/finished request_id=%s", req_id)
                     continue
 
+                self._check_engine_output_error(msg, req_id, stage_id)
+
                 if req_state.metrics is None:
                     continue
                 output_to_yield = self._process_single_result(
@@ -165,7 +182,7 @@ class Omni(OmniBase):
                 if output_to_yield is not None:
                     yield output_to_yield
 
-                if msg.get("finished"):
+                if isinstance(msg, OutputMessage) and msg.finished:
                     active_reqs.discard(req_id)
                     if pbar is not None:
                         pbar.update(1)

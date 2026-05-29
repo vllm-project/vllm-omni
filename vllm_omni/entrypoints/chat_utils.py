@@ -2,7 +2,7 @@ import numpy as np
 
 
 async def extract_audio_from_video_async(video_url: str) -> tuple[np.ndarray, int | float]:
-    """Extract audio from a video URL using librosa.
+    """Extract audio from a video URL using vllm's load_audio.
 
     Returns a (audio_array, sample_rate) tuple compatible with audio format.
     All blocking I/O operations are run in a thread pool.
@@ -26,9 +26,9 @@ async def extract_audio_from_video_async(video_url: str) -> tuple[np.ndarray, in
             return temp_file.name
 
     def _load_audio_sync(file_path: str) -> tuple[np.ndarray, int | float]:
-        import librosa
+        from vllm.multimodal.media.audio import load_audio
 
-        return librosa.load(file_path, sr=16000)
+        return load_audio(file_path, sr=16000)
 
     def _cleanup_file_sync(file_path: str) -> None:
         try:

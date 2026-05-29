@@ -23,6 +23,7 @@ from message_convert import (
 from vllm import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -182,14 +183,13 @@ def main(args):
 
     omni = Omni(
         model=model_name,
-        stage_configs_path=args.stage_configs_path,
+        deploy_config=args.deploy_config,
         log_stats=args.enable_stats,
         log_file=("omni_pipeline.log" if args.enable_stats else None),
         init_sleep_seconds=args.init_sleep_seconds,
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
         shm_threshold_bytes=args.shm_threshold_bytes,
-        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     thinker_sampling_params = SamplingParams(
@@ -310,7 +310,10 @@ def main(args):
             lines.append("Prompt:\n")
             lines.append(str(prompt_text) + "\n")
             lines.append("vllm_text_output:\n")
-            lines.append(str(text_output).strip() + "\n")
+            output_text = str(text_output)
+            if "<chinese>" in output_text or "<english>" in output_text:
+                output_text = output_text.replace("<chinese>", "").replace("<english>", "").strip()
+            lines.append(output_text + "\n")
             try:
                 with open(out_txt, "w", encoding="utf-8") as f:
                     print("lines", lines)
@@ -352,7 +355,7 @@ def parse_args():
         "--text",
         "-t",
         type=str,
-        default="The weather is so nice today.",
+        default="",
         help="input text",
     )
     parser.add_argument(
@@ -429,17 +432,14 @@ def parse_args():
         help="Sampling rate for audio.",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
-        default="../../../model_executor/stage_configs/mimo_audio.yaml",
-        help="Path to a stage configs file.",
-    )
-    parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
+        default=None,
+        help="Override the deploy config path. If unset, auto-loads "
+        "vllm_omni/deploy/mimo_audio.yaml based on the HF model_type.",
     )
 
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

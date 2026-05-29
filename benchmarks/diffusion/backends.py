@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import json
 import mimetypes
 import os
 import time
@@ -10,6 +9,8 @@ from typing import Any
 
 import aiohttp
 from tqdm import tqdm
+
+DEFAULT_EDITS_BOT_TASK = "think"
 
 
 @dataclass
@@ -28,6 +29,7 @@ class RequestFuncInput:
     extra_body: dict[str, Any] = field(default_factory=dict)
     image_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    default_bot_task: str | None = DEFAULT_EDITS_BOT_TASK
 
 
 @dataclass
@@ -52,6 +54,95 @@ def _encode_image_as_data_url(path: str) -> str:
         encoded = base64.b64encode(f.read()).decode("utf-8")
     mime = _guess_mime_type(path)
     return f"data:{mime};base64,{encoded}"
+
+
+async def async_request_image_edits(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+    enable_diffusion_pipeline_profiler: bool = False,
+) -> RequestFuncOutput:
+    """POST /v1/images/edits (multipart)."""
+    del enable_diffusion_pipeline_profiler
+    output = RequestFuncOutput()
+    output.start_time = time.perf_counter()
+
+    extra_body = dict(input.extra_body)
+    width = input.width or extra_body.get("width") or 1024
+    height = input.height or extra_body.get("height") or 1024
+    edits_url = input.api_url
+
+    form = aiohttp.FormData()
+    form.add_field("model", input.model)
+    form.add_field("prompt", input.prompt)
+    form.add_field("size", f"{width}x{height}")
+    form.add_field("response_format", "b64_json")
+
+    if input.num_inference_steps is not None:
+        form.add_field("num_inference_steps", str(input.num_inference_steps))
+    elif extra_body.get("num_inference_steps") is not None:
+        form.add_field("num_inference_steps", str(extra_body["num_inference_steps"]))
+
+    if input.seed is not None:
+        form.add_field("seed", str(input.seed))
+    elif extra_body.get("seed") is not None:
+        form.add_field("seed", str(extra_body["seed"]))
+
+    if extra_body.get("guidance_scale") is not None:
+        form.add_field("guidance_scale", str(extra_body["guidance_scale"]))
+    if extra_body.get("negative_prompt") is not None:
+        form.add_field("negative_prompt", str(extra_body["negative_prompt"]))
+    if extra_body.get("true_cfg_scale") is not None:
+        form.add_field("true_cfg_scale", str(extra_body["true_cfg_scale"]))
+    if extra_body.get("sys_type") is not None:
+        form.add_field("sys_type", str(extra_body["sys_type"]))
+    if extra_body.get("system_prompt") is not None:
+        form.add_field("system_prompt", str(extra_body["system_prompt"]))
+
+    bot_task = extra_body.get("bot_task")
+    if bot_task is None and input.default_bot_task is not None:
+        bot_task = input.default_bot_task
+    if bot_task is not None:
+        form.add_field("bot_task", str(bot_task))
+
+    assert input.image_paths is not None
+    for img_path in input.image_paths:
+        if not os.path.exists(img_path):
+            output.error = f"Image file not found: {img_path}"
+            output.success = False
+            if pbar:
+                pbar.update(1)
+            return output
+        with open(img_path, "rb") as img_f:
+            image_bytes = img_f.read()
+        form.add_field(
+            "image",
+            image_bytes,
+            filename=os.path.basename(img_path),
+            content_type=_guess_mime_type(img_path),
+        )
+
+    try:
+        async with session.post(edits_url, data=form) as response:
+            if response.status == 200:
+                resp_json = await response.json()
+                output.response_body = resp_json
+                output.success = True
+            else:
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+    except Exception as e:
+        output.error = str(e)
+        output.success = False
+
+    output.latency = time.perf_counter() - output.start_time
+
+    if output.success and input.slo_ms is not None:
+        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
+
+    if pbar:
+        pbar.update(1)
+    return output
 
 
 async def async_request_chat_completions(
@@ -123,6 +214,18 @@ async def async_request_chat_completions(
                                     output.peak_memory_mb = first_item.get("peak_memory_mb", 0.0)
                 except (IndexError, TypeError, AttributeError):
                     pass
+
+                if (not output.stage_durations or output.peak_memory_mb == 0.0) and isinstance(
+                    resp_json.get("metrics"), dict
+                ):
+                    m = resp_json["metrics"]
+                    if not output.stage_durations and isinstance(m.get("stage_durations"), dict):
+                        output.stage_durations = m.get("stage_durations") or {}
+                    if output.peak_memory_mb == 0.0 and m.get("peak_memory_mb") is not None:
+                        try:
+                            output.peak_memory_mb = float(m.get("peak_memory_mb") or 0.0)
+                        except (TypeError, ValueError):
+                            pass
             else:
                 output.error = f"HTTP {response.status}: {await response.text()}"
                 output.success = False
@@ -140,7 +243,7 @@ async def async_request_chat_completions(
     return output
 
 
-async def async_request_openai_images(
+async def async_request_openai_image_generations(
     input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
@@ -307,6 +410,8 @@ async def async_request_v1_videos(
             video_bytes = await content_response.read()
             output.response_body = video_bytes
             output.success = True
+            if "stage_durations" in poll_json:
+                output.stage_durations = poll_json["stage_durations"] or {}
             if "peak_memory_mb" in poll_json:
                 output.peak_memory_mb = poll_json["peak_memory_mb"]
             elif "peak_memory_mb" in resp_json:
@@ -335,263 +440,39 @@ async def async_request_v1_videos(
     return output
 
 
-async def async_request_image_sglang(
-    input: RequestFuncInput,
-    session: aiohttp.ClientSession,
-    pbar: tqdm | None = None,
-) -> RequestFuncOutput:
-    output = RequestFuncOutput()
-    output.start_time = time.perf_counter()
-
-    # Check if we need to use multipart (for image edits with input images)
-    if input.image_paths and len(input.image_paths) > 0:
-        # Use multipart/form-data for image edits
-        data = aiohttp.FormData()
-        data.add_field("model", input.model)
-        data.add_field("prompt", input.prompt)
-        data.add_field("response_format", "b64_json")
-
-        if input.width and input.height:
-            data.add_field("size", f"{input.width}x{input.height}")
-
-        # Merge extra parameters
-        for key, value in input.extra_body.items():
-            data.add_field(key, str(value))
-
-        # Add image file(s)
-        for idx, img_path in enumerate(input.image_paths):
-            if os.path.exists(img_path):
-                data.add_field(
-                    "image",
-                    open(img_path, "rb"),
-                    filename=os.path.basename(img_path),
-                    content_type="application/octet-stream",
-                )
-            else:
-                output.error = f"Image file not found: {img_path}"
-                output.success = False
-                if pbar:
-                    pbar.update(1)
-                return output
-
-        try:
-            async with session.post(input.api_url, data=data) as response:
-                if response.status == 200:
-                    resp_json = await response.json()
-                    output.response_body = resp_json
-                    output.success = True
-                    if "peak_memory_mb" in resp_json:
-                        output.peak_memory_mb = resp_json["peak_memory_mb"]
-                else:
-                    output.error = f"HTTP {response.status}: {await response.text()}"
-                    output.success = False
-        except Exception as e:
-            output.error = str(e)
-            output.success = False
-    else:
-        # Use JSON for text-to-image generation
-        payload = {
-            "model": input.model,
-            "prompt": input.prompt,
-            "n": 1,
-            "response_format": "b64_json",
-        }
-
-        if input.width and input.height:
-            payload["size"] = f"{input.width}x{input.height}"
-
-        if input.num_inference_steps:
-            payload["num_inference_steps"] = input.num_inference_steps
-
-        payload.update(input.extra_body)
-
-        try:
-            async with session.post(input.api_url, json=payload) as response:
-                if response.status == 200:
-                    resp_json = await response.json()
-                    output.response_body = resp_json
-                    output.success = True
-                    if "peak_memory_mb" in resp_json:
-                        output.peak_memory_mb = resp_json["peak_memory_mb"]
-                else:
-                    output.error = f"HTTP {response.status}: {await response.text()}"
-                    output.success = False
-        except Exception as e:
-            output.error = str(e)
-            output.success = False
-
-    output.latency = time.perf_counter() - output.start_time
-
-    # Check SLO if defined
-    if input.slo_ms is not None and output.success:
-        output.slo_achieved = (output.latency * 1000.0) <= input.slo_ms
-
-    if pbar:
-        pbar.update(1)
-    return output
+LEGACY_BACKEND_ENDPOINT_ALIASES = {
+    "vllm-omni": "/v1/chat/completions",
+    "openai": "/v1/images/generations",
+}
 
 
-async def async_request_video_sglang(
-    input: RequestFuncInput,
-    session: aiohttp.ClientSession,
-    pbar: tqdm | None = None,
-) -> RequestFuncOutput:
-    output = RequestFuncOutput()
-    output.start_time = time.perf_counter()
+def normalize_endpoint(value: str) -> str:
+    endpoint = str(value).strip()
+    if not endpoint:
+        raise ValueError("endpoint must not be empty.")
+    endpoint = LEGACY_BACKEND_ENDPOINT_ALIASES.get(
+        endpoint,
+        LEGACY_BACKEND_ENDPOINT_ALIASES.get(endpoint.lstrip("/"), endpoint),
+    )
+    if not endpoint.startswith("/"):
+        endpoint = f"/{endpoint}"
+    return endpoint
 
-    # 1. Submit Job
-    job_id = None
-    # Check if we need to upload images (Multipart) or just send JSON
-    if input.image_paths and len(input.image_paths) > 0:
-        # Use multipart/form-data
-        data = aiohttp.FormData()
-        data.add_field("model", input.model)
-        data.add_field("prompt", input.prompt)
 
-        if input.width and input.height:
-            data.add_field("size", f"{input.width}x{input.height}")
-
-        # Add extra body fields to form data if possible, or assume simple key-values
-        # Note: Nested dicts in extra_body might need JSON serialization if API expects it stringified
-        if input.extra_body:
-            data.add_field("extra_body", json.dumps(input.extra_body))
-
-        # Explicitly add fps/num_frames if they are not in extra_body (bench_serving logic overrides)
-        if input.num_frames:
-            data.add_field("num_frames", str(input.num_frames))
-        if input.fps:
-            data.add_field("fps", str(input.fps))
-
-        # Add image file
-        # Currently only support single image upload as 'input_reference' per API spec
-        img_path = input.image_paths[0]
-        if os.path.exists(img_path):
-            data.add_field(
-                "input_reference",
-                open(img_path, "rb"),
-                filename=os.path.basename(img_path),
-                content_type="application/octet-stream",
-            )
-        else:
-            output.error = f"Image file not found: {img_path}"
-            output.success = False
-            if pbar:
-                pbar.update(1)
-            return output
-
-        try:
-            async with session.post(input.api_url, data=data) as response:
-                if response.status == 200:
-                    resp_json = await response.json()
-                    job_id = resp_json.get("id")
-                else:
-                    output.error = f"Submit failed HTTP {response.status}: {await response.text()}"
-                    output.success = False
-                    if pbar:
-                        pbar.update(1)
-                    return output
-        except Exception as e:
-            output.error = f"Submit exception: {str(e)}"
-            output.success = False
-            if pbar:
-                pbar.update(1)
-            return output
-
-    else:
-        # Use JSON
-        payload: dict[str, Any] = {
-            "model": input.model,
-            "prompt": input.prompt,
-        }
-        if input.width and input.height:
-            payload["size"] = f"{input.width}x{input.height}"
-        if input.num_frames:
-            payload["num_frames"] = input.num_frames
-        if input.fps:
-            payload["fps"] = input.fps
-        if input.num_inference_steps:
-            payload["num_inference_steps"] = input.num_inference_steps
-
-        payload.update(input.extra_body)
-
-        try:
-            async with session.post(input.api_url, json=payload) as response:
-                if response.status == 200:
-                    resp_json = await response.json()
-                    job_id = resp_json.get("id")
-                else:
-                    output.error = f"Submit failed HTTP {response.status}: {await response.text()}"
-                    output.success = False
-                    if pbar:
-                        pbar.update(1)
-                    return output
-        except Exception as e:
-            output.error = f"Submit exception: {str(e)}"
-            output.success = False
-            if pbar:
-                pbar.update(1)
-            return output
-
-    if not job_id:
-        output.error = "No job_id returned"
-        output.success = False
-        if pbar:
-            pbar.update(1)
-        return output
-
-    # 2. Poll for completion
-    # Assuming the API returns a 'status' field.
-    # We construct the check URL. Assuming api_url is like .../v1/videos
-    # The check url should be .../v1/videos/{id}
-    check_url = f"{input.api_url}/{job_id}"
-
-    while True:
-        try:
-            async with session.get(check_url) as response:
-                if response.status == 200:
-                    status_data = await response.json()
-                    status = status_data.get("status")
-                    if status == "completed":
-                        output.success = True
-                        output.response_body = status_data
-                        if "peak_memory_mb" in status_data:
-                            output.peak_memory_mb = status_data["peak_memory_mb"]
-                        break
-                    elif status == "failed":
-                        output.success = False
-                        output.error = f"Job failed: {status_data.get('error')}"
-                        break
-                    else:
-                        # queued or processing
-                        await asyncio.sleep(1.0)
-                else:
-                    output.success = False
-                    output.error = f"Poll failed HTTP {response.status}: {await response.text()}"
-                    break
-        except Exception as e:
-            output.success = False
-            output.error = f"Poll exception: {str(e)}"
-            break
-
-    output.latency = time.perf_counter() - output.start_time
-
-    # Check SLO if defined
-    if input.slo_ms is not None and output.success:
-        output.slo_achieved = (output.latency * 1000.0) <= input.slo_ms
-
-    if pbar:
-        pbar.update(1)
-    return output
+def endpoint_filename_token(value: str) -> str:
+    token = normalize_endpoint(value).lstrip("/")
+    for bad in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
+        token = token.replace(bad, "_")
+    return token or "endpoint"
 
 
 backends_function_mapping = {
     "2i": {
-        "vllm-omni": (async_request_chat_completions, "/v1/chat/completions"),
-        "openai": (async_request_openai_images, "/v1/images/generations"),
-        "sglang": (async_request_image_sglang, "/v1/images/generations"),
+        "/v1/chat/completions": (async_request_chat_completions, "/v1/chat/completions"),
+        "/v1/images/generations": (async_request_openai_image_generations, "/v1/images/generations"),
+        "/v1/images/edits": (async_request_image_edits, "/v1/images/edits"),
     },
     "2v": {
-        "v1/videos": (async_request_v1_videos, "/v1/videos"),
-        "sglang": (async_request_video_sglang, "/v1/videos"),
+        "/v1/videos": (async_request_v1_videos, "/v1/videos"),
     },
 }

@@ -16,6 +16,8 @@ from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
     talker2code2wav_async_chunk,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 _FRAME = [1, 2, 3, 4]
 _Q = len(_FRAME)
 
@@ -32,7 +34,7 @@ def _req(rid, *, finished, initial_codec_chunk_frames=None):
     )
 
 
-def _tm(*, chunk_frames=25, left_context=25, max_num_seqs=1):
+def _tm(*, chunk_frames=25, left_context=25, max_num_seqs=1, initial_chunk_frames=0):
     return SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
         scheduler_max_num_seqs=max_num_seqs,
@@ -43,6 +45,7 @@ def _tm(*, chunk_frames=25, left_context=25, max_num_seqs=1):
                 "extra": {
                     "codec_chunk_frames": chunk_frames,
                     "codec_left_context_frames": left_context,
+                    "initial_codec_chunk_frames": initial_chunk_frames,
                 }
             }
         ),
@@ -53,7 +56,7 @@ def _call(tm, rid, *, n_frames, finished=False, req_ic=None):
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(n_frames)]
     return talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"audio_codes": torch.zeros((0,))},
+        pooling_output={"codes": {"audio": torch.zeros((0,))}},
         request=_req(rid, finished=finished, initial_codec_chunk_frames=req_ic),
         is_finished=finished,
     )
@@ -63,7 +66,7 @@ def test_empty_returns_none():
     tm = _tm()
     p = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"audio_codes": torch.zeros((0,))},
+        pooling_output={"codes": {"audio": torch.zeros((0,))}},
         request=_req("r", finished=False),
     )
     assert p is None
@@ -77,7 +80,8 @@ def test_eof_marker_when_finished_empty():
         request=_req("r", finished=True),
         is_finished=True,
     )
-    assert p == {"code_predictor_codes": [], "finished": torch.tensor(True, dtype=torch.bool)}
+    assert p.codes.audio.tolist() == []
+    assert p.meta.finished.item() is True
 
 
 def test_flush_on_finish():
@@ -90,26 +94,44 @@ def test_flush_on_finish():
         is_finished=True,
     )
     assert p is not None
-    assert p["finished"].item() is True
-    assert len(p["code_predictor_codes"]) == _Q * 24
+    assert p.meta.finished.item() is True
+    assert len(p.codes.audio) == _Q * 24
 
 
 _CASES = [
+    # ── IC boundary rule ──────────────────────────────────────────────
+    # initial_codec_chunk_frames only controls the first emitted chunk.
+    # After that, the processor returns to codec_chunk_frames-sized windows
+    # to avoid flooding Code2Wav with repeated tiny overlapping decodes.
+    #
     # Dynamic IC=16, cs=25, initial_coverage=16
-    ((25, 25, 0), 24, False, None),  # IC phase: 24%16!=0 -> hold
-    ((25, 25, 0), 25, False, None),  # transition: adjusted=9, hold (no replay)
-    ((25, 25, 0), 41, False, (16, 41)),  # first normal emit, lc=16
-    # Per-request IC=10, cs=25, initial_coverage=20
-    ((25, 25, 10), 9, False, None),  # IC: hold
-    ((25, 25, 10), 10, False, (0, 10)),  # IC: emit at boundary
-    ((25, 25, 10), 25, False, None),  # transition: hold (no replay)
-    ((25, 25, 10), 45, False, (20, 45)),  # first normal emit, lc=20
+    # Normal phase: adjusted = length - 16, emit when adjusted % 25 == 0.
+    ((25, 25, 0), 24, False, None),
+    ((25, 25, 0), 25, False, None),
+    ((25, 25, 0), 41, False, (16, 41)),  # normal: adjusted=25, 25%25==0 -> emit, lc=16
+    #
+    # Per-request IC=10, cs=25: first emit at 10, then 35, 60...
+    ((25, 25, 10), 9, False, None),
+    ((25, 25, 10), 10, False, (0, 10)),
+    ((25, 25, 10), 25, False, None),
+    ((25, 25, 10), 35, False, (10, 35)),
+    ((25, 25, 10), 45, False, None),
     ((25, 25, 10), 5, True, (0, 5)),  # finished flushes IC tail
-    ((25, 25, 10), 33, True, (20, 33)),  # finished flushes normal tail
-    # IC=8, cs=16: IC divides chunk_size evenly (edge case)
-    ((16, 25, 8), 8, False, (0, 8)),  # IC: emit
-    ((16, 25, 8), 16, False, None),  # transition: hold (no replay)
-    ((16, 25, 8), 24, False, (8, 24)),  # first normal emit, lc=8
+    ((25, 25, 10), 33, True, (10, 33)),  # finished flushes normal tail
+    #
+    # IC=8, cs=16: first emit at 8, then 24, 40...
+    ((16, 25, 8), 8, False, (0, 8)),
+    ((16, 25, 8), 16, False, None),
+    ((16, 25, 8), 24, False, (8, 24)),
+    ((16, 25, 8), 32, False, None),
+    #
+    # IC=5, cs=25: first emit at 5, then 30, 55...
+    ((25, 25, 5), 5, False, (0, 5)),
+    ((25, 25, 5), 12, False, None),
+    ((25, 25, 5), 25, False, None),
+    ((25, 25, 5), 30, False, (5, 30)),
+    ((25, 25, 5), 50, False, None),
+    #
     # Per-request override: IC=15 at n_frames=10 -> 10%15!=0 -> hold
     ((25, 25, 15), 10, False, None),
 ]
@@ -127,8 +149,8 @@ def test_streaming_phases(config, n_frames, finished, expected):
     else:
         exp_ctx, exp_window = expected
         assert payload is not None
-        assert payload["left_context_size"] == exp_ctx
-        assert len(payload["code_predictor_codes"]) == _Q * exp_window
+        assert payload.meta.left_context_size == exp_ctx
+        assert len(payload.codes.audio) == _Q * exp_window
 
 
 def test_dynamic_ic_adapts_to_load():
@@ -138,14 +160,14 @@ def test_dynamic_ic_adapts_to_load():
     # Low load (1/8) -> IC=2 -> emit at 2
     p1 = _call(tm, "r", n_frames=2)
     assert p1 is not None
-    assert len(p1["code_predictor_codes"]) == _Q * 2
+    assert len(p1.codes.audio) == _Q * 2
 
-    # High load: add 4 others -> active=5/8 -> IC=8 -> emit at 8
+    # High load on a new request: active=6/8 -> IC=8 -> emit at 8
     for i in range(4):
         tm.code_prompt_token_ids[f"other-{i}"] = [[0]]
-    p2 = _call(tm, "r", n_frames=8)
+    p2 = _call(tm, "new-high-load", n_frames=8)
     assert p2 is not None
-    assert len(p2["code_predictor_codes"]) == _Q * 8
+    assert len(p2.codes.audio) == _Q * 8
 
     # Requests past initial phase still count in load factor
     tm2 = _tm(max_num_seqs=4)
@@ -154,28 +176,51 @@ def test_dynamic_ic_adapts_to_load():
     # active=4/4=1.0 -> IC=16
     p3 = _call(tm2, "new", n_frames=16)
     assert p3 is not None
-    assert len(p3["code_predictor_codes"]) == _Q * 16
+    assert len(p3.codes.audio) == _Q * 16
 
 
 def test_ic_load_change_mid_request():
-    """IC stateless: load spike mid-request shifts initial_coverage."""
+    """IC is cached per request; a load spike only affects new requests."""
     tm = _tm(chunk_frames=25, left_context=25, max_num_seqs=8)
 
-    # Low load -> IC=2 -> emit at frame 2
+    # Low load -> IC=2 (cached for "r"), emit at frame 2
     p1 = _call(tm, "r", n_frames=2)
     assert p1 is not None
 
-    # Spike load: 6 others -> IC=16 -> initial_coverage=16
+    # Spike load: 6 others running
     for i in range(6):
         tm.code_prompt_token_ids[f"other-{i}"] = [[0]] * 10
 
-    # adjusted=25-16=9, 9%25!=0 -> hold
+    # IC for "r" is still cached as 2. The first normal emit is at 2+25=27.
     assert _call(tm, "r", n_frames=25) is None
-
-    # First normal emit at 16+25=41
-    p3 = _call(tm, "r", n_frames=41)
+    p3 = _call(tm, "r", n_frames=27)
     assert p3 is not None
-    assert p3["left_context_size"] == 16
+    assert p3.meta.left_context_size == 2
+
+    # A *new* request under high load gets IC=16 (not IC=2).
+    # Frame 2 would emit under IC=2 but must hold under IC=16.
+    assert _call(tm, "new_req", n_frames=2) is None
+    p4 = _call(tm, "new_req", n_frames=16)
+    assert p4 is not None
+
+
+def test_connector_initial_chunk_config_overrides_dynamic_ic():
+    tm = _tm(initial_chunk_frames=4, max_num_seqs=8)
+
+    # Under high load dynamic IC would be 16, but connector config pins the
+    # first chunk to 4 frames.
+    for i in range(7):
+        tm.code_prompt_token_ids[f"other-{i}"] = [[0]]
+
+    p1 = _call(tm, "r", n_frames=4)
+    assert p1 is not None
+    assert len(p1.codes.audio) == _Q * 4
+
+    # Only the first chunk uses the small size; the next emit is 4+25.
+    assert _call(tm, "r", n_frames=25) is None
+    p2 = _call(tm, "r", n_frames=29)
+    assert p2 is not None
+    assert p2.meta.left_context_size == 4
 
 
 @pytest.mark.parametrize(
@@ -217,36 +262,66 @@ def test_first_streaming_chunk_prepends_ref_code_context():
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"audio_codes": torch.zeros((0,)), "ref_code": ref_code},
+        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
 
     assert payload is not None
-    assert payload["left_context_size"] == 2
-    assert len(payload["code_predictor_codes"]) == _Q * 12
+    assert payload.meta.left_context_size == 2
+    assert len(payload.codes.audio) == _Q * 12
 
 
 def test_ref_code_context_applies_to_all_streaming_chunks():
     """ref_code is prepended as decoder context on every chunk, not just the first."""
     tm = _tm()
     rid = "r-ref2"
-    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(20)]
+    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(35)]
     tm.put_req_chunk[rid] = 1
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
     tm.request_payload[rid] = ref_code
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"audio_codes": torch.zeros((0,)), "ref_code": ref_code},
+        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
 
     assert payload is not None
     # ref_code (2 frames) prepended as left context on second chunk too
-    assert payload["left_context_size"] == 10 + 2
-    assert len(payload["code_predictor_codes"]) == _Q * (20 + 2)
+    assert payload.meta.left_context_size == 10 + 2
+    assert len(payload.codes.audio) == _Q * (35 + 2)
+
+
+def test_streaming_ref_code_context_is_bounded_for_batchable_shapes():
+    tm = _tm(chunk_frames=4, left_context=3, initial_chunk_frames=4)
+    rid = "r-ref-bounded"
+    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(8)]
+    ref_code = torch.tensor(
+        [
+            [1, 1, 1, 1],
+            [2, 2, 2, 2],
+            [3, 3, 3, 3],
+            [4, 4, 4, 4],
+            [5, 5, 5, 5],
+        ],
+        dtype=torch.long,
+    )
+    tm.request_payload[rid] = ref_code
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+        request=_req(rid, finished=False),
+        is_finished=False,
+    )
+
+    assert payload is not None
+    assert payload.meta.left_context_size == 3 + 3
+    assert len(payload.codes.audio) == _Q * (3 + 3 + 4)
+    frames = payload.codes.audio.reshape(_Q, -1).transpose(0, 1)
+    torch.testing.assert_close(frames[:3], ref_code[-3:])
 
 
 def test_ref_code_context_can_be_buffered_before_first_emit():
@@ -256,7 +331,7 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
 
     first_payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"audio_codes": torch.tensor([[1, 2, 3, 4]]), "ref_code": ref_code},
+        pooling_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]]), "ref": ref_code}},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
@@ -266,22 +341,22 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
     for _ in range(8):
         talker2code2wav_async_chunk(
             transfer_manager=tm,
-            pooling_output={"audio_codes": torch.tensor([[1, 2, 3, 4]])},
+            pooling_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]])}},
             request=_req(rid, finished=False, initial_codec_chunk_frames=10),
             is_finished=False,
         )
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"audio_codes": torch.tensor([[1, 2, 3, 4]])},
+        pooling_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]])}},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
 
     assert payload is not None
     # ref_code (2 frames) is kept (not popped) for subsequent chunks
-    assert payload["left_context_size"] == 2
-    assert len(payload["code_predictor_codes"]) == _Q * 12
+    assert payload.meta.left_context_size == 2
+    assert len(payload.codes.audio) == _Q * 12
     assert rid in tm.request_payload
 
 
@@ -295,14 +370,20 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
         ],
         dtype=torch.long,
     )
-    output = SimpleNamespace(multimodal_output={"audio_codes": audio_codes, "ref_code": ref_code})
-    stage = SimpleNamespace(engine_outputs=[SimpleNamespace(outputs=[output])])
+    output = SimpleNamespace(
+        multimodal_output={"codes": {"audio": audio_codes, "ref": ref_code}},
+        token_ids=list(range(3)),
+        cumulative_token_ids=list(range(3)),
+    )
+    stage = SimpleNamespace(
+        engine_outputs=[SimpleNamespace(outputs=[output], finished=True)],
+    )
 
-    prompts = talker2code2wav(stage_list=[stage], engine_input_source=[0])
+    prompts = talker2code2wav(stage.engine_outputs)
 
     assert len(prompts) == 1
     prompt = prompts[0]
-    assert prompt["additional_information"] == {"left_context_size": [2]}
+    assert prompt["additional_information"] == {"meta": {"left_context_size": 2}}
     assert prompt["prompt_token_ids"] == [
         9,
         8,
@@ -335,13 +416,19 @@ def test_non_async_processor_filters_out_of_range_codec_values():
         ],
         dtype=torch.long,
     )
-    output = SimpleNamespace(multimodal_output={"audio_codes": audio_codes, "ref_code": ref_code})
-    stage = SimpleNamespace(engine_outputs=[SimpleNamespace(outputs=[output])])
+    output = SimpleNamespace(
+        multimodal_output={"codes": {"audio": audio_codes, "ref": ref_code}},
+        token_ids=list(range(4)),
+        cumulative_token_ids=list(range(4)),
+    )
+    stage = SimpleNamespace(
+        engine_outputs=[SimpleNamespace(outputs=[output], finished=True)],
+    )
 
-    prompts = talker2code2wav(stage_list=[stage], engine_input_source=[0])
+    prompts = talker2code2wav(stage.engine_outputs)
 
     assert len(prompts) == 1
     prompt = prompts[0]
     # Only ref_code (1 frame) + 2 valid frames = 3 frames * 4 quantizers = 12 codes
     assert len(prompt["prompt_token_ids"]) == 4 * 3
-    assert prompt["additional_information"] == {"left_context_size": [1]}
+    assert prompt["additional_information"] == {"meta": {"left_context_size": 1}}

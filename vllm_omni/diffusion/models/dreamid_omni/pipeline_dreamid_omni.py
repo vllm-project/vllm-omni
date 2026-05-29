@@ -4,6 +4,7 @@
 import logging
 import math
 import os
+from collections.abc import Iterable
 
 import torch
 import torch.distributed
@@ -12,15 +13,16 @@ from PIL import Image, ImageOps
 from torch import nn
 from torchvision.transforms import Compose, Normalize
 from tqdm import tqdm
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_cfg_group,
-    get_classifier_free_guidance_rank,
-    get_classifier_free_guidance_world_size,
-)
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -32,7 +34,6 @@ try:
         init_mmaudio_vae,
         init_text_model,
         init_wan_vae_2_2,
-        load_fusion_checkpoint,
     )
     from dreamid_omni.utils.rearrange import Rearrange
     from dreamid_omni.utils.resize import NaResize
@@ -41,6 +42,21 @@ except ImportError:
 from vllm_omni.diffusion.models.dreamid_omni.fusion import FusionModel
 
 logger = logging.getLogger(__name__)
+
+
+def get_dreamid_omni_post_process_func(*args, **kwargs):
+    def post_process(output):
+        if isinstance(output, tuple) and len(output) == 2:
+            video, audio = output
+            return {
+                "video": video,
+                "audio": audio,
+                "audio_sample_rate": 16000,
+                "fps": 24,
+            }
+        return output
+
+    return post_process
 
 
 AUDIO_CONFIG = {
@@ -112,15 +128,24 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
         self.text_model = init_text_model(model, rank=self.device)
         self.text_encoder = self.text_model.model
 
-        # Fusion model
-        ## load audio/video model config
-        Fusion_model = FusionModel(VIDEO_CONFIG, AUDIO_CONFIG)
-
-        checkpoint_path = self.od_config.model_config.get("fusion", None)
-        assert checkpoint_path is not None, "fusion checkpoint path is None"
-        load_fusion_checkpoint(Fusion_model, checkpoint_path=os.path.join(model, checkpoint_path))
-        self.model = Fusion_model
+        # Fusion model — weights are loaded later via load_weights()
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        self.model = FusionModel(VIDEO_CONFIG, AUDIO_CONFIG, quant_config=quant_config)
         self.transformer = self.model
+
+        fusion_path = self.od_config.tf_model_config.get("fusion", None)
+        assert fusion_path is not None, "fusion checkpoint path is None in transformer config"
+        fusion_subfolder = os.path.dirname(fusion_path) or None
+        fusion_filename = os.path.basename(fusion_path)
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model,
+                subfolder=fusion_subfolder,
+                revision=None,
+                prefix="model.",
+                allow_patterns_overrides=[fusion_filename],
+            )
+        ]
 
         # Fixed attributes, non-configurable
         self.audio_latent_channel = AUDIO_CONFIG.get("in_dim")
@@ -216,8 +241,76 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
 
         return ref_vae_latents, ref_audio_lengths
 
-    def load_weights(self, weights):
-        pass
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        pipeline_prefix = "model."
+
+        qkv_stacked_mapping = [
+            (".self_attn.to_qkv", ".self_attn.q", "q"),
+            (".self_attn.to_qkv", ".self_attn.k", "k"),
+            (".self_attn.to_qkv", ".self_attn.v", "v"),
+        ]
+
+        params_dict = dict(self.model.named_parameters())
+        loaded_local: set[str] = set()
+
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
+
+        def _maybe_shard_weight(weight: torch.Tensor, param: torch.Tensor) -> torch.Tensor:
+            """Slice a checkpoint tensor to this rank's TP shard when the
+            param is a TP-local shape but the checkpoint stores the full one.
+            """
+            if tp_size <= 1 or weight.shape == param.shape:
+                return weight
+            if weight.ndim == 1 and weight.numel() == param.numel() * tp_size:
+                return weight.chunk(tp_size, dim=0)[tp_rank]
+            if weight.ndim == 2:
+                if weight.shape[0] == param.shape[0] * tp_size:
+                    return weight.chunk(tp_size, dim=0)[tp_rank]
+                if weight.shape[1] == param.shape[1] * tp_size:
+                    return weight.chunk(tp_size, dim=1)[tp_rank]
+            return weight
+
+        for full_name, loaded_weight in weights:
+            if not full_name.startswith(pipeline_prefix):
+                continue
+            name = full_name[len(pipeline_prefix) :]
+
+            # Fused-QKV stacking: route checkpoint's separate
+            # - ...self_attn.{q,k,v}: weights into the corresponding
+            # - ...self_attn.to_qkv : via its sharded weight_loader.
+            stacked_hit = False
+            for fused_name, raw_name, shard_id in qkv_stacked_mapping:
+                if raw_name not in name:
+                    continue
+                stacked = name.replace(raw_name, fused_name)
+                if stacked not in params_dict:
+                    continue
+                param = params_dict[stacked]
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded_local.add(stacked)
+                stacked_hit = True
+                break
+            if stacked_hit:
+                continue
+
+            if name not in params_dict:
+                logger.warning(f"Skipping DreamID-Omni weight {full_name} -- not found in model parameters")
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", None)
+            if weight_loader is not None:
+                # Parallel Linears handle TP sharding internally
+                weight_loader(param, loaded_weight)
+            else:
+                default_weight_loader(param, _maybe_shard_weight(loaded_weight, param))
+            loaded_local.add(name)
+
+        # Detach must happen before `DiffusersPipelineLoader._process_weights_after_loading`
+        # and before any forward pass that triggers layerwise-offload hooks.
+        self.model._detach_blocks_from_backbones()
+
+        return {pipeline_prefix + k for k in loaded_local}
 
     def get_scheduler_time_steps(self, sampling_steps, solver_name="unipc", device=0, shift=5.0):
         torch.manual_seed(4)
@@ -248,6 +341,28 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
             raise NotImplementedError("Unsupported solver.")
 
         return sample_scheduler, timesteps
+
+    def predict_noise(self, **kwargs):
+        pred_vid, pred_audio = self.model(**kwargs)
+        return (pred_vid[0], pred_audio[0])
+
+    def combine_multi_branch_cfg_noise(self, predictions, true_cfg_scale, cfg_normalize=False):
+        vid_pos, audio_pos = predictions[0]
+        vid_neg, audio_neg = predictions[1]
+        vid_ip_neg, _ = predictions[2]
+        _, refaudio_neg = predictions[3]
+
+        pred_video = (
+            vid_neg
+            + true_cfg_scale["video_cfg_scale"] * (vid_pos - vid_neg)
+            + true_cfg_scale["video_ref_cfg_scale"] * (vid_pos - vid_ip_neg)
+        )
+        pred_audio = (
+            audio_neg
+            + true_cfg_scale["audio_cfg_scale"] * (audio_pos - audio_neg)
+            + true_cfg_scale["audio_ref_cfg_scale"] * (audio_pos - refaudio_neg)
+        )
+        return (pred_video, pred_audio)
 
     def diffuse(
         self,
@@ -306,72 +421,22 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
                 "vid_context": [text_embeddings_video_neg],
             }
 
-            if get_classifier_free_guidance_world_size() > 1:
-                # Enable CFG-parallel: rank0 computes positive, rank1 computes negative.
-                cfg_group = get_cfg_group()
-                cfg_rank = get_classifier_free_guidance_rank()
+            branches_kwargs = [
+                {"vid": [model_input_video], "audio": [model_input_audio], "t": timestep_input, **pos_args},
+                {"vid": [model_input_video], "audio": [model_input_audio], "t": timestep_input, **neg_args},
+                {"vid": [model_input_video_neg], "audio": [model_input_audio], "t": timestep_input, **pos_args},
+                {"vid": [model_input_video], "audio": [model_input_audio_neg], "t": timestep_input, **pos_args},
+            ]
 
-                if cfg_rank == 0:
-                    pred_vid, pred_audio = self.model(
-                        vid=[model_input_video], audio=[model_input_audio], t=timestep_input, **pos_args
-                    )
-                    pre_vid_ip_neg, _ = self.model(
-                        vid=[model_input_video_neg], audio=[model_input_audio], t=timestep_input, **pos_args
-                    )
-                    pred_vid_0 = pred_vid[0]
-                    pred_audio_0 = pred_audio[0]
-                    pre_vid_ip_0 = pre_vid_ip_neg[0]
-                    pred_refaudio_0 = torch.zeros_like(pred_audio_0)  # dummy tensor
-                else:
-                    pred_vid, pred_audio = self.model(
-                        vid=[model_input_video], audio=[model_input_audio], t=timestep_input, **neg_args
-                    )
-                    _, pred_refaudio_neg = self.model(
-                        vid=[model_input_video], audio=[model_input_audio_neg], t=timestep_input, **pos_args
-                    )
-                    pred_vid_0 = pred_vid[0]
-                    pred_audio_0 = pred_audio[0]
-                    pre_vid_ip_0 = torch.zeros_like(pred_vid_0)  # dummy tensor
-                    pred_refaudio_0 = pred_refaudio_neg[0]
-
-                pred_vid_gathered = cfg_group.all_gather(pred_vid_0, separate_tensors=True)
-                pred_audio_gathered = cfg_group.all_gather(pred_audio_0, separate_tensors=True)
-                pre_vid_ip_gathered = cfg_group.all_gather(pre_vid_ip_0, separate_tensors=True)
-                pred_refaudio_gathered = cfg_group.all_gather(pred_refaudio_0, separate_tensors=True)
-
-                pred_vid_pos = [pred_vid_gathered[0]]
-                pred_vid_neg = [pred_vid_gathered[1]]
-                pred_audio_pos = [pred_audio_gathered[0]]
-                pred_audio_neg = [pred_audio_gathered[1]]
-                pre_vid_ip_neg = [pre_vid_ip_gathered[0]]
-                pred_refaudio_neg = [pred_refaudio_gathered[1]]
-            else:
-                pred_vid_pos, pred_audio_pos = self.model(
-                    vid=[model_input_video], audio=[model_input_audio], t=timestep_input, **pos_args
-                )
-
-                pred_vid_neg, pred_audio_neg = self.model(
-                    vid=[model_input_video], audio=[model_input_audio], t=timestep_input, **neg_args
-                )
-
-                pre_vid_ip_neg, _ = self.model(
-                    vid=[model_input_video_neg], audio=[model_input_audio], t=timestep_input, **pos_args
-                )
-
-                _, pred_refaudio_neg = self.model(
-                    vid=[model_input_video], audio=[model_input_audio_neg], t=timestep_input, **pos_args
-                )
-
-            pred_video_guided = (
-                pred_vid_neg[0]
-                + self.video_cfg_scale * (pred_vid_pos[0] - pred_vid_neg[0])
-                + self.video_ref_cfg_scale * (pred_vid_pos[0] - pre_vid_ip_neg[0])
-            )
-
-            pred_audio_guided = (
-                pred_audio_neg[0]
-                + self.audio_cfg_scale * (pred_audio_pos[0] - pred_audio_neg[0])
-                + self.audio_ref_cfg_scale * (pred_audio_pos[0] - pred_refaudio_neg[0])
+            pred_video_guided, pred_audio_guided = self.predict_noise_with_multi_branch_cfg(
+                do_true_cfg=True,
+                true_cfg_scale={
+                    "video_cfg_scale": self.video_cfg_scale,
+                    "video_ref_cfg_scale": self.video_ref_cfg_scale,
+                    "audio_cfg_scale": self.audio_cfg_scale,
+                    "audio_ref_cfg_scale": self.audio_ref_cfg_scale,
+                },
+                branches_kwargs=branches_kwargs,
             )
             video_noise = scheduler_video.step(
                 pred_video_guided.unsqueeze(0), t_v, video_noise.unsqueeze(0), return_dict=False
@@ -380,6 +445,33 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
                 pred_audio_guided.unsqueeze(0), t_a, audio_noise.unsqueeze(0), return_dict=False
             )[0].squeeze(0)
         return video_noise, audio_noise
+
+    def encode_prompt(
+        self,
+        prompt: str,
+        video_negative_prompt: str = "",
+        audio_negative_prompt: str = "",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode the positive and negative prompts via ``self.text_model``.
+
+        This is the single text-encoder entrypoint so that the runner-level
+        prompt-embedding cache (see
+        ``vllm_omni/diffusion/cache/prompt_embed_cache.py``) can transparently
+        memoize results when the same prompts are submitted repeatedly (e.g.
+        GRPO rollouts that sample the same prompt with different seeds).
+
+        Returns:
+            (audio_pos, video_pos, video_neg, audio_neg) embeddings cast to
+            ``self.target_dtype``. ``audio_pos`` and ``video_pos`` are the
+            same tensor, matching the original inline behavior.
+        """
+        text_embeddings = self.text_model(
+            [prompt, video_negative_prompt, audio_negative_prompt],
+            device=self.device,
+        )
+        text_embeddings = [emb.to(self.target_dtype) for emb in text_embeddings]
+        # Index 0 is the positive embedding, shared between video and audio branches.
+        return text_embeddings[0], text_embeddings[0], text_embeddings[1], text_embeddings[2]
 
     def forward(
         self,
@@ -438,12 +530,13 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
         )
 
         # 3. text embedding
-        text_embeddings = self.text_model([prompt, video_negative_prompt, audio_negative_prompt], device=self.device)
-        text_embeddings = [emb.to(self.target_dtype) for emb in text_embeddings]
-        text_embeddings_audio_pos = text_embeddings[0]
-        text_embeddings_video_pos = text_embeddings[0]
-        text_embeddings_video_neg = text_embeddings[1]
-        text_embeddings_audio_neg = text_embeddings[2]
+        text_embeddings_audio_pos, text_embeddings_video_pos, text_embeddings_video_neg, text_embeddings_audio_neg = (
+            self.encode_prompt(
+                prompt=prompt,
+                video_negative_prompt=video_negative_prompt,
+                audio_negative_prompt=audio_negative_prompt,
+            )
+        )
 
         video_latent_h, video_latent_w = height // 16, width // 16
 

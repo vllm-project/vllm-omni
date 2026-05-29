@@ -1,8 +1,8 @@
-from unittest.mock import MagicMock, patch
-
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.flux2.flux2_transformer import (
     Flux2PosEmbed,
     Flux2Transformer2DModel,
@@ -11,19 +11,24 @@ from vllm_omni.diffusion.models.flux2.flux2_transformer import (
 
 # Initialize TP group before tests
 @pytest.fixture(scope="function", autouse=True)
-def setup_tp_group():
+def setup_tp_group(mocker: MockerFixture):
     """Set up TP group for each test function"""
-    with patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=2):
-        with patch("vllm.distributed.parallel_state.get_tp_group") as mock_get_tp_group:
-            mock_tp_group = MagicMock()
-            mock_tp_group.world_size = 2
-            mock_get_tp_group.return_value = mock_tp_group
-            yield
+    mocker.patch(
+        "vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size",
+        return_value=2,
+    )
+    mock_get_tp_group = mocker.patch("vllm.distributed.parallel_state.get_tp_group")
+    mock_tp_group = mocker.MagicMock()
+    mock_tp_group.world_size = 2
+    mock_get_tp_group.return_value = mock_tp_group
+    yield
 
 
 class TestFlux2TransformerWeightLoading:
     """Test Flux2Transformer weight loading functionality"""
 
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_weight_loading_tp2(self, setup_tp_group):
         """Verify weights load correctly with TP=2"""
         # Prepare test data
@@ -78,6 +83,8 @@ class TestFlux2TransformerWeightLoading:
 class TestFlux2RopePositionEmbedding:
     """Test Flux2 RoPE position embedding functionality"""
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
     def test_rope_position_embedding(self):
         """Verify RoPE produces correct embeddings for 4D coordinates"""
         # Prepare test data - use model default configuration
@@ -132,6 +139,8 @@ class TestFlux2RopePositionEmbedding:
 class TestFlux2PackedModuleMapping:
     """Test Flux2 packed module mapping functionality"""
 
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_packed_module_mapping(self, setup_tp_group):
         """Verify to_qkv packing matches HF checkpoint"""
         model = Flux2Transformer2DModel(
@@ -208,6 +217,8 @@ class TestFlux2PackedModuleMapping:
             f"add_kv_proj weight dimension should be {expected_add_kv_shape}, got {attn_block.add_kv_proj.weight.shape}"
         )
 
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_packed_mapping_edge_cases(self, setup_tp_group):
         """Test edge cases for packed mapping"""
         model = Flux2Transformer2DModel(

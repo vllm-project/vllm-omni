@@ -54,9 +54,9 @@ class DistributedVaeExecutor:
         self.parallel_size = parallel_size
 
     def gather_tensors(self, tensor: torch.Tensor):
-        gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)] if self.rank == 0 else None
-        dist.gather(tensor, gather_list=gather_list, dst=0, group=self.group)
-        return gather_list
+        gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)]
+        dist.all_gather(gather_list, tensor, group=self.group)
+        return gather_list if self.rank == 0 else None
 
     def broadcast_tensor(self, tensor: torch.Tensor):
         dist.broadcast(tensor, src=0, group=self.group)
@@ -125,7 +125,7 @@ class DistributedVaeExecutor:
 
         # 2. local decode
         assigned = self._balance_tasks(tiletask_list, pp_size)
-        local_tasks = assigned[self.rank] if pp_size <= self.world_size else []
+        local_tasks = assigned[self.rank] if self.rank < pp_size else []
         local_results = [(t.tile_id, operator.exec(t)) for t in local_tasks]
 
         # 3. compute shape per rank
@@ -168,25 +168,25 @@ class DistributedVaeExecutor:
 
 class DistributedVaeMixin:
     def init_distributed(self):
-        self.distributed_decoder = DistributedVaeExecutor()
+        self.distributed_executor = DistributedVaeExecutor()
 
-    def set_parallel_size(self, parallel_size: int) -> bool:
-        return self.distributed_decoder.set_parallel_size(parallel_size)
+    def set_parallel_size(self, parallel_size: int) -> None:
+        self.distributed_executor.set_parallel_size(parallel_size)
 
     def is_distributed_enabled(self) -> bool:
         if (
-            self.distributed_decoder.parallel_size <= 1
+            self.distributed_executor.parallel_size <= 1
             or not dist.is_initialized()
             or not getattr(self, "use_tiling", False)
         ):
             return False
-        world_size = dist.get_world_size(group=self.distributed_decoder.group)
-        pp_size = min(int(self.distributed_decoder.parallel_size), int(world_size))
+        world_size = dist.get_world_size(group=self.distributed_executor.group)
+        pp_size = min(int(self.distributed_executor.parallel_size), int(world_size))
         if pp_size <= 1:
             return False
-        if self.distributed_decoder.parallel_size > pp_size:
+        if self.distributed_executor.parallel_size > pp_size:
             logger.warning(
-                f"vae_patch_parallel_size={self.distributed_decoder.parallel_size} "
+                f"vae_patch_parallel_size={self.distributed_executor.parallel_size} "
                 f"is greater than dit_group={world_size};"
                 f" using dit_group size={world_size}"
             )

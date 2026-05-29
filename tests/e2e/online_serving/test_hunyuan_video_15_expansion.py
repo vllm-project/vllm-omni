@@ -11,13 +11,10 @@ Coverage (H100, since model cannot fit L4):
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-    dummy_messages_from_mix_data,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 PROMPT = "A cat walking across a sunlit garden, cinematic lighting, slow motion."
 NEGATIVE_PROMPT = "low quality, blurry, distorted"
@@ -67,8 +64,6 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(MODEL),
@@ -79,20 +74,20 @@ def test_hunyuan_video_15_t2v(
     openai_client: OpenAIClientHandler,
 ):
     """L4 diffusion feature coverage for HunyuanVideo-1.5-T2V on H100."""
-    messages = dummy_messages_from_mix_data(content_text=PROMPT)
+    form_data = {
+        "prompt": PROMPT,
+        "negative_prompt": NEGATIVE_PROMPT,
+        "height": 480,
+        "width": 640,
+        "num_frames": 5,
+        "num_inference_steps": 2,
+        "guidance_scale": 6.0,
+        "seed": 42,
+    }
 
     request_config = {
         "model": omni_server.model,
-        "messages": messages,
-        "extra_body": {
-            "height": 480,
-            "width": 640,
-            "num_frames": 5,
-            "num_inference_steps": 2,
-            "guidance_scale": 6.0,
-            "negative_prompt": NEGATIVE_PROMPT,
-            "seed": 42,
-        },
+        "form_data": form_data,
     }
 
-    openai_client.send_diffusion_request(request_config)
+    openai_client.send_video_diffusion_request(request_config)

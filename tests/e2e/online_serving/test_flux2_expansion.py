@@ -1,16 +1,25 @@
 """
 Tests for Flux2 Klein; currently Dev is implemented separately,
 but ideally these models will fold together in the future.
+
+Coverage:
+- FP8 + CacheDiT + Ulysses=2 + TP=2
+- Layerwise CPU offload + Ulysses=2 + Ring=2
+- Layerwise CPU offload + TP=2
+- Layerwise CPU offload + HSDP
 """
 
 import pytest
 
-from tests.conftest import (
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
     OpenAIClientHandler,
+    dummy_messages_from_mix_data,
 )
-from tests.utils import hardware_marks
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 FOUR_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
 POSITIVE_PROMPT = "A cat sitting on a windowsill"
@@ -42,11 +51,48 @@ def _get_diffusion_feature_cases(model: str):
             ),
             marks=FOUR_CARD_FEATURE_MARKS,
         ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-layerwise-offload",
+                    "--ulysses-degree",
+                    "2",
+                    "--ring",
+                    "2",
+                ],
+            ),
+            id="layerwise_ulysses2_ring2",
+            marks=FOUR_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-layerwise-offload",
+                    "--tensor-parallel-size",
+                    "2",
+                ],
+            ),
+            id="layerwise_tp2",
+            marks=FOUR_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-layerwise-offload",
+                    "--use-hsdp",
+                    "--hsdp-shard-size",
+                    "2",
+                ],
+            ),
+            id="layerwise_hsdp",
+            marks=FOUR_CARD_FEATURE_MARKS,
+        ),
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(
@@ -55,9 +101,10 @@ def _get_diffusion_feature_cases(model: str):
     indirect=True,
 )
 def test_flux2_klein(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+    messages = dummy_messages_from_mix_data(content_text=POSITIVE_PROMPT)
     request_config = {
         "model": omni_server.model,
-        "messages": [{"role": "user", "content": POSITIVE_PROMPT}],
+        "messages": messages,
         "extra_body": {
             "height": 512,
             "width": 512,

@@ -218,10 +218,16 @@ class DiffusionLoRAManager:
             lora_scale: The external scale for the LoRA adapter.
         """
         if lora_request is None:
+            if self._active_adapter_id is None:
+                logger.debug("No lora_request provided and adapters are already inactive")
+                return
             logger.debug("No lora_request provided, deactivating all LoRA adapters")
             self._deactivate_all_adapters()
             return
         elif math.isclose(0.0, lora_scale):
+            if self._active_adapter_id is None:
+                logger.debug("Received LoRA scale 0 with adapters already inactive")
+                return
             logger.warning("Received a request with LoRA scale 0; deactivating all LoRA adapters")
             self._deactivate_all_adapters()
             return
@@ -360,12 +366,16 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        for component_name in ("transformer", "transformer_2", "dit"):
+        for component_name in ("transformer", "transformer_2", "dit", "bagel"):
             if not hasattr(self.pipeline, component_name):
                 continue
             component = getattr(self.pipeline, component_name)
             if not isinstance(component, nn.Module):
                 continue
+
+            # Collect replacements first to avoid mutating the module tree
+            # while iterating over named_modules().
+            pending_replacements: list[tuple[str, str, nn.Module, list[str]]] = []
 
             for module_name, module in component.named_modules(remove_duplicate=False):
                 # Don't recurse into already-replaced LoRA wrappers. Their
@@ -395,6 +405,9 @@ class DiffusionLoRAManager:
                     if not should_replace:
                         continue
 
+                pending_replacements.append((module_name, full_module_name, module, packed_modules_list))
+
+            for module_name, full_module_name, module, packed_modules_list in pending_replacements:
                 lora_layer = from_layer_diffusion(
                     layer=module,
                     max_loras=1,
@@ -605,6 +618,9 @@ class DiffusionLoRAManager:
         self._update_adapter_scale(adapter_id, scale)
 
     def _deactivate_all_adapters(self) -> None:
+        if self._active_adapter_id is None:
+            logger.debug("All adapters already inactive")
+            return
         logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)

@@ -242,6 +242,7 @@ class SequenceParallelSplitHook(ModelHook):
 
         if not is_tensor and not is_tensor_list:
             # No tensor outputs to shard
+            logger.warning_once("No tensor outputs to shard.")
             return output
 
         output_list = [output] if is_tensor else list(output)
@@ -315,10 +316,45 @@ class SequenceParallelSplitHook(ModelHook):
             logger.warning_once(f"Expected tensor with {sp_input.expected_dims} dims, got {x.dim()}. Skipping split.")
             return x
 
+        split_dim = (
+            sp_input.split_dim if isinstance(sp_input, (SequenceParallelInput, SequenceParallelPartialInput)) else None
+        )
+        if split_dim is not None and x.size(split_dim) == 0:
+            logger.warning_once("Skip sharding for zero-sized tensors.")
+            return x
+
+        def _raise_strict_divisibility_error(*, dim: int, seq_len: int, sp_size: int) -> None:
+            # Keep message actionable: strict mode must be evenly shardable at the split hook level.
+            msg = (
+                "Sequence Parallel strict mode requires the sequence length to be evenly shardable at split time, "
+                f"but got seq_len={seq_len} (dim={dim}) not divisible by sequence_parallel_size={sp_size}. "
+            )
+            suggestions: list[str] = []
+            if self.config.ulysses_degree > 1:
+                suggestions.append("set parallel_config.ulysses_mode='advanced_uaa' (UAA)")
+            suggestions.append(
+                "enable auto_pad=True in the model _sp_plan (requires attention_mask support and ring_degree=1)"
+            )
+            suggestions.append("choose seq_len divisible by sequence_parallel_size (or adjust SP degrees)")
+            msg += "Try: " + "; ".join(suggestions) + "."
+            raise ValueError(msg)
+
+        def _maybe_validate_strict_divisibility(*, dim: int, seq_len: int) -> None:
+            from vllm_omni.diffusion.forward_context import get_ulysses_mode
+
+            if get_ulysses_mode(default="strict") != "strict":
+                return
+            sp_size = int(self.config.sequence_parallel_size)
+            if sp_size <= 1:
+                return
+            if seq_len < sp_size or (seq_len % sp_size) != 0:
+                _raise_strict_divisibility_error(dim=dim, seq_len=int(seq_len), sp_size=sp_size)
+
         if isinstance(sp_input, SequenceParallelInput):
             # Full split with optional auto-padding
             if sp_input.auto_pad:
                 return self._shard_with_auto_pad(x, sp_input.split_dim)
+            _maybe_validate_strict_divisibility(dim=sp_input.split_dim, seq_len=x.size(sp_input.split_dim))
             return sp_shard(x, sp_input.split_dim, validate=False)
         elif isinstance(sp_input, SequenceParallelPartialInput):
             # Partial split: keep text portion, split image portion
@@ -330,6 +366,7 @@ class SequenceParallelSplitHook(ModelHook):
             image_part = x.narrow(dim, text_len, x.size(dim) - text_len)
 
             # Only shard the image portion
+            _maybe_validate_strict_divisibility(dim=dim, seq_len=image_part.size(dim))
             image_part_sharded = sp_shard(image_part, dim, validate=False)
 
             # Concatenate back: [text_full, image_sharded]
@@ -345,7 +382,7 @@ class SequenceParallelSplitHook(ModelHook):
         2. Creates an attention mask indicating valid vs padding positions
         3. Stores the mask and padding info in ForwardContext
         """
-        from vllm_omni.diffusion.attention.selector import get_attn_backend
+        from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
         from vllm_omni.diffusion.distributed.parallel_state import (
             get_ring_parallel_world_size,
             get_sequence_parallel_rank,
@@ -365,7 +402,17 @@ class SequenceParallelSplitHook(ModelHook):
             return sp_shard(x, dim, validate=False)
 
         # Check backend compatibility
-        attn_backend = get_attn_backend(-1)
+        attention_config = None
+        if is_forward_context_available():
+            od_config = get_forward_context().omni_diffusion_config
+            if od_config is not None:
+                attention_config = od_config.diffusion_attention_config
+
+        attn_backend, _ = get_attn_backend_for_role(
+            role="self",
+            head_size=-1,
+            attention_config=attention_config,
+        )
         if not attn_backend.supports_attention_mask:
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "

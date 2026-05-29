@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+from vllm import envs
+from vllm.config import VllmConfig
+from vllm.config.kernel import IrOpPriorityConfig
 from vllm.logger import init_logger
 from vllm.platforms.rocm import RocmPlatform
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+from vllm_omni.platforms.rocm.patch import apply_patches
 
 logger = init_logger(__name__)
 
@@ -16,9 +20,41 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
     Inherits all ROCm-specific implementations from vLLM's RocmPlatform,
     and adds Omni-specific interfaces from OmniPlatform.
+
+
+    NOTE: AR Attention Backend Overriding Logic:
+    ------------------------------------------
+    Since vLLM v0.19.0, the default attention backend is ROCM_ATTN for ROCm.
+    However, the compatibility of ROCM_ATTN with Omni is not guaranteed.
+    Therefore, we still use TRITON_ATTN as the default attention backend,
+    when the selected_backend is not specified.
+
+    So the behaviour of the attention backend overriding logic currently lives in
+    extract_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
+
+    ```
+    if current_omni_platform.is_rocm():
+        print(f"engine_args: {str(engine_args)}")
+        if engine_args.get("attention_backend") is None:
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            if rocm_aiter_ops.is_enabled():
+                engine_args["attention_backend"] = "ROCM_AITER_FA"
+            # Before vLLM v0.19.0, the default attention backend is TRITON_ATTN for ROCm.
+            # Since vLLM v0.19.0, the default attention backend is ROCM_ATTN for ROCm.
+            # However, the compatibility of ROCM_ATTN with Omni is not guaranteed.
+            # Therefore, we still use TRITON_ATTN as the default attention backend,
+            # when the selected_backend is not specified.
+            engine_args["attention_backend"] = "TRITON_ATTN"
+    ```
+
     """
 
     _omni_enum = OmniPlatformEnum.ROCM
+
+    def __init__(self):
+        super().__init__()
+        apply_patches()
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
@@ -27,6 +63,12 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:
         return "vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker"
+
+    @classmethod
+    def has_flash_attn_package(cls) -> bool:
+        from vllm_omni.diffusion.attention.backends.utils.fa import is_flash_attn_installed
+
+        return is_flash_attn_installed()
 
     @classmethod
     def get_diffusion_attn_backend_cls(
@@ -51,19 +93,19 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
                     "Flash Attention requires `aiter` library which is only supported "
                     "on gfx942 and gfx950. Falling back to TORCH_SDPA backend."
                 )
-                logger.info("Defaulting to diffusion attention backend SDPA")
+                logger.debug("Defaulting to diffusion attention backend SDPA")
                 return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
             backend = DiffusionAttentionBackendEnum[backend_upper]
-            logger.info("Using diffusion attention backend '%s'", backend_upper)
+            logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
 
         # Choose to enable Flash Attention by default on ROCm
         # whenever possible as it is the fastest backend
         if aiter_supported:
-            logger.info("Defaulting to diffusion attention backend FLASH_ATTN")
+            logger.debug("Defaulting to diffusion attention backend FLASH_ATTN")
             return DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
 
-        logger.info("Defaulting to diffusion attention backend SDPA")
+        logger.debug("Defaulting to diffusion attention backend SDPA")
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
@@ -82,7 +124,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
     @classmethod
     def get_device_count(cls) -> int:
-        return torch.cuda.device_count()
+        return torch.accelerator.device_count()
 
     @classmethod
     def get_device_version(cls) -> str | None:
@@ -93,7 +135,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
     @classmethod
     def synchronize(cls) -> None:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
@@ -113,3 +155,21 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
         os.environ.pop("HIP_VISIBLE_DEVICES", None)
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+    @classmethod
+    def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
+        """Copied from vllm/platforms/rocm/platform.py v0.20.0 with force using vllm_c kernels"""
+        # TODO(luka/TJ) use aiter, vllm_c, native by default on ROCm
+        cc = vllm_config.compilation_config
+        default = ["vllm_c", "native"]  # Originally using "native" here when compiling
+
+        # This (mostly) preserves previous CustomOp behavior
+        # Necessary on ROCm because it's common that users
+        # enable rms_norm to use the aiter kernel.
+        # TODO(luka/TJ) remove env vars completely
+        if cc.is_custom_op_enabled("rms_norm") and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_RMSNORM:
+            rms_norm = ["aiter"] + default
+        else:
+            rms_norm = default
+
+        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)

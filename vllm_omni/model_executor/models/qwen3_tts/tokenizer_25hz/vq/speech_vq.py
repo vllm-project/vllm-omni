@@ -17,16 +17,17 @@ import operator
 from itertools import accumulate
 
 import onnxruntime
-import sox
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio.compliance.kaldi as kaldi
-from librosa.filters import mel as librosa_mel_fn
 from torch import Tensor
 
+from vllm_omni.model_executor.models.whisper_utils import Conv1d, ConvTranspose1d
+from vllm_omni.utils.audio import mel_filter_bank, peak_normalize
+
 from .core_vq import DistributedGroupResidualVectorQuantization
-from .whisper_encoder import Conv1d, ConvTranspose1d, WhisperEncoder
+from .whisper_encoder import WhisperEncoder
 
 
 def dynamic_range_compression_torch(x, c=1, clip_val=1e-5):
@@ -103,14 +104,14 @@ class MelSpectrogramFeatures(nn.Module):
 
         y = audio
         if len(list(self.mel_basis.keys())) == 0:
-            mel = librosa_mel_fn(
+            mel = mel_filter_bank(
                 sr=self.sampling_rate,
                 n_fft=self.filter_length,
                 n_mels=self.n_mel_channels,
                 fmin=self.mel_fmin,
                 fmax=self.mel_fmax,
             )
-            self.mel_basis[str(self.mel_fmax) + "_" + str(y.device)] = torch.from_numpy(mel).float().to(y.device)
+            self.mel_basis[str(self.mel_fmax) + "_" + str(y.device)] = mel.to(y.device)
             self.hann_window[str(y.device)] = torch.hann_window(self.win_length).to(y.device)
 
         y = torch.nn.functional.pad(
@@ -152,9 +153,6 @@ class XVectorExtractor(nn.Module):
             audio_codec_with_xvector, sess_options=option, providers=providers
         )
 
-        self.tfm = sox.Transformer()
-        self.tfm.norm(db_level=-6)
-
         self.mel_ext = MelSpectrogramFeatures(
             filter_length=1024,
             hop_length=160,
@@ -182,8 +180,7 @@ class XVectorExtractor(nn.Module):
         return norm_embedding.numpy(), ref_mel.permute(0, 2, 1).squeeze(0).numpy()
 
     def sox_norm(self, audio):
-        wav_norm = self.tfm.build_array(input_array=audio, sample_rate_in=16000)
-        return wav_norm
+        return peak_normalize(audio, db_level=-6)
 
 
 class WhisperEncoderVQ(WhisperEncoder):

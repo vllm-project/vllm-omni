@@ -256,6 +256,15 @@ lora_adapter/
 
 ## Web UI Demo
 
+!!! note "Gradio is an optional dependency"
+    The Gradio demo requires the `[demo]` extras. Install them first:
+
+    ```bash
+    pip install 'vllm-omni[demo]'
+    ```
+
+    Or, if installing from source: `pip install -e '.[demo]'`
+
 Launch the Gradio demo:
 
 ```bash

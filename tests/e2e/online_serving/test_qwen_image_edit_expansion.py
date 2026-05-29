@@ -2,21 +2,19 @@
 Comprehensive tests of diffusion features that are available in online serving mode
 and are supported by the following models:
 - Qwen-Image-Edit: single image input
-- Qwen-Image-Edit-2509: two image inputs
+- Qwen-Image-Edit-2511: single image input and two image inputs
 """
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-    dummy_messages_from_mix_data,
-    generate_synthetic_image,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.media import generate_synthetic_image
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
+SINGLE_EDIT_PROMPT_2511 = "Restyle this image into a Vincent van Gogh style impressionist painting."
 MULTI_EDIT_PROMPT = (
     "Transform the first image into a Dadaism collage art. "
     "Transform the second image into a Vincent van Gogh style painting. "
@@ -36,7 +34,7 @@ def _get_diffusion_feature_cases(model: str):
                 model=model,
                 server_args=[
                     "--cache-backend",
-                    "tea_cache",  # [TODO] may consider changing to cache_dit after #1779 is resolved. Currently cache_dit and layerwise offload cannot work together.
+                    "cache_dit",
                     "--enable-layerwise-offload",
                 ],
             ),
@@ -61,7 +59,7 @@ def _get_diffusion_feature_cases(model: str):
                 model=model,
                 server_args=[
                     "--cache-backend",
-                    "cache_dit",
+                    "tea_cache",
                     "--ring",
                     "2",
                 ],
@@ -98,11 +96,21 @@ def _get_diffusion_feature_cases(model: str):
             id="parallel_004",
             marks=PARALLEL_FEATURE_MARKS,
         ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--use-hsdp",
+                    "--hsdp-shard-size",
+                    "2",
+                ],
+            ),
+            id="parallel_005",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit"),
@@ -131,15 +139,48 @@ def test_qwen_image_edit(omni_server: OmniServer, openai_client: OpenAIClientHan
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
-    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2509"),
+    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2511"),
     indirect=True,
 )
-def test_qwen_image_edit_2509(omni_server: OmniServer, openai_client: OpenAIClientHandler):
-    """Test all diffusion features with Qwen-Image-Edit-2509 in regular end-user scenarios."""
+def test_qwen_image_edit_2511_single_image(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+    """Test Qwen-Image-Edit-2511 with a single image input.
+
+    Regression: with tea_cache enabled and zero_cond_t=True, the TeaCache
+    postprocess closure used the doubled temb (shape 2*batch) without halving
+    it, causing norm_out to broadcast and return noise_pred with shape
+    (2*batch, seq, ch). The scheduler step then silently expanded latents via
+    broadcasting, so at step 2 torch.cat([latents, image_latents], dim=1)
+    crashed with a batch size mismatch. Fixed in extractors.py.
+    """
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
+
+    messages = dummy_messages_from_mix_data(image_data_url=image_data_url, content_text=SINGLE_EDIT_PROMPT_2511)
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "extra_body": {
+            "height": 512,
+            "width": 512,
+            "num_inference_steps": 2,
+            "negative_prompt": NEGATIVE_PROMPT,
+            "true_cfg_scale": 4.0,
+            "seed": 42,
+        },
+    }
+
+    openai_client.send_diffusion_request(request_config)
+
+
+@pytest.mark.parametrize(
+    "omni_server",
+    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2511"),
+    indirect=True,
+)
+def test_qwen_image_edit_2511_two_images(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+    """Test Qwen-Image-Edit-2511 with two image inputs."""
     image_data_url_1 = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
     image_data_url_2 = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 

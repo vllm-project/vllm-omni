@@ -70,8 +70,8 @@ For true stage-level concurrency -- where downstream stages (Talker, Code2Wav)
 start **before** the upstream stage (Thinker) finishes -- use the async_chunk
 example. This requires:
 
-1. A stage config YAML with ``async_chunk: true`` (e.g.
-   ``qwen3_omni_moe_async_chunk.yaml``).
+1. A deploy config YAML with ``async_chunk: true`` (e.g.
+   ``qwen3_omni_moe.yaml``).
 2. Hardware that matches the config (e.g. 2x H100 for the default 3-stage
    config).
 
@@ -101,18 +101,10 @@ python end2end_async_chunk.py --query-type text --modalities text
 ```bash
 python end2end_async_chunk.py \
     --query-type use_audio \
-    --stage-configs-path /path/to/your_async_chunk.yaml
+    --deploy-config /path/to/your_deploy_config.yaml
 ```
 
 > **Note**: The synchronous ``end2end.py`` (using ``Omni``) is still the
 > recommended entry point for non-async-chunk workflows. Only use the
 > async_chunk example when you need the stage-level concurrency semantics
 > described in PR #962 / #1151.
-
-### FAQ
-
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
-```
