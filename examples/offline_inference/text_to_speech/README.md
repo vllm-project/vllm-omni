@@ -16,6 +16,7 @@ list of supported architectures across all modalities, see
 |---|---|---|---|---|---|---|
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
+| GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
@@ -89,6 +90,35 @@ Streaming is enabled by default via `async_chunk: true` in `vllm_omni/deploy/cos
 ### Notes
 - Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
 - Deploy config auto-loads from `vllm_omni/deploy/cosyvoice3.yaml` based on HF `model_type`. Pass `--deploy-config <path>` to override.
+
+---
+
+## GLM-TTS
+
+2-stage TTS pipeline (AR + DiT flow-matching) at 24 kHz. Every request requires reference audio and its transcript for zero-shot voice cloning.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/glm_tts/end2end.py \
+    --model zai-org/GLM-TTS \
+    --text "你好，这是语音合成测试。" \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "这是参考音频的文本内容。" \
+    --output-dir ./output
+```
+
+### Architecture
+```
+Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24 kHz)
+        (Llama-based)    (32k vocab)      (Flow Matching)
+```
+
+### Notes
+- `--ref-audio` and `--ref-text` are **required** together; GLM-TTS does not support text-only synthesis.
+- Reference audio should be 3-10 seconds.
+- First run may be slow due to lazy loading of WhisperVQ tokenizer and CampPlus ONNX speaker embedder.
+- Default sampling: temperature=1.0, top_k=25, top_p=0.8 (RAS method).
+- The `--model` path should point to the repository root (not `llm/` subdirectory).
 
 ---
 
@@ -239,6 +269,14 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
     --text "你好，这是一个测试。" \
     --lang zh
+```
+
+### Seed for Reproducibility
+```bash
+python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
+    --model k2-fsa/OmniVoice \
+    --text "Hello, this is a test." \
+    --seed 42
 ```
 
 ### Notes

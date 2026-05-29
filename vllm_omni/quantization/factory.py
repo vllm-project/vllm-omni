@@ -138,10 +138,18 @@ def _normalize_quant_method_alias(method: str | None) -> str | None:
 
 _MODEL_OPT_METHODS = {
     "modelopt",
+    "modelopt_fp4",
+    "modelopt_mixed",
 }
 _MODEL_OPT_FP8_ALGOS = {
     "FP8",
     "FP8_PER_CHANNEL_PER_TOKEN",
+}
+_MODEL_OPT_NVFP4_ALGOS = {
+    "NVFP4",
+}
+_MODEL_OPT_MIXED_ALGOS = {
+    "MIXED_PRECISION",
 }
 
 
@@ -170,6 +178,10 @@ def _detect_modelopt_method(config: Mapping[str, Any]) -> str | None:
     if quant_algo:
         if quant_algo in _MODEL_OPT_FP8_ALGOS:
             return "modelopt"
+        if quant_algo in _MODEL_OPT_NVFP4_ALGOS:
+            return "modelopt_fp4"
+        if quant_algo in _MODEL_OPT_MIXED_ALGOS:
+            return "modelopt_mixed"
         return None
 
     if method is not None:
@@ -385,6 +397,12 @@ def resolve_quant_config_from_disk(
             "config.json marks checkpoint as serialized; switching to offline %s mode.",
             qc_method,
         )
+        return build_quant_config(qc_method, **qc_kwargs)
+
+    # AutoRound MXFP8 checkpoints use data_type="mx_fp" instead of
+    # is_checkpoint_*_serialized; rebuild so the offline path is selected.
+    if qc_kwargs.get("data_type") == "mx_fp":
+        logger.info("config.json declares data_type='mx_fp'; rebuilding as offline AutoRound MXFP8.")
         return build_quant_config(qc_method, **qc_kwargs)
 
     if (

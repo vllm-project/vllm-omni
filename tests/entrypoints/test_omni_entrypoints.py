@@ -184,7 +184,7 @@ def test_direct_omni_with_nullified_parser_only_nulls_untyped_override_fields(
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--hsdp-shard-size", type=int, default=-1)
+    parser.add_argument("--batch-timeout", type=int, default=10)
     nullify_stage_engine_defaults(parser)
     args = parser.parse_args([])
     args.model = "fake-model"
@@ -192,7 +192,7 @@ def test_direct_omni_with_nullified_parser_only_nulls_untyped_override_fields(
     Omni(**vars(args))
 
     assert captured["gpu_memory_utilization"] is None
-    assert captured["hsdp_shard_size"] == -1
+    assert captured["batch_timeout"] == 10
     assert "_cli_explicit_keys" not in captured
 
 
@@ -233,7 +233,7 @@ def test_deprecated_from_cli_args_preserves_legacy_parser_nulling(
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--hsdp-shard-size", type=int, default=-1)
+    parser.add_argument("--batch-timeout", type=int, default=10)
     args = parser.parse_args([])
     args.model = "fake-model"
 
@@ -241,7 +241,7 @@ def test_deprecated_from_cli_args_preserves_legacy_parser_nulling(
         Omni.from_cli_args(args, parser=parser)
 
     assert captured["gpu_memory_utilization"] is None
-    assert captured["hsdp_shard_size"] == -1
+    assert captured["batch_timeout"] == 10
 
 
 def _make_base():

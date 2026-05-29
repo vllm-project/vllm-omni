@@ -17,7 +17,16 @@ def test_task_excluded_from_cli_args():
         "percentile-metrics": "audio_rtf,audio_ttfp",
         "baseline": {"mean_audio_rtf": [0.5]},
     }
-    exclude_keys = {"request_rate", "baseline", "num_prompts", "max_concurrency", "task", "enabled", "eval_phase"}
+    exclude_keys = {
+        "request_rate",
+        "baseline",
+        "num_prompts",
+        "max_concurrency",
+        "task",
+        "enabled",
+        "eval_phase",
+        "trust_remote_code",
+    }
     args = []
     for key, value in params.items():
         if key in exclude_keys or value is None:

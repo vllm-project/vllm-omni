@@ -52,8 +52,8 @@ vLLM-Omni's runtime module names.
 
 | Model | Scope | Status | Notes |
 |-------|-------|--------|-------|
+| GLM-Image | Diffusion transformer  | ✅ | `Intel/GLM-Image-int4-AutoRound` |
 | BAGEL | Checkpoint-defined diffusion or transformer stage | Not validated | Requires a compatible AutoRound checkpoint |
-| GLM-Image | Checkpoint-defined diffusion or transformer stage | Not validated | Requires a compatible AutoRound checkpoint |
 
 ## Configuration
 

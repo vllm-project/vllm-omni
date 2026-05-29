@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 import diffusers
 import torch
 from PIL import Image
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -432,6 +432,15 @@ class OmniDiffusionConfig:
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
 
+    # Prompt-embedding cache. When enabled, ``DiffusionModelRunner`` wraps the
+    # pipeline's ``encode_prompt`` so repeated calls with identical prompt
+    # arguments (e.g. GRPO rollouts that sample the same prompt many times
+    # with different seeds) reuse the text-encoder output instead of re-running
+    # it. Safe against inputs that cannot be hashed (tensors, PIL images):
+    # those calls transparently bypass the cache.
+    enable_prompt_embed_cache: bool = False
+    prompt_embed_cache_size: int = 32
+
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
@@ -593,6 +602,9 @@ class OmniDiffusionConfig:
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
+    # Supplementary model specific parameters
+    extras: dict[str, Any] = Field(default_factory=dict)
+
     @property
     def is_moe(self) -> bool:
         num_experts = self.tf_model_config.get("num_experts", None)
@@ -605,6 +617,25 @@ class OmniDiffusionConfig:
             return any(isinstance(n, int) and n > 0 for n in num_experts)
 
         return False
+
+    def _resolve_master_port(self) -> int:
+        """Resolve torch.distributed master port without unnecessary random jitter.
+
+        Precedence:
+        1. ``MASTER_PORT`` environment variable (set by orchestrators for multi-replica launch).
+        2. Explicit ``master_port`` passed at construction time.
+        3. An OS-assigned ephemeral port when neither is provided.
+        """
+        from vllm.utils.network_utils import get_open_port
+
+        from vllm_omni.diffusion import envs
+
+        env_port = envs.MASTER_PORT
+        if env_port is not None:
+            return self.settle_port(env_port, port_inc=37)
+        if self.master_port is not None:
+            return self.settle_port(self.master_port, port_inc=37)
+        return self.settle_port(get_open_port(), port_inc=37)
 
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """
@@ -642,9 +673,7 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
-        # TODO: remove hard code
-        initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
-        self.master_port = self.settle_port(initial_master_port, 37)
+        self.master_port = self._resolve_master_port()
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
@@ -745,8 +774,11 @@ class OmniDiffusionConfig:
             return
 
         is_checkpoint_fp8 = bool(getattr(tf_config.quant_config, "is_checkpoint_fp8_serialized", False))
-        should_use_checkpoint_config = self.quantization_config is None or (
-            is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config)
+        is_checkpoint_nvfp4 = bool(getattr(tf_config.quant_config, "is_checkpoint_nvfp4_serialized", False))
+        should_use_checkpoint_config = (
+            self.quantization_config is None
+            or (is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config))
+            or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
         )
         if should_use_checkpoint_config:
             self.quantization_config = tf_config.quant_config
@@ -764,6 +796,17 @@ class OmniDiffusionConfig:
             return isinstance(method, str) and method.lower() == "fp8"
         if hasattr(quant_config, "get_name"):
             return quant_config.get_name() == "fp8"
+        return False
+
+    @staticmethod
+    def _is_generic_nvfp4_quant_config(quant_config: object) -> bool:
+        if isinstance(quant_config, str):
+            return quant_config.lower() in {"fp4", "nvfp4", "modelopt_fp4"}
+        if isinstance(quant_config, Mapping):
+            method = quant_config.get("method", quant_config.get("quant_method"))
+            return isinstance(method, str) and method.lower() in {"fp4", "nvfp4", "modelopt_fp4"}
+        if hasattr(quant_config, "get_name"):
+            return quant_config.get_name() == "modelopt_fp4"
         return False
 
     def set_tf_model_config(self, tf_config: "TransformerConfig") -> None:
@@ -855,6 +898,17 @@ class OmniDiffusionConfig:
                     self.update_multimodal_support()
                 elif model_type == "neo_chat":
                     self.model_class_name = "SenseNovaU1Pipeline"
+                    self.tf_model_config = TransformerConfig()
+                    self.update_multimodal_support()
+                elif "BailingMM2NativeForConditionalGeneration" in architectures or model_type in (
+                    "bailingmm_moe_v2_lite",
+                    "ming_flash_omni",
+                    "ming_flash_omni_thinker",
+                ):
+                    # Ming-flash-omni-2.0 — imagegen stage uses the custom
+                    # ``MingImagePipeline`` (ZImage DiT + Qwen2 connector). See
+                    # vllm_omni/diffusion/models/ming_flash_omni/pipeline_ming_imagegen.py.
+                    self.model_class_name = "MingImagePipeline"
                     self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
                 elif model_type == "nextstep":
@@ -961,6 +1015,28 @@ class DiffusionOutput:
 
     # memory usage info
     peak_memory_mb: float = 0.0
+
+    # When True, move all tensor fields (including tensors inside
+    # ``custom_output``) to CPU at construction time. Useful when the output
+    # is shipped across process boundaries (e.g. step-execution mode) and the
+    # receiving side must not initialise a stray CUDA context.
+    to_cpu: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.to_cpu:
+            return
+
+        def _maybe_to_cpu(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu()
+            return value
+
+        self.output = _maybe_to_cpu(self.output)
+        self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
+        self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
+        self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
+        if self.custom_output:
+            self.custom_output = {k: _maybe_to_cpu(v) for k, v in self.custom_output.items()}
 
 
 class DiffusionRequestAbortedError(RuntimeError):

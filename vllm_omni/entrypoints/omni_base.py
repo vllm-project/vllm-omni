@@ -289,6 +289,10 @@ class OmniBase(PDDisaggregationMixin):
                 return
             if str(request_id) not in req_state.metrics.e2e_done:
                 self.prom_metrics.request_failed()
+            if self.log_stats:
+                # Emit per-request orchestrator timing (including e2e_total_ms)
+                # before dropping request state.
+                req_state.metrics.build_and_log_summary()
         except Exception:
             logger.exception(
                 "[%s] Failed to build/log summary for req=%s",

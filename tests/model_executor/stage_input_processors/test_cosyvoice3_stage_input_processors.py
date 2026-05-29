@@ -6,13 +6,19 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk, text2flow
+from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
+    talker2code2wav_async_chunk,
+    text2flow,
+    text2flow_full_payload,
+    text2flow_token_only,
+)
 
 
-def _source_output(request_id: str, prompt_ids: list[int], out_ids: list[int], mm: dict):
+def _source_output(request_id: str, prompt_ids: list[int], out_ids: list[int], mm: dict, finished: bool = True):
     return SimpleNamespace(
         request_id=request_id,
         prompt_token_ids=prompt_ids,
+        finished=finished,
         outputs=[SimpleNamespace(token_ids=out_ids, cumulative_token_ids=out_ids, multimodal_output=mm)],
     )
 
@@ -45,8 +51,8 @@ def _transfer_manager(
 
 def test_text2flow_supports_batched_source_outputs():
     source_outputs = [
-        _source_output("req-0", [10, 11], [1, 2, 3], {"speech_token": torch.tensor([[1, 2]])}),
-        _source_output("req-1", [20, 21], [4, 5], {"speech_token": torch.tensor([[3, 4]])}),
+        _source_output("req-0", [10, 11], [1, 2, 3], {"speech_token": torch.tensor([[8, 9]])}),
+        _source_output("req-1", [20, 21], [4, 5], {"speech_token": torch.tensor([[6, 7]])}),
     ]
 
     outputs = text2flow(source_outputs=source_outputs, prompt=None)
@@ -56,6 +62,65 @@ def test_text2flow_supports_batched_source_outputs():
     assert outputs[1]["prompt_token_ids"] == [4, 5]
     assert outputs[0]["additional_information"]["ids"]["prompt"] == [10, 11]
     assert outputs[1]["additional_information"]["ids"]["prompt"] == [20, 21]
+
+
+def test_text2flow_strips_reference_speech_prefix_from_cumulative_ids():
+    source_outputs = [
+        _source_output("req-0", [10, 11], [8, 9, 1, 2, 3], {"speech_token": torch.tensor([[8, 9]])}),
+    ]
+
+    outputs = text2flow(source_outputs=source_outputs, prompt=None)
+
+    assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
+
+
+def test_text2flow_token_only_strips_reference_speech_prefix_from_cumulative_ids():
+    source_outputs = [
+        _source_output(
+            "req-strip",
+            [10, 11],
+            [4, 5, 1, 2, 3],
+            {"embed": {"speech_token": torch.tensor([[4, 5]])}},
+        )
+    ]
+
+    outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
+
+    assert len(outputs) == 1
+    assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
+    assert outputs[0]["additional_information"]["ids"]["prompt"] == [10, 11]
+
+
+def test_text2flow_token_only_marks_prompt_trim_for_stop_token_completion():
+    source_outputs = [
+        _source_output(
+            "req-stop",
+            [10, 11],
+            [4, 5, 1, 2, 6562],
+            {"embed": {"speech_token": torch.tensor([[4, 5]])}},
+        )
+    ]
+
+    outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
+
+    assert outputs[0]["prompt_token_ids"] == [1, 2, 6562]
+    assert outputs[0]["additional_information"]["meta"]["talker_prefill_offset"] == 2
+
+
+def test_text2flow_full_payload_does_not_send_codec_ids():
+    payload = text2flow_full_payload(
+        None,
+        {
+            "embed.speech_token": torch.tensor([[1, 2]], dtype=torch.long),
+            "codes.audio": torch.tensor([7, 8, 9], dtype=torch.long),
+        },
+        SimpleNamespace(),
+    )
+
+    assert payload is not None
+    assert "codes" not in payload
+    assert "next_stage_prompt_len" not in payload["meta"]
+    assert torch.equal(payload["embed"]["speech_token"], torch.tensor([[1, 2]], dtype=torch.long))
 
 
 def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():

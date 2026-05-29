@@ -1,18 +1,28 @@
 import re
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import ColumnParallelLinear
 
 from vllm_omni.diffusion.attention.layer import Attention
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
 try:
-    from dreamid_omni.modules.model import WanLayerNorm, WanRMSNorm
+    from dreamid_omni.modules.model import WanLayerNorm
 except ImportError:
     raise ImportError("Failed to import from dependency 'dreamid_omni'.")
 
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.models.dreamid_omni.wan2_2 import WanModel, rope_apply
+from vllm_omni.diffusion.models.dreamid_omni.wan2_2 import (
+    DistributedRMSNorm,
+    WanModel,
+    rope_apply,
+)
 
 logger = init_logger(__name__)
 
@@ -128,8 +138,8 @@ class FusedBlock(nn.Module):
 
     def forward(
         self,
-        vid,
-        audio,
+        hidden_states,
+        encoder_hidden_states,
         attn: Attention,
         vid_e,
         vid_seq_lens,
@@ -148,6 +158,8 @@ class FusedBlock(nn.Module):
         audio_ref_lengths,
         audio_freqs_scaling,
     ):
+        vid = hidden_states
+        audio = encoder_hidden_states
         vid_block = self.vid_block
         audio_block = self.audio_block
 
@@ -241,26 +253,36 @@ class FusedBlock(nn.Module):
 class FusionModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["fused_blocks"]
 
+    packed_modules_mapping = {
+        "to_qkv": ["q", "k", "v"],
+    }
+
     @staticmethod
     def _is_fused_block(name: str, module) -> bool:
         return "fused_blocks" in name and name.split(".")[-1].isdigit()
 
     _hsdp_shard_conditions = [_is_fused_block]
 
-    def __init__(self, video_config=None, audio_config=None):
+    def __init__(
+        self,
+        video_config=None,
+        audio_config=None,
+        *,
+        quant_config: "QuantizationConfig | None" = None,
+    ):
         super().__init__()
         has_video = True
         has_audio = True
         self.device = get_local_device()
         if video_config is not None:
-            self.video_model = WanModel(**video_config)
+            self.video_model = WanModel(quant_config=quant_config, prefix="video_model", **video_config)
         else:
             has_video = False
             self.video_model = None
             logger.warning("No video model is provided!")
 
         if audio_config is not None:
-            self.audio_model = WanModel(**audio_config)
+            self.audio_model = WanModel(quant_config=quant_config, prefix="audio_model", **audio_config)
         else:
             has_audio = False
             self.audio_model = None
@@ -270,11 +292,12 @@ class FusionModel(nn.Module):
             assert len(self.video_model.blocks) == len(self.audio_model.blocks)
             self.num_blocks = len(self.video_model.blocks)
 
-            self.inject_cross_attention_kv_projections()
+            self.inject_cross_attention_kv_projections(quant_config=quant_config)
 
-        self.num_heads = self.video_model.num_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        self.full_num_heads = self.video_model.num_heads
+        self.num_heads = self.full_num_heads // tp_size
         self.head_dim = self.video_model.dim // self.video_model.num_heads
-        # Make a single shared instance to pass in at forward time
         self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -313,21 +336,42 @@ class FusionModel(nn.Module):
 
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
-    def inject_cross_attention_kv_projections(self):
-        for vid_block in self.video_model.blocks:
-            vid_block.cross_attn.k_fusion = nn.Linear(vid_block.dim, vid_block.dim)
-            vid_block.cross_attn.v_fusion = nn.Linear(vid_block.dim, vid_block.dim)
-            vid_block.cross_attn.pre_attn_norm_fusion = WanLayerNorm(vid_block.dim, elementwise_affine=True)
-            vid_block.cross_attn.norm_k_fusion = (
-                WanRMSNorm(vid_block.dim, eps=1e-6) if vid_block.qk_norm else nn.Identity()
+    def inject_cross_attention_kv_projections(
+        self,
+        quant_config: "QuantizationConfig | None" = None,
+    ):
+        def _make_kv_proj(dim: int, prefix: str) -> ColumnParallelLinear:
+            # K/V projections for the cross-modal (a2v / v2a) attention path.
+            # Inputs are full latents, so we quantize matched to self_attn.
+            return ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=prefix,
             )
 
-        for audio_block in self.audio_model.blocks:
-            audio_block.cross_attn.k_fusion = nn.Linear(audio_block.dim, audio_block.dim)
-            audio_block.cross_attn.v_fusion = nn.Linear(audio_block.dim, audio_block.dim)
-            audio_block.cross_attn.pre_attn_norm_fusion = WanLayerNorm(audio_block.dim, elementwise_affine=True)
-            audio_block.cross_attn.norm_k_fusion = (
-                WanRMSNorm(audio_block.dim, eps=1e-6) if audio_block.qk_norm else nn.Identity()
+        tp_size = get_tensor_model_parallel_world_size()
+        for i, vid_block in enumerate(self.video_model.blocks):
+            cross = vid_block.cross_attn
+            block_prefix = f"video_model.blocks.{i}.cross_attn"
+            cross.k_fusion = _make_kv_proj(vid_block.dim, f"{block_prefix}.k_fusion")
+            cross.v_fusion = _make_kv_proj(vid_block.dim, f"{block_prefix}.v_fusion")
+            cross.pre_attn_norm_fusion = WanLayerNorm(vid_block.dim, elementwise_affine=True)
+            cross.norm_k_fusion = (
+                DistributedRMSNorm(vid_block.dim // tp_size, eps=1e-6) if vid_block.qk_norm else nn.Identity()
+            )
+
+        for i, audio_block in enumerate(self.audio_model.blocks):
+            cross = audio_block.cross_attn
+            block_prefix = f"audio_model.blocks.{i}.cross_attn"
+            cross.k_fusion = _make_kv_proj(audio_block.dim, f"{block_prefix}.k_fusion")
+            cross.v_fusion = _make_kv_proj(audio_block.dim, f"{block_prefix}.v_fusion")
+            cross.pre_attn_norm_fusion = WanLayerNorm(audio_block.dim, elementwise_affine=True)
+            cross.norm_k_fusion = (
+                DistributedRMSNorm(audio_block.dim // tp_size, eps=1e-6) if audio_block.qk_norm else nn.Identity()
             )
 
     def _detach_blocks_from_backbones(self) -> None:

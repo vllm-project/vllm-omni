@@ -329,11 +329,16 @@ def resolve_model_config_path(model: str) -> str:
             except Exception as e:
                 raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
         else:
-            raise ValueError(
-                f"Could not determine model_type for model: {model}. "
-                f"Model is not in standard transformers format and does not have model_index.json. "
-                f"Please ensure the model has proper configuration files with 'model_type' field"
-            )
+            # No config.json at repo root (e.g. GLM-TTS stores configs in
+            # subdirectories only).  Try matching against registered deploy
+            # YAML filenames before giving up.
+            model_type = _try_resolve_omni_model_type(model)
+            if model_type is None:
+                raise ValueError(
+                    f"Could not determine model_type for model: {model}. "
+                    f"Model is not in standard transformers format and does not have model_index.json. "
+                    f"Please ensure the model has proper configuration files with 'model_type' field"
+                )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
     if model_type in _DIFFUSERS_CLASS_TO_CONFIG:

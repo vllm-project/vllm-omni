@@ -13,7 +13,7 @@ For example...
 ```bash
 # Qwen-Image
 vllm serve Qwen/Qwen-Image-Edit-2511 --omni --port 8000
-
+```
 
 ### Generate Images
 
@@ -53,7 +53,7 @@ result = client.images.edit(
     output_format='jpeg',
     # url格式
     extra_body={
-        "url": [input_image_url1,input_image_url],
+        "url": [input_image_url,input_image_url],
         "num_inference_steps": 50,
         "guidance_scale": 1,
         "seed": 777,
@@ -92,7 +92,8 @@ Content-Type: multipart/form-data
 | `user` | string | null | User identifier for tracking |
 | `output_format` | string | "png" | The format in which the generated images are returned. Must be one of "png", "jpg", "jpeg", "webp". |
 | `output_compression` | integer | 100 | The compression level (0-100%) for the generated images. |
-| `background` | string or null | "auto" | Allows to set transparency for the background of the generated image(s).
+| `background` | string or null | "auto" | Allows to set transparency for the background of the generated image(s). |
+| `stream` | boolean | false | Return Server-Sent Events instead of a single JSON response. Currently supported only by multi-stage image edit pipelines that produce AR text before the final image, such as HunyuanImage3 IT2I AR+DiT. |
 
 #### vllm-omni Extension Parameters
 
@@ -109,6 +110,8 @@ Content-Type: multipart/form-data
 
 ### Response Format
 
+When `stream=false` or omitted, the endpoint returns the standard image edit response:
+
 ```json
 {
   "created": 1701234567,
@@ -120,8 +123,54 @@ Content-Type: multipart/form-data
     }
   ],
   "output_format": null,
-  "size": null,
+  "size": null
 }
+```
+
+### Streaming Response Format
+
+Set `stream=true` when you want to receive the HunyuanImage3 IT2I AR
+recaption text before the final edited image is ready. Streaming is only
+available for multi-stage image edit pipelines where stage 0 produces AR text
+and a later diffusion stage produces the image. Single-stage diffusion image
+edit pipelines reject `stream=true` with HTTP 400.
+
+The response uses Server-Sent Events with `Content-Type: text/event-stream`.
+Each event is sent as one `data:` line. The stream order is:
+
+1. One or more AR text delta chunks.
+2. One final image chunk.
+3. `data: [DONE]`.
+
+AR text chunks expose only the generated text delta and the AR completion
+`index`. They do not expose token ids, ratio tokens, KV cache data, or internal
+prompt token ids.
+
+Example AR delta event:
+
+```text
+data: {"object":"image.edit.chunk","type":"ar_delta","delta":"A close-up product photo...","index":0,"created":1701234567,"model":"tencent/HunyuanImage-3.0-Instruct"}
+```
+
+Example final image event:
+
+```text
+data: {"object":"image.edit.chunk","type":"image","data":[{"b64_json":"<base64-encoded PNG>","url":null,"revised_prompt":null}],"output_format":"png","size":"1024x1024","created":1701234567,"model":"tencent/HunyuanImage-3.0-Instruct"}
+```
+
+Terminal event:
+
+```text
+data: [DONE]
+```
+
+If the engine fails after the SSE response has started, the stream emits an
+error chunk followed by `[DONE]`:
+
+```text
+data: {"object":"error","created":1701234567,"model":"tencent/HunyuanImage-3.0-Instruct","error":{"message":"<error message>","type":"server_error","code":500}}
+
+data: [DONE]
 ```
 
 ## Examples
@@ -134,11 +183,27 @@ curl -s -D >(grep -i x-request-id >&2) \
   -X POST "http://localhost:8000/v1/images/edits" \
   -F "model=xxx" \
   -F "image=@xx.png" \
-  -F "image=@xx.png"
+  -F "image=@xx.png" \
   -F "prompt='this bear is wearing sportwear. holding a basketball, and bending one leg.'" \
   -F "size=1024x1024" \
   -F "output_format=png"
 ```
+
+### Streaming HunyuanImage3 IT2I AR Text
+
+```bash
+curl -N -X POST "http://localhost:8000/v1/images/edits" \
+  -F "model=tencent/HunyuanImage-3.0-Instruct" \
+  -F "image=@./input.png" \
+  -F "prompt=Turn the product into a clean studio advertisement." \
+  -F "size=1024x1024" \
+  -F "output_format=png" \
+  -F "stream=true"
+```
+
+Use the `ar_delta` events for progressive display of the AR-generated
+recaption. Decode the `b64_json` field from the final `image` event to get the
+edited image.
 
 
 ## Parameter Handling

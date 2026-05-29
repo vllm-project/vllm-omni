@@ -13,9 +13,10 @@ import importlib
 import multiprocessing as mp
 import os
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
@@ -179,6 +180,19 @@ def terminate_alive_proc(proc, timeout=5):
         proc.join(timeout=timeout)
         if proc.is_alive():
             proc.kill()
+
+
+def set_death_signal(sig: int) -> None:
+    """Best-effort parent-death signal for Linux subprocesses."""
+    try:
+        import ctypes
+        import platform
+
+        if platform.system() != "Linux":
+            return
+        ctypes.CDLL("libc.so.6").prctl(1, sig)
+    except Exception:
+        pass
 
 
 def patch_generation_config_if_needed(model_config: Any) -> None:
@@ -633,6 +647,62 @@ def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
             stage_id,
             physical_devices,
         )
+
+
+@contextmanager
+def stage_runtime_setup(stage_id: int, runtime_cfg: Any) -> Generator[None, None, None]:
+    """Apply per-stage ``runtime.env`` and ``runtime.devices`` for the context.
+
+    Restores ``runtime.env`` on exit. Device visibility restore remains the
+    caller's responsibility (e.g. ``AsyncOmniEngine`` saves/restores the
+    platform device-control env var around this block).
+    """
+    with stage_runtime_env(stage_id, runtime_cfg):
+        setup_stage_devices(stage_id, runtime_cfg)
+        yield
+
+
+@contextmanager
+def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, None]:
+    """Apply per-stage ``runtime.env`` for the duration of the context."""
+    if runtime_cfg is None:
+        runtime_cfg = {}
+    elif not isinstance(runtime_cfg, dict):
+        runtime_cfg = cast(dict[str, Any], _to_dict(runtime_cfg))
+
+    raw_env = runtime_cfg.get("env")
+    if raw_env is None:
+        yield
+        return
+    if isinstance(raw_env, dict):
+        runtime_env = cast(dict[str, Any], raw_env)
+    else:
+        runtime_env = cast(dict[str, Any], _to_dict(raw_env))
+        if not runtime_env:
+            logger.warning(
+                "[stage_init] Stage-%s ignored runtime.env with unsupported type %s",
+                stage_id,
+                type(raw_env).__name__,
+            )
+            yield
+            return
+
+    previous_env: dict[str, str | None] = {}
+    for key, value in runtime_env.items():
+        env_key = str(key)
+        previous_env[env_key] = os.environ.get(env_key)
+        os.environ[env_key] = str(value)
+
+    if previous_env:
+        logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
+    try:
+        yield
+    finally:
+        for key, old_value in previous_env.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
 
 
 def build_engine_args_dict(
