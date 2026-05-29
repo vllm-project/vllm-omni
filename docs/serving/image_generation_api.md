@@ -34,7 +34,7 @@ curl -X POST http://localhost:8000/v1/images/generations \
 
 **Using curl save to file:**
 
-```base
+```bash
 curl -o dragon.png -X POST http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -d '{
