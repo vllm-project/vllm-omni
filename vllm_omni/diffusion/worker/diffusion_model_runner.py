@@ -23,6 +23,10 @@ from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
+from vllm_omni.diffusion.cache.prompt_embed_cache import (
+    install_prompt_embed_cache,
+    resolve_prompt_embed_cache_config,
+)
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -71,6 +75,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.pipeline = None
         self.cache_backend = None
         self.offload_backend = None
+        self.prompt_embed_cache = None
 
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, DiffusionRequestState] = {}
@@ -187,11 +192,37 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             else:
                 self.cache_backend.enable(self.pipeline)
 
+        # Install prompt-embedding cache (transparent wrapper around
+        # ``pipeline.encode_prompt``). Enabled via config or env var; a no-op
+        # when the pipeline does not expose ``encode_prompt``.
+        enable_pec, pec_size = resolve_prompt_embed_cache_config(
+            enable=getattr(self.od_config, "enable_prompt_embed_cache", False),
+            max_size=getattr(self.od_config, "prompt_embed_cache_size", 32),
+        )
+        if enable_pec:
+            self.prompt_embed_cache = install_prompt_embed_cache(
+                self.pipeline,
+                max_size=pec_size,
+                enabled=True,
+                model_tag=self.od_config.model_class_name,
+            )
+
         logger.info("Model runner: Initialization complete.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights into the pipeline."""
         return self.pipeline.load_weights(weights)
+
+    def clear_prompt_embed_cache(self) -> None:
+        """Evict all cached text-encoder outputs (e.g. between training epochs)."""
+        if self.prompt_embed_cache is not None:
+            self.prompt_embed_cache.clear()
+
+    def get_prompt_embed_cache_stats(self) -> dict | None:
+        """Return hit/miss statistics for the prompt-embedding cache, if enabled."""
+        if self.prompt_embed_cache is None:
+            return None
+        return self.prompt_embed_cache.stats()
 
     def _record_peak_memory(self, output: DiffusionOutput) -> None:
         """Record peak GPU memory for the current forward pass into output.
@@ -298,6 +329,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             if is_primary:
                 self._record_peak_memory(output)
+
+            # Log prompt-embed cache activity (hits/misses accumulate across requests).
+            if is_primary and self.prompt_embed_cache is not None:
+                logger.debug("prompt-embed cache: %s", self.prompt_embed_cache.stats())
 
             # NOTE:
             if (

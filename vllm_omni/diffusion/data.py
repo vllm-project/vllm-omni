@@ -432,6 +432,15 @@ class OmniDiffusionConfig:
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
 
+    # Prompt-embedding cache. When enabled, ``DiffusionModelRunner`` wraps the
+    # pipeline's ``encode_prompt`` so repeated calls with identical prompt
+    # arguments (e.g. GRPO rollouts that sample the same prompt many times
+    # with different seeds) reuse the text-encoder output instead of re-running
+    # it. Safe against inputs that cannot be hashed (tensors, PIL images):
+    # those calls transparently bypass the cache.
+    enable_prompt_embed_cache: bool = False
+    prompt_embed_cache_size: int = 32
+
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
