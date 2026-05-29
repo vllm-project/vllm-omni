@@ -17,10 +17,14 @@ stages:
     enable_prefix_caching: false
     devices: "0"
     default_sampling_params:
-      temperature: 0.4
+      # Iter2 set top_k=0 (disable) which REGRESSED to 0.495 (-0.15 from iter1).
+      # Reverting to top_k=1 (the model was trained/fine-tuned with greedy-like
+      # decoding). Keeping iter1's working request-level overrides as defaults:
+      # T=0.3 (was 0.4) and max_tokens=4096 (was 2048).
+      temperature: 0.3
       top_p: 0.9
       top_k: 1
-      max_tokens: 2048
+      max_tokens: 4096
       seed: 52
       detokenize: true
       repetition_penalty: 1.05

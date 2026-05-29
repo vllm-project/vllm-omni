@@ -93,6 +93,8 @@ class StagePool:
         self._stage_vllm_config = stage_vllm_config
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
+        self._inflight_bindings: dict[str, int] = {}
+        self._replica_inflight: list[int] = [0 for _ in self.clients]
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
 
         # Distributed-mode state. Populated by add_client / remove_client.
@@ -218,6 +220,7 @@ class StagePool:
         replica_id = len(self.clients)
         self.clients.append(client)
         self._addr_to_replica_id[input_addr] = replica_id
+        self._replica_inflight.append(0)
         self._replica_metrics.append(_ReplicaMetrics())
         return replica_id
 
@@ -424,6 +427,7 @@ class StagePool:
 
     def release_binding(self, request_id: str) -> None:
         """Drop the route binding for *request_id* in this stage."""
+        self._mark_request_finished(request_id)
         self._request_bindings.pop(request_id, None)
         self._affinity.pop(request_id, None)
 
@@ -456,10 +460,7 @@ class StagePool:
             if len(live) == 1:
                 chosen = live[0]
             else:
-                # Round-robin over live replicas only.
-                start = self._next_replica_id % len(live)
-                chosen = live[start]
-                self._next_replica_id = (self._next_replica_id + 1) % len(live)
+                chosen = self._select_least_loaded_replica_id()
 
         self._request_bindings[request_id] = chosen
         return chosen
@@ -475,6 +476,32 @@ class StagePool:
         if client is None:
             raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
         return cast(StagePoolDiffusionClient, client)
+
+    def _select_least_loaded_replica_id(self) -> int:
+        live = self.live_replica_ids()
+        if not live:
+            raise RuntimeError(f"stage {self.stage_id} has no live replicas")
+        min_load = min(self._replica_inflight[idx] for idx in live)
+        for offset in range(len(live)):
+            candidate = live[(self._next_replica_id + offset) % len(live)]
+            if self._replica_inflight[candidate] == min_load:
+                self._next_replica_id = (offset + 1) % len(live)
+                return candidate
+        return live[0]
+
+    def _mark_request_submitted(self, request_id: str, replica_id: int) -> None:
+        previous = self._inflight_bindings.get(request_id)
+        if previous == replica_id:
+            return
+        if previous is not None:
+            self._replica_inflight[previous] = max(0, self._replica_inflight[previous] - 1)
+        self._inflight_bindings[request_id] = replica_id
+        self._replica_inflight[replica_id] += 1
+
+    def _mark_request_finished(self, request_id: str) -> None:
+        replica_id = self._inflight_bindings.pop(request_id, None)
+        if replica_id is not None:
+            self._replica_inflight[replica_id] = max(0, self._replica_inflight[replica_id] - 1)
 
     # ---- Metrics ----
 
@@ -540,10 +567,15 @@ class StagePool:
                 affinity_request_id=affinity_request_id,
             )
             client = self._diffusion_client(replica_id)
-            if isinstance(request, list):
-                await client.add_batch_request_async(request_id, request, params, **submit_kwargs)
-            else:
-                await client.add_request_async(request_id, request, params, **submit_kwargs)
+            try:
+                if isinstance(request, list):
+                    await client.add_batch_request_async(request_id, request, params, **submit_kwargs)
+                else:
+                    await client.add_request_async(request_id, request, params, **submit_kwargs)
+            except Exception:
+                self.release_binding(request_id)
+                raise
+            self._mark_request_submitted(request_id, replica_id)
             return replica_id
 
         replica_id = await self._pick_or_select(
@@ -581,6 +613,7 @@ class StagePool:
                         rollback_error,
                     )
             raise
+        self._mark_request_submitted(request_id, replica_id)
         return replica_id
 
     async def submit_update(
@@ -615,6 +648,7 @@ class StagePool:
                 queue=None,
             )
             await self._llm_client(replica_id).add_request_async(request)
+        self._mark_request_submitted(request_id, replica_id)
         return replica_id
 
     async def _pick_or_select(
@@ -653,6 +687,9 @@ class StagePool:
             raw_outputs.timestamp,
             None,
         )
+        for output in processed.request_outputs:
+            if getattr(output, "finished", False):
+                self._mark_request_finished(output.request_id)
 
         if processed.reqs_to_abort:
             await client.abort_requests_async(processed.reqs_to_abort)
@@ -695,7 +732,10 @@ class StagePool:
         raw_client = self.clients[replica_id]
         if raw_client is None:
             return None
-        return cast(StagePoolDiffusionClient, raw_client).get_diffusion_output_nowait()
+        output = cast(StagePoolDiffusionClient, raw_client).get_diffusion_output_nowait()
+        if output is not None and getattr(output, "finished", True):
+            self._mark_request_finished(output.request_id)
+        return output
 
     # ---- Stage-local control plane ----
 
@@ -721,6 +761,8 @@ class StagePool:
             if client is None:
                 continue
             await client.abort_requests_async(replica_request_ids)
+            for request_id in replica_request_ids:
+                self._mark_request_finished(request_id)
 
         # Clean up OutputProcessor state (e.g. mm_accumulated tensors) that
         # would otherwise leak — aborted requests never produce a final

@@ -36,7 +36,13 @@ class OmniDiffusionRequest:
 
         # When neither a generator nor a seed is provided, assign a random seed
         # so that all ranks derive the same generator state.
-        if self.sampling_params.generator is None and self.sampling_params.seed is None:
+        extra_args = getattr(self.sampling_params, "extra_args", None) or {}
+        preserve_none_seed = bool(extra_args.get("preserve_none_seed", False))
+        if (
+            self.sampling_params.generator is None
+            and self.sampling_params.seed is None
+            and not preserve_none_seed
+        ):
             self.sampling_params.seed = random.randint(0, 2**31 - 1)
 
         # Detect whether user explicitly provided guidance_scale.

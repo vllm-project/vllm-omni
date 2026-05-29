@@ -118,6 +118,14 @@ def get_extra_output_params(model_class_name: str) -> frozenset[str]:
     return frozenset(getattr(model_cls, "EXTRA_OUTPUT_PARAMS", frozenset()))
 
 
+def supports_request_batching(od_config: OmniDiffusionConfig) -> bool:
+    """Return whether request-mode scheduler batching is supported."""
+    model_cls = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "SUPPORTS_REQUEST_BATCHING", False))
+
+
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
@@ -149,10 +157,17 @@ class DiffusionEngine:
             StepScheduler() if self.step_execution else RequestScheduler()
         )
         self.scheduler.initialize(od_config)
-        if self.scheduler.max_num_running_reqs > 1 and not self.step_execution:
+        self.request_batching = (not self.step_execution) and supports_request_batching(od_config)
+        if self.scheduler.max_num_running_reqs > 1 and not self.step_execution and not self.request_batching:
             max_num_seqs = self.scheduler.max_num_running_reqs
             self.scheduler.max_num_running_reqs = 1
             logger.warning(f"Non-stepwise-execution does not support max-num-seqs={max_num_seqs}, set it to 1.")
+        elif self.scheduler.max_num_running_reqs > 1 and self.request_batching:
+            logger.info(
+                "Request-mode batching enabled for %s with max-num-seqs=%d.",
+                od_config.model_class_name,
+                self.scheduler.max_num_running_reqs,
+            )
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
         self.worker_thread: threading.Thread | None = None
@@ -170,6 +185,18 @@ class DiffusionEngine:
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
         self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
+        self._request_batch_wait_s = max(
+            0.0,
+            float(getattr(self.od_config, "request_batch_wait_ms", 0) or 0) / 1000.0,
+        )
+        self._request_batch_idle_s = max(
+            0.0,
+            float(getattr(self.od_config, "request_batch_idle_ms", 0) or 0) / 1000.0,
+        )
+        self._request_batch_idle_min_size = max(
+            1,
+            int(getattr(self.od_config, "request_batch_idle_min_size", 2) or 2),
+        )
 
         try:
             self._dummy_run()
@@ -463,6 +490,7 @@ class DiffusionEngine:
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
+                self._wait_for_request_batch_if_needed()
                 sched_output = self.scheduler.schedule()
 
             if sched_output.is_empty:
@@ -494,6 +522,50 @@ class DiffusionEngine:
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
+
+    def _wait_for_request_batch_if_needed(self) -> None:
+        """Briefly wait for a fuller request-mode batch before scheduling.
+
+        This is intentionally only active for request-mode pipelines that
+        advertise native request batching. It keeps the default zero-wait
+        behavior for other diffusion models while allowing expensive BAGEL
+        Stage 1 calls to launch with fuller batches.
+        """
+        if self._request_batch_wait_s <= 0 or not self.request_batching:
+            return
+        if self.scheduler.num_running > 0:
+            return
+
+        deadline = time.monotonic() + self._request_batch_wait_s
+        idle_deadline = None
+        last_waiting = self.scheduler.num_waiting
+        if self._request_batch_idle_s > 0 and last_waiting >= self._request_batch_idle_min_size:
+            idle_deadline = time.monotonic() + self._request_batch_idle_s
+        while (
+            self.scheduler.num_waiting > 0
+            and self.scheduler.num_waiting < self.scheduler.max_num_running_reqs
+            and self._rpc_queue.empty()
+            and self.abort_queue.empty()
+            and not self.stop_event.is_set()
+        ):
+            now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                break
+            if self._request_batch_idle_s > 0:
+                current_waiting = self.scheduler.num_waiting
+                if current_waiting != last_waiting:
+                    last_waiting = current_waiting
+                    if current_waiting >= self._request_batch_idle_min_size:
+                        idle_deadline = now + self._request_batch_idle_s
+                    else:
+                        idle_deadline = None
+                if idle_deadline is not None:
+                    idle_remaining = idle_deadline - now
+                    if idle_remaining <= 0:
+                        break
+                    remaining = min(remaining, idle_remaining)
+            self._cv.wait(timeout=remaining)
 
     def _process_rpc_queue(self) -> None:
         """Execute pending collective_rpc tasks from the busy-loop thread.

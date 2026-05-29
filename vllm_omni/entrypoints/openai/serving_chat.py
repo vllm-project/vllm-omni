@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -110,6 +111,10 @@ from vllm_omni.entrypoints.openai.utils import (
 )
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.bagel_vqa import (
+    bagel_vqa_reference_layout_enabled,
+    build_bagel_vqa_reference_prompt_token_ids,
+)
 
 logger = init_logger(__name__)
 
@@ -700,7 +705,78 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 engine_prompt["additional_information"] = {}
             engine_prompt["additional_information"]["instruction"] = instructions.strip()
 
+        self._maybe_apply_bagel_vqa_reference_prompt(
+            request=request,
+            messages=messages,
+            tokenizer=tokenizer,
+            engine_prompt=engine_prompt,
+        )
+
         return conversation, [engine_prompt]
+
+    def _is_bagel_vqa_request(
+        self,
+        request: ChatLikeRequest | ResponsesRequest,
+        engine_prompt: TokPrompt,
+    ) -> bool:
+        """Return True for BAGEL image-understanding chat requests."""
+        hf_config = getattr(self.model_config, "hf_config", None)
+        if type(hf_config).__name__ != "BagelConfig":
+            return False
+
+        req_modalities = getattr(request, "modalities", None)
+        if req_modalities and "text" not in req_modalities:
+            return False
+
+        mm_data = engine_prompt.get("multi_modal_data")
+        if not isinstance(mm_data, dict) or "image" not in mm_data:
+            return False
+
+        # img2img/image-generation requests also carry images, but should stay
+        # on the diffusion-oriented prompt path.
+        if "img2img" in mm_data:
+            return False
+        return True
+
+    def _maybe_apply_bagel_vqa_reference_prompt(
+        self,
+        *,
+        request: ChatLikeRequest | ResponsesRequest,
+        messages: list[ChatCompletionMessageParam],
+        tokenizer: AnyTokenizer,
+        engine_prompt: TokPrompt,
+    ) -> None:
+        """Use BAGEL's reference VQA layout while keeping vLLM serving.
+
+        Reference BAGEL does not run Qwen's chat template. It updates KV cache
+        in this order: think-system text, image block(s), final text containing
+        <img><|image_N|></img> markers, then a bare <|im_start|> decode token.
+        This produces token IDs directly and lets the multimodal processor
+        expand one <|image_pad|> per image into the actual vision block.
+
+        This path is opt-in because vLLM still performs the image block as
+        causal decoder prefill, while reference BAGEL uses non-causal image
+        prefill. In GPU smoke tests, enabling only the token/position layout
+        caused special-token repetition and caption-mode failures.
+        """
+        if not bagel_vqa_reference_layout_enabled():
+            return
+
+        if not self._is_bagel_vqa_request(request, engine_prompt):
+            return
+
+        prompt_token_ids, final_text, image_count = (
+            build_bagel_vqa_reference_prompt_token_ids(messages, tokenizer)
+        )
+        if image_count <= 0:
+            return
+
+        engine_prompt["prompt_token_ids"] = prompt_token_ids
+        engine_prompt["prompt"] = final_text
+        addi = engine_prompt.setdefault("additional_information", {})
+        if isinstance(addi, dict):
+            addi["bagel_vqa_reference_layout"] = [1]
+            addi["bagel_vqa_image_count"] = [image_count]
 
     async def _inject_audio_from_video_urls(
         self,
@@ -3161,6 +3237,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 try:
                                     _, b64_data = url.split(",", 1)
                                     images.append(b64_data)
+                                    if bagel_vqa_reference_layout_enabled():
+                                        prompt_parts.append(f"<img><|image_{len(images)}|></img>")
                                 except ValueError:
                                     logger.warning("Invalid data URL format")
                         elif item.get("type") == "video_url":
@@ -3174,6 +3252,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         # Handle {"image": "base64..."} format
                         elif "image" in item:
                             images.append(item["image"])
+                            if bagel_vqa_reference_layout_enabled():
+                                prompt_parts.append(f"<img><|image_{len(images)}|></img>")
                         elif "video" in item and isinstance(item["video"], str):
                             videos.append(item["video"])
                         elif "audio" in item and isinstance(item["audio"], str):

@@ -1120,6 +1120,40 @@ class AsyncOmniEngine:
             return self._initialize_diffusion_replica(plan, stage_init_timeout, stage_launch_lock)
         return self._initialize_llm_replica(plan, stage_init_timeout, stage_launch_lock)
 
+    @staticmethod
+    def _parse_replica_devices(plan: LogicalStageInitPlan) -> set[str]:
+        devices: set[str] = set()
+        for replica in plan.replicas:
+            runtime_cfg = getattr(replica.stage_cfg, "runtime", None)
+            raw_devices = None
+            if runtime_cfg is not None:
+                raw_devices = (
+                    runtime_cfg.get("devices")
+                    if hasattr(runtime_cfg, "get")
+                    else getattr(runtime_cfg, "devices", None)
+                )
+            if raw_devices is None:
+                continue
+            devices.update(d.strip() for d in str(raw_devices).split(",") if d.strip())
+        return devices
+
+    @classmethod
+    def _stage_init_requires_ordering(cls, stage_plans: Sequence[LogicalStageInitPlan]) -> bool:
+        """Return true when stages intentionally share devices.
+
+        Disjoint stages can initialize concurrently. If stages overlap on a
+        physical device, initialize them in logical order so an upstream LLM
+        stage can finish profiling and reserve KV cache before a downstream
+        replica loads onto the same GPU.
+        """
+        seen: set[str] = set()
+        for plan in stage_plans:
+            devices = cls._parse_replica_devices(plan)
+            if devices & seen:
+                return True
+            seen.update(devices)
+        return False
+
     def _initialize_stage_replicas(
         self,
         stage_plans: Sequence[LogicalStageInitPlan],
@@ -1720,8 +1754,9 @@ class AsyncOmniEngine:
         sampling_params_list: list[Any],
     ) -> None:
         """Expand prompt into CFG companions, process through InputProcessor, and enqueue."""
+        expand_params = self._sampling_params_for_prompt_expansion(stage0_params, sampling_params_list)
         try:
-            expanded = self.prompt_expand_func(original_prompt, stage0_params)
+            expanded = self.prompt_expand_func(original_prompt, expand_params)
         except Exception:
             logger.exception("[AsyncOmniEngine] prompt_expand_func failed for req %s", parent_id)
             return
@@ -1765,6 +1800,37 @@ class AsyncOmniEngine:
             parent_id,
             len(expanded),
         )
+
+    @staticmethod
+    def _sampling_params_for_prompt_expansion(stage0_params: Any, sampling_params_list: list[Any]) -> Any:
+        """Expose downstream diffusion extra_args to Stage-0 prompt expansion."""
+        stage0_extra = dict(getattr(stage0_params, "extra_args", None) or {})
+        merged_extra: dict[str, Any] = {}
+        for params in sampling_params_list[1:]:
+            extra = getattr(params, "extra_args", None) or {}
+            if extra:
+                merged_extra.update(extra)
+        merged_extra.update(stage0_extra)
+        if not merged_extra or merged_extra == stage0_extra:
+            return stage0_params
+
+        try:
+            if hasattr(stage0_params, "clone"):
+                expand_params = stage0_params.clone()
+            else:
+                expand_params = copy.copy(stage0_params)
+            setattr(expand_params, "extra_args", merged_extra)
+            return expand_params
+        except Exception:
+            class _ExpansionParamsProxy:
+                def __init__(self, base: Any, extra_args: dict[str, Any]) -> None:
+                    self._base = base
+                    self.extra_args = extra_args
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._base, name)
+
+            return _ExpansionParamsProxy(stage0_params, merged_extra)
 
     @staticmethod
     def _get_default_cache_config(cache_backend: str | None) -> dict[str, Any] | None:

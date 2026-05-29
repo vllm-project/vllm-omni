@@ -345,6 +345,91 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             return output
 
+    def execute_model_batch(
+        self,
+        reqs: list[OmniDiffusionRequest],
+        sched_req_ids: list[str],
+    ) -> BatchRunnerOutput:
+        """Execute a request-mode batch and return per-request outputs."""
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        if len(reqs) != len(sched_req_ids):
+            raise ValueError(f"reqs length ({len(reqs)}) does not match sched_req_ids length ({len(sched_req_ids)})")
+        if not reqs:
+            return BatchRunnerOutput.from_list([])
+
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        with grad_context:
+            for req in reqs:
+                if len(req.prompts) == 0:
+                    raise ValueError("Cannot execute model with empty request list")
+                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                    req,
+                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                    target_device=getattr(self.pipeline, "device", None),
+                )
+
+                if req.sampling_params.generator is None and req.sampling_params.seed is not None:
+                    if req.sampling_params.generator_device is not None:
+                        gen_device = req.sampling_params.generator_device
+                    elif self.device.type == "cpu":
+                        gen_device = "cpu"
+                    else:
+                        gen_device = self.device
+                    req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(
+                        req.sampling_params.seed
+                    )
+
+            if self.cache_backend is not None and self.cache_backend.is_enabled():
+                step_values = {
+                    req.sampling_params.num_inference_steps
+                    for req in reqs
+                    if req.sampling_params.num_inference_steps is not None
+                }
+                if len(step_values) == 1:
+                    self.cache_backend.refresh(self.pipeline, next(iter(step_values)))
+
+            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            if is_primary:
+                current_omni_platform.reset_peak_memory_stats()
+
+            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                with record_function("pipeline_forward_batch"):
+                    forward_batch = getattr(self.pipeline, "forward_batch", None)
+                    if callable(forward_batch):
+                        outputs = forward_batch(reqs)
+                    else:
+                        outputs = [self.pipeline.forward(req) for req in reqs]
+
+            if len(outputs) != len(reqs):
+                raise RuntimeError(f"Batched pipeline returned {len(outputs)} outputs for {len(reqs)} requests")
+
+            if is_primary and outputs:
+                self._record_peak_memory(outputs[0])
+                peak_memory_mb = outputs[0].peak_memory_mb
+                for output in outputs[1:]:
+                    output.peak_memory_mb = peak_memory_mb
+
+            if (
+                self.cache_backend is not None
+                and self.cache_backend.is_enabled()
+                and self.od_config.cache_backend == "cache_dit"
+                and self.od_config.enable_cache_dit_summary
+            ):
+                cache_summary(self.pipeline, details=True)
+
+            return BatchRunnerOutput.from_list(
+                [
+                    RunnerOutput(
+                        req_id=sched_req_id,
+                        step_index=None,
+                        finished=True,
+                        result=output,
+                    )
+                    for sched_req_id, output in zip(sched_req_ids, outputs)
+                ]
+            )
+
     # ------------------------------------------------------------------
     # Step-wise execution
     # ------------------------------------------------------------------

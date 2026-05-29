@@ -13,6 +13,7 @@ This module provides model-specific functions referenced by bagel.yaml:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -21,6 +22,14 @@ logger = logging.getLogger(__name__)
 
 CFG_TEXT_SUFFIX = "__cfg_text"
 CFG_IMG_SUFFIX = "__cfg_img"
+
+
+def _cfg_text_from_main_prefix_enabled(sampling_params: Any) -> bool:
+    raw = os.environ.get("BAGEL_CFG_TEXT_FROM_MAIN_PREFIX", "0")
+    if raw.strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    extra = getattr(sampling_params, "extra_args", None) or {}
+    return bool(extra.get("force_stage1_continue"))
 
 
 @dataclass
@@ -98,50 +107,57 @@ def expand_cfg_prompts(
 
     if "img2img" in modalities:
         IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
+        original_text = prompt.get("prompt", "")
+        parts = original_text.split(IMG2IMG_PLACEHOLDER, 1)
+        system_prefix = parts[0] if len(parts) > 1 else ""
 
         cfg_text_dict: dict[str, Any] = {
-            "prompt": f"{IMG2IMG_PLACEHOLDER}{neg_prompt}",
+            "prompt": f"{system_prefix}{IMG2IMG_PLACEHOLDER}{neg_prompt}",
             "modalities": ["img2img"],
         }
         mm_data = prompt.get("multi_modal_data")
         if mm_data:
             cfg_text_dict["multi_modal_data"] = mm_data
 
-        original_text = prompt.get("prompt", "")
         cfg_img_text = original_text.replace(IMG2IMG_PLACEHOLDER, "")
         cfg_img_dict: dict[str, Any] = {
             "prompt": cfg_img_text,
             "modalities": ["img2img"],
         }
 
-        return [
-            ExpandedPrompt(
-                prompt=cfg_text_dict,
-                role="cfg_text",
-                request_id_suffix=CFG_TEXT_SUFFIX,
-            ),
+        expanded = []
+        if not _cfg_text_from_main_prefix_enabled(sampling_params):
+            expanded.append(
+                ExpandedPrompt(
+                    prompt=cfg_text_dict,
+                    role="cfg_text",
+                    request_id_suffix=CFG_TEXT_SUFFIX,
+                )
+            )
+        expanded.append(
             ExpandedPrompt(
                 prompt=cfg_img_dict,
                 role="cfg_img",
                 request_id_suffix=CFG_IMG_SUFFIX,
-            ),
-        ]
+            )
+        )
+        return expanded
 
     return []
 
 
 GEN_THINK_SYSTEM_PROMPT = (
-    "You should first think about the planning process in the mind "
-    "and then generate the image. \n"
-    "The planning process is enclosed within <think> </think> tags, "
-    "i.e. <think> planning process here </think> image here"
+    "You should first think about the planning process in the mind and then "
+    "generate the image.\n"
+    "The planning process is enclosed within <think> </think> tags, i.e. "
+    "<think> planning process here </think> image here"
 )
 
 VLM_THINK_SYSTEM_PROMPT = (
-    "You should first think about the reasoning process in the mind "
-    "and then provide the user with the answer. \n"
-    "The reasoning process is enclosed within <think> </think> tags, "
-    "i.e. <think> reasoning process here </think> answer here"
+    "You should first think about the reasoning process in the mind and then "
+    "provide the user with the answer.\n"
+    "The reasoning process is enclosed within <think> </think> tags, i.e. "
+    "<think> reasoning process here </think> answer here"
 )
 
 
@@ -207,23 +223,26 @@ def expand_cfg_prompts_think(
             "prompt": cfg_img_text,
             "modalities": ["img2img"],
         }
-        if mm_data:
-            cfg_img_dict["multi_modal_data"] = mm_data
 
-        return [
-            ExpandedPrompt(
-                prompt=cfg_text_dict,
-                role="cfg_text",
-                request_id_suffix=CFG_TEXT_SUFFIX,
-                sampling_params_override=companion_params,
-            ),
+        expanded = []
+        if not _cfg_text_from_main_prefix_enabled(sampling_params):
+            expanded.append(
+                ExpandedPrompt(
+                    prompt=cfg_text_dict,
+                    role="cfg_text",
+                    request_id_suffix=CFG_TEXT_SUFFIX,
+                    sampling_params_override=companion_params,
+                )
+            )
+        expanded.append(
             ExpandedPrompt(
                 prompt=cfg_img_dict,
                 role="cfg_img",
                 request_id_suffix=CFG_IMG_SUFFIX,
                 sampling_params_override=companion_params,
-            ),
-        ]
+            )
+        )
+        return expanded
 
     return []
 

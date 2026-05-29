@@ -291,14 +291,26 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Adapt request-mode scheduler output to worker execute_model RPC."""
-        from vllm_omni.diffusion.worker.utils import RunnerOutput
+        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 
         self._ensure_open()
-        if scheduler_output.num_scheduled_reqs != 1:
-            raise ValueError(
-                f"Request mode currently supports batch_size=1, "
-                f"but got {scheduler_output.num_scheduled_reqs} scheduled requests."
+        if scheduler_output.num_scheduled_reqs == 0:
+            return BatchRunnerOutput.from_list([])
+        if scheduler_output.scheduled_cached_reqs.sched_req_ids:
+            raise ValueError("Request-mode batching only supports newly scheduled requests.")
+
+        if scheduler_output.num_scheduled_reqs > 1:
+            sched_req_ids = [new_req.sched_req_id for new_req in scheduler_output.scheduled_new_reqs]
+            reqs = [new_req.req for new_req in scheduler_output.scheduled_new_reqs]
+            result = self.collective_rpc(
+                "execute_model_batch",
+                args=(reqs, sched_req_ids, self.od_config),
+                unique_reply_rank=0,
+                exec_all_ranks=True,
             )
+            if isinstance(result, BaseRunnerOutput):
+                return result
+            raise RuntimeError(f"Unexpected response type for execute_model_batch: {type(result)!r}")
 
         new_req = scheduler_output.scheduled_new_reqs[0]
         result = self.collective_rpc(

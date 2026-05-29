@@ -370,6 +370,26 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def execute_model_batch(
+        self,
+        reqs: list[OmniDiffusionRequest],
+        sched_req_ids: list[str],
+        od_config: OmniDiffusionConfig,
+    ) -> BaseRunnerOutput:
+        """Execute a batched request-mode forward pass."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        if self.lora_manager is not None:
+            if any(req.sampling_params.lora_request is not None for req in reqs):
+                raise ValueError("Request-mode batching does not support LoRA yet.")
+            self.lora_manager.set_active_adapter(None)
+        profiler = self._get_profiler()
+        ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
+        with ctx:
+            output = self.model_runner.execute_model_batch(reqs, sched_req_ids)
+        if profiler:
+            profiler.step()
+        return output
+
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
@@ -994,6 +1014,15 @@ class WorkerWrapperBase:
             DiffusionOutput with generated results
         """
         return self.worker.execute_model(reqs, od_config)
+
+    def execute_model_batch(
+        self,
+        reqs: list[OmniDiffusionRequest],
+        sched_req_ids: list[str],
+        od_config: OmniDiffusionConfig,
+    ) -> BaseRunnerOutput:
+        """Execute a batched request-mode forward pass."""
+        return self.worker.execute_model_batch(reqs, sched_req_ids, od_config)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""

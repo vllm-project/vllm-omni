@@ -1295,6 +1295,17 @@ class Bagel(nn.Module):
         packed_position_ids: torch.LongTensor,
         packed_seqlens: torch.IntTensor,
     ):
+        packed_text_embedding = self.language_model.forward(
+            packed_text_ids=packed_text_ids,
+            return_embeddings_only=True,
+        ).packed_query_sequence
+        packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
+        packed_sequence[packed_text_indexes] = packed_text_embedding
+
+        padded_images = padded_images.to(
+            device=packed_text_embedding.device,
+            dtype=torch.bfloat16,
+        )
         padded_latent = vae_model.encode(padded_images)
 
         p = self.latent_patch_size
@@ -1307,6 +1318,9 @@ class Bagel(nn.Module):
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
         packed_timestep_embeds = self.time_embedder(packed_timesteps)
         packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + packed_pos_embed
+        if packed_latent.dtype != packed_sequence.dtype:
+            packed_latent = packed_latent.to(packed_sequence.dtype)
+        packed_sequence[packed_vae_token_indexes] = packed_latent
 
         # Mirror forward_cache_update_vit: build a full packed_sequence so MoE gen-mode
         # indexes (packed_text_indexes / packed_vae_token_indexes) match tensor length.
@@ -1443,15 +1457,22 @@ class Bagel(nn.Module):
 
         return past_key_values
 
-    def prepare_input(self, curr_kvlens, curr_rope, image_sizes, new_token_ids=None):
+    def prepare_input(self, curr_kvlens, curr_rope, image_sizes, new_token_ids=None, noise_seeds=None):
         packed_text_ids, packed_text_indexes = list(), list()
         packed_vae_position_ids, packed_vae_token_indexes, packed_init_noises = list(), list(), list()
-        packed_position_ids, packed_seqlens = list(), list()
+        packed_position_ids, packed_seqlens, packed_indexes = list(), list(), list()
+        packed_key_value_indexes = list()
 
-        query_curr = 0
-        for (H, W), curr_kvlen, curr_position_id in zip(image_sizes, curr_kvlens, curr_rope):
+        query_curr = curr = 0
+        for sample_idx, ((H, W), curr_kvlen, curr_position_id) in enumerate(zip(image_sizes, curr_kvlens, curr_rope)):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            curr += curr_kvlen
+
             packed_text_ids.append(new_token_ids["start_of_image"])
             packed_text_indexes.append(query_curr)
+
+            packed_indexes.append(curr)
+            curr += 1
             query_curr += 1
 
             vae_position_ids = self.get_flattened_position_ids(
@@ -1462,13 +1483,28 @@ class Bagel(nn.Module):
             h, w = H // self.latent_downsample, W // self.latent_downsample
             num_image_tokens = h * w
 
-            packed_init_noises.append(torch.randn(num_image_tokens, self.latent_channel * self.latent_patch_size**2))
+            generator = None
+            if noise_seeds is not None and noise_seeds[sample_idx] is not None:
+                generator = torch.Generator(device="cpu").manual_seed(int(noise_seeds[sample_idx]))
+            packed_init_noises.append(
+                torch.randn(
+                    num_image_tokens,
+                    self.latent_channel * self.latent_patch_size**2,
+                    generator=generator,
+                )
+            )
             packed_vae_token_indexes.extend(range(query_curr, query_curr + num_image_tokens))
             packed_seqlens.append(num_image_tokens + 2)
+
+            packed_indexes.extend(range(curr, curr + num_image_tokens))
+            curr += num_image_tokens
             query_curr += num_image_tokens
 
             packed_text_ids.append(new_token_ids["end_of_image"])
             packed_text_indexes.append(query_curr)
+
+            packed_indexes.append(curr)
+            curr += 1
             query_curr += 1
 
             packed_position_ids.extend([curr_position_id] * (num_image_tokens + 2))
@@ -1482,23 +1518,45 @@ class Bagel(nn.Module):
             "packed_vae_token_indexes": torch.tensor(packed_vae_token_indexes, dtype=torch.long),
             "packed_seqlens": torch.tensor(packed_seqlens, dtype=torch.int),
             "packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+            "packed_indexes": torch.tensor(packed_indexes, dtype=torch.long),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
         }
 
         return generation_input
 
-    def prepare_vae_latent(self, curr_kvlens, curr_rope, image_sizes, new_token_ids):
-        return self.prepare_input(curr_kvlens, curr_rope, image_sizes, new_token_ids)
+    def prepare_vae_latent(self, curr_kvlens, curr_rope, image_sizes, new_token_ids, noise_seeds=None):
+        return self.prepare_input(curr_kvlens, curr_rope, image_sizes, new_token_ids, noise_seeds=noise_seeds)
 
     def prepare_vae_latent_cfg(self, curr_kvlens, curr_rope, image_sizes):
-        packed_position_ids = list()
+        packed_position_ids, packed_indexes, packed_key_value_indexes = list(), list(), list()
 
+        query_curr = curr = 0
         for (H, W), curr_kvlen, curr_position_id in zip(image_sizes, curr_kvlens, curr_rope):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            curr += curr_kvlen
+
+            packed_indexes.append(curr)
+            curr += 1
+            query_curr += 1
+
             h, w = H // self.latent_downsample, W // self.latent_downsample
             num_image_tokens = h * w
+            packed_indexes.extend(range(curr, curr + num_image_tokens))
+            curr += num_image_tokens
+            query_curr += num_image_tokens
+
+            packed_indexes.append(curr)
+            curr += 1
+            query_curr += 1
+
             packed_position_ids.extend([curr_position_id] * (num_image_tokens + 2))
 
         generation_input = {
             "cfg_packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long),
+            "cfg_key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+            "cfg_packed_query_indexes": torch.tensor(packed_indexes, dtype=torch.long),
+            "cfg_packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
         }
 
         return generation_input
@@ -1547,6 +1605,7 @@ class Bagel(nn.Module):
         do_sample: bool = False,
         temperature: float = 1.0,
         end_token_id: int | None = None,
+        repeat_stop_n: int | None = None,
     ):
         """Autoregressive text generation (ported from original BAGEL).
 
@@ -1555,8 +1614,11 @@ class Bagel(nn.Module):
         """
         step = 0
         generated_sequence = []
+        repeat_limit = int(repeat_stop_n or 0)
+        repeat_count = 1
         curr_tokens = packed_start_tokens
         while step < max_length:
+            prev_tokens = curr_tokens.clone()
             generated_sequence.append(curr_tokens)
             query_lens = torch.ones_like(curr_tokens)
 
@@ -1584,9 +1646,148 @@ class Bagel(nn.Module):
 
             if end_token_id is not None and curr_tokens[0] == end_token_id:
                 break
+            if repeat_limit > 0:
+                if bool((curr_tokens == prev_tokens).all()):
+                    repeat_count += 1
+                else:
+                    repeat_count = 1
+                if repeat_count >= repeat_limit:
+                    break
 
         output_device = generated_sequence[0].device
         return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
+
+    @torch.no_grad()
+    def batch_generate_text(
+        self,
+        past_key_values: NaiveCache,
+        packed_key_value_indexes: torch.LongTensor,
+        key_values_lens: torch.IntTensor,
+        packed_start_tokens: torch.LongTensor,
+        packed_query_position_ids: torch.LongTensor,
+        max_length: int,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        end_token_id: int | None = None,
+        sampling_generators: list[torch.Generator | None] | None = None,
+        repeat_stop_n: int | None = None,
+    ) -> list[torch.Tensor]:
+        """Autoregressive batched text generation with per-row EOS tracking."""
+        device = None
+        for layer_idx in range(past_key_values.num_layers):
+            if past_key_values.key_cache[layer_idx] is not None:
+                device = past_key_values.key_cache[layer_idx].device
+                break
+        if device is None:
+            device = packed_start_tokens.device
+
+        packed_key_value_indexes = packed_key_value_indexes.to(device)
+        key_values_lens = key_values_lens.to(device)
+        packed_start_tokens = packed_start_tokens.to(device)
+        packed_query_position_ids = packed_query_position_ids.to(device)
+
+        batch_size = int(key_values_lens.numel())
+        generated_sequences: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        repeat_limit = int(repeat_stop_n or 0)
+        repeat_counts = torch.ones(batch_size, dtype=torch.int, device=device)
+        curr_tokens = packed_start_tokens.clone()
+
+        step = 0
+        while step < max_length:
+            prev_tokens = curr_tokens.clone()
+            active_before_sample = ~finished
+            for row_idx in range(batch_size):
+                if not bool(finished[row_idx]):
+                    generated_sequences[row_idx].append(curr_tokens[row_idx].clone())
+
+            query_lens = torch.ones_like(curr_tokens)
+            packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
+                0,
+                len(key_values_lens),
+                device=key_values_lens.device,
+                dtype=key_values_lens.dtype,
+            )
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for row_idx in range(len(uppacked)):
+                uppacked[row_idx] += row_idx
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+
+            output = self.language_model(
+                packed_text_ids=curr_tokens,
+                query_lens=query_lens,
+                packed_query_position_ids=packed_query_position_ids,
+                packed_query_indexes=packed_query_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=True,
+                is_causal=True,
+                mode="und",
+            )
+            past_key_values = output.past_key_values
+            pred_logits = self.language_model.lm_head(output.packed_query_sequence)
+
+            if do_sample:
+                probs = nn.functional.softmax(pred_logits / temperature, dim=-1)
+                if sampling_generators is not None:
+                    sampled_tokens = []
+                    for row_idx in range(batch_size):
+                        if bool(finished[row_idx]):
+                            sampled_tokens.append(curr_tokens[row_idx : row_idx + 1])
+                            continue
+                        generator = (
+                            sampling_generators[row_idx]
+                            if row_idx < len(sampling_generators)
+                            else None
+                        )
+                        sampled_tokens.append(
+                            torch.multinomial(
+                                probs[row_idx : row_idx + 1],
+                                num_samples=1,
+                                generator=generator,
+                            ).squeeze(0)
+                        )
+                    curr_tokens = torch.stack(sampled_tokens, dim=0).squeeze(1)
+                else:
+                    curr_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                curr_tokens = torch.argmax(pred_logits, dim=-1)
+
+            if end_token_id is not None:
+                finished = finished | (curr_tokens == end_token_id)
+
+            if repeat_limit > 0:
+                repeated = (curr_tokens == prev_tokens) & active_before_sample
+                repeat_counts = torch.where(
+                    repeated,
+                    repeat_counts + 1,
+                    torch.ones_like(repeat_counts),
+                )
+                finished = finished | (repeat_counts >= repeat_limit)
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for row_idx in range(len(uppacked)):
+                uppacked[row_idx] = torch.cat(
+                    [
+                        uppacked[row_idx],
+                        torch.tensor([uppacked[row_idx][-1] + 1], device=uppacked[row_idx].device),
+                    ],
+                    dim=0,
+                )
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+            key_values_lens = key_values_lens + 1
+            packed_query_position_ids = packed_query_position_ids + 1
+            step += 1
+
+            if bool(finished.all()):
+                break
+
+        return [
+            torch.stack(seq, dim=0) if seq else torch.empty(0, dtype=torch.long, device=device)
+            for seq in generated_sequences
+        ]
 
     def generate_image(
         self,
@@ -1860,29 +2061,30 @@ class Bagel(nn.Module):
         scheduler: object | None = None,
         scheduler_kwargs: dict | None = None,
     ):
-        """CFG parallel denoising loop: each rank computes one CFG branch.
+        """CFG parallel denoising loop.
 
-        Rank 0: gen branch (full conditioning)
-        Rank 1: text_cfg branch (unconditional text)
-        Rank 2: img_cfg branch (no image condition), only when cfg_img_scale > 1.0
+        cfg_parallel_size=2:
+            Rank 0 computes gen and, when enabled, img_cfg.
+            Rank 1 computes text_cfg.
+        cfg_parallel_size=3:
+            Rank 0 computes gen, rank 1 computes text_cfg, rank 2 computes img_cfg.
         """
         cfg_group = get_cfg_group()
         cfg_rank = get_classifier_free_guidance_rank()
         cfg_world_size = get_classifier_free_guidance_world_size()
         use_cfg_img = cfg_img_scale > 1.0
 
-        # Validate cfg_parallel_size vs cfg_img_scale consistency
+        # Validate cfg_parallel_size vs cfg_img_scale consistency.
+        if cfg_world_size not in (2, 3):
+            raise ValueError(
+                f"BAGEL CFG parallel supports cfg_parallel_size=2 or 3, "
+                f"but got cfg_parallel_size={cfg_world_size}."
+            )
         if cfg_world_size == 3 and not use_cfg_img:
             raise ValueError(
                 f"cfg_parallel_size=3 requires cfg_img_scale > 1.0, "
                 f"but got cfg_img_scale={cfg_img_scale}. "
                 f"Use cfg_parallel_size=2 for text-only CFG parallel(text2img), or set cfg_img_scale > 1.0."
-            )
-        if cfg_world_size == 2 and use_cfg_img:
-            raise ValueError(
-                f"Image CFG (cfg_img_scale={cfg_img_scale}) requires cfg_parallel_size=3, "
-                f"but got cfg_parallel_size=2. "
-                f"Use cfg_parallel_size=3 to enable image CFG in parallel mode."
             )
 
         # Ensure all ranks start with the same x_t (initial noise may differ
@@ -1890,21 +2092,40 @@ class Bagel(nn.Module):
         x_t = x_t.contiguous()
         cfg_group.broadcast(x_t, src=0)
 
-        # Select this rank's branch inputs
+        gen_branch = (
+            packed_position_ids,
+            packed_indexes,
+            past_key_values,
+            key_values_lens,
+            packed_key_value_indexes,
+        )
+        text_branch = (
+            cfg_text_packed_position_ids,
+            cfg_text_packed_query_indexes,
+            cfg_text_past_key_values,
+            cfg_text_key_values_lens,
+            cfg_text_packed_key_value_indexes,
+        )
+        img_branch = (
+            cfg_img_packed_position_ids,
+            cfg_img_packed_query_indexes,
+            cfg_img_past_key_values,
+            cfg_img_key_values_lens,
+            cfg_img_packed_key_value_indexes,
+        )
+
+        # Select this rank's primary branch for all_gather.
         if cfg_rank == 0:
-            # Gen branch: use main inputs directly
-            branch_position_ids = packed_position_ids
-            branch_past_key_values = past_key_values
+            branch = gen_branch
         elif cfg_rank == 1:
-            # Text CFG branch
-            branch_position_ids = cfg_text_packed_position_ids
-            branch_past_key_values = cfg_text_past_key_values
+            branch = text_branch
         elif cfg_rank == 2:
-            # Image CFG branch
-            branch_position_ids = cfg_img_packed_position_ids
-            branch_past_key_values = cfg_img_past_key_values
+            branch = img_branch
         else:
-            raise RuntimeError(f"Unexpected cfg_rank={cfg_rank} for Bagel 3-branch CFG parallel")
+            raise RuntimeError(f"Unexpected cfg_rank={cfg_rank} for BAGEL CFG parallel")
+        branch_position_ids, branch_indexes, branch_past_key_values, branch_key_values_lens, branch_key_value_indexes = (
+            branch
+        )
 
         trajectory_latents: list[torch.Tensor] | None = [] if return_trajectory_latents else None
         trajectory_timesteps: list[torch.Tensor] | None = [] if return_trajectory_latents else None
@@ -1921,7 +2142,7 @@ class Bagel(nn.Module):
             use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
 
             if use_cfg_this_step:
-                # CFG interval: each rank computes its own branch
+                # CFG interval: each rank computes its primary branch.
                 local_v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
@@ -1934,11 +2155,39 @@ class Bagel(nn.Module):
                     past_key_values=branch_past_key_values,
                 )
 
+                cfg_img_v_t = None
+                if use_cfg_img and cfg_world_size == 2:
+                    if cfg_rank == 0:
+                        (
+                            img_position_ids,
+                            img_indexes,
+                            img_past_key_values,
+                            img_key_values_lens,
+                            img_key_value_indexes,
+                        ) = img_branch
+                        cfg_img_v_t = self.forward_single_branch(
+                            x_t=x_t,
+                            timestep=timestep,
+                            packed_vae_token_indexes=packed_vae_token_indexes,
+                            packed_vae_position_ids=packed_vae_position_ids,
+                            packed_text_ids=packed_text_ids,
+                            packed_text_indexes=packed_text_indexes,
+                            packed_indexes=img_indexes,
+                            packed_position_ids=img_position_ids,
+                            packed_seqlens=packed_seqlens,
+                            key_values_lens=img_key_values_lens,
+                            past_key_values=img_past_key_values,
+                            packed_key_value_indexes=img_key_value_indexes,
+                        )
+                    else:
+                        cfg_img_v_t = torch.empty_like(local_v_t)
+                    cfg_img_v_t = cfg_group.broadcast(cfg_img_v_t.contiguous(), src=0)
+
                 gathered = cfg_group.all_gather(local_v_t, separate_tensors=True)
                 v_t = self._combine_cfg(
                     gathered[0],
                     gathered[1],
-                    gathered[2] if (use_cfg_img and len(gathered) > 2) else None,
+                    cfg_img_v_t if cfg_world_size == 2 else (gathered[2] if use_cfg_img else None),
                     cfg_text_scale,
                     cfg_img_scale,
                     cfg_renorm_type,

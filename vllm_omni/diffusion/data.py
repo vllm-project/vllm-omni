@@ -602,6 +602,18 @@ class OmniDiffusionConfig:
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
+    # Optional request-mode micro-batch fill wait. Diffusion request-mode
+    # execution is expensive enough that waiting briefly for compatible
+    # requests can improve throughput substantially.
+    request_batch_wait_ms: int = 0
+    # Optional idle cutoff while filling a request-mode micro-batch. When set,
+    # dispatch a partial batch after this many milliseconds without additional
+    # compatible arrivals instead of always waiting until request_batch_wait_ms.
+    request_batch_idle_ms: int = 0
+    # Minimum waiting requests before request_batch_idle_ms may dispatch a
+    # partial batch. This avoids accidentally launching singleton batches.
+    request_batch_idle_min_size: int = 2
+
     # Supplementary model specific parameters
     extras: dict[str, Any] = Field(default_factory=dict)
 
