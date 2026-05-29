@@ -59,6 +59,10 @@ def _get_coordinator_mp_context() -> multiprocessing.context.BaseContext:
     ready pipe, which can exceed the coordinator startup timeout. Prefer
     ``fork`` on platforms that support it.
 
+    ``fork`` must happen before the parent initializes CUDA or owns long-lived
+    ZMQ sockets; otherwise the child inherits unsafe state. If coordinator
+    startup moves later, switch this to ``spawn``/``forkserver``.
+
     TODO: make the coordinator child entry cheap and spawn-safe, then revisit
     whether ``spawn`` is still needed here.
     """
