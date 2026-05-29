@@ -81,9 +81,9 @@ class ImageGenerationRequest(BaseModel):
     @field_validator("response_format")
     @classmethod
     def validate_response_format(cls, v):
-        """Validate response format - only b64_json is supported."""
-        if v is not None and v != ResponseFormat.B64_JSON:
-            raise ValueError(f"Only 'b64_json' response format is supported, got: {v}")
+        """Validate response format - only b64_json and file are supported."""
+        if v is not None and v not in (ResponseFormat.B64_JSON, ResponseFormat.FILE):
+            raise ValueError(f"Only 'b64_json' or 'file' response format is supported, got: {v}")
         return v
 
     @field_validator("layers")

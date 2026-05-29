@@ -35,48 +35,18 @@ curl -X POST http://localhost:8000/v1/images/generations \
 **Using curl save to file:**
 
 ```base
-curl -X POST http://localhost:8000/v1/images/generations \
+curl -o dragon.png -X POST http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "a dragon laying over the spine of the Green Mountains of Vermont",
     "size": "1024x1024",
     "seed": 42,
-    "response_format":"file",
-  }' \
-  -O dragon.png
+    "response_format":"file"
+  }'
 ```
 
 
 **Using Python:**
-
-```python
-import requests
-import base64
-from PIL import Image
-import io
-
-response = requests.post(
-    "http://localhost:8000/v1/images/generations",
-    json={
-        "prompt": "a black and white cat wearing a princess tiara",
-        "size": "1024x1024",
-        "num_inference_steps": 50,
-        "seed": 42,
-        "response_format":"file"
-    }
-)
-
-# save to file
-content_disposition = response.headers.get("Content-Disposition", "")
-match = re.search(r'filename="?(.+)"?', content_disposition)
-filename = match.group(1) if match else "save.png"
-with open(filename, "wb") as f:
-    for chunk in response.iter_content(8192):
-        f.write(chunk)
-print("saved:", filename)
-```
-
-**Using Python save to file:**
 
 ```python
 import requests
@@ -99,6 +69,36 @@ img_data = response.json()["data"][0]["b64_json"]
 img_bytes = base64.b64decode(img_data)
 img = Image.open(io.BytesIO(img_bytes))
 img.save("cat.png")
+```
+
+**Using Python save to file:**
+
+```python
+import requests
+import base64
+from PIL import Image
+import io
+import re
+
+response = requests.post(
+    "http://localhost:8000/v1/images/generations",
+    json={
+        "prompt": "a black and white cat wearing a princess tiara",
+        "size": "1024x1024",
+        "num_inference_steps": 50,
+        "seed": 42,
+        "response_format":"file"
+    }
+)
+
+# save to file
+content_disposition = response.headers.get("Content-Disposition", "")
+match = re.search(r'filename="?(.+)"?', content_disposition)
+filename = match.group(1) if match else "save.png"
+with open(filename, "wb") as f:
+    for chunk in response.iter_content(8192):
+        f.write(chunk)
+print("saved:", filename)
 ```
 
 **Using OpenAI SDK:**
