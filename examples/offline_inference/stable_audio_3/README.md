@@ -1,10 +1,10 @@
 # Stable Audio 3 (medium) — offline inference
 
-> Status: **scaffold / port in progress** — issue [#3787](https://github.com/vllm-project/vllm-omni/issues/3787).
-> The pipeline classes exist (see `vllm_omni/diffusion/models/stable_audio_3/`) but the
-> DiT and SAME autoencoder must still be ported from
-> [Stability-AI/stable-audio-3](https://github.com/Stability-AI/stable-audio-3) (MIT).
-> Once that is done, the commands below will work.
+> Status: **text-to-audio working** — issue [#3787](https://github.com/vllm-project/vllm-omni/issues/3787).
+> The DiT + SAME autoencoder are ported from
+> [Stability-AI/stable-audio-3](https://github.com/Stability-AI/stable-audio-3) (MIT)
+> under `vllm_omni/diffusion/models/stable_audio_3/`. audio-to-audio editing and
+> inpainting are not wired up yet.
 
 ## Model
 
@@ -17,13 +17,25 @@ Small variants are CPU-targeted and **not** the primary serving target:
 
 Stable Audio 3 **Large** (2.7B) is API-only and out of scope.
 
+## Download
+
+`stabilityai/stable-audio-3-medium` is **gated** — accept the license on its
+[model page](https://huggingface.co/stabilityai/stable-audio-3-medium) and
+`hf auth login` first. The HF repo does not ship the `model_index.json` /
+`transformer/config.json` that vLLM-Omni's engine uses for model discovery, so
+download via the helper script, which fetches the weights and writes both files:
+
+```bash
+python download_stable_audio_3.py --output-dir ./stable-audio-3-medium
+```
+
 ## Run
 
-The shared `text_to_audio.py` driver works for SA3 as well — just pass `--model`:
+Point the shared `text_to_audio.py` driver at the prepared local directory:
 
 ```bash
 python ../text_to_audio/text_to_audio.py \
-    --model stabilityai/stable-audio-3-medium \
+    --model ./stable-audio-3-medium \
     --prompt "An ambient drone evolving slowly with shimmering overtones" \
     --audio-length 120.0 \
     --num-inference-steps 100 \

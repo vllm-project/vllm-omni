@@ -35,7 +35,7 @@ from typing import Any, ClassVar
 import torch
 from torch import nn
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -263,6 +263,10 @@ class StableAudio3Pipeline(
             ctype = cinfo["type"]
             ccfg = {"output_dim": cond_dim, **cinfo["config"]}
             if ctype == "t5gemma":
+                # Local checkpoint: load T5Gemma from {model}/{subfolder} instead of
+                # the HF repo_id (which would require network access).
+                if os.path.exists(self.od_config.model):
+                    ccfg.setdefault("model_path", self.od_config.model)
                 conditioners[cid] = T5GemmaConditioner(**ccfg)
             elif ctype == "number":
                 conditioners[cid] = NumberConditioner(**ccfg)
@@ -372,6 +376,22 @@ class StableAudio3Pipeline(
             device=device,
         )
 
+        # --- 5b. Inject default inpaint conditioning ---------------------
+        # SA3 always routes inpaint_mask + inpaint_masked_input through
+        # local_add_cond. For pure text-to-audio: all-zero mask = generate
+        # everything, zero masked input = no source audio.
+        # PORT_FROM: model.py:280-297
+        io_channels = self.diffusion.io_channels
+        inpaint_mask = torch.zeros((batch_size, 1, latent_sample_size), device=device)
+        inpaint_masked_input = torch.zeros(
+            (batch_size, io_channels, latent_sample_size), device=device
+        )
+        conditioning_tensors["inpaint_mask"] = [inpaint_mask]
+        conditioning_tensors["inpaint_masked_input"] = [inpaint_masked_input]
+        if negative_conditioning_tensors:
+            negative_conditioning_tensors["inpaint_mask"] = [inpaint_mask]
+            negative_conditioning_tensors["inpaint_masked_input"] = [inpaint_masked_input]
+
         # --- 6. Route conditioning into the 6 ConditionedDiffusion buckets
         cond_inputs = self.diffusion.get_conditioning_inputs(conditioning_tensors)
         if negative_conditioning_tensors:
@@ -405,7 +425,10 @@ class StableAudio3Pipeline(
         self._current_timestep = None
 
         # --- 9. Decode latents → audio ----------------------------------
-        audio = self.pretransform.decode(latents)
+        # The DiT runs in the engine compute dtype (e.g. bf16) but the SAME
+        # autoencoder runs in fp32; cast latents to the VAE dtype before decode.
+        vae_dtype = next(self.pretransform.parameters()).dtype
+        audio = self.pretransform.decode(latents.to(vae_dtype))
 
         # --- 10. Trim + wrap ---------------------------------------------
         target_samples = int(duration * self.sample_rate)
@@ -419,6 +442,41 @@ class StableAudio3Pipeline(
 
     # ------------------------------------------------------------------ weight loading
 
+    @staticmethod
+    def _remap_weight_name(name: str) -> str:
+        """Upstream checkpoint name -> vllm-omni param name.
+
+        The checkpoint is the state_dict of upstream ConditionedDiffusionModelWrapper,
+        whose DiT lives under ``model.`` (wrapper.model = DiTWrapper). Here the same
+        DiTWrapper is registered as ``diffusion_model``, so the only rename needed is the
+        leading ``model.`` -> ``diffusion_model.``. ``pretransform.*`` and
+        ``conditioner.*`` match verbatim (verified: 997/997 tensors, zero shape mismatch).
+        """
+        if name.startswith("model."):
+            return "diffusion_model." + name[len("model."):]
+        return name
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """AutoWeightsLoader entry — delegates to each component's load_weights."""
-        return AutoWeightsLoader(self).load_weights(weights)
+        """Load the upstream SA3 checkpoint into the pipeline module tree.
+
+        Direct remap + copy (upstream ``copy_state_dict`` style) rather than
+        AutoWeightsLoader: the upstream key namespace (``model.model.*``,
+        ``pretransform.model.*``, ``conditioner.*``) does not align with
+        AutoWeightsLoader's attribute-based routing, and T5Gemma is loaded separately in
+        ``__init__`` (hidden from ``named_parameters`` when frozen).
+        """
+        params = dict(self.named_parameters())
+        buffers = dict(self.named_buffers())
+        loaded: set[str] = set()
+        for name, tensor in weights:
+            mapped = self._remap_weight_name(name)
+            target = params.get(mapped)
+            if target is not None:
+                default_weight_loader(target, tensor)
+                loaded.add(mapped)
+                continue
+            buf = buffers.get(mapped)
+            if buf is not None:
+                buf.copy_(tensor.to(buf.dtype))
+                loaded.add(mapped)
+        return loaded

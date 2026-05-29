@@ -33,6 +33,7 @@ from torch.nn import functional as F
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.models.stable_audio_3.conditioners import ExpoFourierFeatures
 
 
 # Stub LoRA helpers (model-side no-ops; vllm-omni framework handles LoRA at serving layer)
