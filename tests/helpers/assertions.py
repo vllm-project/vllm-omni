@@ -481,7 +481,6 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
             if "text" in modalities:
                 transcript = (response.audio_content or "").strip()
                 text_output = (response.text_content or "").strip()
-<<<<<<< HEAD
                 # For very short outputs (e.g. one-word answers), n-gram cosine
                 # similarity with length penalty is unreliable because Whisper
                 # may hallucinate extra context around the short utterance.  Use
@@ -506,16 +505,8 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                         transcript.lower(),
                         text_output.lower(),
                     )
-                    assert similarity > 0.9, "The audio content is not same as the text"
                     print(f"similarity is: {similarity}")
-=======
-                similarity = cosine_similarity_text(
-                    transcript.lower(),
-                    text_output.lower(),
-                )
-                print(f"similarity is: {similarity}")
-                assert similarity > similarity_threshold, "The audio content is not same as the text"
->>>>>>> upstream/main
+                    assert similarity > similarity_threshold, "The audio content is not same as the text"
             if audio_ref_text:
                 audio_similarity = cosine_similarity_text(
                     response.audio_content.lower(),

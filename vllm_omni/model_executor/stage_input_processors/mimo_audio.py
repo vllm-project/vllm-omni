@@ -148,8 +148,8 @@ def llm2code2wav_async_chunk(
     returns payload only when chunk_size is full or request is finished; returns None when waiting.
     """
     # Null guard: chunk_transfer_adapter calls this every emit step
-    # including no-output steps where pooling_output is None.
-    if pooling_output is None or not isinstance(pooling_output, dict):
+    # including no-output steps where multimodal_output is None.
+    if multimodal_output is None or not isinstance(multimodal_output, dict):
         if is_finished:
             connector = getattr(transfer_manager, "connector", None)
             raw_cfg = getattr(connector, "config", {}) or {}

@@ -404,7 +404,13 @@ class OmniRequestState(RequestState):
         directly with ``prompt_logprobs=None``.
         """
         if self.logprobs_processor is not None:
-            return super()._new_request_output(external_req_id, outputs, finished, kv_transfer_params, prompt_routed_experts)
+            return super()._new_request_output(
+                external_req_id,
+                outputs,
+                finished,
+                kv_transfer_params,
+                prompt_routed_experts,
+            )
 
         # No-detokenizer path: build RequestOutput directly.
         prompt_token_ids = self.prompt_token_ids

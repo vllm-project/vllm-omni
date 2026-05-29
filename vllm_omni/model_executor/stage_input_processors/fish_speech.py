@@ -99,7 +99,7 @@ def _extract_last_frame(multimodal_output: dict[str, Any]) -> torch.Tensor | Non
         return None
     if audio_codes.ndim == 2:
         frame = audio_codes[-1]
-        valid = pooling_output.get("audio_code_valid")
+        valid = multimodal_output.get("audio_code_valid")
         if isinstance(valid, torch.Tensor) and valid.numel() > 0:
             is_valid = bool(valid.reshape(-1)[-1].item())
         elif valid is not None:

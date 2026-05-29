@@ -209,7 +209,7 @@ def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_ad
     request.num_computed_tokens = 10
     request.num_output_placeholders = 2
 
-    adapter.save_async(pooling_output=None, request=request)
+    adapter.save_async(multimodal_output=None, request=request)
 
     assert adapter.requests_num_chunks_sent["external-async"] == 8
     assert len(adapter._pending_save_reqs) == 1
