@@ -100,7 +100,7 @@ from vllm_omni.engine.stage_init_utils import (
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
-    setup_stage_devices,
+    stage_runtime_setup,
     terminate_alive_proc,
 )
 from vllm_omni.engine.stage_pool import StagePool, StagePoolClient
@@ -354,6 +354,7 @@ class AsyncOmniEngine:
         self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
+        self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
 
@@ -875,50 +876,53 @@ class AsyncOmniEngine:
                     with llm_stage_launch_lock:
                         previous_visible_devices = os.environ.get(device_control_env)
                         try:
-                            setup_stage_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
-                            vllm_config = plan.stage_vllm_config
-                            executor_class = plan.executor_class
-                            assert vllm_config is not None
-                            assert executor_class is not None
-                            engine_args_dict = build_engine_args_dict(
-                                stage_cfg,
-                                self.model,
-                                stage_connector_spec=plan.stage_connector_spec,
-                                cli_tokenizer=getattr(self, "tokenizer", None),
-                            )
-                            lock_fds = acquire_device_locks(
+                            with stage_runtime_setup(
                                 plan.metadata.stage_id,
-                                engine_args_dict,
-                                stage_init_timeout,
-                            )
-                            if self.single_stage_mode and self._omni_master_server is not None:
-                                coord_router_addr: str | None = (
-                                    self._coordinator_runtime.router_address
-                                    if self._coordinator_runtime is not None
-                                    else None
+                                plan.metadata.runtime_cfg,
+                            ):
+                                vllm_config = plan.stage_vllm_config
+                                executor_class = plan.executor_class
+                                assert vllm_config is not None
+                                assert executor_class is not None
+                                engine_args_dict = build_engine_args_dict(
+                                    stage_cfg,
+                                    self.model,
+                                    stage_connector_spec=plan.stage_connector_spec,
+                                    cli_tokenizer=getattr(self, "tokenizer", None),
                                 )
-                                engine_manager, coordinator, addresses = launch_stack.enter_context(
-                                    launch_omni_core_engines(
+                                lock_fds = acquire_device_locks(
+                                    plan.metadata.stage_id,
+                                    engine_args_dict,
+                                    stage_init_timeout,
+                                )
+                                if self.single_stage_mode and self._omni_master_server is not None:
+                                    coord_router_addr: str | None = (
+                                        self._coordinator_runtime.router_address
+                                        if self._coordinator_runtime is not None
+                                        else None
+                                    )
+                                    engine_manager, coordinator, addresses = launch_stack.enter_context(
+                                        launch_omni_core_engines(
+                                            vllm_config=vllm_config,
+                                            executor_class=executor_class,
+                                            log_stats=False,
+                                            omni_master_server=self._omni_master_server,
+                                            stage_id=plan.metadata.stage_id,
+                                            stage_config=stage_cfg,
+                                            replica_id=plan.replica_id,
+                                            omni_coordinator_address=coord_router_addr,
+                                        )
+                                    )
+                                else:
+                                    addresses, proc, handshake_address = spawn_stage_core(
                                         vllm_config=vllm_config,
                                         executor_class=executor_class,
                                         log_stats=False,
-                                        omni_master_server=self._omni_master_server,
-                                        stage_id=plan.metadata.stage_id,
-                                        stage_config=stage_cfg,
-                                        replica_id=plan.replica_id,
-                                        omni_coordinator_address=coord_router_addr,
                                     )
+                                logger.info(
+                                    "[AsyncOmniEngine] Stage %s engine launch started",
+                                    plan.metadata.stage_id,
                                 )
-                            else:
-                                addresses, proc, handshake_address = spawn_stage_core(
-                                    vllm_config=vllm_config,
-                                    executor_class=executor_class,
-                                    log_stats=False,
-                                )
-                            logger.info(
-                                "[AsyncOmniEngine] Stage %s engine launch started",
-                                plan.metadata.stage_id,
-                            )
                         finally:
                             if previous_visible_devices is None:
                                 current_omni_platform.unset_device_control_env_var()
@@ -1017,68 +1021,71 @@ class AsyncOmniEngine:
                 with stage_launch_lock:
                     previous_visible_devices = os.environ.get(device_control_env)
                     try:
-                        setup_stage_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
-                        omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
-                        if omni_conn_cfg:
-                            inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                        inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self.stage_configs)
-                        if self.single_stage_mode:
-                            assert self._omni_master_server is not None
-                            od_config = build_diffusion_config(self.model, plan.stage_cfg, plan.metadata)
-                            lock_fds = acquire_diffusion_device_locks(
-                                plan.metadata.stage_id,
-                                od_config,
-                                stage_init_timeout,
-                            )
-                            handshake_address, request_address, response_address = register_stage_with_omni_master(
-                                omni_master_address=self._omni_master_server.address,
-                                omni_master_port=self._omni_master_server.port,
-                                omni_stage_id=plan.metadata.stage_id,
-                                omni_stage_config=plan.stage_cfg,
-                                return_addresses=True,
-                                replica_id=plan.replica_id,
-                            )
-                            logger.info(
-                                "[AsyncOmniEngine] Stage %s diffusion registration completed",
-                                plan.metadata.stage_id,
-                            )
-                            coord_router_addr: str | None = (
-                                self._coordinator_runtime.router_address
-                                if self._coordinator_runtime is not None
-                                else None
-                            )
-                            proc, _, _, _ = spawn_diffusion_proc(
-                                self.model,
-                                od_config,
-                                handshake_address=handshake_address,
-                                request_address=request_address,
-                                response_address=response_address,
-                                omni_coordinator_address=coord_router_addr,
-                                omni_stage_id=plan.metadata.stage_id,
-                                omni_replica_id=plan.replica_id,
-                            )
-                            complete_diffusion_handshake(proc, handshake_address, stage_init_timeout)
-                            logger.info(
-                                "[AsyncOmniEngine] Stage %s diffusion startup completed",
-                                plan.metadata.stage_id,
-                            )
-                            client = StageDiffusionClient.from_addresses(
-                                plan.metadata,
-                                request_address=request_address,
-                                response_address=response_address,
-                                proc=proc,
-                                batch_size=self.diffusion_batch_size,
-                            )
-                        else:
-                            client = initialize_diffusion_stage(
-                                plan.metadata.stage_id,
-                                self.model,
-                                plan.stage_cfg,
-                                plan.metadata,
-                                stage_init_timeout=stage_init_timeout,
-                                batch_size=self.diffusion_batch_size,
-                                use_inline=self.num_stages == 1 and plan.num_replicas == 1,
-                            )
+                        with stage_runtime_setup(
+                            plan.metadata.stage_id,
+                            plan.metadata.runtime_cfg,
+                        ):
+                            omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
+                            if omni_conn_cfg:
+                                inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
+                            inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self.stage_configs)
+                            if self.single_stage_mode:
+                                assert self._omni_master_server is not None
+                                od_config = build_diffusion_config(self.model, plan.stage_cfg, plan.metadata)
+                                lock_fds = acquire_diffusion_device_locks(
+                                    plan.metadata.stage_id,
+                                    od_config,
+                                    stage_init_timeout,
+                                )
+                                handshake_address, request_address, response_address = register_stage_with_omni_master(
+                                    omni_master_address=self._omni_master_server.address,
+                                    omni_master_port=self._omni_master_server.port,
+                                    omni_stage_id=plan.metadata.stage_id,
+                                    omni_stage_config=plan.stage_cfg,
+                                    return_addresses=True,
+                                    replica_id=plan.replica_id,
+                                )
+                                logger.info(
+                                    "[AsyncOmniEngine] Stage %s diffusion registration completed",
+                                    plan.metadata.stage_id,
+                                )
+                                coord_router_addr: str | None = (
+                                    self._coordinator_runtime.router_address
+                                    if self._coordinator_runtime is not None
+                                    else None
+                                )
+                                proc, _, _, _ = spawn_diffusion_proc(
+                                    self.model,
+                                    od_config,
+                                    handshake_address=handshake_address,
+                                    request_address=request_address,
+                                    response_address=response_address,
+                                    omni_coordinator_address=coord_router_addr,
+                                    omni_stage_id=plan.metadata.stage_id,
+                                    omni_replica_id=plan.replica_id,
+                                )
+                                complete_diffusion_handshake(proc, handshake_address, stage_init_timeout)
+                                logger.info(
+                                    "[AsyncOmniEngine] Stage %s diffusion startup completed",
+                                    plan.metadata.stage_id,
+                                )
+                                client = StageDiffusionClient.from_addresses(
+                                    plan.metadata,
+                                    request_address=request_address,
+                                    response_address=response_address,
+                                    proc=proc,
+                                    batch_size=self.diffusion_batch_size,
+                                )
+                            else:
+                                client = initialize_diffusion_stage(
+                                    plan.metadata.stage_id,
+                                    self.model,
+                                    plan.stage_cfg,
+                                    plan.metadata,
+                                    stage_init_timeout=stage_init_timeout,
+                                    batch_size=self.diffusion_batch_size,
+                                    use_inline=self.num_stages == 1 and plan.num_replicas == 1,
+                                )
                     finally:
                         if previous_visible_devices is None:
                             current_omni_platform.unset_device_control_env_var()
@@ -1161,35 +1168,37 @@ class AsyncOmniEngine:
                 primary_exc = exc
                 break
 
-        # --- 2) LLM replicas: parallel init via a scoped ThreadPoolExecutor. ---
+        # --- 2) LLM replicas: parallel init via a long-lived ThreadPoolExecutor. ---
         if primary_exc is None and llm_replicas:
             future_to_replica: dict[concurrent.futures.Future[StagePoolClient], tuple[int, int]] = {}
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, len(llm_replicas)),
-                thread_name_prefix="stage-init",
-            ) as init_executor:
-                for stage_idx, replica in llm_replicas:
-                    future = init_executor.submit(
-                        self._initialize_replica,
-                        replica,
-                        stage_init_timeout,
-                        stage_launch_lock,
-                    )
-                    future_to_replica[future] = (stage_idx, replica.replica_id)
+            if getattr(self, "_stage_init_executor", None) is None:
+                self._stage_init_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max(1, len(llm_replicas)),
+                    thread_name_prefix="stage-init",
+                )
+            init_executor = self._stage_init_executor
+            for stage_idx, replica in llm_replicas:
+                future = init_executor.submit(
+                    self._initialize_replica,
+                    replica,
+                    stage_init_timeout,
+                    stage_launch_lock,
+                )
+                future_to_replica[future] = (stage_idx, replica.replica_id)
 
-                for future in concurrent.futures.as_completed(future_to_replica):
-                    stage_idx, replica_id = future_to_replica[future]
-                    try:
-                        initialized_clients_by_stage[stage_idx][replica_id] = future.result()
-                    except concurrent.futures.CancelledError:
-                        continue
-                    except Exception as exc:
-                        if primary_exc is None:
-                            primary_exc = exc
-                            for other_future in future_to_replica:
-                                if other_future is future:
-                                    continue
-                                other_future.cancel()
+            for future in concurrent.futures.as_completed(future_to_replica):
+                stage_idx, replica_id = future_to_replica[future]
+                try:
+                    initialized_clients_by_stage[stage_idx][replica_id] = future.result()
+                except concurrent.futures.CancelledError:
+                    continue
+                except Exception as exc:
+                    if primary_exc is None:
+                        primary_exc = exc
+                        for other_future in future_to_replica:
+                            if other_future is future:
+                                continue
+                            other_future.cancel()
 
         if primary_exc is not None:
             setattr(primary_exc, "_initialized_clients_by_stage", initialized_clients_by_stage)
@@ -1879,9 +1888,9 @@ class AsyncOmniEngine:
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
             enable_expert_parallel = normalized_kwargs.get("enable_expert_parallel") or False
-            use_hsdp = normalized_kwargs.get("use_hsdp", False)
-            hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
-            hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size", 1)
+            use_hsdp = normalized_kwargs.get("use_hsdp") or False
+            hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size") or -1
+            hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size") or 1
             if sequence_parallel_size is None:
                 sequence_parallel_size = ulysses_degree * ring_degree
 
@@ -1940,6 +1949,8 @@ class AsyncOmniEngine:
                 "mp" if kwargs.get("distributed_executor_backend") is None else kwargs["distributed_executor_backend"]
             ),
             "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
+            "enable_prompt_embed_cache": kwargs.get("enable_prompt_embed_cache", False),
+            "prompt_embed_cache_size": kwargs.get("prompt_embed_cache_size", 32),
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
@@ -2417,6 +2428,11 @@ class AsyncOmniEngine:
             self.orchestrator_thread.join(timeout=10)
             if self.orchestrator_thread.is_alive():
                 logger.warning("[AsyncOmniEngine] Orchestrator thread did not exit in time")
+
+        stage_init_executor = getattr(self, "_stage_init_executor", None)
+        if stage_init_executor is not None:
+            stage_init_executor.shutdown(wait=False, cancel_futures=True)
+            self._stage_init_executor = None
 
         for q in (self.request_queue, self.output_queue, self.rpc_output_queue):
             try:

@@ -25,6 +25,27 @@ from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
 logger = init_logger(__name__)
 
 
+def _codec_ids_from_payload_or_input(
+    input_ids: torch.Tensor,
+    runtime_info: dict[str, Any] | None,
+) -> torch.Tensor:
+    """Prefer connector-delivered codec ids over token placeholders.
+
+    In non-async full-payload mode, the scheduler only needs placeholder
+    token ids for allocation.  The real codec sequence is delivered through
+    model_intermediate_buffer as ``codes.audio``.
+    """
+    if isinstance(runtime_info, dict):
+        codes = runtime_info.get("codes")
+        if isinstance(codes, dict):
+            audio = codes.get("audio")
+            if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+                return audio.reshape(-1).to(device=input_ids.device, dtype=torch.long)
+            if isinstance(audio, (list, tuple)) and audio:
+                return torch.as_tensor(audio, device=input_ids.device, dtype=torch.long).reshape(-1)
+    return input_ids.reshape(-1).to(dtype=torch.long)
+
+
 class Qwen3TTSCode2Wav(nn.Module):
     """Stage-1 code2wav model for Qwen3-TTS (GenerationModelRunner).
     Consumes frame-aligned codec tokens from input_ids and decodes waveform
@@ -239,6 +260,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
             )
 
+        runtime_infos = runtime_additional_information or []
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
@@ -246,14 +268,18 @@ class Qwen3TTSCode2Wav(nn.Module):
         valid_codes_qf: list[torch.Tensor] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
-        if runtime_additional_information is not None:
-            for i, info in enumerate(runtime_additional_information):
+        if runtime_infos:
+            for i, info in enumerate(runtime_infos):
                 if i >= len(left_context_size):
                     break
+                if not isinstance(info, dict):
+                    continue
                 meta = info.get("meta", {})
                 if "left_context_size" in meta:
                     left_context_size[i] = meta["left_context_size"]
         for i, req_ids in enumerate(request_ids_list):
+            runtime_info = runtime_infos[i] if i < len(runtime_infos) else None
+            req_ids = _codec_ids_from_payload_or_input(req_ids, runtime_info)
             if req_ids.numel() < 1:
                 parsed.append((0, 0))
                 continue

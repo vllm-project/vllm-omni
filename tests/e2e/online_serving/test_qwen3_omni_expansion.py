@@ -61,7 +61,11 @@ test_params = [
             model=model,
             stage_config_path=default_path,
             use_stage_cli=True,
-            server_args=["--no-async-chunk"],
+            server_args=[
+                "--no-async-chunk",
+                "--stage-overrides",
+                '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
+            ],
         ),
         id="default",
     ),
@@ -539,3 +543,24 @@ def test_language_001(omni_server, openai_client) -> None:
     }
 
     openai_client.send_omni_request(request_config)
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text only (long-form generation prompt).
+    Output Modal: text, audio (default ``modalities``);
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text="Tell a 300-word story.",
+    )
+
+    request_config = {"model": omni_server.model, "messages": messages, "stream": True}
+    responses = openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    text = responses[0].text_content if responses else ""
+    word_count = len(text.split())
+    assert word_count >= 200, f"Expected at least 200 words in long output, got {word_count}"

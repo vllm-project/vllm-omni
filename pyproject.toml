@@ -249,7 +249,11 @@ extend-ignore-identifiers-re = [
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
     ".*[Nn][Dd]3.*",
+<<<<<<< HEAD
     ".*updator.*",
+=======
+    "byt5.*",
+>>>>>>> upstream/main
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
@@ -262,3 +266,4 @@ Vai = "Vai"
 tockens = "tockens"
 CANN = "CANN"
 ND = "ND"
+byt5 = "byt5"

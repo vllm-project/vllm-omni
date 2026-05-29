@@ -77,7 +77,7 @@ class DefaultAdapter:
                 os.path.join("transformer", "config.json"),
                 od_config.model,
             )
-            od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+            od_config.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
 
         loader = DiffusersPipelineLoader(LoadConfig(), od_config=od_config)
         # load_model will handle dtypes / device placement, put in .eval() mode
@@ -202,6 +202,7 @@ class TeaCacheCoefficientEstimator:
         self.hook.start_collection()
         req = OmniDiffusionRequest(
             prompts=[prompt],
+            request_id="teacache-coefficient-estimator",
             sampling_params=OmniDiffusionSamplingParams(
                 num_inference_steps=generate_kwargs.get("num_inference_steps", 20),
                 seed=generate_kwargs.get("seed", 42),

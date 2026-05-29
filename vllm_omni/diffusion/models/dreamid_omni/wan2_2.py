@@ -6,6 +6,16 @@ import torch.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.attention.layer import Attention
 
@@ -17,7 +27,6 @@ try:
         MLPProj,
         ModulationAdd,
         WanLayerNorm,
-        WanRMSNorm,
         rope_apply,  # diff from  wan2.2
         rope_params,
         sinusoidal_embedding_1d,
@@ -26,42 +35,99 @@ except ImportError:
     raise ImportError("Failed to import from dependency 'dreamid_omni'.")
 
 
+class DistributedRMSNorm(nn.Module):
+    """RMSNorm that computes global RMS across tensor parallel ranks.
+
+    Mirrors `vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py::DistributedRMSNorm`
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tp_size = get_tensor_model_parallel_world_size()
+        x_dtype = x.dtype
+        x_float = x.float()
+        local_sum_sq = x_float.pow(2).sum(dim=-1, keepdim=True)
+        local_count = x.shape[-1]
+
+        if tp_size > 1:
+            local_sum_sq = tensor_model_parallel_all_reduce(local_sum_sq)
+            local_count = local_count * tp_size
+
+        rms = torch.sqrt(local_sum_sq / local_count + self.eps)
+        return (x_float / rms * self.weight.float()).to(x_dtype)
+
+
 class WanSelfAttention(nn.Module):
     """Optimized self-attention module using vLLM layers."""
 
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        eps=1e-6,
+        *,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
-        self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
 
-        # layers
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
-        self.o = nn.Linear(dim, dim)
-        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=num_heads,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
+        )
+        self.num_heads = self.to_qkv.num_heads
+        self.num_kv_heads = self.to_qkv.num_kv_heads
+        self.tp_inner_dim = self.num_heads * self.head_dim
+        self.tp_kv_dim = self.num_kv_heads * self.head_dim
+
+        self.o = RowParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o" if prefix else "o",
+        )
+        self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = DistributedRMSNorm(self.tp_kv_dim, eps=eps) if qk_norm else nn.Identity()
         # Unified attention layer
         self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
-            num_kv_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
+            prefix=prefix,
         )
 
     # query, key, value function
     def qkv_fn(self, x):
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        b, s = x.shape[:2]
+        qkv, _ = self.to_qkv(x)
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
+        q = self.norm_q(q).view(b, s, self.num_heads, self.head_dim)
+        k = self.norm_k(k).view(b, s, self.num_kv_heads, self.head_dim)
+        v = v.view(b, s, self.num_kv_heads, self.head_dim)
         return q, k, v
 
     def forward(self, x, seq_lens, grid_sizes, freqs, ref_lengths=None, freqs_scaling=None):
@@ -87,14 +153,97 @@ class WanSelfAttention(nn.Module):
         return x
 
 
-class WanT2VCrossAttention(WanSelfAttention):
-    def qkv_fn(self, x, context):
-        b, n, d = x.size(0), self.num_heads, self.head_dim
+class WanT2VCrossAttention(nn.Module):
+    """Text -> latent cross-attention."""
 
-        # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        eps=1e-6,
+        *,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.dim = dim
+        self.head_dim = dim // num_heads
+        self.window_size = window_size
+        self.qk_norm = qk_norm
+        self.eps = eps
+
+        # Separate Q/K/V — Q's input differs from K/V's input (text context)
+        self.q = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q" if prefix else "q",
+        )
+        self.k = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.k" if prefix else "k",
+        )
+        self.v = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.v" if prefix else "v",
+        )
+
+        tp_size = get_tensor_model_parallel_world_size()
+        self.num_heads = num_heads // tp_size
+        self.num_kv_heads = self.num_heads
+        self.tp_inner_dim = self.num_heads * self.head_dim
+
+        self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
+
+        self.o = RowParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o" if prefix else "o",
+        )
+
+        # Kept for interface parity with WanSelfAttention;
+        # the active cross-attention path in DreamID-Omni uses the shared FusionModel.attn.
+        # Disable kv quant to prevent affecting quality.
+        self.attn = Attention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            num_kv_heads=self.num_kv_heads,
+            softmax_scale=1.0 / (self.head_dim**0.5),
+            causal=False,
+            prefix=prefix,
+            disable_kv_quant=True,
+        )
+
+    def qkv_fn(self, x, context):
+        b = x.size(0)
+
+        q = self.q(x)
+        k = self.k(context)
+        v = self.v(context)
+        q = self.norm_q(q).view(b, -1, self.num_heads, self.head_dim)
+        k = self.norm_k(k).view(b, -1, self.num_kv_heads, self.head_dim)
+        v = v.view(b, -1, self.num_kv_heads, self.head_dim)
 
         return q, k, v
 
@@ -142,6 +291,9 @@ class WanAttentionBlock(nn.Module):
         cross_attn_norm=False,
         eps=1e-6,
         additional_emb_length=None,
+        *,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dim = dim
@@ -154,7 +306,15 @@ class WanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps)
+        self.self_attn = WanSelfAttention(
+            dim,
+            num_heads,
+            window_size,
+            qk_norm,
+            eps,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn" if prefix else "self_attn",
+        )
         self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
         if cross_attn_type == "i2v_cross_attn":
             assert additional_emb_length is not None, "additional_emb_length should be specified for i2v_cross_attn"
@@ -167,9 +327,32 @@ class WanAttentionBlock(nn.Module):
                 (-1, -1),
                 qk_norm,
                 eps,
+                quant_config=quant_config,
+                prefix=f"{prefix}.cross_attn" if prefix else "cross_attn",
             )
         self.norm2 = WanLayerNorm(dim, eps)
-        self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
+        # FFN layout: Stay compatible with upstream DreamID-Omni checkpoints
+        self.ffn = nn.Sequential(
+            ColumnParallelLinear(
+                dim,
+                ffn_dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.ffn.0" if prefix else "ffn.0",
+            ),
+            nn.GELU(approximate="tanh"),
+            RowParallelLinear(
+                ffn_dim,
+                dim,
+                bias=True,
+                input_is_parallel=True,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.ffn.2" if prefix else "ffn.2",
+            ),
+        )
 
         # modulation
         self.modulation = ModulationAdd(dim, 6)
@@ -243,6 +426,9 @@ class WanModel(ModelMixin, ConfigMixin):
         cross_attn_norm=True,
         temporal_rope_scaling_factor=1.0,
         eps=1e-6,
+        *,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -357,8 +543,10 @@ class WanModel(ModelMixin, ConfigMixin):
                     cross_attn_norm,
                     eps,
                     additional_emb_length,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.blocks.{layer_idx}" if prefix else f"blocks.{layer_idx}",
                 )
-                for _ in range(num_layers)
+                for layer_idx in range(num_layers)
             ]
         )
 
