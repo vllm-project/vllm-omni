@@ -17,6 +17,29 @@ Small variants are CPU-targeted and **not** the primary serving target:
 
 Stable Audio 3 **Large** (2.7B) is API-only and out of scope.
 
+## Architecture
+
+`StableAudio3Pipeline.forward` (text → audio) routes conditioning into the DiT,
+denoises in bf16, then decodes with the fp32 SAME autoencoder:
+
+```mermaid
+flowchart TD
+    P["Text prompt + duration"] --> C["conditioning dicts<br/>{prompt, seconds_start, seconds_total}"]
+    C --> T5["T5GemmaConditioner<br/>(t5gemma-b-b-ul2)"]
+    C --> NUM["NumberConditioner<br/>(seconds_start / seconds_total)"]
+    T5 --> ROUTE["get_conditioning_inputs<br/>cross_attn: prompt + seconds_total<br/>global: seconds_total<br/>local_add: inpaint_mask + masked_input"]
+    NUM --> ROUTE
+    NOISE["Initial noise<br/>[B, io_channels, latent_len]"] --> LOOP
+    SCHED["Sigma schedule<br/>(LogSNRShift)"] --> LOOP
+    ROUTE --> LOOP
+    subgraph DENOISE["Denoise loop — bf16"]
+        LOOP["sample_diffusion<br/>(dpmpp-3m-sde)"] <--> DM["DiffusionTransformer<br/>(1.4B DiT)"]
+    end
+    LOOP --> VAE["SAME AudioAutoencoder<br/>decode — fp32"]
+    VAE --> TRIM["trim to requested duration"]
+    TRIM --> OUT["stereo WAV @ 44.1 kHz"]
+```
+
 ## Download
 
 `stabilityai/stable-audio-3-medium` is **gated** — accept the license on its
