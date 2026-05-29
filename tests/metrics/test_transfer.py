@@ -90,26 +90,27 @@ class TestObserveTxTime:
 
 class TestObserveRxTime:
     def test_rx_time_observed_in_seconds(self, tx: OmniTransferMetrics) -> None:
-        # Use unique (from, to) labels so the per-test sum is isolated from
-        # other tests that observe on this module-level Histogram.
-        tx.observe_rx_time(20, 0, 21, 0, 0.0042)
+        # Use a (from, to) combo not shared with TestRegistration's setup
+        # observe on the rx_s Histogram, otherwise the per-test sum picks
+        # up accumulated values from earlier observes.
+        tx.observe_rx_time(3, 0, 4, 0, 0.0042)
         out = generate_latest(REGISTRY).decode()
         prefix = (
             f"{defs.TRANSFER_RX_S}_sum"
-            f'{{from_replica="0",from_stage="20",model_name="{_MODEL}",'
-            f'to_replica="0",to_stage="21"}}'
+            f'{{from_replica="0",from_stage="3",model_name="{_MODEL}",'
+            f'to_replica="0",to_stage="4"}}'
         )
         assert _sample_value(out, prefix) == pytest.approx(0.0042)
 
 
 class TestObserveInFlightTime:
     def test_in_flight_time_observed_in_seconds(self, tx: OmniTransferMetrics) -> None:
-        tx.observe_in_flight_time(22, 0, 23, 0, 0.0017)
+        tx.observe_in_flight_time(3, 0, 4, 0, 0.0017)
         out = generate_latest(REGISTRY).decode()
         prefix = (
             f"{defs.TRANSFER_IN_FLIGHT_S}_sum"
-            f'{{from_replica="0",from_stage="22",model_name="{_MODEL}",'
-            f'to_replica="0",to_stage="23"}}'
+            f'{{from_replica="0",from_stage="3",model_name="{_MODEL}",'
+            f'to_replica="0",to_stage="4"}}'
         )
         assert _sample_value(out, prefix) == pytest.approx(0.0017)
 
