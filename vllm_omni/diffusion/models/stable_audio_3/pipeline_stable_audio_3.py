@@ -183,6 +183,12 @@ class StableAudio3Pipeline(
             diffusion_objective=diffusion_objective,
         )
 
+        # HSDP discovery: the loader shards `model.transformer` (and carries the
+        # transformer's `_hsdp_shard_conditions`). SA3's DiT lives under
+        # `diffusion_model.model`, so alias it here. Same object → named_parameters
+        # dedups to the `diffusion_model.*` names, leaving weight loading unchanged.
+        self.transformer = self.diffusion_model.model
+
         # ----------------------------------------------------------------
         # Weights sources — vllm-omni loader will populate self.diffusion after init.
         # SA3 ships weights at the model root (no `transformer/` subfolder).

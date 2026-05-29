@@ -2019,6 +2019,23 @@ DiffusionTransformer._repeated_blocks: ClassVar[list[str]] = ["TransformerBlock"
 DiffusionTransformer._layerwise_offload_blocks_attr: ClassVar[str] = "transformer.layers"
 
 
+def _sa3_is_transformer_block(name: str, module: nn.Module) -> bool:
+    """HSDP shard condition for SA3.
+
+    SA3's DiT blocks are ``TransformerBlock`` instances at ``transformer.layers.<idx>``.
+    Match by type rather than by name: the shared
+    ``hsdp_utils.is_transformer_block_module`` keys off ``transformer_blocks`` (which SA3
+    does not use), and a name like ``"transformer.layers" in name`` over-matches the
+    numbered submodules *inside* each block (e.g. ``transformer.layers.0.ff.ff.0``).
+    Sharding each TransformerBlock via FSDP2 keeps the 1.4B DiT off a single card.
+    PORT_FROM: parallelism phase 10d (skill add-diffusion-model).
+    """
+    return isinstance(module, TransformerBlock)
+
+
+DiffusionTransformer._hsdp_shard_conditions: ClassVar[list] = [_sa3_is_transformer_block]
+
+
 def _sa3_load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     """Pattern 2 (BAGEL-style): standard loader + custom name remap.
 

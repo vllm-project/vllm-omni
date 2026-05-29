@@ -77,9 +77,9 @@ python ../text_to_audio/text_to_audio.py \
 | `--guidance-scale` | 7.0 | 7.0 | CFG, same default |
 | `--enable-cpu-offload` | yes | yes | Recommended for long clips |
 | `--enable-layerwise-offload` | yes | yes | Pin DiT, offload SAME chunks |
-| `--use-hsdp` | yes | **yes (port goal)** | Shard 1.4B DiT across GPUs |
-| `--tensor-parallel-size` | yes | **yes (port goal)** | Requires `num_heads % tp_size == 0` |
-| `--ulysses-degree` | yes | **yes (port goal)** | Sequence parallelism for long clips |
+| `--use-hsdp` | yes | **yes** | Shard the 1.4B DiT across GPUs (FSDP2) |
+| `--tensor-parallel-size` | yes | not yet | TP not implemented for SA3 (audio peers ship without it) |
+| `--ulysses-degree` | yes | not yet | SP not implemented for SA3 |
 
 ### SAME autoencoder variant
 
