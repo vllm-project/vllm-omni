@@ -10,18 +10,18 @@ steps:
     commands:
       - |
         pytest -v -s -m 'core_model and cpu' \
-        --cov=vllm_omni --cov-branch --cov-report=
+        --cov=vllm_omni --cov-report=
 
         pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda' \
-        --cov=vllm_omni --cov-branch --cov-append --cov-report= \
+        --cov=vllm_omni --cov-append --cov-report= \
         --ignore=tests/e2e --ignore=tests/engine/test_async_omni_engine_abort.py
 
         pytest -v -s -m 'core_model and cuda and L4 and distributed_cuda' \
-        --cov=vllm_omni --cov-branch --cov-append --cov-report=
+        --cov=vllm_omni --cov-append --cov-report=
 
-        coverage html
-        coverage xml
-        coverage report -m
+        coverage report -m --skip-covered
+        coverage html --skip-covered
+        coverage xml --skip-covered
     agents:
       queue: "gpu_4_queue"
     plugins:
