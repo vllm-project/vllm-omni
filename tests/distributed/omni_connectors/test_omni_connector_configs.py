@@ -88,7 +88,7 @@ def test_load_qwen_yaml_configs(yaml_file):
 #     ``get_stage_connector_spec`` returning the first spec) always
 #     recovers a self-consistent config.
 #
-# For role-bound ZMQ connectors (Mori / Mooncake) the function also
+# For role-bound ZMQ connectors (Mori) the function also
 # pre-computes ``zmq_port`` / ``sender_host`` / ``sender_zmq_port`` so
 # an intranode pipeline can come up without an external handshake.
 #
@@ -119,7 +119,7 @@ def _stable_local_ip(monkeypatch: pytest.MonkeyPatch) -> str:
 
 @pytest.mark.parametrize(
     "connector_name",
-    ["MoriTransferEngineConnector", "MooncakeTransferEngineConnector"],
+    ["MoriTransferEngineConnector"],
 )
 def test_stage_0_is_sender_only(connector_name, _stable_local_ip):
     """Stage 0 has only outgoing edges → role=sender, listener port = base + 0."""
@@ -137,7 +137,7 @@ def test_stage_0_is_sender_only(connector_name, _stable_local_ip):
 
 @pytest.mark.parametrize(
     "connector_name",
-    ["MoriTransferEngineConnector", "MooncakeTransferEngineConnector"],
+    ["MoriTransferEngineConnector"],
 )
 def test_final_stage_is_receiver_only(connector_name, _stable_local_ip):
     """Stage 2 has only incoming edges → role=receiver, points at upstream sender."""
@@ -154,7 +154,7 @@ def test_final_stage_is_receiver_only(connector_name, _stable_local_ip):
 
 @pytest.mark.parametrize(
     "connector_name",
-    ["MoriTransferEngineConnector", "MooncakeTransferEngineConnector"],
+    ["MoriTransferEngineConnector"],
 )
 def test_middle_stage_is_dual(connector_name, _stable_local_ip):
     """Middle stage has both → role=dual, both entries share composite spec."""
@@ -263,55 +263,3 @@ def test_inject_helper_is_noop_for_non_integer_stage(_stable_local_ip):
 def test_get_connectors_config_for_stage_none_transfer_config():
     """Callers pass ``None`` when no yaml was loaded; return an empty dict."""
     assert get_connectors_config_for_stage(None, 0) == {}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# TP > 1 fail-fast guard for chunk-mode RDMA connectors
-# (see _inject_chunk_path_endpoints: chunk path lacks per-rank ZMQ port stride)
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def _mock_sdk_non_none(monkeypatch, mod):
-    """Ensure the SDK availability gate (``if X is None: raise ImportError``)
-    in each connector's ``__init__`` doesn't fire before our TP guard does.
-    Only the *presence* of the SDK matters for the gate; tests don't need a
-    functional SDK because the TP guard is supposed to ``raise`` first.
-    """
-    for sdk_attr in ("IOEngine", "TransferEngine"):
-        if hasattr(mod, sdk_attr) and getattr(mod, sdk_attr) is None:
-            monkeypatch.setattr(mod, sdk_attr, object)  # any non-None sentinel
-
-
-@pytest.mark.parametrize(
-    "module_path, class_name",
-    [
-        (
-            "vllm_omni.distributed.omni_connectors.connectors.mori_transfer_engine_connector",
-            "MoriTransferEngineConnector",
-        ),
-        (
-            "vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector",
-            "MooncakeTransferEngineConnector",
-        ),
-    ],
-)
-def test_chunk_mode_connector_fails_fast_on_tp_gt_1(monkeypatch, module_path, class_name):
-    """Both Mori and Mooncake chunk-mode connectors must reject TP > 1 on init.
-
-    The chunk path's endpoint derivation in
-    ``_inject_chunk_path_endpoints`` is keyed only on stage_id, so multiple
-    TP ranks in the same stage would collide on the listener port and
-    receivers cannot route per-rank shards.  Until a rank-aware variant of
-    ``utils/kv_utils.kv_zmq_port`` is ported here, the connectors must
-    refuse TP > 1 deployments at construction time with a clear
-    NotImplementedError pointing at the missing infrastructure.
-    """
-    import importlib
-
-    mod = importlib.import_module(module_path)
-    _mock_sdk_non_none(monkeypatch, mod)
-    monkeypatch.setattr(mod, "get_tp_world_size", lambda: 2)
-
-    cls = getattr(mod, class_name)
-    with pytest.raises(NotImplementedError, match=r"TP=1-only"):
-        cls({})

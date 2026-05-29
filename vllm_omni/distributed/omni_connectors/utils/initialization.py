@@ -52,12 +52,7 @@ KV_REPLICA_PORT_STRIDE = 1024
 # The orchestrator-level path (``create_connectors_from_config`` below)
 # has its own Mooncake-specific port adjustment for PD disaggregation
 # and is intentionally independent of this set.
-_ROLE_BOUND_ZMQ_CONNECTORS = frozenset(
-    {
-        "MoriTransferEngineConnector",
-        "MooncakeTransferEngineConnector",
-    }
-)
+_ROLE_BOUND_ZMQ_CONNECTORS = frozenset({"MoriTransferEngineConnector"})
 
 
 def _detect_local_ip() -> str:

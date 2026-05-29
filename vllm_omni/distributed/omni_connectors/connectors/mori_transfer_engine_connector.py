@@ -37,7 +37,6 @@ import msgspec
 import torch
 import zmq
 
-from ..utils.kv_utils import get_tp_world_size
 from ..utils.logging import get_connector_logger
 from ..utils.memory_pool import BufferAllocator, ManagedBuffer
 from ..utils.serialization import OmniSerializer
@@ -121,20 +120,6 @@ class MoriTransferEngineConnector(OmniConnectorBase):
     def __init__(self, config: dict[str, Any]):
         if IOEngine is None:
             raise ImportError("Mori is not available. Install via: pip install mori")
-
-        # ---- TP=1-only guard ----
-        # Chunk-path endpoint derivation in
-        # ``utils/initialization._inject_chunk_path_endpoints`` is keyed only
-        # on ``stage_id``; with TP > 1, ranks in one stage collide on the
-        # listener port.  See the raise message for the follow-up anchor.
-        tp_world_size = get_tp_world_size()
-        if tp_world_size > 1:
-            raise NotImplementedError(
-                f"MoriTransferEngineConnector is currently TP=1-only "
-                f"(detected tp_world_size={tp_world_size}).  Reuse "
-                f"``utils/kv_utils.kv_zmq_port`` (KV path's rank-aware "
-                f"formula) and add per-rank metadata routing to lift this."
-            )
 
         self._closed = False
         self._bind_error: Exception | None = None

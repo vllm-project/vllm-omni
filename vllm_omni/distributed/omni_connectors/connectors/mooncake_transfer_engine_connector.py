@@ -15,7 +15,6 @@ import msgspec
 import torch
 import zmq
 
-from ..utils.kv_utils import get_tp_world_size
 from ..utils.logging import get_connector_logger
 from ..utils.memory_pool import BufferAllocator, ManagedBuffer
 from ..utils.serialization import OmniSerializer
@@ -102,17 +101,6 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         if TransferEngine is None:
             raise ImportError("Mooncake not available")
 
-        # ---- TP=1-only guard (chunk_transfer_adapter path) ----
-        # See ``MoriTransferEngineConnector`` for the rationale.
-        tp_world_size = get_tp_world_size()
-        if tp_world_size > 1:
-            raise NotImplementedError(
-                f"MooncakeTransferEngineConnector chunk-mode RDMA path is currently "
-                f"TP=1-only (detected tp_world_size={tp_world_size}).  Reuse "
-                f"``utils/kv_utils.kv_zmq_port`` (KV path's rank-aware formula) "
-                f"to lift this."
-            )
-
         self._closed = False
         self._bind_error: Exception | None = None  # fatal ZMQ bind error from listener thread
 
@@ -140,15 +128,6 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         }
 
         self.config = config
-
-        # Stage id is read by OmniChunkTransferAdapter.process_pending_chunks
-        # (and the AR / generation schedulers) to decide whether this
-        # connector sits at stage 0 of the pipeline.  Kept parallel to
-        # SharedMemoryConnector and MoriTransferEngineConnector.  Populated
-        # by OmniEngineArgs.create_model_config via the ``stage_id`` key
-        # that get_connectors_config_for_stage injects into extra.
-        self.stage_id = config.get("stage_id", -1)
-
         host_config = config.get("host")
         host_value = "auto" if host_config is None else str(host_config)
         # Default sender/receiver bootstrap to a routable local IP so the
@@ -183,30 +162,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         # --- Role ---
         # "sender": bind ZMQ listener, accept put() calls.
-        # "receiver": skip ZMQ bind, only accept get() calls by querying
-        #             an upstream sender at
-        #             ``sender_host`` / ``sender_zmq_port``.
-        # "dual":    a single instance that simultaneously binds the
-        #            listener (so a downstream receiver can pull from
-        #            it) AND queries an upstream sender (so its own
-        #            get() works).  Used by middle stages on the
-        #            chunk_transfer_adapter path -- the adapter keeps
-        #            its historical one-connector-per-stage model
-        #            (like ``SharedMemoryConnector``), and a dual
-        #            instance is how this role-bound RDMA connector
-        #            exposes put+get from the same object.  The role
-        #            is chosen by the framework (see
-        #            ``get_connectors_config_for_stage``) based on
-        #            whether the stage has incoming / outgoing edges.
+        # "receiver": skip ZMQ bind, only accept get() calls.
         # The orchestration layer (get_connectors_config_for_stage /
         # kv_transfer_manager) is responsible for injecting the correct role.
         role = str(config.get("role", "sender")).lower()
-        if role not in {"sender", "receiver", "dual"}:
+        if role not in {"sender", "receiver"}:
             raise ValueError(
-                f"Invalid role={role!r} for MooncakeTransferEngineConnector. Expected 'sender', 'receiver', or 'dual'."
+                f"Invalid role={role!r} for MooncakeTransferEngineConnector. Expected 'sender' or 'receiver'."
             )
-        self.role = role
-        self.can_put = role in ("sender", "dual")
+        self.can_put = role == "sender"
 
         self.engine_id = str(uuid.uuid4())
 
@@ -256,7 +220,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             f"  Role: can_put={self.can_put}, configured_role={config.get('role', 'sender')}"
         )
 
-        # Sender and dual both need the ZMQ listener to handle pull requests.
+        # Only sender needs ZMQ listener to handle pull requests
         if self.can_put:
             self._last_ttl_check = _time_mod.monotonic()  # reset after slow init
             self._listener_thread = threading.Thread(target=self._zmq_listener_loop, daemon=True)
@@ -269,16 +233,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     f"MooncakeTransferEngineConnector failed to bind ZMQ on "
                     f"{self.host}:{self.zmq_port}: {self._bind_error}"
                 ) from self._bind_error
-            if self.role == "dual":
-                logger.info(
-                    f"MooncakeTransferEngineConnector started as DUAL "
-                    f"(ZMQ listener on {self.host}:{self.zmq_port}, "
-                    f"upstream sender at {self.sender_host}:{self.sender_zmq_port})"
-                )
-            else:
-                logger.info(
-                    f"MooncakeTransferEngineConnector started as SENDER (ZMQ listener on {self.host}:{self.zmq_port})"
-                )
+            logger.info(
+                f"MooncakeTransferEngineConnector started as SENDER (ZMQ listener on {self.host}:{self.zmq_port})"
+            )
         else:
             # Receiver mode — sender address is provided per-request via
             # metadata from put() through the queue, not pre-configured.
