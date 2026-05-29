@@ -735,6 +735,7 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     """LTXImageToVideoTwoStagesPipeline is for two stages image to video generation"""
 
     support_image_input = True
+    dummy_run_num_frames = 2
 
     _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
     _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
