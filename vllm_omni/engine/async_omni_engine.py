@@ -66,6 +66,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
+_REQUEST_QUEUE_MAXSIZE = 256
 
 
 # ============================================================================
@@ -284,7 +285,7 @@ class AsyncOmniEngine:
         # sees a non-None ``self.request_queue`` when on_register fires.
         # ``async_q`` lazily binds to whatever event loop first awaits on
         # it (the orchestrator loop), so cross-thread use stays correct.
-        self.request_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
+        self.request_queue: janus.Queue[EngineQueueMessage] = janus.Queue(maxsize=_REQUEST_QUEUE_MAXSIZE)
         self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
@@ -773,7 +774,7 @@ class AsyncOmniEngine:
             # Registration of this companion on stage-0's output processor is
             # deferred to Orchestrator._handle_add_companion, which routes
             # admission through StagePool.submit_initial(..., affinity_request_id=...).
-            self.request_queue.sync_q.put_nowait(
+            self.request_queue.sync_q.put(
                 AddCompanionRequestMessage(
                     companion_id=cid,
                     parent_id=parent_id,
@@ -1229,7 +1230,7 @@ class AsyncOmniEngine:
             reasoning_ended=reasoning_ended,
             resumable=resumable,
         )
-        self.request_queue.sync_q.put_nowait(msg)
+        self.request_queue.sync_q.put(msg)
 
         # CFG companion expansion: create and enqueue companion requests
         # so the AR stage also generates their KV caches.
@@ -1296,7 +1297,7 @@ class AsyncOmniEngine:
             resumable=resumable,
             message_type="streaming_update",
         )
-        self.request_queue.sync_q.put_nowait(msg)
+        self.request_queue.sync_q.put(msg)
 
     async def add_streaming_update_async(
         self,
@@ -1346,7 +1347,7 @@ class AsyncOmniEngine:
         """Send abort message to the Orchestrator."""
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
-        self.request_queue.sync_q.put_nowait(AbortRequestMessage(request_ids=request_ids))
+        self.request_queue.sync_q.put(AbortRequestMessage(request_ids=request_ids))
 
     async def abort_async(self, request_ids: list[str]) -> None:
         """Async abort API."""
@@ -1376,7 +1377,7 @@ class AsyncOmniEngine:
         )
 
         with self._rpc_lock:
-            self.request_queue.sync_q.put_nowait(msg)
+            self.request_queue.sync_q.put(msg)
             deadline = None if timeout is None else time.monotonic() + timeout
 
             while True:
