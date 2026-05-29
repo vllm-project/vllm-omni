@@ -47,9 +47,8 @@ stages:
 ```
 
 A ready-to-run intra-node example for Qwen3-Omni-MoE on AMD MI300X lives
-at
-[`vllm_omni/deploy/qwen3_omni_moe_mori_intranode.yaml`](../../../../vllm_omni/deploy/qwen3_omni_moe_mori_intranode.yaml)
-and can be loaded with:
+at `vllm_omni/deploy/qwen3_omni_moe_mori_intranode.yaml` and can be loaded
+with:
 
 ```bash
 vllm-omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --log-stats \
