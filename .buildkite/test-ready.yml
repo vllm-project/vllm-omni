@@ -20,8 +20,8 @@ steps:
         --cov=vllm_omni --cov-append --cov-report=
 
         coverage report -m --skip-covered
-        coverage html --skip-covered
-        coverage xml --skip-covered
+        coverage html
+        coverage xml
     agents:
       queue: "gpu_4_queue"
     plugins:
