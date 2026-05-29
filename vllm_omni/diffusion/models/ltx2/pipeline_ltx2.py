@@ -157,6 +157,9 @@ class _VideoAudioScheduler:
 
 
 class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
+    # Audio is diffused jointly with video; warmup must size audio tokens.
+    support_audio_output = True
+
     def __init__(
         self,
         *,

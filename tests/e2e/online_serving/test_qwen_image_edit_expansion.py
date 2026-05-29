@@ -2,7 +2,7 @@
 Comprehensive tests of diffusion features that are available in online serving mode
 and are supported by the following models:
 - Qwen-Image-Edit: single image input
-- Qwen-Image-Edit-2509: single image input and two image inputs
+- Qwen-Image-Edit-2511: single image input and two image inputs
 """
 
 import pytest
@@ -14,7 +14,7 @@ from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHand
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
-SINGLE_EDIT_PROMPT_2509 = "Restyle this image into a Vincent van Gogh style impressionist painting."
+SINGLE_EDIT_PROMPT_2511 = "Restyle this image into a Vincent van Gogh style impressionist painting."
 MULTI_EDIT_PROMPT = (
     "Transform the first image into a Dadaism collage art. "
     "Transform the second image into a Vincent van Gogh style painting. "
@@ -34,7 +34,7 @@ def _get_diffusion_feature_cases(model: str):
                 model=model,
                 server_args=[
                     "--cache-backend",
-                    "tea_cache",  # [TODO] may consider changing to cache_dit after #1779 is resolved. Currently cache_dit and layerwise offload cannot work together.
+                    "cache_dit",
                     "--enable-layerwise-offload",
                 ],
             ),
@@ -59,7 +59,7 @@ def _get_diffusion_feature_cases(model: str):
                 model=model,
                 server_args=[
                     "--cache-backend",
-                    "cache_dit",
+                    "tea_cache",
                     "--ring",
                     "2",
                 ],
@@ -145,7 +145,7 @@ def test_qwen_image_edit(omni_server: OmniServer, openai_client: OpenAIClientHan
     indirect=True,
 )
 def test_qwen_image_edit_2511_single_image(omni_server: OmniServer, openai_client: OpenAIClientHandler):
-    """Test Qwen-Image-Edit-2509 with a single image input.
+    """Test Qwen-Image-Edit-2511 with a single image input.
 
     Regression: with tea_cache enabled and zero_cond_t=True, the TeaCache
     postprocess closure used the doubled temb (shape 2*batch) without halving
@@ -156,7 +156,7 @@ def test_qwen_image_edit_2511_single_image(omni_server: OmniServer, openai_clien
     """
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 
-    messages = dummy_messages_from_mix_data(image_data_url=image_data_url, content_text=SINGLE_EDIT_PROMPT_2509)
+    messages = dummy_messages_from_mix_data(image_data_url=image_data_url, content_text=SINGLE_EDIT_PROMPT_2511)
 
     request_config = {
         "model": omni_server.model,
@@ -180,7 +180,7 @@ def test_qwen_image_edit_2511_single_image(omni_server: OmniServer, openai_clien
     indirect=True,
 )
 def test_qwen_image_edit_2511_two_images(omni_server: OmniServer, openai_client: OpenAIClientHandler):
-    """Test Qwen-Image-Edit-2509 with two image inputs."""
+    """Test Qwen-Image-Edit-2511 with two image inputs."""
     image_data_url_1 = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
     image_data_url_2 = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 

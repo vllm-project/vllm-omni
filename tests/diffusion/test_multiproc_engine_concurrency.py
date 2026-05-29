@@ -36,7 +36,7 @@ def _tagged_output(tag: str) -> DiffusionOutput:
 def _mock_request(tag: str):
     """Return a lightweight request object identifiable by *tag*."""
     return SimpleNamespace(
-        request_ids=[tag],
+        request_id=tag,
         prompts=[f"prompt_{tag}"],
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
     )
@@ -97,8 +97,8 @@ def _start_worker(req_q, res_q, count=2):
             req = req_q.get(timeout=10)
             method = req.get("method", "")
             args = req.get("args", ())
-            if method in {"generate", "execute_model"} and args and hasattr(args[0], "request_ids"):
-                tag = f"result_for_{args[0].request_ids[0]}"
+            if method in {"generate", "execute_model"} and args and hasattr(args[0], "request_id"):
+                tag = f"result_for_{args[0].request_id}"
             elif args:
                 tag = f"result_for_{args[0]}"
             else:

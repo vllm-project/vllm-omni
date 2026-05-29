@@ -56,10 +56,7 @@ def _make_generate_args(num_tokens=NUM_TOKENS, hidden_dim=HIDDEN_DIM, cfg=False)
         packed_vae_token_indexes=torch.arange(2, seq_len, dtype=torch.long),
         packed_seqlens=torch.tensor([seq_len], dtype=torch.int),
         packed_position_ids=torch.arange(seq_len, dtype=torch.long),
-        packed_indexes=torch.arange(seq_len, dtype=torch.long),
         past_key_values=NaiveCache(1),
-        key_values_lens=torch.tensor([0], dtype=torch.int),
-        packed_key_value_indexes=torch.zeros(0, dtype=torch.long),
         num_timesteps=NUM_TIMESTEPS,
         timestep_shift=1.0,
         cfg_text_scale=1.0,
@@ -68,11 +65,8 @@ def _make_generate_args(num_tokens=NUM_TOKENS, hidden_dim=HIDDEN_DIM, cfg=False)
     if cfg:
         base |= dict(
             cfg_text_scale=4.0,
-            cfg_text_packed_query_indexes=torch.arange(seq_len, dtype=torch.long),
             cfg_text_packed_position_ids=torch.arange(seq_len, dtype=torch.long),
             cfg_text_past_key_values=NaiveCache(1),
-            cfg_text_key_values_lens=torch.tensor([0], dtype=torch.int),
-            cfg_text_packed_key_value_indexes=torch.zeros(0, dtype=torch.long),
         )
     return base
 

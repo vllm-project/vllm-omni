@@ -322,50 +322,44 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self, scheduler_output: DiffusionSchedulerOutput
     ) -> tuple[list[DiffusionRequestState], list[str]]:
         """Step-before update: cleanup finished requests and get/create one running state."""
-        for req_id in scheduler_output.finished_req_ids:
-            self.state_cache.pop(req_id, None)
+        for request_id in scheduler_output.finished_req_ids:
+            self.state_cache.pop(request_id, None)
 
         resolved: list[DiffusionRequestState] = []
-        new_req_id: list[str] = []
+        new_request_ids: list[str] = []
         try:
             # process new requests
             for sched_new_req in scheduler_output.scheduled_new_reqs:
-                # new_req_data = scheduler_output.scheduled_new_reqs[0]
-                req_id = sched_new_req.sched_req_id
+                request_id = sched_new_req.request_id
                 req = sched_new_req.req
-                new_req_id.append(req_id)
-                if req_id in self.state_cache:
-                    raise ValueError(f"Received duplicate new-request payload for cached request {req_id}.")
-                request_ids = req.request_ids or [req_id]
-                if len(request_ids) != len(req.prompts):
-                    raise ValueError(
-                        f"request_ids length ({len(request_ids)}) does not match prompts length ({len(req.prompts)})"
-                    )
+                new_request_ids.append(request_id)
+                if request_id in self.state_cache:
+                    raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
                 new_state = DiffusionRequestState(
-                    req_id=req_id,
+                    request_id=request_id,
                     sampling=copy.deepcopy(req.sampling_params),
                     prompts=req.prompts,
                 )
-                self.state_cache[req_id] = new_state
+                self.state_cache[request_id] = new_state
                 resolved.append(new_state)
 
             # process cached requests
-            for req_id in scheduler_output.scheduled_cached_reqs.sched_req_ids:
-                state = self.state_cache.get(req_id)
+            for request_id in scheduler_output.scheduled_cached_reqs.request_ids:
+                state = self.state_cache.get(request_id)
                 if state is None:
-                    raise ValueError(f"Missing cached state for request {req_id}.")
+                    raise ValueError(f"Missing cached state for request {request_id}.")
                 resolved.append(state)
         except Exception:
-            for req_id in new_req_id:
-                self.state_cache.pop(req_id, None)
+            for request_id in new_request_ids:
+                self.state_cache.pop(request_id, None)
             raise
 
-        return resolved, new_req_id
+        return resolved, new_request_ids
 
     def _prepare_batch_inputs(self, states: list[DiffusionRequestState], new_request_ids: list[str]) -> InputBatch:
         # process new reqs
         for state in states:
-            if state.req_id in new_request_ids:
+            if state.request_id in new_request_ids:
                 # set generator
                 if state.sampling.generator is None and state.sampling.seed is not None:
                     if state.sampling.generator_device is not None:
@@ -407,7 +401,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         for state in states:
             if interrupted or state.denoise_completed:
-                self.state_cache.pop(state.req_id, None)
+                self.state_cache.pop(state.request_id, None)
 
     def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
         model_state = getattr(self, "model_state", None)
@@ -449,7 +443,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     for state in states:
                         runner_output_list.append(
                             RunnerOutput(
-                                req_id=state.req_id,
+                                request_id=state.request_id,
                                 step_index=state.step_index,
                                 finished=True,
                                 result=DiffusionOutput(error="stepwise denoise interrupted"),
@@ -470,7 +464,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             result = None
                         runner_output_list.append(
                             RunnerOutput(
-                                req_id=req.req_id,
+                                request_id=req.request_id,
                                 step_index=req.step_index,
                                 finished=req.denoise_completed,
                                 result=result,

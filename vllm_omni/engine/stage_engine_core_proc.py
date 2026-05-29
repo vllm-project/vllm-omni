@@ -28,8 +28,17 @@ from vllm.v1.engine.utils import (
 )
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
+from vllm_omni.engine.stage_init_utils import set_death_signal
 
 logger = init_logger(__name__)
+
+
+_SIGNAL_EXIT_BASE = 128
+
+
+def _signal_exit_code(signum: int) -> int:
+    """Return the conventional process exit code for signal-driven exits."""
+    return _SIGNAL_EXIT_BASE + signum
 
 
 class StageEngineCoreProc(EngineCoreProc):
@@ -77,6 +86,7 @@ class StageEngineCoreProc(EngineCoreProc):
             # like upstream vLLM.
 
             stage_label = f"stage{omni_stage_id}" if omni_stage_id is not None else "noid"
+            set_death_signal(signal.SIGTERM)
             set_process_title(f"StageEngineCoreProc_{stage_label}_replica{omni_replica_id}_DP{dp_rank}")
             decorate_logs()
             os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
@@ -118,6 +128,7 @@ class StageEngineCoreProc(EngineCoreProc):
             def signal_handler(signum: int, frame: Any) -> None:
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
                 signal_callback.trigger()
+                raise SystemExit(_signal_exit_code(signum))
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)

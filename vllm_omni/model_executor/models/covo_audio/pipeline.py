@@ -29,6 +29,7 @@ COVO_AUDIO_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             engine_output_type="latent",
+            custom_process_next_stage_input_func=f"{_PROC}.llm2code2wav_full_payload",
             sampling_constraints={
                 "detokenize": True,
                 "stop_token_ids": [151645],
@@ -44,6 +45,7 @@ COVO_AUDIO_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             custom_process_input_func=f"{_PROC}.llm2code2wav",
+            sync_process_input_func=f"{_PROC}.llm2code2wav_token_only",
             sampling_constraints={"detokenize": False},
         ),
     ),
