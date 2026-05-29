@@ -90,24 +90,26 @@ class TestObserveTxTime:
 
 class TestObserveRxTime:
     def test_rx_time_observed_in_seconds(self, tx: OmniTransferMetrics) -> None:
-        tx.observe_rx_time(0, 0, 1, 0, 0.0042)
+        # Use unique (from, to) labels so the per-test sum is isolated from
+        # other tests that observe on this module-level Histogram.
+        tx.observe_rx_time(20, 0, 21, 0, 0.0042)
         out = generate_latest(REGISTRY).decode()
         prefix = (
             f"{defs.TRANSFER_RX_S}_sum"
-            f'{{from_replica="0",from_stage="0",model_name="{_MODEL}",'
-            f'to_replica="0",to_stage="1"}}'
+            f'{{from_replica="0",from_stage="20",model_name="{_MODEL}",'
+            f'to_replica="0",to_stage="21"}}'
         )
         assert _sample_value(out, prefix) == pytest.approx(0.0042)
 
 
 class TestObserveInFlightTime:
     def test_in_flight_time_observed_in_seconds(self, tx: OmniTransferMetrics) -> None:
-        tx.observe_in_flight_time(0, 0, 1, 0, 0.0017)
+        tx.observe_in_flight_time(22, 0, 23, 0, 0.0017)
         out = generate_latest(REGISTRY).decode()
         prefix = (
             f"{defs.TRANSFER_IN_FLIGHT_S}_sum"
-            f'{{from_replica="0",from_stage="0",model_name="{_MODEL}",'
-            f'to_replica="0",to_stage="1"}}'
+            f'{{from_replica="0",from_stage="22",model_name="{_MODEL}",'
+            f'to_replica="0",to_stage="23"}}'
         )
         assert _sample_value(out, prefix) == pytest.approx(0.0017)
 
@@ -154,7 +156,9 @@ class TestBucketSelection:
     def test_size_uses_bytes_buckets(self, tx: OmniTransferMetrics) -> None:
         tx.observe_size(7, 0, 8, 0, 4096)
         out = generate_latest(REGISTRY).decode()
-        marker = f'{defs.TRANSFER_SIZE_BYTES}_bucket{{from_replica="0",from_stage="7",le="1024"'
+        # prometheus_client renders bucket boundary as float (e.g. ``1024.0``)
+        # regardless of the declared int in BYTES_BUCKETS.
+        marker = f'{defs.TRANSFER_SIZE_BYTES}_bucket{{from_replica="0",from_stage="7",le="1024.0"'
         assert marker in out
 
     def test_time_families_use_seconds_fast_buckets(self, tx: OmniTransferMetrics) -> None:
