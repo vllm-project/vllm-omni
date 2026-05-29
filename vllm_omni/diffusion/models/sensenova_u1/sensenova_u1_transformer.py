@@ -681,6 +681,12 @@ class SenseNovaU1DecoderLayer(nn.Module):
         past_key_values=None,
         **kwargs,
     ):
+        if isinstance(attention_mask, dict):
+            attention_mask = attention_mask.get(
+                self.attention_type,
+                attention_mask.get("full_attention"),
+            )
+
         if exist_und and not exist_gen:
             return self._forward_und(hidden_states, indexes, attention_mask, past_key_values, **kwargs)
         if not exist_und and exist_gen:
@@ -757,7 +763,7 @@ class SenseNovaU1Model(nn.Module):
                 exist_und=exist_und,
                 exist_gen=exist_gen,
                 indexes=indexes,
-                attention_mask=causal_mask_mapping.get(layer.attention_type, causal_mask_mapping.get("full_attention")),
+                attention_mask=causal_mask_mapping,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 **kwargs,
