@@ -5,15 +5,16 @@
 
 This file mirrors tests/e2e/offline_inference/test_stable_audio_expansion.py for SA3.
 
-Status: **scaffold** — tests are skipped while the port from
-https://github.com/Stability-AI/stable-audio-3 is in progress
-(see vllm_omni/diffusion/models/stable_audio_3/ for the implementation status).
-
-To activate: once `StableAudio3DiTModel` and `SAMEAutoencoder` have working
-implementations, remove the `pytest.mark.skip` from the tests below.
+The DiT + SAME autoencoder are ported (see vllm_omni/diffusion/models/stable_audio_3/).
+Point ``STABLE_AUDIO_3_TEST_MODEL`` at a directory prepared by
+``examples/offline_inference/stable_audio_3/download_stable_audio_3.py`` (which writes
+the ``model_index.json`` / ``transformer/config.json`` the engine needs); it defaults
+to the bare HF repo id otherwise.
 """
 
 from __future__ import annotations
+
+import os
 
 import numpy as np
 import pytest
@@ -29,7 +30,7 @@ from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
-_MODEL_REPO = "stabilityai/stable-audio-3-medium"
+_MODEL_REPO = os.environ.get("STABLE_AUDIO_3_TEST_MODEL", "stabilityai/stable-audio-3-medium")
 
 _SAMPLE_RATE = 44100
 _SHORT_CLIP_DURATION_S = 2.0
@@ -70,7 +71,6 @@ def _generate_short_sa3_clip(
     return audio
 
 
-@pytest.mark.skip(reason="SA3 DiT + SAME autoencoder port not yet complete (issue #3787)")
 @hardware_test(res={"cuda": "L4"})
 def test_stable_audio_3_short_clip_smoke() -> None:
     """SA3 short-clip smoke test — checks basic text→audio works end-to-end."""
@@ -83,10 +83,11 @@ def test_stable_audio_3_short_clip_smoke() -> None:
     assert abs(audio.shape[-1] - expected_samples) < _SAMPLE_RATE, (
         f"expected ~{expected_samples} samples for {_SHORT_CLIP_DURATION_S}s, got {audio.shape[-1]}"
     )
-    assert_audio_valid(audio, sample_rate=_SAMPLE_RATE)
+    assert_audio_valid(
+        audio, sample_rate=_SAMPLE_RATE, channels=2, duration_s=_SHORT_CLIP_DURATION_S
+    )
 
 
-@pytest.mark.skip(reason="SA3 DiT + SAME autoencoder port not yet complete (issue #3787)")
 @hardware_test(res={"cuda": "L4"})
 def test_stable_audio_3_variable_length() -> None:
     """SA3 variable-length test — verifies latents scale to requested duration.
@@ -102,7 +103,9 @@ def test_stable_audio_3_variable_length() -> None:
     assert long_.shape[-1] > short.shape[-1] * 5, (
         f"variable-length latents not engaged: short={short.shape}, long={long_.shape}"
     )
-    assert_audio_valid(long_, sample_rate=_SAMPLE_RATE)
+    assert_audio_valid(
+        long_, sample_rate=_SAMPLE_RATE, channels=2, duration_s=_LONG_CLIP_DURATION_S
+    )
 
 
 # TODO(stable-audio-3): once port is done, add:
