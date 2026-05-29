@@ -294,6 +294,10 @@ class DiffusionEngine:
         if is_audio_output and model_audio_sample_rate is None:
             model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
             model_audio_sample_rate = getattr(model_cls, "audio_sample_rate", None)
+        # Some pipelines, such as LTX-2/LTX-2.3, return video as the primary
+        # output and attach audio through the post-process dict. Only treat the
+        # request as audio-only when no separate audio payload was extracted.
+        is_audio_only_output = is_audio_output and audio_payload is None
 
         def _audio_mm(payload: Any) -> dict[str, Any]:
             mm: dict[str, Any] = {"audio": payload}
@@ -319,7 +323,7 @@ class DiffusionEngine:
                         peak_memory_mb=output.peak_memory_mb,
                     ),
                 ]
-            if is_audio_output:
+            if is_audio_only_output:
                 request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
                 return [
                     OmniRequestOutput.from_diffusion(
@@ -378,7 +382,7 @@ class DiffusionEngine:
                 request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
                 output_idx = end_idx
 
-                if is_audio_output:
+                if is_audio_only_output:
                     request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
                     results.append(
                         OmniRequestOutput.from_diffusion(
