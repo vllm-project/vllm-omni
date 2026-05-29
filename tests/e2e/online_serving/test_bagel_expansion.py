@@ -18,6 +18,7 @@ import pytest
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
@@ -25,7 +26,18 @@ PROMPT = "A futuristic city skyline at twilight, cyberpunk style, ultra-detailed
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+PARALLEL_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+HSDP_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+
+BAGEL_CI_DEPLOY = get_deploy_config_path("ci/bagel.yaml")
+BAGEL_PARALLEL_2_DEPLOY = modify_stage_config(
+    BAGEL_CI_DEPLOY,
+    updates={"stages": {0: {"devices": "0"}, 1: {"devices": "0,1"}}},
+)
+BAGEL_HSDP_2_DEPLOY = modify_stage_config(
+    BAGEL_CI_DEPLOY,
+    updates={"stages": {0: {"devices": "0"}, 1: {"devices": "0,1"}}},
+)
 
 
 def _get_diffusion_feature_cases(model: str):
@@ -63,6 +75,7 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_config_path=BAGEL_PARALLEL_2_DEPLOY,
                 server_args=[
                     "--cache-backend",
                     "tea_cache",
@@ -71,31 +84,33 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="parallel_cfg_2",
-            marks=PARALLEL_FEATURE_MARKS,
+            marks=PARALLEL_2_FEATURE_MARKS,
         ),
         # Ulysses-SP degree=2 (2 GPUs)
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_config_path=BAGEL_PARALLEL_2_DEPLOY,
                 server_args=[
                     "--usp",
                     "2",
                 ],
             ),
             id="sp_ulysses_2",
-            marks=PARALLEL_FEATURE_MARKS,
+            marks=PARALLEL_2_FEATURE_MARKS,
         ),
         # Ring-Attention degree=2 (2 GPUs)
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_config_path=BAGEL_PARALLEL_2_DEPLOY,
                 server_args=[
                     "--ring",
                     "2",
                 ],
             ),
             id="sp_ring_2",
-            marks=PARALLEL_FEATURE_MARKS,
+            marks=PARALLEL_2_FEATURE_MARKS,
         ),
         # Layerwise Offloading (single-card)
         pytest.param(
@@ -106,18 +121,19 @@ def _get_diffusion_feature_cases(model: str):
             id="single_card_layerwise_offload",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
-        # Hybrid Sharded Data Parallel (4 GPUs)
+        # Hybrid Sharded Data Parallel (2 GPUs)
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_config_path=BAGEL_HSDP_2_DEPLOY,
                 server_args=[
                     "--use-hsdp",
                     "--hsdp-shard-size",
-                    "4",
+                    "2",
                 ],
             ),
-            id="parallel_hsdp_4",
-            marks=PARALLEL_FEATURE_MARKS,
+            id="parallel_hsdp_2",
+            marks=HSDP_2_FEATURE_MARKS,
         ),
     ]
 
@@ -140,7 +156,7 @@ def test_bagel(
     - Ulysses-SP (degree=2)
     - Ring-Attention (degree=2)
     - Layerwise Offloading
-    - Hybrid Sharded Data Parallel (size=4)
+    - Hybrid Sharded Data Parallel (size=2)
 
     Validation is delegated to assert_diffusion_response in tests/helpers/assertions.py,
     which checks output dimensions and basic correctness.
@@ -158,6 +174,7 @@ def test_bagel(
             # Enable CFG for models that use classifier-free guidance
             "negative_prompt": NEGATIVE_PROMPT,
             "true_cfg_scale": 4.0,
+            "cfg_img_scale": 1.0,
             "seed": 42,
         },
     }
