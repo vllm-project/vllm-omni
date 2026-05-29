@@ -64,7 +64,7 @@ def _make_diffusion_metadata(stage_id: int, *, replica_id: int = 0, final_output
 def _make_llm_plan(
     stage_idx: int,
     *,
-    configured_stage_id: int,
+    stage_id: int,
     vllm_config: object,
     num_replicas: int = 1,
     final_output: bool = False,
@@ -74,7 +74,7 @@ def _make_llm_plan(
     replicas: list[ReplicaInitPlan] = []
     for replica_id in range(num_replicas):
         stage_cfg = types.SimpleNamespace(
-            stage_id=configured_stage_id,
+            stage_id=stage_id,
             stage_type="llm",
             runtime=types.SimpleNamespace(devices=str(replica_id)),
             engine_args={},
@@ -86,7 +86,7 @@ def _make_llm_plan(
                 launch_mode="local",
                 stage_cfg=stage_cfg,
                 metadata=_make_llm_metadata(
-                    configured_stage_id,
+                    stage_id,
                     replica_id=replica_id,
                     final_output=final_output,
                     final_output_type=final_output_type,
@@ -100,7 +100,7 @@ def _make_llm_plan(
         )
     return LogicalStageInitPlan(
         stage_idx=stage_idx,
-        configured_stage_id=configured_stage_id,
+        stage_id=stage_id,
         replicas=replicas,
     )
 
@@ -108,13 +108,13 @@ def _make_llm_plan(
 def _make_diffusion_plan(
     stage_idx: int,
     *,
-    configured_stage_id: int,
+    stage_id: int,
     num_replicas: int = 1,
 ):
     replicas: list[ReplicaInitPlan] = []
     for replica_id in range(num_replicas):
         stage_cfg = types.SimpleNamespace(
-            stage_id=configured_stage_id,
+            stage_id=stage_id,
             stage_type="diffusion",
             runtime=types.SimpleNamespace(devices=str(replica_id)),
             engine_args={},
@@ -125,14 +125,14 @@ def _make_diffusion_plan(
                 num_replicas=num_replicas,
                 launch_mode="local",
                 stage_cfg=stage_cfg,
-                metadata=_make_diffusion_metadata(configured_stage_id, replica_id=replica_id),
+                metadata=_make_diffusion_metadata(stage_id, replica_id=replica_id),
                 stage_connector_spec={},
                 omni_kv_connector=(None, None, None),
             )
         )
     return LogicalStageInitPlan(
         stage_idx=stage_idx,
-        configured_stage_id=configured_stage_id,
+        stage_id=stage_id,
         replicas=replicas,
     )
 
@@ -188,7 +188,7 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
         async_chunk=False,
     )
 
-    plan = _make_diffusion_plan(0, configured_stage_id=0).replicas[0]
+    plan = _make_diffusion_plan(0, stage_id=0).replicas[0]
 
     env_var = current_omni_platform.device_control_env_var
     old_env = os.environ.get(env_var)
@@ -228,7 +228,7 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
         async_chunk=False,
     )
 
-    plan = _make_diffusion_plan(0, configured_stage_id=0).replicas[0]
+    plan = _make_diffusion_plan(0, stage_id=0).replicas[0]
 
     captured: dict[str, object] = {}
 
@@ -271,8 +271,8 @@ def test_stage_runtime_initializes_stage_pools(monkeypatch):
     cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
     cfg1 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
     stage_plans = [
-        _make_llm_plan(0, configured_stage_id=0, vllm_config=cfg0, num_replicas=2, is_comprehension=True),
-        _make_llm_plan(1, configured_stage_id=1, vllm_config=cfg1, final_output=True),
+        _make_llm_plan(0, stage_id=0, vllm_config=cfg0, num_replicas=2, is_comprehension=True),
+        _make_llm_plan(1, stage_id=1, vllm_config=cfg1, final_output=True),
     ]
 
     stage0_client_r0 = types.SimpleNamespace(
@@ -366,7 +366,7 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
         replica_devices_map={1: ["1", "2", "3"]},
     )
 
-    assert [plan.configured_stage_id for plan in stage_plans] == [0, 1]
+    assert [plan.stage_id for plan in stage_plans] == [0, 1]
     assert [replica.stage_cfg.runtime.devices for replica in stage_plans[1].replicas] == ["1", "2", "3"]
     assert [replica.replica_id for replica in stage_plans[1].replicas] == [0, 1, 2]
     assert all(replica.num_replicas == 3 for replica in stage_plans[1].replicas)
@@ -385,8 +385,8 @@ def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monk
     cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
     cfg1 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
     stage_plans = [
-        _make_llm_plan(0, configured_stage_id=0, vllm_config=cfg0, num_replicas=2),
-        _make_llm_plan(1, configured_stage_id=1, vllm_config=cfg1, num_replicas=2),
+        _make_llm_plan(0, stage_id=0, vllm_config=cfg0, num_replicas=2),
+        _make_llm_plan(1, stage_id=1, vllm_config=cfg1, num_replicas=2),
     ]
 
     clients = {
@@ -421,7 +421,7 @@ def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_rep
     )
 
     cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
-    stage_plans = [_make_llm_plan(0, configured_stage_id=0, vllm_config=cfg0, num_replicas=2)]
+    stage_plans = [_make_llm_plan(0, stage_id=0, vllm_config=cfg0, num_replicas=2)]
     initialized_client = types.SimpleNamespace(shutdown=lambda: None)
 
     monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: stage_plans)
@@ -458,7 +458,7 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
     )
 
     cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
-    stage_plans = [_make_llm_plan(0, configured_stage_id=0, vllm_config=cfg0, num_replicas=2)]
+    stage_plans = [_make_llm_plan(0, stage_id=0, vllm_config=cfg0, num_replicas=2)]
     initialized_client = types.SimpleNamespace(shutdown=lambda: None)
 
     monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: stage_plans)

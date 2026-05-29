@@ -10,7 +10,6 @@ import pytest
 
 from vllm_omni.distributed.omni_coordinator.messages import ReplicaStatus
 from vllm_omni.engine.membership_controller import MembershipController
-from vllm_omni.engine.messages import ErrorMessage
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -30,9 +29,8 @@ class FakeHub:
 
 
 class FakePool:
-    def __init__(self, configured_stage_id: int):
-        self.stage_id = 0
-        self.configured_stage_id = configured_stage_id
+    def __init__(self, stage_id: int):
+        self.stage_id = stage_id
         self.clients = []
         self.added = []
         self.removed = []
@@ -76,19 +74,18 @@ def _controller(monkeypatch, pool, hub):
         stage_pools=[pool],
         coordinator_pub_address="tcp://127.0.0.1:12345",
         load_balancer_factory=lambda: object(),
-        remote_replica_factory=lambda stage_id, replica_id: asyncio.sleep(
-            0,
-            result=SimpleNamespace(client_addresses={"input_address": f"tcp://stage-{stage_id}-replica-{replica_id}"}),
+        remote_replica_factory=lambda stage_id, replica_id: SimpleNamespace(
+            client_addresses={"input_address": f"tcp://stage-{stage_id}-replica-{replica_id}"}
         ),
     )
 
 
 @pytest.mark.asyncio
 async def test_watch_replica_list_unregisters_disappeared_replicas(monkeypatch):
-    pool = FakePool(configured_stage_id=7)
+    pool = FakePool(stage_id=0)
     hub = FakeHub(
         snapshots=[
-            _snapshot(_replica(7, "tcp://gone")),
+            _snapshot(_replica(0, "tcp://gone")),
             _snapshot(),
         ]
     )
@@ -105,12 +102,12 @@ async def test_watch_replica_list_unregisters_disappeared_replicas(monkeypatch):
     await asyncio.wait_for(controller._watch_replica_list(), timeout=1)
     await controller.drain_tasks(timeout=1)
 
-    assert unregistered == [(7, "tcp://gone")]
+    assert unregistered == [(0, "tcp://gone")]
 
 
 @pytest.mark.asyncio
 async def test_shutdown_closes_hub_then_cancels_watcher(monkeypatch):
-    pool = FakePool(configured_stage_id=0)
+    pool = FakePool(stage_id=0)
     hub = FakeHub()
     controller = _controller(monkeypatch, pool, hub)
     watcher = asyncio.create_task(asyncio.sleep(10))
@@ -125,7 +122,7 @@ async def test_shutdown_closes_hub_then_cancels_watcher(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_drain_tasks_waits_for_membership_tasks(monkeypatch):
-    pool = FakePool(configured_stage_id=0)
+    pool = FakePool(stage_id=0)
     controller = _controller(monkeypatch, pool, FakeHub())
     completed = []
 

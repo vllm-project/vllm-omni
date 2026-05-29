@@ -313,16 +313,23 @@ class StageRuntime:
 
         for stage_idx, stage_cfg in enumerate(self._stage_configs):
             base_metadata = extract_stage_metadata(stage_cfg)
-            configured_stage_id = base_metadata.stage_id
+            stage_id = int(base_metadata.stage_id)
+            if stage_id != stage_idx:
+                raise ValueError(
+                    "stage_id must match its position in stage_configs: "
+                    f"stage_configs[{stage_idx}] has stage_id={stage_id}. "
+                    "Stage ids must be contiguous and zero-based because the "
+                    "orchestrator indexes stage pools by stage_id."
+                )
 
             stage_connector_spec = get_stage_connector_spec(
                 omni_transfer_config=omni_transfer_config,
-                stage_id=configured_stage_id,
+                stage_id=stage_id,
                 async_chunk=self._async_chunk,
             )
-            omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
+            omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
             num_replicas = replicas_per_stage[stage_idx]
-            launch_mode = self._get_launch_mode(configured_stage_id)
+            launch_mode = self._get_launch_mode(stage_id)
 
             replicas: list[ReplicaInitPlan] = []
             stage_vllm_config = None
@@ -338,11 +345,11 @@ class StageRuntime:
                 inject_omni_kv_connector_config(
                     engine_args_dict,
                     omni_kv_connector,
-                    configured_stage_id,
+                    stage_id,
                 )
                 _inject_inferred_kv_tp_topology(
                     engine_args_dict.get("omni_kv_config"),
-                    configured_stage_id,
+                    stage_id,
                     self._stage_configs,
                 )
                 stage_vllm_config, executor_class = build_vllm_config(
@@ -380,14 +387,14 @@ class StageRuntime:
             stage_plans.append(
                 LogicalStageInitPlan(
                     stage_idx=stage_idx,
-                    configured_stage_id=configured_stage_id,
+                    stage_id=stage_id,
                     replicas=replicas,
                 )
             )
 
         return stage_plans
 
-    def _get_launch_mode(self, configured_stage_id: int) -> str:
+    def _get_launch_mode(self, stage_id: int) -> str:
         """Determine launch mode for a stage. Overridden by DistStageRuntime."""
         return "local"
 
@@ -653,7 +660,7 @@ class StageRuntime:
             if plan.replicas[0].metadata.stage_type != "diffusion":
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 if stage_vllm_config is None:
-                    raise RuntimeError(f"Stage {plan.configured_stage_id} is missing vllm_config")
+                    raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
                 output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
 
             stage_pools.append(
@@ -793,8 +800,8 @@ class DistStageRuntime(StageRuntime):
 
     # ---- Distributed overrides ----
 
-    def _get_launch_mode(self, configured_stage_id: int) -> str:
-        if self._single_stage_id_filter is not None and configured_stage_id != self._single_stage_id_filter:
+    def _get_launch_mode(self, stage_id: int) -> str:
+        if self._single_stage_id_filter is not None and stage_id != self._single_stage_id_filter:
             return "remote"
         return "local"
 
@@ -855,7 +862,7 @@ class DistStageRuntime(StageRuntime):
         head_local_replicas: dict[int, list[int]] = {}
         seen_stage_ids: set[int] = set()
         for plan in stage_plans:
-            stage_id = plan.configured_stage_id
+            stage_id = plan.stage_id
             if stage_id in seen_stage_ids:
                 raise ValueError(f"Duplicate stage_id {stage_id!r} detected")
             seen_stage_ids.add(stage_id)
@@ -890,7 +897,7 @@ class DistStageRuntime(StageRuntime):
             if not plan.replicas:
                 continue
             template = plan.replicas[0]
-            stage_id = int(plan.configured_stage_id)
+            stage_id = int(plan.stage_id)
             contexts[stage_id] = StageRemoteFactoryContext(
                 stage_id=stage_id,
                 stage_type=template.metadata.stage_type or "llm",

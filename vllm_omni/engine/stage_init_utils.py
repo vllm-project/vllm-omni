@@ -59,7 +59,7 @@ class LogicalStageInitPlan:
     """Startup plan for one logical stage."""
 
     stage_idx: int
-    configured_stage_id: int
+    stage_id: int
     replicas: list[ReplicaInitPlan]
 
 

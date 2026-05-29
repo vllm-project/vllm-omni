@@ -47,13 +47,13 @@ def _make_stage_cfg(stage_id: int, stage_type: str = "llm"):
 def _make_llm_plan(
     stage_idx: int,
     *,
-    configured_stage_id: int,
+    stage_id: int,
     launch_mode: str,
     vllm_config: Any | None = None,
 ) -> LogicalStageInitPlan:
-    stage_cfg = _make_stage_cfg(configured_stage_id)
+    stage_cfg = _make_stage_cfg(stage_id)
     metadata = SimpleNamespace(
-        stage_id=configured_stage_id,
+        stage_id=stage_id,
         stage_type="llm",
         runtime_cfg={"devices": "0"},
         prompt_expand_func=None,
@@ -67,7 +67,7 @@ def _make_llm_plan(
     )
     return LogicalStageInitPlan(
         stage_idx=stage_idx,
-        configured_stage_id=configured_stage_id,
+        stage_id=stage_id,
         replicas=[
             ReplicaInitPlan(
                 replica_id=0,
@@ -89,12 +89,12 @@ def _make_llm_plan(
 def _make_diffusion_plan(
     stage_idx: int,
     *,
-    configured_stage_id: int,
+    stage_id: int,
     launch_mode: str,
 ) -> LogicalStageInitPlan:
-    stage_cfg = _make_stage_cfg(configured_stage_id, stage_type="diffusion")
+    stage_cfg = _make_stage_cfg(stage_id, stage_type="diffusion")
     metadata = SimpleNamespace(
-        stage_id=configured_stage_id,
+        stage_id=stage_id,
         stage_type="diffusion",
         runtime_cfg={"devices": "0"},
         prompt_expand_func=None,
@@ -108,7 +108,7 @@ def _make_diffusion_plan(
     )
     return LogicalStageInitPlan(
         stage_idx=stage_idx,
-        configured_stage_id=configured_stage_id,
+        stage_id=stage_id,
         replicas=[
             ReplicaInitPlan(
                 replica_id=0,
@@ -478,8 +478,8 @@ class TestSingleStageInitialization:
     def test_build_logical_stage_init_plans_marks_non_matching_stage_remote(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
 
-        stage_cfgs = [_make_stage_cfg(7), _make_stage_cfg(11)]
-        runtime = self._build_runtime(stage_cfgs, stage_id_filter=7)
+        stage_cfgs = [_make_stage_cfg(0), _make_stage_cfg(1)]
+        runtime = self._build_runtime(stage_cfgs, stage_id_filter=0)
 
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
@@ -503,11 +503,33 @@ class TestSingleStageInitialization:
 
         assert [plan.replicas[0].launch_mode for plan in stage_plans] == ["local", "remote"]
 
-    def test_start_omni_master_server_uses_configured_stage_ids(self, mocker: MockerFixture):
+    def test_build_logical_stage_init_plans_rejects_non_contiguous_stage_ids(self, mocker: MockerFixture):
+        import vllm_omni.engine.stage_runtime as runtime_mod
+
+        runtime = self._build_runtime([_make_stage_cfg(7), _make_stage_cfg(11)], stage_id_filter=7)
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(
+            runtime_mod,
+            "extract_stage_metadata",
+            lambda cfg: SimpleNamespace(
+                stage_id=cfg.stage_id,
+                stage_type=getattr(cfg, "stage_type", "llm"),
+                prompt_expand_func=None,
+                runtime_cfg={},
+            ),
+        )
+        try:
+            with pytest.raises(ValueError, match="stage_id must match its position"):
+                runtime._build_logical_stage_init_plans(None, [1, 1], {})
+        finally:
+            monkeypatch.undo()
+
+    def test_start_omni_master_server_uses_stage_ids(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
         from vllm_omni.distributed import omni_coordinator as omni_coord_mod
 
-        runtime = self._build_runtime([], stage_id_filter=7)
+        runtime = self._build_runtime([], stage_id_filter=0)
         mock_oms = mocker.Mock(spec=OmniMasterServer)
         mocker.patch.object(runtime_mod, "OmniMasterServer", return_value=mock_oms)
         mocker.patch.object(
@@ -517,8 +539,8 @@ class TestSingleStageInitialization:
         )
 
         stage_plans = [
-            _make_llm_plan(0, configured_stage_id=7, launch_mode="local"),
-            _make_diffusion_plan(1, configured_stage_id=11, launch_mode="remote"),
+            _make_llm_plan(0, stage_id=0, launch_mode="local"),
+            _make_diffusion_plan(1, stage_id=1, launch_mode="remote"),
         ]
 
         runtime._start_omni_master_server(stage_plans)
@@ -526,38 +548,38 @@ class TestSingleStageInitialization:
         call_kwargs = runtime_mod.OmniMasterServer.call_args.kwargs
         assert call_kwargs["master_address"] == "127.0.0.1"
         assert call_kwargs["master_port"] == 26000
-        assert call_kwargs["stage_ids"] == [7, 11]
-        assert call_kwargs["stage_replica_counts"] == {7: 1, 11: 1}
+        assert call_kwargs["stage_ids"] == [0, 1]
+        assert call_kwargs["stage_replica_counts"] == {0: 1, 1: 1}
         # head_local_replicas reserves slots that the head will register
-        # itself (launch_mode == "local"). Stage 11 is remote, so it must
+        # itself (launch_mode == "local"). Stage 1 is remote, so it must
         # NOT appear in the head-owned set — that slot is for the headless
         # to fill via auto-assign.
-        assert call_kwargs["head_local_replicas"] == {7: [0]}
+        assert call_kwargs["head_local_replicas"] == {0: [0]}
         mock_oms.start.assert_called_once()
 
     def test_start_omni_master_server_duplicate_stage_ids_raise(self):
-        runtime = self._build_runtime([], stage_id_filter=7)
+        runtime = self._build_runtime([], stage_id_filter=0)
         stage_plans = [
-            _make_llm_plan(0, configured_stage_id=7, launch_mode="local"),
-            _make_llm_plan(1, configured_stage_id=7, launch_mode="remote"),
+            _make_llm_plan(0, stage_id=0, launch_mode="local"),
+            _make_llm_plan(1, stage_id=0, launch_mode="remote"),
         ]
 
         with pytest.raises(ValueError, match="Duplicate stage_id"):
             runtime._start_omni_master_server(stage_plans)
 
     def test_start_omni_master_server_missing_address_raises(self):
-        runtime = self._build_runtime([], stage_id_filter=7)
+        runtime = self._build_runtime([], stage_id_filter=0)
         runtime._omni_master_address = None
 
         with pytest.raises(ValueError, match="requires both"):
-            runtime._start_omni_master_server([_make_llm_plan(0, configured_stage_id=7, launch_mode="local")])
+            runtime._start_omni_master_server([_make_llm_plan(0, stage_id=0, launch_mode="local")])
 
     def test_build_logical_stage_init_plans_preserves_runtime_cfg_for_local_llm_in_single_stage_mode(
         self, mocker: MockerFixture
     ):
         import vllm_omni.engine.stage_runtime as runtime_mod
 
-        runtime = self._build_runtime([_make_stage_cfg(7)], stage_id_filter=7)
+        runtime = self._build_runtime([_make_stage_cfg(0)], stage_id_filter=0)
 
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
@@ -597,9 +619,9 @@ class TestSingleStageInitialization:
     ):
         import vllm_omni.engine.stage_runtime as runtime_mod
 
-        stage_cfg = _make_stage_cfg(7, stage_type="diffusion")
+        stage_cfg = _make_stage_cfg(0, stage_type="diffusion")
         stage_cfg.runtime.devices = "0,1"
-        runtime = self._build_runtime([stage_cfg], stage_id_filter=7)
+        runtime = self._build_runtime([stage_cfg], stage_id_filter=0)
 
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
@@ -636,7 +658,7 @@ class TestSingleStageInitialization:
 
         stage_cfgs = [_make_stage_cfg(0)]
         runtime = self._build_runtime(stage_cfgs, stage_id_filter=0)
-        stage_plan = _make_llm_plan(0, configured_stage_id=0, launch_mode="local")
+        stage_plan = _make_llm_plan(0, stage_id=0, launch_mode="local")
         client = SimpleNamespace(
             stage_type="llm",
             is_comprehension=False,
@@ -681,7 +703,7 @@ class TestSingleStageInitialization:
 
         stage_cfgs = [_make_stage_cfg(0)]
         runtime = self._build_runtime(stage_cfgs, stage_id_filter=0)
-        stage_plan = _make_llm_plan(0, configured_stage_id=0, launch_mode="local")
+        stage_plan = _make_llm_plan(0, stage_id=0, launch_mode="local")
         initialized_client = mocker.Mock()
         mock_master = mocker.Mock(spec=OmniMasterServer)
 
@@ -721,7 +743,7 @@ class TestSingleStageReplicaInitialization:
             omni_master_port=26000,
         )
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
-        runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 7, "stage_type": "llm"}
+        runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 1, "stage_type": "llm"}
 
         fake_vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1))
         fake_addresses = SimpleNamespace(
@@ -745,7 +767,7 @@ class TestSingleStageReplicaInitialization:
 
         plan = _make_llm_plan(
             0,
-            configured_stage_id=7,
+            stage_id=1,
             launch_mode="remote",
             vllm_config=fake_vllm_config,
         ).replicas[0]
@@ -761,9 +783,9 @@ class TestSingleStageReplicaInitialization:
         result = runtime._initialize_remote_replica(plan, stage_init_timeout=60)
 
         assert result is sentinel_client
-        runtime._omni_master_server.get_stage_config.assert_called_once_with(7, timeout_s=60, replica_id=0)
+        runtime._omni_master_server.get_stage_config.assert_called_once_with(1, timeout_s=60, replica_id=0)
         assert mock_connect.call_args.kwargs["vllm_config"].parallel_config.data_parallel_size_local == 0
-        assert mock_connect.call_args.kwargs["stage_id"] == 7
+        assert mock_connect.call_args.kwargs["stage_id"] == 1
         assert mock_connect.call_args.kwargs["replica_id"] == 0
         assert events == ["enter", "exit", "attach"]
 
@@ -782,7 +804,7 @@ class TestSingleStageReplicaInitialization:
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._omni_master_server.get_stage_config.return_value = None
 
-        plan = _make_llm_plan(0, configured_stage_id=7, launch_mode="remote").replicas[0]
+        plan = _make_llm_plan(0, stage_id=1, launch_mode="remote").replicas[0]
 
         with pytest.raises(ValueError, match="registered without stage config"):
             runtime._initialize_remote_replica(plan, stage_init_timeout=60)
@@ -802,7 +824,7 @@ class TestSingleStageReplicaInitialization:
             omni_master_port=26000,
         )
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
-        runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 7, "stage_type": "llm"}
+        runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 1, "stage_type": "llm"}
 
         fake_vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1))
         fake_addresses = SimpleNamespace(
@@ -821,7 +843,7 @@ class TestSingleStageReplicaInitialization:
 
         plan = _make_llm_plan(
             0,
-            configured_stage_id=7,
+            stage_id=1,
             launch_mode="remote",
             vllm_config=fake_vllm_config,
         ).replicas[0]
@@ -871,7 +893,7 @@ class TestSingleStageReplicaInitialization:
 
         plan = _make_llm_plan(
             0,
-            configured_stage_id=3,
+            stage_id=0,
             launch_mode="local",
             vllm_config=fake_vllm_config,
         ).replicas[0]
@@ -902,7 +924,7 @@ class TestSingleStageReplicaInitialization:
                 os.environ[device_env_var] = prev_device_env
 
         assert result is sentinel_client
-        assert mock_launch.call_args.kwargs["stage_id"] == 3
+        assert mock_launch.call_args.kwargs["stage_id"] == 0
         assert mock_launch.call_args.kwargs["stage_config"] is plan.stage_cfg
         assert mock_launch.call_args.kwargs["replica_id"] == 0
         assert mock_launch.call_args.kwargs["omni_master_server"] is runtime._omni_master_server
@@ -922,7 +944,7 @@ class TestSingleStageReplicaInitialization:
             omni_master_port=26000,
         )
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
-        runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 11, "stage_type": "diffusion"}
+        runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 1, "stage_type": "diffusion"}
 
         def _fake_connect(**kwargs):
             @contextmanager
@@ -936,8 +958,8 @@ class TestSingleStageReplicaInitialization:
 
             return _ctx()
 
-        remote_metadata = _make_diffusion_plan(1, configured_stage_id=11, launch_mode="remote").replicas[0].metadata
-        plan = _make_diffusion_plan(1, configured_stage_id=11, launch_mode="remote").replicas[0]
+        remote_metadata = _make_diffusion_plan(1, stage_id=1, launch_mode="remote").replicas[0].metadata
+        plan = _make_diffusion_plan(1, stage_id=1, launch_mode="remote").replicas[0]
         sentinel_client = SimpleNamespace()
 
         mocker.patch.object(runtime_mod, "extract_stage_metadata", return_value=remote_metadata)
@@ -950,10 +972,10 @@ class TestSingleStageReplicaInitialization:
         result = runtime._initialize_remote_replica(plan, stage_init_timeout=60)
 
         assert result is sentinel_client
-        runtime._omni_master_server.get_stage_config.assert_called_once_with(11, timeout_s=60, replica_id=0)
+        runtime._omni_master_server.get_stage_config.assert_called_once_with(1, timeout_s=60, replica_id=0)
         mock_connect.assert_called_once_with(
             omni_master_server=runtime._omni_master_server,
-            stage_id=11,
+            stage_id=1,
             replica_id=0,
         )
         mock_from_addresses.assert_called_once()
@@ -978,7 +1000,7 @@ class TestSingleStageReplicaInitialization:
         runtime._omni_master_server.port = 25000
         runtime._coordinator_runtime = None
 
-        plan = _make_diffusion_plan(0, configured_stage_id=5, launch_mode="local").replicas[0]
+        plan = _make_diffusion_plan(0, stage_id=0, launch_mode="local").replicas[0]
         sentinel_client = SimpleNamespace()
         proc = mocker.Mock()
 
@@ -1029,7 +1051,7 @@ class TestSingleStageReplicaInitialization:
         mock_register.assert_called_once_with(
             omni_master_address="127.0.0.1",
             omni_master_port=25000,
-            omni_stage_id=5,
+            omni_stage_id=0,
             omni_stage_config=plan.stage_cfg,
             replica_id=0,
         )
@@ -1040,7 +1062,7 @@ class TestSingleStageReplicaInitialization:
             handshake_address="tcp://127.0.0.1:26001",
             addresses=mocker.ANY,
             omni_coordinator_address=None,
-            omni_stage_id=5,
+            omni_stage_id=0,
             omni_replica_id=0,
         )
         assert mock_manager.call_args.kwargs["addresses"].inputs == ["tcp://127.0.0.1:26002"]
@@ -1074,7 +1096,7 @@ class TestSingleStageReplicaInitialization:
         runtime._omni_master_server.port = 25000
         runtime._coordinator_runtime = None
 
-        plan = _make_diffusion_plan(0, configured_stage_id=5, launch_mode="local").replicas[0]
+        plan = _make_diffusion_plan(0, stage_id=0, launch_mode="local").replicas[0]
 
         device_env_var = current_omni_platform.device_control_env_var
         prev_device_env = os.environ.get(device_env_var)
