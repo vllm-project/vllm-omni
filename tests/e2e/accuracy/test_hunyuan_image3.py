@@ -81,14 +81,6 @@ THRESHOLDS = {
     "ssim": 0.26,  # Structural similarity
     "psnr": 12.5,  # Peak signal-to-noise ratio (dB)
 }
-NPU_THRESHOLDS = {
-    # NPU CI uses the distilled checkpoint and may emit a different aspect bucket from the L20x reference.
-    "text_prefix_match": 10,
-    "cot_semantic_sim": 0.9,
-    "clip_score": 89,
-    "ssim": 0.16,
-    "psnr": 9.5,
-}
 
 QUANT_PROMPT = "A brown and white dog is running on the grass."
 QUANT_HEIGHT, QUANT_WIDTH = 1024, 1024
@@ -538,31 +530,31 @@ def test_image_to_image_alignment_npu(
     ssim_value, psnr_value = compute_image_ssim_psnr(prediction=npu_image, reference=pixel_ref, compare_mode="RGB")
 
     table = [
-        ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", NPU_THRESHOLDS["cot_semantic_sim"]],
-        ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", NPU_THRESHOLDS["text_prefix_match"]],
-        ["Image-Image similarity", f"{image_clip_score:.4f}", NPU_THRESHOLDS["clip_score"]],
-        ["SSIM", f"{ssim_value:.4f}", NPU_THRESHOLDS["ssim"]],
-        ["PSNR (dB)", f"{psnr_value:.2f}", NPU_THRESHOLDS["psnr"]],
+        ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", THRESHOLDS["cot_semantic_sim"]],
+        ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", THRESHOLDS["text_prefix_match"]],
+        ["Image-Image similarity", f"{image_clip_score:.4f}", THRESHOLDS["clip_score"]],
+        ["SSIM", f"{ssim_value:.4f}", THRESHOLDS["ssim"]],
+        ["PSNR (dB)", f"{psnr_value:.2f}", THRESHOLDS["psnr"]],
     ]
-    print(f"[NPU][{case_name}] " + tabulate(table, headers=["Metric", "Value", "NPU Threshold"], tablefmt="grid"))
+    print(f"[NPU][{case_name}] " + tabulate(table, headers=["Metric", "Value", "Threshold"], tablefmt="grid"))
 
-    assert cot_results["cot_semantic_sim"] >= NPU_THRESHOLDS["cot_semantic_sim"], (
+    assert cot_results["cot_semantic_sim"] >= THRESHOLDS["cot_semantic_sim"], (
         f"[NPU][{case_name}] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} "
-        f"below threshold {NPU_THRESHOLDS['cot_semantic_sim']}"
+        f"below threshold {THRESHOLDS['cot_semantic_sim']}"
     )
-    assert cot_results["text_prefix_match_count"] >= NPU_THRESHOLDS["text_prefix_match"], (
+    assert cot_results["text_prefix_match_count"] >= THRESHOLDS["text_prefix_match"], (
         f"[NPU][{case_name}] COT prefix match {cot_results['text_prefix_match_count']} "
-        f"below threshold {NPU_THRESHOLDS['text_prefix_match']}"
+        f"below threshold {THRESHOLDS['text_prefix_match']}"
     )
-    assert image_clip_score >= NPU_THRESHOLDS["clip_score"], (
+    assert image_clip_score >= THRESHOLDS["clip_score"], (
         f"[NPU][{case_name}] Image-Image similarity {image_clip_score:.4f} "
-        f"below threshold {NPU_THRESHOLDS['clip_score']}"
+        f"below threshold {THRESHOLDS['clip_score']}"
     )
-    assert ssim_value >= NPU_THRESHOLDS["ssim"], (
-        f"[NPU][{case_name}] SSIM {ssim_value:.4f} below threshold {NPU_THRESHOLDS['ssim']}"
+    assert ssim_value >= THRESHOLDS["ssim"], (
+        f"[NPU][{case_name}] SSIM {ssim_value:.4f} below threshold {THRESHOLDS['ssim']}"
     )
-    assert psnr_value >= NPU_THRESHOLDS["psnr"], (
-        f"[NPU][{case_name}] PSNR {psnr_value:.2f} dB below threshold {NPU_THRESHOLDS['psnr']} dB"
+    assert psnr_value >= THRESHOLDS["psnr"], (
+        f"[NPU][{case_name}] PSNR {psnr_value:.2f} dB below threshold {THRESHOLDS['psnr']} dB"
     )
 
 
