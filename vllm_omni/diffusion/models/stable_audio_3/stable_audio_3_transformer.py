@@ -20,19 +20,22 @@ Stage 2 (follow-up PR) will swap to vllm_omni.diffusion.attention.layer.Attentio
 
 from __future__ import annotations
 
+import logging
 import math
+import os as _os
 import typing as tp
-from collections.abc import Iterable
-from typing import ClassVar
+from collections.abc import Callable, Iterable
+from functools import reduce
+from typing import ClassVar, Literal
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
-from torch import nn
-from torch.nn import functional as F
+from einops import rearrange
+from einops.layers.torch import Rearrange
+from torch import einsum, nn
+from torch.amp import autocast
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.stable_audio_3.conditioners import ExpoFourierFeatures
 
 
@@ -64,16 +67,16 @@ def filter_lora_layers(module):
 LoRAParametrization = _NoOpLoRAParametrization
 
 
-
 # ===========================================================================
 # Fourier helpers (PORT_FROM: models/blocks.py)
 # ===========================================================================
 
+
 class FourierFeatures(nn.Module):
-    def __init__(self, in_features, out_features, std=16.):
+    def __init__(self, in_features, out_features, std=16.0):
         super().__init__()
         assert out_features % 2 == 0
-        self.register_buffer('weight', torch.randn([out_features // 2, in_features]) * std)
+        self.register_buffer("weight", torch.randn([out_features // 2, in_features]) * std)
 
     def forward(self, input):
         f = 2 * math.pi * input @ self.weight.T
@@ -83,21 +86,9 @@ class FourierFeatures(nn.Module):
 # ===========================================================================
 # Transformer building blocks (PORT_FROM: models/transformer.py)
 # ===========================================================================
-from functools import reduce, partial
-from packaging import version
-import logging
-import math
-
-from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
-import torch
-import torch.nn.functional as F
-from torch import nn, einsum
-from torch.amp import autocast
-from torch.nn.utils.parametrizations import weight_norm
-from typing import Callable, Literal, Optional
 try:
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
     flex_attention_available = True
 except ImportError:
     flex_attention = None
@@ -108,16 +99,16 @@ try:
     from flash_attn import flash_attn_func, flash_attn_kvpacked_func
 except ImportError as e:
     print(e)
-    print('flash_attn not installed, disabling Flash Attention')
+    print("flash_attn not installed, disabling Flash Attention")
     flash_attn_kvpacked_func = None
     flash_attn_func = None
 
 try:
     from flash_attn import flash_attn_varlen_func
-    from flash_attn.bert_padding import pad_input, unpad_input, index_first_axis
+    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
 except ImportError as e:
     print(e)
-    print('flash_attn varlen/bert_padding not available, disabling varlen attention')
+    print("flash_attn varlen/bert_padding not available, disabling varlen attention")
     flash_attn_varlen_func = None
     pad_input = None
     unpad_input = None
@@ -156,9 +147,8 @@ def precompute_varlen_metadata(padding_mask: torch.Tensor):
         "seq_len": seq_len,
     }
 
-# PORT_FROM: models/utils.py compile helper (inlined to avoid extra file)
-import os as _os
 
+# PORT_FROM: models/utils.py compile helper (inlined to avoid extra file)
 torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
 torch._dynamo.config.suppress_errors = True
 
@@ -183,10 +173,11 @@ def _left_pad_to_match(emb, target_len):
     """
     emb_len = emb.shape[-2]
     if emb_len < target_len:
-        return F.pad(emb, (0, 0, target_len - emb_len, 0), value=0.)
+        return F.pad(emb, (0, 0, target_len - emb_len, 0), value=0.0)
     elif emb_len > target_len:
         return emb[:, -target_len:, :]
     return emb
+
 
 if flex_attention_available:
     try:
@@ -204,17 +195,21 @@ else:
 # but the result is reused across all transformer layers and forward passes.
 _SLIDING_WINDOW_BLOCK_MASK_CACHE = {}
 
+
 def _get_sliding_window_block_mask(seq_q, seq_k, w_left, w_right, device):
     key = (seq_q, seq_k, int(w_left), int(w_right), str(device))
     bm = _SLIDING_WINDOW_BLOCK_MASK_CACHE.get(key)
     if bm is None:
         wl, wr = int(w_left), int(w_right)
+
         def _band_mod(b, h, q_idx, kv_idx):
             delta = kv_idx - q_idx
             return (delta >= -wl) & (delta <= wr)
+
         bm = create_block_mask(_band_mod, B=None, H=None, Q_LEN=seq_q, KV_LEN=seq_k, device=device)
         _SLIDING_WINDOW_BLOCK_MASK_CACHE[key] = bm
     return bm
+
 
 def _sliding_window_additive_mask(seq_q, seq_k, w_left, w_right, device, dtype):
     """Build a (seq_q, seq_k) additive mask for masked SDPA fallback.
@@ -225,7 +220,7 @@ def _sliding_window_additive_mask(seq_q, seq_k, w_left, w_right, device, dtype):
     delta = jj[None, :] - ii[:, None]
     in_band = (delta >= -int(w_left)) & (delta <= int(w_right))
     mask = torch.zeros((seq_q, seq_k), dtype=dtype, device=device)
-    return mask.masked_fill(~in_band, float('-inf'))
+    return mask.masked_fill(~in_band, float("-inf"))
 
 
 # Chunked-halo SDPA fallback. Math-equivalent to masked SDPA with a band
@@ -241,6 +236,7 @@ def _sliding_window_additive_mask(seq_q, seq_k, w_left, w_right, device, dtype):
 # smaller chunks suffer from launch overhead.
 _SLIDING_WINDOW_CHUNK_SIZE = 1024
 
+
 def _sliding_window_chunked_halo_sdpa(q, k, v, w_left, w_right, chunk_size=_SLIDING_WINDOW_CHUNK_SIZE):
     B, H, N, D = q.shape
     outs = []
@@ -255,7 +251,7 @@ def _sliding_window_chunked_halo_sdpa(q, k, v, w_left, w_right, chunk_size=_SLID
         k_idx = torch.arange(k_start, k_end, device=q.device)
         delta = k_idx[None, :] - q_idx[:, None]
         in_band = (delta >= -int(w_left)) & (delta <= int(w_right))
-        mask = torch.zeros(delta.shape, dtype=q.dtype, device=q.device).masked_fill(~in_band, float('-inf'))
+        mask = torch.zeros(delta.shape, dtype=q.dtype, device=q.device).masked_fill(~in_band, float("-inf"))
         outs.append(F.scaled_dot_product_attention(q_c, k_c, v_c, attn_mask=mask, is_causal=False))
     return torch.cat(outs, dim=-2)
 
@@ -265,24 +261,28 @@ def checkpoint(function, *args, **kwargs):
     # Preserve autocast context during recomputation to avoid dtype mismatches
     if "context_fn" not in kwargs:
         from torch.amp import autocast
-        import functools
+
         # Get current autocast state
         if torch.is_autocast_enabled():
-            dtype = torch.get_autocast_dtype('cuda')
+            dtype = torch.get_autocast_dtype("cuda")
+
             def get_contexts():
                 return (
-                    autocast('cuda', dtype=dtype),
-                    autocast('cuda', dtype=dtype),
+                    autocast("cuda", dtype=dtype),
+                    autocast("cuda", dtype=dtype),
                 )
+
             kwargs["context_fn"] = get_contexts
     return torch.utils.checkpoint.checkpoint(function, *args, **kwargs)
 
 
-# Copied and modified from https://github.com/lucidrains/x-transformers/blob/main/x_transformers/attend.py under MIT License
+# Copied and modified from lucidrains/x-transformers (x_transformers/attend.py, MIT License)
 # License can be found in LICENSES/LICENSE_XTRANSFORMERS.txt
 
+
 def create_causal_mask(i, j, device):
-    return torch.ones((i, j), device = device, dtype = torch.bool).triu(j - i + 1)
+    return torch.ones((i, j), device=device, dtype=torch.bool).triu(j - i + 1)
+
 
 def or_reduce(masks):
     head, *body = masks
@@ -290,62 +290,63 @@ def or_reduce(masks):
         head = head | rest
     return head
 
+
 # positional embeddings
+
 
 class AbsolutePositionalEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len):
         super().__init__()
-        self.scale = dim ** -0.5
+        self.scale = dim**-0.5
         self.max_seq_len = max_seq_len
         self.emb = nn.Embedding(max_seq_len, dim)
 
-    def forward(self, x, pos = None, seq_start_pos = None):
+    def forward(self, x, pos=None, seq_start_pos=None):
         seq_len, device = x.shape[1], x.device
-        assert seq_len <= self.max_seq_len, f'you are passing in a sequence length of {seq_len} but your absolute positional embedding has a max sequence length of {self.max_seq_len}'
+        assert seq_len <= self.max_seq_len, (
+            f"you are passing in a sequence length of {seq_len} but your absolute "
+            f"positional embedding has a max sequence length of {self.max_seq_len}"
+        )
 
         if pos is None:
-            pos = torch.arange(seq_len, device = device)
+            pos = torch.arange(seq_len, device=device)
 
         if seq_start_pos is not None:
-            pos = (pos - seq_start_pos[..., None]).clamp(min = 0)
+            pos = (pos - seq_start_pos[..., None]).clamp(min=0)
 
         pos_emb = self.emb(pos)
         pos_emb = pos_emb * self.scale
         return pos_emb
 
+
 class ScaledSinusoidalEmbedding(nn.Module):
-    def __init__(self, dim, theta = 10000):
+    def __init__(self, dim, theta=10000):
         super().__init__()
-        assert (dim % 2) == 0, 'dimension must be divisible by 2'
-        self.scale = nn.Parameter(torch.ones(1) * dim ** -0.5)
+        assert (dim % 2) == 0, "dimension must be divisible by 2"
+        self.scale = nn.Parameter(torch.ones(1) * dim**-0.5)
 
         half_dim = dim // 2
         freq_seq = torch.arange(half_dim).float() / half_dim
-        inv_freq = theta ** -freq_seq
-        self.register_buffer('inv_freq', inv_freq, persistent = False)
+        inv_freq = theta**-freq_seq
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, x, pos = None, seq_start_pos = None):
+    def forward(self, x, pos=None, seq_start_pos=None):
         seq_len, device = x.shape[1], x.device
 
         if pos is None:
-            pos = torch.arange(seq_len, device = device)
+            pos = torch.arange(seq_len, device=device)
 
         if seq_start_pos is not None:
             pos = pos - seq_start_pos[..., None]
 
-        emb = einsum('i, j -> i j', pos, self.inv_freq)
-        emb = torch.cat((emb.sin(), emb.cos()), dim = -1)
+        emb = einsum("i, j -> i j", pos, self.inv_freq)
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb * self.scale
-    
+
+
 class RotaryEmbedding(nn.Module):
     def __init__(
-        self,
-        dim,
-        use_xpos = False,
-        scale_base = 512,
-        interpolation_factor = 1.,
-        base = 10000,
-        base_rescale_factor = 1.
+        self, dim, use_xpos=False, scale_base=512, interpolation_factor=1.0, base=10000, base_rescale_factor=1.0
     ):
         super().__init__()
         # proposed by reddit user bloc97, to rescale rotary embeddings to longer sequence length without fine-tuning
@@ -353,28 +354,28 @@ class RotaryEmbedding(nn.Module):
         # https://www.reddit.com/r/LocalLLaMA/comments/14lz7j5/ntkaware_scaled_rope_allows_llama_models_to_have/
         base *= base_rescale_factor ** (dim / (dim - 2))
 
-        inv_freq = 1. / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
 
-        assert interpolation_factor >= 1.
+        assert interpolation_factor >= 1.0
         self.interpolation_factor = interpolation_factor
 
         if not use_xpos:
-            self.register_buffer('scale', None)
+            self.register_buffer("scale", None)
             return
 
         scale = (torch.arange(0, dim, 2) + 0.4 * dim) / (1.4 * dim)
 
         self.scale_base = scale_base
-        self.register_buffer('scale', scale)
+        self.register_buffer("scale", scale)
 
     def forward_from_seq_len(self, seq_len):
         device = self.inv_freq.device
 
-        t = torch.arange(seq_len, device = device)
+        t = torch.arange(seq_len, device=device)
         return self.forward(t)
 
-    @autocast("cuda", enabled = False)
+    @autocast("cuda", enabled=False)
     def forward(self, t):
         device = self.inv_freq.device
 
@@ -382,26 +383,28 @@ class RotaryEmbedding(nn.Module):
 
         t = t / self.interpolation_factor
 
-        freqs = torch.einsum('i , j -> i j', t, self.inv_freq)
-        freqs = torch.cat((freqs, freqs), dim = -1)
+        freqs = torch.einsum("i , j -> i j", t, self.inv_freq)
+        freqs = torch.cat((freqs, freqs), dim=-1)
 
         if self.scale is None:
-            return freqs, 1.
+            return freqs, 1.0
 
-        power = (torch.arange(seq_len, device = device) - (seq_len // 2)) / self.scale_base
-        scale = self.scale ** rearrange(power, 'n -> n 1')
-        scale = torch.cat((scale, scale), dim = -1)
+        seq_len = t.shape[-1]
+        power = (torch.arange(seq_len, device=device) - (seq_len // 2)) / self.scale_base
+        scale = self.scale ** rearrange(power, "n -> n 1")
+        scale = torch.cat((scale, scale), dim=-1)
 
         return freqs, scale
 
+
 def rotate_half(x):
-    x = rearrange(x, '... (j d) -> ... j d', j = 2)
-    x1, x2 = x.unbind(dim = -2)
-    return torch.cat((-x2, x1), dim = -1)
+    x = rearrange(x, "... (j d) -> ... j d", j=2)
+    x1, x2 = x.unbind(dim=-2)
+    return torch.cat((-x2, x1), dim=-1)
 
 
-@autocast("cuda", enabled = False)
-def apply_rotary_pos_emb(t, freqs, scale = 1):
+@autocast("cuda", enabled=False)
+def apply_rotary_pos_emb(t, freqs, scale=1):
     out_dtype = t.dtype
 
     # cast to float32 if necessary for numerical stability
@@ -411,16 +414,17 @@ def apply_rotary_pos_emb(t, freqs, scale = 1):
     freqs = freqs[-seq_len:, :]
 
     if t.ndim == 4 and freqs.ndim == 3:
-        freqs = rearrange(freqs, 'b n d -> b 1 n d')
+        freqs = rearrange(freqs, "b n d -> b 1 n d")
 
     # partial rotary embeddings, Wang et al. GPT-J
     t, t_unrotated = t[..., :rot_dim], t[..., rot_dim:]
 
-    t = (t * freqs.cos() * scale ) + (rotate_half(t) * freqs.sin() * scale)
+    t = (t * freqs.cos() * scale) + (rotate_half(t) * freqs.sin() * scale)
 
     t, t_unrotated = t.to(out_dtype), t_unrotated.to(out_dtype)
 
-    return torch.cat((t, t_unrotated), dim = -1)
+    return torch.cat((t, t_unrotated), dim=-1)
+
 
 # norms
 class DynamicTanh(nn.Module):
@@ -434,11 +438,12 @@ class DynamicTanh(nn.Module):
         x = F.tanh(self.alpha * x)
         return self.gamma * x + self.beta
 
+
 class RunningInstanceNorm(nn.Module):
-    def __init__(self, dim, momentum = 0.99, eps = 1e-4, saturate = True, trainable_gain = True):
+    def __init__(self, dim, momentum=0.99, eps=1e-4, saturate=True, trainable_gain=True):
         super().__init__()
-        self.register_buffer("running_mean", torch.zeros(1,1,dim))
-        self.register_buffer("running_std", torch.ones(1,1,dim))
+        self.register_buffer("running_mean", torch.zeros(1, 1, dim))
+        self.register_buffer("running_std", torch.ones(1, 1, dim))
         self.saturate = saturate
         self.eps = eps
         self.momentum = momentum
@@ -446,10 +451,14 @@ class RunningInstanceNorm(nn.Module):
         self.trainable_gain = trainable_gain
         if self.trainable_gain:
             self.gain = nn.Parameter(torch.ones(1))
-    
+
     def _update_stats(self, x):
-        self.running_mean = self.running_mean * self.momentum + x.detach().mean(dim = [0,1]).view(1, 1, self.dim) * (1 - self.momentum)
-        self.running_std  = (self.running_std * self.momentum + x.detach().std(dim = [0,1]).view(1, 1, self.dim) * (1 - self.momentum)).clip(min = self.eps)
+        self.running_mean = self.running_mean * self.momentum + x.detach().mean(dim=[0, 1]).view(1, 1, self.dim) * (
+            1 - self.momentum
+        )
+        self.running_std = (
+            self.running_std * self.momentum + x.detach().std(dim=[0, 1]).view(1, 1, self.dim) * (1 - self.momentum)
+        ).clip(min=self.eps)
 
     def forward(self, x):
         if self.training:
@@ -460,11 +469,13 @@ class RunningInstanceNorm(nn.Module):
         if self.trainable_gain:
             x = x * self.gain
         return x
-        
+
+
 class LayerNorm(nn.Module):
     def __init__(self, dim, bias=False, fix_scale=False, force_fp32=False, eps=1e-5):
         """
-        bias-less layernorm has been shown to be more stable. most newer models have moved towards rmsnorm, also bias-less
+        bias-less layernorm has been shown to be more stable. most newer models
+        have moved towards rmsnorm, also bias-less
         """
         super().__init__()
 
@@ -482,13 +493,16 @@ class LayerNorm(nn.Module):
 
         self.force_fp32 = force_fp32
 
-    #@autocast("cuda", enabled = False)
+    # @autocast("cuda", enabled = False)
     def forward(self, x):
         if not self.force_fp32:
             return F.layer_norm(x, x.shape[-1:], weight=self.gamma, bias=self.beta, eps=self.eps)
         else:
-            output = F.layer_norm(x.float(), x.shape[-1:], weight=self.gamma.float(), bias=self.beta.float(), eps=self.eps)
+            output = F.layer_norm(
+                x.float(), x.shape[-1:], weight=self.gamma.float(), bias=self.beta.float(), eps=self.eps
+            )
             return output.to(x.dtype)
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, fix_scale=False, force_fp32=False, eps=1e-5):
@@ -510,14 +524,18 @@ class RMSNorm(nn.Module):
             output = F.rms_norm(x.float(), x.shape[-1:], weight=self.gamma.float(), eps=self.eps)
             return output.to(x.dtype)
 
+
 class LayerScale(nn.Module):
-    def __init__(self, dim, init_val = 1e-5):
+    def __init__(self, dim, init_val=1e-5):
         super().__init__()
         self.scale = nn.Parameter(torch.full([dim], init_val))
+
     def forward(self, x):
         return x * self.scale
 
+
 # feedforward
+
 
 class GLU(nn.Module):
     def __init__(
@@ -525,24 +543,29 @@ class GLU(nn.Module):
         dim_in,
         dim_out,
         activation: Callable,
-        use_conv = False,
-        conv_kernel_size = 3,
+        use_conv=False,
+        conv_kernel_size=3,
     ):
         super().__init__()
         self.act = activation
-        self.proj = nn.Linear(dim_in, dim_out * 2) if not use_conv else nn.Conv1d(dim_in, dim_out * 2, conv_kernel_size, padding = (conv_kernel_size // 2))
+        self.proj = (
+            nn.Linear(dim_in, dim_out * 2)
+            if not use_conv
+            else nn.Conv1d(dim_in, dim_out * 2, conv_kernel_size, padding=(conv_kernel_size // 2))
+        )
         self.use_conv = use_conv
 
     def forward(self, x):
         if self.use_conv:
-            x = rearrange(x, 'b n d -> b d n')
+            x = rearrange(x, "b n d -> b d n")
             x = self.proj(x)
-            x = rearrange(x, 'b d n -> b n d')
+            x = rearrange(x, "b d n -> b n d")
         else:
             x = self.proj(x)
 
-        x, gate = x.chunk(2, dim = -1)
+        x, gate = x.chunk(2, dim=-1)
         return x * self.act(gate)
+
 
 class Sin(nn.Module):
     def __init__(self):
@@ -551,18 +574,19 @@ class Sin(nn.Module):
     def forward(self, x):
         return torch.sin(3.14159265359 * x)
 
+
 class FeedForward(nn.Module):
     def __init__(
         self,
         dim,
-        dim_out = None,
-        mult = 4,
-        no_bias = False,
-        glu = True,
-        use_conv = False,
-        conv_kernel_size = 3,
-        zero_init_output = True,
-        sinusoidal = False
+        dim_out=None,
+        mult=4,
+        no_bias=False,
+        glu=True,
+        use_conv=False,
+        conv_kernel_size=3,
+        zero_init_output=True,
+        sinusoidal=False,
     ):
         super().__init__()
         inner_dim = int(dim * mult)
@@ -577,13 +601,19 @@ class FeedForward(nn.Module):
             linear_in = GLU(dim, inner_dim, activation)
         else:
             linear_in = nn.Sequential(
-                Rearrange('b n d -> b d n') if use_conv else nn.Identity(),
-                nn.Linear(dim, inner_dim, bias = not no_bias) if not use_conv else nn.Conv1d(dim, inner_dim, conv_kernel_size, padding = (conv_kernel_size // 2), bias = not no_bias),
-                Rearrange('b n d -> b d n') if use_conv else nn.Identity(),
-                activation
+                Rearrange("b n d -> b d n") if use_conv else nn.Identity(),
+                nn.Linear(dim, inner_dim, bias=not no_bias)
+                if not use_conv
+                else nn.Conv1d(dim, inner_dim, conv_kernel_size, padding=(conv_kernel_size // 2), bias=not no_bias),
+                Rearrange("b n d -> b d n") if use_conv else nn.Identity(),
+                activation,
             )
 
-        linear_out = nn.Linear(inner_dim, dim_out, bias = not no_bias) if not use_conv else nn.Conv1d(inner_dim, dim_out, conv_kernel_size, padding = (conv_kernel_size // 2), bias = not no_bias)
+        linear_out = (
+            nn.Linear(inner_dim, dim_out, bias=not no_bias)
+            if not use_conv
+            else nn.Conv1d(inner_dim, dim_out, conv_kernel_size, padding=(conv_kernel_size // 2), bias=not no_bias)
+        )
 
         # init last linear layer to 0
         if zero_init_output:
@@ -591,15 +621,14 @@ class FeedForward(nn.Module):
             if not no_bias:
                 nn.init.zeros_(linear_out.bias)
 
-
         self.ff = nn.Sequential(
             linear_in,
-            Rearrange('b d n -> b n d') if use_conv else nn.Identity(),
+            Rearrange("b d n -> b n d") if use_conv else nn.Identity(),
             linear_out,
-            Rearrange('b n d -> b d n') if use_conv else nn.Identity(),
+            Rearrange("b n d -> b d n") if use_conv else nn.Identity(),
         )
 
-    #@compile
+    # @compile
     def forward(self, x, varlen_metadata=None):
         if varlen_metadata is not None and index_first_axis is not None and pad_input is not None:
             # Pack valid tokens for efficient FFN computation (skip padding tokens)
@@ -621,18 +650,19 @@ class FeedForward(nn.Module):
         else:
             return self.ff(x)
 
+
 class Attention(nn.Module):
     def __init__(
         self,
         dim,
-        dim_heads = 64,
-        dim_context = None,
-        causal = False,
+        dim_heads=64,
+        dim_context=None,
+        causal=False,
         zero_init_output=True,
-        qk_norm_eps = 1e-6,
-        qk_norm: Literal['l2', 'ln', 'rms', 'dyt', 'none'] = 'none',
-        differential = False,
-        feat_scale = False
+        qk_norm_eps=1e-6,
+        qk_norm: Literal["l2", "ln", "rms", "dyt", "none"] = "none",
+        differential=False,
+        feat_scale=False,
     ):
         super().__init__()
         self.dim = dim
@@ -641,7 +671,7 @@ class Attention(nn.Module):
         self.differential = differential
 
         dim_kv = dim_context if dim_context is not None else dim
-        
+
         self.num_heads = dim // dim_heads
         self.kv_heads = dim_kv // dim_heads
 
@@ -663,9 +693,9 @@ class Attention(nn.Module):
         if zero_init_output:
             nn.init.zeros_(self.to_out.weight)
 
-        if qk_norm not in ['l2', 'ln', 'rms', 'dyt','none']:
+        if qk_norm not in ["l2", "ln", "rms", "dyt", "none"]:
             raise ValueError(f'qk_norm must be one of ["l2", "ln", "rms" ,"dyt", "none"], got {qk_norm}')
-            
+
         self.qk_norm = qk_norm
         self.qk_norm_eps = qk_norm_eps
 
@@ -675,7 +705,7 @@ class Attention(nn.Module):
         elif self.qk_norm == "rms":
             self.q_norm = RMSNorm(dim_heads, eps=qk_norm_eps)
             self.k_norm = RMSNorm(dim_heads, eps=qk_norm_eps)
-        elif self.qk_norm == 'dyt':
+        elif self.qk_norm == "dyt":
             self.q_norm = DynamicTanh(dim_heads)
             self.k_norm = DynamicTanh(dim_heads)
 
@@ -686,7 +716,7 @@ class Attention(nn.Module):
             self.lambda_hf = nn.Parameter(torch.zeros(dim))
 
         self.causal = causal
-        
+
     @compile
     def apply_qk_layernorm(self, q, k):
         q_type = q.dtype
@@ -695,13 +725,22 @@ class Attention(nn.Module):
         k = self.k_norm(k).to(k_type)
         return q, k
 
-
-    def apply_attn(self, q, k, v, causal = None, flex_attention_block_mask = None, flex_attention_score_mod = None, flash_attn_sliding_window = None, padding_mask = None, varlen_metadata = None):
-
+    def apply_attn(
+        self,
+        q,
+        k,
+        v,
+        causal=None,
+        flex_attention_block_mask=None,
+        flex_attention_score_mod=None,
+        flash_attn_sliding_window=None,
+        padding_mask=None,
+        varlen_metadata=None,
+    ):
         if self.num_heads != self.kv_heads:
-             # Repeat interleave kv_heads to match q_heads for grouped query attention
-             heads_per_kv_head = self.num_heads // self.kv_heads
-             k, v = map(lambda t: t.repeat_interleave(heads_per_kv_head, dim = 1), (k, v))
+            # Repeat interleave kv_heads to match q_heads for grouped query attention
+            heads_per_kv_head = self.num_heads // self.kv_heads
+            k, v = map(lambda t: t.repeat_interleave(heads_per_kv_head, dim=1), (k, v))
 
         flash_attn_available = flash_attn_func is not None
         flash_attn_varlen_available = flash_attn_varlen_func is not None and index_first_axis is not None
@@ -715,9 +754,9 @@ class Attention(nn.Module):
             if padding_mask is not None:
                 mask_expanded = padding_mask.unsqueeze(1).unsqueeze(-1).to(v.dtype)
                 v = v * mask_expanded
-            out = flex_attention_compiled(q,k,v,
-                block_mask = flex_attention_block_mask,
-                score_mod = flex_attention_score_mod)
+            out = flex_attention_compiled(
+                q, k, v, block_mask=flex_attention_block_mask, score_mod=flex_attention_score_mod
+            )
         elif flash_attn_available and varlen_metadata is not None and flash_attn_varlen_available:
             # Flash attention with varlen using precomputed metadata (fast path)
             batch_size = varlen_metadata["batch_size"]
@@ -728,7 +767,7 @@ class Attention(nn.Module):
 
             fa_dtype_in = q.dtype
             # Rearrange to (B, T, H, D) for flash_attn
-            q, k, v = map(lambda t: rearrange(t, 'b h n d -> b n h d'), (q, k, v))
+            q, k, v = map(lambda t: rearrange(t, "b h n d -> b n h d"), (q, k, v))
 
             if fa_dtype_in != torch.float16 and fa_dtype_in != torch.bfloat16:
                 q, k, v = map(lambda t: t.to(torch.float16), (q, k, v))
@@ -740,16 +779,20 @@ class Attention(nn.Module):
             v_unpad = index_first_axis(v.reshape(-1, num_heads, head_dim), indices)
 
             out_unpad = flash_attn_varlen_func(
-                q_unpad, k_unpad, v_unpad,
-                cu_seqlens, cu_seqlens,
-                max_seqlen, max_seqlen,
+                q_unpad,
+                k_unpad,
+                v_unpad,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
                 causal=causal if causal is not None else False,
                 window_size=flash_attn_sliding_window if flash_attn_sliding_window is not None else (-1, -1),
             )
 
             # Pad output back to original shape
             out = pad_input(out_unpad, indices, batch_size, seq_len)
-            out = rearrange(out.to(fa_dtype_in), 'b n h d -> b h n d')
+            out = rearrange(out.to(fa_dtype_in), "b n h d -> b h n d")
         elif flash_attn_available:
             # Standard flash attention (no padding mask, or varlen imports not available)
             # Apply V-zeroing fallback if padding_mask provided but we couldn't use varlen
@@ -757,14 +800,20 @@ class Attention(nn.Module):
                 mask_expanded = padding_mask.unsqueeze(1).unsqueeze(-1).to(v.dtype)
                 v = v * mask_expanded
             fa_dtype_in = q.dtype
-            q, k, v = map(lambda t: rearrange(t, 'b h n d -> b n h d'), (q, k, v))
+            q, k, v = map(lambda t: rearrange(t, "b h n d -> b n h d"), (q, k, v))
 
             if fa_dtype_in != torch.float16 and fa_dtype_in != torch.bfloat16:
                 q, k, v = map(lambda t: t.to(torch.float16), (q, k, v))
 
-            out = flash_attn_func(q, k, v, causal = causal, window_size=flash_attn_sliding_window if (flash_attn_sliding_window is not None) else [-1,-1])
+            out = flash_attn_func(
+                q,
+                k,
+                v,
+                causal=causal,
+                window_size=flash_attn_sliding_window if (flash_attn_sliding_window is not None) else [-1, -1],
+            )
 
-            out = rearrange(out.to(fa_dtype_in), 'b n h d -> b h n d')
+            out = rearrange(out.to(fa_dtype_in), "b n h d -> b h n d")
         else:
             # No flash-attn available. Sliding-window fallback cascade:
             #   Tier 2: flex_attention with band block_mask (best when torch.compile works)
@@ -800,49 +849,50 @@ class Attention(nn.Module):
                 out = F.scaled_dot_product_attention(q, k, v, is_causal=causal if causal is not None else False)
         return out
 
-
-    #@compile
+    # @compile
     def forward(
         self,
         x,
-        context = None,
-        rotary_pos_emb = None,
-        rotary_pos_emb_k = None,
-        causal = None,
-        flex_attention_block_mask = None,
-        flex_attention_score_mod = None,
-        flash_attn_sliding_window = None,
-        padding_mask = None,
-        varlen_metadata = None,
+        context=None,
+        rotary_pos_emb=None,
+        rotary_pos_emb_k=None,
+        causal=None,
+        flex_attention_block_mask=None,
+        flex_attention_score_mod=None,
+        flash_attn_sliding_window=None,
+        padding_mask=None,
+        varlen_metadata=None,
     ):
         h, kv_h, has_context = self.num_heads, self.kv_heads, context is not None
 
         kv_input = context if has_context else x
 
-        if hasattr(self, 'to_q'):
+        if hasattr(self, "to_q"):
             # Use separate linear projections for q and k/v
             if self.differential:
                 q, q_diff = self.to_q(x).chunk(2, dim=-1)
-                q, q_diff = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, q_diff))
-                q = torch.stack([q, q_diff], dim = 1)
+                q, q_diff = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, q_diff))
+                q = torch.stack([q, q_diff], dim=1)
                 k, k_diff, v = self.to_kv(kv_input).chunk(3, dim=-1)
-                k, k_diff, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = kv_h), (k, k_diff, v))
-                k = torch.stack([k, k_diff], dim = 1)
+                k, k_diff, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=kv_h), (k, k_diff, v))
+                k = torch.stack([k, k_diff], dim=1)
             else:
                 q = self.to_q(x)
-                q = rearrange(q, 'b n (h d) -> b h n d', h = h)
+                q = rearrange(q, "b n (h d) -> b h n d", h=h)
                 k, v = self.to_kv(kv_input).chunk(2, dim=-1)
-                k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = kv_h), (k, v))
+                k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=kv_h), (k, v))
         else:
             # Use fused linear projection
             if self.differential:
                 q, k, v, q_diff, k_diff = self.to_qkv(x).chunk(5, dim=-1)
-                q, k, v, q_diff, k_diff  = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v, q_diff, k_diff))
-                q = torch.stack([q, q_diff], dim = 1)
-                k = torch.stack([k, k_diff], dim = 1)
+                q, k, v, q_diff, k_diff = map(
+                    lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v, q_diff, k_diff)
+                )
+                q = torch.stack([q, q_diff], dim=1)
+                k = torch.stack([k, k_diff], dim=1)
             else:
                 q, k, v = self.to_qkv(x).chunk(3, dim=-1)
-                q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
+                q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
 
         # Normalize q and k for cosine sim attention
         if self.qk_norm == "l2":
@@ -855,12 +905,10 @@ class Attention(nn.Module):
 
         if rotary_pos_emb is not None:
             freqs, _ = rotary_pos_emb
-            q_dtype = q.dtype
-            k_dtype = k.dtype
             q = q.to(torch.float32)
             k = k.to(torch.float32)
             freqs = freqs.to(torch.float32)
-        
+
             q_freqs = freqs
 
             if rotary_pos_emb_k is not None:
@@ -880,8 +928,8 @@ class Attention(nn.Module):
             k = apply_rotary_pos_emb(k, k_freqs)
             q = q.to(v.dtype)
             k = k.to(v.dtype)
-        
-        n, device = q.shape[-2], q.device
+
+        n = q.shape[-2]
 
         causal = self.causal if causal is None else causal
 
@@ -889,18 +937,48 @@ class Attention(nn.Module):
             causal = False
 
         if self.differential:
-            q, q_diff = q.unbind(dim = 1)
-            k, k_diff = k.unbind(dim = 1)
-            out = self.apply_attn(q, k, v,  causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
-            out_diff = self.apply_attn(q_diff, k_diff, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
+            q, q_diff = q.unbind(dim=1)
+            k, k_diff = k.unbind(dim=1)
+            out = self.apply_attn(
+                q,
+                k,
+                v,
+                causal=causal,
+                flex_attention_block_mask=flex_attention_block_mask,
+                flex_attention_score_mod=flex_attention_score_mod,
+                flash_attn_sliding_window=flash_attn_sliding_window,
+                padding_mask=padding_mask,
+                varlen_metadata=varlen_metadata,
+            )
+            out_diff = self.apply_attn(
+                q_diff,
+                k_diff,
+                v,
+                causal=causal,
+                flex_attention_block_mask=flex_attention_block_mask,
+                flex_attention_score_mod=flex_attention_score_mod,
+                flash_attn_sliding_window=flash_attn_sliding_window,
+                padding_mask=padding_mask,
+                varlen_metadata=varlen_metadata,
+            )
             out = out - out_diff
         else:
-            out = self.apply_attn(q, k, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
+            out = self.apply_attn(
+                q,
+                k,
+                v,
+                causal=causal,
+                flex_attention_block_mask=flex_attention_block_mask,
+                flex_attention_score_mod=flex_attention_score_mod,
+                flash_attn_sliding_window=flash_attn_sliding_window,
+                padding_mask=padding_mask,
+                varlen_metadata=varlen_metadata,
+            )
         # merge heads
-        out = rearrange(out, ' b h n d -> b n (h d)')
+        out = rearrange(out, " b h n d -> b n (h d)")
 
         # Communicate between heads
-        
+
         # with autocast(enabled = False):
         #     out_dtype = out.dtype
         #     out = out.to(torch.float32)
@@ -920,95 +998,89 @@ class Attention(nn.Module):
 
         return out
 
+
 class ConformerModule(nn.Module):
     def __init__(
         self,
         dim,
-        norm_kwargs = {},
-    ):     
-
+        norm_kwargs={},
+    ):
         super().__init__()
 
         self.dim = dim
-        
+
         self.in_norm = LayerNorm(dim, **norm_kwargs)
         self.pointwise_conv = nn.Conv1d(dim, dim, kernel_size=1, bias=False)
         self.glu = GLU(dim, dim, nn.SiLU())
         self.depthwise_conv = nn.Conv1d(dim, dim, kernel_size=17, groups=dim, padding=8, bias=False)
-        self.mid_norm = LayerNorm(dim, **norm_kwargs) # This is a batch norm in the original but I don't like batch norm
+        self.mid_norm = LayerNorm(
+            dim, **norm_kwargs
+        )  # This is a batch norm in the original but I don't like batch norm
         self.swish = nn.SiLU()
         self.pointwise_conv_2 = nn.Conv1d(dim, dim, kernel_size=1, bias=False)
 
-    #@compile
+    # @compile
     def forward(self, x):
         x = self.in_norm(x)
-        x = rearrange(x, 'b n d -> b d n')
+        x = rearrange(x, "b n d -> b d n")
         x = self.pointwise_conv(x)
-        x = rearrange(x, 'b d n -> b n d')
+        x = rearrange(x, "b d n -> b n d")
         x = self.glu(x)
-        x = rearrange(x, 'b n d -> b d n')
+        x = rearrange(x, "b n d -> b d n")
         x = self.depthwise_conv(x)
-        x = rearrange(x, 'b d n -> b n d')
+        x = rearrange(x, "b d n -> b n d")
         x = self.mid_norm(x)
         x = self.swish(x)
-        x = rearrange(x, 'b n d -> b d n')
+        x = rearrange(x, "b n d -> b d n")
         x = self.pointwise_conv_2(x)
-        x = rearrange(x, 'b d n -> b n d')
+        x = rearrange(x, "b d n -> b n d")
 
         return x
 
+
 class TransformerBlock(nn.Module):
     def __init__(
-            self,
-            dim,
-            dim_heads = 64,
-            cross_attend = False,
-            dim_context = None,
-            global_cond_dim = None,
-            local_add_cond_dim = None,
-            modular_local_cond_configs = None,
-            causal = False,
-            zero_init_branch_outputs = True,
-            conformer = False,
-            layer_ix = -1,
-            add_rope = False,
-            layer_scale = False,
-            norm_type = 'layer_norm',
-            attn_kwargs = {},
-            ff_kwargs = {},
-            norm_kwargs = {}
+        self,
+        dim,
+        dim_heads=64,
+        cross_attend=False,
+        dim_context=None,
+        global_cond_dim=None,
+        local_add_cond_dim=None,
+        modular_local_cond_configs=None,
+        causal=False,
+        zero_init_branch_outputs=True,
+        conformer=False,
+        layer_ix=-1,
+        add_rope=False,
+        layer_scale=False,
+        norm_type="layer_norm",
+        attn_kwargs={},
+        ff_kwargs={},
+        norm_kwargs={},
     ):
-        
         super().__init__()
         self.dim = dim
-        self.dim_heads = min(dim_heads,dim)
+        self.dim_heads = min(dim_heads, dim)
         self.cross_attend = cross_attend
         self.dim_context = dim_context
         self.causal = causal
-       
+
         if layer_scale and zero_init_branch_outputs:
-            print('zero_init_branch_outputs is redundant with layer_scale, setting zero_init_branch_outputs to False')
+            print("zero_init_branch_outputs is redundant with layer_scale, setting zero_init_branch_outputs to False")
             zero_init_branch_outputs = False
-        
-        if norm_type not in ['layer_norm', 'rms_norm', 'dyt']:
+
+        if norm_type not in ["layer_norm", "rms_norm", "dyt"]:
             raise ValueError(f'norm_type must be one of ["layer_norm", "rms_norm", "dyt"], got {norm_type}')
 
-        norm_layer_map = {
-            'layer_norm': LayerNorm,
-            'rms_norm': RMSNorm,
-            'dyt': DynamicTanh
-        }
+        norm_layer_map = {"layer_norm": LayerNorm, "rms_norm": RMSNorm, "dyt": DynamicTanh}
         norm_layer = norm_layer_map[norm_type]
 
-        self.pre_norm = norm_layer(dim,**norm_kwargs)
+        self.pre_norm = norm_layer(dim, **norm_kwargs)
         self.add_rope = add_rope
 
         self.self_attn = Attention(
-            dim,
-            dim_heads = self.dim_heads,
-            causal = causal,
-            zero_init_output=zero_init_branch_outputs,
-            **attn_kwargs
+            dim, dim_heads=self.dim_heads, causal=causal, zero_init_output=zero_init_branch_outputs, **attn_kwargs
         )
 
         self.self_attn_scale = LayerScale(dim) if layer_scale else nn.Identity()
@@ -1018,14 +1090,14 @@ class TransformerBlock(nn.Module):
             self.cross_attend_norm = norm_layer(dim, **norm_kwargs)
             self.cross_attn = Attention(
                 dim,
-                dim_heads = self.dim_heads,
+                dim_heads=self.dim_heads,
                 dim_context=dim_context,
-                causal = causal,
+                causal=causal,
                 zero_init_output=zero_init_branch_outputs,
-                **attn_kwargs
+                **attn_kwargs,
             )
             self.cross_attn_scale = LayerScale(dim) if layer_scale else nn.Identity()
-        
+
         self.ff_norm = norm_layer(dim, **norm_kwargs)
         self.ff = FeedForward(dim, zero_init_output=zero_init_branch_outputs, **ff_kwargs)
         self.ff_scale = LayerScale(dim) if layer_scale else nn.Identity()
@@ -1040,16 +1112,12 @@ class TransformerBlock(nn.Module):
         self.global_cond_dim = global_cond_dim
 
         if global_cond_dim is not None:
-            self.to_scale_shift_gate = nn.Parameter(torch.randn(6*dim)/dim**0.5)
+            self.to_scale_shift_gate = nn.Parameter(torch.randn(6 * dim) / dim**0.5)
 
         self.local_add_cond_dim = local_add_cond_dim
 
         if local_add_cond_dim is not None:
-            self.to_local_embed = nn.Sequential(
-                nn.Linear(local_add_cond_dim, dim),
-                nn.SiLU(),
-                nn.Linear(dim, dim)
-            )
+            self.to_local_embed = nn.Sequential(nn.Linear(local_add_cond_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
 
             nn.init.zeros_(self.to_local_embed[-1].weight)
             nn.init.zeros_(self.to_local_embed[-1].bias)
@@ -1064,11 +1132,7 @@ class TransformerBlock(nn.Module):
         for config in self.modular_local_cond_configs:
             cond_id = config["id"]
             cond_dim = config["dim"]
-            proj = nn.Sequential(
-                nn.Linear(cond_dim, dim),
-                nn.SiLU(),
-                nn.Linear(dim, dim)
-            )
+            proj = nn.Sequential(nn.Linear(cond_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
             # Zero-init output layer so new conditioning doesn't affect model initially
             nn.init.zeros_(proj[-1].weight)
             nn.init.zeros_(proj[-1].bias)
@@ -1098,42 +1162,69 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x,
-        context = None,
+        context=None,
         global_cond=None,
         local_add_cond=None,
         modular_local_cond=None,
-        rotary_pos_emb = None,
-        cross_attn_rotary_pos_emb = None,
-        self_attention_block_mask = None,
-        self_attention_score_mod = None,
-        cross_attention_block_mask = None,
-        cross_attention_score_mod = None,
-        self_attention_flash_sliding_window = None,
-        cross_attention_flash_sliding_window = None,
-        padding_mask = None,
-        varlen_metadata = None,
+        rotary_pos_emb=None,
+        cross_attn_rotary_pos_emb=None,
+        self_attention_block_mask=None,
+        self_attention_score_mod=None,
+        cross_attention_block_mask=None,
+        cross_attention_score_mod=None,
+        self_attention_flash_sliding_window=None,
+        cross_attention_flash_sliding_window=None,
+        padding_mask=None,
+        varlen_metadata=None,
     ):
         if rotary_pos_emb is None and self.add_rope:
             rotary_pos_emb = self.rope.forward_from_seq_len(x.shape[-2])
 
         if self.global_cond_dim is not None and self.global_cond_dim > 0 and global_cond is not None:
-            
-            scale_self, shift_self, gate_self, scale_ff, shift_ff, gate_ff = (self.to_scale_shift_gate + global_cond).unsqueeze(1).chunk(6, dim=-1)
+            scale_self, shift_self, gate_self, scale_ff, shift_ff, gate_ff = (
+                (self.to_scale_shift_gate + global_cond).unsqueeze(1).chunk(6, dim=-1)
+            )
 
             # self-attention with adaLN
             residual = x
             x = self.pre_norm(x)
             x = x * (1 + scale_self) + shift_self
-            x = self.self_attn(x, rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
+            x = self.self_attn(
+                x,
+                rotary_pos_emb=rotary_pos_emb,
+                flex_attention_block_mask=self_attention_block_mask,
+                flex_attention_score_mod=self_attention_score_mod,
+                flash_attn_sliding_window=self_attention_flash_sliding_window,
+                padding_mask=padding_mask,
+                varlen_metadata=varlen_metadata,
+            )
             x = x * torch.sigmoid(1 - gate_self)
             x = self.self_attn_scale(x)
             x = x + residual
 
             if context is not None and self.cross_attend:
                 if cross_attn_rotary_pos_emb is not None:
-                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), rotary_pos_emb = rotary_pos_emb, rotary_pos_emb_k = cross_attn_rotary_pos_emb, context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+                    x = x + self.cross_attn_scale(
+                        self.cross_attn(
+                            self.cross_attend_norm(x),
+                            rotary_pos_emb=rotary_pos_emb,
+                            rotary_pos_emb_k=cross_attn_rotary_pos_emb,
+                            context=context,
+                            flex_attention_block_mask=cross_attention_block_mask,
+                            flex_attention_score_mod=cross_attention_score_mod,
+                            flash_attn_sliding_window=cross_attention_flash_sliding_window,
+                        )
+                    )
                 else:
-                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+                    x = x + self.cross_attn_scale(
+                        self.cross_attn(
+                            self.cross_attend_norm(x),
+                            context=context,
+                            flex_attention_block_mask=cross_attention_block_mask,
+                            flex_attention_score_mod=cross_attention_score_mod,
+                            flash_attn_sliding_window=cross_attention_flash_sliding_window,
+                        )
+                    )
 
             if self.conformer is not None:
                 x = x + self.conformer_scale(self.conformer(x))
@@ -1150,33 +1241,61 @@ class TransformerBlock(nn.Module):
             x = x + residual
 
         else:
-            x = x + self.self_attn_scale(self.self_attn(self.pre_norm(x), rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata))
+            x = x + self.self_attn_scale(
+                self.self_attn(
+                    self.pre_norm(x),
+                    rotary_pos_emb=rotary_pos_emb,
+                    flex_attention_block_mask=self_attention_block_mask,
+                    flex_attention_score_mod=self_attention_score_mod,
+                    flash_attn_sliding_window=self_attention_flash_sliding_window,
+                    padding_mask=padding_mask,
+                    varlen_metadata=varlen_metadata,
+                )
+            )
 
             if context is not None and self.cross_attend:
                 if cross_attn_rotary_pos_emb is not None:
-                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), rotary_pos_emb = rotary_pos_emb, rotary_pos_emb_k = cross_attn_rotary_pos_emb, context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+                    x = x + self.cross_attn_scale(
+                        self.cross_attn(
+                            self.cross_attend_norm(x),
+                            rotary_pos_emb=rotary_pos_emb,
+                            rotary_pos_emb_k=cross_attn_rotary_pos_emb,
+                            context=context,
+                            flex_attention_block_mask=cross_attention_block_mask,
+                            flex_attention_score_mod=cross_attention_score_mod,
+                            flash_attn_sliding_window=cross_attention_flash_sliding_window,
+                        )
+                    )
                 else:
-                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
-                    
+                    x = x + self.cross_attn_scale(
+                        self.cross_attn(
+                            self.cross_attend_norm(x),
+                            context=context,
+                            flex_attention_block_mask=cross_attention_block_mask,
+                            flex_attention_score_mod=cross_attention_score_mod,
+                            flash_attn_sliding_window=cross_attention_flash_sliding_window,
+                        )
+                    )
+
             if self.conformer is not None:
                 x = x + self.conformer_scale(self.conformer(x))
 
             x = self._apply_local_conditioning(x, local_add_cond, modular_local_cond)
 
             x = x + self.ff_scale(self.ff(self.ff_norm(x), varlen_metadata=varlen_metadata))
-            
 
         return x
-        
+
+
 class ContinuousTransformer(nn.Module):
     def __init__(
         self,
         dim,
         depth,
         *,
-        dim_in = None,
-        dim_out = None,
-        dim_heads = 64,
+        dim_in=None,
+        dim_out=None,
+        dim_heads=64,
         cross_attend=False,
         cond_token_dim=None,
         final_cross_attn_ix=-1,
@@ -1193,9 +1312,8 @@ class ContinuousTransformer(nn.Module):
         abs_pos_emb_max_length=10000,
         num_memory_tokens=0,
         sliding_window=None,
-        **kwargs
-        ):
-
+        **kwargs,
+    ):
         super().__init__()
 
         self.dim = dim
@@ -1231,9 +1349,7 @@ class ContinuousTransformer(nn.Module):
         self.global_cond_embedder = None
         if global_cond_dim is not None:
             self.global_cond_embedder = nn.Sequential(
-                nn.Linear(global_cond_dim, dim),
-                nn.SiLU(),
-                nn.Linear(dim, dim * 6)
+                nn.Linear(global_cond_dim, dim), nn.SiLU(), nn.Linear(dim, dim * 6)
             )
 
         self.final_cross_attn_ix = final_cross_attn_ix
@@ -1245,35 +1361,35 @@ class ContinuousTransformer(nn.Module):
             self.layers.append(
                 TransformerBlock(
                     dim,
-                    dim_heads = dim_heads,
-                    cross_attend = should_cross_attend,
-                    dim_context = cond_token_dim,
-                    global_cond_dim = global_cond_dim,
-                    local_add_cond_dim = local_add_cond_dim,
-                    modular_local_cond_configs = modular_local_cond_configs,
-                    causal = causal,
-                    zero_init_branch_outputs = zero_init_branch_outputs,
+                    dim_heads=dim_heads,
+                    cross_attend=should_cross_attend,
+                    dim_context=cond_token_dim,
+                    global_cond_dim=global_cond_dim,
+                    local_add_cond_dim=local_add_cond_dim,
+                    modular_local_cond_configs=modular_local_cond_configs,
+                    causal=causal,
+                    zero_init_branch_outputs=zero_init_branch_outputs,
                     conformer=conformer,
                     layer_ix=i,
-                    **kwargs
+                    **kwargs,
                 )
             )
-        
+
     def forward(
         self,
         x,
-        context = None,
-        prepend_embeds = None,
-        global_cond = None,
-        local_add_cond = None,
-        modular_local_cond = None,
-        return_info = False,
-        use_checkpointing = True,
-        exit_layer_ix = None,
-        padding_mask: Optional[torch.Tensor] = None,
-        **kwargs
+        context=None,
+        prepend_embeds=None,
+        global_cond=None,
+        local_add_cond=None,
+        modular_local_cond=None,
+        return_info=False,
+        use_checkpointing=True,
+        exit_layer_ix=None,
+        padding_mask: torch.Tensor | None = None,
+        **kwargs,
     ):
-        batch, seq, device = *x.shape[:2], x.device
+        batch, _, device = *x.shape[:2], x.device
 
         model_dtype = next(self.parameters()).dtype
         x = x.to(model_dtype)
@@ -1287,9 +1403,9 @@ class ContinuousTransformer(nn.Module):
         if prepend_embeds is not None:
             prepend_length, prepend_dim = prepend_embeds.shape[1:]
 
-            assert prepend_dim == x.shape[-1], 'prepend dimension must match sequence dimension'
+            assert prepend_dim == x.shape[-1], "prepend dimension must match sequence dimension"
 
-            x = torch.cat((prepend_embeds, x), dim = -2)
+            x = torch.cat((prepend_embeds, x), dim=-2)
 
         if self.num_memory_tokens > 0:
             memory_tokens = self.memory_tokens.expand(batch, -1, -1)
@@ -1334,7 +1450,6 @@ class ContinuousTransformer(nn.Module):
 
         # Iterate over the transformer layers
         for layer_ix, layer in enumerate(self.layers):
-
             layer_kwargs = {
                 "context": context,
                 "rotary_pos_emb": rotary_pos_emb,
@@ -1344,7 +1459,7 @@ class ContinuousTransformer(nn.Module):
                 "modular_local_cond": modular_local_cond,
                 "self_attention_flash_sliding_window": self.sliding_window,
                 "padding_mask": extended_padding_mask,
-                "varlen_metadata": varlen_metadata
+                "varlen_metadata": varlen_metadata,
             }
 
             if use_checkpointing:
@@ -1356,20 +1471,20 @@ class ContinuousTransformer(nn.Module):
                 info["hidden_states"].append(x)
 
             if exit_layer_ix is not None and layer_ix == exit_layer_ix:
-                x = x[:, self.num_memory_tokens:, :]
+                x = x[:, self.num_memory_tokens :, :]
 
                 if return_info:
                     return x, info
-                
+
                 return x
 
-        x = x[:, self.num_memory_tokens:, :]
+        x = x[:, self.num_memory_tokens :, :]
 
         x = self.project_out(x)
 
         if return_info:
             return x, info
-        
+
         return x
 
 
@@ -1377,8 +1492,10 @@ class ContinuousTransformer(nn.Module):
 # DiffusionTransformer (PORT_FROM: models/dit.py)
 # ===========================================================================
 
+
 class DiffusionTransformer(nn.Module):
-    def __init__(self,
+    def __init__(
+        self,
         io_channels=32,
         patch_size=1,
         embed_dim=768,
@@ -1396,11 +1513,11 @@ class DiffusionTransformer(nn.Module):
         timestep_embed_dim=None,
         diffusion_objective: tp.Literal["v", "rectified_flow", "rf_denoiser"] = "v",
         timestep_features_type: tp.Literal["learned", "expo"] = "learned",
-        timestep_features_dim = 256,
+        timestep_features_dim=256,
         timestep_features_logsnr: bool = False,
-        modular_local_cond_configs = None,
-        **kwargs):
-
+        modular_local_cond_configs=None,
+        **kwargs,
+    ):
         super().__init__()
 
         self.cond_token_dim = cond_token_dim
@@ -1419,7 +1536,9 @@ class DiffusionTransformer(nn.Module):
         if timestep_cond_type == "global":
             timestep_embed_dim = embed_dim
         elif timestep_cond_type == "input_concat":
-            assert timestep_embed_dim is not None, "timestep_embed_dim must be specified if timestep_cond_type is input_concat"
+            assert timestep_embed_dim is not None, (
+                "timestep_embed_dim must be specified if timestep_cond_type is input_concat"
+            )
             input_concat_dim += timestep_embed_dim
 
         self.to_timestep_embed = nn.Sequential(
@@ -1427,7 +1546,7 @@ class DiffusionTransformer(nn.Module):
             nn.SiLU(),
             nn.Linear(timestep_embed_dim, timestep_embed_dim, bias=True),
         )
-        
+
         self.diffusion_objective = diffusion_objective
 
         if cond_token_dim > 0:
@@ -1437,7 +1556,7 @@ class DiffusionTransformer(nn.Module):
             self.to_cond_embed = nn.Sequential(
                 nn.Linear(cond_token_dim, cond_embed_dim, bias=False),
                 nn.SiLU(),
-                nn.Linear(cond_embed_dim, cond_embed_dim, bias=False)
+                nn.Linear(cond_embed_dim, cond_embed_dim, bias=False),
             )
         else:
             cond_embed_dim = 0
@@ -1448,7 +1567,7 @@ class DiffusionTransformer(nn.Module):
             self.to_global_embed = nn.Sequential(
                 nn.Linear(global_cond_dim, global_embed_dim, bias=False),
                 nn.SiLU(),
-                nn.Linear(global_embed_dim, global_embed_dim, bias=False)
+                nn.Linear(global_embed_dim, global_embed_dim, bias=False),
             )
 
         if prepend_cond_dim > 0:
@@ -1456,7 +1575,7 @@ class DiffusionTransformer(nn.Module):
             self.to_prepend_embed = nn.Sequential(
                 nn.Linear(prepend_cond_dim, embed_dim, bias=False),
                 nn.SiLU(),
-                nn.Linear(embed_dim, embed_dim, bias=False)
+                nn.Linear(embed_dim, embed_dim, bias=False),
             )
 
         self.input_concat_dim = input_concat_dim
@@ -1474,7 +1593,6 @@ class DiffusionTransformer(nn.Module):
         transformer_dim_out = io_channels * patch_size
 
         if self.transformer_type == "continuous_transformer":
-
             global_dim = None
 
             if self.global_cond_type == "adaLN":
@@ -1487,13 +1605,13 @@ class DiffusionTransformer(nn.Module):
                 dim_heads=embed_dim // num_heads,
                 dim_in=dim_in * patch_size,
                 dim_out=transformer_dim_out,
-                cross_attend = cond_token_dim > 0,
-                cond_token_dim = cond_embed_dim,
+                cross_attend=cond_token_dim > 0,
+                cond_token_dim=cond_embed_dim,
                 global_cond_dim=global_dim,
                 modular_local_cond_configs=modular_local_cond_configs,
-                **kwargs
+                **kwargs,
             )
-      
+
         else:
             raise ValueError(f"Unknown transformer type: {self.transformer_type}")
 
@@ -1518,18 +1636,36 @@ class DiffusionTransformer(nn.Module):
         logsnr = logsnr.clamp(self._LOGSNR_MIN, self._LOGSNR_MAX)
         return ((self._LOGSNR_MAX - logsnr) / self._LOGSNR_RANGE).to(t.dtype)
 
-    def _call_transformer(self, x, *, prepend_inputs=None, cross_attn_cond=None,
-                         mask=None, prepend_mask=None, return_info=False,
-                         exit_layer_ix=None, local_add_cond=None,
-                         modular_local_cond=None, padding_mask=None,
-                         extra_args=None, **kwargs):
+    def _call_transformer(
+        self,
+        x,
+        *,
+        prepend_inputs=None,
+        cross_attn_cond=None,
+        mask=None,
+        prepend_mask=None,
+        return_info=False,
+        exit_layer_ix=None,
+        local_add_cond=None,
+        modular_local_cond=None,
+        padding_mask=None,
+        extra_args=None,
+        **kwargs,
+    ):
         """Helper method to call transformer and handle early exit logic."""
 
-        output = self.transformer(x, prepend_embeds=prepend_inputs, context=cross_attn_cond,
-                                    return_info=return_info, exit_layer_ix=exit_layer_ix,
-                                    local_add_cond=local_add_cond, modular_local_cond=modular_local_cond,
-                                    padding_mask=padding_mask,
-                                    **(extra_args or {}), **kwargs)
+        output = self.transformer(
+            x,
+            prepend_embeds=prepend_inputs,
+            context=cross_attn_cond,
+            return_info=return_info,
+            exit_layer_ix=exit_layer_ix,
+            local_add_cond=local_add_cond,
+            modular_local_cond=modular_local_cond,
+            padding_mask=padding_mask,
+            **(extra_args or {}),
+            **kwargs,
+        )
 
         if return_info:
             output, info = output
@@ -1541,7 +1677,7 @@ class DiffusionTransformer(nn.Module):
             else:
                 return output
 
-        return (output, info) if return_info and 'info' in locals() else output
+        return (output, info) if return_info and "info" in locals() else output
 
     def _forward(
         self,
@@ -1559,8 +1695,8 @@ class DiffusionTransformer(nn.Module):
         padding_mask=None,
         return_info=False,
         exit_layer_ix=None,
-        **kwargs):
-
+        **kwargs,
+    ):
         if cross_attn_cond is not None:
             cross_attn_cond = self.to_cond_embed(cross_attn_cond)
 
@@ -1568,13 +1704,13 @@ class DiffusionTransformer(nn.Module):
             # Project the global conditioning to the embedding dimension
             global_embed = self.to_global_embed(global_embed)
 
-        prepend_inputs = None 
+        prepend_inputs = None
         prepend_mask = None
         prepend_length = 0
         if prepend_cond is not None:
             # Project the prepend conditioning to the embedding dimension
             prepend_cond = self.to_prepend_embed(prepend_cond)
-            
+
             prepend_inputs = prepend_cond
             if prepend_cond_mask is not None:
                 prepend_mask = prepend_cond_mask
@@ -1584,7 +1720,7 @@ class DiffusionTransformer(nn.Module):
         if input_concat_cond is not None:
             # Interpolate input_concat_cond to the same length as x
             if input_concat_cond.shape[2] != x.shape[2]:
-                input_concat_cond = F.interpolate(input_concat_cond, (x.shape[2], ), mode='nearest')
+                input_concat_cond = F.interpolate(input_concat_cond, (x.shape[2],), mode="nearest")
 
             x = torch.cat([x, input_concat_cond], dim=1)
 
@@ -1593,17 +1729,14 @@ class DiffusionTransformer(nn.Module):
 
         # Rearrange modular_local_cond tensors
         if modular_local_cond is not None:
-            modular_local_cond = {
-                k: rearrange(v, "b c t -> b t c")
-                for k, v in modular_local_cond.items()
-            }
+            modular_local_cond = {k: rearrange(v, "b c t -> b t c") for k, v in modular_local_cond.items()}
 
         # Get the batch of timestep embeddings
         t_cond = self._t_to_logsnr_cond(t) if self.timestep_features_logsnr else t
         # Convert to model dtype for linear layers (t itself is kept in float32 for precision)
         # x has already been converted to model dtype in the outer forward() method
         t_cond = t_cond.to(x.dtype)
-        timestep_embed = self.to_timestep_embed(self.timestep_features(t_cond[:, None])) # (b, embed_dim)
+        timestep_embed = self.to_timestep_embed(self.timestep_features(t_cond[:, None]))  # (b, embed_dim)
 
         # Timestep embedding is considered a global embedding. Add to the global conditioning if it exists
 
@@ -1624,7 +1757,9 @@ class DiffusionTransformer(nn.Module):
             else:
                 # Prepend inputs are the prepend conditioning + the global embed
                 prepend_inputs = torch.cat([prepend_inputs, global_embed.unsqueeze(1)], dim=1)
-                prepend_mask = torch.cat([prepend_mask, torch.ones((x.shape[0], 1), device=x.device, dtype=torch.bool)], dim=1)
+                prepend_mask = torch.cat(
+                    [prepend_mask, torch.ones((x.shape[0], 1), device=x.device, dtype=torch.bool)], dim=1
+                )
 
             prepend_length = prepend_inputs.shape[1]
 
@@ -1663,7 +1798,7 @@ class DiffusionTransformer(nn.Module):
         if return_info:
             info = result[1]
 
-        output = rearrange(output, "b t c -> b c t")[:,:,prepend_length:]       
+        output = rearrange(output, "b t c -> b c t")[:, :, prepend_length:]
 
         if self.patch_size > 1:
             output = rearrange(output, "b (c p) t -> b c (t p)", p=self.patch_size)
@@ -1727,10 +1862,10 @@ class DiffusionTransformer(nn.Module):
         padding_mask=None,
         cfg_scale=1.0,
         cfg_dropout_prob=0.0,
-        cfg_interval = (0, 1),
-        lora_interval = (0, 1),
-        lora_layer_filter = "",
-        lora_configs = None,
+        cfg_interval=(0, 1),
+        lora_interval=(0, 1),
+        lora_layer_filter="",
+        lora_configs=None,
         causal=False,
         scale_phi=0.0,
         cfg_norm_threshold=0.0,
@@ -1738,8 +1873,8 @@ class DiffusionTransformer(nn.Module):
         mask=None,
         return_info=False,
         exit_layer_ix=None,
-        **kwargs):
-
+        **kwargs,
+    ):
         assert not causal, "Causal mode is not supported for DiffusionTransformer"
 
         model_dtype = next(self.parameters()).dtype
@@ -1778,14 +1913,18 @@ class DiffusionTransformer(nn.Module):
         if cross_attn_cond_mask is not None:
             cross_attn_cond_mask = cross_attn_cond_mask.bool()
 
-            cross_attn_cond_mask = None # Temporarily disabling conditioning masks due to kernel issue for flash attention
+            cross_attn_cond_mask = (
+                None  # Temporarily disabling conditioning masks due to kernel issue for flash attention
+            )
 
         if prepend_cond_mask is not None:
             prepend_cond_mask = prepend_cond_mask.bool()
 
         # Early exit bypasses CFG processing
         if exit_layer_ix is not None:
-            assert self.transformer_type == "continuous_transformer", "exit_layer_ix is only supported for continuous_transformer"
+            assert self.transformer_type == "continuous_transformer", (
+                "exit_layer_ix is only supported for continuous_transformer"
+            )
             return self._forward(
                 x,
                 t,
@@ -1801,19 +1940,23 @@ class DiffusionTransformer(nn.Module):
                 mask=mask,
                 return_info=return_info,
                 exit_layer_ix=exit_layer_ix,
-                **kwargs
+                **kwargs,
             )
 
         # CFG dropout
         if cfg_dropout_prob > 0.0 and cfg_scale == 1.0:
             if cross_attn_cond is not None:
                 null_embed = torch.zeros_like(cross_attn_cond, device=cross_attn_cond.device)
-                dropout_mask = torch.bernoulli(torch.full((cross_attn_cond.shape[0], 1, 1), cfg_dropout_prob, device=cross_attn_cond.device)).to(torch.bool)
+                dropout_mask = torch.bernoulli(
+                    torch.full((cross_attn_cond.shape[0], 1, 1), cfg_dropout_prob, device=cross_attn_cond.device)
+                ).to(torch.bool)
                 cross_attn_cond = torch.where(dropout_mask, null_embed, cross_attn_cond)
 
             if prepend_cond is not None:
                 null_embed = torch.zeros_like(prepend_cond, device=prepend_cond.device)
-                dropout_mask = torch.bernoulli(torch.full((prepend_cond.shape[0], 1, 1), cfg_dropout_prob, device=prepend_cond.device)).to(torch.bool)
+                dropout_mask = torch.bernoulli(
+                    torch.full((prepend_cond.shape[0], 1, 1), cfg_dropout_prob, device=prepend_cond.device)
+                ).to(torch.bool)
                 prepend_cond = torch.where(dropout_mask, null_embed, prepend_cond)
 
         if self.diffusion_objective == "v":
@@ -1843,10 +1986,13 @@ class DiffusionTransformer(nn.Module):
                 else:
                     disable_lora(self)
 
-        if cfg_scale != 1.0 and (cross_attn_cond is not None or prepend_cond is not None) and (cfg_interval[0] <= sigma[0] <= cfg_interval[1]):
-
+        if (
+            cfg_scale != 1.0
+            and (cross_attn_cond is not None or prepend_cond is not None)
+            and (cfg_interval[0] <= sigma[0] <= cfg_interval[1])
+        ):
             # Classifier-free guidance
-            # Concatenate conditioned and unconditioned inputs on the batch dimension            
+            # Concatenate conditioned and unconditioned inputs on the batch dimension
             batch_inputs = torch.cat([x, x], dim=0)
             batch_timestep = torch.cat([t, t], dim=0)
 
@@ -1872,21 +2018,22 @@ class DiffusionTransformer(nn.Module):
 
             batch_cond = None
             batch_cond_masks = None
-            
+
             # Handle CFG for cross-attention conditioning
             if cross_attn_cond is not None:
-
                 null_embed = torch.zeros_like(cross_attn_cond, device=cross_attn_cond.device)
 
-                # For negative cross-attention conditioning, replace the null embed with the negative cross-attention conditioning
+                # For negative cross-attention conditioning, replace the null embed
+                # with the negative cross-attention conditioning
                 if negative_cross_attn_cond is not None:
-
                     # If there's a negative cross-attention mask, set the masked tokens to the null embed
                     if negative_cross_attn_mask is not None:
                         negative_cross_attn_mask = negative_cross_attn_mask.to(torch.bool).unsqueeze(2)
 
-                        negative_cross_attn_cond = torch.where(negative_cross_attn_mask, negative_cross_attn_cond, null_embed)
-                    
+                        negative_cross_attn_cond = torch.where(
+                            negative_cross_attn_mask, negative_cross_attn_cond, null_embed
+                        )
+
                     batch_cond = torch.cat([cross_attn_cond, negative_cross_attn_cond], dim=0)
 
                 else:
@@ -1894,19 +2041,17 @@ class DiffusionTransformer(nn.Module):
 
                 if cross_attn_cond_mask is not None:
                     batch_cond_masks = torch.cat([cross_attn_cond_mask, cross_attn_cond_mask], dim=0)
-               
+
             batch_prepend_cond = None
             batch_prepend_cond_mask = None
 
             if prepend_cond is not None:
-
                 null_embed = torch.zeros_like(prepend_cond, device=prepend_cond.device)
 
                 batch_prepend_cond = torch.cat([prepend_cond, null_embed], dim=0)
-                           
+
                 if prepend_cond_mask is not None:
                     batch_prepend_cond_mask = torch.cat([prepend_cond_mask, prepend_cond_mask], dim=0)
-         
 
             if mask is not None:
                 batch_masks = torch.cat([mask, mask], dim=0)
@@ -1923,16 +2068,17 @@ class DiffusionTransformer(nn.Module):
                 batch_timestep,
                 cross_attn_cond=batch_cond,
                 cross_attn_cond_mask=batch_cond_masks,
-                mask = batch_masks,
-                input_concat_cond = batch_input_concat_cond,
-                local_add_cond = batch_local_add_cond,
+                mask=batch_masks,
+                input_concat_cond=batch_input_concat_cond,
+                local_add_cond=batch_local_add_cond,
                 modular_local_cond=batch_modular_local_cond,
-                global_embed = batch_global_cond,
-                prepend_cond = batch_prepend_cond,
-                prepend_cond_mask = batch_prepend_cond_mask,
-                padding_mask = batch_padding_mask,
-                return_info = return_info,
-                **kwargs)
+                global_embed=batch_global_cond,
+                prepend_cond=batch_prepend_cond,
+                prepend_cond_mask=batch_prepend_cond_mask,
+                padding_mask=batch_padding_mask,
+                return_info=return_info,
+                **kwargs,
+            )
 
             if return_info:
                 batch_output, info = batch_output
@@ -1948,7 +2094,7 @@ class DiffusionTransformer(nn.Module):
                 uncond_denoised = x - uncond_output * sigma[:, None, None]
 
             diff = cond_denoised - uncond_denoised
-            
+
             if cfg_norm_threshold > 0:
                 if padding_mask is not None:
                     # Only compute norm over valid positions
@@ -1973,7 +2119,7 @@ class DiffusionTransformer(nn.Module):
                 cfg_diff = apg_scale * diff_orthogonal + (1 - apg_scale) * diff
 
             cfg_denoised = cond_denoised + (cfg_scale - 1) * cfg_diff
-                    
+
             if self.diffusion_objective == "v":
                 output = (x * alpha[:, None, None] - cfg_denoised) / sigma[:, None, None]
             elif self.diffusion_objective in ["rectified_flow", "rf_denoiser"]:
@@ -1983,14 +2129,14 @@ class DiffusionTransformer(nn.Module):
             if scale_phi != 0.0:
                 cond_out_std = cond_output.std(dim=1, keepdim=True)
                 out_cfg_std = output.std(dim=1, keepdim=True)
-                output = scale_phi * (output * (cond_out_std/out_cfg_std)) + (1-scale_phi) * output
-           
+                output = scale_phi * (output * (cond_out_std / out_cfg_std)) + (1 - scale_phi) * output
+
             if return_info:
                 info["uncond_output"] = uncond_output
                 return output, info
 
             return output
-            
+
         else:
             return self._forward(
                 x,
@@ -2006,8 +2152,9 @@ class DiffusionTransformer(nn.Module):
                 padding_mask=padding_mask,
                 mask=mask,
                 return_info=return_info,
-                **kwargs
+                **kwargs,
             )
+
 
 # ---------------------------------------------------------------------------
 # vllm-omni adaptation: extend DiffusionTransformer

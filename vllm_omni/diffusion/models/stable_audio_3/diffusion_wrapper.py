@@ -44,8 +44,8 @@ class ConditionedDiffusionModelWrapper(nn.Module):
 
     def __init__(
         self,
-        model: nn.Module,                                          # DiTWrapper
-        conditioner: nn.Module,                                    # MultiConditioner
+        model: nn.Module,  # DiTWrapper
+        conditioner: nn.Module,  # MultiConditioner
         io_channels: int,
         sample_rate: int,
         min_input_length: int,
@@ -83,9 +83,7 @@ class ConditionedDiffusionModelWrapper(nn.Module):
         # Distribution-shift schedulers
         # PORT_FROM: diffusion.py:64-79 + inference/distribution_shift.py
         self.dist_shift = (
-            create_dist_shift(distribution_shift_options)
-            if distribution_shift_options is not None
-            else None
+            create_dist_shift(distribution_shift_options) if distribution_shift_options is not None else None
         )
         if sampling_distribution_shift_options is not None:
             self.sampling_dist_shift = create_dist_shift(sampling_distribution_shift_options)
@@ -148,13 +146,15 @@ class ConditionedDiffusionModelWrapper(nn.Module):
             # Concatenate input concat conditioning over the channel dim.
             # Inputs are shape (batch, channels, seq).
             input_concat_cond = torch.cat(
-                [conditioning_tensors[key][0] for key in self.input_concat_ids], dim=1,
+                [conditioning_tensors[key][0] for key in self.input_concat_ids],
+                dim=1,
             )
 
         if len(self.local_add_cond_ids) > 0:
             # Concatenate local additive conditioning over the channel dim.
             local_add_cond = torch.cat(
-                [conditioning_tensors[key][0] for key in self.local_add_cond_ids], dim=1,
+                [conditioning_tensors[key][0] for key in self.local_add_cond_ids],
+                dim=1,
             )
 
         if len(self.modular_local_cond_ids) > 0:

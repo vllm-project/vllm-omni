@@ -25,7 +25,6 @@ import torch
 from einops import rearrange
 from torch import Tensor, nn
 
-
 # ---------------------------------------------------------------------------
 # Padding modes (PORT_FROM: conditioners.py:17-21)
 # ---------------------------------------------------------------------------
@@ -60,11 +59,7 @@ class Conditioner(nn.Module):
         self.padding_mode = padding_mode
 
         # Project only if dimensions differ OR project_out is forced on (upstream behavior).
-        self.proj_out = (
-            nn.Linear(dim, output_dim)
-            if (dim != output_dim or project_out)
-            else nn.Identity()
-        )
+        self.proj_out = nn.Linear(dim, output_dim) if (dim != output_dim or project_out) else nn.Identity()
 
         # Learned padding embedding (only created if used).
         if padding_mode == "learned" or padding_mode == PaddingMode.LEARNED:
@@ -219,7 +214,8 @@ class NumberConditioner(Conditioner):
         self.min_val = min_val
         self.max_val = max_val
         self.embedder = NumberEmbedder(
-            features=output_dim, fourier_features_type=fourier_features_type,
+            features=output_dim,
+            fourier_features_type=fourier_features_type,
         )
 
     def forward(self, floats: list[float], device: torch.device | None = None) -> list[Tensor]:
@@ -344,9 +340,7 @@ class T5GemmaConditioner(Conditioner):
         if isinstance(inputs[0], dict):
             input_ids = torch.stack([x["input_ids"] for x in inputs]).to(device, non_blocking=True)
             attention_mask = (
-                torch.stack([x["attention_mask"] for x in inputs])
-                .to(device, non_blocking=True)
-                .to(torch.bool)
+                torch.stack([x["attention_mask"] for x in inputs]).to(device, non_blocking=True).to(torch.bool)
             )
         else:
             encoded = self.tokenizer(
@@ -361,7 +355,8 @@ class T5GemmaConditioner(Conditioner):
 
         with torch.no_grad():
             embeddings = self.model(
-                input_ids=input_ids, attention_mask=attention_mask,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
             )["last_hidden_state"]
 
         # Cast embeddings to proj_out dtype if a real projection is present.

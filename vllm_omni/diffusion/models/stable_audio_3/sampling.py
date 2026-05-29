@@ -22,12 +22,10 @@ These are pure torch — no diffusers, no vllm-omni primitives. Port verbatim.
 from __future__ import annotations
 
 import math
-import typing as tp
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 from tqdm import tqdm, trange
-
 
 # ---------------------------------------------------------------------------
 # Distribution shift (PORT_FROM: inference/distribution_shift.py)
@@ -139,9 +137,7 @@ class DistributionShift:
             sigma = 1.0
             mu = -(
                 self.base_shift
-                + (self.max_shift - self.base_shift)
-                * (seq_len - self.min_length)
-                / (self.max_length - self.min_length)
+                + (self.max_shift - self.base_shift) * (seq_len - self.min_length) / (self.max_length - self.min_length)
             )
             t_out = 1 - math.exp(mu) / (math.exp(mu) + (1 / (1 - t) - 1) ** sigma)
             if self.use_sine:
@@ -385,7 +381,8 @@ def sample_flow_dpmpp(
     old_denoised = None
 
     # Clamp t to avoid numerical issues with log(0) and division by zero
-    log_snr = lambda t: ((1 - t).clamp(min=1e-10) / t.clamp(min=1e-10)).log()
+    def log_snr(t):
+        return ((1 - t).clamp(min=1e-10) / t.clamp(min=1e-10)).log()
 
     for i in trange(num_steps, disable=disable_tqdm):
         if per_element_schedule:
@@ -415,14 +412,10 @@ def sample_flow_dpmpp(
         # For rectified flow, compute the DPM++ coefficient directly without log_snr
         # to avoid numerical issues at t=0 or t=1.
         dt = t_next_broadcast - t_curr_broadcast
-        dpmpp_coeff = dt / (
-            (1 - t_next_broadcast).clamp(min=1e-10) * t_curr_broadcast.clamp(min=1e-10)
-        )
+        dpmpp_coeff = dt / ((1 - t_next_broadcast).clamp(min=1e-10) * t_curr_broadcast.clamp(min=1e-10))
 
         is_first_step = old_denoised is None
-        is_last_step = (
-            (t_next_broadcast == 0).all() if per_element_schedule else (t_next == 0)
-        )
+        is_last_step = (t_next_broadcast == 0).all() if per_element_schedule else (t_next == 0)
 
         if is_first_step or is_last_step:
             # First-order update (no history available, or final step)

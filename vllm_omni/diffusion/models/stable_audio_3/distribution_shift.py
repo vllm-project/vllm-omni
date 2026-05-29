@@ -14,7 +14,6 @@ schedule. SA3 uses the inference-time ``sampling_dist_shift`` (default
 from __future__ import annotations
 
 import math
-import typing as tp
 
 import torch
 
@@ -22,7 +21,7 @@ import torch
 class IdentityDistributionShift:
     """No-op distribution shift — returns timesteps unchanged."""
 
-    def shift(self, t: torch.Tensor, seq_len: tp.Union[int, torch.Tensor]) -> torch.Tensor:
+    def shift(self, t: torch.Tensor, seq_len: int | torch.Tensor) -> torch.Tensor:
         return t
 
 
@@ -33,8 +32,9 @@ class FluxDistributionShift:
     Constant alpha (alpha_min == alpha_max) or seq_len-dependent (log-linear in seq_len).
     """
 
-    def __init__(self, min_length: int = 256, max_length: int = 4096,
-                 alpha_min: float = 1.0, alpha_max: float = 1.0) -> None:
+    def __init__(
+        self, min_length: int = 256, max_length: int = 4096, alpha_min: float = 1.0, alpha_max: float = 1.0
+    ) -> None:
         self.min_length = min_length
         self.max_length = max_length
         self.alpha_min = alpha_min
@@ -46,7 +46,7 @@ class FluxDistributionShift:
         if self.log_max_seq == self.log_min_seq:
             self.log_max_seq += 1e-8
 
-    def get_alpha(self, seq_len: tp.Union[int, torch.Tensor]):
+    def get_alpha(self, seq_len: int | torch.Tensor):
         if isinstance(seq_len, torch.Tensor):
             seq_len = seq_len.float().clamp(self.min_length, self.max_length)
             log_seq = torch.log(seq_len)
@@ -59,7 +59,7 @@ class FluxDistributionShift:
         log_alpha = self.log_alpha_min + frac * (self.log_alpha_max - self.log_alpha_min)
         return math.exp(log_alpha)
 
-    def shift(self, t: torch.Tensor, seq_len: tp.Union[int, torch.Tensor]) -> torch.Tensor:
+    def shift(self, t: torch.Tensor, seq_len: int | torch.Tensor) -> torch.Tensor:
         alpha = self.get_alpha(seq_len)
         if isinstance(seq_len, torch.Tensor):
             alpha = alpha.to(t.device)
@@ -72,15 +72,21 @@ class FluxDistributionShift:
 class DistributionShift:
     """Sequence-length-aware sigmoid shift (SA3 'full' training-time shift)."""
 
-    def __init__(self, base_shift: float = 0.5, max_shift: float = 1.15,
-                 max_length: int = 4096, min_length: int = 256, use_sine: bool = False) -> None:
+    def __init__(
+        self,
+        base_shift: float = 0.5,
+        max_shift: float = 1.15,
+        max_length: int = 4096,
+        min_length: int = 256,
+        use_sine: bool = False,
+    ) -> None:
         self.base_shift = base_shift
         self.max_shift = max_shift
         self.max_length = max_length
         self.min_length = min_length
         self.use_sine = use_sine
 
-    def shift(self, t: torch.Tensor, seq_len: tp.Union[int, torch.Tensor]) -> torch.Tensor:
+    def shift(self, t: torch.Tensor, seq_len: int | torch.Tensor) -> torch.Tensor:
         if isinstance(seq_len, torch.Tensor):
             seq_len = seq_len.to(t.device)
             seq_len_clamped = seq_len.float().clamp(self.min_length, self.max_length)
@@ -88,16 +94,22 @@ class DistributionShift:
                 t = t.unsqueeze(0)
                 seq_len_clamped = seq_len_clamped.unsqueeze(1)
             sigma = 1.0
-            mu = -(self.base_shift + (self.max_shift - self.base_shift)
-                   * (seq_len_clamped - self.min_length) / (self.max_length - self.min_length))
+            mu = -(
+                self.base_shift
+                + (self.max_shift - self.base_shift)
+                * (seq_len_clamped - self.min_length)
+                / (self.max_length - self.min_length)
+            )
             t_out = 1 - torch.exp(mu) / (torch.exp(mu) + (1 / (1 - t) - 1) ** sigma)
             if self.use_sine:
                 t_out = torch.sin(t_out * math.pi / 2)
         else:
             seq_len = min(max(seq_len, self.min_length), self.max_length)
             sigma = 1.0
-            mu = -(self.base_shift + (self.max_shift - self.base_shift)
-                   * (seq_len - self.min_length) / (self.max_length - self.min_length))
+            mu = -(
+                self.base_shift
+                + (self.max_shift - self.base_shift) * (seq_len - self.min_length) / (self.max_length - self.min_length)
+            )
             t_out = 1 - math.exp(mu) / (math.exp(mu) + (1 / (1 - t) - 1) ** sigma)
             if self.use_sine:
                 t_out = torch.sin(t_out * math.pi / 2)
@@ -112,21 +124,22 @@ class LogSNRShift:
     seq_len; logsnr_end is fixed (low-t refinement is local).
     """
 
-    def __init__(self, anchor_length: int = 2000, anchor_logsnr: float = -6.2,
-                 rate: float = 1.0, logsnr_end: float = 2.0) -> None:
+    def __init__(
+        self, anchor_length: int = 2000, anchor_logsnr: float = -6.2, rate: float = 1.0, logsnr_end: float = 2.0
+    ) -> None:
         self.anchor_length = anchor_length
         self.anchor_logsnr = anchor_logsnr
         self.rate = rate
         self.logsnr_end = logsnr_end
 
-    def get_logsnr_start(self, seq_len: tp.Union[int, torch.Tensor]):
+    def get_logsnr_start(self, seq_len: int | torch.Tensor):
         if isinstance(seq_len, torch.Tensor):
             log2_ratio = torch.log2(seq_len.float() / self.anchor_length)
             return self.anchor_logsnr - self.rate * log2_ratio
         log2_ratio = math.log2(seq_len / self.anchor_length)
         return self.anchor_logsnr - self.rate * log2_ratio
 
-    def shift(self, t: torch.Tensor, seq_len: tp.Union[int, torch.Tensor]) -> torch.Tensor:
+    def shift(self, t: torch.Tensor, seq_len: int | torch.Tensor) -> torch.Tensor:
         t_original = t
         logsnr_start = self.get_logsnr_start(seq_len)
         if isinstance(seq_len, torch.Tensor):
@@ -157,6 +170,5 @@ def create_dist_shift(options: dict):
     if dist_shift_type == "logsnr":
         return LogSNRShift(**kwargs)
     raise ValueError(
-        f"Unknown distribution shift type: {dist_shift_type}. "
-        "Expected 'none', 'flux', 'full', or 'logsnr'."
+        f"Unknown distribution shift type: {dist_shift_type}. Expected 'none', 'flux', 'full', or 'logsnr'."
     )

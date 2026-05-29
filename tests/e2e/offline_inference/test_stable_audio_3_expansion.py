@@ -83,9 +83,7 @@ def test_stable_audio_3_short_clip_smoke() -> None:
     assert abs(audio.shape[-1] - expected_samples) < _SAMPLE_RATE, (
         f"expected ~{expected_samples} samples for {_SHORT_CLIP_DURATION_S}s, got {audio.shape[-1]}"
     )
-    assert_audio_valid(
-        audio, sample_rate=_SAMPLE_RATE, channels=2, duration_s=_SHORT_CLIP_DURATION_S
-    )
+    assert_audio_valid(audio, sample_rate=_SAMPLE_RATE, channels=2, duration_s=_SHORT_CLIP_DURATION_S)
 
 
 @hardware_test(res={"cuda": "L4"})
@@ -103,9 +101,7 @@ def test_stable_audio_3_variable_length() -> None:
     assert long_.shape[-1] > short.shape[-1] * 5, (
         f"variable-length latents not engaged: short={short.shape}, long={long_.shape}"
     )
-    assert_audio_valid(
-        long_, sample_rate=_SAMPLE_RATE, channels=2, duration_s=_LONG_CLIP_DURATION_S
-    )
+    assert_audio_valid(long_, sample_rate=_SAMPLE_RATE, channels=2, duration_s=_LONG_CLIP_DURATION_S)
 
 
 # TODO(stable-audio-3): once port is done, add:

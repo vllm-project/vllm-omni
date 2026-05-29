@@ -125,7 +125,6 @@ class StableAudio3Pipeline(
         # SA3 ships {repo}/model_config.json + {repo}/model.safetensors.
         # ----------------------------------------------------------------
         model_path = od_config.model
-        local_files_only = os.path.exists(model_path)
         config_path = os.path.join(model_path, "model_config.json")
         with open(config_path) as f:
             sa3_config = json.load(f)
@@ -316,8 +315,7 @@ class StableAudio3Pipeline(
 
         if duration > self.max_audio_seconds:
             raise ValueError(
-                f"Requested duration {duration:.1f}s exceeds SA3 Medium max of "
-                f"{self.max_audio_seconds:.0f}s",
+                f"Requested duration {duration:.1f}s exceeds SA3 Medium max of {self.max_audio_seconds:.0f}s",
             )
 
         # --- 2. Parse prompts into per-batch dicts -----------------------
@@ -340,8 +338,7 @@ class StableAudio3Pipeline(
 
         # Build the per-element conditioning dicts the MultiConditioner consumes.
         conditioning_batch: list[dict[str, Any]] = [
-            {"prompt": p, "seconds_start": audio_start_s, "seconds_total": duration}
-            for p in prompt_list
+            {"prompt": p, "seconds_start": audio_start_s, "seconds_total": duration} for p in prompt_list
         ]
         has_negative = any(np_ is not None for np_ in negative_prompt_list)
         negative_conditioning_batch: list[dict[str, Any]] | None = (
@@ -369,9 +366,7 @@ class StableAudio3Pipeline(
         downsampling_ratio = self.pretransform.downsampling_ratio
         audio_sample_size = int(duration * self.sample_rate)
         # Round UP so audio_sample_size is a multiple of downsampling_ratio
-        audio_sample_size = (
-            (audio_sample_size + downsampling_ratio - 1) // downsampling_ratio
-        ) * downsampling_ratio
+        audio_sample_size = ((audio_sample_size + downsampling_ratio - 1) // downsampling_ratio) * downsampling_ratio
         latent_sample_size = audio_sample_size // downsampling_ratio
 
         # --- 5. Initial noise -------------------------------------------
@@ -389,9 +384,7 @@ class StableAudio3Pipeline(
         # PORT_FROM: model.py:280-297
         io_channels = self.diffusion.io_channels
         inpaint_mask = torch.zeros((batch_size, 1, latent_sample_size), device=device)
-        inpaint_masked_input = torch.zeros(
-            (batch_size, io_channels, latent_sample_size), device=device
-        )
+        inpaint_masked_input = torch.zeros((batch_size, io_channels, latent_sample_size), device=device)
         conditioning_tensors["inpaint_mask"] = [inpaint_mask]
         conditioning_tensors["inpaint_masked_input"] = [inpaint_masked_input]
         if negative_conditioning_tensors:
@@ -402,7 +395,8 @@ class StableAudio3Pipeline(
         cond_inputs = self.diffusion.get_conditioning_inputs(conditioning_tensors)
         if negative_conditioning_tensors:
             neg_inputs = self.diffusion.get_conditioning_inputs(
-                negative_conditioning_tensors, negative=True,
+                negative_conditioning_tensors,
+                negative=True,
             )
             cond_inputs.update(neg_inputs)
         cond_inputs["cfg_scale"] = cfg_scale
@@ -426,7 +420,10 @@ class StableAudio3Pipeline(
         self._guidance_scale = cfg_scale
         self._num_timesteps = steps
         latents = sample_diffusion(
-            model_fn, noise, sigmas, sampler_type=sampler_type,
+            model_fn,
+            noise,
+            sigmas,
+            sampler_type=sampler_type,
         )
         self._current_timestep = None
 
@@ -459,7 +456,7 @@ class StableAudio3Pipeline(
         ``conditioner.*`` match verbatim (verified: 997/997 tensors, zero shape mismatch).
         """
         if name.startswith("model."):
-            return "diffusion_model." + name[len("model."):]
+            return "diffusion_model." + name[len("model.") :]
         return name
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

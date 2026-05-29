@@ -30,7 +30,6 @@ from torch import nn
 from torch.nn.utils import weight_norm
 from torchaudio.transforms import Resample
 
-
 # ---------------------------------------------------------------------------
 # Small helpers (PORT_FROM: blocks.py + autoencoders.py top)
 # ---------------------------------------------------------------------------
@@ -147,9 +146,7 @@ class SoftNormBottleneck(nn.Module):
         x = x * self.scaling_factor + self.bias
 
         if self.training and hasattr(self, "running_std") and not self.freeze:
-            self.running_std.data = (
-                self.running_std.data * 0.999 + x.std().detach() * 0.001
-            ).clamp(min=1e-4)
+            self.running_std.data = (self.running_std.data * 0.999 + x.std().detach() * 0.001).clamp(min=1e-4)
         if hasattr(self, "running_std"):
             x = x / self.running_std
 
@@ -179,7 +176,9 @@ class SoftNormBottleneck(nn.Module):
 
         if self.noise_augment_dim > 0:
             noise = self.noise_scaling_factor * torch.randn(
-                x.shape[0], self.noise_augment_dim, x.shape[-1],
+                x.shape[0],
+                self.noise_augment_dim,
+                x.shape[-1],
             ).type_as(x)
             x = torch.cat([x, noise], dim=1)
         return x
@@ -214,14 +213,23 @@ class AutoencoderPretransform(nn.Module):
         self.chunked = chunked
 
     def encode(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        return self.model.encode_audio(
-            x, chunked=self.chunked, iterate_batch=self.iterate_batch, **kwargs,
-        ) / self.scale
+        return (
+            self.model.encode_audio(
+                x,
+                chunked=self.chunked,
+                iterate_batch=self.iterate_batch,
+                **kwargs,
+            )
+            / self.scale
+        )
 
     def decode(self, z: torch.Tensor, chunked: bool | None = None, **kwargs) -> torch.Tensor:
         chunked = self.chunked if chunked is None else chunked
         return self.model.decode_audio(
-            z * self.scale, chunked=chunked, iterate_batch=self.iterate_batch, **kwargs,
+            z * self.scale,
+            chunked=chunked,
+            iterate_batch=self.iterate_batch,
+            **kwargs,
         )
 
 
@@ -391,7 +399,8 @@ class TransformerResamplingBlock(nn.Module):
             )
 
         self.new_tokens = nn.Parameter(
-            1e-5 * torch.randn(
+            1e-5
+            * torch.randn(
                 1,
                 self.output_seg_size if not self.variable_stride else 1,
                 out_channels if type == "encoder" else in_channels,
@@ -467,7 +476,9 @@ class TransformerResamplingBlock(nn.Module):
             new_tokens = self.new_tokens.expand([x.shape[0], new_token_seq_dim, -1])
             if override_new_tokens is not None:
                 override_new_tokens = rearrange(
-                    override_new_tokens, "b (n c) d -> (b n) c d", c=output_seg_size,
+                    override_new_tokens,
+                    "b (n c) d -> (b n) c d",
+                    c=output_seg_size,
                 )
                 new_tokens = new_tokens + override_new_tokens
             elif self.mask_noise > 0:
@@ -531,7 +542,9 @@ class TransformerResamplingBlock(nn.Module):
 
                 for layer in self.transformers:
                     x = (
-                        checkpoint(layer, x, context=cross_attn_cond, self_attention_flash_sliding_window=sliding_window)
+                        checkpoint(
+                            layer, x, context=cross_attn_cond, self_attention_flash_sliding_window=sliding_window
+                        )
                         if self.checkpointing
                         else layer(x, context=cross_attn_cond, self_attention_flash_sliding_window=sliding_window)
                     )
@@ -731,9 +744,7 @@ class SAMEDecoder(nn.Module):
         transformer_layer_index = 0
         for layer in self.layers:
             if isinstance(layer, TransformerResamplingBlock):
-                stride = (
-                    override_stride[transformer_layer_index] if override_stride is not None else None
-                )
+                stride = override_stride[transformer_layer_index] if override_stride is not None else None
                 x = layer(x, stride=stride)
                 transformer_layer_index += 1
             else:
@@ -809,14 +820,14 @@ class AudioAutoencoder(nn.Module):
         if self.pretransform is not None and not skip_pretransform:
             if self.pretransform.enable_grad:
                 audio = (
-                    torch.cat([self.pretransform.encode(audio[i:i + 1]) for i in range(audio.shape[0])], dim=0)
+                    torch.cat([self.pretransform.encode(audio[i : i + 1]) for i in range(audio.shape[0])], dim=0)
                     if iterate_batch
                     else self.pretransform.encode(audio)
                 )
             else:
                 with torch.no_grad():
                     audio = (
-                        torch.cat([self.pretransform.encode(audio[i:i + 1]) for i in range(audio.shape[0])], dim=0)
+                        torch.cat([self.pretransform.encode(audio[i : i + 1]) for i in range(audio.shape[0])], dim=0)
                         if iterate_batch
                         else self.pretransform.encode(audio)
                     )
@@ -824,7 +835,8 @@ class AudioAutoencoder(nn.Module):
         if self.encoder is not None:
             if iterate_batch:
                 latents = torch.cat(
-                    [self.encoder(audio[i:i + 1], **kwargs) for i in range(audio.shape[0])], dim=0,
+                    [self.encoder(audio[i : i + 1], **kwargs) for i in range(audio.shape[0])],
+                    dim=0,
                 )
             else:
                 latents = self.encoder(audio, **kwargs)
@@ -852,14 +864,15 @@ class AudioAutoencoder(nn.Module):
     ):
         if self.bottleneck is not None:
             latents = (
-                torch.cat([self.bottleneck.decode(latents[i:i + 1]) for i in range(latents.shape[0])], dim=0)
+                torch.cat([self.bottleneck.decode(latents[i : i + 1]) for i in range(latents.shape[0])], dim=0)
                 if iterate_batch
                 else self.bottleneck.decode(latents)
             )
 
         if iterate_batch:
             decoded = torch.cat(
-                [self.decoder(latents[i:i + 1], **kwargs) for i in range(latents.shape[0])], dim=0,
+                [self.decoder(latents[i : i + 1], **kwargs) for i in range(latents.shape[0])],
+                dim=0,
             )
         else:
             if return_loss:
@@ -870,14 +883,16 @@ class AudioAutoencoder(nn.Module):
         if self.pretransform is not None:
             if self.pretransform.enable_grad:
                 decoded = (
-                    torch.cat([self.pretransform.decode(decoded[i:i + 1]) for i in range(decoded.shape[0])], dim=0)
+                    torch.cat([self.pretransform.decode(decoded[i : i + 1]) for i in range(decoded.shape[0])], dim=0)
                     if iterate_batch
                     else self.pretransform.decode(decoded)
                 )
             else:
                 with torch.no_grad():
                     decoded = (
-                        torch.cat([self.pretransform.decode(decoded[i:i + 1]) for i in range(decoded.shape[0])], dim=0)
+                        torch.cat(
+                            [self.pretransform.decode(decoded[i : i + 1]) for i in range(decoded.shape[0])], dim=0
+                        )
                         if iterate_batch
                         else self.pretransform.decode(decoded)
                     )
@@ -910,7 +925,7 @@ class AudioAutoencoder(nn.Module):
         if chunk_starts[-1] != total_samples - chunk_size_samples:
             chunk_starts.append(total_samples - chunk_size_samples)
 
-        encoded_chunks = [self.encode(audio[..., s:s + chunk_size_samples]) for s in chunk_starts]
+        encoded_chunks = [self.encode(audio[..., s : s + chunk_size_samples]) for s in chunk_starts]
         total_latents = total_samples // samples_per_latent
         half_overlap_latents = overlap // 2
         output = audio.new_zeros(*encoded_chunks[0].shape[:-1], total_latents)
@@ -922,7 +937,7 @@ class AudioAutoencoder(nn.Module):
             out_start = (total_latents - chunk_size) if is_last else (start_sample // samples_per_latent)
             left = 0 if is_first else half_overlap_latents
             right = chunk_size if is_last else chunk_size - half_overlap_latents
-            output[..., out_start + left:out_start + right] = chunk[..., left:right]
+            output[..., out_start + left : out_start + right] = chunk[..., left:right]
 
         return output
 
@@ -946,7 +961,7 @@ class AudioAutoencoder(nn.Module):
         if chunk_starts[-1] != total_latents - chunk_size:
             chunk_starts.append(total_latents - chunk_size)
 
-        decoded_chunks = [self.decode(latents[..., s:s + chunk_size]) for s in chunk_starts]
+        decoded_chunks = [self.decode(latents[..., s : s + chunk_size]) for s in chunk_starts]
         total_samples = total_latents * samples_per_latent
         chunk_size_samples = chunk_size * samples_per_latent
         half_overlap_samples = (overlap // 2) * samples_per_latent
@@ -959,6 +974,6 @@ class AudioAutoencoder(nn.Module):
             out_start = (total_samples - chunk_size_samples) if is_last else (start_latent * samples_per_latent)
             left = 0 if is_first else half_overlap_samples
             right = chunk_size_samples if is_last else chunk_size_samples - half_overlap_samples
-            output[..., out_start + left:out_start + right] = chunk[..., left:right]
+            output[..., out_start + left : out_start + right] = chunk[..., left:right]
 
         return output
