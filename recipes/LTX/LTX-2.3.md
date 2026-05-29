@@ -86,7 +86,6 @@ curl -X POST http://localhost:8000/v1/videos \
 - Duration: Controlled by `num_frames` (frames = duration_seconds * 24 + 1)
 - Known limitations:
   - No image-to-video support yet (LTX23ImageToVideoPipeline is a placeholder)
-  - No CFG-parallel support (single-GPU only)
   - Requires `diffusers >= 0.38.0` (not yet on PyPI, install from git)
 
 ## Hardware Support

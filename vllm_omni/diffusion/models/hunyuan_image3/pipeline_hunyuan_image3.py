@@ -1001,7 +1001,7 @@ class HunyuanImage3Pipeline(
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
-            if input_ids.shape[1] != kwargs["position_ids"].shape[1]:  # in decode steps
+            if input_ids is not None and input_ids.shape[1] != kwargs["position_ids"].shape[1]:  # in decode steps
                 input_ids = torch.gather(input_ids, dim=1, index=kwargs["position_ids"])
             model_inputs = {"input_ids": input_ids}
 
@@ -1082,12 +1082,27 @@ class HunyuanImage3Pipeline(
 
                 # attention mask
                 mask_list = []
-                for attention_mask_i, position_ids_i in zip(
-                    model_kwargs["attention_mask"], updated_model_kwargs["position_ids"]
+                current_starts = timestep_position_ids.reshape(-1)
+                max_current_start = int(current_starts.max().item())
+                for attention_mask_i, position_ids_i, current_start_i in zip(
+                    model_kwargs["attention_mask"], updated_model_kwargs["position_ids"], current_starts
                 ):
-                    mask_list.append(
-                        torch.index_select(attention_mask_i, dim=1, index=position_ids_i.reshape(-1) - offset)
+                    query_mask = torch.index_select(attention_mask_i, dim=1, index=position_ids_i.reshape(-1) - offset)
+                    current_start = int(current_start_i.item())
+                    prefix_mask = torch.index_select(
+                        query_mask,
+                        dim=2,
+                        index=torch.arange(current_start, device=image_mask.device),
                     )
+                    if current_start < max_current_start:
+                        prefix_pad = query_mask.new_zeros(
+                            query_mask.shape[0],
+                            query_mask.shape[1],
+                            max_current_start - current_start,
+                        )
+                        prefix_mask = torch.cat([prefix_mask, prefix_pad], dim=2)
+                    current_mask = torch.index_select(query_mask, dim=2, index=position_ids_i.reshape(-1))
+                    mask_list.append(torch.cat([prefix_mask, current_mask], dim=2))
                 attention_mask = torch.stack(mask_list, dim=0)
                 updated_model_kwargs["attention_mask"] = attention_mask
                 updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
@@ -1219,9 +1234,14 @@ class HunyuanImage3Pipeline(
         )
         custom_pos_emb = self.get_pos_emb(custom_pos_emb, position_ids)
 
-        inputs_embeds = self.model.embed_tokens(input_ids)
-
-        bsz, seq_len, n_embd = inputs_embeds.shape
+        if input_ids is not None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
+            bsz, seq_len, n_embd = inputs_embeds.shape
+        else:
+            inputs_embeds = None
+            bsz = images.shape[0] if isinstance(images, torch.Tensor) else len(images)
+            seq_len = 0
+            n_embd = self.config.hidden_size
 
         # Instantiate placeholder tokens: <timestep>, <img> for the gen image
         if mode == "gen_text":
@@ -1232,6 +1252,7 @@ class HunyuanImage3Pipeline(
             token_h, token_w = None, None
         else:
             if first_step:
+                assert inputs_embeds is not None
                 inputs_embeds, token_h, token_w = self.instantiate_vae_image_tokens(
                     inputs_embeds, images, timestep, image_mask
                 )
@@ -1253,6 +1274,8 @@ class HunyuanImage3Pipeline(
             inputs_embeds = self.instantiate_vit_image_tokens(
                 inputs_embeds, cond_vit_images, cond_vit_image_mask, vit_kwargs
             )
+        assert inputs_embeds is not None
+        bsz, seq_len, n_embd = inputs_embeds.shape
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         from vllm.forward_context import set_forward_context
@@ -1291,7 +1314,7 @@ class HunyuanImage3Pipeline(
             diffusion_prediction = None
         else:
             logits = None
-            hidden_states = hidden_states.to(input_ids.device)
+            hidden_states = hidden_states.to(inputs_embeds.device)
             assert hidden_states.numel() == bsz * seq_len * n_embd, (
                 f"Shape mismatch: {hidden_states.shape} cannot reshape to ({bsz}, {seq_len}, {n_embd})"
             )

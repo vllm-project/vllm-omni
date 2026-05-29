@@ -2813,19 +2813,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request.input[:50] + "..." if len(request.input) > 50 else request.input,
                 "ref_audio" in prompt,
             )
-
+            if request.extra_params is not None and not isinstance(request.extra_params, dict):
+                raise ValueError("extra_params must be a JSON object/dict.")
+            extra = dict(request.extra_params or {})
+            if request.seed is not None:
+                extra["seed"] = request.seed
             # Apply extra_params from the request to sampling params
             sampling_params_list = self._diffusion_engine.default_sampling_params_list
-            if request.extra_params is not None:
-                if not isinstance(request.extra_params, dict):
-                    raise ValueError("extra_params must be a JSON object/dict.")
+            if extra:
                 import copy
 
                 sampling_params_list = copy.deepcopy(sampling_params_list)
                 if sampling_params_list[0].extra_args is None:
                     sampling_params_list[0].extra_args = {}
-                sampling_params_list[0].extra_args.update(request.extra_params)
-                logger.info("Applied extra_params to diffusion: %s", request.extra_params)
+                sampling_params_list[0].extra_args.update(extra)
+                logger.info("Applied extra_params to diffusion: %s", extra)
 
             generator = self._diffusion_engine.generate(
                 prompt=prompt,
