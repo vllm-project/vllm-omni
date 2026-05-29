@@ -8,30 +8,47 @@ import torch.nn.functional as torch_F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
+from vllm.model_executor.models.utils import PPMissingLayer
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_pipeline_parallel_rank,
+    get_pipeline_parallel_world_size,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
 
 from .state_lingbot_world_fast import CacheIndex
 from .wan_model import WanLayerNorm, WanRMSNorm, WanSelfAttention, rope_params, sinusoidal_embedding_1d
 
 
-def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
+def causal_rope_apply(x, grid_sizes, freqs, start_frames=0):
+    """Apply causal rotary position embedding per batch row.
+
+    start_frames: int or list[int] of per-row frame offsets. 
+    An int broadcasts to all rows.
+    """
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
+    if isinstance(start_frames, int):
+        start_frames = [start_frames] * grid_sizes.shape[0]
+
     # loop over samples
     output = []
 
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        sf = start_frames[i]
         seq_len = f * h * w
 
         # precompute multipliers
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
         freqs_i = torch.cat(
             [
-                freqs[0][start_frame : start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs[0][sf : sf + f].view(f, 1, 1, -1).expand(f, h, w, -1),
                 freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
                 freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
             ],
@@ -84,7 +101,7 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache=None,
         local_end_index=None,
         global_end_index=None,
-        current_start=0,
+        current_starts=0,
         max_attention_size=1_000_000,
     ):
         r"""
@@ -92,9 +109,14 @@ class CausalWanSelfAttention(nn.Module):
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-            block_mask (BlockMask)
+            current_starts(int | list[int]): per-row absolute token offset; an int
+                broadcasts to all rows.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+        if isinstance(current_starts, int):
+            current_starts = [current_starts] * b
+        assert len(current_starts) == b
 
         # query, key, value function
         def qkv_fn(x):
@@ -106,54 +128,74 @@ class CausalWanSelfAttention(nn.Module):
         q, k, v = qkv_fn(x)
 
         frame_seqlen = math.prod(grid_sizes[0][1:]).item()
-        current_start_frame = current_start // frame_seqlen
-        roped_query = causal_rope_apply(q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-        roped_key = causal_rope_apply(k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-        current_end = current_start + roped_query.shape[1]
-        sink_tokens = self.sink_size * frame_seqlen
-        # If we are using local attention and the current KV cache size is larger than the local attention size,
-        # then we need to truncate the KV cache
-        kv_cache_size = kv_cache[CacheIndex.K].shape[1]
+        start_frames = [cs // frame_seqlen for cs in current_starts]
+        roped_query = causal_rope_apply(q, grid_sizes, freqs, start_frames=start_frames).type_as(v)
+        roped_key = causal_rope_apply(k, grid_sizes, freqs, start_frames=start_frames).type_as(v)
         num_new_tokens = roped_query.shape[1]
-        if (
-            self.local_attn_size != -1
-            and (current_end > global_end_index.item())
-            and (num_new_tokens + local_end_index.item() > kv_cache_size)
-        ):
-            # Calculate the number of new tokens added in this step
-            # Shift existing cache content left to discard oldest tokens
-            # Clone the source slice to avoid overlapping memory error
-            num_evicted_tokens = num_new_tokens + local_end_index.item() - kv_cache_size
-            num_rolled_tokens = local_end_index.item() - num_evicted_tokens - sink_tokens
-            kv_cache[CacheIndex.K][:, sink_tokens : sink_tokens + num_rolled_tokens] = kv_cache[CacheIndex.K][
-                :, sink_tokens + num_evicted_tokens : sink_tokens + num_evicted_tokens + num_rolled_tokens
-            ].clone()
-            kv_cache[CacheIndex.V][:, sink_tokens : sink_tokens + num_rolled_tokens] = kv_cache[CacheIndex.V][
-                :, sink_tokens + num_evicted_tokens : sink_tokens + num_evicted_tokens + num_rolled_tokens
-            ].clone()
-            # Insert the new keys/values at the end
-            new_local_end_index = local_end_index.item() + current_end - global_end_index.item() - num_evicted_tokens
+
+        if self.local_attn_size != -1:
+            # Cache-rolling path only supports single-row processing.
+            assert b == 1, "local_attn_size != -1 requires batch_size=1"
+            current_start = current_starts[0]
+            current_end = current_start + num_new_tokens
+            sink_tokens = self.sink_size * frame_seqlen
+            kv_cache_size = kv_cache[CacheIndex.K].shape[1]
+
+            if (current_end > global_end_index.item()) and (
+                num_new_tokens + local_end_index.item() > kv_cache_size
+            ):
+                num_evicted_tokens = num_new_tokens + local_end_index.item() - kv_cache_size
+                num_rolled_tokens = local_end_index.item() - num_evicted_tokens - sink_tokens
+                kv_cache[CacheIndex.K][:, sink_tokens : sink_tokens + num_rolled_tokens] = kv_cache[CacheIndex.K][
+                    :, sink_tokens + num_evicted_tokens : sink_tokens + num_evicted_tokens + num_rolled_tokens
+                ].clone()
+                kv_cache[CacheIndex.V][:, sink_tokens : sink_tokens + num_rolled_tokens] = kv_cache[CacheIndex.V][
+                    :, sink_tokens + num_evicted_tokens : sink_tokens + num_evicted_tokens + num_rolled_tokens
+                ].clone()
+                new_local_end_index = (
+                    local_end_index.item() + current_end - global_end_index.item() - num_evicted_tokens
+                )
+            else:
+                new_local_end_index = local_end_index.item() + current_end - global_end_index.item()
+
             local_start_index = new_local_end_index - num_new_tokens
             kv_cache[CacheIndex.K][:, local_start_index:new_local_end_index] = roped_key
             kv_cache[CacheIndex.V][:, local_start_index:new_local_end_index] = v
+
+            k_cache = kv_cache[CacheIndex.K][:, max(0, new_local_end_index - max_attention_size) : new_local_end_index]
+            v_cache = kv_cache[CacheIndex.V][:, max(0, new_local_end_index - max_attention_size) : new_local_end_index]
+            out = self.attn(roped_query, k_cache, v_cache)
+
+            global_end_index.fill_(current_end)
+            local_end_index.fill_(new_local_end_index)
         else:
-            # Assign new keys/values directly up to current_end
-            new_local_end_index = local_end_index.item() + current_end - global_end_index.item()
-            local_start_index = new_local_end_index - num_new_tokens
-            kv_cache[CacheIndex.K][:, local_start_index:new_local_end_index] = roped_key
-            kv_cache[CacheIndex.V][:, local_start_index:new_local_end_index] = v
+            # local_attn_size == -1: per-row writes to non-overlapping cache slots,
+            # per-row attention reads sized by max_attention_size. Loops once per
+            # batch row inside attention to avoid needing a key-padding mask.
+            outs = []
+            max_end = 0
+            for i in range(b):
+                cs_i = current_starts[i]
+                ce_i = cs_i + num_new_tokens
+                kv_cache[CacheIndex.K][:, cs_i:ce_i] = roped_key[i : i + 1]
+                kv_cache[CacheIndex.V][:, cs_i:ce_i] = v[i : i + 1]
 
-        k_cache = kv_cache[CacheIndex.K][:, max(0, new_local_end_index - max_attention_size) : new_local_end_index]
-        v_cache = kv_cache[CacheIndex.V][:, max(0, new_local_end_index - max_attention_size) : new_local_end_index]
-        x = self.attn(roped_query, k_cache, v_cache)
+                kv_start_i = max(0, ce_i - max_attention_size)
+                k_cache_i = kv_cache[CacheIndex.K][:, kv_start_i:ce_i]
+                v_cache_i = kv_cache[CacheIndex.V][:, kv_start_i:ce_i]
 
-        global_end_index.fill_(current_end)
-        local_end_index.fill_(new_local_end_index)
+                outs.append(self.attn(roped_query[i : i + 1], k_cache_i, v_cache_i))
+                if ce_i > max_end:
+                    max_end = ce_i
+
+            out = torch.cat(outs, dim=0)
+            global_end_index.fill_(max_end)
+            local_end_index.fill_(max_end)
 
         # output
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
+        out = out.flatten(2)
+        out = self.o(out)
+        return out
 
 
 class WanCrossAttention(WanSelfAttention):
@@ -183,13 +225,18 @@ class WanCrossAttention(WanSelfAttention):
         if crossattn_cache is not None:
             if not crossattn_cache.get("is_init", False):
                 crossattn_cache["is_init"] = True
-                k = self.norm_k(self.k(context)).view(b, -1, n, d)
-                v = self.v(context).view(b, -1, n, d)
+                # Cache at B=1 (text context is shared across chunks in a batch);
+                # expand on retrieval to match q's batch size for variable-B calls.
+                k = self.norm_k(self.k(context[:1])).view(1, -1, n, d)
+                v = self.v(context[:1]).view(1, -1, n, d)
                 crossattn_cache[CacheIndex.K] = k
                 crossattn_cache[CacheIndex.V] = v
             else:
                 k = crossattn_cache[CacheIndex.K]
                 v = crossattn_cache[CacheIndex.V]
+            if k.shape[0] != b:
+                k = k.expand(b, *k.shape[1:])
+                v = v.expand(b, *v.shape[1:])
         else:
             k = self.norm_k(self.k(context)).view(b, -1, n, d)
             v = self.v(context).view(b, -1, n, d)
@@ -248,7 +295,7 @@ class CausalWanAttentionBlock(nn.Module):
         local_end_index=None,
         global_end_index=None,
         crossattn_cache=None,
-        current_start=0,
+        current_starts=0,
         max_attention_size=1_000_000,
     ):
         r"""
@@ -257,6 +304,7 @@ class CausalWanAttentionBlock(nn.Module):
             e(Tensor): Shape [B, F, 6, C]
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            current_starts(int | list[int]): per-row absolute token offset; int broadcasts.
         """
         assert e.dtype == torch.float32
         with torch.amp.autocast("cuda", dtype=torch.float32):
@@ -271,7 +319,7 @@ class CausalWanAttentionBlock(nn.Module):
             kv_cache,
             local_end_index,
             global_end_index,
-            current_start,
+            current_starts,
             max_attention_size,
         )
         with torch.amp.autocast("cuda", dtype=torch.float32):
@@ -449,6 +497,10 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # head
         self.head = CausalHead(dim, out_dim, patch_size, eps)
 
+        # PP layout — defaults to single-stage; apply_pp_split() refines after loading.
+        self.start_layer = 0
+        self.end_layer = num_layers
+
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
@@ -459,6 +511,40 @@ class WanModelFast(ModelMixin, ConfigMixin):
 
         # initialize weights
         self.init_weights()
+
+    def apply_pp_split(self) -> None:
+        """Partition the model across PP ranks. Called after weight loading.
+
+        After this returns, blocks outside this rank's [start_layer, end_layer)
+        slice are replaced with PPMissingLayer(); embeddings/head are kept only
+        on the first/last stage. KV-cache sizing (in the pipeline state) reads
+        end_layer - start_layer to allocate just for the owned slice.
+        """
+        pp_world = get_pipeline_parallel_world_size()
+        if pp_world <= 1:
+            self.start_layer = 0
+            self.end_layer = self.num_layers
+            return
+
+        rank = get_pipeline_parallel_rank()
+        per_rank = self.num_layers // pp_world
+        rem = self.num_layers % pp_world
+        # Even split: extra layers go to the first `rem` ranks.
+        self.start_layer = rank * per_rank + min(rank, rem)
+        self.end_layer = self.start_layer + per_rank + (1 if rank < rem else 0)
+
+        for i in range(self.num_layers):
+            if not (self.start_layer <= i < self.end_layer):
+                self.blocks[i] = PPMissingLayer()
+
+        if not is_pipeline_first_stage():
+            self.patch_embedding = PPMissingLayer()
+            self.patch_embedding_wancamctrl = PPMissingLayer()
+            self.c2ws_hidden_states_layer1 = PPMissingLayer()
+            self.c2ws_hidden_states_layer2 = PPMissingLayer()
+
+        if not is_pipeline_last_stage():
+            self.head = PPMissingLayer()
 
     def forward(
         self,
@@ -472,106 +558,110 @@ class WanModelFast(ModelMixin, ConfigMixin):
         local_end_index=None,
         global_end_index=None,
         crossattn_cache=None,
-        current_start=0,
+        current_starts=0,
         max_attention_size=1_000_000,
+        intermediate_tensors: IntermediateTensors | None = None,
     ):
         r"""
         Run the diffusion model with kv caching.
-        See Algorithm 2 of CausVid paper https://arxiv.org/abs/2412.07772 for details.
-        This function will be run for num_frame times.
-        Process the latent frames one by one (1560 tokens each)
+
+        On the first PP stage, ``x``/``y``/``dit_cond_dict`` are consumed to build
+        the token sequence; non-first stages take ``hidden_states`` (and the
+        camera-conditioned ``c2ws_plucker_emb`` if used) from ``intermediate_tensors``.
+        Non-last stages return an ``IntermediateTensors`` carrying ``hidden_states``
+        (plus ``c2ws_plucker_emb`` so downstream stages can do cam injection).
 
         Args:
-            x (List[Tensor]):
-                List of input video tensors, each with shape [C_in, F, H, W]
-            t (Tensor):
-                Diffusion timesteps tensor of shape [B]
-            context (List[Tensor]):
-                List of text embeddings each with shape [L, C]
-            seq_len (`int`):
-                Maximum sequence length for positional encoding
-            y (List[Tensor], *optional*):
-                Conditional video inputs for image-to-video mode, same shape as x
-            dit_cond_dict (`dict`, *optional*, defaults to None):
-                Dictionary of conditioning signals. May contain key ``c2ws_plucker_emb``
-                with camera Plucker embeddings of shape [B, C, F, H, W] for camera control.
-            kv_cache (`list[dict]`, *optional*, defaults to None):
-                Per-layer self-attention KV cache. Each dict contains keys ``k``, ``v``
-                (Tensor of shape [B, kv_size, num_heads, head_dim]), ``global_end_index``,
-                and ``local_end_index`` (scalar Tensors tracking cache position).
-            crossattn_cache (`list[dict]`, *optional*, defaults to None):
-                Per-layer cross-attention KV cache. Each dict contains keys ``k``, ``v``
-                (Tensor of shape [B, text_len, num_heads, head_dim]) and ``is_init`` (bool).
-            current_start (`int`, *optional*, defaults to 0):
-                Token offset of the current chunk in the full sequence. Used to index
-                into the KV cache and compute positional embeddings correctly.
-            max_attention_size (`int`, *optional*, defaults to 1_000_000):
-                Maximum number of KV tokens each query can attend to. Limits the
-                effective context window of self-attention to control memory usage.
+            current_starts (int | list[int]): per-row absolute token offset.
+                int broadcasts to all rows.
+            intermediate_tensors: per-stage hidden state from the previous PP rank.
 
         Returns:
-            List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+            list[Tensor] on last PP stage; IntermediateTensors elsewhere.
         """
 
-        if self.model_type == "i2v":
+        if self.model_type == "i2v" and is_pipeline_first_stage():
             assert y is not None
 
         # params
-        device = self.patch_embedding.weight.device
+        first_stage = is_pipeline_first_stage()
+        last_stage = is_pipeline_last_stage()
+        # `freqs` lives as a plain attribute (not a buffer) — move it to the
+        # device of the first parameter we can find on this stage.
+        first_param = next(self.parameters())
+        device = first_param.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+        if first_stage:
+            if y is not None:
+                x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+            x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+            grid_sizes = torch.stack(
+                [torch.tensor(u.shape[2:], dtype=torch.long, device=device) for u in x]
+            )
+            x = [u.flatten(2).transpose(1, 2) for u in x]
+            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long, device=device)
+            assert seq_lens.max() <= seq_len
+            x = torch.cat(x)
+        else:
+            assert intermediate_tensors is not None, "non-first PP stage requires intermediate_tensors"
+            x = intermediate_tensors["hidden_states"]
+            grid_sizes = intermediate_tensors["grid_sizes"]
+            seq_lens = intermediate_tensors["seq_lens"]
 
-        # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
-        x = torch.cat(x)
+        B = x.shape[0]
+        s = x.shape[1]
 
-        # time embeddings
-        if t.dim() == 1:
-            t = t.expand(t.size(0), seq_lens)
+        # Per-row time embeddings: same timestep replicated across this row's tokens.
         with torch.amp.autocast("cuda", dtype=torch.float32):
-            bt = t.size(0)
-            t = t.flatten()
-            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).unflatten(0, (bt, seq_lens)).float())
+            if t.dim() == 1:
+                t_full = t.unsqueeze(1).expand(B, s).contiguous()
+            else:
+                t_full = t
+            bt, btn = t_full.shape
+            t_flat = t_full.flatten()
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, t_flat).unflatten(0, (bt, btn)).float()
+            )
             e0 = self.time_projection(e).unflatten(2, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        # context
+        # context — text embedding runs on every stage (each block has cross-attn).
         context_lens = None
         context = self.text_embedding(
             torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
         )
 
-        # cam
-        if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
-            c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
-            c2ws_plucker_emb = [
-                rearrange(
-                    i,
-                    "1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)",
-                    c1=self.patch_size[0],
-                    c2=self.patch_size[1],
-                    c3=self.patch_size[2],
+        # cam Plucker — processed on first stage, then forwarded via intermediate_tensors
+        # so downstream stages re-use the same embedding for in-block cam injection.
+        if first_stage:
+            if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
+                c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
+                c2ws_plucker_emb = [
+                    rearrange(
+                        i,
+                        "1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)",
+                        c1=self.patch_size[0],
+                        c2=self.patch_size[1],
+                        c3=self.patch_size[2],
+                    )
+                    for i in c2ws_plucker_emb
+                ]
+                c2ws_plucker_emb = torch.cat(c2ws_plucker_emb, dim=0)
+
+                c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
+                c2ws_hidden_states = self.c2ws_hidden_states_layer2(
+                    torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb))
                 )
-                for i in c2ws_plucker_emb
-            ]
-            c2ws_plucker_emb = torch.cat(c2ws_plucker_emb, dim=1)  # [1, (L1+...+Ln), C]
+                dit_cond_dict = dict(dit_cond_dict)
+                dit_cond_dict["c2ws_plucker_emb"] = c2ws_plucker_emb + c2ws_hidden_states
+        else:
+            if "c2ws_plucker_emb" in intermediate_tensors.tensors:
+                dit_cond_dict = {"c2ws_plucker_emb": intermediate_tensors["c2ws_plucker_emb"]}
+            else:
+                dit_cond_dict = None
 
-            c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
-            c2ws_hidden_states = self.c2ws_hidden_states_layer2(
-                torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb))
-            )
-            dit_cond_dict = dict(dit_cond_dict)
-            dit_cond_dict["c2ws_plucker_emb"] = c2ws_plucker_emb + c2ws_hidden_states
-
-        # arguments
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
@@ -583,24 +673,34 @@ class WanModelFast(ModelMixin, ConfigMixin):
             max_attention_size=max_attention_size,
         )
 
-        for block_index, block in enumerate(self.blocks):
+        # Iterate this rank's blocks. kv_cache / crossattn_cache / *_end_index are
+        # sized to (end_layer - start_layer) — index locally.
+        for local_idx, block in enumerate(self.blocks[self.start_layer : self.end_layer]):
             kwargs.update(
                 {
-                    "kv_cache": kv_cache[block_index],
-                    "crossattn_cache": crossattn_cache[block_index],
-                    "local_end_index": local_end_index[block_index],
-                    "global_end_index": global_end_index[block_index],
-                    "current_start": current_start,
+                    "kv_cache": kv_cache[local_idx],
+                    "crossattn_cache": crossattn_cache[local_idx],
+                    "local_end_index": local_end_index[local_idx],
+                    "global_end_index": global_end_index[local_idx],
+                    "current_starts": current_starts,
                 }
             )
             x = block(x, **kwargs)
 
-        # head
+        if not last_stage:
+            model_dtype = next(self.parameters()).dtype
+            it = {
+                "hidden_states": x.to(model_dtype),
+                "grid_sizes": grid_sizes,
+                "seq_lens": seq_lens,
+            }
+            if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
+                it["c2ws_plucker_emb"] = dit_cond_dict["c2ws_plucker_emb"].to(model_dtype)
+            return IntermediateTensors(it)
+
+        # head + unpatchify only on the last PP stage
         x = self.head(x, e)
-
-        # unpatchify
         x = self.unpatchify(x, grid_sizes)
-
         return [u.float() for u in x]
 
     def unpatchify(self, x, grid_sizes):
