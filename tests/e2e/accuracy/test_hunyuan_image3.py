@@ -52,6 +52,13 @@ def _default_ar_dit_devices() -> tuple[str, str]:
     return ar, dit
 
 
+def _empty_accelerator_cache() -> None:
+    from vllm_omni.platforms import current_omni_platform
+
+    if not current_omni_platform.is_cpu():
+        current_omni_platform.empty_cache()
+
+
 AR_DEVICES, DIT_DEVICES = _default_ar_dit_devices()
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
 NUM_INFERENCE_STEPS = 50
@@ -386,8 +393,7 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     image.save(output_path / "image_offline.png")
     (output_path / "cot_offline.txt").write_text(cot_text, encoding="utf-8")
     gc.collect()
-    if torch.accelerator.is_available():
-        torch.accelerator.empty_cache()
+    _empty_accelerator_cache()
     return image, cot_text, elapsed
 
 
@@ -439,8 +445,7 @@ def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image
             return image, cot_text, elapsed
     finally:
         gc.collect()
-        if torch.accelerator.is_available():
-            torch.accelerator.empty_cache()
+        _empty_accelerator_cache()
 
 
 @pytest.mark.skipif(
@@ -612,8 +617,7 @@ def _run_dit_model(
             else:
                 os.environ["VLLM_NVFP4_GEMM_BACKEND"] = old_backend
         gc.collect()
-        if torch.accelerator.is_available():
-            torch.accelerator.empty_cache()
+        _empty_accelerator_cache()
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=8)
