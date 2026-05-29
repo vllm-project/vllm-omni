@@ -48,15 +48,13 @@ _audio_duration_family = Histogram(
 )
 _audio_rtf_family = Histogram(
     defs.AUDIO_RTF_METRIC,
-    "Audio real-time factor (stage_gen_time_s / audio_duration_s); "
-    "streaming TTS requires < 1.",
+    "Audio real-time factor (stage_gen_time_s / audio_duration_s); streaming TTS requires < 1.",
     labelnames=_stage_labels,
     buckets=defs.RTF_BUCKETS,
 )
 _audio_frames_family = Counter(
     defs.AUDIO_FRAMES_METRIC,
-    "Cumulative audio frame count; per-model rate (not summable across models). "
-    "Throughput recovered via rate().",
+    "Cumulative audio frame count; per-model rate (not summable across models). Throughput recovered via rate().",
     labelnames=_stage_labels,
 )
 _audio_underrun_family = Histogram(
@@ -74,8 +72,7 @@ _audio_continuity_ok_family = Counter(
 )
 _audio_skipped_family = Counter(
     defs.AUDIO_SKIPPED_REQUESTS_METRIC,
-    "Silent-loss counter — code2wav rejected malformed codec input and "
-    "returned 200 OK with empty audio.",
+    "Silent-loss counter — code2wav rejected malformed codec input and returned 200 OK with empty audio.",
     labelnames=list(defs.AUDIO_SKIPPED_LABELS),
 )
 
@@ -92,35 +89,27 @@ class OmniModalityMetrics:
     # ---- Audio ------------------------------------------------------------
 
     def observe_audio_ttfp(self, stage: str, replica: str, ttfp_seconds: float) -> None:
-        _audio_ttfp_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica
-        ).observe(ttfp_seconds)
+        _audio_ttfp_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(ttfp_seconds)
 
     def observe_audio_duration(self, stage: str, replica: str, duration_seconds: float) -> None:
-        _audio_duration_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica
-        ).observe(duration_seconds)
+        _audio_duration_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(
+            duration_seconds
+        )
 
     def observe_audio_rtf(self, stage: str, replica: str, rtf: float) -> None:
-        _audio_rtf_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica
-        ).observe(rtf)
+        _audio_rtf_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(rtf)
 
     def inc_audio_frames(self, stage: str, replica: str, n_frames: int) -> None:
         if n_frames <= 0:
             return
-        _audio_frames_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica
-        ).inc(n_frames)
+        _audio_frames_family.labels(model_name=self._model_name, stage=stage, replica=replica).inc(n_frames)
 
     def observe_audio_underrun(self, stage: str, replica: str, underrun_s: float) -> None:
-        _audio_underrun_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica
-        ).observe(max(underrun_s, 0.0))
+        _audio_underrun_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(
+            max(underrun_s, 0.0)
+        )
 
-    def inc_audio_continuity_ok(
-        self, stage: str, replica: str, threshold_ms: int
-    ) -> None:
+    def inc_audio_continuity_ok(self, stage: str, replica: str, threshold_ms: int) -> None:
         _audio_continuity_ok_family.labels(
             model_name=self._model_name,
             stage=stage,
@@ -298,6 +287,4 @@ def observe_audio_streaming_finalize(
     replica_label = str(replica_id)
     mod_metrics.observe_audio_underrun(stage_label, replica_label, stats.max_underrun_s)
     if stats.is_continuous:
-        mod_metrics.inc_audio_continuity_ok(
-            stage_label, replica_label, int(threshold_s * 1000)
-        )
+        mod_metrics.inc_audio_continuity_ok(stage_label, replica_label, int(threshold_s * 1000))

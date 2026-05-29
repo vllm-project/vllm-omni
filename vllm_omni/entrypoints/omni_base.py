@@ -461,13 +461,10 @@ class OmniBase(PDDisaggregationMixin):
                 # Extract finished_reason from upstream CompletionOutput so
                 # the per-reason completion Counter is labelled correctly.
                 completion_outputs = getattr(engine_outputs, "outputs", None) or []
-                fr = (
-                    getattr(completion_outputs[0], "finish_reason", None)
-                    if completion_outputs
-                    else None
-                ) or "stop"
+                fr = (getattr(completion_outputs[0], "finish_reason", None) if completion_outputs else None) or "stop"
                 self.prom_metrics.request_succeeded(
-                    e2e_seconds, finished_reason=fr,
+                    e2e_seconds,
+                    finished_reason=fr,
                 )
 
                 # Modality observe inside the same finalize guard so it fires

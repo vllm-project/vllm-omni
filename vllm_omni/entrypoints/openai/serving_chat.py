@@ -17,14 +17,14 @@ from pydantic import TypeAdapter
 
 from vllm_omni.diffusion.diffusion_engine import get_extra_body_params, get_extra_output_params
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
+from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics import definitions as _metric_defs
 from vllm_omni.metrics.modality import (
     observe_audio_first_packet,
     observe_audio_streaming_finalize,
 )
-from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
-from vllm_omni.entrypoints.utils import coerce_param_message_types
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 try:
     import soundfile
@@ -1684,9 +1684,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if req_state is not None and req_state.request_arrival_ts > 0:
                         chunk_bytes = _audio_chunk_pcm_bytes(omni_res)
                         if chunk_bytes > 0:
-                            req_state.audio_chunk_arrivals_s.append(
-                                max(now_ts - req_state.request_arrival_ts, 0.0)
-                            )
+                            req_state.audio_chunk_arrivals_s.append(max(now_ts - req_state.request_arrival_ts, 0.0))
                             req_state.audio_chunk_bytes.append(chunk_bytes)
                             if req_state.audio_sample_rate is None:
                                 req_state.audio_sample_rate = _audio_chunk_sample_rate(omni_res)
@@ -1725,10 +1723,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     replica_id=req_state_audio_ref.audio_emit_replica_id,
                     chunk_arrival_times_s=req_state_audio_ref.audio_chunk_arrivals_s,
                     chunk_bytes=req_state_audio_ref.audio_chunk_bytes,
-                    sample_rate=(
-                        req_state_audio_ref.audio_sample_rate
-                        or _metric_defs.DEFAULT_AUDIO_SAMPLE_RATE
-                    ),
+                    sample_rate=(req_state_audio_ref.audio_sample_rate or _metric_defs.DEFAULT_AUDIO_SAMPLE_RATE),
                 )
 
             # once the final token is handled, if stream_options.include_usage

@@ -23,8 +23,7 @@ _completion_family = Counter(
 )
 _e2e_latency_family = Histogram(
     defs.E2E_REQUEST_LATENCY_S,
-    "Pipeline-global end-to-end request latency in seconds "
-    "(user arrival to complete response).",
+    "Pipeline-global end-to-end request latency in seconds (user arrival to complete response).",
     labelnames=_labelnames,
     buckets=defs.SECONDS_BUCKETS,
 )

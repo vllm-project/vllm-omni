@@ -266,9 +266,7 @@ class OrchestratorAggregator:
     # replica label.
     # ------------------------------------------------------------------
 
-    def _resolve_edge_replicas(
-        self, from_stage: int, to_stage: int, request_id: str
-    ) -> tuple[int, int] | None:
+    def _resolve_edge_replicas(self, from_stage: int, to_stage: int, request_id: str) -> tuple[int, int] | None:
         # Prefer the per-request replica snapshot captured by
         # record_transfer_rx (survives pool binding release); fall back to the
         # resolver callback (pool.get_bound_replica_id) when the cache
@@ -301,9 +299,7 @@ class OrchestratorAggregator:
             return
         from_r, to_r = replicas
         self._transfer_emitter.observe_size(from_stage, from_r, to_stage, to_r, size_bytes)
-        self._transfer_emitter.observe_tx_time(
-            from_stage, from_r, to_stage, to_r, tx_time_ms / 1000.0
-        )
+        self._transfer_emitter.observe_tx_time(from_stage, from_r, to_stage, to_r, tx_time_ms / 1000.0)
 
     def _emit_transfer_rx(
         self,
@@ -320,12 +316,8 @@ class OrchestratorAggregator:
         if replicas is None:
             return
         from_r, to_r = replicas
-        self._transfer_emitter.observe_rx_time(
-            from_stage, from_r, to_stage, to_r, rx_decode_time_ms / 1000.0
-        )
-        self._transfer_emitter.observe_in_flight_time(
-            from_stage, from_r, to_stage, to_r, in_flight_time_ms / 1000.0
-        )
+        self._transfer_emitter.observe_rx_time(from_stage, from_r, to_stage, to_r, rx_decode_time_ms / 1000.0)
+        self._transfer_emitter.observe_in_flight_time(from_stage, from_r, to_stage, to_r, in_flight_time_ms / 1000.0)
 
     def record_audio_generated_frames(
         self,

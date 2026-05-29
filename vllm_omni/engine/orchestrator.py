@@ -1001,16 +1001,14 @@ class Orchestrator:
         if to_replica is None:
             return
         try:
-            self._transfer_emitter.observe_size(
-                from_stage, from_replica, to_stage, to_replica, 0
-            )
-            self._transfer_emitter.observe_tx_time(
-                from_stage, from_replica, to_stage, to_replica, tx_ms / 1000.0
-            )
+            self._transfer_emitter.observe_size(from_stage, from_replica, to_stage, to_replica, 0)
+            self._transfer_emitter.observe_tx_time(from_stage, from_replica, to_stage, to_replica, tx_ms / 1000.0)
         except Exception:
             logger.debug(
                 "[Orchestrator] transfer_tx emit failed for edge %d->%d req=%s",
-                from_stage, to_stage, request_id,
+                from_stage,
+                to_stage,
+                request_id,
                 exc_info=True,
             )
 

@@ -95,9 +95,7 @@ class _RelabelMixin:
         labelnames = kwargs.get("labelnames")
         if labelnames is not None:
             original = list(labelnames)
-            self._engine_label_index = (
-                original.index("engine") if "engine" in original else -1
-            )
+            self._engine_label_index = original.index("engine") if "engine" in original else -1
             kwargs["labelnames"] = _rewrite_labelnames(labelnames)
         else:
             self._engine_label_index = -1

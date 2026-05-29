@@ -295,25 +295,19 @@ class TestObserveAudioFirstPacket:
     def test_replica_none_skipped(self):
         stub = _StubModMetrics()
         stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
-        observe_audio_first_packet(
-            stub, stage_id=1, replica_id=None, arrival_ts=100.0, now_ts=100.5
-        )
+        observe_audio_first_packet(stub, stage_id=1, replica_id=None, arrival_ts=100.0, now_ts=100.5)
         assert stub.calls == []
 
     def test_arrival_ts_zero_skipped(self):
         stub = _StubModMetrics()
         stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
-        observe_audio_first_packet(
-            stub, stage_id=1, replica_id=0, arrival_ts=0.0, now_ts=100.5
-        )
+        observe_audio_first_packet(stub, stage_id=1, replica_id=0, arrival_ts=0.0, now_ts=100.5)
         assert stub.calls == []
 
     def test_clock_skew_clamped_to_zero(self):
         stub = _StubModMetrics()
         stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
-        observe_audio_first_packet(
-            stub, stage_id=1, replica_id=0, arrival_ts=100.5, now_ts=100.0
-        )
+        observe_audio_first_packet(stub, stage_id=1, replica_id=0, arrival_ts=100.5, now_ts=100.0)
         assert stub.calls == [("observe_audio_ttfp", "1", "0", 0.0)]
 
 
@@ -402,6 +396,4 @@ class TestBucketSelection:
         out = generate_latest(REGISTRY).decode()
         # SECONDS_FAST_BUCKETS includes le=0.001 which is absent from SECONDS_BUCKETS.
         fast_marker = f'{defs.AUDIO_UNDERRUN_S}_bucket{{le="0.001"'
-        assert fast_marker in out, (
-            "audio_underrun_s should use SECONDS_FAST_BUCKETS containing le=0.001"
-        )
+        assert fast_marker in out, "audio_underrun_s should use SECONDS_FAST_BUCKETS containing le=0.001"

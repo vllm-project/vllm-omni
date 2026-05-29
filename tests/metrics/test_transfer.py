@@ -69,7 +69,7 @@ class TestObserveSize:
         tx.observe_size(2, 0, 3, 1, 65536)
         out = generate_latest(REGISTRY).decode()
         prefix = (
-            f'{defs.TRANSFER_SIZE_BYTES}_sum'
+            f"{defs.TRANSFER_SIZE_BYTES}_sum"
             f'{{from_replica="0",from_stage="2",model_name="{_MODEL}",'
             f'to_replica="1",to_stage="3"}}'
         )
@@ -81,7 +81,7 @@ class TestObserveTxTime:
         tx.observe_tx_time(2, 1, 3, 0, 0.0125)
         out = generate_latest(REGISTRY).decode()
         prefix = (
-            f'{defs.TRANSFER_TX_S}_sum'
+            f"{defs.TRANSFER_TX_S}_sum"
             f'{{from_replica="1",from_stage="2",model_name="{_MODEL}",'
             f'to_replica="0",to_stage="3"}}'
         )
@@ -93,7 +93,7 @@ class TestObserveRxTime:
         tx.observe_rx_time(0, 0, 1, 0, 0.0042)
         out = generate_latest(REGISTRY).decode()
         prefix = (
-            f'{defs.TRANSFER_RX_S}_sum'
+            f"{defs.TRANSFER_RX_S}_sum"
             f'{{from_replica="0",from_stage="0",model_name="{_MODEL}",'
             f'to_replica="0",to_stage="1"}}'
         )
@@ -105,7 +105,7 @@ class TestObserveInFlightTime:
         tx.observe_in_flight_time(0, 0, 1, 0, 0.0017)
         out = generate_latest(REGISTRY).decode()
         prefix = (
-            f'{defs.TRANSFER_IN_FLIGHT_S}_sum'
+            f"{defs.TRANSFER_IN_FLIGHT_S}_sum"
             f'{{from_replica="0",from_stage="0",model_name="{_MODEL}",'
             f'to_replica="0",to_stage="1"}}'
         )
@@ -118,9 +118,7 @@ class TestObserveInFlightTime:
 
 
 class TestCardinality:
-    def test_multiple_edges_produce_independent_series(
-        self, tx: OmniTransferMetrics
-    ) -> None:
+    def test_multiple_edges_produce_independent_series(self, tx: OmniTransferMetrics) -> None:
         tx.observe_size(5, 0, 6, 0, 100)
         tx.observe_size(5, 0, 6, 1, 200)
         tx.observe_size(5, 1, 6, 0, 300)
@@ -128,17 +126,17 @@ class TestCardinality:
         out = generate_latest(REGISTRY).decode()
 
         prefix_a = (
-            f'{defs.TRANSFER_SIZE_BYTES}_sum'
+            f"{defs.TRANSFER_SIZE_BYTES}_sum"
             f'{{from_replica="0",from_stage="5",model_name="{_MODEL}",'
             f'to_replica="0",to_stage="6"}}'
         )
         prefix_b = (
-            f'{defs.TRANSFER_SIZE_BYTES}_sum'
+            f"{defs.TRANSFER_SIZE_BYTES}_sum"
             f'{{from_replica="0",from_stage="5",model_name="{_MODEL}",'
             f'to_replica="1",to_stage="6"}}'
         )
         prefix_c = (
-            f'{defs.TRANSFER_SIZE_BYTES}_sum'
+            f"{defs.TRANSFER_SIZE_BYTES}_sum"
             f'{{from_replica="1",from_stage="5",model_name="{_MODEL}",'
             f'to_replica="0",to_stage="6"}}'
         )
@@ -308,9 +306,7 @@ class TestEmitHookRx:
             transfer_emitter=emitter,
             replica_resolver=lambda s, rid: {0: 1, 1: 0}.get(s),
         )
-        stats = _make_stats(
-            stage_id=1, request_id="r-rx-1", rx_decode=4.2, rx_in_flight=1.7
-        )
+        stats = _make_stats(stage_id=1, request_id="r-rx-1", rx_decode=4.2, rx_in_flight=1.7)
         agg.record_transfer_rx(stats)
         assert emitter.calls == [
             ("observe_rx_time", 0, 1, 1, 0, pytest.approx(0.0042)),

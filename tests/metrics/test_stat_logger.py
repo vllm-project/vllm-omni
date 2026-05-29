@@ -6,10 +6,13 @@ from prometheus_client import CollectorRegistry, generate_latest
 from vllm_omni.metrics.stat_logger import (
     _ENGINE_INDEX_MAP,
     OmniPrometheusStatLogger,
+    _engine_to_stage_replica,
+    _OmniKVConnectorProm,
+    _OmniPerfMetricsProm,
+    _OmniSpecDecodingProm,
     _RelabelCounter,
     _RelabelGauge,
     _RelabelHistogram,
-    _engine_to_stage_replica,
     _rewrite_labelnames,
 )
 
@@ -112,10 +115,7 @@ class TestRelabelGauge:
         g.labels(engine=5, model_name="qwen-omni").set(42.0)
 
         out = generate_latest(registry).decode()
-        assert (
-            'omni_test_gauge_kwarg{model_name="qwen-omni",replica="0",stage="diffusion"} 42.0'
-            in out
-        )
+        assert 'omni_test_gauge_kwarg{model_name="qwen-omni",replica="0",stage="diffusion"} 42.0' in out
 
     def test_labels_positional_passthrough(self, registry):
         # Double-rewrite guard: the per_engine_labelvalues setter rewrites
@@ -134,10 +134,7 @@ class TestRelabelGauge:
         g.labels("qwen-omni", "thinker", "0").set(7.0)
 
         out = generate_latest(registry).decode()
-        assert (
-            'omni_test_gauge_pos{model_name="qwen-omni",replica="0",stage="thinker"} 7.0'
-            in out
-        )
+        assert 'omni_test_gauge_pos{model_name="qwen-omni",replica="0",stage="thinker"} 7.0' in out
 
     def test_multiprocess_mode_kwarg_passthrough(self, registry):
         # Upstream creates Gauges with multiprocess_mode="mostrecent" — must not
@@ -205,10 +202,7 @@ class TestRelabelHistogram:
         h.labels(engine=0, model_name="m").observe(0.5)
 
         out = generate_latest(registry).decode()
-        assert (
-            'omni_test_histo_obs_count{model_name="m",replica="0",stage="talker"} 1.0'
-            in out
-        )
+        assert 'omni_test_histo_obs_count{model_name="m",replica="0",stage="talker"} 1.0' in out
 
     def test_no_engine_label_unaffected(self, registry):
         # Families without engine label (e.g. omni-side own metrics) pass through.
@@ -241,10 +235,7 @@ class TestPositionalEngine:
         c.labels("m", "5", "decoder").inc(2)
 
         out = generate_latest(registry).decode()
-        assert (
-            'omni_test_pos_mid_total{model_name="m",replica="0",source="decoder",stage="talker"} 2.0'
-            in out
-        )
+        assert 'omni_test_pos_mid_total{model_name="m",replica="0",source="decoder",stage="talker"} 2.0' in out
 
     def test_positional_engine_with_int_value(self, registry):
         # Defensive: positional form may also receive an int (we accept both).
@@ -258,10 +249,7 @@ class TestPositionalEngine:
         c.labels("m", 3, "stop").inc()
 
         out = generate_latest(registry).decode()
-        assert (
-            'omni_test_pos_int_total{model_name="m",reason="stop",replica="1",stage="thinker"} 1.0'
-            in out
-        )
+        assert 'omni_test_pos_int_total{model_name="m",reason="stop",replica="1",stage="thinker"} 1.0' in out
 
 
 # ---------------------------------------------------------------------------
@@ -284,10 +272,7 @@ class TestStrEngineKwarg:
         g.labels(cache_size="big", engine="0").set(1)
 
         out = generate_latest(registry).decode()
-        assert (
-            'omni_test_info{cache_size="big",replica="0",stage="thinker"} 1.0'
-            in out
-        )
+        assert 'omni_test_info{cache_size="big",replica="0",stage="thinker"} 1.0' in out
 
 
 # ---------------------------------------------------------------------------
@@ -314,10 +299,7 @@ class TestChildNoRecursion:
         # Re-populate so generate_latest doesn't trip on anything else.
         _ENGINE_INDEX_MAP[4] = ("diffusion", "0")
         out = generate_latest(registry).decode()
-        assert (
-            'omni_test_child{model_name="m",replica="0",stage="diffusion"} 99.0'
-            in out
-        )
+        assert 'omni_test_child{model_name="m",replica="0",stage="diffusion"} 99.0' in out
 
 
 # ---------------------------------------------------------------------------
@@ -396,13 +378,6 @@ class TestOmniPrometheusStatLogger:
 # ---------------------------------------------------------------------------
 
 
-from vllm_omni.metrics.stat_logger import (
-    _OmniKVConnectorProm,
-    _OmniPerfMetricsProm,
-    _OmniSpecDecodingProm,
-)
-
-
 class TestHelperClassWraps:
     def test_perf_metrics_wrap_routes_through_relabel_counter(self):
         assert _OmniPerfMetricsProm._counter_cls is _RelabelCounter
@@ -438,9 +413,7 @@ class TestHelperClassWraps:
 
 @pytest.fixture
 def fresh_registry():
-    from prometheus_client import CollectorRegistry as _R
-
-    return _R()
+    return CollectorRegistry()
 
 
 class TestDoubleRewriteGuard:
@@ -460,9 +433,7 @@ class TestDoubleRewriteGuard:
         # 3 positional args matching the rewritten 3-label family.
         g.labels("m", "1", "0").set(42)
         out = generate_latest(fresh_registry).decode()
-        assert (
-            'dr_pre_rewritten{model_name="m",replica="0",stage="1"} 42.0' in out
-        )
+        assert 'dr_pre_rewritten{model_name="m",replica="0",stage="1"} 42.0' in out
 
     def test_legacy_2tuple_with_extra_label_still_splices(self, fresh_registry):
         # 3-label original (engine in middle) → 4-label rewritten family.
@@ -482,7 +453,4 @@ class TestDoubleRewriteGuard:
         # engine_str, reason).
         c.labels("m", "1", "stop").inc(3)
         out = generate_latest(fresh_registry).decode()
-        assert (
-            'dr_legacy_with_extra_total{model_name="m",reason="stop",replica="0",stage="1"} 3.0'
-            in out
-        )
+        assert 'dr_legacy_with_extra_total{model_name="m",reason="stop",replica="0",stage="1"} 3.0' in out

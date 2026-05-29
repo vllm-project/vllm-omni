@@ -100,24 +100,66 @@ TRANSFER_LABELS = (
 # Seconds bucket for e2e / generation / TTFP-style metrics that range from
 # ~10 ms to several minutes.
 SECONDS_BUCKETS = (
-    0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    5.0,
+    10.0,
+    20.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
 )
 
 # Seconds bucket for fine-grained metrics (cross-stage transfer + audio
 # underrun) that need millisecond-level resolution.
 SECONDS_FAST_BUCKETS = (
-    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 60.0,
+    0.001,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    60.0,
 )
 
 # RTF SLO red line is 1.0 — TTS must generate faster than playback.
 RTF_BUCKETS = (
-    0.1, 0.25, 0.5, 0.75, 0.9, 1.0, 1.25, 1.5, 2.0, 5.0, 10.0,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    0.9,
+    1.0,
+    1.25,
+    1.5,
+    2.0,
+    5.0,
+    10.0,
 )
 
 # Bytes bucket for transfer payload size.
 BYTES_BUCKETS = (
-    1024, 4096, 16384, 65536, 262144, 1048576,
-    4194304, 16777216, 67108864, 268435456,
+    1024,
+    4096,
+    16384,
+    65536,
+    262144,
+    1048576,
+    4194304,
+    16777216,
+    67108864,
+    268435456,
 )
 
 
