@@ -14,16 +14,10 @@
                         "async_chunk": false,
                         "trust_remote_code": true,
                         "connectors": {
-                            "yuanrong_te_connector": {
-                                "name": "YuanrongTransferEngineConnector",
+                            "shared_memory_connector": {
+                                "name": "SharedMemoryConnector",
                                 "extra": {
-                                    "host": "auto",
-                                    "zmq_port": 50051,
-                                    "rpc_port": "auto",
-                                    "protocol": "ascend",
-                                    "device_name": "auto",
-                                    "memory_pool_size": 1073741824,
-                                    "memory_pool_device": "npu"
+                                    "shm_threshold_bytes": 65536
                                 }
                             }
                         },
@@ -50,7 +44,7 @@
                                     "need_send_cache": true
                                 },
                                 "output_connectors": {
-                                    "to_stage_1": "yuanrong_te_connector"
+                                    "to_stage_1": "shared_memory_connector"
                                 },
                                 "default_sampling_params": {
                                     "temperature": 0.0,
@@ -80,7 +74,7 @@
                                     "ulysses_degree": 1
                                 },
                                 "input_connectors": {
-                                    "from_stage_0": "yuanrong_te_connector"
+                                    "from_stage_0": "shared_memory_connector"
                                 },
                                 "default_sampling_params": {
                                     "num_inference_steps": 50,

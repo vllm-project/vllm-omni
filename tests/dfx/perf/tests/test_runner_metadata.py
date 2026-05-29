@@ -88,5 +88,5 @@ def test_hunyuan_image3_npu_perf_config_is_registered():
 
     assert configs[0]["test_name"] == "test_hunyuan_image3_ti2i_npu_tp4_tp4_inline"
     content = configs[0]["server_params"]["serve_args"]["deploy-config-inline"]["content"]
-    assert content["connectors"]["yuanrong_te_connector"]["extra"]["protocol"] == "ascend"
+    assert content["connectors"]["shared_memory_connector"]["name"] == "SharedMemoryConnector"
     assert configs[0]["benchmark_params"][0]["dataset"] == "custom"

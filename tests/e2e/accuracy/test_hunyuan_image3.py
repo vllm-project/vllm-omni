@@ -156,17 +156,9 @@ _NPU_DEPLOY_CONFIG = {
     "async_chunk": False,
     "trust_remote_code": True,
     "connectors": {
-        "yuanrong_te_connector": {
-            "name": "YuanrongTransferEngineConnector",
-            "extra": {
-                "host": "auto",
-                "zmq_port": 50051,
-                "rpc_port": "auto",
-                "protocol": "ascend",
-                "device_name": "auto",
-                "memory_pool_size": 1073741824,
-                "memory_pool_device": "npu",
-            },
+        "shared_memory_connector": {
+            "name": "SharedMemoryConnector",
+            "extra": {"shm_threshold_bytes": 65536},
         },
     },
     "stages": [
@@ -186,7 +178,7 @@ _NPU_DEPLOY_CONFIG = {
                 "rope_parameters": {"mrope_section": [0, 32, 32], "rope_type": "default"},
             },
             "omni_kv_config": {"need_send_cache": True},
-            "output_connectors": {"to_stage_1": "yuanrong_te_connector"},
+            "output_connectors": {"to_stage_1": "shared_memory_connector"},
             "default_sampling_params": {
                 "temperature": 0.0,
                 "top_p": 1,
@@ -213,7 +205,7 @@ _NPU_DEPLOY_CONFIG = {
                 "sequence_parallel_size": 1,
                 "ulysses_degree": 1,
             },
-            "input_connectors": {"from_stage_0": "yuanrong_te_connector"},
+            "input_connectors": {"from_stage_0": "shared_memory_connector"},
             "default_sampling_params": {
                 "num_inference_steps": NUM_INFERENCE_STEPS,
                 "guidance_scale": GUIDANCE_SCALE,
