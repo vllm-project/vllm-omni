@@ -21,13 +21,19 @@ from tests.dfx.conftest import (
     resolve_oom_device_spec,
 )
 from tests.dfx.reliability.helpers import (
+    FaultInjector,
+    assert_no_server_tree_process_residual_and_gpu_release,
     extract_openai_error_contract_from_bytes,
     get_health_raw,
     inject_gpu_oom,
     make_process_kill_fault_injector,
+    make_server_root_kill_fault_injector,
+    make_server_tree_kill_fault_injector,
     post_chat_completions_raw,
     post_json_raw,
+    run_fault_injection_with_rate_load,
     stop_gpu_oom_hogs,
+    worker_residual_timeout_after_kill_signal,
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
@@ -97,7 +103,73 @@ FAULT_ERROR_KEYWORDS = (
     "500",
     "503",
 )
-RUNTIME_WORKER_PATTERN = "VLLM::Worker"
+PROCESS_KILL_ERROR_KEYWORDS = (
+    "timeout",
+    "did not complete within",
+    "connection",
+    "engine",
+    "orchestrator",
+    "dead",
+    "internal",
+    "500",
+    "503",
+)
+# Prefix match for vLLM-titled children (``VLLM::Worker``, ``VLLM::StageEngineCoreProc_*``, …).
+# Must be a literal substring of ``name``/``cmdline`` — no trailing whitespace (would break match).
+RUNTIME_WORKER_PATTERN = "VLLM::"
+# RFC#2366 signal x target matrix:
+# - worker: SIGTERM, SIGKILL
+# - serve-root no-load: SIGINT; SIGTERM/SIGKILL skipped (vllm issue#43060)
+# - serve-root with-load: SIGINT; SIGTERM skipped (issue#3683); SIGKILL skipped (issue#43060)
+# - serve-tree no-load: SIGTERM/SIGKILL
+# - serve-tree with-load: SIGKILL; SIGTERM skipped (issue#3683)
+_SERVE_ROOT_NON_SIGINT_SKIP = pytest.mark.skip(reason="vllm issue#43060")
+_WITH_LOAD_SIGTERM_SKIP = pytest.mark.skip(reason="issue#3683")
+SERVE_SIGNAL_PARAMS = [
+    pytest.param("SIGTERM", id="sigterm"),
+    pytest.param("SIGINT", id="sigint"),
+    pytest.param("SIGKILL", id="sigkill", marks=_SERVE_ROOT_NON_SIGINT_SKIP),
+]
+SERVE_WITH_LOAD_SIGNAL_PARAMS = [
+    pytest.param("SIGTERM", id="sigterm", marks=_WITH_LOAD_SIGTERM_SKIP),
+    pytest.param("SIGINT", id="sigint", marks=_WITH_LOAD_SIGTERM_SKIP),
+    pytest.param("SIGKILL", id="sigkill", marks=_WITH_LOAD_SIGTERM_SKIP),
+]
+TREE_SIGNAL_PARAMS = [
+    pytest.param("SIGTERM", id="sigterm"),
+    pytest.param("SIGKILL", id="sigkill"),
+]
+TREE_WITH_LOAD_SIGNAL_PARAMS = [
+    pytest.param("SIGTERM", id="sigterm", marks=_WITH_LOAD_SIGTERM_SKIP),
+    pytest.param("SIGKILL", id="sigkill"),
+]
+WORKER_SIGNAL_FAULT_PARAMS = [
+    pytest.param(
+        make_process_kill_fault_injector(
+            grep_patterns=RUNTIME_WORKER_PATTERN,
+            signal_name="SIGTERM",
+            limit=1,
+            post_kill_wait_seconds=2.0,
+        ),
+        id="runtime_process_chain_sigterm",
+    ),
+    pytest.param(
+        make_process_kill_fault_injector(
+            grep_patterns=RUNTIME_WORKER_PATTERN,
+            signal_name="SIGKILL",
+            limit=1,
+            post_kill_wait_seconds=2.0,
+        ),
+        id="runtime_process_chain_sigkill",
+    ),
+]
+INFLIGHT_INJECTION_REQUEST_RATE = 0.3
+INFLIGHT_INJECTION_REQUEST_COUNT = 10
+
+# Post-fault chat probe: ``MAX_ELAPSED`` aligns with HTTP read timeout; assert allows +1s jitter
+# when the client raises at timeout (e.g. ~30.03s).
+_PROCESS_KILL_WORKER_CHAT_FF_HTTP_TIMEOUT_SEC = 30
+_PROCESS_KILL_WORKER_CHAT_FF_MAX_ELAPSED_SEC = 30
 
 
 class _HasServeArgs(Protocol):
@@ -192,6 +264,55 @@ def _looks_like_server_unreachable(exc: BaseException) -> bool:
         )
     msg = str(exc).lower()
     return "connection refused" in msg or "actively refused" in msg
+
+
+def _chat_request_config(omni_server: _HasServeArgs) -> dict[str, Any]:
+    messages = dummy_messages_from_mix_data(
+        system_prompt=_get_system_prompt(),
+        content_text="What is the capital of China? Answer in one short sentence.",
+    )
+    return {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "modalities": ["text"],
+    }
+
+
+def _assert_post_fault_chat_fast_fail(host: str, port: int, *, model: str, scenario: str) -> None:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "post-fault fast-fail check"}],
+        "stream": False,
+        "modalities": ["text"],
+    }
+    start = time.monotonic()
+    try:
+        status, body = post_json_raw(host, port, "/v1/chat/completions", payload, timeout_sec=20)
+        elapsed = time.monotonic() - start
+        assert elapsed < 15, f"[{scenario} fast_fail] /v1/chat/completions did not fail fast: {elapsed:.2f}s"
+        assert status >= 500, (
+            f"[{scenario} fast_fail] expected server-side error after fault, got status={status}, body={body[:200]!r}"
+        )
+    except Exception:  # noqa: BLE001
+        elapsed = time.monotonic() - start
+        assert elapsed < 15, f"[{scenario} fast_fail] exception was too slow after fault: {elapsed:.2f}s"
+
+
+def _assert_post_fault_health_terminal(host: str, port: int, *, scenario: str) -> None:
+    deadline = time.monotonic() + 20.0
+    last_observation = ""
+    while time.monotonic() < deadline:
+        try:
+            status, body = get_health_raw(host, port, timeout_sec=5)
+            last_observation = f"http={status}, body={body[:200]!r}"
+            if status == 503:
+                return
+        except Exception as exc:  # noqa: BLE001
+            last_observation = f"exception={exc!r}"
+            return
+        time.sleep(0.5)
+    pytest.fail(f"[{scenario} health] no terminal post-fault health observed: {last_observation}")
 
 
 QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLOY_CONFIGS_DIR)
@@ -354,17 +475,7 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize(
     "fault_injector",
-    [
-        pytest.param(
-            make_process_kill_fault_injector(
-                grep_patterns="VLLM::Worker",
-                signal_name="SIGKILL",
-                limit=1,
-                post_kill_wait_seconds=2.0,
-            ),
-            id="runtime_process_chain",
-        ),
-    ],
+    WORKER_SIGNAL_FAULT_PARAMS,
     indirect=True,
 )
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
@@ -385,7 +496,7 @@ def test_reliability_fault_process_kill_request_failure(
     try:
         openai_client_function.send_omni_request(request_config, request_num=1)
     except Exception as exc:
-        assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
+        assert_fault_exception(exc, PROCESS_KILL_ERROR_KEYWORDS)
     else:
         pytest.fail("expected request failure after process-kill injection")
 
@@ -394,47 +505,21 @@ def test_reliability_fault_process_kill_request_failure(
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize(
     "fault_injector",
-    [
-        pytest.param(
-            make_process_kill_fault_injector(
-                grep_patterns="VLLM::Worker",
-                signal_name="SIGKILL",
-                limit=1,
-                post_kill_wait_seconds=2.0,
-            ),
-            id="runtime_process_chain",
-        ),
-    ],
+    WORKER_SIGNAL_FAULT_PARAMS,
     indirect=True,
 )
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     omni_server_after_fault_function,
 ) -> None:
-    """Black-box: after worker SIGKILL, /health→503, chat fails fast, concurrent chat does not hang."""
+    """Black-box: after worker process kill, chat fails fast, concurrent chat does not hang; /health→503 last.
+
+    ``SIGTERM`` on a stage engine often exceeds a 15s client-visible path; ``SIGKILL`` is
+    typically quicker. See module constants ``_PROCESS_KILL_WORKER_CHAT_FF_*``.
+    """
     host = omni_server_after_fault_function.host
     port = omni_server_after_fault_function.port
     model = omni_server_after_fault_function.model
-
-    deadline = time.monotonic() + 20.0
-    last_observation = ""
-    saw_503 = False
-    health_final_status: int | None = None
-    health_final_body = b""
-    while time.monotonic() < deadline:
-        try:
-            status, body = get_health_raw(host, port, timeout_sec=5)
-            last_observation = f"http={status}, body={body[:200]!r}"
-            health_final_status, health_final_body = status, body
-            if status == 503:
-                saw_503 = True
-                break
-        except Exception as exc:  # noqa: BLE001
-            last_observation = f"exception={exc!r}"
-        time.sleep(0.5)
-    assert saw_503, (
-        f"[process_kill health] expected /health to become 503 after fault injection, got {last_observation}"
-    )
 
     payload = {
         "model": model,
@@ -444,20 +529,28 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     }
     ff_status: int | None = None
     ff_body = b""
-    ff_exc: BaseException | None = None
     start = time.monotonic()
     try:
-        ff_status, ff_body = post_json_raw(host, port, "/v1/chat/completions", payload, timeout_sec=20)
+        ff_status, ff_body = post_json_raw(
+            host,
+            port,
+            "/v1/chat/completions",
+            payload,
+            timeout_sec=_PROCESS_KILL_WORKER_CHAT_FF_HTTP_TIMEOUT_SEC,
+        )
         elapsed = time.monotonic() - start
-        assert elapsed < 15, f"[process_kill fast_fail] request did not fail fast after fault: {elapsed:.2f}s"
+        assert elapsed <= _PROCESS_KILL_WORKER_CHAT_FF_MAX_ELAPSED_SEC + 1.0, (
+            f"[process_kill fast_fail] request did not fail fast after fault: {elapsed:.2f}s"
+        )
         assert ff_status >= 500, (
             f"[process_kill fast_fail] expected server-side failure after fault, "
             f"got status={ff_status}, body={ff_body[:200]!r}"
         )
-    except Exception as exc:
-        ff_exc = exc
+    except Exception:
         elapsed = time.monotonic() - start
-        assert elapsed < 15, f"[process_kill fast_fail] request exception was too slow after fault: {elapsed:.2f}s"
+        assert elapsed <= _PROCESS_KILL_WORKER_CHAT_FF_MAX_ELAPSED_SEC + 1.0, (
+            f"[process_kill fast_fail] request exception was too slow after fault: {elapsed:.2f}s"
+        )
 
     payload_json = json.dumps(
         {
@@ -490,32 +583,195 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     assert elapsed < 30, f"[process_kill concurrent] fault-time request convergence is too slow: {elapsed:.2f}s"
 
     fault_observed = False
-    conc_debug: list[Any] = []
     for future in done:
         try:
             status, body = future.result()
-            conc_debug.append((status, body[:200]))
             if status >= 500:
                 fault_observed = True
         except Exception as exc:
-            conc_debug.append(repr(exc))
+            assert_fault_exception(exc, PROCESS_KILL_ERROR_KEYWORDS)
             fault_observed = True
-    # DEBUG: remove before merge
-    print(
-        health_final_status,
-        health_final_body[:200],
-        ff_status,
-        ff_body[:200],
-        ff_exc,
-        conc_debug,
-    )
     assert fault_observed, (
         "[process_kill concurrent] expected at least one request to fail after process-kill fault injection"
     )
 
+    deadline = time.monotonic() + 20.0
+    last_observation = ""
+    final_health_status: int | None = None
+    while time.monotonic() < deadline:
+        try:
+            status, body = get_health_raw(host, port, timeout_sec=5)
+            last_observation = f"http={status}, body={body[:200]!r}"
+            final_health_status = status
+            if status == 503:
+                break
+        except Exception as exc:  # noqa: BLE001
+            last_observation = f"exception={exc!r}"
+        time.sleep(0.5)
+    if final_health_status != 503:
+        pytest.skip("issue#3050")
+    assert final_health_status == 503, (
+        "[process_kill health] expected /health 503 after fatal fault, "
+        f"got status={final_health_status}, last_observation={last_observation}"
+    )
+
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#2327")
+@pytest.mark.skip(reason="issue#3683")
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize(
+    "fault_injector",
+    WORKER_SIGNAL_FAULT_PARAMS,
+    indirect=True,
+)
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_worker_with_load_request_failure(
+    omni_server_function,
+    openai_client_function,
+    fault_injector: FaultInjector,
+) -> None:
+    request_config = _chat_request_config(omni_server_function)
+    scenario = "kill_worker_with_load"
+    load_result = run_fault_injection_with_rate_load(
+        submit_request=lambda: openai_client_function.send_omni_request(request_config, request_num=1),
+        inject_fault=lambda: fault_injector(omni_server_function),
+        num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
+        request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
+        completion_timeout_sec=120.0,
+    )
+    assert load_result["failure_observed"], (
+        f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
+    )
+    host = omni_server_function.host
+    port = omni_server_function.port
+    _assert_post_fault_chat_fast_fail(host, port, model=omni_server_function.model, scenario=scenario)
+    _assert_post_fault_health_terminal(host, port, scenario=scenario)
+
+
+@pytest.mark.slow
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup(
+    omni_server_function,
+    signal_name: str,
+) -> None:
+    """Black-box: kill serve root without load; verify fast-fail/health/cleanup."""
+    scenario = f"kill_serve_root_no_load_{signal_name.lower()}"
+    injector = make_server_root_kill_fault_injector(signal_name=signal_name, post_kill_wait_seconds=2.0)
+    injector(omni_server_function)
+    host = omni_server_function.host
+    port = omni_server_function.port
+    _assert_post_fault_chat_fast_fail(host, port, model=omni_server_function.model, scenario=scenario)
+    _assert_post_fault_health_terminal(host, port, scenario=scenario)
+    assert_no_server_tree_process_residual_and_gpu_release(
+        omni_server_function,
+        scenario=scenario,
+        timeout_sec=worker_residual_timeout_after_kill_signal(signal_name),
+    )
+
+
+@pytest.mark.slow
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize("signal_name", SERVE_WITH_LOAD_SIGNAL_PARAMS)
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_cleanup(
+    omni_server_function,
+    openai_client_function,
+    signal_name: str,
+) -> None:
+    request_config = _chat_request_config(omni_server_function)
+    scenario = f"kill_serve_root_with_load_{signal_name.lower()}"
+    injector = make_server_root_kill_fault_injector(signal_name=signal_name, post_kill_wait_seconds=2.0)
+    load_result = run_fault_injection_with_rate_load(
+        submit_request=lambda: openai_client_function.send_omni_request(request_config, request_num=1),
+        inject_fault=lambda: injector(omni_server_function),
+        num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
+        request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
+        completion_timeout_sec=300.0,
+    )
+    assert load_result["failure_observed"], (
+        f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
+    )
+    host = omni_server_function.host
+    port = omni_server_function.port
+    _assert_post_fault_chat_fast_fail(host, port, model=omni_server_function.model, scenario=scenario)
+    _assert_post_fault_health_terminal(host, port, scenario=scenario)
+    assert_no_server_tree_process_residual_and_gpu_release(
+        omni_server_function,
+        scenario=scenario,
+        timeout_sec=worker_residual_timeout_after_kill_signal(signal_name),
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize("signal_name", TREE_SIGNAL_PARAMS)
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
+    omni_server_function,
+    signal_name: str,
+) -> None:
+    """Black-box: kill server tree without load; verify fast-fail/health/cleanup."""
+    scenario = f"kill_serve_tree_no_load_{signal_name.lower()}"
+    injector = make_server_tree_kill_fault_injector(
+        signal_name=signal_name,
+        post_kill_wait_seconds=2.0,
+        inter_kill_wait_seconds=0.1,
+    )
+    injector(omni_server_function)
+    host = omni_server_function.host
+    port = omni_server_function.port
+    _assert_post_fault_chat_fast_fail(host, port, model=omni_server_function.model, scenario=scenario)
+    _assert_post_fault_health_terminal(host, port, scenario=scenario)
+    assert_no_server_tree_process_residual_and_gpu_release(
+        omni_server_function,
+        scenario=scenario,
+        timeout_sec=worker_residual_timeout_after_kill_signal(signal_name),
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize("signal_name", TREE_WITH_LOAD_SIGNAL_PARAMS)
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
+    omni_server_function,
+    openai_client_function,
+    signal_name: str,
+) -> None:
+    request_config = _chat_request_config(omni_server_function)
+    scenario = f"kill_serve_tree_with_load_{signal_name.lower()}"
+    injector = make_server_tree_kill_fault_injector(
+        signal_name=signal_name,
+        post_kill_wait_seconds=2.0,
+        inter_kill_wait_seconds=0.1,
+    )
+    load_result = run_fault_injection_with_rate_load(
+        submit_request=lambda: openai_client_function.send_omni_request(request_config, request_num=1),
+        inject_fault=lambda: injector(omni_server_function),
+        num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
+        request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
+        completion_timeout_sec=120.0,
+    )
+    assert load_result["failure_observed"], (
+        f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
+    )
+    host = omni_server_function.host
+    port = omni_server_function.port
+    _assert_post_fault_chat_fast_fail(host, port, model=omni_server_function.model, scenario=scenario)
+    _assert_post_fault_health_terminal(host, port, scenario=scenario)
+    assert_no_server_tree_process_residual_and_gpu_release(
+        omni_server_function,
+        scenario=scenario,
+        timeout_sec=worker_residual_timeout_after_kill_signal(signal_name),
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.skip(reason="OOM injection causes the serving instance to exit")
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
