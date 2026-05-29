@@ -13,7 +13,7 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL.Image
@@ -482,6 +482,7 @@ class Wan22S2VPipeline(
     _DEFAULT_MOTION_FRAMES = 73
     _DEFAULT_INFER_FRAMES = 80
     _DEFAULT_FPS = 16
+    dummy_num_frames: ClassVar[int] = 4
 
     def __init__(
         self,

@@ -65,15 +65,19 @@ def rope_params(max_seq_len, dim, theta=10000):
 
 
 def rope_precompute(x, grid_sizes, freqs, start=None):
-    """Precompute complex-valued RoPE embeddings for S2V multi-grid positions."""
-    b, s, n, c = x.size(0), x.size(1), x.size(2), x.size(3) // 2
+    """Precompute complex-valued RoPE embeddings for S2V multi-grid positions.
+
+    RoPE frequencies are identical across attention heads, so keep a singleton
+    head dimension here and rely on broadcasting in ``rope_apply_s2v``.
+    """
+    b, s, _, c = x.size(0), x.size(1), x.size(2), x.size(3) // 2
 
     if isinstance(freqs, list):
         trainable_freqs = freqs[1]
         freqs = freqs[0]
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-    output = torch.view_as_complex(x.detach().reshape(b, s, n, -1, 2).to(torch.float64))
+    output = torch.empty((b, s, 1, c), device=x.device, dtype=freqs[0].dtype)
     seq_bucket = [0]
     if not isinstance(grid_sizes, list):
         grid_sizes = [grid_sizes]
@@ -411,7 +415,24 @@ class WanS2VTransformerBlock(nn.Module):
         # 6-way scale-shift modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        seq_lens=None,
+        grid_sizes=None,
+        freqs=None,
+        context=None,
+        context_lens=None,
+        e=None,
+    ):
+        x = hidden_states
+        if encoder_hidden_states is None:
+            encoder_hidden_states = e
+        if encoder_hidden_states is None:
+            raise ValueError("S2V transformer block requires modulation states.")
+
+        e = encoder_hidden_states
         seg_boundary = e[1]
         seg_idx = [0, min(max(0, seg_boundary), x.size(1)), x.size(1)]
         e = e[0]
@@ -1521,12 +1542,11 @@ class WanS2VTransformer3DModel(nn.Module):
             audio_emb = self.merged_audio_emb
             num_frames = audio_emb.shape[1]
 
-            input_hidden_states = hidden_states[:, : self.original_seq_len].clone()
+            input_hidden_states = hidden_states[:, : self.original_seq_len]
             input_hidden_states = rearrange(input_hidden_states, "b (t n) c -> (b t) n c", t=num_frames)
 
             if self.enable_adain and self.adain_mode == "attn_norm":
-                audio_emb_global = self.audio_emb_global
-                audio_emb_global = rearrange(audio_emb_global, "b t n c -> (b t) n c")
+                audio_emb_global = self._flat_audio_emb_global
                 adain_hidden_states = self.audio_injector.injector_adain_layers[audio_attn_id](
                     input_hidden_states, temb=audio_emb_global[:, 0]
                 )
@@ -1534,8 +1554,7 @@ class WanS2VTransformer3DModel(nn.Module):
             else:
                 attn_hidden_states = self.audio_injector.injector_pre_norm_feat[audio_attn_id](input_hidden_states)
 
-            audio_emb = rearrange(audio_emb, "b t n c -> (b t) n c", t=num_frames)
-            attn_audio_emb = audio_emb
+            attn_audio_emb = self._flat_audio_emb
             residual_out = self.audio_injector.injector[audio_attn_id](
                 x=attn_hidden_states,
                 context=attn_audio_emb,
@@ -1543,7 +1562,7 @@ class WanS2VTransformer3DModel(nn.Module):
                 * attn_audio_emb.shape[1],
             )
             residual_out = rearrange(residual_out, "(b t) n c -> b (t n) c", t=num_frames)
-            hidden_states[:, : self.original_seq_len] = hidden_states[:, : self.original_seq_len] + residual_out
+            hidden_states[:, : self.original_seq_len].add_(residual_out)
 
         return hidden_states
 
@@ -1570,7 +1589,7 @@ class WanS2VTransformer3DModel(nn.Module):
         result = {}
         if self.enable_adain:
             audio_emb_global, audio_emb = audio_emb_res
-            result["audio_emb_global"] = audio_emb_global[:, motion_frames[1] :].clone()
+            result["audio_emb_global"] = audio_emb_global[:, motion_frames[1] :]
         else:
             audio_emb = audio_emb_res
         result["audio_emb"] = audio_emb[:, motion_frames[1] :, :]
@@ -1628,10 +1647,15 @@ class WanS2VTransformer3DModel(nn.Module):
             audio_emb_res = self.casual_audio_encoder(audio_input)
             if self.enable_adain:
                 audio_emb_global, audio_emb_local = audio_emb_res
-                self.audio_emb_global = audio_emb_global[:, motion_frames[1] :].clone()
+                self.audio_emb_global = audio_emb_global[:, motion_frames[1] :]
             else:
                 audio_emb_local = audio_emb_res
             self.merged_audio_emb = audio_emb_local[:, motion_frames[1] :, :]
+
+        self._flat_audio_emb = rearrange(self.merged_audio_emb, "b t n c -> (b t) n c")
+        self._flat_audio_emb_global = None
+        if self.enable_adain:
+            self._flat_audio_emb_global = rearrange(self.audio_emb_global, "b t n c -> (b t) n c")
 
         # Patch embedding + condition
         # NOTE: x and cond_states are 5D tensors [B, C, T, H, W]. Iterating over them
