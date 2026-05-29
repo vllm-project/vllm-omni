@@ -86,6 +86,7 @@ def test_estimate_prompt_len_uses_list_of_int_ref_ids_from_voice_clone_prompt() 
     branches fell through, and `ref_ids_len` defaulted to 0 — silently dropping the
     reference-token contribution to the prefix length budget.
     """
+
     def make_info(num_ref_ids: int) -> dict:
         return {
             "task_type": ["Base"],
