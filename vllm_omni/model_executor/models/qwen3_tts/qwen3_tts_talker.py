@@ -1077,7 +1077,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     # text_embed = ref_ids + text_ids + eos.
                     ref_ids = _first(info.get("ref_ids"), None)
                     if isinstance(voice_clone_prompt, dict) and ref_ids is None:
-                        ref_ids = _first(voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id"), None)
+                        # Same reasoning as ref_code above: values inside `voice_clone_prompt`
+                        # are per-item payloads, not singleton-wrapped batches. Applying
+                        # `_first` to a list-of-int `ref_ids` collapses it to an int and the
+                        # branches below fall through to `ref_ids_len = 0`.
+                        ref_ids = voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id")
 
                     if ref_ids is None:
                         ref_text = _first(info.get("ref_text"), "")

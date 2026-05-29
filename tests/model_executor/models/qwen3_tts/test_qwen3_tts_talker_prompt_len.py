@@ -77,3 +77,52 @@ def test_estimate_prompt_len_handles_1d_ref_code() -> None:
     )
 
     assert est > 50, f"got {est}; 1D ref_code must contribute its own length"
+
+
+def test_estimate_prompt_len_uses_list_of_int_ref_ids_from_voice_clone_prompt() -> None:
+    """`voice_clone_prompt.ref_ids` as a list-of-int (the natural pre-tokenized shape)
+    must be read as a sequence, not unwrapped to its first element. Without the fix
+    `_first` collapsed it to an int, the `isinstance(list)` / `hasattr("shape")`
+    branches fell through, and `ref_ids_len` defaulted to 0 — silently dropping the
+    reference-token contribution to the prefix length budget.
+    """
+    def make_info(num_ref_ids: int) -> dict:
+        return {
+            "task_type": ["Base"],
+            "text": ["hello"],
+            "ref_text": ["world"],
+            "voice_clone_prompt": [
+                {
+                    "ref_spk_embedding": [0.0] * 512,
+                    "ref_code": [[0] * 8 for _ in range(200)],
+                    "ref_ids": list(range(num_ref_ids)),
+                    "icl_mode": True,
+                }
+            ],
+            "non_streaming_mode": [True],
+            "language": ["English"],
+        }
+
+    est_30 = Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+        additional_information=make_info(30),
+        task_type="Base",
+        tokenize_prompt=_fake_tokenize,
+        codec_language_id={"english": 0},
+        spk_is_dialect=None,
+    )
+    est_50 = Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+        additional_information=make_info(50),
+        task_type="Base",
+        tokenize_prompt=_fake_tokenize,
+        codec_language_id={"english": 0},
+        spk_is_dialect=None,
+    )
+
+    # Each additional ref_id contributes exactly one token to the prefix budget
+    # (the estimator strips a fixed 5-token tail from ref_ids regardless of length).
+    # Under the previous bug `_first` collapsed both lists to a single int, so both
+    # estimates would have been identical (delta = 0).
+    assert est_50 - est_30 == 20, (
+        f"got delta={est_50 - est_30}; expected 20 (= 50 - 30 extra ref_ids). "
+        f"Did `_first(ref_ids)` collapse the list to its first int?"
+    )
