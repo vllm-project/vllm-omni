@@ -425,6 +425,12 @@ class OmniVoiceModel(
         batch_attention_mask[1, :, :uncond_len, :uncond_len] = True
 
         # Run iterative generation
+        generator = kwargs.get("generator")
+        if generator is None:
+            seed = kwargs.get("seed")
+            if seed is not None:
+                generator = torch.Generator(device=self.device).manual_seed(int(seed))
+
         tokens = self.generator(
             input_ids=batch_input_ids,
             audio_mask=batch_audio_mask,
@@ -436,6 +442,7 @@ class OmniVoiceModel(
             layer_penalty_factor=self.config.layer_penalty_factor,
             position_temperature=self.config.position_temperature,
             class_temperature=self.config.class_temperature,
+            generator=generator,
         )  # [1, 8, target_len]
 
         return OmniOutput(

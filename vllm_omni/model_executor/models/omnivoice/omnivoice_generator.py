@@ -45,9 +45,22 @@ def _get_time_steps(
     return shifted
 
 
-def _gumbel_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+def _gumbel_sample(
+    logits: torch.Tensor,
+    temperature: float,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
     """Add Gumbel noise for stochastic position selection."""
-    noise = -torch.log(-torch.log(torch.rand_like(logits).clamp(min=1e-8)))
+    if generator is not None:
+        uniform = torch.rand(
+            logits.shape,
+            device=logits.device,
+            dtype=logits.dtype,
+            generator=generator,
+        ).clamp(min=1e-8)
+    else:
+        uniform = torch.rand_like(logits).clamp(min=1e-8)
+    noise = -torch.log(-torch.log(uniform))
     return logits / max(temperature, 1e-8) + noise
 
 
@@ -377,6 +390,7 @@ class OmniVoiceGenerator(nn.Module):
         layer_penalty_factor: float = 5.0,
         position_temperature: float = 5.0,
         class_temperature: float = 0.0,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Run the full 32-step iterative unmasking generation.
 
@@ -391,6 +405,7 @@ class OmniVoiceGenerator(nn.Module):
             layer_penalty_factor: Penalty for later codebooks
             position_temperature: Gumbel temperature for position selection
             class_temperature: Temperature for token prediction (0=greedy)
+            generator: Optional RNG for Gumbel position/token sampling
 
         Returns:
             tokens: [B, 8, max_target_len] - generated audio tokens
@@ -474,7 +489,7 @@ class OmniVoiceGenerator(nn.Module):
 
                 # Token prediction
                 if class_temperature > 0.0:
-                    pred_tokens = _gumbel_sample(log_probs, class_temperature).argmax(dim=-1)
+                    pred_tokens = _gumbel_sample(log_probs, class_temperature, generator).argmax(dim=-1)
                 else:
                     pred_tokens = log_probs.argmax(dim=-1)  # [1, 8, T]
 
@@ -486,7 +501,7 @@ class OmniVoiceGenerator(nn.Module):
 
                 # Gumbel noise for position selection
                 if position_temperature > 0.0:
-                    scores = _gumbel_sample(scores, position_temperature)
+                    scores = _gumbel_sample(scores, position_temperature, generator)
 
                 # Mask out already unmasked positions
                 sample_tokens = tokens[i : i + 1, :, :t_len]

@@ -49,6 +49,10 @@ _DEFAULT_MIN_AUDIO_BYTES = 5000
 REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
+VOICE_CLONE_SEED = 42
+VOICE_CLONE_MAX_ATTEMPTS = 3
+VOICE_CLONE_PASS_THRESHOLD = 0.9
+
 
 def get_prompt(prompt_type="text"):
     prompts = {
@@ -82,15 +86,33 @@ class TestOmniVoiceVoiceCloning:
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_voice_clone_ref_audio_only(self, omni_server, openai_client) -> None:
         """Test voice cloning with ref_audio only (x_vector mode)."""
+        from tests.helpers.media import cosine_similarity_text
+
+        input_text = get_prompt("text")
         request_config = {
             "model": omni_server.model,
-            "input": get_prompt("text"),
+            "input": input_text,
             "ref_audio": REF_AUDIO_URL,
             "response_format": "wav",
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+            "seed": VOICE_CLONE_SEED,
         }
-        openai_client.send_audio_speech_request(request_config)
+        last_error = None
+        for attempt in range(1, VOICE_CLONE_MAX_ATTEMPTS + 1):
+            try:
+                resp = openai_client.send_audio_speech_request(request_config)[0]
+                transcript = (resp.audio_content or "").strip()
+                sim = cosine_similarity_text(transcript.lower(), input_text.lower())
+                if sim >= VOICE_CLONE_PASS_THRESHOLD:
+                    return
+                last_error = (
+                    f"attempt {attempt}/{VOICE_CLONE_MAX_ATTEMPTS}: "
+                    f"similarity={sim:.4f}, transcript={transcript!r}"
+                )
+            except Exception as exc:
+                last_error = f"attempt {attempt}/{VOICE_CLONE_MAX_ATTEMPTS}: {exc}"
+        raise AssertionError(last_error or "voice clone failed")
 
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_voice_clone_ref_audio_and_text(self, omni_server, openai_client) -> None:

@@ -377,26 +377,43 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         For VoxCPM2 this shifts ~15s of torch.compile + CUDA Graph capture from
         the first user request to server startup.
         """
-        if self._tts_model_type != "voxcpm2":
-            return
-
         t0 = time.time()
         logger.info("Running warmup speech request for model_type=%s", self._tts_model_type)
-        # VoxCPM2 has no predefined speaker presets — "default" means zero-shot
-        # mode (no voice cloning).  The voice field is required by the OpenAI
-        # API schema but semantically ignored by the model.
-        warmup_req = OpenAICreateSpeechRequest(
-            input="Warmup.",
-            voice="default",
-            response_format="wav",
-            speed=1.0,
-            stream=False,
-            model=self.model_name,
-        )
-        try:
-            _audio_bytes, _media_type = await self._generate_audio_bytes(warmup_req, request_id="speech-warmup")
-        except Exception as exc:
-            logger.warning("Speech warmup failed (non-fatal): %s", exc)
+
+        if self._tts_model_type == "voxcpm2":
+            # VoxCPM2 has no predefined speaker presets — "default" means zero-shot
+            # mode (no voice cloning).  The voice field is required by the OpenAI
+            # API schema but semantically ignored by the model.
+            warmup_req = OpenAICreateSpeechRequest(
+                input="Warmup.",
+                voice="default",
+                response_format="wav",
+                speed=1.0,
+                stream=False,
+                model=self.model_name,
+            )
+            try:
+                _audio_bytes, _media_type = await self._generate_audio_bytes(
+                    warmup_req, request_id="speech-warmup"
+                )
+            except Exception as exc:
+                logger.warning("Speech warmup failed (non-fatal): %s", exc)
+                return
+        elif self._tts_model_type == "omnivoice" and self._diffusion_mode:
+            warmup_req = OpenAICreateSpeechRequest(
+                input="Warmup.",
+                response_format="wav",
+                speed=1.0,
+                stream=False,
+                model=self.model_name,
+                seed=42,
+            )
+            try:
+                await self._handle_diffusion_speech(warmup_req)
+            except Exception as exc:
+                logger.warning("OmniVoice warmup failed (non-fatal): %s", exc)
+                return
+        else:
             return
 
         elapsed = time.time() - t0
@@ -2407,6 +2424,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     sampling_params_list[0].extra_args = {}
                 sampling_params_list[0].extra_args.update(request.extra_params)
                 logger.info("Applied extra_params to diffusion: %s", request.extra_params)
+
+            if request.seed is not None:
+                import copy
+
+                if sampling_params_list is self._diffusion_engine.default_sampling_params_list:
+                    sampling_params_list = copy.deepcopy(sampling_params_list)
+                elif not (request.extra_params is not None):
+                    sampling_params_list = copy.deepcopy(sampling_params_list)
+                sampling_params_list[0].seed = request.seed
 
             generator = self._diffusion_engine.generate(
                 prompt=prompt,

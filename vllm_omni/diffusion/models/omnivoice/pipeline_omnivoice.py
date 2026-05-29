@@ -285,6 +285,12 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         batch_attn_mask[0, :, :cond_len, :cond_len] = True
         batch_attn_mask[1, :, :uncond_len, :uncond_len] = True
 
+        # Resolve RNG for reproducible Gumbel unmasking
+        sp = req.sampling_params
+        generator = sp.generator
+        if generator is None and sp.seed is not None:
+            generator = torch.Generator(device=device).manual_seed(sp.seed)
+
         # Run 32-step iterative unmasking
         tokens = self.generator(
             input_ids=batch_input_ids,
@@ -297,6 +303,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             layer_penalty_factor=self.layer_penalty_factor,
             position_temperature=self.position_temperature,
             class_temperature=self.class_temperature,
+            generator=generator,
         )
 
         # Decode tokens to audio
