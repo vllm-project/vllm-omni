@@ -155,7 +155,7 @@ def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, m
     cleanup_calls = []
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
 
-    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": False})
+    adapter._send_single_request({"multimodal_output": None, "request": request, "is_finished": False})
 
     assert cleanup_calls == []  # no terminal cleanup; meta.finished is unobservable
 
@@ -173,7 +173,7 @@ def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatc
     adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
 
-    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": False})
+    adapter._send_single_request({"multimodal_output": None, "request": request, "is_finished": False})
 
     assert connector.put.called
     sent_payload = connector.put.call_args.kwargs["data"]
@@ -502,6 +502,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
         status=RequestStatus.RUNNING,
         is_finished=lambda: False,
         num_computed_tokens=10,
+        num_cached_tokens=0,
         num_prompt_tokens=10,
         prompt_token_ids=list(range(10)),
         num_output_placeholders=0,
