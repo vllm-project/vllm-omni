@@ -248,6 +248,47 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
+      - label: "TTS · GLM-TTS Test"
+        timeout_in_minutes: 20
+        commands:
+          - |
+            timeout 20m bash -c "
+              export VLLM_LOGGING_LEVEL=DEBUG
+              pytest -s -v tests/e2e/online_serving/test_glm_tts.py tests/e2e/offline_inference/test_glm_tts.py -m 'advanced_model and cuda' --run-level 'advanced_model'
+            "
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 1
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
 
       - label: "Omni · Qwen3-Omni Test"
         timeout_in_minutes: 30
@@ -333,6 +374,31 @@ steps:
               export VLLM_LOGGING_LEVEL=DEBUG
               export VLLM_WORKER_MULTIPROC_METHOD=spawn
               pytest -s -v tests/e2e/offline_inference/test_voxcpm2.py -m 'advanced_model and cuda' --run-level 'advanced_model'
+            "
+        agents:
+          queue: "gpu_1_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
+      - label: "Omni · Higgs-Audio V2 Test"
+        timeout_in_minutes: 30
+        commands:
+          - |
+            timeout 30m bash -c "
+              export VLLM_LOGGING_LEVEL=DEBUG
+              export VLLM_WORKER_MULTIPROC_METHOD=spawn
+              export VLLM_USE_DEEP_GEMM=0
+              export VLLM_MOE_USE_DEEP_GEMM=0
+              pytest -s -v tests/e2e/online_serving/test_higgs_audio_v2.py tests/e2e/offline_inference/test_higgs_audio_v2.py -m 'advanced_model and cuda' --run-level 'advanced_model'
             "
         agents:
           queue: "gpu_1_queue"

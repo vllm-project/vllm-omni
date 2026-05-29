@@ -19,16 +19,64 @@ from typing import Any
 from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_omni.core.sched.output import OmniChunkRecvHandle
+
 logger = init_logger(__name__)
 
 
-def uses_qwen3_omni_full_payload_input_coordinator(model_config: Any) -> bool:
-    return (
-        getattr(model_config, "stage_id", 0) > 0
-        and not getattr(model_config, "async_chunk", False)
-        and getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration"
-        and getattr(model_config, "model_stage", None) in {"talker", "code2wav"}
+# (arch, model_stage) pairs that route their full_payload stage input via
+# the worker connector and therefore need the scheduler-side coordinator to
+# park requests in WAITING_FOR_INPUT until the recv side delivers.  This set
+# must stay aligned with the arch scope of `init_omni_connectors` in
+# gpu_ar_model_runner.py and gpu_generation_model_runner.py.  Adding a stage
+# here without also wiring its worker connector init produces a permanent
+# Stage 1 hang (gate parks the request, no transport ever releases it).
+#
+_FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("Qwen3OmniMoeForConditionalGeneration", "talker"),
+        ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
+        # qwen2_5_omni thinker->talker uses the real full-payload
+        # producer builder (text_hidden_states routed via
+        # pooler_output["hidden"] -> accumulator -> connector).  Both
+        # stages of qwen2_5_omni are enabled.
+        ("Qwen2_5OmniForConditionalGeneration", "talker"),
+        ("Qwen2_5OmniForConditionalGeneration", "code2wav"),
+        # covo_audio: fused_thinker_talker (Stage 0) -> code2wav (Stage 1).
+        ("CovoAudioForConditionalGeneration", "code2wav"),
+        # mimo_audio: fused_thinker_talker (Stage 0) -> code2wav (Stage 1).
+        ("MiMoAudioModel", "code2wav"),
+        # qwen3_tts: Qwen3TTSTalkerForConditionalGeneration (Stage 0)
+        # -> Qwen3TTSCode2Wav (Stage 1).  Stage 1 is the consumer.
+        ("Qwen3TTSCode2Wav", "code2wav"),
+        # cosyvoice3: cosyvoice3_talker (Stage 0) -> cosyvoice3_code2wav (Stage 1).
+        ("CosyVoice3Model", "cosyvoice3_code2wav"),
+        # dynin: token2text (Stage 0) -> token2image (Stage 1) ->
+        # token2audio (Stage 2).  Producer wires via
+        # custom_process_next_stage_input_func: *_full_payload in deploy yaml.
+        ("DyninOmniForConditionalGeneration", "token2image"),
+        ("DyninOmniForConditionalGeneration", "token2audio"),
+    }
+)
+
+
+def uses_full_payload_input_coordinator(model_config: Any) -> bool:
+    """Returns True iff this stage parks pending requests in
+    WAITING_FOR_INPUT awaiting a full_payload delivery on the worker connector.
+
+    Gated by (model_arch, model_stage) — see _FULL_PAYLOAD_INPUT_STAGES for the
+    rationale on why this is a whitelist instead of a marker-driven structural
+    gate.
+    """
+    if getattr(model_config, "stage_id", 0) <= 0:
+        return False
+    if getattr(model_config, "async_chunk", False):
+        return False
+    key = (
+        getattr(model_config, "model_arch", None),
+        getattr(model_config, "model_stage", None),
     )
+    return key in _FULL_PAYLOAD_INPUT_STAGES
 
 
 class OmniSchedulingCoordinator:
@@ -59,7 +107,11 @@ class OmniSchedulingCoordinator:
 
         # Requests waiting for full_payload stage input (WAITING_FOR_INPUT).
         self._waiting_for_input: deque[Any] = deque()
-        self.pending_input_registrations: list[Any] = []
+        # Per-cycle list of minimal handles to ship to the model runner so it
+        # can call register_chunk_recv().  Typed concretely (not list[Any]) so
+        # the surrounding OmniSchedulerOutput stays msgspec-friendly across
+        # default, PD-disagg, and multi-node executor IPC paths.
+        self.pending_input_registrations: list[OmniChunkRecvHandle] = []
 
         # Monotonic timestamp recording when each request first entered
         # WAITING_FOR_CHUNK or WAITING_FOR_INPUT.  Used by
@@ -166,7 +218,12 @@ class OmniSchedulingCoordinator:
                     self._waiting_since.setdefault(request.request_id, time.monotonic())
                     to_remove.append(request)
                     self._waiting_for_input.append(request)
-                    self.pending_input_registrations.append(request)
+                    self.pending_input_registrations.append(
+                        OmniChunkRecvHandle(
+                            request_id=request.request_id,
+                            external_req_id=getattr(request, "external_req_id", None),
+                        )
+                    )
                 elif request.status == RequestStatus.WAITING_FOR_INPUT:
                     if request.request_id in stage_recv_req_ids:
                         request.status = RequestStatus.WAITING
@@ -174,7 +231,12 @@ class OmniSchedulingCoordinator:
                     else:
                         to_remove.append(request)
                         self._waiting_for_input.append(request)
-                        self.pending_input_registrations.append(request)
+                        self.pending_input_registrations.append(
+                            OmniChunkRecvHandle(
+                                request_id=request.request_id,
+                                external_req_id=getattr(request, "external_req_id", None),
+                            )
+                        )
             if to_remove:
                 # Use the bulk-remove helper: one O(N) sweep instead of N
                 # repeated O(N) removes from a list-backed queue.

@@ -48,7 +48,7 @@ def _make_pipeline(cls):
 
 def _make_request(**sp_kwargs) -> OmniDiffusionRequest:
     sp = OmniDiffusionSamplingParams(**sp_kwargs)
-    return OmniDiffusionRequest(prompts=[{"prompt": "a cat"}], sampling_params=sp)
+    return OmniDiffusionRequest(prompts=[{"prompt": "a cat"}], sampling_params=sp, request_id="dmd2-scheduler")
 
 
 @pytest.fixture(

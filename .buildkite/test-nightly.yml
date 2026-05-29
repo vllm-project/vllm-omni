@@ -305,6 +305,51 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
+      - label: ":full_moon: Omni · Perf Test · Multi-Replica"
+        key: nightly-omni-performance-multi-replicas
+        timeout_in_minutes: 180
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 3
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
 
       - label: ":full_moon: Omni · Multi-Replica Startup Test with 4x H100"
         timeout_in_minutes: 45
@@ -390,6 +435,52 @@ steps:
                     resources:
                       limits:
                         nvidia.com/gpu: 2
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
+      - label: ":full_moon: VoxCPM2 · Perf Test"
+        key: nightly-voxcpm2-performance
+        timeout_in_minutes: 180
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_voxcpm2.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 1
                     volumeMounts:
                       - name: devshm
                         mountPath: /dev/shm
@@ -525,6 +616,7 @@ steps:
             tests/e2e/online_serving/test_longcat_image_expansion.py
             tests/e2e/online_serving/test_longcat_image_edit_expansion.py
             tests/e2e/online_serving/test_flux_2_dev_expansion.py
+            tests/e2e/offline_inference/test_glm_image_autoround_w4a16_expansion.py
             -m "full_model and diffusion and H100 and distributed_cuda"
             --run-level "full_model"
         agents:
@@ -578,7 +670,7 @@ steps:
                   - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
                     resources:
                       limits:
-                        nvidia.com/gpu: 3
+                        nvidia.com/gpu: 2
                     volumeMounts:
                       - name: devshm
                         mountPath: /dev/shm
@@ -797,8 +889,8 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-Edit-2509"
-        key: nightly-diffusion-x2iat-performance-qwen-image-edit-2509
+      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-Edit-2511"
+        key: nightly-diffusion-x2iat-performance-qwen-image-edit-2511
         timeout_in_minutes: 180
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
@@ -806,7 +898,7 @@ steps:
           - export CACHE_DIT_VERSION=1.3.0
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_edit_2509_vllm_omni.json
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_edit_2511_vllm_omni.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
@@ -855,6 +947,54 @@ steps:
           - |
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_layered_vllm_omni.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 1
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
+      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · BAGEL"
+        key: nightly-diffusion-x2iat-performance-bagel
+        timeout_in_minutes: 180
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
+          - export CACHE_DIT_VERSION=1.3.0
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_bagel_vllm_omni.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
@@ -959,7 +1099,7 @@ steps:
       - label: ":full_moon: Diffusion X2V · Function Test"
         timeout_in_minutes: 90
         commands:
-          - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py tests/e2e/online_serving/test_wan_2_1_vace_expansion.py tests/e2e/online_serving/test_hunyuan_video_15_expansion.py  -m "full_model and cuda" --run-level "full_model"
+          - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py tests/e2e/online_serving/test_wan_2_1_vace_expansion.py tests/e2e/online_serving/test_hunyuan_video_15_expansion.py tests/e2e/offline_inference/test_wan22_autoround_w4a16_expansion.py -m "full_model and cuda" --run-level "full_model"
         agents:
           queue: "mithril-h100-pool"
         plugins:
@@ -998,6 +1138,8 @@ steps:
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py -m full_model --run-level full_model
+          - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py -m full_model --run-level full_model
+          - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py -m full_model --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_ltx2_3_video_similarity.py -m full_model --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2v_matches_diffusers' -m full_model --run-level full_model
         agents:
@@ -1086,9 +1228,8 @@ steps:
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "diffusion-x2iat-test"
     steps:
       - label: ":full_moon: Quantization Test with H100"
-        timeout_in_minutes: 90
         commands:
-          - timeout 30m pytest -sv tests/diffusion/quantization -m 'full_model and cuda and H100' --run-level "full_model"
+          - timeout 60m pytest -sv tests/diffusion/quantization -m 'full_model and cuda and H100' --run-level "full_model"
         agents:
           queue: "mithril-h100-pool"
         plugins:
@@ -1189,14 +1330,16 @@ steps:
       - nightly-omni-performance-no-async-chunk
       - nightly-omni-performance-async-chunk
       - nightly-omni-performance-vllm-text
+      - nightly-omni-performance-multi-replicas
       - nightly-tts-performance
       - nightly-diffusion-x2iat-performance-qwen-image
       - nightly-diffusion-x2iat-performance-qwen-image-edit
-      - nightly-diffusion-x2iat-performance-qwen-image-edit-2509
+      - nightly-diffusion-x2iat-performance-qwen-image-edit-2511
       - nightly-diffusion-x2iat-performance-qwen-image-layered
+      - nightly-diffusion-x2iat-performance-bagel
       - nightly-diffusion-x2v-performance
       - nightly-testcase-statistics
-    if: build.env("NIGHTLY") == "1"
+    if: build.env("NIGHTLY") == "1" && build.env("EMAIL_DISTRIBUTION") == "1"
     commands:
       - pip install openpyxl
       - export DEFAULT_INPUT_DIR=tests/dfx/perf/results
@@ -1205,10 +1348,12 @@ steps:
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-no-async-chunk
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-async-chunk
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-vllm-text
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-multi-replicas
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image-edit
-      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image-edit-2509
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image-edit-2511
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image-layered
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-bagel
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2v-performance
       - buildkite-agent artifact download "tests/dfx/perf/results/*.html" . --step nightly-testcase-statistics
       - python tools/nightly/generate_nightly_perf_excel.py

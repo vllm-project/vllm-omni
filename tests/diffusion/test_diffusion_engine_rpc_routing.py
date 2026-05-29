@@ -89,7 +89,7 @@ class _ConcurrencyTrackingExecutor:
             if method in {"execute_model", "execute_stepwise", "generate"}:
                 # args[0] is the request-like object for execute_model.
                 req = args[0] if args else None
-                tag = req.request_ids[0] if req is not None and hasattr(req, "request_ids") else "unknown"
+                tag = req.request_id if req is not None and hasattr(req, "request_id") else "unknown"
                 return DiffusionOutput(error=f"result_for_{tag}")
             tag = args[0] if args else method
             return DiffusionOutput(error=f"rpc_result_for_{tag}")
@@ -108,7 +108,7 @@ class _ConcurrencyTrackingExecutor:
             exec_all_ranks=True,
         )
         return RunnerOutput(
-            req_id=new_req.sched_req_id,
+            request_id=new_req.request_id,
             step_index=None,
             finished=True,
             result=result,
@@ -120,7 +120,7 @@ class _ConcurrencyTrackingExecutor:
 
 def _make_request(tag: str):
     return SimpleNamespace(
-        request_ids=[tag],
+        request_id=tag,
         prompts=[f"prompt_{tag}"],
         sampling_params=SimpleNamespace(num_inference_steps=1, **_SAMPLING_KEY_DEFAULTS),
     )
@@ -148,6 +148,7 @@ def _make_engine_with_loop(
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_queue = {}
+    engine._closed = False
     engine.abort_queue = queue.Queue()
     engine._rpc_queue = queue.Queue()
 

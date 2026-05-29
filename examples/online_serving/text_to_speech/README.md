@@ -15,11 +15,11 @@ For the full list of supported architectures across all modalities, see
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
+| GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
-| VoxCPM | `openbmb/VoxCPM-0.5B` | ✓ | ✓ (PCM stream) | — | — |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
@@ -95,6 +95,45 @@ For full request-shape documentation (all parameters, response formats, error co
 
 ---
 
+## GLM-TTS
+
+2-stage TTS (AR + DiT flow-matching) at 24 kHz. Every request requires `ref_audio` + `ref_text`.
+
+### Launch
+```bash
+vllm serve zai-org/GLM-TTS --omni --trust-remote-code --port 8091
+# or:
+bash examples/online_serving/text_to_speech/glm_tts/run_server.sh /path/to/GLM-TTS
+```
+
+### Sending requests
+```bash
+# Voice cloning (required)
+python examples/online_serving/text_to_speech/glm_tts/openai_speech_client.py \
+    --text "你好，这是语音克隆测试。" \
+    --ref-audio file:///path/to/ref.wav \
+    --ref-text "这是参考音频的文本内容。"
+
+# Custom format
+python examples/online_serving/text_to_speech/glm_tts/openai_speech_client.py \
+    --text "Hello, this is a voice cloning test." \
+    --ref-audio file:///path/to/ref.wav \
+    --ref-text "Transcript of the reference audio." \
+    --response-format mp3 -o output.mp3
+```
+
+### Gradio demo
+```bash
+bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
+```
+
+### Notes
+- Output: 24 kHz mono WAV via HiFT vocoder.
+- `ref_audio` + `ref_text` are **required** together on every request. Reference audio should be 3-10 seconds.
+- Voice cloning feature extraction (WhisperVQ, CampPlus, mel) runs on the model side — no external dependency on the serving layer.
+
+---
+
 ## Fish Speech S2 Pro
 
 4B dual-AR TTS at 44.1 kHz. Server uses the DAC codec.
@@ -102,6 +141,26 @@ For full request-shape documentation (all parameters, response formats, error co
 ### Prerequisites
 ```bash
 pip install fish-speech
+```
+
+### Kvcache attention fast path
+
+Fish Speech S2 Pro uses a Triton decode-only kvcache attention fast path by
+default on CUDA builds. Set `VLLM_OMNI_FISH_KVCACHE_ATTN=0` to disable it, or
+`VLLM_OMNI_FISH_KVCACHE_ATTN=required` to fail fast if the fast path cannot be
+installed.
+
+```bash
+# Verify fast path availability.
+python - <<'PY'
+from vllm_omni.attention import fish_kvcache_attn
+
+print(fish_kvcache_attn.is_available())
+print(fish_kvcache_attn.load_error())
+PY
+
+# Optional: disable the runtime fast path.
+export VLLM_OMNI_FISH_KVCACHE_ATTN=0
 ```
 
 ### Launch
@@ -294,10 +353,10 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091
 ./qwen3_tts/run_server.sh Base
 ```
 
-### Choosing an executor backend (uniproc vs mp)
-Stage configs ship with the chunked-streaming default. To use the uniproc executor (lower IPC overhead for the Base cloning task), pass `--stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_uniproc.yaml`. See [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) and [#2604](https://github.com/vllm-project/vllm-omni/pull/2604) for the full investigation.
+### Executor backend
+Single-GPU serves now default to the uniproc executor (lower IPC overhead, the Base cloning use case from [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) / [#2604](https://github.com/vllm-project/vllm-omni/pull/2604)). `vllm_omni/deploy/qwen3_tts.yaml` is the only Qwen3-TTS deploy config; pass `--deploy-config <path>` to override.
 
-To opt out of chunked streaming, pass `--no-async-chunk` instead — the pipeline auto-dispatches to the end-to-end codec processor.
+To opt out of chunked streaming, pass `--no-async-chunk` — the pipeline auto-dispatches to the end-to-end codec processor.
 
 ### Sending requests
 ```bash
@@ -375,70 +434,8 @@ python qwen3_tts/streaming_speech_client.py --text "..." --simulate-stt --stt-de
 `qwen3_tts/batch_speech_client.py` issues many concurrent requests for throughput measurement.
 
 ### Notes
-- Base voice cloning has uniproc-vs-mp tradeoffs depending on per-request reference audio cost; see the executor-backend section above.
+- Base voice cloning has per-request reference-audio cost; the uniproc default keeps IPC overhead off the critical path. See the executor-backend section above for background.
 - `vllm_omni/deploy/qwen3_tts.yaml` is the default deploy config (loaded by HF `model_type`); per-stage runtime overrides are available via `--stage-N-<field> <value>`.
-
----
-
-## VoxCPM
-
-Split-stage TTS at 24 kHz.
-
-### Prerequisites
-```bash
-pip install voxcpm
-# or use a local source tree:
-export VLLM_OMNI_VOXCPM_CODE_PATH=/path/to/VoxCPM/src
-```
-
-If the native VoxCPM `config.json` lacks HF `model_type`, set up an HF-compatible config dir:
-```bash
-export VOXCPM_MODEL=/path/to/voxcpm-model
-export VLLM_OMNI_VOXCPM_HF_CONFIG_PATH=/tmp/voxcpm_hf_config
-mkdir -p "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"
-cp "$VOXCPM_MODEL/config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/config.json"
-cp "$VOXCPM_MODEL/generation_config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/generation_config.json" 2>/dev/null || true
-python3 -c 'import json, os; p=os.path.join(os.environ["VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"], "config.json"); cfg=json.load(open(p, "r", encoding="utf-8")); cfg["model_type"]="voxcpm"; cfg.setdefault("architectures", ["VoxCPMForConditionalGeneration"]); json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)'
-```
-
-### Launch
-```bash
-export VOXCPM_MODEL=/path/to/voxcpm-model
-./voxcpm/run_server.sh                # async-chunk streaming (default)
-./voxcpm/run_server.sh sync           # non-streaming
-```
-Or directly:
-```bash
-vllm serve "$VOXCPM_MODEL" \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml \
-    --trust-remote-code --enforce-eager --omni --port 8091
-```
-
-### Sending requests
-```bash
-# Basic TTS
-python voxcpm/openai_speech_client.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This is a VoxCPM online text-to-speech example."
-
-# Voice cloning
-python voxcpm/openai_speech_client.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This sentence is synthesized with a cloned voice." \
-    --ref-audio /path/to/reference.wav \
-    --ref-text "The exact transcript spoken in reference.wav."
-
-# Streaming PCM
-python voxcpm/openai_speech_client.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This is a streaming VoxCPM request." \
-    --stream --output voxcpm_stream.pcm
-```
-
-### Notes
-- `voxcpm.yaml` for one-shot decode; `voxcpm_async_chunk.yaml` for single-request streaming. Do not use the async-chunk config for concurrent requests or `/v1/audio/speech/batch`.
-- Generic TTS fields not supported by VoxCPM: `voice`, `instructions`, `language`, `speaker_embedding`, `x_vector_only_mode`.
-- For benchmark measurement, see [`benchmarks/voxcpm`](../../../benchmarks/voxcpm/README.md).
 
 ---
 

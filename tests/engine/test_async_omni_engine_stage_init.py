@@ -1,8 +1,10 @@
+import concurrent.futures
 import importlib
 import os
 import threading
 import time
 import types
+from contextlib import contextmanager
 
 import pytest
 
@@ -189,10 +191,12 @@ def test_initialize_diffusion_replica_restores_device_visibility_after_local_ini
     old_env = os.environ.get(env_var)
     os.environ[env_var] = "0,1"
 
-    def _fake_setup_stage_devices(_stage_id, _runtime_cfg):
+    @contextmanager
+    def _fake_stage_runtime_setup(_stage_id, _runtime_cfg):
         current_omni_platform.set_device_control_env_var("1")
+        yield
 
-    monkeypatch.setattr(engine_mod, "setup_stage_devices", _fake_setup_stage_devices)
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _fake_stage_runtime_setup)
     monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
     monkeypatch.setattr(engine_mod, "initialize_diffusion_stage", lambda *_, **__: types.SimpleNamespace())
 
@@ -221,7 +225,11 @@ def test_initialize_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
 
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(engine_mod, "setup_stage_devices", lambda *_: None)
+    @contextmanager
+    def _noop_stage_runtime_setup(*_):
+        yield
+
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _noop_stage_runtime_setup)
     monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
 
     def _capture_initialize_diffusion_stage(
@@ -372,6 +380,44 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
     assert all(replica.num_replicas == 3 for replica in stage_plans[1].replicas)
 
 
+def test_initialize_stage_replicas_reuses_long_lived_executor(monkeypatch):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._stage_init_executor = None
+
+    cfg = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    stage_plans = [_make_llm_plan(0, configured_stage_id=0, vllm_config=cfg, num_replicas=1)]
+
+    created_executors = []
+
+    class FakeExecutor:
+        def __init__(self, *args, **kwargs):
+            self.shutdown_calls = []
+            created_executors.append(self)
+
+        def submit(self, fn, *args, **kwargs):
+            future = concurrent.futures.Future()
+            future.set_result(fn(*args, **kwargs))
+            return future
+
+        def shutdown(self, wait=False, cancel_futures=False):
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(
+        engine,
+        "_initialize_replica",
+        lambda plan, _stage_init_timeout, _stage_launch_lock: f"client-{plan.replica_id}",
+    )
+
+    first = engine._initialize_stage_replicas(stage_plans, stage_init_timeout=1)
+    second = engine._initialize_stage_replicas(stage_plans, stage_init_timeout=1)
+
+    assert first == {0: ["client-0"]}
+    assert second == {0: ["client-0"]}
+    assert len(created_executors) == 1
+    assert engine._stage_init_executor is created_executors[0]
+
+
 def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monkeypatch):
     engine = object.__new__(AsyncOmniEngine)
 
@@ -401,6 +447,42 @@ def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monk
         0: [clients[(0, 0)], clients[(0, 1)]],
         1: [clients[(1, 0)], clients[(1, 1)]],
     }
+
+
+def test_shutdown_closes_long_lived_stage_init_executor():
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine._weak_finalizer = None
+    engine._omni_master_server = None
+    engine._coordinator_runtime = None
+    engine.orchestrator_thread = types.SimpleNamespace(join=lambda timeout: None, is_alive=lambda: False)
+
+    class FakeQueue:
+        def __init__(self):
+            self.closed = False
+            self.sync_q = types.SimpleNamespace(put_nowait=lambda _msg: None)
+
+        def close(self):
+            self.closed = True
+
+    class FakeExecutor:
+        def __init__(self):
+            self.shutdown_calls = []
+
+        def shutdown(self, wait=False, cancel_futures=False):
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    engine.request_queue = FakeQueue()
+    engine.output_queue = FakeQueue()
+    engine.rpc_output_queue = FakeQueue()
+    engine._stage_init_executor = FakeExecutor()
+
+    engine.shutdown()
+
+    assert engine._stage_init_executor is None
+    assert engine.request_queue.closed is True
+    assert engine.output_queue.closed is True
+    assert engine.rpc_output_queue.closed is True
 
 
 def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_replica_failure(monkeypatch):
@@ -527,7 +609,11 @@ def test_initialize_llm_replica_passes_stage_init_timeout_to_complete_stage_hand
     prev_device_env = os.environ.get(device_env_var)
     os.environ[device_env_var] = "0"
 
-    monkeypatch.setattr(engine_mod, "setup_stage_devices", lambda *_: None)
+    @contextmanager
+    def _noop_stage_runtime_setup(*_):
+        yield
+
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _noop_stage_runtime_setup)
     monkeypatch.setattr(engine_mod, "build_engine_args_dict", lambda *_, **__: {})
     monkeypatch.setattr(engine_mod, "acquire_device_locks", lambda *_: [])
     monkeypatch.setattr(engine_mod, "spawn_stage_core", lambda **_: (fake_addresses, fake_proc, "ipc://handshake"))

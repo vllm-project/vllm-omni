@@ -11,6 +11,7 @@ to DiffusionModelRunner.
 import gc
 import multiprocessing as mp
 import os
+import signal
 from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -46,6 +47,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
@@ -185,6 +187,10 @@ class DiffusionWorker:
         self.model_runner: DiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
+        # Worker-side cache of (lora_request, lora_scale) per scheduled
+        # request id. Used by step mode to recover LoRA identity for cached
+        # requests, which only carry their request_id in subsequent ticks.
+        self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner using the platform-specified class
@@ -367,13 +373,7 @@ class DiffusionWorker:
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
-        if self.lora_manager is not None:
-            # Step mode does not support LoRA yet. Clear any previously active
-            # adapter first so worker-local LoRA state cannot leak in.
-            self.lora_manager.set_active_adapter(None)
-
-        if any(new_req.req.sampling_params.lora_request is not None for new_req in scheduler_output.scheduled_new_reqs):
-            raise ValueError("Step mode does not support LoRA yet.")
+        self._activate_step_lora(scheduler_output)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
         with ctx:
@@ -381,6 +381,43 @@ class DiffusionWorker:
         if profiler:
             profiler.step()
         return output
+
+    def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
+        """Activate the LoRA adapter for the scheduled step batch.
+
+        Newly scheduled requests register their (lora_request, lora_scale)
+        in ``_step_lora_state`` so cached requests can resolve to the same
+        adapter on later ticks. Finished requests are evicted. Batch
+        homogeneity is enforced by the scheduler via ``SamplingParamsKey``,
+        so any scheduled request id resolves to the active LoRA identity.
+        """
+        for request_id in scheduler_output.finished_req_ids:
+            self._step_lora_state.pop(request_id, None)
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            sampling = new_req.req.sampling_params
+            self._step_lora_state[new_req.request_id] = (
+                sampling.lora_request,
+                sampling.lora_scale,
+            )
+
+        if self.lora_manager is None:
+            return
+
+        lora_request: LoRARequest | None = None
+        lora_scale = 1.0
+        for request_id in scheduler_output.scheduled_request_ids:
+            entry = self._step_lora_state.get(request_id)
+            if entry is not None:
+                lora_request, lora_scale = entry
+                break
+
+        try:
+            self.lora_manager.set_active_adapter(lora_request, lora_scale)
+        except Exception as exc:
+            if lora_request is not None:
+                raise
+            logger.warning("LoRA activation skipped: %s", exc)
 
     def load_weights(self, weights) -> set[str]:
         """Load weights by delegating to the model runner."""
@@ -485,11 +522,11 @@ class DiffusionWorker:
             logger.info(f"[Worker {self.rank}] Handshake Received: Task {task.task_id}")
 
             current_omni_platform.synchronize()
-            usage_before = current_omni_platform.get_current_memory_usage(self.device)
+            free_before = current_omni_platform.get_free_memory(self.device)
             self.sleep(level=task.level)
             current_omni_platform.synchronize()
-            usage_after = current_omni_platform.get_current_memory_usage(self.device)
-            real_freed = max(0, usage_before - usage_after)
+            free_after = current_omni_platform.get_free_memory(self.device)
+            real_freed = max(0, free_after - free_before)
             logger.info(f"[Worker {self.rank}] Preparing ACK: freed_bytes={real_freed / GiB_bytes:.2f} GiB.")
 
             # Ensure all ranks have completed sleep before measuring memory and sending ACK
@@ -501,6 +538,11 @@ class DiffusionWorker:
             if self.rank != 0:
                 return None
 
+            try:
+                total_mem = current_omni_platform.get_device_total_memory()
+            except (NotImplementedError, AttributeError):
+                total_mem = torch.cuda.get_device_properties(self.device).total_memory
+            residual_gib = (total_mem - free_after) / GiB_bytes
             ack = OmniACK(
                 task_id=task.task_id,
                 status="SUCCESS",
@@ -511,7 +553,7 @@ class DiffusionWorker:
                 metadata={
                     "source": f"Platform_{current_omni_platform.get_device_name()}",
                     "total_freed_gib": f"{real_freed / GiB_bytes:.2f}",
-                    "rank_residual_gib": f"{usage_after / GiB_bytes:.2f}",
+                    "rank_residual_gib": f"{residual_gib:.2f}",
                 },
             )
             logger.info(f"[Worker {self.rank}] ACK emitted. Freed {real_freed / GiB_bytes:.2f} GiB.")
@@ -539,8 +581,12 @@ class DiffusionWorker:
                 torch.distributed.barrier()
 
             current_omni_platform.synchronize()
-            usage_now = current_omni_platform.get_current_memory_usage(self.device)
-            current_used_gib = usage_now / (1024**3)
+            free_now = current_omni_platform.get_free_memory(self.device)
+            try:
+                total_mem = current_omni_platform.get_device_total_memory()
+            except (NotImplementedError, AttributeError):
+                total_mem = torch.cuda.get_device_properties(self.device).total_memory
+            current_used_gib = (total_mem - free_now) / (1024**3)
 
             if self.rank != 0:
                 return None
@@ -795,6 +841,8 @@ class WorkerProc:
     ) -> None:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
+
+        set_death_signal(signal.SIGTERM)
 
         # Set process title for visibility in nvidia-smi / htop (optional, non-fatal)
         try:

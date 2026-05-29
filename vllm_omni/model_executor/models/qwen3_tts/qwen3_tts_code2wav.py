@@ -25,6 +25,27 @@ from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
 logger = init_logger(__name__)
 
 
+def _codec_ids_from_payload_or_input(
+    input_ids: torch.Tensor,
+    runtime_info: dict[str, Any] | None,
+) -> torch.Tensor:
+    """Prefer connector-delivered codec ids over token placeholders.
+
+    In non-async full-payload mode, the scheduler only needs placeholder
+    token ids for allocation.  The real codec sequence is delivered through
+    model_intermediate_buffer as ``codes.audio``.
+    """
+    if isinstance(runtime_info, dict):
+        codes = runtime_info.get("codes")
+        if isinstance(codes, dict):
+            audio = codes.get("audio")
+            if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+                return audio.reshape(-1).to(device=input_ids.device, dtype=torch.long)
+            if isinstance(audio, (list, tuple)) and audio:
+                return torch.as_tensor(audio, device=input_ids.device, dtype=torch.long).reshape(-1)
+    return input_ids.reshape(-1).to(dtype=torch.long)
+
+
 class Qwen3TTSCode2Wav(nn.Module):
     """Stage-1 code2wav model for Qwen3-TTS (GenerationModelRunner).
     Consumes frame-aligned codec tokens from input_ids and decodes waveform
@@ -111,6 +132,56 @@ class Qwen3TTSCode2Wav(nn.Module):
                 return [ids[boundaries[i] : boundaries[i + 1]] for i in range(len(boundaries) - 1)]
         return [ids]
 
+    def _maybe_enable_decoder_cudagraph(
+        self,
+        *,
+        device: torch.device,
+        codec_chunk_frames: int,
+        codec_left_context_frames: int,
+        decode_cudagraph_capture_sizes: list[int] | None,
+        decode_cudagraph_batch_sizes: list[int] | None,
+        decode_cudagraph_extra_capture_shapes: list[tuple[int, int]] | None,
+        decode_compile_shapes: list[tuple[int, int]] | None,
+    ) -> None:
+        """Enable inner Code2Wav CUDA graph unless stage is enforce_eager."""
+        if not hasattr(self.decoder, "enable_cudagraph") or device.type != "cuda":
+            return
+
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        if getattr(model_cfg, "enforce_eager", False):
+            logger.info("Qwen3-TTS Code2Wav CUDA Graph disabled because enforce_eager is set")
+            return
+
+        if (
+            codec_chunk_frames > 0
+            and codec_left_context_frames > 0
+            and self._decoder_sliding_window
+            and codec_left_context_frames < self._decoder_sliding_window
+        ):
+            logger.warning(
+                "Qwen3-TTS streaming codec_left_context_frames=%d "
+                "is smaller than decoder sliding_window=%d; "
+                "chunk-boundary distortion may occur. "
+                "Increase codec_left_context_frames to at least "
+                "%d for streaming.",
+                codec_left_context_frames,
+                self._decoder_sliding_window,
+                self._decoder_sliding_window,
+            )
+
+        self.decoder.enable_cudagraph(
+            capture_sizes=decode_cudagraph_capture_sizes,
+            capture_batch_sizes=decode_cudagraph_batch_sizes,
+            extra_capture_shapes=decode_cudagraph_extra_capture_shapes,
+            compile_shapes=decode_compile_shapes,
+            device=device,
+            codec_chunk_frames=codec_chunk_frames,
+            codec_left_context_frames=codec_left_context_frames,
+            decode_chunk_size=self._decode_chunk_frames,
+            decode_left_context=self._decode_left_context_frames,
+        )
+        logger.info("Code2Wav decoder CUDA Graph enabled")
+
     def _get_decode_batch_bucket_frames(self, actual_frames: int) -> int:
         for bucket_frames in self._decode_batch_bucket_frames:
             if actual_frames <= bucket_frames:
@@ -189,6 +260,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
             )
 
+        runtime_infos = runtime_additional_information or []
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
@@ -196,14 +268,18 @@ class Qwen3TTSCode2Wav(nn.Module):
         valid_codes_qf: list[torch.Tensor] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
-        if runtime_additional_information is not None:
-            for i, info in enumerate(runtime_additional_information):
+        if runtime_infos:
+            for i, info in enumerate(runtime_infos):
                 if i >= len(left_context_size):
                     break
+                if not isinstance(info, dict):
+                    continue
                 meta = info.get("meta", {})
                 if "left_context_size" in meta:
                     left_context_size[i] = meta["left_context_size"]
         for i, req_ids in enumerate(request_ids_list):
+            runtime_info = runtime_infos[i] if i < len(runtime_infos) else None
+            req_ids = _codec_ids_from_payload_or_input(req_ids, runtime_info)
             if req_ids.numel() < 1:
                 parsed.append((0, 0))
                 continue
@@ -581,35 +657,15 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
-                if (
-                    codec_chunk_frames > 0
-                    and codec_left_context_frames > 0
-                    and self._decoder_sliding_window
-                    and codec_left_context_frames < self._decoder_sliding_window
-                ):
-                    logger.warning(
-                        "Qwen3-TTS streaming codec_left_context_frames=%d "
-                        "is smaller than decoder sliding_window=%d; "
-                        "chunk-boundary distortion may occur. "
-                        "Increase codec_left_context_frames to at least "
-                        "%d for streaming.",
-                        codec_left_context_frames,
-                        self._decoder_sliding_window,
-                        self._decoder_sliding_window,
-                    )
-
-                self.decoder.enable_cudagraph(
-                    capture_sizes=decode_cudagraph_capture_sizes,
-                    capture_batch_sizes=decode_cudagraph_batch_sizes,
-                    extra_capture_shapes=decode_cudagraph_extra_capture_shapes,
-                    compile_shapes=decode_compile_shapes,
+                self._maybe_enable_decoder_cudagraph(
                     device=device,
                     codec_chunk_frames=codec_chunk_frames,
                     codec_left_context_frames=codec_left_context_frames,
-                    decode_chunk_size=self._decode_chunk_frames,
-                    decode_left_context=self._decode_left_context_frames,
+                    decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
+                    decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
+                    decode_cudagraph_extra_capture_shapes=decode_cudagraph_extra_capture_shapes,
+                    decode_compile_shapes=decode_compile_shapes,
                 )
-                logger.info("Code2Wav decoder CUDA Graph enabled")
             except Exception:
                 logger.warning(
                     "Failed to enable CUDA Graph for Code2Wav decoder",
