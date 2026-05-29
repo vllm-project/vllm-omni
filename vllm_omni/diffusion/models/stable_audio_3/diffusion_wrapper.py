@@ -30,6 +30,11 @@ from typing import Any
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.models.stable_audio_3.distribution_shift import (
+    LogSNRShift,
+    create_dist_shift,
+)
+
 
 class ConditionedDiffusionModelWrapper(nn.Module):
     """Top-level diffusion module: routes raw conditioning into DiT.
@@ -77,11 +82,16 @@ class ConditionedDiffusionModelWrapper(nn.Module):
 
         # Distribution-shift schedulers
         # PORT_FROM: diffusion.py:64-79 + inference/distribution_shift.py
-        self.dist_shift = None
-        self.sampling_dist_shift = None
-        # TODO(stable-audio-3): init dist_shift from options dicts
-        # via _create_dist_shift helper. Default sampling_dist_shift =
-        # LogSNRShift(rate=0, anchor_logsnr=-6.2, logsnr_end=2.0)
+        self.dist_shift = (
+            create_dist_shift(distribution_shift_options)
+            if distribution_shift_options is not None
+            else None
+        )
+        if sampling_distribution_shift_options is not None:
+            self.sampling_dist_shift = create_dist_shift(sampling_distribution_shift_options)
+        else:
+            # Default matches upstream legacy log_snr_sampling=True.
+            self.sampling_dist_shift = LogSNRShift(rate=0, anchor_logsnr=-6.2, logsnr_end=2.0)
 
     def get_conditioning_inputs(
         self,
