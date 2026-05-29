@@ -96,7 +96,6 @@ class WanEulerScheduler:
         self,
         num_inference_steps: int,
         device: torch.device | str | int | None = None,
-        sigma_start: float = 1.0,
         **kwargs,  # noqa: ARG002 - kept for scheduler API compatibility
     ) -> None:
         timesteps = _get_timesteps(
@@ -108,12 +107,6 @@ class WanEulerScheduler:
             device=device or self.device,
         )
         self.set_shift(self._shift)
-        # scale shifted sigmas so step 0 lands at sigma_start
-        if sigma_start != 1.0:
-            if not 0.0 < sigma_start <= 1.0:
-                raise ValueError(f"sigma_start must be in (0, 1], got {sigma_start}")
-            self.sigmas = self.sigmas * float(sigma_start)
-            self.timesteps = self.sigmas[:-1] * self.num_train_timesteps
         self._step_index = None
         self._begin_index = None
 
