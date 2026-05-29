@@ -614,6 +614,23 @@ class TestSingleStageInitialization:
 
         runtime._validate_single_stage_mode_replica_constraints()
 
+    def test_validate_single_stage_mode_does_not_swallow_num_replica_validation_errors(self):
+        class RuntimeConfig:
+            @property
+            def num_replicas(self):
+                return 1
+
+            @num_replicas.setter
+            def num_replicas(self, value):
+                raise ValueError("invalid num_replicas")
+
+        stage_cfg = _make_stage_cfg(0, stage_type="llm")
+        stage_cfg.runtime = RuntimeConfig()
+        runtime = self._build_runtime([stage_cfg], stage_id_filter=0)
+
+        with pytest.raises(ValueError, match="invalid num_replicas"):
+            runtime._validate_single_stage_mode_replica_constraints()
+
     def test_build_logical_stage_init_plans_preserves_diffusion_runtime_cfg_in_single_stage_mode(
         self, mocker: MockerFixture
     ):

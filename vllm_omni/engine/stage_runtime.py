@@ -760,13 +760,10 @@ class DistStageRuntime(StageRuntime):
             if stage_id == target_stage_id:
                 try:
                     runtime_cfg.num_replicas = self._omni_dp_size_local
-                except Exception:
+                except (AttributeError, TypeError):
                     if hasattr(runtime_cfg, "__setitem__"):
-                        try:
-                            runtime_cfg["num_replicas"] = self._omni_dp_size_local
-                            continue
-                        except Exception:
-                            pass
+                        runtime_cfg["num_replicas"] = self._omni_dp_size_local
+                        continue
                     logger.warning(
                         "[DistStageRuntime] Failed to apply omni_dp_size_local=%s to stage %s runtime config",
                         self._omni_dp_size_local,
