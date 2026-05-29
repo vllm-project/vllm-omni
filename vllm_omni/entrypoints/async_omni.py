@@ -27,7 +27,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
-from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.entrypoints.client_request_state import AsyncClientRequestState
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
@@ -134,6 +134,8 @@ class AsyncOmni(EngineClient, OmniBase):
         ... ):
         ...     print(output)
     """
+
+    request_states: dict[str, AsyncClientRequestState]
 
     def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
@@ -302,7 +304,7 @@ class AsyncOmni(EngineClient, OmniBase):
                 wall_start_ts,
                 final_stage_id_for_e2e,
             )
-            req_state = ClientRequestState(request_id)
+            req_state = AsyncClientRequestState(request_id)
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
 
