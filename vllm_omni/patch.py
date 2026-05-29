@@ -96,6 +96,45 @@ except ImportError:
     # GlmImageTextConfig not available, skip patching
     pass
 
+# Widen vLLM's KimiAudioTokenizer.encode allowed_special set so prompts
+# carrying kimia_speech_ct_id / kimia_speech_ctd_id are accepted. The
+# upstream set omits these conditioning markers; Kimi-Audio QA prompts
+# need ctd to produce non-noisy audio.
+try:
+    from vllm.tokenizers.kimi_audio import KimiAudioTokenizer as _KimiAudioTokenizer
+
+    _KIMI_ALLOWED_SPECIAL = frozenset(
+        {
+            "<|im_media_begin|>",
+            "<|im_media_end|>",
+            "<|im_kimia_text_blank|>",
+            "<|im_kimia_text_eos|>",
+            "<|im_msg_end|>",
+            "<|im_kimia_user_msg_start|>",
+            "<|im_kimia_assistant_msg_start|>",
+            "<|im_kimia_speech_ct_id|>",
+            "<|im_kimia_speech_ctd_id|>",
+        }
+    )
+
+    def _kimi_audio_encode(
+        self,
+        text,
+        truncation=None,
+        max_length=None,
+        add_special_tokens=True,
+        **kwargs,
+    ):
+        del add_special_tokens
+        tokens = self._tokenizer.encode(text, allowed_special=_KIMI_ALLOWED_SPECIAL)
+        if truncation:
+            tokens = self._maybe_truncate(tokens, max_length)
+        return tokens
+
+    _KimiAudioTokenizer.encode = _kimi_audio_encode
+except ImportError:
+    pass
+
 # Extend RequestStatus enum with omni-specific statuses
 if not hasattr(RequestStatus, "WAITING_FOR_CHUNK"):
     # The value - 1 is intentionally chosen to ensure it is treated

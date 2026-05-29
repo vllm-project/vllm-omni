@@ -227,6 +227,22 @@ _OMNI_MODELS = {
         "dynin_omni",
         "DyninOmniForConditionalGeneration",
     ),
+    ## Kimi-Audio-7B
+    "KimiAudioForConditionalGeneration": (
+        "kimi_audio",
+        "kimi_audio",
+        "KimiAudioForConditionalGeneration",
+    ),
+    "KimiAudioThinkerForConditionalGeneration": (
+        "kimi_audio",
+        "kimi_audio_thinker",
+        "KimiAudioFusedThinker",
+    ),
+    "KimiAudioCode2Wav": (
+        "kimi_audio",
+        "kimi_audio_code2wav",
+        "KimiAudioCode2Wav",
+    ),
     ## Ming-flash-omni-2.0
     "MingFlashOmniForConditionalGeneration": (
         "ming_flash_omni",

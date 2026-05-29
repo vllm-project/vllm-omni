@@ -1,0 +1,73 @@
+# Kimi-Audio-7B deploy: 2-stage fused thinker → code2wav.
+#
+# Single-GPU sync default. Both stages pin to cuda:0; stage 0 holds
+# 0.55 GPU memory util so stage 1 (code2wav vocoder) fits alongside it.
+# Stage 1 reads the full token sequence from stage 0 via the
+# ``kimi2code2wav`` input processor.
+#
+# For multi-GPU async-chunk streaming, set ``async_chunk: true``,
+# move stage 1 to ``devices: "1"``, raise stage 0's
+# ``gpu_memory_utilization`` (e.g. 0.85), drop the ``input_processor``
+# on stage 1, and add a SharedMemoryConnector under ``connectors:``
+# wired stage 0 ``to_stage_1`` → stage 1 ``from_stage_0``.
+# See the recipe for the full snippet.
+#
+# For audio-only-in tasks (audio2text), the MIMO branch still loads
+# but is unused at inference time. To save ~4 GB of weights, override
+# ``hf_overrides.kimia_generate_audio: false`` via the serve CLI.
+#
+# enforce_eager=true:
+#   * Stage 0 (fused thinker) — MIMO branch hook on layer N requires eager
+#     forward (vLLM's CUDA Graph capture would skip the hook).
+#   * Stage 1 (code2wav) — outer generation loop is cudagraph-incompatible
+#     (Python-orchestrated). The fixed-shape inner ``vocoder.decode_mel`` IS
+#     captured separately by ``KimiAudioCudaGraphDecoderWrapper`` whenever
+#     ``connectors.<...>.extra.codec_chunk_frames`` is set (async-chunk mode).
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.55
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    tokenizer_mode: kimi_audio
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    devices: "0"
+    hf_overrides:
+      kimia_generate_audio: true
+    default_sampling_params:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.30
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    tokenizer_mode: kimi_audio
+    # max_model_len capped to keep vLLM's profile_run within the
+    # FM detokenizer's 900-token KV-cache budget. Bumping past ~2k
+    # makes profile_run feed dummy codes through the chunked
+    # detokenize loop and overflow ``reserve_kv_cache_tokens``.
+    max_model_len: 2048
+    max_num_batched_tokens: 2048
+    async_scheduling: false
+    devices: "0"
+    input_processor: kimi2code2wav
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: false

@@ -28,6 +28,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "MingFlashOmniConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "Qwen3VLMoeVisionConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "WhisperEncoderConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
+    "WhisperVQConfig": "vllm_omni.transformers_utils.configs.glm4_voice",
 }
 
 __all__ = [
@@ -49,6 +50,7 @@ __all__ = [
     "MingFlashOmniConfig",
     "Qwen3VLMoeVisionConfig",
     "WhisperEncoderConfig",
+    "WhisperVQConfig",
 ]
 
 
