@@ -27,7 +27,7 @@ from tests.e2e.accuracy.helpers import (
     download_images,
     model_output_dir,
 )
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.runtime import OmniRunner, OmniServer
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens, resolve_stop_token_ids
 
@@ -150,6 +150,80 @@ _DEPLOY_CONFIG = {
 }
 # fmt: on
 
+# fmt: off
+_NPU_DEPLOY_CONFIG = {
+    "pipeline": "hunyuan_image_3_moe",
+    "async_chunk": False,
+    "trust_remote_code": True,
+    "connectors": {
+        "yuanrong_te_connector": {
+            "name": "YuanrongTransferEngineConnector",
+            "extra": {
+                "host": "auto",
+                "zmq_port": 50051,
+                "rpc_port": "auto",
+                "protocol": "ascend",
+                "device_name": "auto",
+                "memory_pool_size": 1073741824,
+                "memory_pool_device": "npu",
+            },
+        },
+    },
+    "stages": [
+        {
+            "stage_id": 0,
+            "is_comprehension": True,
+            "final_output": True,
+            "final_output_type": "text",
+            "max_num_seqs": 1,
+            "gpu_memory_utilization": 0.8,
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "max_num_batched_tokens": 8192,
+            "devices": "0,1,2,3",
+            "tensor_parallel_size": 4,
+            "hf_overrides": {
+                "rope_parameters": {"mrope_section": [0, 32, 32], "rope_type": "default"},
+            },
+            "omni_kv_config": {"need_send_cache": True},
+            "output_connectors": {"to_stage_1": "yuanrong_te_connector"},
+            "default_sampling_params": {
+                "temperature": 0.0,
+                "top_p": 1,
+                "top_k": -1,
+                "max_tokens": 8192,
+                "stop_token_ids": [128025],
+                "detokenize": True,
+                "skip_special_tokens": False,
+            },
+        },
+        {
+            "stage_id": 1,
+            "max_num_seqs": 1,
+            "gpu_memory_utilization": 0.65,
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "devices": "4,5,6,7",
+            "distributed_executor_backend": "mp",
+            "max_num_batched_tokens": 8192,
+            "omni_kv_config": {"need_recv_cache": True},
+            "parallel_config": {
+                "tensor_parallel_size": 4,
+                "enable_expert_parallel": False,
+                "sequence_parallel_size": 1,
+                "ulysses_degree": 1,
+            },
+            "input_connectors": {"from_stage_0": "yuanrong_te_connector"},
+            "default_sampling_params": {
+                "num_inference_steps": NUM_INFERENCE_STEPS,
+                "guidance_scale": GUIDANCE_SCALE,
+            },
+        },
+    ],
+    "edges": [{"from": 0, "to": 1, "window_size": -1, "max_inflight": 1}],
+}
+# fmt: on
+
 _QUANT_DIT_CONFIG = {
     "pipeline": "hunyuan_image_3_moe",
     "async_chunk": False,
@@ -222,6 +296,10 @@ def _make_config(enable_kv_reuse: bool, path: Path) -> None:
     config["stages"][0]["omni_kv_config"] = {"need_send_cache": enable_kv_reuse}
     config["stages"][1]["omni_kv_config"] = {"need_recv_cache": enable_kv_reuse}
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+
+
+def _make_npu_config(path: Path) -> None:
+    path.write_text(yaml.dump(_NPU_DEPLOY_CONFIG, default_flow_style=False, sort_keys=False))
 
 
 def _quant_devices() -> str:
@@ -412,6 +490,71 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path, accuracy_
     assert ssim_value >= THRESHOLDS["ssim"], f"[ONLINE] SSIM {ssim_value:.4f} below threshold {THRESHOLDS['ssim']}"
     assert psnr_value >= THRESHOLDS["psnr"], (
         f"[ONLINE] PSNR {psnr_value:.2f} dB below threshold {THRESHOLDS['psnr']} dB"
+    )
+
+
+NPU_HUNYUAN_IMAGE3_MARKS = hardware_marks(res={"npu": "A2"}, num_cards=8)
+
+
+@pytest.mark.parametrize(
+    "case_name,runner",
+    [
+        pytest.param("offline", _run_offline, id="npu_offline", marks=NPU_HUNYUAN_IMAGE3_MARKS),
+        pytest.param("online", _run_online, id="npu_online", marks=NPU_HUNYUAN_IMAGE3_MARKS),
+    ],
+)
+@pytest.mark.skipif(torch.accelerator.device_count() < 8, reason="Needs 8+ NPUs (4 AR + 4 DiT)")
+def test_image_to_image_alignment_npu(
+    case_name: str,
+    runner,
+    accuracy_artifact_root: Path,
+    accuracy_assets_root: Path,
+) -> None:
+    if importlib.util.find_spec("FlagEmbedding") is None:
+        raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
+    from tabulate import tabulate
+
+    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + f"-npu-{case_name}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        _make_npu_config(tmp / "npu.yaml")
+        npu_image, npu_cot, _ = runner(str(tmp / "npu.yaml"), output_dir)
+
+    npu_cot = npu_cot.lstrip("\n")
+    scorer = SemanticSimilarityScorer()
+    clip_scorer = CLIPScorer()
+    cot_results = scorer.text_similarity(npu_cot, COT_REF)
+    image_ref = Image.open(str(accuracy_assets_root / "hunyuan_image_ref.png")).convert("RGB")
+    image_clip_score = clip_scorer.image_image_score(npu_image, image_ref)
+    ssim_value, psnr_value = compute_image_ssim_psnr(prediction=npu_image, reference=image_ref, compare_mode="RGB")
+
+    table = [
+        ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", 0.9644],
+        ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", 29],
+        ["Image-Image similarity", f"{image_clip_score:.4f}", 94.5538],
+        ["SSIM", f"{ssim_value:.4f}", 0.242],
+        ["PSNR (dB)", f"{psnr_value:.2f}", 14.1],
+    ]
+    print(f"[NPU][{case_name}] " + tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
+
+    assert cot_results["cot_semantic_sim"] >= THRESHOLDS["cot_semantic_sim"], (
+        f"[NPU][{case_name}] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} "
+        f"below threshold {THRESHOLDS['cot_semantic_sim']}"
+    )
+    assert cot_results["text_prefix_match_count"] >= THRESHOLDS["text_prefix_match"], (
+        f"[NPU][{case_name}] COT prefix match {cot_results['text_prefix_match_count']} "
+        f"below threshold {THRESHOLDS['text_prefix_match']}"
+    )
+    assert image_clip_score >= THRESHOLDS["clip_score"], (
+        f"[NPU][{case_name}] Image-Image similarity {image_clip_score:.4f} "
+        f"below threshold {THRESHOLDS['clip_score']}"
+    )
+    assert ssim_value >= THRESHOLDS["ssim"], (
+        f"[NPU][{case_name}] SSIM {ssim_value:.4f} below threshold {THRESHOLDS['ssim']}"
+    )
+    assert psnr_value >= THRESHOLDS["psnr"], (
+        f"[NPU][{case_name}] PSNR {psnr_value:.2f} dB below threshold {THRESHOLDS['psnr']} dB"
     )
 
 
