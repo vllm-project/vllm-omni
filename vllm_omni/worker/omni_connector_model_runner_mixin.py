@@ -1245,9 +1245,7 @@ class OmniConnectorModelRunnerMixin:
         if self._kv_transfer_manager is None:
             return False
 
-        request_id = getattr(req, "request_id", None) or (
-            req.request_ids[0] if hasattr(req, "request_ids") and req.request_ids else None
-        )
+        request_id = getattr(req, "request_id", None)
         if not request_id:
             logger.warning("Request has no ID, cannot receive KV cache")
             return False

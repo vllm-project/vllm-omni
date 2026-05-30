@@ -660,8 +660,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _estimate_prompt_len(self, tts_params: dict[str, Any]) -> int:
         """Estimate prompt length so the placeholder matches model-side embeddings."""
         try:
-            from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
-                Qwen3TTSTalkerForConditionalGeneration,
+            from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+                Qwen3TTSPromptEmbedsBuilder,
             )
 
             if self._tts_tokenizer is None:
@@ -676,7 +676,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             hf_config = self.engine_client.model_config.hf_config
             talker_config = hf_config.talker_config
             task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
-            return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+            return Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
                 additional_information=tts_params,
                 task_type=task_type,
                 tokenize_prompt=lambda t: self._tts_tokenizer(t, padding=False)["input_ids"],
@@ -2813,19 +2813,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request.input[:50] + "..." if len(request.input) > 50 else request.input,
                 "ref_audio" in prompt,
             )
-
+            if request.extra_params is not None and not isinstance(request.extra_params, dict):
+                raise ValueError("extra_params must be a JSON object/dict.")
+            extra = dict(request.extra_params or {})
+            if request.seed is not None:
+                extra["seed"] = request.seed
             # Apply extra_params from the request to sampling params
             sampling_params_list = self._diffusion_engine.default_sampling_params_list
-            if request.extra_params is not None:
-                if not isinstance(request.extra_params, dict):
-                    raise ValueError("extra_params must be a JSON object/dict.")
+            if extra:
                 import copy
 
                 sampling_params_list = copy.deepcopy(sampling_params_list)
                 if sampling_params_list[0].extra_args is None:
                     sampling_params_list[0].extra_args = {}
-                sampling_params_list[0].extra_args.update(request.extra_params)
-                logger.info("Applied extra_params to diffusion: %s", request.extra_params)
+                sampling_params_list[0].extra_args.update(extra)
+                logger.info("Applied extra_params to diffusion: %s", extra)
 
             generator = self._diffusion_engine.generate(
                 prompt=prompt,

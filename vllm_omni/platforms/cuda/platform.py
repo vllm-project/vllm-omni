@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
+
 import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -129,6 +131,22 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                     logger.warning("Flash Attention packages not available. Falling back to TORCH_SDPA backend.")
                 logger.debug("Defaulting to diffusion attention backend SDPA")
                 return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
+            if backend_upper == "SAGE_ATTN_3":
+                sage_attn3_supported = compute_capability is not None and compute_capability.major >= 10
+                if not sage_attn3_supported:
+                    logger.warning(
+                        "SageAttention3 requires a Blackwell-class GPU with compute capability >= 10.0. "
+                        "Falling back to TORCH_SDPA backend."
+                    )
+                    return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
+                try:
+                    importlib.import_module("sageattn3")
+                except ImportError:
+                    logger.warning(
+                        "SageAttention3 package not available. Install it from "
+                        "SageAttention/sageattention3_blackwell. Falling back to TORCH_SDPA backend."
+                    )
+                    return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
