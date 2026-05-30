@@ -301,13 +301,6 @@ def _make_npu_config(path: Path) -> None:
     path.write_text(yaml.dump(_NPU_DEPLOY_CONFIG, default_flow_style=False, sort_keys=False))
 
 
-def _resize_reference_for_pixel_metrics(prediction: Image.Image, reference: Image.Image) -> Image.Image:
-    if prediction.size == reference.size:
-        return reference
-    print(f"[NPU] Resize reference for pixel metrics from {reference.size} to {prediction.size}.")
-    return reference.resize(prediction.size, Image.Resampling.LANCZOS)
-
-
 def _quant_devices() -> str:
     return os.environ.get("HUNYUAN_IMAGE3_QUANT_DEVICES", "0,1")
 
@@ -531,8 +524,7 @@ def test_image_to_image_alignment_npu(
     cot_results = scorer.text_similarity(npu_cot, COT_REF)
     image_ref = Image.open(str(accuracy_assets_root / "hunyuan_image_ref.png")).convert("RGB")
     image_clip_score = clip_scorer.image_image_score(npu_image, image_ref)
-    pixel_ref = _resize_reference_for_pixel_metrics(npu_image, image_ref)
-    ssim_value, psnr_value = compute_image_ssim_psnr(prediction=npu_image, reference=pixel_ref, compare_mode="RGB")
+    ssim_value, psnr_value = compute_image_ssim_psnr(prediction=npu_image, reference=image_ref, compare_mode="RGB")
 
     table = [
         ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", THRESHOLDS["cot_semantic_sim"]],
