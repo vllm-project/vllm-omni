@@ -129,7 +129,7 @@ The following tables show which models support each feature:
 | **Qwen-Image-Edit**      |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Qwen-Image-Edit-2509** |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |        ✅ (decode)         |          ✅           |       ❌        |        ❌         |
 | **Qwen-Image-Layered**   |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
-| **SenseNova-U1**         |     ❌     |     ❌      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
+| **SenseNova-U1**         |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Stable-Diffusion3.5**  |     ❌     |     ✅      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Z-Image**              |     ✅     |     ✅      |           ✅           |       ❓        |   ✅ (TP=2 only)   |          ❌          |   ✅    |             ❌             |      ✅ (decode)      |       ✅        |        ❌         |
 | **ERNIE-Image**          |     ❌     |     ✅      |           ✅           |       ❓        |         ✅         |          ❌          |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
@@ -147,7 +147,7 @@ The following tables show which models support each feature:
 | **LTX-2**                    |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **LTX-2.3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Helios**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
-| **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ❌           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ✅        |        ❌         |
+| **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **DreamID-Omni**             |     ❌     |     ❌      |           ❌           |       ✅        |         ❌         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 
 **Frame Interpolation Support**
