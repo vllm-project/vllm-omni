@@ -229,7 +229,7 @@ def main():
 
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
+    autoregressive_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
@@ -241,7 +241,7 @@ def main():
                 sp.height = args.height
                 sp.width = args.width
         elif hasattr(sp, "stop_token_ids"):
-            sp.stop_token_ids = ar_stop_token_ids
+            sp.stop_token_ids = autoregressive_stop_token_ids
 
     print(f"\n{'=' * 60}")
     print("HunyuanImage-3.0 Generation Configuration:")
