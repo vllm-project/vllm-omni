@@ -678,6 +678,16 @@ class HunyuanImage3Pipeline(
 
     @staticmethod
     def build_batch_rope_image_info(output, sections):
+        if output.all_image_slices is None:
+            return []
+        if len(sections) == 1 and len(output.all_image_slices) > 1:
+            sections = sections * len(output.all_image_slices)
+        if len(output.all_image_slices) != len(sections):
+            raise ValueError(
+                "RoPE metadata batch size mismatch: "
+                f"{len(output.all_image_slices)} image-slice entries but {len(sections)} section entries."
+            )
+
         rope_image_info = []
         for image_slices, sections_i in zip(output.all_image_slices, sections):
             image_shapes = []
@@ -697,6 +707,22 @@ class HunyuanImage3Pipeline(
             rope_image_info.append(list(zip(image_slices, image_shapes)))
         return rope_image_info
 
+    @staticmethod
+    def _expand_rope_batch(
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        target_batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cos.shape[0] == target_batch_size:
+            return cos, sin
+        if cos.shape[0] != 1:
+            raise ValueError(
+                "RoPE batch size mismatch: "
+                f"got {cos.shape[0]} RoPE rows for {target_batch_size} token rows."
+            )
+        repeat_shape = [target_batch_size] + [1] * (cos.ndim - 1)
+        return cos.repeat(*repeat_shape), sin.repeat(*repeat_shape)
+
     def _apply_mixfusion_rope_positions(
         self,
         cos: torch.Tensor,
@@ -708,6 +734,11 @@ class HunyuanImage3Pipeline(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if len(original_image_infos) != len(plan.layouts):
             raise ValueError(f"Expected {len(plan.layouts)} original image infos, got {len(original_image_infos)}.")
+        if len(gen_image_slices) != cos.shape[0]:
+            raise ValueError(
+                "MixFusion RoPE metadata batch size mismatch: "
+                f"{len(gen_image_slices)} image-slice rows but {cos.shape[0]} RoPE rows."
+            )
 
         cfg_factor = cos.shape[0] // plan.chunk_count
         if cos.shape[0] % plan.chunk_count != 0:
@@ -1044,6 +1075,7 @@ class HunyuanImage3Pipeline(
             device=device,
             base=self.config.rope_theta,
         )
+        cos, sin = self._expand_rope_batch(cos, sin, output.tokens.shape[0])
         mixfusion_sequence_plan = kwargs.pop("mixfusion_sequence_plan", None)
         mixfusion_original_image_infos = kwargs.pop("mixfusion_original_image_infos", None)
         if mixfusion_sequence_plan is not None:
