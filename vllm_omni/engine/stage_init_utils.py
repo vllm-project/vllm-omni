@@ -712,18 +712,17 @@ def build_engine_args_dict(
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Build the normalized engine args dict for one stage."""
-    engine_args = stage_config.engine_args
+    engine_args_dict = _to_dict(stage_config.engine_args)
     # HACK (Alex) Tensor parallel size should not be passed as None;
     # remove it if this is the case so that we fall back to default
     # creation from vLLM's engine args.
     # NOTE: This will be fixed more generically in ongoing work for engine arg filtering.
-    if "tensor_parallel_size" in engine_args and engine_args["tensor_parallel_size"] is None:
-        del engine_args["tensor_parallel_size"]
+    if "tensor_parallel_size" in engine_args_dict and engine_args_dict["tensor_parallel_size"] is None:
+        del engine_args_dict["tensor_parallel_size"]
 
     stage_type = getattr(stage_config, "stage_type", "llm")
     stage_id = stage_config.stage_id
 
-    engine_args_dict = _to_dict(engine_args)
     stage_defines_tokenizer = (
         engine_args_dict.get("tokenizer") is not None or engine_args_dict.get("tokenizer_subdir") is not None
     )
