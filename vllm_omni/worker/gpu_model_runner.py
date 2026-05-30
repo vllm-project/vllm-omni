@@ -1765,7 +1765,12 @@ class OmniGPUModelRunner(GPUModelRunner):
             if key in gpu_keys:
                 dest[key] = value.detach().clone()
             else:
-                dest[key] = value.detach().to("cpu").contiguous()
+                t = value.detach()
+                if t.is_cuda:
+                    dest[key] = t.to("cpu").contiguous()
+                else:
+                    # If the tensor is already on the CPU, there is no need to unload it to the CPU.
+                    dest[key] = t.contiguous()
         elif isinstance(value, list):
             dest[key] = [
                 (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in value
