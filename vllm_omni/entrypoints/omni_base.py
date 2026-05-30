@@ -282,6 +282,22 @@ class OmniBase(PDDisaggregationMixin):
             raise ValueError(f"Expected {self.num_stages} sampling params, got {len(normalized)}")
         return normalized
 
+    def _fire_failure_counter_if_alive(self, request_id: str) -> None:
+        """Fire the abort/exception bucket of requests_success_total.
+
+        Called from cancel / exception paths in async_omni.generate() BEFORE
+        _abort_internal_requests pops request_states — that method resolves
+        the internal id by dict lookup, so popping first would no-op it. We
+        keep this counter fire separate from _log_summary_and_cleanup (which
+        pops) so the abort path can still find the state to clean up.
+        """
+        req_state = self.request_states.get(request_id)
+        prom = getattr(self, "prom_metrics", None)
+        if req_state is None or req_state.metrics is None or prom is None:
+            return
+        if str(request_id) not in req_state.metrics.e2e_done:
+            prom.request_failed()
+
     def _log_summary_and_cleanup(self, request_id: str) -> None:
         req_state = self.request_states.get(request_id)
         try:
