@@ -20,7 +20,7 @@ def _streaming_context() -> SimpleNamespace:
 
 
 def test_get_streaming_talker_tokens_first_segment(_streaming_context: SimpleNamespace) -> None:
-    inc_p, inc_o, merged, thinker_in = q3._get_streaming_talker_tokens(
+    inc_p, inc_o = q3._get_streaming_talker_tokens(
         "r1",
         [1, 2],
         [10, 11],
@@ -28,13 +28,11 @@ def test_get_streaming_talker_tokens_first_segment(_streaming_context: SimpleNam
     )
     assert inc_p == [1, 2]
     assert inc_o == [10, 11]
-    assert merged == [1, 2, 10, 11]
-    assert thinker_in == [1, 2]
 
 
 def test_get_streaming_talker_tokens_second_segment_accumulates(_streaming_context: SimpleNamespace) -> None:
     q3._get_streaming_talker_tokens("r2", [1, 2], [10, 11], streaming_context=_streaming_context)
-    inc_p, inc_o, merged, thinker_in = q3._get_streaming_talker_tokens(
+    inc_p, inc_o = q3._get_streaming_talker_tokens(
         "r2",
         [1, 2, 3, 4],
         [10, 11, 12, 13],
@@ -42,14 +40,12 @@ def test_get_streaming_talker_tokens_second_segment_accumulates(_streaming_conte
     )
     assert inc_p == [3, 4]
     assert inc_o == [12, 13]
-    assert merged == [1, 2, 10, 3, 4, 12, 13]
-    assert thinker_in == [1, 2, 10, 3, 4]
 
 
 def test_get_streaming_talker_tokens_new_prompt_len_snapshot_truncates(
     _streaming_context: SimpleNamespace,
 ) -> None:
-    inc_p, inc_o, merged, thinker_in = q3._get_streaming_talker_tokens(
+    inc_p, inc_o = q3._get_streaming_talker_tokens(
         "r3",
         [1, 2, 3, 4, 5, 6],
         [10],
@@ -58,8 +54,6 @@ def test_get_streaming_talker_tokens_new_prompt_len_snapshot_truncates(
     )
     assert inc_p == [1, 2, 3, 4]
     assert inc_o == [10]
-    assert merged == [1, 2, 3, 4, 10]
-    assert thinker_in == [1, 2, 3, 4]
 
 
 def test_get_streaming_talker_tokens_clear_state(_streaming_context: SimpleNamespace) -> None:

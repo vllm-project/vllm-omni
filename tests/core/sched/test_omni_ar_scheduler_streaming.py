@@ -25,6 +25,7 @@ def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=stage_id))
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
+    sched.chunk_transfer_adapter = None
     return sched
 
 

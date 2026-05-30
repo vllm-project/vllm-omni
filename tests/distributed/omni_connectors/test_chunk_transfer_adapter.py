@@ -277,13 +277,19 @@ def test_send_single_request_struct_preserves_segment_finished(build_adapter, mo
     assert sent_payload.meta.is_segment_finished.item() is True
 
 
-def test_save_async_resets_dedup_for_resumable_new_segment(build_adapter):
+def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
     request.resumable = True
     request.num_computed_tokens = 0
     adapter.requests_num_chunks_sent["ext-stream"] = 111
 
+    adapter.save_async(pooling_output=None, request=request, is_segment_finished=False)
+
+    assert len(adapter._pending_save_reqs) == 0
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 111
+
+    adapter.requests_num_chunks_sent.pop("ext-stream")
     adapter.save_async(pooling_output=None, request=request, is_segment_finished=False)
 
     assert len(adapter._pending_save_reqs) == 1
