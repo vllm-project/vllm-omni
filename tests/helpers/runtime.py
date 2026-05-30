@@ -2147,8 +2147,8 @@ class OmniRunner:
         _cache = self._prompt_len_estimate_cache
         try:
             from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
-            from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
-                Qwen3TTSTalkerForConditionalGeneration,
+            from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+                Qwen3TTSPromptEmbedsBuilder,
             )
 
             if model_name not in _cache:
@@ -2160,7 +2160,7 @@ class OmniRunner:
 
             tok, tcfg = _cache[model_name]
             task_type = (additional_information.get("task_type") or ["CustomVoice"])[0]
-            return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+            return Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
                 additional_information=additional_information,
                 task_type=task_type,
                 tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],
