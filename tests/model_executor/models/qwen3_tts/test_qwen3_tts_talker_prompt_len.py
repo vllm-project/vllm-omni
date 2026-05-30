@@ -9,8 +9,8 @@ dimension and reports `len(ref_code) == num_codebooks` instead of
 
 import pytest
 
-from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
-    Qwen3TTSTalkerForConditionalGeneration,
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    Qwen3TTSPromptEmbedsBuilder,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -38,7 +38,7 @@ def test_estimate_prompt_len_uses_full_ref_code_length() -> None:
         "language": ["English"],
     }
 
-    est = Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+    est = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
         additional_information=info,
         task_type="Base",
         tokenize_prompt=_fake_tokenize,
@@ -68,7 +68,7 @@ def test_estimate_prompt_len_handles_1d_ref_code() -> None:
         "language": ["English"],
     }
 
-    est = Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+    est = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
         additional_information=info,
         task_type="Base",
         tokenize_prompt=_fake_tokenize,
@@ -104,14 +104,14 @@ def test_estimate_prompt_len_uses_list_of_int_ref_ids_from_voice_clone_prompt() 
             "language": ["English"],
         }
 
-    est_30 = Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+    est_30 = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
         additional_information=make_info(30),
         task_type="Base",
         tokenize_prompt=_fake_tokenize,
         codec_language_id={"english": 0},
         spk_is_dialect=None,
     )
-    est_50 = Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+    est_50 = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
         additional_information=make_info(50),
         task_type="Base",
         tokenize_prompt=_fake_tokenize,
