@@ -30,6 +30,7 @@ from tests.e2e.accuracy.helpers import (
 from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.runtime import OmniRunner, OmniServer
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens, resolve_stop_token_ids
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
 
@@ -316,6 +317,23 @@ def _make_quant_dit_config(path: Path) -> None:
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
+def _apply_offline_it2i_size_overrides(
+    params_list: list[object],
+    prompt: dict,
+    *,
+    height: int,
+    width: int,
+) -> None:
+    prompt["height"] = height
+    prompt["width"] = width
+    prompt["mm_processor_kwargs"] = {"target_h": height, "target_w": width}
+
+    for sp in params_list:
+        if isinstance(sp, OmniDiffusionSamplingParams):
+            sp.height = height
+            sp.width = width
+
+
 def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
     from transformers import AutoTokenizer
 
@@ -352,11 +370,10 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
                 "prompt": PROMPT,
                 "use_system_prompt": system_prompt_type,
                 "modalities": ["image"],
-                "height": 720,
-                "width": 1280,
                 "multi_modal_data": {"image": images},
             }
         ]
+        _apply_offline_it2i_size_overrides(params_list, prompts[0], height=720, width=1280)
         t0 = time.perf_counter()
         outputs = list(runner.omni.generate(prompts=prompts, sampling_params_list=params_list))
         elapsed = time.perf_counter() - t0
@@ -612,6 +629,27 @@ def _run_dit_model(
                 os.environ["VLLM_NVFP4_GEMM_BACKEND"] = old_backend
         gc.collect()
         _empty_accelerator_cache()
+
+
+def test_offline_it2i_size_overrides_align_with_online() -> None:
+    from types import SimpleNamespace
+
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    ar_params = SimpleNamespace(extra_args={}, stop_token_ids=[])
+    dit_params = OmniDiffusionSamplingParams()
+    unrelated_params = SimpleNamespace(extra_args={})
+    prompt = {"prompt": PROMPT}
+
+    _apply_offline_it2i_size_overrides([ar_params, dit_params, unrelated_params], prompt, height=720, width=1280)
+
+    assert prompt["height"] == 720
+    assert prompt["width"] == 1280
+    assert prompt["mm_processor_kwargs"] == {"target_h": 720, "target_w": 1280}
+    assert ar_params.extra_args == {}
+    assert dit_params.height == 720
+    assert dit_params.width == 1280
+    assert unrelated_params.extra_args == {}
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=8)
