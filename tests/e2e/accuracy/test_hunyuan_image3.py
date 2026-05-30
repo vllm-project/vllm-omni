@@ -352,6 +352,8 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
                 "prompt": PROMPT,
                 "use_system_prompt": system_prompt_type,
                 "modalities": ["image"],
+                "height": 720,
+                "width": 1280,
                 "multi_modal_data": {"image": images},
             }
         ]
