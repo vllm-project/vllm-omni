@@ -2334,12 +2334,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         prompt_token_ids: list[int] | None = None
         system_prompt_type: str | None = None
+        ar_stop_token_ids: list[int] | None = None
         build_kwargs: dict[str, Any] = {}
 
         if bot_task is not None or use_system_prompt is not None or custom_system_prompt is not None:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
                 build_prompt_tokens,
+                resolve_stop_token_ids,
             )
 
             build_kwargs: dict[str, Any] = {
@@ -2355,6 +2357,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # Explicit None from the caller is plain-mode; omitted lets
                 # each task fall back to its default trigger.
                 build_kwargs["bot_task"] = extra_body["bot_task"]
+            ar_stop_token_ids = resolve_stop_token_ids(
+                task=build_kwargs["task"],
+                bot_task=build_kwargs.get("bot_task"),
+                tokenizer=tokenizer,
+            )
             if tokenizer is not None:
                 # Feed segment-tokenized prompt_token_ids so AR matches HF
                 # apply_chat_template byte-for-byte (engine BPE would merge
@@ -2420,6 +2427,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 and hasattr(default_stage_params, "seed")
             ):
                 default_stage_params.seed = seed
+
+            if (
+                comprehension_idx is not None
+                and idx == comprehension_idx
+                and ar_stop_token_ids is not None
+                and hasattr(default_stage_params, "stop_token_ids")
+            ):
+                default_stage_params.stop_token_ids = ar_stop_token_ids
 
             # Inject target_h/w into AR stage for M-RoPE position pre-computation
             # (e.g. GLM-Image). max_tokens comes from deploy YAML.

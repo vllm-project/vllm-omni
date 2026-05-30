@@ -301,6 +301,7 @@ def _make_npu_config(path: Path) -> None:
     content = yaml.dump(_NPU_DEPLOY_CONFIG, default_flow_style=False, sort_keys=False)
     path.write_text(content)
     if save_path := os.environ.get("HUNYUAN_IMAGE3_SAVE_NPU_CONFIG"):
+        print(f"[NPU] Saving generated deploy config to {save_path}")
         Path(save_path).write_text(content)
 
 
