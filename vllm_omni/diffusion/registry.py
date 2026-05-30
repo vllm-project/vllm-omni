@@ -106,6 +106,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2_3_image2video",
         "LTX23ImageToVideoPipeline",
     ),
+    "AceStepPipeline": (
+        "ace_step",
+        "pipeline_ace_step",
+        "AceStepPipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -463,6 +468,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
     "LTX23Pipeline": "get_ltx2_post_process_func",
     "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
+    "AceStepPipeline": "get_ace_step_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
