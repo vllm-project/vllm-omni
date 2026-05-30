@@ -934,6 +934,8 @@ class AsyncOmni(EngineClient, OmniBase):
                         merged.update(item)
                     elif isinstance(item, int):
                         merged.add(item)
+            elif isinstance(result, int):
+                merged.add(result)
         return sorted(merged)
 
     async def pin_lora(self, adapter_id: int) -> bool:
