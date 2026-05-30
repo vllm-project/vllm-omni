@@ -298,7 +298,10 @@ def _make_config(enable_kv_reuse: bool, path: Path) -> None:
 
 
 def _make_npu_config(path: Path) -> None:
-    path.write_text(yaml.dump(_NPU_DEPLOY_CONFIG, default_flow_style=False, sort_keys=False))
+    content = yaml.dump(_NPU_DEPLOY_CONFIG, default_flow_style=False, sort_keys=False)
+    path.write_text(content)
+    if save_path := os.environ.get("HUNYUAN_IMAGE3_SAVE_NPU_CONFIG"):
+        Path(save_path).write_text(content)
 
 
 def _quant_devices() -> str:
