@@ -77,7 +77,7 @@ def test_get_streaming_codec_delta_len_increments_and_finishes(_streaming_contex
 
 
 def test_streaming_input_prefill_chunk_is_cached() -> None:
-    transfer_manager = SimpleNamespace()
+    transfer_manager = SimpleNamespace(_pending_streaming_prefills={})
     request = SimpleNamespace(
         external_req_id="rt-1",
         output_token_ids=[100],

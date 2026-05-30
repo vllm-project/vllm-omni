@@ -108,9 +108,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 break
             # async_chunk: don't schedule placeholder tokens when no new chunk is available.
             if required_tokens <= 0:
-                if self.chunk_transfer_adapter is not None and (
-                    request.request_id in self.chunk_transfer_adapter.finished_requests
-                    or request.request_id in self.chunk_transfer_adapter.segment_finished_requests
+                if self.chunk_transfer_adapter is not None and self.chunk_transfer_adapter.is_done_receiving_chunks(
+                    request.request_id
                 ):
                     self._pending_finish_reqs.append(request)
                 req_index += 1
@@ -160,10 +159,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # async_chunk: wait for the first upstream chunk (don't start with placeholders).
             if self.chunk_transfer_adapter is not None and len(request.prompt_token_ids) == 0:
-                if (
-                    request.request_id in self.chunk_transfer_adapter.finished_requests
-                    or request.request_id in self.chunk_transfer_adapter.segment_finished_requests
-                ):
+                if self.chunk_transfer_adapter.is_done_receiving_chunks(request.request_id):
                     self.waiting.pop_request()
                     self._pending_finish_reqs.append(request)
                     continue
@@ -486,18 +482,13 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = None
             routed_experts = None
 
-            is_segment_finished = False
-
             # Diffusion request: completes in one step; mark finished and free resources
             if (
                 request.status == RequestStatus.FINISHED_STOPPED
                 or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
                 or (
                     self.chunk_transfer_adapter is not None
-                    and (
-                        request.request_id in self.chunk_transfer_adapter.finished_requests
-                        or request.request_id in self.chunk_transfer_adapter.segment_finished_requests
-                    )
+                    and self.chunk_transfer_adapter.is_done_receiving_chunks(request.request_id)
                     and request.num_computed_tokens >= len(request.prompt_token_ids)
                 )
             ):
@@ -515,11 +506,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     routed_experts = model_runner_output.routed_experts_dict[req_id]
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
-                is_segment_finished = True
-                if is_segment_finished and not finished:
-                    adapter = self.chunk_transfer_adapter
-                    if adapter:
-                        adapter.segment_finished_requests.discard(req_id)
+                if not finished:
+                    # for streaming input request only
+                    if self.chunk_transfer_adapter:
+                        self.chunk_transfer_adapter.segment_finished_requests.discard(req_id)
                 if finished:
                     kv_transfer_params = self._free_request(request)
                     if self.chunk_transfer_adapter is not None:
@@ -682,7 +672,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         Do not expend prompt id using update.
         """
-        self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
+        if self.chunk_transfer_adapter:
+            self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
         session._output_token_ids.clear()
         session._all_token_ids.clear()
         new_prompt = update.prompt_token_ids or ()

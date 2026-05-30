@@ -302,15 +302,10 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                 speaker=speaker,
                 language=language,
             )
-            pending_prefills = getattr(transfer_manager, "_pending_streaming_prefills", None)
-            if pending_prefills is None:
-                pending_prefills = {}
-                transfer_manager._pending_streaming_prefills = pending_prefills
-            pending_prefills[request_id] = to_dict(payload)
+            transfer_manager._pending_streaming_prefills[request_id] = to_dict(payload)
             return None
         else:
-            pending_prefills = getattr(transfer_manager, "_pending_streaming_prefills", None)
-            save_payload = pending_prefills.pop(request_id, None) if pending_prefills is not None else None
+            save_payload = transfer_manager._pending_streaming_prefills.pop(request_id, None)
             if save_payload is not None:
                 saved_prefill = save_payload.get("embed", {}).get("prefill")
                 saved_output = save_payload.get("hidden_states", {}).get("output")

@@ -65,6 +65,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks = set()
         self.requests_origin_status = {}
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
+        self._pending_streaming_prefills: dict[str, dict] = {}
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -145,9 +146,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             is_segment_finished: whether the segment of request is finished
         """
         is_finished = request.is_finished() and not request.resumable
-        # A fully finished request also finishes the current streaming segment;
-        # the inverse is not true.
-        is_segment_finished = is_segment_finished or is_finished
 
         confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
 
@@ -298,7 +296,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
 
         if payload_data is None:
-            return
+            if not (is_segment_finished or is_finished):
+                return
+            # Segment/request finish markers must still reach downstream even when
+            # the processor has no tensor payload.
+            payload_data = OmniPayloadStruct()
         if payload_data.meta is None:
             payload_data.meta = MetaStruct()
         payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
@@ -338,6 +340,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if cached_ic is not None:
                 cached_ic.pop(external_req_id, None)
 
+    def is_done_receiving_chunks(self, request_id: str) -> bool:
+        """Return True if the request should stop polling upstream chunks.
+
+        Covers both the whole-request finish marker (``finished_requests``) and
+        the per-segment finish marker (``segment_finished_requests``) used while
+        waiting for the next streaming input slice.
+        """
+        return request_id in self.finished_requests or request_id in self.segment_finished_requests
+
     ########################################################################
     # Cleanup
     ########################################################################
@@ -373,10 +384,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
-
-        pending_prefills = getattr(self, "_pending_streaming_prefills", None)
-        if pending_prefills is not None:
-            pending_prefills.pop(external_req_id, None)
+        self._pending_streaming_prefills.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
@@ -497,10 +505,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # Requests that have loaded chunk from last round
                     # of schedule, but have not scheduled
                     continue
-                if request.request_id in self.finished_requests:
-                    request.additional_information = None
-                    continue
-                if request.request_id in self.segment_finished_requests:
+                if self.is_done_receiving_chunks(request.request_id):
                     request.additional_information = None
                     continue
                 # Requests that waiting for chunk

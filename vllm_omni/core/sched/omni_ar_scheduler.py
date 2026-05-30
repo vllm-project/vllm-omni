@@ -426,9 +426,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
-                is_segment_finished = request.is_finished() and request.resumable
+                is_segment_finished = True
                 finished = self._handle_stopped_request(request)
-                if is_segment_finished and not finished:
+                if not finished:
+                    # for streaming input request only
                     if self.chunk_transfer_adapter:
                         if self.vllm_config.model_config.stage_id != 0:
                             # Downstream async-chunk stages receive real payloads from the
