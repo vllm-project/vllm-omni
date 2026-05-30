@@ -531,10 +531,6 @@ class OmniServerStageCli(OmniServer):
         if self.env_dict is not None:
             env.update(self.env_dict)
 
-        devices = self.stage_runtime_devices.get(stage_id)
-        if devices:
-            self._set_stage_device_env(stage_id, env, devices, replica_id=replica_id)
-
         cmd = self._build_stage_cmd(stage_id, headless=headless, replica_id=replica_id)
         print(f"Launching OmniServerStageCli stage {stage_id} replica {replica_id}: {' '.join(cmd)}")
         # Capture each subprocess's stdout+stderr to a per-stage log file so
