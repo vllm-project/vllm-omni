@@ -11,7 +11,6 @@ from typing import Any, cast
 import numpy as np
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLHunyuanVideo15
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
@@ -27,6 +26,9 @@ from transformers import (
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_hunyuan_video_15 import (
+    DistributedAutoencoderKLHunyuanVideo15,
+)
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -139,7 +141,7 @@ class HunyuanVideo15I2VPipeline(
             model, subfolder="feature_extractor", local_files_only=local_files_only
         )
 
-        self.vae = AutoencoderKLHunyuanVideo15.from_pretrained(
+        self.vae = DistributedAutoencoderKLHunyuanVideo15.from_pretrained(
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
         ).to(self.device)
 
