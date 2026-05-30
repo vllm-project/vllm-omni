@@ -699,3 +699,28 @@ def test_delta_fast_emits_every_call_under_delta_mode(monkeypatch):
     )
     # Same input size after the first call → identical encoded length.
     assert len({len(b) for b in emitted_b64[1:]}) == 1, "post-first-call chunks should have identical encoded length"
+
+
+def test_delta_slow_emits_every_call_under_delta_mode(monkeypatch):
+    """Multi-step assertion that DELTA-mode single-tensor branch in _delta_slow
+    emits b64 on every call — mirrors the _delta_fast regression test."""
+    monkeypatch.setenv("VLLM_VIDEO_AUDIO_DELTA_MODE", "slow")
+
+    sample_count = _CODEC_FRAME_SAMPLES * 4
+
+    chunks_drained = 0
+    emitted_b64: list[str] = []
+    for step in range(5):
+        result = _audio_result(_fake_delta_tensor(sample_count))
+        b64, chunks_drained = OmniStreamingVideoHandler._extract_audio_delta_b64(result, chunks_drained)
+        assert b64 is not None, f"step={step} produced None (truncation bug)"
+        assert isinstance(b64, str) and b64, f"step={step} produced empty b64"
+        emitted_b64.append(b64)
+
+    assert chunks_drained == 5
+
+    # First call strips _CODEC_FRAME_SAMPLES of head transient
+    assert len(emitted_b64[0]) < len(emitted_b64[1]), (
+        "first call should emit a shorter chunk due to head-transient strip"
+    )
+    assert len({len(b) for b in emitted_b64[1:]}) == 1, "post-first-call chunks should have identical encoded length"
