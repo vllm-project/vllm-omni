@@ -94,10 +94,18 @@ class RotaryEmbedding(CustomOp):
         self.interleaved = not is_neox_style
         self.apply_rotary_emb_flash_attn = None
         self.has_mindie = False
+        # ``find_spec("flash_attn")`` is True as long as *any* package publishes
+        # the ``flash_attn`` namespace — including ``flash-attn-4``, which ships
+        # only ``flash_attn.cute`` and no ``flash_attn.ops``. Guard the import
+        # so a partial namespace doesn't crash the RoPE init; the CUDA forward
+        # path uses ``vllm.vllm_flash_attn.layers.rotary`` anyway.
         if find_spec("flash_attn") is not None:
-            from flash_attn.ops.triton.rotary import apply_rotary
+            try:
+                from flash_attn.ops.triton.rotary import apply_rotary
 
-            self.apply_rotary_emb_flash_attn = apply_rotary
+                self.apply_rotary_emb_flash_attn = apply_rotary
+            except ImportError:
+                pass
         if find_spec("mindiesd") is not None:
             self.has_mindie = True
 
@@ -204,7 +212,38 @@ class RotaryEmbeddingWan(RotaryEmbedding):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x, cos, sin)
+        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+
+        if cos.dim() > 2:
+            cos = cos.reshape(-1, cos.shape[-1])
+            sin = sin.reshape(-1, sin.shape[-1])
+
+        return apply_rotary_emb(
+            x,
+            cos,
+            sin,
+            interleaved=self.interleaved,
+        )
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.apply_rotary_emb_flash_attn is None:
+            return self.forward_native(x, cos, sin)
+
+        if cos.dim() > 2:
+            cos = cos.reshape(-1, cos.shape[-1])
+            sin = sin.reshape(-1, sin.shape[-1])
+
+        return self.apply_rotary_emb_flash_attn(
+            x,
+            cos,
+            sin,
+            interleaved=self.interleaved,
+        )
 
     def forward_npu(
         self,

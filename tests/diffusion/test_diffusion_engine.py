@@ -22,15 +22,15 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int = 0
 
     @property
-    def scheduled_req_ids(self):
+    def scheduled_request_ids(self):
         ids = [req.request_id for req in self.scheduled_new_reqs]
         if self.scheduled_cached_reqs:
-            ids.extend(self.scheduled_cached_reqs.sched_req_ids)
+            ids.extend(self.scheduled_cached_reqs.request_ids)
         return ids
 
     @property
     def is_empty(self):
-        return len(self.scheduled_req_ids) == 0
+        return len(self.scheduled_request_ids) == 0
 
 
 class MockScheduler:
@@ -71,31 +71,36 @@ async def test_async_add_req_and_wait_for_response():
     engine.scheduler = MockScheduler()
     engine._out_queue = {}
     engine.abort_queue: queue.Queue[str] = queue.Queue()
-    engine._rpc_lock = threading.Lock()
+    engine._rpc_queue = queue.Queue()
+    engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
+    engine._init_lock = asyncio.Lock()
+    engine._closed = False
+    engine._loop_started = False
+    engine.main_loop = None
 
     engine._finalize_finished_request = lambda rid, out, err: out.result
 
     def mock_execute_batch(sched_output):
-        req_ids = sched_output.scheduled_req_ids
+        request_ids = sched_output.scheduled_request_ids
 
         time.sleep(1)
 
         class MockRunnerOutput:
             def __init__(self, ids):
-                self.req_id = ids
+                self.request_id = ids
                 self.step_index = 0
                 self.finished = True
                 self._results = {rid: SimpleNamespace(result_data=f"data_{rid}") for rid in ids}
 
-            def get_req_output(self, rid):
+            def get_request_output(self, rid):
                 return SimpleNamespace(result=self._results[rid], step_index=0, finished=True)
 
-        return MockRunnerOutput(req_ids)
+        return MockRunnerOutput(request_ids)
 
     engine.execute_fn = mock_execute_batch
 
-    engine.stop_event = threading.Event()
-    engine.start_background_loop()
+    await engine._check_and_start_background_loop()
 
     async def run_task(rid):
         req = SimpleNamespace(request_id=rid)
@@ -105,10 +110,13 @@ async def test_async_add_req_and_wait_for_response():
 
     task_ids = [f"req_{i}" for i in range(5)]
     tasks = [run_task(rid) for rid in task_ids]
-    results = await asyncio.gather(*tasks)
-
-    engine.stop_event.set()
-    engine.worker_thread.join(timeout=5)
+    try:
+        results = await asyncio.gather(*tasks)
+    finally:
+        with engine._cv:
+            engine.stop_event.set()
+            engine._cv.notify_all()
+        engine.worker_thread.join(timeout=5)
     assert len(results) == 5
     for rid, res, elapsed in results:
         assert rid in res.result_data

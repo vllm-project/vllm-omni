@@ -69,7 +69,7 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.glm_image.pipeline",
         "GLM_IMAGE_PIPELINE",
     ),
-    "hunyuan_image3": (
+    "hunyuan_image_3_moe": (
         "vllm_omni.model_executor.models.hunyuan_image3.pipeline",
         "HUNYUAN_IMAGE3_PIPELINE",
     ),
@@ -97,6 +97,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.voxtral_tts.pipeline",
         "VOXTRAL_TTS_PIPELINE",
     ),
+    "glm_tts": (
+        "vllm_omni.model_executor.models.glm_tts.pipeline",
+        "GLM_TTS_PIPELINE",
+    ),
     "fish_qwen3_omni": (
         "vllm_omni.model_executor.models.fish_speech.pipeline",
         "FISH_SPEECH_PIPELINE",
@@ -116,5 +120,9 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "moss_tts_nano": (
         "vllm_omni.model_executor.models.moss_tts_nano.pipeline",
         "MOSS_TTS_NANO_PIPELINE",
+    ),
+    "higgs_audio_v2": (
+        "vllm_omni.model_executor.models.higgs_audio_v2.pipeline",
+        "HIGGS_AUDIO_V2_PIPELINE",
     ),
 }

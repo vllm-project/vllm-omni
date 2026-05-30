@@ -15,7 +15,8 @@ RUN apt-get update && \
         libsm6 \
         libxext6 \
         libxrender1 \
-        libxcb1 && \
+        libxcb1 \
+        espeak-ng && \
     rm -rf /var/cache/apt/* && \
     rm -rf /var/lib/apt/lists/*
 
@@ -29,6 +30,11 @@ RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
       "pytest-cov>=4.0.0" \
       "pytest-mock>=3.10.0" \
       "openpyxl>=3.0.0" \
+      "psutil>=7.2.0" \
+      "soundfile>=0.13.1" \
+      "pyttsx3>=2.99" \
+      "opencv-python>=4.12.0.88" \
+      "imageio[ffmpeg]>=0.6.0" \
       --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
       --default-timeout=60 && \

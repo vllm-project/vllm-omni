@@ -33,7 +33,6 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
-from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.utils import (
     concat_text_with_prompt_ids,
     extract_speech_feat,
@@ -42,6 +41,7 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
     extract_text_token,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
@@ -784,12 +784,14 @@ class CosyVoice3Model(
                             else:
                                 self._stream_vocoder_cache_by_req[req_id] = new_cache_state
                 else:
+                    token_offset = max(0, meta.talker_prefill_offset or 0) if meta else 0
                     tts_speech = self.code2wav.forward(
                         token=token.unsqueeze(0),
                         prompt_token=speech_token[:1],
                         prompt_feat=speech_feat[:1],
                         embedding=embedding[:1],
                         n_timesteps=10,
+                        token_offset_tokens=token_offset,
                     )
 
                 audio = tts_speech.reshape(-1).to(dtype=torch.float32)

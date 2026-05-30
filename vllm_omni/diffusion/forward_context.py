@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import vllm.ir
 from vllm.config import VllmConfig
@@ -10,6 +11,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
@@ -23,6 +27,8 @@ class ForwardContext:
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
+    # Per-request reference latent for img2img DiT models (e.g. Ming)
+    ref_latent: torch.Tensor | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
 
     # Sequence Parallel padding support
@@ -171,3 +177,14 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
+
+
+def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
+    """Set the per-request reference latent on the active ForwardContext.
+
+    Used by img2img-capable DiT models (e.g. Ming-flash-omni-2.0) so the
+    transformer can read the reference latent from request scope instead of
+    module instance state.
+    """
+    if _forward_context is not None:
+        _forward_context.ref_latent = ref_latent
