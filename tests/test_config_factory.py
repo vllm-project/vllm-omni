@@ -1580,6 +1580,74 @@ class TestMingFlashOmniPipeline:
         assert len(stages) == 1
         assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniForConditionalGeneration"
 
+    def test_image_pipeline_registered(self):
+        p = _PIPELINE_REGISTRY.get("ming_flash_omni_image")
+        assert p is not None
+        assert p.model_arch == "MingFlashOmniForConditionalGeneration"
+        assert len(p.stages) == 2
+        assert p.validate() == []
+
+    def test_image_thinker_stage(self):
+        s = _PIPELINE_REGISTRY["ming_flash_omni_image"].get_stage(0)
+        assert s.model_stage == "thinker"
+        assert s.execution_type == StageExecutionType.LLM_AR
+        assert s.input_sources == ()
+        assert s.final_output is False
+        assert s.owns_tokenizer is True
+        assert s.requires_multimodal_data is True
+        # Image variant exports hidden states for the diffusion stage.
+        assert s.engine_output_type == "latent"
+        assert s.hf_config_name == "thinker_config"
+        assert s.sampling_constraints["detokenize"] is False
+        assert s.prompt_expand_func is not None
+
+    def test_image_dit_stage(self):
+        s = _PIPELINE_REGISTRY["ming_flash_omni_image"].get_stage(1)
+        assert s.model_stage == "dit"
+        assert s.execution_type == StageExecutionType.DIFFUSION
+        assert s.input_sources == (0,)
+        assert s.final_output is True
+        assert s.final_output_type == "image"
+        assert s.hf_config_name == "image_gen_config"
+        assert s.model_arch == "MingImagePipeline"
+        assert s.custom_process_input_func is not None
+
+    def test_image_processor_wiring_resolves(self):
+        """The prompt_expand_func and custom_process_input_func strings must point to real callables."""
+        thinker = _PIPELINE_REGISTRY["ming_flash_omni_image"].get_stage(0)
+        dit = _PIPELINE_REGISTRY["ming_flash_omni_image"].get_stage(1)
+        for ref in (thinker.prompt_expand_func, dit.custom_process_input_func):
+            module_path, _, attr = ref.rpartition(".")
+            module = importlib.import_module(module_path)
+            assert callable(getattr(module, attr))
+
+    def test_image_yaml_loads_and_merges(self):
+        """deploy/ming_flash_omni_image.yaml parses and routes to the image pipeline."""
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni_image.yaml"
+        if not deploy_path.exists():
+            pytest.skip("ming_flash_omni_image deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+        assert len(deploy.stages) == 2
+        assert deploy.async_chunk is False
+        assert deploy.pipeline == "ming_flash_omni_image"
+        assert deploy.connectors is not None
+        assert "shared_memory_connector" in deploy.connectors
+
+        pipeline = _PIPELINE_REGISTRY["ming_flash_omni_image"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert len(stages) == 2
+        # Stage 0 thinker: AR worker that emits latents.
+        assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniForConditionalGeneration"
+        assert stages[0].yaml_engine_args["engine_output_type"] == "latent"
+        assert stages[0].yaml_extras["default_sampling_params"]["detokenize"] is False
+        assert stages[0].yaml_extras["prompt_expand_func"] is not None
+        # Stage 1 dit: diffusion stage with MingImagePipeline.
+        assert stages[1].yaml_engine_args["model_arch"] == "MingImagePipeline"
+        assert stages[1].custom_process_input_func is not None
+        assert stages[1].final_output is True
+        assert stages[1].final_output_type == "image"
+
 
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
