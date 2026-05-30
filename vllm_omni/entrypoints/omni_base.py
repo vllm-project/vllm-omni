@@ -480,7 +480,8 @@ class OmniBase(PDDisaggregationMixin):
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 
-        running = self.engine._running_counter.value
+        counter = getattr(self.engine, "_running_counter", None)
+        running = counter.value if counter is not None else len(self.request_states)
         total = len(self.request_states)
         self.prom_metrics.set_running(running)
         self.prom_metrics.set_waiting(max(0, total - running))

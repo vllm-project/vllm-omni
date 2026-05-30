@@ -315,7 +315,7 @@ class AsyncOmni(EngineClient, OmniBase):
                 self.log_stats,
                 wall_start_ts,
                 final_stage_id_for_e2e,
-                transfer_emitter=self.transfer_metrics,
+                transfer_emitter=getattr(self, "transfer_metrics", None),
                 replica_resolver=self._resolve_transfer_replica,
             )
             req_state = ClientRequestState(request_id)

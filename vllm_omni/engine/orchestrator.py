@@ -158,6 +158,12 @@ class Orchestrator:
     _WATCH_REPLICA_INTERVAL_S: float = 0.5
     _WATCH_REPLICA_IDLE_INTERVAL_S: float = 1.0
 
+    # Class-level defaults so tests that bypass __init__ via object.__new__
+    # don't AttributeError when transfer / counter emit paths access them.
+    _running_counter: OmniRequestCounter | None = None
+    _transfer_emitter: Any = None
+    _stat_logger: OmniPrometheusStatLogger | None = None
+
     def __init__(
         self,
         request_async_queue: janus.AsyncQueue[EngineQueueMessage],
@@ -215,10 +221,17 @@ class Orchestrator:
                 flat_idx += 1
 
         if vllm_config_for_stats is not None:
-            self._stat_logger: OmniPrometheusStatLogger | None = OmniPrometheusStatLogger(
-                vllm_config=vllm_config_for_stats,
-                stage_replica_map=stage_replica_map,
-            )
+            try:
+                self._stat_logger = OmniPrometheusStatLogger(
+                    vllm_config=vllm_config_for_stats,
+                    stage_replica_map=stage_replica_map,
+                )
+            except Exception:
+                # Minimal vllm_config in unit-test contexts can lack fields the
+                # upstream PrometheusStatLogger expects. Skip wrap rather than
+                # break orchestrator construction.
+                logger.exception("[Orchestrator] OmniPrometheusStatLogger init failed; metrics wrap disabled")
+                self._stat_logger = None
         else:
             self._stat_logger = None
         self._last_stats_ts: float = 0.0
