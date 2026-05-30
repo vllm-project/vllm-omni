@@ -2361,6 +2361,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request, ref_audio_data=ref_audio_data, has_inline_ref_audio=has_inline_ref_audio
             )
             tts_params = {}
+            prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
         elif self._tts_model_type == "omnivoice":
             if not request.input or not request.input.strip():
                 raise ValueError("Input text cannot be empty")
