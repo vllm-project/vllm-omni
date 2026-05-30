@@ -13,6 +13,11 @@ from PIL import Image, ImageOps
 from torch import nn
 from torchvision.transforms import Compose, Normalize
 from tqdm import tqdm
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -124,7 +129,8 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
         self.text_encoder = self.text_model.model
 
         # Fusion model — weights are loaded later via load_weights()
-        self.model = FusionModel(VIDEO_CONFIG, AUDIO_CONFIG)
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        self.model = FusionModel(VIDEO_CONFIG, AUDIO_CONFIG, quant_config=quant_config)
         self.transformer = self.model
 
         fusion_path = self.od_config.tf_model_config.get("fusion", None)
@@ -236,10 +242,75 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
         return ref_vae_latents, ref_audio_lengths
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        prefix = "model."
-        state_dict = {name[len(prefix) :]: tensor for name, tensor in weights if name.startswith(prefix)}
-        self.model.load_state_dict(state_dict, strict=True)
-        return {prefix + k for k in state_dict}
+        pipeline_prefix = "model."
+
+        qkv_stacked_mapping = [
+            (".self_attn.to_qkv", ".self_attn.q", "q"),
+            (".self_attn.to_qkv", ".self_attn.k", "k"),
+            (".self_attn.to_qkv", ".self_attn.v", "v"),
+        ]
+
+        params_dict = dict(self.model.named_parameters())
+        loaded_local: set[str] = set()
+
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
+
+        def _maybe_shard_weight(weight: torch.Tensor, param: torch.Tensor) -> torch.Tensor:
+            """Slice a checkpoint tensor to this rank's TP shard when the
+            param is a TP-local shape but the checkpoint stores the full one.
+            """
+            if tp_size <= 1 or weight.shape == param.shape:
+                return weight
+            if weight.ndim == 1 and weight.numel() == param.numel() * tp_size:
+                return weight.chunk(tp_size, dim=0)[tp_rank]
+            if weight.ndim == 2:
+                if weight.shape[0] == param.shape[0] * tp_size:
+                    return weight.chunk(tp_size, dim=0)[tp_rank]
+                if weight.shape[1] == param.shape[1] * tp_size:
+                    return weight.chunk(tp_size, dim=1)[tp_rank]
+            return weight
+
+        for full_name, loaded_weight in weights:
+            if not full_name.startswith(pipeline_prefix):
+                continue
+            name = full_name[len(pipeline_prefix) :]
+
+            # Fused-QKV stacking: route checkpoint's separate
+            # - ...self_attn.{q,k,v}: weights into the corresponding
+            # - ...self_attn.to_qkv : via its sharded weight_loader.
+            stacked_hit = False
+            for fused_name, raw_name, shard_id in qkv_stacked_mapping:
+                if raw_name not in name:
+                    continue
+                stacked = name.replace(raw_name, fused_name)
+                if stacked not in params_dict:
+                    continue
+                param = params_dict[stacked]
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded_local.add(stacked)
+                stacked_hit = True
+                break
+            if stacked_hit:
+                continue
+
+            if name not in params_dict:
+                logger.warning(f"Skipping DreamID-Omni weight {full_name} -- not found in model parameters")
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", None)
+            if weight_loader is not None:
+                # Parallel Linears handle TP sharding internally
+                weight_loader(param, loaded_weight)
+            else:
+                default_weight_loader(param, _maybe_shard_weight(loaded_weight, param))
+            loaded_local.add(name)
+
+        # Detach must happen before `DiffusersPipelineLoader._process_weights_after_loading`
+        # and before any forward pass that triggers layerwise-offload hooks.
+        self.model._detach_blocks_from_backbones()
+
+        return {pipeline_prefix + k for k in loaded_local}
 
     def get_scheduler_time_steps(self, sampling_steps, solver_name="unipc", device=0, shift=5.0):
         torch.manual_seed(4)
@@ -375,6 +446,33 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
             )[0].squeeze(0)
         return video_noise, audio_noise
 
+    def encode_prompt(
+        self,
+        prompt: str,
+        video_negative_prompt: str = "",
+        audio_negative_prompt: str = "",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode the positive and negative prompts via ``self.text_model``.
+
+        This is the single text-encoder entrypoint so that the runner-level
+        prompt-embedding cache (see
+        ``vllm_omni/diffusion/cache/prompt_embed_cache.py``) can transparently
+        memoize results when the same prompts are submitted repeatedly (e.g.
+        GRPO rollouts that sample the same prompt with different seeds).
+
+        Returns:
+            (audio_pos, video_pos, video_neg, audio_neg) embeddings cast to
+            ``self.target_dtype``. ``audio_pos`` and ``video_pos`` are the
+            same tensor, matching the original inline behavior.
+        """
+        text_embeddings = self.text_model(
+            [prompt, video_negative_prompt, audio_negative_prompt],
+            device=self.device,
+        )
+        text_embeddings = [emb.to(self.target_dtype) for emb in text_embeddings]
+        # Index 0 is the positive embedding, shared between video and audio branches.
+        return text_embeddings[0], text_embeddings[0], text_embeddings[1], text_embeddings[2]
+
     def forward(
         self,
         request: OmniDiffusionRequest,
@@ -432,12 +530,13 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
         )
 
         # 3. text embedding
-        text_embeddings = self.text_model([prompt, video_negative_prompt, audio_negative_prompt], device=self.device)
-        text_embeddings = [emb.to(self.target_dtype) for emb in text_embeddings]
-        text_embeddings_audio_pos = text_embeddings[0]
-        text_embeddings_video_pos = text_embeddings[0]
-        text_embeddings_video_neg = text_embeddings[1]
-        text_embeddings_audio_neg = text_embeddings[2]
+        text_embeddings_audio_pos, text_embeddings_video_pos, text_embeddings_video_neg, text_embeddings_audio_neg = (
+            self.encode_prompt(
+                prompt=prompt,
+                video_negative_prompt=video_negative_prompt,
+                audio_negative_prompt=audio_negative_prompt,
+            )
+        )
 
         video_latent_h, video_latent_w = height // 16, width // 16
 

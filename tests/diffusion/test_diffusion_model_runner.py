@@ -52,6 +52,7 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     runner.pipeline = _DummyPipeline(output=SimpleNamespace(output="ok"))
     runner.cache_backend = cache_backend
     runner.offload_backend = None
+    runner.prompt_embed_cache = None
     runner.od_config = SimpleNamespace(
         cache_backend=cache_backend_name,
         enable_cache_dit_summary=enable_cache_dit_summary,

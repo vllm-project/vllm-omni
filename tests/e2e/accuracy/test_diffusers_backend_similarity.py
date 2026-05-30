@@ -30,10 +30,14 @@ from tests.e2e.accuracy.helpers import (
     env_to_apply_ftfy_mock_in_subproc,
     model_output_dir,
 )
-from tests.e2e.accuracy.wan22_i2v.test_wan22_i2v_video_similarity import (
-    _parse_psnr_score,
-    _parse_ssim_score,
-    _run_ffmpeg_similarity,
+from tests.e2e.accuracy.helpers import (
+    parse_psnr_score as _parse_psnr_score,
+)
+from tests.e2e.accuracy.helpers import (
+    parse_ssim_score as _parse_ssim_score,
+)
+from tests.e2e.accuracy.helpers import (
+    run_ffmpeg_similarity as _run_ffmpeg_similarity,
 )
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.mark import hardware_test
@@ -284,7 +288,6 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
     [
         pytest.param(
             "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-            marks=pytest.mark.skip(reason="#3488"),
         ),
     ],
 )

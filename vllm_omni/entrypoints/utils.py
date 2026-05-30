@@ -183,7 +183,17 @@ def _filter_dict_like_object(obj: dict | Any) -> dict:
     result = {}
     filtered_keys = []
     for k, v in obj.items():
-        if _is_callable_value(v):
+        # Preserve class objects by converting to a fully qualified name string
+        # so callers that resolve via import path (e.g. custom_pipeline_args.pipeline_class)
+        # still work after OmegaConf round-trip.
+        if isinstance(v, type):
+            module = getattr(v, "__module__", None)
+            qualname = getattr(v, "__qualname__", getattr(v, "__name__", None))
+            if module and qualname and module != "builtins":
+                result[k] = f"{module}.{qualname}"
+            else:
+                result[k] = qualname
+        elif _is_callable_value(v):
             filtered_keys.append(str(k))
         else:
             result[k] = _convert_dataclasses_to_dict(v)
@@ -240,6 +250,13 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     # Note: This must come AFTER Counter check since Counter is a dict subclass
     if isinstance(obj, dict):
         return _filter_dict_like_object(obj)
+    # Preserve class objects by converting to a fully qualified name string.
+    if isinstance(obj, type):
+        module = getattr(obj, "__module__", None)
+        qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", None))
+        if module and qualname and module != "builtins":
+            return f"{module}.{qualname}"
+        return qualname
     # Handle callable objects (functions, methods, etc.) - skip them
     # Note: This comes after dict/list checks to avoid misclassifying dict-like objects
     if callable(obj):
@@ -329,11 +346,16 @@ def resolve_model_config_path(model: str) -> str:
             except Exception as e:
                 raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
         else:
-            raise ValueError(
-                f"Could not determine model_type for model: {model}. "
-                f"Model is not in standard transformers format and does not have model_index.json. "
-                f"Please ensure the model has proper configuration files with 'model_type' field"
-            )
+            # No config.json at repo root (e.g. GLM-TTS stores configs in
+            # subdirectories only).  Try matching against registered deploy
+            # YAML filenames before giving up.
+            model_type = _try_resolve_omni_model_type(model)
+            if model_type is None:
+                raise ValueError(
+                    f"Could not determine model_type for model: {model}. "
+                    f"Model is not in standard transformers format and does not have model_index.json. "
+                    f"Please ensure the model has proper configuration files with 'model_type' field"
+                )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
     if model_type in _DIFFUSERS_CLASS_TO_CONFIG:
@@ -612,7 +634,7 @@ def load_and_resolve_stage_configs(
         if not stage_configs:
             if default_stage_cfg_factory is not None:
                 default_stage_cfg = default_stage_cfg_factory()
-                stage_configs = create_config(default_stage_cfg)
+                stage_configs = create_config(_convert_dataclasses_to_dict(default_stage_cfg))
             else:
                 stage_configs = []
     elif stage_configs_path is None:
@@ -625,7 +647,7 @@ def load_and_resolve_stage_configs(
         if not stage_configs:
             if default_stage_cfg_factory is not None:
                 default_stage_cfg = default_stage_cfg_factory()
-                stage_configs = create_config(default_stage_cfg)
+                stage_configs = create_config(_convert_dataclasses_to_dict(default_stage_cfg))
             else:
                 stage_configs = []
     else:
@@ -744,54 +766,6 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
         filtered_kwargs[k] = _filter_value(v, field.type)
 
     return filtered_kwargs
-
-
-# TODO(wuhang): Remove after PR #1115.
-def build_base_engine_args(source: Any) -> dict[str, Any] | None:
-    """Build base engine args with tokenizer and parallel configuration.
-
-    Automatically detects whether source is a dict-like object or namespace object.
-
-    Args:
-        source: Source object (args namespace or kwargs dict) containing configuration.
-
-    Returns:
-        Dictionary containing tokenizer and parallel configuration overrides,
-        or None if no configuration is present.
-    """
-    # Auto-detect source type: dict-like objects have 'get' method
-    is_dict_like = hasattr(source, "get") and callable(getattr(source, "get"))
-
-    # Extract tokenizer
-    if is_dict_like:
-        tokenizer = source.get("tokenizer", None)
-    else:
-        tokenizer = getattr(source, "tokenizer", None)
-
-    base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
-
-    # Extract parallel configuration
-    parallel_keys = [
-        "tensor_parallel_size",
-        "pipeline_parallel_size",
-        "data_parallel_size",
-        "data_parallel_size_local",
-        "data_parallel_backend",
-        "distributed_executor_backend",
-    ]
-
-    if is_dict_like:
-        parallel_overrides = {k: source[k] for k in parallel_keys if k in source and source[k] is not None}
-    else:
-        parallel_overrides = {
-            k: getattr(source, k) for k in parallel_keys if hasattr(source, k) and getattr(source, k) is not None
-        }
-
-    if parallel_overrides:
-        base_engine_args = base_engine_args or {}
-        base_engine_args.update(parallel_overrides)
-
-    return base_engine_args
 
 
 # The following code detects if the process is running in a container and if

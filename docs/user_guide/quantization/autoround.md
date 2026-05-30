@@ -32,7 +32,9 @@ guide. AutoRound is Intel-supported.
 |-------|------------|-------|--------|---------|
 | FLUX.1-dev | `vllm-project-org/FLUX.1-dev-AutoRound-w4a16` | Diffusion transformer | W4A16 | GPTQ-Marlin or Intel-supported AutoRound backend |
 | Qwen-Image | Not listed | Diffusion transformer | W4A16 | Not validated |
-| Wan2.2 | Not listed | Diffusion transformer | W4A16 | Not validated |
+| Wan2.2-I2V | `Intel/Wan2.2-I2V-A14B-Diffusers-int4-AutoRound` | Diffusion transformer | W4A16 | GPTQ-Marlin or Intel-supported AutoRound backend |
+| Wan2.2-T2V | `Intel/Wan2.2-T2V-A14B-Diffusers-int4-AutoRound` | Diffusion transformer | W4A16 | GPTQ-Marlin or Intel-supported AutoRound backend |
+| Wan2.2-TI2V | `Intel/Wan2.2-TI2V-5B-Diffusers-int4-AutoRound` | Diffusion transformer | W4A16 | GPTQ-Marlin or Intel-supported AutoRound backend |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
@@ -50,8 +52,8 @@ vLLM-Omni's runtime module names.
 
 | Model | Scope | Status | Notes |
 |-------|-------|--------|-------|
+| GLM-Image | Diffusion transformer  | ✅ | `Intel/GLM-Image-int4-AutoRound` |
 | BAGEL | Checkpoint-defined diffusion or transformer stage | Not validated | Requires a compatible AutoRound checkpoint |
-| GLM-Image | Checkpoint-defined diffusion or transformer stage | Not validated | Requires a compatible AutoRound checkpoint |
 
 ## Configuration
 

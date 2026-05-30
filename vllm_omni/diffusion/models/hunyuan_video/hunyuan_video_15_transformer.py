@@ -764,6 +764,13 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
 
         # Create explicit attn_mask for image tokens when SP auto_pad is active.
         ctx = get_forward_context()
+        if not ctx.sp_active:
+            max_valid_encoder_tokens = int(encoder_attention_mask.sum(dim=1).max().item())
+            if max_valid_encoder_tokens < encoder_attention_mask.shape[1]:
+                encoder_hidden_states = encoder_hidden_states[:, :max_valid_encoder_tokens]
+                encoder_attention_mask = encoder_attention_mask[:, :max_valid_encoder_tokens]
+            if encoder_attention_mask.all():
+                encoder_attention_mask = None
         hidden_states_mask = None
         if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
             padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
@@ -830,9 +837,10 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in original_name:
                     continue
-                lookup_name = original_name.replace(weight_name, param_name)
-                if lookup_name not in params_dict:
-                    break
+                maybe_lookup_name = original_name.replace(weight_name, param_name)
+                if maybe_lookup_name not in params_dict:
+                    continue
+                lookup_name = maybe_lookup_name
                 param = params_dict[lookup_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)

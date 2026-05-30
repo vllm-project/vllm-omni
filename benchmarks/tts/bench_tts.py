@@ -118,7 +118,7 @@ def build_bench_args(
         "--num-warmups",
         "2",
         "--percentile-metrics",
-        "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun",
     ]
 
     if resolved_dataset_path:
@@ -129,6 +129,9 @@ def build_bench_args(
 
     if task_extra_body:
         cmd += ["--extra-body", json.dumps(task_extra_body, separators=(",", ":"))]
+
+    if model_cfg.get("trust_remote_code"):
+        cmd.append("--trust-remote-code")
 
     if concurrency is not None:
         cmd += ["--max-concurrency", str(concurrency), "--request-rate", "inf"]

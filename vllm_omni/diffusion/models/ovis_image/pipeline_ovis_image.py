@@ -168,7 +168,10 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMi
         )
 
         self.text_encoder = Qwen3Model.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
+            model,
+            subfolder="text_encoder",
+            local_files_only=local_files_only,
+            torch_dtype=od_config.dtype,
         )
 
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
