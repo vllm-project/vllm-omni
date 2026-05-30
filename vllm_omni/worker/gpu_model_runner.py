@@ -1809,5 +1809,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         if cached_additional_info:
             merged_info = dict(cached_additional_info)
             merged_info.setdefault("meta", {})["num_processed_tokens"] = 0
+            merged_info.setdefault("meta", {})["resumable"] = True
             self.model_intermediate_buffer[req_id] = merged_info
             setattr(self.requests[req_id], "additional_information_cpu", merged_info)

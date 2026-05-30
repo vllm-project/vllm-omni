@@ -680,7 +680,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         is_prefill = bool(payload.get("_omni_is_prefill", span_len > 1))
         if is_prefill:
             num_computed_tokens = payload.get("_omni_num_computed_tokens")
-            if num_computed_tokens is not None:
+            request_resumable = meta.get("resumable", False)
+            if num_computed_tokens is not None and not request_resumable:
                 meta["num_processed_tokens"] = int(num_computed_tokens)
             input_ids, input_embeds, update_dict = self.talker_preprocess_prefill(input_ids, input_embeds, payload)
             code_predictor_codes = torch.zeros(
