@@ -1784,6 +1784,12 @@ class AsyncOmniEngine:
             return {
                 "rel_l1_thresh": 0.2,
             }
+        if cache_backend == "mag_cache":
+            return {
+                "mag_threshold": 0.24,
+                "mag_max_skip_steps": 5,
+                "mag_retention_ratio": 0.1,
+            }
         return None
 
     @staticmethod
@@ -1949,6 +1955,8 @@ class AsyncOmniEngine:
                 "mp" if kwargs.get("distributed_executor_backend") is None else kwargs["distributed_executor_backend"]
             ),
             "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
+            "enable_prompt_embed_cache": kwargs.get("enable_prompt_embed_cache", False),
+            "prompt_embed_cache_size": kwargs.get("prompt_embed_cache_size", 32),
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),

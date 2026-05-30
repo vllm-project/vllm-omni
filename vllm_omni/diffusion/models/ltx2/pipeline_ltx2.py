@@ -158,7 +158,7 @@ class _VideoAudioScheduler:
 
 class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
     # Audio is diffused jointly with video; warmup must size audio tokens.
-    support_audio_output = True
+    dummy_run_num_frames = 2
 
     def __init__(
         self,
@@ -1120,6 +1120,8 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
 class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     """LTX2TwoStagesPipeline is for two stages image to video generation"""
+
+    dummy_run_num_frames = 2
 
     _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
     _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]

@@ -446,6 +446,33 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
             )[0].squeeze(0)
         return video_noise, audio_noise
 
+    def encode_prompt(
+        self,
+        prompt: str,
+        video_negative_prompt: str = "",
+        audio_negative_prompt: str = "",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode the positive and negative prompts via ``self.text_model``.
+
+        This is the single text-encoder entrypoint so that the runner-level
+        prompt-embedding cache (see
+        ``vllm_omni/diffusion/cache/prompt_embed_cache.py``) can transparently
+        memoize results when the same prompts are submitted repeatedly (e.g.
+        GRPO rollouts that sample the same prompt with different seeds).
+
+        Returns:
+            (audio_pos, video_pos, video_neg, audio_neg) embeddings cast to
+            ``self.target_dtype``. ``audio_pos`` and ``video_pos`` are the
+            same tensor, matching the original inline behavior.
+        """
+        text_embeddings = self.text_model(
+            [prompt, video_negative_prompt, audio_negative_prompt],
+            device=self.device,
+        )
+        text_embeddings = [emb.to(self.target_dtype) for emb in text_embeddings]
+        # Index 0 is the positive embedding, shared between video and audio branches.
+        return text_embeddings[0], text_embeddings[0], text_embeddings[1], text_embeddings[2]
+
     def forward(
         self,
         request: OmniDiffusionRequest,
@@ -503,12 +530,13 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
         )
 
         # 3. text embedding
-        text_embeddings = self.text_model([prompt, video_negative_prompt, audio_negative_prompt], device=self.device)
-        text_embeddings = [emb.to(self.target_dtype) for emb in text_embeddings]
-        text_embeddings_audio_pos = text_embeddings[0]
-        text_embeddings_video_pos = text_embeddings[0]
-        text_embeddings_video_neg = text_embeddings[1]
-        text_embeddings_audio_neg = text_embeddings[2]
+        text_embeddings_audio_pos, text_embeddings_video_pos, text_embeddings_video_neg, text_embeddings_audio_neg = (
+            self.encode_prompt(
+                prompt=prompt,
+                video_negative_prompt=video_negative_prompt,
+                audio_negative_prompt=audio_negative_prompt,
+            )
+        )
 
         video_latent_h, video_latent_w = height // 16, width // 16
 

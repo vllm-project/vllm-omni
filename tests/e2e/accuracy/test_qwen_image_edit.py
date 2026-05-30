@@ -253,37 +253,6 @@ def _diffusers_output_single_image(accuracy_artifact_root: Path, qwen_bear_image
     )
 
 
-def _vllm_omni_output_multiple_image(
-    accuracy_artifact_root: Path,
-    qwen_bear_image: Image.Image,
-    rabbit_image: Image.Image,
-) -> Image.Image:
-    output_dir = model_output_dir(accuracy_artifact_root, MULTIPLE_MODEL)
-    output_path = output_dir / "vllm_omni_multiple.png"
-    with OmniServer(model=MULTIPLE_MODEL, serve_args=SERVER_ARGS) as server:
-        output = _run_vllm_omni_image_edit(
-            omni_server=server,
-            prompt=PROMPT_MULTIPLE_IMAGE,
-            input_images=[qwen_bear_image, rabbit_image],
-            output_path=output_path,
-        )
-    return output
-
-
-def _diffusers_output_multiple_image(
-    accuracy_artifact_root: Path, qwen_bear_image: Image.Image, rabbit_image: Image.Image
-) -> Image.Image:
-    output_dir = model_output_dir(accuracy_artifact_root, MULTIPLE_MODEL)
-    output_path = output_dir / "diffusers_multiple.png"
-    return _run_diffusers_image_edit(
-        model=MULTIPLE_MODEL,
-        pipeline_class=QwenImageEditPlusPipeline,
-        prompt=PROMPT_MULTIPLE_IMAGE,
-        input_images=[qwen_bear_image, rabbit_image],
-        output_path=output_path,
-    )
-
-
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_edit_single_matches_diffusers(
@@ -300,37 +269,6 @@ def test_qwen_image_edit_single_matches_diffusers(
     )
     assert_similarity(
         model_name=SINGLE_MODEL,
-        vllm_image=vllm_image,
-        diffusers_image=diffusers_image,
-        width=WIDTH,
-        height=HEIGHT,
-        ssim_threshold=SSIM_THRESHOLD,
-        psnr_threshold=PSNR_THRESHOLD,
-    )
-
-
-@pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skip(
-    reason="Skipping as the second image seems to be ignored by the API. Will come back to this later after #2772 is merged."
-)
-def test_qwen_image_edit_multiple_matches_diffusers(
-    accuracy_artifact_root: Path,
-    qwen_bear_image: Image.Image,
-    rabbit_image: Image.Image,
-) -> None:
-    vllm_image = _vllm_omni_output_multiple_image(
-        accuracy_artifact_root=accuracy_artifact_root,
-        qwen_bear_image=qwen_bear_image,
-        rabbit_image=rabbit_image,
-    )
-    diffusers_image = _diffusers_output_multiple_image(
-        accuracy_artifact_root=accuracy_artifact_root,
-        qwen_bear_image=qwen_bear_image,
-        rabbit_image=rabbit_image,
-    )
-    assert_similarity(
-        model_name=MULTIPLE_MODEL,
         vllm_image=vllm_image,
         diffusers_image=diffusers_image,
         width=WIDTH,

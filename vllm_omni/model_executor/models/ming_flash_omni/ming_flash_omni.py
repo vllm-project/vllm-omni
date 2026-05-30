@@ -128,12 +128,12 @@ class MingFlashOmniForConditionalGeneration(
         elif self.model_stage == "imagegen":
             # Image generation is a separate diffusion stage; it does not run
             # through this AR wrapper. See
-            # ``vllm_omni/diffusion/models/ming_flash_omni/pipeline_ming_imagegen.py``
-            # and ``model_arch: MingImagePipeline`` in the stage YAML.
+            # `vllm_omni/diffusion/models/ming_flash_omni/pipeline_ming_imagegen.py`
+            # and `model_arch: MingImagePipeline` in the deploy YAML.
             raise NotImplementedError(
                 "Image generation stage is not implemented in this AR wrapper. "
-                "Use stage_type: diffusion with model_arch: MingImagePipeline "
-                "for the imagegen stage (see stage_configs/ming_flash_omni.yaml)."
+                "Use the DIFFUSION execution_type with model_arch: MingImagePipeline "
+                "for the imagegen stage (see vllm_omni/deploy/ming_flash_omni_image.yaml)."
             )
 
         else:
