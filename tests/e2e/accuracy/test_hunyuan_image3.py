@@ -53,14 +53,26 @@ def _default_ar_dit_devices() -> tuple[str, str]:
 
 
 AR_DEVICES, DIT_DEVICES = _default_ar_dit_devices()
-MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
-NUM_INFERENCE_STEPS = 50
-GUIDANCE_SCALE = 2.5
+
+# Model configuration based on HUNYUAN_MODEL_PATH
+DISTIL_MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct-Distil"
+INSTRUCT_MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
+MODEL_PATH = os.environ.get("HUNYUAN_MODEL_PATH", DISTIL_MODEL_NAME)
+
+# Determine model type and set parameters accordingly
+IS_DISTIL = "distil" in MODEL_PATH.lower()
+MODEL_NAME = DISTIL_MODEL_NAME if IS_DISTIL else INSTRUCT_MODEL_NAME
+NUM_INFERENCE_STEPS = 8 if IS_DISTIL else 50
+GUIDANCE_SCALE = 1.0 if IS_DISTIL else 2.5
+
+# Asset paths based on model type
+ASSET_SUBDIR = "hunyuan_image3"
+REF_IMAGE_NAME = "hunyuan_image_distill_ref.png" if IS_DISTIL else "hunyuan_image_instruct_ref.png"
+COT_REF_NAME = "hunyuan_image_distill_cot_ref.txt" if IS_DISTIL else "hunyuan_image3_instruct_cot_ref.txt"
 
 # ============================================================================
 # Constants
 # ============================================================================
-MODEL_PATH = os.environ.get("HUNYUAN_MODEL_PATH", MODEL_NAME)
 # Test input
 PROMPT = "基于图一的logo，参考图二中冰箱贴的材质，制作一个新的冰箱贴"
 TEST_IMAGE_URLS = [
@@ -202,19 +214,6 @@ def _quant_accuracy_cases() -> list[pytest.ParameterSet]:
             marks.append(pytest.mark.skip(reason=f"Set {case.model_env} to run this quant accuracy case."))
         params.append(pytest.param(case, id=case.name, marks=marks))
     return params
-
-
-# fmt: off
-COT_REF = ("首先，我分析所有输入图像：图像1是一个圆形的logo，设计现代且抽象。它由不同色调的蓝色（深蓝、中蓝、浅蓝）和白色构成，这些色块以流畅的曲线相互交织，形成一个动态的、类似旋涡或波浪的图案。整个logo是扁平化的矢量图形，背景为纯黑色。图像2展示了四个并排摆放的卡通动物造型冰箱贴，"
-           "它们被放置在灰色的织物背景上。这些冰箱贴的关键特征是其材质：它们具有光滑、高光的珐琅或烤漆质感，边缘有明显的金属包边，整体呈现出一种立体的、有厚度的实体感。用户的指令是“基于图一的logo，参考图二中冰箱贴的材质，制作一个新的冰箱贴”。这个指令要求将一个二维的平面设计（logo）"
-           "转化为一个具有特定物理属性（材质和立体感）的三维物体。核心任务是保留logo的视觉识别性，同时赋予其冰箱贴的实体质感。为了构建答案图像，我会将图一的圆形logo作为基础形状。然后，我会将图二中冰箱贴的材质特性应用到这个logo上。具体来说，logo中的每一个色块（深蓝、中蓝、浅蓝、白色）"
-           "都会被渲染成具有高光泽度的珐琅质感，表面会反射出柔和的环境光，形成自然的高光。logo中不同颜色区域之间的分界线，将被处理成纤细的、带有金属光泽的凸起边缘，这既能清晰地勾勒出图案，也符合珐琅工艺品的典型特征。整个冰箱贴会呈现出轻微的厚度和圆润的边缘，使其看起来像一个真实的、可触摸的物体。"
-           "最后，将这个制作完成的冰箱贴放置在图二所示的灰色织物背景上，并为其添加一个微妙的、柔和的阴影，以增强其立体感和与背景的融合度，最终呈现出一个精致、逼真的产品展示图。</think><recaption>这幅图像以产品摄影的精致风格，呈现了一枚根据`image_1`标志定制的圆形珐琅冰箱贴。最终图像使用`image_2`的分辨率。"
-           "冰箱贴居中放置在`image_2`的灰色织物背景上，其设计完美复刻了`image_1`中由深蓝、中蓝、浅蓝和白色构成的动态旋涡图案。整个冰箱贴被赋予了`image_2`中冰箱贴特有的高级质感：表面覆盖着一层光滑如镜的珐琅釉面，反射出柔和而清晰的高光；图案的每一个色块边缘都由纤细的抛光金属边框精确勾勒，增强了立体感。"
-           "柔和的顶光在冰箱贴的弧形边缘上形成平滑的过渡，并在其下方投下淡淡的、轮廓模糊的阴影，使其与织物背景无缝融合，营造出一种真实、静谧的视觉效果。<relation_1>最终图像完整保留了`image_1`中标志的全部设计元素。这包括其完美的圆形轮廓，以及内部由深蓝、中蓝、浅蓝和白色组成的精确旋涡状图案布局、形状和色彩关系。"
-           "</relation_1><relation_2>最终图像的分辨率、背景和材质均来自`image_2`。背景中灰色织物的纹理和质感被完整保留。冰箱贴的材质被完美重构，精确复刻了`image_2`中冰箱贴所展示的光滑珐琅质感、抛光金属边框的视觉效果，以及整体柔和、均匀的布光环境和由此产生的自然阴影。</relation_2></recaption><answer><boi>"
-           "<img_size_1024><img_ratio_36><timestep>[<img>]{3600}<eoi></answer>")
-# fmt: on
 
 
 def _make_config(enable_kv_reuse: bool, path: Path) -> None:
@@ -386,8 +385,9 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path, accuracy_
     online_cot = online_cot.lstrip("\n")
     scorer = SemanticSimilarityScorer()
     clip_scorer = CLIPScorer()
-    cot_results = scorer.text_similarity(online_cot, COT_REF)
-    image_ref = Image.open(str(accuracy_assets_root / "hunyuan_image_ref.png")).convert("RGB")
+    cot_ref = (accuracy_assets_root / ASSET_SUBDIR / COT_REF_NAME).read_text(encoding="utf-8")
+    cot_results = scorer.text_similarity(online_cot, cot_ref)
+    image_ref = Image.open(str(accuracy_assets_root / ASSET_SUBDIR / REF_IMAGE_NAME)).convert("RGB")
     image_clip_score = clip_scorer.image_image_score(online_image, image_ref)
     ssim_value, psnr_value = compute_image_ssim_psnr(prediction=online_image, reference=image_ref, compare_mode="RGB")
 
@@ -493,8 +493,9 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path, accuracy_assets_
 
     scorer = SemanticSimilarityScorer()
     clip_scorer = CLIPScorer()
-    cot_results = scorer.text_similarity(omni_cot, COT_REF)
-    image_ref = Image.open(str(accuracy_assets_root / "hunyuan_image_ref.png")).convert("RGB")
+    cot_ref = (accuracy_assets_root / ASSET_SUBDIR / COT_REF_NAME).read_text(encoding="utf-8")
+    cot_results = scorer.text_similarity(omni_cot, cot_ref)
+    image_ref = Image.open(str(accuracy_assets_root / ASSET_SUBDIR / REF_IMAGE_NAME)).convert("RGB")
     image_clip_score = clip_scorer.image_image_score(omni_image, image_ref)
     ssim_value, psnr_value = compute_image_ssim_psnr(prediction=omni_image, reference=image_ref, compare_mode="RGB")
 
