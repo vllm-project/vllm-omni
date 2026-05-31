@@ -13,7 +13,6 @@ Adds per-component quantization for multi-stage models.
 
 from .component_config import ComponentQuantizationConfig
 from .factory import SUPPORTED_QUANTIZATION_METHODS, build_quant_config
-from .inc_config import OmniINCConfig
 
 # Heavy configs (GGUF, MXFP8) are NOT imported here to avoid pulling in
 # optional dependencies (pynvml, torch_npu) at module load time.
@@ -26,3 +25,11 @@ __all__ = [
     "OmniINCConfig",
     "SUPPORTED_QUANTIZATION_METHODS",
 ]
+
+
+def __getattr__(name: str):
+    if name == "OmniINCConfig":
+        from .inc_config import OmniINCConfig
+
+        return OmniINCConfig
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

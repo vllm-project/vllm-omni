@@ -967,6 +967,55 @@ class TestSingleStageReplicaInitialization:
             batch_size=4,
         )
 
+    def test_initialize_diffusion_replica_local_submodule_uses_diffusion_initializer(self, mocker: MockerFixture):
+        import vllm_omni.engine.async_omni_engine as engine_mod
+        from vllm_omni.platforms import current_omni_platform
+
+        engine = object.__new__(AsyncOmniEngine)
+        engine.model = "fake-model"
+        engine.single_stage_mode = False
+        engine.diffusion_batch_size = 4
+        engine.stage_configs = []
+        engine._omni_master_server = mocker.Mock(spec=OmniMasterServer)
+
+        plan = _make_diffusion_plan(0, configured_stage_id=5, launch_mode="local").replicas[0]
+        plan.stage_cfg.worker_type = "submodule"
+        sentinel_client = SimpleNamespace()
+
+        device_env_var = current_omni_platform.device_control_env_var
+        prev_device_env = os.environ.get(device_env_var)
+        os.environ[device_env_var] = "0"
+
+        mocker.patch.object(engine_mod, "stage_runtime_setup", return_value=nullcontext())
+        mocker.patch.object(engine_mod, "inject_kv_stage_info")
+        mock_initialize = mocker.patch.object(
+            engine_mod,
+            "initialize_diffusion_stage",
+            return_value=sentinel_client,
+        )
+        mock_register = mocker.patch.object(engine_mod, "register_stage_with_omni_master")
+        try:
+            result = engine._initialize_diffusion_replica(
+                plan, stage_init_timeout=60, stage_launch_lock=threading.Lock()
+            )
+        finally:
+            if prev_device_env is None:
+                os.environ.pop(device_env_var, None)
+            else:
+                os.environ[device_env_var] = prev_device_env
+
+        assert result is sentinel_client
+        mock_initialize.assert_called_once_with(
+            5,
+            "fake-model",
+            plan.stage_cfg,
+            plan.metadata,
+            stage_init_timeout=60,
+            batch_size=4,
+            use_inline=False,
+        )
+        mock_register.assert_not_called()
+
     def test_initialize_diffusion_replica_local_failure_terminates_proc(self, mocker: MockerFixture):
         import vllm_omni.engine.async_omni_engine as engine_mod
         from vllm_omni.platforms import current_omni_platform

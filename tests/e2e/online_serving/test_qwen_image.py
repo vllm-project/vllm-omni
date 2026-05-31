@@ -4,7 +4,8 @@
 """
 Online serving tests for ``Qwen/Qwen-Image`` (text-to-image).
 
-- ``test_text_to_image_001``: single chat request, default server (``_get_default_case``).
+- ``test_text_to_image_001``: single chat request, default server and disaggregated VAE
+  server config.
 - ``test_batch_001``: concurrent prompts via ``send_diffusion_request([cfg0, cfg1, ...])`` — one
   dict per prompt; each entry carries its own ``messages`` / ``negative_prompt`` (see
   ``TEST_PROMPTS``).
@@ -20,6 +21,7 @@ From ``tests/``::
 """
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -31,6 +33,10 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 MODEL = "Qwen/Qwen-Image"
 T2I_PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
 NEGATIVE_PROMPT = "blurry, low quality"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DISAGGREGATED_VAE_STAGE_CONFIG = str(
+    REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "qwen_image_3stage.yaml"
+)
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
@@ -46,24 +52,32 @@ TEST_PROMPTS: list[dict[str, str]] = [
     {"prompt": "a watercolor painting of a mountain lake", "negative_prompt": "photo, realistic"},
 ]
 
-
-def _get_default_case(model: str):
-    """Return a single default ``OmniServerParams`` row (no extra ``server_args``)."""
-    return [
-        pytest.param(
-            OmniServerParams(model=model),
-            id="default",
-            marks=SINGLE_CARD_FEATURE_MARKS,
+DEFAULT_SERVER_PARAMS = [
+    pytest.param(
+        OmniServerParams(model=MODEL),
+        id="default",
+        marks=SINGLE_CARD_FEATURE_MARKS,
+    ),
+]
+TEXT_TO_IMAGE_SERVER_PARAMS = [
+    *DEFAULT_SERVER_PARAMS,
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=DISAGGREGATED_VAE_STAGE_CONFIG,
         ),
-    ]
+        id="disaggregated_vae",
+        marks=PARALLEL_FEATURE_MARKS,
+    ),
+]
 
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@pytest.mark.parametrize("omni_server", _get_default_case(MODEL), indirect=True)
+@pytest.mark.parametrize("omni_server", TEXT_TO_IMAGE_SERVER_PARAMS, indirect=True)
 def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    """Default Qwen-Image T2I smoke (single ``default`` server config)."""
+    """Qwen-Image T2I smoke for default and disaggregated VAE server configs."""
     messages = dummy_messages_from_mix_data(content_text=T2I_PROMPT)
     request_config = {
         "model": omni_server.model,
@@ -83,7 +97,7 @@ def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientH
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@pytest.mark.parametrize("omni_server", _get_default_case(MODEL), indirect=True)
+@pytest.mark.parametrize("omni_server", DEFAULT_SERVER_PARAMS, indirect=True)
 def test_batch_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     """Concurrent T2I: one ``request_config`` dict per prompt (``send_diffusion_request`` list mode)."""
     request_config = [

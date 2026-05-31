@@ -27,13 +27,11 @@ from vllm.v1.executor import Executor
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.quantization.inc_config import OmniINCConfig
 
 logger = init_logger(__name__)
 
@@ -820,6 +818,8 @@ def build_vllm_config(
     executor_class = Executor.get_class(vllm_config)
 
     # Upgrade vanilla INCConfig to OmniINCConfig for multi-stage models.
+    from vllm_omni.quantization.inc_config import OmniINCConfig
+
     upgraded = OmniINCConfig.maybe_upgrade(vllm_config.quant_config)
     if upgraded is not vllm_config.quant_config:
         vllm_config = replace(vllm_config, quant_config=upgraded)
@@ -829,6 +829,8 @@ def build_vllm_config(
 
 def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_config: Any) -> Any | None:
     """Build one output processor per logical LLM stage."""
+
+    from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 
     metadata = plan.replicas[0].metadata
     if stage_vllm_config.model_config.skip_tokenizer_init:
@@ -1107,4 +1109,14 @@ def initialize_diffusion_stage(
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
+    if getattr(stage_cfg, "worker_type", None) == "submodule":
+        from vllm_omni.diffusion.stage_submodule_client import StageSubModuleClient
+
+        return StageSubModuleClient(
+            model,
+            od_config,
+            metadata,
+            stage_init_timeout=stage_init_timeout,
+            batch_size=batch_size,
+        )
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)

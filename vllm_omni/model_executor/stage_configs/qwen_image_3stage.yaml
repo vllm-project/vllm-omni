@@ -1,0 +1,77 @@
+# Qwen-Image disaggregated VAE pipeline.
+#
+# Stage 0 encode  (GPU 0): tokenizer + text_encoder + latent/timestep prep.
+# Stage 1 denoise (GPU 1): transformer + scheduler step loop.
+# Stage 2 decode  (GPU 0): VAE decode + image postprocess.
+#
+# TODO: Migrate this legacy stage config to deploy config.
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    worker_type: submodule
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: QwenImagePipeline
+      model_stage: encode
+      enforce_eager: true
+      trust_remote_code: true
+      max_num_seqs: 1
+    final_output: false
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 40
+      true_cfg_scale: 4.0
+      guidance_scale: 1.0
+      height: 1024
+      width: 1024
+
+  - stage_id: 1
+    stage_type: diffusion
+    runtime:
+      devices: "1"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: QwenImagePipeline
+      model_stage: denoise
+      enforce_eager: false
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+      step_execution: false
+      max_num_seqs: 1
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen_image.encode_to_denoise
+    final_output: false
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 40
+      true_cfg_scale: 4.0
+      guidance_scale: 1.0
+      height: 1024
+      width: 1024
+
+  - stage_id: 2
+    stage_type: diffusion
+    worker_type: submodule
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: QwenImagePipeline
+      model_stage: decode
+      enforce_eager: true
+      trust_remote_code: true
+      max_num_seqs: 1
+    engine_input_source: [1]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen_image.denoise_to_decode
+    final_output: true
+    final_output_type: image
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 40
+      true_cfg_scale: 4.0
+      guidance_scale: 1.0
+      height: 1024
+      width: 1024

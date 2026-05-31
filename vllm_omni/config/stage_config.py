@@ -162,11 +162,12 @@ class StageType(str, Enum):
 
 
 class StageExecutionType(str, Enum):
-    """Merged StageType + WorkerType — 3 combinations today."""
+    """Merged StageType + WorkerType — 4 combinations today."""
 
     LLM_AR = "llm_ar"
     LLM_GENERATION = "llm_generation"
     DIFFUSION = "diffusion"
+    DIFFUSION_SUBMODULE = "diffusion_submodule"
 
 
 def _resolve_scheduler(
@@ -779,6 +780,7 @@ _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str |
     StageExecutionType.LLM_AR: (StageType.LLM, "ar"),
     StageExecutionType.LLM_GENERATION: (StageType.LLM, "generation"),
     StageExecutionType.DIFFUSION: (StageType.DIFFUSION, None),
+    StageExecutionType.DIFFUSION_SUBMODULE: (StageType.DIFFUSION, "submodule"),
 }
 
 

@@ -221,6 +221,27 @@ class DiffusionEngine:
         logger.debug("Generation completed successfully.")
 
         if output.output is None:
+            if output.multimodal_output:
+                final_output_type = (
+                    f"stage_{getattr(self.od_config, 'model_stage', None)}"
+                    if getattr(self.od_config, "model_stage", None)
+                    else "latents"
+                )
+                return [
+                    OmniRequestOutput.from_diffusion(
+                        request_id=request.request_id,
+                        images=[],
+                        prompt=prompt,
+                        metrics={},
+                        latents=None,
+                        multimodal_output=output.multimodal_output,
+                        final_output_type=final_output_type,
+                        stage_durations=output.stage_durations,
+                        peak_memory_mb=output.peak_memory_mb,
+                    )
+                    for i, prompt in enumerate(request.prompts)
+                ]
+
             logger.warning("Output is None, returning empty OmniRequestOutput")
             return [
                 OmniRequestOutput.from_diffusion(
@@ -683,39 +704,51 @@ class DiffusionEngine:
         num_inference_steps = 1
         height = 512
         width = 512
-        prompt: OmniTextPrompt = {"prompt": "dummy run"}
-
-        supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
-        if supports_image_input:
-            # Provide a dummy image input if the model supports it
-            color_format = image_color_format(self.od_config.model_class_name)
-            dummy_image = PIL.Image.new(color_format, (width, height))
-            prompt.setdefault("multi_modal_data", {})["image"] = dummy_image
-
-        if supports_audio_input:
-            audio_sr = 16000
-            dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
-            prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
-
-        num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
-        req = OmniDiffusionRequest(
-            prompts=[prompt],
-            request_id=DUMMY_DIFFUSION_REQUEST_ID,
-            sampling_params=OmniDiffusionSamplingParams(
+        req = None
+        model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
+        builder = getattr(model_cls, "build_dummy_run_request", None) if model_cls is not None else None
+        if callable(builder):
+            req = builder(
+                self.od_config,
                 height=height,
                 width=width,
                 num_inference_steps=num_inference_steps,
-                num_frames=num_frames,
-                # Keep warmup path minimal and robust across text encoders.
-                # Some models may fail when warmup implicitly triggers
-                # classifier-free guidance with an empty negative prompt.
-                guidance_scale=0.0,
-                num_outputs_per_prompt=1,
-                # Disable CFG for warmup to avoid triggering CFG parallel
-                # validation when cfg_parallel_size > 1.
-                extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
-            ),
-        )
+            )
+        if req is None:
+            prompt: OmniTextPrompt = {"prompt": "dummy run"}
+
+            supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
+            if supports_image_input:
+                # Provide a dummy image input if the model supports it
+                color_format = image_color_format(self.od_config.model_class_name)
+                dummy_image = PIL.Image.new(color_format, (width, height))
+                prompt.setdefault("multi_modal_data", {})["image"] = dummy_image
+
+            if supports_audio_input:
+                audio_sr = 16000
+                dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
+                prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
+
+            num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
+            req = OmniDiffusionRequest(
+                prompts=[prompt],
+                request_id=DUMMY_DIFFUSION_REQUEST_ID,
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=height,
+                    width=width,
+                    num_inference_steps=num_inference_steps,
+                    num_frames=num_frames,
+                    # Keep warmup path minimal and robust across text encoders.
+                    # Some models may fail when warmup implicitly triggers
+                    # classifier-free guidance with an empty negative prompt.
+                    guidance_scale=0.0,
+                    num_outputs_per_prompt=1,
+                    # Disable CFG for warmup to avoid triggering CFG parallel
+                    # validation when cfg_parallel_size > 1.
+                    extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
+                ),
+            )
+
         logger.info("dummy run to warm up the model")
         request = self.pre_process_func(req) if self.pre_process_func is not None else req
         output = self.add_req_and_wait_for_response(request)

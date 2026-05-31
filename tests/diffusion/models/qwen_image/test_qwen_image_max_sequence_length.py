@@ -135,6 +135,7 @@ def test_prepare_encode_defaults_to_tokenizer_max_length():
     pipeline.tokenizer_max_length = 1024
     pipeline.vae_scale_factor = 8
     pipeline.default_sample_size = 128
+    pipeline.stage = "diffusion"
     pipeline.scheduler = _FakeScheduler()
     pipeline._extract_prompts = lambda prompts: (["prompt"], None)
 

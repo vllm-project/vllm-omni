@@ -339,7 +339,7 @@ class TestCFGParallelForwardPath:
                 audio_latents=audio_latents,
                 output_type="latent",
             ),
-            request_id="ltx23-cfg-parallel-forward-test",
+            request_id="ltx23-cfg-forward",
         )
 
         output = pipe.forward(req)

@@ -4,6 +4,8 @@
 import asyncio
 import multiprocessing as mp
 import queue
+import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -23,6 +25,22 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_stage_diffusion_proc_import_keeps_llm_heavy_modules_lazy():
+    code = """
+import sys
+import vllm_omni.diffusion.stage_diffusion_proc  # noqa: F401
+blocked = [
+    "vllm_omni.engine.output_processor",
+    "vllm_omni.quantization.inc_config",
+    "vllm.model_executor.layers.fused_moe.routed_experts_capturer",
+    "vllm.model_executor.models.utils",
+]
+loaded = [name for name in blocked if name in sys.modules]
+assert not loaded, loaded
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 # ───────────────────────────────────────────── helpers ─────────────────────

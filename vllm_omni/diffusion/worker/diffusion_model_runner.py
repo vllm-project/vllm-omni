@@ -251,6 +251,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
         )
 
+    def _build_completed_step_output(self, state: DiffusionRequestState) -> DiffusionOutput:
+        post_intermediate_output = getattr(self.pipeline, "post_intermediate_output", None)
+        if getattr(self.pipeline, "produces_intermediate_stage_output", False) and callable(post_intermediate_output):
+            return post_intermediate_output(state)
+        return self.pipeline.post_decode(state)
+
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
@@ -325,7 +331,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
-                    output = self.pipeline.forward(req)
+                    execute_stage_model = getattr(self.pipeline, "execute_stage_model", None)
+                    if getattr(self.pipeline, "stage", "diffusion") != "diffusion" and callable(execute_stage_model):
+                        output = execute_stage_model(req)
+                    else:
+                        output = self.pipeline.forward(req)
 
             if is_primary:
                 self._record_peak_memory(output)
@@ -494,7 +504,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         )
                         offset = offset + row_num
                         if req.denoise_completed:
-                            result = self.pipeline.post_decode(req)
+                            result = self._build_completed_step_output(req)
                         else:
                             result = None
                         runner_output_list.append(

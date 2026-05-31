@@ -7,6 +7,7 @@ This module contains unit tests and integration tests (with mocking) for the
 OpenAI-compatible async text-to-image generation API endpoints in api_server.py.
 """
 
+import asyncio
 import base64
 import io
 import json
@@ -110,6 +111,47 @@ def test_encode_image_base64():
 
 
 # Integration Tests (with mocking)
+
+
+def test_omni_init_app_state_uses_diffusion_serving_for_multistage_diffusion(mocker: MockerFixture):
+    import vllm_omni.entrypoints.openai.api_server as api_server
+
+    class FakeEngine:
+        stage_configs = [
+            SimpleNamespace(stage_type="diffusion"),
+            SimpleNamespace(stage_type="diffusion"),
+            SimpleNamespace(stage_type="diffusion"),
+        ]
+
+        async def get_vllm_config(self):
+            return None
+
+    state = SimpleNamespace()
+    args = Namespace(
+        served_model_name=None,
+        model="Qwen/Qwen-Image",
+        enable_log_requests=False,
+        max_log_len=0,
+        disable_log_stats=False,
+    )
+    chat = object()
+    audio_generate = object()
+    video = object()
+    speech = object()
+    mocker.patch.object(api_server.OmniOpenAIServingChat, "for_diffusion", return_value=chat)
+    mocker.patch.object(api_server.OmniOpenAIServingAudioGenerate, "for_diffusion", return_value=audio_generate)
+    mocker.patch.object(api_server.OmniOpenAIServingVideo, "for_diffusion", return_value=video)
+    mocker.patch.object(api_server.OmniOpenAIServingSpeech, "for_diffusion", return_value=speech)
+
+    asyncio.run(api_server.omni_init_app_state(FakeEngine(), state, args))
+
+    assert state.vllm_config is None
+    assert isinstance(state.openai_serving_models, _DiffusionServingModels)
+    assert state.openai_serving_chat is chat
+    assert state.openai_serving_audio_generate is audio_generate
+    assert state.openai_serving_video is video
+    assert state.openai_serving_speech is speech
+    assert not hasattr(state, "openai_serving_render")
 
 
 class MockGenerationResult:

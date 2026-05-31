@@ -1029,7 +1029,22 @@ class AsyncOmniEngine:
                             if omni_conn_cfg:
                                 inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
                             inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self.stage_configs)
-                            if self.single_stage_mode:
+                            if getattr(plan.stage_cfg, "worker_type", None) == "submodule":
+                                if self.single_stage_mode:
+                                    raise NotImplementedError(
+                                        "Diffusion submodule stages do not support single_stage_mode yet. "
+                                        "Use normal multi-stage startup for worker_type='submodule'."
+                                    )
+                                client = initialize_diffusion_stage(
+                                    plan.metadata.stage_id,
+                                    self.model,
+                                    plan.stage_cfg,
+                                    plan.metadata,
+                                    stage_init_timeout=stage_init_timeout,
+                                    batch_size=self.diffusion_batch_size,
+                                    use_inline=False,
+                                )
+                            elif self.single_stage_mode:
                                 assert self._omni_master_server is not None
                                 od_config = build_diffusion_config(self.model, plan.stage_cfg, plan.metadata)
                                 lock_fds = acquire_diffusion_device_locks(

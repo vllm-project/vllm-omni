@@ -279,6 +279,10 @@ class DiffusersPipelineLoader:
             )
         )
 
+    @staticmethod
+    def _weights_loaded_by_model_init(model: nn.Module) -> bool:
+        return bool(getattr(model, "weights_loaded_by_model_init", False))
+
     def _get_expected_parameter_names(self, model: nn.Module) -> set[str]:
         """Return parameter names that should be covered by strict load checks."""
         all_parameter_names = {name for name, _ in model.named_parameters()}
@@ -419,6 +423,15 @@ class DiffusersPipelineLoader:
                     module.to(module_device)
 
     def load_weights(self, model: nn.Module) -> None:
+        sources = self._get_weight_sources(model)
+        if not sources and self._weights_loaded_by_model_init(model):
+            logger.info(
+                "%s declares weights were loaded during model initialization; "
+                "skipping explicit diffusers weight loading.",
+                model.__class__.__name__,
+            )
+            return
+
         weights_to_load = self._get_expected_parameter_names(model)
         loaded_weights = model.load_weights(self.get_all_weights(model))
 

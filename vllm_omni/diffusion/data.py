@@ -422,6 +422,7 @@ class OmniDiffusionConfig:
     model: str | None = None
 
     model_class_name: str | None = None
+    model_stage: str | None = None
 
     dtype: torch.dtype = torch.bfloat16
 
@@ -1020,6 +1021,9 @@ class DiffusionOutput:
     # Extra custom output data (e.g. latent trajectories, prompt embeds)
     # passed through to OmniRequestOutput.custom_output
     custom_output: dict[str, Any] = field(default_factory=dict)
+
+    # Intermediate stage payloads passed through OmniRequestOutput.multimodal_output.
+    multimodal_output: dict[str, Any] = field(default_factory=dict)
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None

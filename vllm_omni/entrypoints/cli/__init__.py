@@ -1,13 +1,30 @@
-"""CLI helpers for vLLM-Omni entrypoints."""
+"""CLI helpers for vLLM-Omni entrypoints.
 
-# To ensure patch imports work properly, disable unused import checks
-# ruff: noqa: E402, F401
-# isort: off
-from vllm_omni.benchmarks.patch import patch
-# isort: on
+Keep this package import lightweight. Multiprocessing ``spawn`` re-imports the
+main module's package in stage subprocesses, and eager benchmark imports can
+trigger CUDA/NVML probing before the stage has finished bootstrapping.
+"""
 
-from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+from __future__ import annotations
 
-from .serve import OmniServeCommand
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+
+    from .serve import OmniServeCommand
+
 
 __all__ = ["OmniServeCommand", "OmniBenchmarkServingSubcommand"]
+
+
+def __getattr__(name: str):
+    if name == "OmniServeCommand":
+        from .serve import OmniServeCommand
+
+        return OmniServeCommand
+    if name == "OmniBenchmarkServingSubcommand":
+        from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+
+        return OmniBenchmarkServingSubcommand
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

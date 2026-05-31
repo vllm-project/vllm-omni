@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import typing
 
 from vllm.entrypoints.cli.types import CLISubcommand
@@ -25,7 +26,25 @@ class OmniBenchmarkSubcommand(CLISubcommand):
     def validate(self, args: argparse.Namespace) -> None:
         pass
 
+    @staticmethod
+    def _load_requested_benchmark_subcommands() -> None:
+        is_benchmark_invocation = False
+        for arg in sys.argv[1:]:
+            if arg.startswith("-"):
+                continue
+            is_benchmark_invocation = arg == "bench"
+            break
+        if not is_benchmark_invocation:
+            return
+
+        # Registers OmniBenchmarkServingSubcommand via __subclasses__(). This is
+        # intentionally lazy: importing it loads vllm.benchmarks and the Omni
+        # benchmark monkey patches, which can probe CUDA/NVML.
+        import vllm_omni.entrypoints.cli.benchmark.serve  # noqa: F401
+
     def subparser_init(self, subparsers: argparse._SubParsersAction) -> FlexibleArgumentParser:
+        self._load_requested_benchmark_subcommands()
+
         bench_parser = subparsers.add_parser(
             self.name, description=self.help, usage=f"vllm {self.name} <bench_type> [options]"
         )

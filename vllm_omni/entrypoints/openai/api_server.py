@@ -552,7 +552,7 @@ async def omni_init_app_state(
 
     Sets up the application state with model information, request logger,
     and other server configuration needed for handling API requests.
-    Automatically detects pure diffusion mode (single diffusion stage) and
+    Automatically detects diffusion-only mode and
     handles it appropriately.
 
     Args:
@@ -563,15 +563,15 @@ async def omni_init_app_state(
     # Get vllm_config from engine_client (following 0.14.0 pattern)
     vllm_config = await _get_vllm_config(engine_client)
 
-    # Detect if it's pure Diffusion mode (single stage and is Diffusion)
+    # Detect diffusion-only mode. Multi-stage diffusion pipelines do not have
+    # an LLM vllm_config either, so they must use the same lightweight OpenAI
+    # serving state as single-stage diffusion.
     is_pure_diffusion = False
     if hasattr(engine_client, "stage_configs") and engine_client.stage_configs:
         stage_configs = engine_client.stage_configs
-        if len(stage_configs) == 1:
-            stage_type = get_stage_type(stage_configs[0])
-            if stage_type == "diffusion":
-                is_pure_diffusion = True
-                logger.info("Detected pure diffusion mode (single diffusion stage)")
+        if vllm_config is None and all(get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs):
+            is_pure_diffusion = True
+            logger.info("Detected diffusion-only mode (%d diffusion stage(s))", len(stage_configs))
 
     if args.served_model_name is not None:
         served_model_names = args.served_model_name

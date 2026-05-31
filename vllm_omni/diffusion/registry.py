@@ -5,7 +5,6 @@ import importlib
 
 import torch.nn as nn
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -299,6 +298,8 @@ def _prepare_diffusion_quant_config(
     quant_config = getattr(od_config, "quantization_config", None)
     if quant_config is None:
         return
+    from vllm.model_executor.model_loader.utils import configure_quant_config
+
     if hasattr(quant_config, "maybe_update_config"):
         quant_config.maybe_update_config(od_config.model)
     diffusion_packed_modules_mapping = current_omni_platform.get_diffusion_packed_modules_mapping(model_class)
@@ -585,6 +586,11 @@ def _load_process_func(od_config: OmniDiffusionConfig, func_name: str):
 
 def get_diffusion_post_process_func(od_config: OmniDiffusionConfig):
     if od_config.model_class_name not in _DIFFUSION_POST_PROCESS_FUNCS:
+        return None
+    if (
+        od_config.model_class_name in {"QwenImagePipeline", "QwenImageDMD2Pipeline"}
+        and getattr(od_config, "model_stage", None) == "denoise"
+    ):
         return None
     func_name = _DIFFUSION_POST_PROCESS_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)
