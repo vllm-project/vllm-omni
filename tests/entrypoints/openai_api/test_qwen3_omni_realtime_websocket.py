@@ -44,7 +44,6 @@ realtime_server_params = [
             model=MODEL,
             stage_config_path=default_stage_config,
             use_stage_cli=True,
-            server_args=["--no-async-chunk"],
         ),
         id="default",
     ),
