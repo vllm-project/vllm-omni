@@ -21,7 +21,7 @@ by msModelSlim and the merge tools.
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ | ✅ | ⭕ | ⭕ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ | ✅ | ⭕ | ⭕ |
 | AMD ROCm | ⭕ | ⭕ | ⭕ | ⭕ |
-| Intel XPU | ⭕ | ⭕ | ⭕ | ⭕ |
+| Intel XPU | ⭕ | ⭕ | ✅ | ⭕ |
 | Ascend NPU | ❌ | ✅ | ✅ | ✅ |
 
 Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
@@ -36,7 +36,7 @@ MXFP4 are documented for the Ascend NPU path.
 |--------|-------|----------------|--------|
 | FP8 W8A8 | [FP8](fp8.md) | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image family and other DiT models |
 | Int8 W8A8 | [Int8](int8.md) | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image and Z-Image |
-| MXFP8 W8A8 | [MXFP8](mxfp8.md) | Wan2.2-T2V-A14B, Wan2.2-I2V-A14B, Wan2.2-TI2V-5B | Ascend NPU only |
+| MXFP8 W8A8 | [MXFP8](mxfp8.md) | Wan2.2-T2V-A14B, Wan2.2-I2V-A14B, Wan2.2-TI2V-5B | Validated on Ascend NPU and Intel XPU |
 | MXFP4 W4A4 | [MXFP4](mxfp4.md) | Wan2.2-T2V-A14B, Wan2.2-I2V-A14B | Ascend NPU only; TI2V-5B is not supported |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)

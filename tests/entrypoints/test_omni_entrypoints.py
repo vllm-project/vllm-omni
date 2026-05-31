@@ -16,6 +16,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.outputs import OmniRequestOutput
@@ -165,6 +166,14 @@ class FakeAsyncOmniEngine:
 def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) -> None:
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", lambda *args, **kwargs: engine)
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
+    # Don't add random UUIDs to requests calling .generate since we usually
+    # just want to check for present requests anyway, and would need to just
+    # strip the UUID. Explicit checks against the mapping are in tests for
+    # AsyncOmni, or explicitly set the client req states.
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.async_omni.AsyncOmni._get_unique_request_id",
+        staticmethod(lambda request_id: request_id),
+    )
 
 
 def test_direct_omni_with_nullified_parser_only_nulls_untyped_override_fields(
@@ -184,7 +193,7 @@ def test_direct_omni_with_nullified_parser_only_nulls_untyped_override_fields(
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--hsdp-shard-size", type=int, default=-1)
+    parser.add_argument("--batch-timeout", type=int, default=10)
     nullify_stage_engine_defaults(parser)
     args = parser.parse_args([])
     args.model = "fake-model"
@@ -192,7 +201,7 @@ def test_direct_omni_with_nullified_parser_only_nulls_untyped_override_fields(
     Omni(**vars(args))
 
     assert captured["gpu_memory_utilization"] is None
-    assert captured["hsdp_shard_size"] == -1
+    assert captured["batch_timeout"] == 10
     assert "_cli_explicit_keys" not in captured
 
 
@@ -233,7 +242,7 @@ def test_deprecated_from_cli_args_preserves_legacy_parser_nulling(
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--hsdp-shard-size", type=int, default=-1)
+    parser.add_argument("--batch-timeout", type=int, default=10)
     args = parser.parse_args([])
     args.model = "fake-model"
 
@@ -241,7 +250,7 @@ def test_deprecated_from_cli_args_preserves_legacy_parser_nulling(
         Omni.from_cli_args(args, parser=parser)
 
     assert captured["gpu_memory_utilization"] is None
-    assert captured["hsdp_shard_size"] == -1
+    assert captured["batch_timeout"] == 10
 
 
 def _make_base():
@@ -623,16 +632,23 @@ async def test_async_omni_llm_diffusion_yields_text_stream_then_image(monkeypatc
 async def test_async_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
     engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META)
     _patch_engine(monkeypatch, engine)
-
     app = AsyncOmni("dummy-model")
+
+    # Requests internally have a random UUID appended to the
+    # external ID to avoid collisions, so this also tests mapping
+    external_req_id = "req-1"
+    req_id = "req-1-12345678"
     try:
-        app.request_states["req-1"] = object()
-        await app.abort("req-1")
+        app.request_states[req_id] = ClientRequestState(
+            request_id=req_id,
+            external_request_id=external_req_id,
+        )
+        await app.abort(external_req_id)
     finally:
         app.shutdown()
 
-    assert engine.aborted == [["req-1"]]
-    assert "req-1" not in app.request_states
+    assert engine.aborted == [[req_id]]
+    assert external_req_id not in app.request_states
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ For the full list of supported architectures across all modalities, see
 |---|---|---|---|---|---|
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
+| higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` | ✓ (`ref_audio`+`ref_text`) | ✓ (codec_streaming) | — | — |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
@@ -193,6 +194,45 @@ python fish_speech/gradio_demo.py --api-base http://localhost:8091  # if server 
 
 ---
 
+## higgs-audio v2
+
+2-stage TTS at 24 kHz: a vLLM-native Llama-3.2-3B talker with a DualFFN audio expert (Stage 0) feeding a HiggsAudio codec decoder (Stage 1) that streams chunks back to the client.
+
+### Prerequisites
+
+Voice clone uses HF's `HiggsAudioV2TokenizerModel` loaded from `k2-fsa/OmniVoice/audio_tokenizer/` (~806 MB subdir; the boson-ai standalone tokenizer Hub repo's `model.safetensors` is the 3B talker LM, not the codec):
+
+```bash
+pip install -U "transformers>=5.3.0"
+```
+
+### Launch
+```bash
+GPUS=6,7 PORT=8094 bash examples/online_serving/text_to_speech/higgs_audio_v2/run_server.sh
+```
+Deploy config auto-loads from `vllm_omni/deploy/higgs_audio_v2.yaml`.
+
+### Sending requests
+```bash
+# Plain TTS
+python higgs_audio_v2/batch_speech_client.py \
+    --base-url http://localhost:8094 \
+    --output-dir /tmp/higgs_out \
+    --prompts "Hello world." "The quick brown fox jumps over the lazy dog."
+
+# Voice cloning — pass a reference clip and its transcript together
+python higgs_audio_v2/batch_speech_client.py \
+    --base-url http://localhost:8094 \
+    --output-dir /tmp/higgs_clone \
+    --ref-audio /path/to/reference.wav \
+    --ref-text  "Exact transcript spoken in reference.wav." \
+    --prompts "Hello, this is a cloned voice."
+```
+
+### Notes
+- Output: 24 kHz mono.
+- `--ref-text` must be the real transcript of `--ref-audio`; mismatched text degrades cloned-voice quality.
+- Out of scope (rejected with explicit 4xx): multi-speaker `[SPEAKERn]` tags inside `input`, `profile:` text-only speaker descriptions, the `ref_audio_in_system_message` system-block variant, chunked long-form generation, and per-request `voice` / `instructions` / `task_type` / `language` / `speed != 1.0` / `x_vector_only_mode` / `speaker_embedding`.
 ## GLM-TTS
 
 2-stage TTS (AR + DiT flow-matching) at 24 kHz. Every request requires `ref_audio` + `ref_text`.
@@ -288,6 +328,16 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091
 Single-GPU serves now default to the uniproc executor (lower IPC overhead, the Base cloning use case from [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) / [#2604](https://github.com/vllm-project/vllm-omni/pull/2604)). `vllm_omni/deploy/qwen3_tts.yaml` is the only Qwen3-TTS deploy config; pass `--deploy-config <path>` to override.
 
 To opt out of chunked streaming, pass `--no-async-chunk` — the pipeline auto-dispatches to the end-to-end codec processor.
+
+### Tuning stage 1 `max_num_seqs` per task type
+The bundled `qwen3_tts.yaml` ships stage 1 (Code2Wav) at `max_num_seqs: 10`, tuned for Base voice cloning: stage-1 lifetimes are long (~3 s/req), so admitting up to 10 concurrent codec sequences lets requests progress in parallel in the scheduler — ~2× TTFA p95 at c=4 / c=8 (1× H100, 1.7B-Base, seed-tts) at an 8–12 % audio-throughput cost.
+
+CustomVoice / VoiceDesign have much shorter stage-1 lifetimes (~50–200 ms) and are TTFA-optimal at `max_num_seqs: 1`. Override the default when serving those task types:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
+    --stage-overrides '{"1": {"max_num_seqs": 1}}'
+```
 
 ### Sending requests
 ```bash
@@ -459,6 +509,13 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
     ``````py
     --8<-- "examples/online_serving/text_to_speech/fish_speech/speech_client.py"
     ``````
+??? abstract "higgs_audio_v2/batch_speech_client.py"
+    ``````py
+    --8<-- "examples/online_serving/text_to_speech/higgs_audio_v2/batch_speech_client.py"
+    ``````
+??? abstract "higgs_audio_v2/run_server.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_speech/higgs_audio_v2/run_server.sh"
 ??? abstract "glm_tts/gradio_demo.py"
     ``````py
     --8<-- "examples/online_serving/text_to_speech/glm_tts/gradio_demo.py"

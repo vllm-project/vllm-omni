@@ -68,7 +68,7 @@ def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info():
 
         request = captured["request"]
         assert request.request_id == "req-parent"
-        assert request.request_ids == ["req-parent-0", "req-parent-1"]
+        assert not hasattr(request, "request_ids")
         assert request.kv_sender_info == {0: {"host": "10.0.0.2", "zmq_port": 50151}}
         assert result.request_id == "req-parent"
         assert result.images == ["img-1", "img-2"]

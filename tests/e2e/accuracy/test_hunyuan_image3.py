@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import requests
 import torch
 import yaml
 from PIL import Image
@@ -27,6 +28,7 @@ from tests.e2e.accuracy.helpers import (
     model_output_dir,
 )
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner, OmniServer
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens, resolve_stop_token_ids
 
 os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
@@ -75,9 +77,9 @@ THRESHOLDS = {
     "text_prefix_match": 10,  # First 10 characters must match exactly
     "cot_semantic_sim": 0.9,  # Full CoT semantic similarity
     # Image comparison
-    "clip_score": 85,  # CLIP image semantic similarity
-    "ssim": 0.20,  # Structural similarity
-    "psnr": 11.0,  # Peak signal-to-noise ratio (dB)
+    "clip_score": 90,  # CLIP image semantic similarity
+    "ssim": 0.26,  # Structural similarity
+    "psnr": 12.5,  # Peak signal-to-noise ratio (dB)
 }
 
 QUANT_PROMPT = "A brown and white dog is running on the grass."
@@ -240,7 +242,6 @@ def _make_quant_dit_config(path: Path) -> None:
 def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
     from transformers import AutoTokenizer
 
-    from tests.helpers.runtime import OmniRunner
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
     from vllm_omni.platforms import current_omni_platform
 
@@ -311,6 +312,107 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     if torch.accelerator.is_available():
         torch.accelerator.empty_cache()
     return image, cot_text, elapsed
+
+
+def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+    from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
+
+    server_args = [
+        "--stage-configs-path",
+        stage_configs_path,
+        "--stage-init-timeout",
+        "300",
+        "--init-timeout",
+        "900",
+    ]
+    try:
+        with OmniServer(MODEL_PATH, server_args, use_omni=True) as omni_server:
+            images = download_images(TEST_IMAGE_URLS)
+            t0 = time.perf_counter()
+            response = requests.post(
+                f"http://{omni_server.host}:{omni_server.port}/v1/images/edits",
+                data={
+                    "model": omni_server.model,
+                    "prompt": PROMPT,
+                    "n": 1,
+                    "response_format": "b64_json",
+                    "num_inference_steps": NUM_INFERENCE_STEPS,
+                    "guidance_scale": GUIDANCE_SCALE,
+                    "seed": SEED,
+                    "sys_type": "en_unified",
+                    "bot_task": "think_recaption",
+                    "size": "1280x720",
+                },
+                files=[
+                    ("image", (f"image_{i}.png", pil_to_png_bytes(img), "image/png")) for i, img in enumerate(images)
+                ],
+                timeout=600,
+            )
+            elapsed = time.perf_counter() - t0
+            if not response.ok:
+                print(f"[ONLINE] HTTP {response.status_code} response body: {response.text}")
+            response.raise_for_status()
+            payload = response.json()
+            assert len(payload["data"]) == 1
+            image = decode_base64_image(payload["data"][0]["b64_json"])
+            image.load()
+            image.save(output_path / "image_online.png")
+            cot_text = payload.get("cot_output") or ""
+            (output_path / "cot_online.txt").write_text(cot_text, encoding="utf-8")
+            return image, cot_text, elapsed
+    finally:
+        gc.collect()
+        if torch.accelerator.is_available():
+            torch.accelerator.empty_cache()
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < AR_TP_SIZE + DIT_TP_SIZE,
+    reason=f"Needs {AR_TP_SIZE + DIT_TP_SIZE}+ GPUs ({AR_TP_SIZE} AR + {DIT_TP_SIZE} DiT)",
+)
+def test_image_to_image_alignment_online(accuracy_artifact_root: Path, accuracy_assets_root: Path) -> None:
+    """Online API test: same pipeline, same seed as offline → PSNR >= 10 dB."""
+    if importlib.util.find_spec("FlagEmbedding") is None:
+        raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
+    from tabulate import tabulate
+
+    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-online")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        _make_config(True, tmp / "online.yaml")
+        online_image, online_cot, _ = _run_online(str(tmp / "online.yaml"), output_dir)
+
+    online_cot = online_cot.lstrip("\n")
+    scorer = SemanticSimilarityScorer()
+    clip_scorer = CLIPScorer()
+    cot_results = scorer.text_similarity(online_cot, COT_REF)
+    image_ref = Image.open(str(accuracy_assets_root / "hunyuan_image_ref.png")).convert("RGB")
+    image_clip_score = clip_scorer.image_image_score(online_image, image_ref)
+    ssim_value, psnr_value = compute_image_ssim_psnr(prediction=online_image, reference=image_ref, compare_mode="RGB")
+
+    table = [
+        ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", 0.9644],
+        ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", 29],
+        ["Image-Image similarity", f"{image_clip_score:.4f}", 94.5538],
+        ["SSIM", f"{ssim_value:.4f}", 0.242],
+        ["PSNR (dB)", f"{psnr_value:.2f}", 14.1],
+    ]
+    print("[ONLINE] " + tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
+
+    assert cot_results["cot_semantic_sim"] >= THRESHOLDS["cot_semantic_sim"], (
+        f"[ONLINE] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} below threshold {THRESHOLDS['cot_semantic_sim']}"
+    )
+    assert cot_results["text_prefix_match_count"] >= THRESHOLDS["text_prefix_match"], (
+        f"[ONLINE] COT prefix match {cot_results['text_prefix_match_count']} below threshold {THRESHOLDS['text_prefix_match']}"
+    )
+    assert image_clip_score >= THRESHOLDS["clip_score"], (
+        f"[ONLINE] Image-Image similarity {image_clip_score:.4f} below threshold {THRESHOLDS['clip_score']}"
+    )
+    assert ssim_value >= THRESHOLDS["ssim"], f"[ONLINE] SSIM {ssim_value:.4f} below threshold {THRESHOLDS['ssim']}"
+    assert psnr_value >= THRESHOLDS["psnr"], (
+        f"[ONLINE] PSNR {psnr_value:.2f} dB below threshold {THRESHOLDS['psnr']} dB"
+    )
 
 
 def _extract_image(outputs) -> Image.Image:

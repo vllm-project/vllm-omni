@@ -117,8 +117,16 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.ming_flash_omni.pipeline",
         "MING_FLASH_OMNI_THINKER_ONLY_PIPELINE",
     ),
+    "ming_flash_omni_image": (
+        "vllm_omni.model_executor.models.ming_flash_omni.pipeline",
+        "MING_FLASH_OMNI_IMAGE_PIPELINE",
+    ),
     "moss_tts_nano": (
         "vllm_omni.model_executor.models.moss_tts_nano.pipeline",
         "MOSS_TTS_NANO_PIPELINE",
+    ),
+    "higgs_audio_v2": (
+        "vllm_omni.model_executor.models.higgs_audio_v2.pipeline",
+        "HIGGS_AUDIO_V2_PIPELINE",
     ),
 }

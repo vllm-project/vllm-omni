@@ -292,6 +292,7 @@ class CosyVoice3Code2Wav(nn.Module):
         prompt_feat: torch.Tensor,
         embedding: torch.Tensor,
         n_timesteps: int = 10,
+        token_offset_tokens: int = 0,
     ) -> torch.Tensor:
         """Generate audio waveform from speech tokens."""
         feat = self._forward_mel(
@@ -300,7 +301,7 @@ class CosyVoice3Code2Wav(nn.Module):
             prompt_feat=prompt_feat,
             embedding=embedding,
             n_timesteps=n_timesteps,
-            token_offset_tokens=0,
+            token_offset_tokens=token_offset_tokens,
             streaming=False,
             finalize=True,
         )

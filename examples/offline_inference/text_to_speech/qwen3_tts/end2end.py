@@ -43,8 +43,8 @@ def _estimate_prompt_len(
     """
     try:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
-        from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
-            Qwen3TTSTalkerForConditionalGeneration,
+        from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+            Qwen3TTSPromptEmbedsBuilder,
         )
 
         if model_name not in _cache:
@@ -124,7 +124,7 @@ def _estimate_prompt_len(
             except Exception:
                 return None
 
-        return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+        return Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
             additional_information=additional_information,
             task_type=task_type,
             tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],

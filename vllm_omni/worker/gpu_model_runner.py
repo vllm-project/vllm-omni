@@ -1,10 +1,10 @@
 import contextlib
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
-from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
@@ -32,6 +32,7 @@ from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -95,31 +96,121 @@ class OmniGPUModelRunner(GPUModelRunner):
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
+        self._init_talker_mtp()
+        self._prewarm_attention_capture_workspaces()
 
+    def _init_talker_mtp(self) -> None:
         # TODO move this model specific logic to a separate class
         # TTS model IS the talker (no .talker sub-attr); use getattr to support both Omni and TTS.
         self.has_talker_mtp = False
         talker_mtp = getattr(self.model, "talker_mtp", None)
-        if talker_mtp is not None:
-            self.talker_mtp = talker_mtp  # type: ignore[assignment]
-            self.has_talker_mtp = True
-            cudagraph_mode = self.compilation_config.cudagraph_mode
-            assert cudagraph_mode is not None
-            has_separate_talker = getattr(self.model, "talker", None) is not None
-            talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
-            if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
-                self.talker_mtp = CUDAGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
-            # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
-            hidden_size = int(
-                getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
-            )
-            max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
-            self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
-            self.talker_mtp_inputs_embeds = self._make_buffer(
-                max_batch_size, hidden_size, dtype=self.dtype, numpy=False
-            )
-            self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
-            self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+        if talker_mtp is None:
+            return
+        self.talker_mtp = talker_mtp  # type: ignore[assignment]
+        self.has_talker_mtp = True
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        assert cudagraph_mode is not None
+        has_separate_talker = getattr(self.model, "talker", None) is not None
+        talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
+        if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
+            graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
+            self.talker_mtp = graph_wrapper_cls(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+        # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
+        hidden_size = int(
+            getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
+        )
+        max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
+        self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
+        self.talker_mtp_inputs_embeds = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+        self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+        self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+
+    def _prewarm_attention_capture_workspaces(self) -> None:
+        capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
+        if not capture_sizes:
+            return
+        from vllm_omni.attention.fish_kvcache_backend import prewarm_fish_kvcache_attn_capture_workspaces
+
+        prewarm_fish_kvcache_attn_capture_workspaces(
+            model_config=self.model_config,
+            device=self.device,
+            dtype=self.dtype,
+            capture_sizes=capture_sizes,
+        )
+
+    def _maybe_attach_attention_metadata_extensions(
+        self,
+        *,
+        attn_metadata: Any,
+        num_reqs: int,
+        num_reqs_padded: int,
+        max_query_len: int,
+        pad_attn: bool,
+        for_cudagraph_capture: bool = False,
+        num_scheduled_tokens_np: np.ndarray | None = None,
+    ) -> None:
+        from vllm_omni.attention.fish_kvcache_backend import maybe_attach_fish_kvcache_seq_lens_upper_bound
+
+        maybe_attach_fish_kvcache_seq_lens_upper_bound(
+            model_config=self.model_config,
+            attn_metadata=attn_metadata,
+            input_batch=self.input_batch,
+            optimistic_seq_lens_cpu=self.optimistic_seq_lens_cpu,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            max_query_len=max_query_len,
+            pad_attn=pad_attn,
+            for_cudagraph_capture=for_cudagraph_capture,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+        )
+
+    def _build_model_sampler_output_token_ids(self) -> list[list[int]]:
+        """Build decoded-token history for ``prefer_model_sampler`` models.
+
+        vLLM only populates ``sampling_metadata.output_token_ids`` when penalties
+        or logits processors require it. Models that opt into a custom sampler
+        (e.g. CosyVoice3 RAS sampler, HunyuanImage3 stage-transition sampler)
+        also depend on this history, so we reconstruct it directly from the
+        input batch. Shared by GPU and NPU AR runners.
+        """
+        req_output_token_ids = getattr(self.input_batch, "req_output_token_ids", [])
+        req_ids = list(getattr(self.input_batch, "req_ids", []))
+        output_token_ids = [list(req_output_token_ids[idx] or []) for idx in range(len(req_ids))]
+
+        sampled_token_ids_cpu = getattr(self.input_batch, "sampled_token_ids_cpu", None)
+        async_copy_ready_event = getattr(self.input_batch, "async_copy_ready_event", None)
+        prev_req_id_to_index = getattr(self.input_batch, "prev_req_id_to_index", None)
+        if sampled_token_ids_cpu is None or not output_token_ids or prev_req_id_to_index is None:
+            return output_token_ids
+
+        sampled_token_ids: list[list[int]] | None = None
+        for index, req_id in enumerate(req_ids):
+            prev_index = prev_req_id_to_index.get(req_id)
+            if prev_index is None:
+                continue
+            req_history = output_token_ids[index]
+            if not req_history or req_history[-1] != -1:
+                continue
+            if sampled_token_ids is None:
+                assert async_copy_ready_event is not None
+                async_copy_ready_event.synchronize()
+                sampled_token_ids = sampled_token_ids_cpu.tolist()
+            new_ids = list(sampled_token_ids[prev_index])
+            if not new_ids:
+                continue
+            num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
+            first_placeholder = req_history.index(-1)
+            num_placeholders = len(req_history) - first_placeholder
+            num_to_replace = min(num_sampled_ids, num_placeholders)
+            req_history[first_placeholder : first_placeholder + num_to_replace] = new_ids[:num_to_replace]
+
+        return output_token_ids
+
+    def _sampling_metadata_for_model_sampler(self, sampling_metadata):
+        output_token_ids = self._build_model_sampler_output_token_ids()
+        if output_token_ids == sampling_metadata.output_token_ids:
+            return sampling_metadata
+        return replace(sampling_metadata, output_token_ids=output_token_ids)
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
@@ -272,17 +363,22 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         # Remove finished requests from the cached states.
         # cleanup_finished_request lives on OmniConnectorModelRunnerMixin and
-        # is only safe to call once init_omni_connectors() has populated the
-        # mixin state. Archs that inherit the method via MRO without running
-        # that init must be skipped, so probe a mixin-owned attribute as the
-        # "state initialized" gate.
+        # is only safe to call once init_omni_connectors() has finished
+        # populating mixin state (it sets ``_omni_connector_initialized = True``
+        # at the very end).  Archs that inherit the method via MRO without
+        # running that init must be skipped, so gate on the explicit flag
+        # rather than probing private attribute names.
         cleanup_finished_request = (
-            getattr(self, "cleanup_finished_request", None) if hasattr(self, "_request_ids_mapping") else None
+            getattr(self, "cleanup_finished_request", None)
+            if getattr(self, "_omni_connector_initialized", False)
+            else None
         )
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            if self.omni_prefix_cache is not None:
+                self.omni_prefix_cache.discard_deferred_mm_outputs(req_id)
             if hasattr(self, "_downstream_payload_cache"):
                 self._downstream_payload_cache.pop(req_id, None)
             if hasattr(self, "_talker_mtp_generators"):
@@ -846,6 +942,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
+                )
+                self._maybe_attach_attention_metadata_extensions(
+                    attn_metadata=attn_metadata,
+                    num_reqs=num_reqs_padded,
+                    num_reqs_padded=num_reqs_padded,
+                    max_query_len=max_query_len,
+                    pad_attn=True,
+                    for_cudagraph_capture=is_graph_capturing,
                 )
 
         with self.maybe_dummy_run_with_lora(
@@ -1543,9 +1647,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             use_cascade_attn=False,
         )
         # Force eager for unwrapped code predictors (AR loops / multinomial).
-        # When talker_mtp is not a CUDAGraphWrapper, it manages its own CUDA
-        # graphs internally (code_predictor has its own bucket sizes).
-        if not isinstance(self.talker_mtp, CUDAGraphWrapper):
+        # When talker_mtp is not wrapped by the platform's full-graph wrapper,
+        # it manages its own device graphs internally (code_predictor has its
+        # own bucket sizes).
+        if not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()):
             _cudagraph_mode = CUDAGraphMode.NONE
             num_tokens_padded = decode_batch_size
         else:
@@ -1609,7 +1714,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         }
         if generator is not None:
             talker_kwargs["generator"] = generator
-        with set_forward_context(
+        with current_omni_platform.set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
             req_embeds, code_predictor_codes = self.talker_mtp(
@@ -1663,7 +1768,12 @@ class OmniGPUModelRunner(GPUModelRunner):
             if key in gpu_keys:
                 dest[key] = value.detach().clone()
             else:
-                dest[key] = value.detach().to("cpu").contiguous()
+                t = value.detach()
+                if t.is_cuda:
+                    dest[key] = t.to("cpu").contiguous()
+                else:
+                    # If the tensor is already on the CPU, there is no need to unload it to the CPU.
+                    dest[key] = t.contiguous()
         elif isinstance(value, list):
             dest[key] = [
                 (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in value

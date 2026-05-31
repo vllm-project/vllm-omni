@@ -18,7 +18,7 @@ For the full list of supported architectures across all modalities, see
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
-| OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
+| OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
@@ -141,6 +141,26 @@ bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
 ### Prerequisites
 ```bash
 pip install fish-speech
+```
+
+### Kvcache attention fast path
+
+Fish Speech S2 Pro uses a Triton decode-only kvcache attention fast path by
+default on CUDA builds. Set `VLLM_OMNI_FISH_KVCACHE_ATTN=0` to disable it, or
+`VLLM_OMNI_FISH_KVCACHE_ATTN=required` to fail fast if the fast path cannot be
+installed.
+
+```bash
+# Verify fast path availability.
+python - <<'PY'
+from vllm_omni.attention import fish_kvcache_attn
+
+print(fish_kvcache_attn.is_available())
+print(fish_kvcache_attn.load_error())
+PY
+
+# Optional: disable the runtime fast path.
+export VLLM_OMNI_FISH_KVCACHE_ATTN=0
 ```
 
 ### Launch
@@ -301,16 +321,29 @@ vllm serve k2-fsa/OmniVoice --omni --port 8091 --trust-remote-code
 ### CLI client
 ```bash
 cd examples/online_serving/text_to_speech/omnivoice
+# Text-only (auto voice)
 python speech_client.py --text "Hello, how are you?"
+
+# Language hint
 python speech_client.py --text "Bonjour, comment allez-vous?" --language French
+# Voice cloning (reference audio + optional ref_text)
+python speech_client.py \
+--text "Bonjour, comment allez-vous?" \
+--ref-audio /path/to/ref_audio.wav \
+--ref-text "Bonjour, comment allez-vous?"
+
+# Style instruction (voice design-style control)
+python speech_client.py \
+--text "Bonjour, comment allez-vous?" \
+--language French \
+--instructions "loud voice"
+
+# Deterministic output with seed parameter
+python speech_client.py --text "Hello, how are you?" --seed 42
 ```
 
-The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--output`.
+The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--voice`, `--ref-audio`, `--ref-text`, `--instructions`, `--seed`, and `--output`.
 
-### Notes
-- Voice cloning and voice design require offline inference; see the [offline OmniVoice section](../../offline_inference/text_to_speech/README.md#omnivoice).
-
----
 
 ## Qwen3-TTS
 

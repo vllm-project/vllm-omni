@@ -22,9 +22,8 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
-    uses_qwen3_omni_full_payload_input_coordinator,
+    uses_full_payload_input_coordinator,
 )
-from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
@@ -81,7 +80,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         self.input_coordinator: OmniSchedulingCoordinator | None = None
-        if uses_qwen3_omni_full_payload_input_coordinator(model_config):
+        if uses_full_payload_input_coordinator(model_config):
             self.input_coordinator = OmniSchedulingCoordinator(
                 scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
                 stage_id=getattr(model_config, "stage_id", 0),
@@ -211,18 +210,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
-        connector_output = self._latest_omni_connector_output
-        self._latest_omni_connector_output = None
-        if self.input_coordinator:
-            if connector_output and connector_output.request_metadata:
-                self.input_coordinator.update_request_metadata(
-                    self.requests, connector_output.request_metadata, model_mode="ar"
-                )
-            self.input_coordinator.process_pending_full_payload_inputs(
-                self.waiting,
-                self.running,
-                connector_output.stage_recv_req_ids if connector_output else set(),
-            )
+        self._consume_pending_connector_output(model_mode="ar")
+        self._process_pending_input_timeouts()
 
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
@@ -232,7 +221,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finally:
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+                self.chunk_transfer_adapter.restore_queues(
+                    self.waiting,
+                    self.running,
+                    scheduler_requests=self.requests,
+                )
             if self.input_coordinator:
                 self.input_coordinator.restore_queues(self.waiting, self.running)
         try:
@@ -274,13 +267,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finished_reqs = {}
 
         # Wrap in omni scheduler output to carry transfer metadata.
-        base_fields = SchedulerOutput.__dataclass_fields__.keys()
-        base_data = {name: getattr(scheduler_output, name) for name in base_fields}
-        input_regs = self.input_coordinator.pending_input_registrations if self.input_coordinator else []
-        return OmniSchedulerOutput(
-            **base_data,
+        return self._wrap_omni_scheduler_output(
+            scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
-            pending_input_registrations=input_regs,
         )
 
     def update_from_output(
@@ -577,15 +566,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
-        omni_output = getattr(model_runner_output, "omni_connector_output", None)
-        if omni_output is not None:
-            self._latest_omni_connector_output = omni_output
-            if self.input_coordinator and omni_output.request_metadata:
-                self.input_coordinator.update_request_metadata(
-                    self.requests,
-                    omni_output.request_metadata,
-                    model_mode="ar",
-                )
+        self._capture_omni_connector_output(model_runner_output)
 
         # Free blocks that were held for transfer (kv_ready and
         # active_kv_transfers updates already done before the per-request loop).
@@ -664,70 +645,73 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
-        # 2. Omni Specific: Check if we need to transfer KV
-        if self._should_transfer_kv_for_request(request_id):
-            already_triggered = request_id in self.transfer_triggered_requests
-            is_active = request_id in self.active_kv_transfers
+        # Mirror the generation scheduler's try/finally pattern so the
+        # input_coordinator entry is always pruned along every return path,
+        # including the early returns for in-flight / waiting KV transfers
+        # below. _free_input_coordinator_request is a no-op when the
+        # coordinator is None, so the unconditional finally is safe.
+        try:
+            # 2. Omni Specific: Check if we need to transfer KV
+            if self._should_transfer_kv_for_request(request_id):
+                already_triggered = request_id in self.transfer_triggered_requests
+                is_active = request_id in self.active_kv_transfers
 
-            if already_triggered:
-                if is_active:
-                    # It triggered but hasn't finished yet. We MUST wait.
-                    logger.debug(f"[Omni] Request {request_id} finished but transfer is still ACTIVE. Waiting.")
-                    self.waiting_for_transfer_free.add(request_id)
-                    if self.input_coordinator is not None:
-                        self._free_input_coordinator_request(request_id)
-                    kv_xfer_params = None
-                    return kv_xfer_params
-                elif request_id in self.waiting_for_transfer_free:
-                    # Blocks held until KV extraction completes in a future step.
-                    if self.input_coordinator is not None:
-                        self._free_input_coordinator_request(request_id)
-                    return None
+                if already_triggered:
+                    if is_active:
+                        # It triggered but hasn't finished yet. We MUST wait.
+                        logger.debug(f"[Omni] Request {request_id} finished but transfer is still ACTIVE. Waiting.")
+                        self.waiting_for_transfer_free.add(request_id)
+                        kv_xfer_params = None
+                        return kv_xfer_params
+                    elif request_id in self.waiting_for_transfer_free:
+                        # Blocks held until KV extraction completes in a future step.
+                        return None
+                    else:
+                        logger.debug(
+                            f"[Omni] Request {request_id} finished and transfer no longer ACTIVE (extracted/acked). "
+                            "Freeing immediately."
+                        )
                 else:
-                    logger.debug(
-                        f"[Omni] Request {request_id} finished and transfer no longer ACTIVE (extracted/acked). "
-                        "Freeing immediately."
-                    )
-            else:
-                self.waiting_for_transfer_free.add(request_id)
-                confirmed_computed = self._get_confirmed_num_computed_tokens(request)
-                self._mark_request_for_kv_transfer(request_id, confirmed_computed)
-                # Return KV transfer metadata so it propagates to RequestOutput
-                if request_id in self.requests_needing_kv_transfer:
-                    transfer_data = self.requests_needing_kv_transfer[request_id]
-                    kv_xfer_params = {
-                        "past_key_values": transfer_data["block_ids"],
-                        "kv_metadata": {"seq_len": transfer_data["seq_len"], "block_ids": transfer_data["block_ids"]},
-                    }
-                    # Also update request.additional_information for good measure
-                    add_info = getattr(request, "additional_information", None)
-                    # If additional_information is an AdditionalInformationPayload-like object,
-                    # unpack it into a plain dict.
-                    if (
-                        add_info is not None
-                        and hasattr(add_info, "entries")
-                        and isinstance(getattr(add_info, "entries"), dict)
-                    ):
-                        request.additional_information = deserialize_additional_information(add_info)
-                        add_info = request.additional_information
-                    if add_info is None:
-                        request.additional_information = {}
-                        add_info = request.additional_information
-                    if isinstance(add_info, dict):
-                        add_info.update(kv_xfer_params)
+                    self.waiting_for_transfer_free.add(request_id)
+                    confirmed_computed = self._get_confirmed_num_computed_tokens(request)
+                    self._mark_request_for_kv_transfer(request_id, confirmed_computed)
+                    # Return KV transfer metadata so it propagates to RequestOutput
+                    if request_id in self.requests_needing_kv_transfer:
+                        transfer_data = self.requests_needing_kv_transfer[request_id]
+                        kv_xfer_params = {
+                            "past_key_values": transfer_data["block_ids"],
+                            "kv_metadata": {
+                                "seq_len": transfer_data["seq_len"],
+                                "block_ids": transfer_data["block_ids"],
+                            },
+                        }
+                        # Also update request.additional_information for good measure
+                        add_info = getattr(request, "additional_information", None)
+                        # If additional_information is an AdditionalInformationPayload-like object,
+                        # unpack it into a plain dict.
+                        if (
+                            add_info is not None
+                            and hasattr(add_info, "entries")
+                            and isinstance(getattr(add_info, "entries"), dict)
+                        ):
+                            request.additional_information = deserialize_additional_information(add_info)
+                            add_info = request.additional_information
+                        if add_info is None:
+                            request.additional_information = {}
+                            add_info = request.additional_information
+                        if isinstance(add_info, dict):
+                            add_info.update(kv_xfer_params)
 
-                if self.input_coordinator is not None:
-                    self._free_input_coordinator_request(request_id)
-                return kv_xfer_params
+                    return kv_xfer_params
 
-        # 3. Standard Freeing
-        delay_free_blocks |= connector_delay_free_blocks
-        if self.input_coordinator is not None:
+            # 3. Standard Freeing
+            delay_free_blocks |= connector_delay_free_blocks
+            if not delay_free_blocks:
+                self._free_blocks(request)
+
+            return kv_xfer_params
+        finally:
             self._free_input_coordinator_request(request_id)
-        if not delay_free_blocks:
-            self._free_blocks(request)
-
-        return kv_xfer_params
 
     def _free_blocks(self, request: Request):
         # Helper to match base class structure if not directly available

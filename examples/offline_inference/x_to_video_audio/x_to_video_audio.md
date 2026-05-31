@@ -102,3 +102,5 @@ Key arguments:
 - `--audio-negative-prompt`: negative prompt for audio generation.
 - `--enable-cpu-offload`: enable CPU offload (defaults False).
 - `--cache-backend`: enable `cache_dit` for acceleration.
+- `--quantization`: online (dynamic) quantization method — `fp8` or `int8`.
+  (VAEs, the T5 text encoder, norms and modulation stay bf16.)
