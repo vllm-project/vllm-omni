@@ -79,6 +79,27 @@ def test_estimate_prompt_len_handles_1d_ref_code() -> None:
     assert est > 50, f"got {est}; 1D ref_code must contribute its own length"
 
 
+def test_estimate_prompt_len_uses_ref_code_length_without_ref_audio() -> None:
+    est = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+        additional_information={
+            "task_type": ["Base"],
+            "text": ["hello"],
+            "ref_text": ["reference transcript"],
+            "x_vector_only_mode": [False],
+            "ref_code_length": [6],
+            "_qwen3_tts_ref_audio_cache_key": ["same-ref"],
+            "language": ["English"],
+        },
+        task_type="Base",
+        tokenize_prompt=lambda _text: list(range(10)),
+        codec_language_id=None,
+        spk_is_dialect=None,
+        estimate_ref_code_len=lambda _ref_audio: None,
+    )
+
+    assert est == 15
+
+
 def test_estimate_prompt_len_uses_list_of_int_ref_ids_from_voice_clone_prompt() -> None:
     """`voice_clone_prompt.ref_ids` as a list-of-int (the natural pre-tokenized shape)
     must be read as a sequence, not unwrapped to its first element. Without the fix
