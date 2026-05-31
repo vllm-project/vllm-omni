@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         "black-forest-labs/FLUX.2-dev, tencent/HunyuanImage-3.0-Instruct, "
         "meituan-longcat/LongCat-Image, OvisAI/Ovis-Image, "
         "stabilityai/stable-diffusion-3-medium-diffusers, stabilityai/stable-diffusion-3.5-medium, "
-        "and etc.",
+        "Tongyi-MAI/Z-Image-Turbo and etc.",
     )
     parser.add_argument(
         "--stage-configs-path",
