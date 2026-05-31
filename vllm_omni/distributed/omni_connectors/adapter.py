@@ -219,11 +219,14 @@ def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
 def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], request: Any) -> None:
     """Update a downstream streaming request prompt from connector payload ids.
 
-    Async chunk downstream stages are prewarmed before the real Talker prompt is
-    known. When a Thinker payload carries `ids.prompt`, this helper rebuilds the
-    placeholder prompt length for the next stage, resets the computed-token
-    cursor, and refreshes block hashes so the scheduler allocates KV slots that
-    match the newly received streaming slice.
+    Async-chunk downstream stages are prewarmed before the real Talker prompt is
+    known. When a Thinker payload carries ``ids.prompt``, this helper:
+
+    * Preserves ``num_computed_tokens`` (the scheduler token watermark).
+    * Moves already-computed output tokens into ``prompt_token_ids``.
+    * Appends a new placeholder prompt slice sized from the upstream ids.
+    * Refreshes block hashes so the scheduler allocates KV slots for the
+      extended prompt without discarding prior computed state.
     """
     ids = payload_data.get("ids", {})
     prompt_token_ids = ids.get("prompt", None)
