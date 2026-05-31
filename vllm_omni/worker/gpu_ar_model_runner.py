@@ -210,7 +210,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return result
 
     def _capture_talker_mtp_graphs(self) -> None:
-        from vllm_omni.worker.gpu_model_runner import CUDAGraphWrapper
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
 
         if not self.has_talker_mtp or not isinstance(self.talker_mtp, CUDAGraphWrapper):
             return

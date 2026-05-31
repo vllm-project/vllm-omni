@@ -161,11 +161,11 @@ def _make_runner_for_mimo(req_id="r_mimo"):
 
 
 def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
-    # Patch the module-level `set_forward_context` symbol used inside
-    # OmniGPUModelRunner._talker_mtp_forward.
+    # `_talker_mtp_forward` calls `current_omni_platform.set_forward_context`,
+    # which would otherwise dispatch to the real device implementation.
     import vllm_omni.worker.gpu_model_runner as mod  # Must be the same module that defines OmniGPUModelRunner
 
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
 
@@ -199,7 +199,7 @@ def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
 def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
 
@@ -215,7 +215,7 @@ def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
 def test_talker_mtp_forward_ignores_default_sampling_seed_without_request_marker(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(seed=42)
@@ -237,7 +237,7 @@ def test_talker_mtp_forward_ignores_default_sampling_seed_without_request_marker
 def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(
@@ -281,7 +281,7 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
 def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(
@@ -322,7 +322,7 @@ def test_update_intermediate_buffer_writes_to_buffer_and_setattr(monkeypatch):
     (forward path) and mirrors to additional_information_cpu setattr (backward compat)."""
     import vllm_omni.worker.gpu_model_runner as mod
 
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
 
