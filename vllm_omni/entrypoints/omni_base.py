@@ -317,6 +317,16 @@ class OmniBase(PDDisaggregationMixin):
             )
         finally:
             self.request_states.pop(request_id, None)
+            # Republish gauges so any stale value left by the per-stage
+            # publish in _process_single_result (which runs while the request
+            # is still in self.request_states) is corrected after the pop.
+            prom = getattr(self, "prom_metrics", None)
+            counter = getattr(getattr(self, "engine", None), "_running_counter", None)
+            if prom is not None:
+                total = len(self.request_states)
+                running = counter.value if counter is not None else total
+                prom.set_running(running)
+                prom.set_waiting(max(0, total - running))
 
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(
@@ -496,9 +506,15 @@ class OmniBase(PDDisaggregationMixin):
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 
+        # When this result finalizes the request, the orchestrator has
+        # already decremented _running_counter but _log_summary_and_cleanup
+        # hasn't popped self.request_states yet — exclude the finalizing
+        # request from `total` so waiting doesn't read 1 and stay stuck
+        # there until the next request arrives.
         counter = getattr(self.engine, "_running_counter", None)
-        running = counter.value if counter is not None else len(self.request_states)
-        total = len(self.request_states)
+        is_finalizing = finished and stage_id == final_stage_id_for_e2e
+        total = max(0, len(self.request_states) - (1 if is_finalizing else 0))
+        running = counter.value if counter is not None else total
         self.prom_metrics.set_running(running)
         self.prom_metrics.set_waiting(max(0, total - running))
 
