@@ -234,8 +234,6 @@ class Orchestrator:
                 self._stat_logger = None
         else:
             self._stat_logger = None
-        self._last_stats_ts: float = 0.0
-        self._stats_interval_s: float = 1.0
 
         self._cfg_tracker = CfgCompanionTracker()
 
@@ -653,10 +651,12 @@ class Orchestrator:
                                     "new_prompt_len_snapshot",
                                     None,
                                 )
-                            now = _time.monotonic()
-                            record_stats = (
-                                self._stat_logger is not None and now - self._last_stats_ts >= self._stats_interval_s
-                            )
+                            # OmniSchedulerMixin.make_stats() already throttles
+                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
+                            # being non-None means this replica passed its own gate.
+                            # A second global throttle here would drop stats for
+                            # other (stage, replica) pairs in the same 1s window.
+                            record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
                             iteration_stats = IterationStats() if record_stats else None
                             raw_output = await pool.process_llm_raw_outputs(
                                 replica_id,
@@ -664,7 +664,6 @@ class Orchestrator:
                                 iteration_stats=iteration_stats,
                             )
                             if record_stats:
-                                self._last_stats_ts = now
                                 self._stat_logger.record(
                                     raw_outputs.scheduler_stats,
                                     iteration_stats,
