@@ -9,6 +9,7 @@ enabling concurrent request handling and streaming generation.
 """
 
 import asyncio
+import os
 import uuid
 import weakref
 from collections.abc import AsyncGenerator, Iterable
@@ -26,6 +27,34 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+DEFAULT_DIFFUSION_EXECUTOR_WORKERS = 32
+
+
+def _resolve_diffusion_executor_workers() -> int:
+    raw_value = os.getenv("VLLM_OMNI_DIFFUSION_EXECUTOR_WORKERS")
+    if raw_value is None:
+        return DEFAULT_DIFFUSION_EXECUTOR_WORKERS
+
+    try:
+        worker_count = int(raw_value)
+    except ValueError:
+        logger.warning(
+            "Invalid VLLM_OMNI_DIFFUSION_EXECUTOR_WORKERS=%r; using default=%d",
+            raw_value,
+            DEFAULT_DIFFUSION_EXECUTOR_WORKERS,
+        )
+        return DEFAULT_DIFFUSION_EXECUTOR_WORKERS
+
+    if worker_count < 1:
+        logger.warning(
+            "Non-positive VLLM_OMNI_DIFFUSION_EXECUTOR_WORKERS=%r; using default=%d",
+            raw_value,
+            DEFAULT_DIFFUSION_EXECUTOR_WORKERS,
+        )
+        return DEFAULT_DIFFUSION_EXECUTOR_WORKERS
+
+    return worker_count
 
 
 def _weak_close_async_omni_diffusion(engine: DiffusionEngine, executor: ThreadPoolExecutor) -> None:
@@ -141,8 +170,15 @@ class AsyncOmniDiffusion:
         # Initialize engine
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
-        # Thread pool for running sync engine in async context
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # Allow multiple request threads to enter the diffusion engine.
+        # The engine itself serializes execution internally, but preemption
+        # requires later arrivals to be submitted while an earlier request is
+        # still running.
+        self._executor_workers = _resolve_diffusion_executor_workers()
+        self._executor = ThreadPoolExecutor(
+            max_workers=self._executor_workers,
+            thread_name_prefix="async-omni-diffusion",
+        )
         self._closed = False
         self._weak_finalizer = weakref.finalize(
             self,

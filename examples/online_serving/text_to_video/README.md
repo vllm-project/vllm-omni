@@ -4,27 +4,68 @@ This example demonstrates how to deploy the Wan2.2 text-to-video model for onlin
 
 ## Start Server
 
-### Basic Start
+Wan2.2 T2V validation in this branch is intentionally scoped to the old
+`feat/preemption-recovery-v0.16.0-squashed` serving topology:
 
-```bash
-vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8091
-```
+- dispatcher on `:8080`
+- single managed backend on `:8091`
+- backend config fixed to:
+  - `--usp 8`
+  - `--enable-layerwise-offload`
+  - `--boundary-ratio 0.875`
+  - `--vae-use-slicing`
+  - `--vae-use-tiling`
 
-### Start with Parameters
+### Backend Start
 
-Or use the startup script:
+Use the startup script for the backend:
 
 ```bash
 bash run_server.sh
 ```
 
-The script allows overriding:
+The script defaults to the supported validation config and allows overriding:
 - `MODEL` (default: `Wan-AI/Wan2.2-T2V-A14B-Diffusers`)
 - `PORT` (default: `8091`)
+- `USP` (default: `8`)
+- `ENABLE_LAYERWISE_OFFLOAD` (default: `1`)
 - `BOUNDARY_RATIO` (default: `0.875`)
 - `FLOW_SHIFT` (default: `5.0`)
+- `VAE_USE_SLICING` (default: `1`)
+- `VAE_USE_TILING` (default: `1`)
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
+
+### Dispatcher Start
+
+Run baseline or `super_p95` through the dispatcher even though there is only one
+backend, so the serving topology stays identical to the old validation setup.
+
+Baseline:
+
+```bash
+env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=0 \
+VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0 \
+python3 benchmarks/diffusion/super_p95_dispatcher.py \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --backend-url http://127.0.0.1:8091 \
+  --hardware-profile 910B3
+```
+
+super_p95:
+
+```bash
+env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=1 \
+VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1 \
+python3 benchmarks/diffusion/super_p95_dispatcher.py \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --backend-url http://127.0.0.1:8091 \
+  --hardware-profile 910B3
+```
 
 ## Async Job Behavior
 

@@ -724,6 +724,7 @@ def _populate_slo_ms_from_warmups(
 async def iter_requests(
     requests_list: list[RequestFuncInput],
     request_rate: float,
+    arrival_seed: int | None = None,
 ) -> AsyncGenerator[RequestFuncInput, None]:
     """Yield requests using a Poisson process if request_rate is set.
 
@@ -734,10 +735,11 @@ async def iter_requests(
     if request_rate != float("inf"):
         if request_rate <= 0:
             raise ValueError(f"request_rate must be positive or inf, got {request_rate}.")
+    arrival_rng = random.Random(arrival_seed) if arrival_seed is not None else random
 
     for i, req in enumerate(requests_list):
         if request_rate != float("inf") and i > 0:
-            interval_s = random.expovariate(request_rate)
+            interval_s = arrival_rng.expovariate(request_rate)
             await asyncio.sleep(interval_s)
         yield req
 
@@ -890,7 +892,8 @@ async def benchmark(args):
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
-    async with aiohttp.ClientSession() as session:
+    client_timeout = aiohttp.ClientTimeout(total=args.client_timeout_s)
+    async with aiohttp.ClientSession(timeout=client_timeout) as session:
         warmup_pairs: list[tuple[RequestFuncInput, RequestFuncOutput]] = []
         if args.warmup_requests and requests_list:
             print(
@@ -919,7 +922,11 @@ async def benchmark(args):
 
         start_time = time.perf_counter()
         tasks = []
-        async for req in iter_requests(requests_list=requests_list, request_rate=args.request_rate):
+        async for req in iter_requests(
+            requests_list=requests_list,
+            request_rate=args.request_rate,
+            arrival_seed=args.arrival_seed,
+        ):
             task = asyncio.create_task(limited_request_func(req, session, pbar))
             tasks.append(task)
 
@@ -1058,6 +1065,12 @@ if __name__ == "__main__":
         help="Number of warmup requests to run before measurement.",
     )
     parser.add_argument(
+        "--client-timeout-s",
+        type=float,
+        default=10000.0,
+        help="Client-side total timeout in seconds for each benchmark request.",
+    )
+    parser.add_argument(
         "--warmup-num-inference-steps",
         type=int,
         default=1,
@@ -1077,6 +1090,18 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Random seed (for diffusion models).",
+    )
+    parser.add_argument(
+        "--random-request-seed",
+        type=int,
+        default=42,
+        help="Seed for sampling request profiles when using the random dataset.",
+    )
+    parser.add_argument(
+        "--arrival-seed",
+        type=int,
+        default=42,
+        help="Seed for Poisson inter-arrival sampling when --request-rate is finite.",
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")

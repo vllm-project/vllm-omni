@@ -12,6 +12,7 @@ from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker import WorkerProc
 
 logger = init_logger(__name__)
@@ -188,6 +189,40 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return response
         except Exception as e:
             logger.error(f"Generate call failed: {e}")
+            raise
+
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput):
+        self._ensure_open()
+        rpc_request = {
+            "type": "rpc",
+            "method": "execute_stepwise",
+            "args": (scheduler_output,),
+            "kwargs": {},
+            "output_rank": 0,
+            "exec_all_ranks": True,
+        }
+
+        try:
+            self._broadcast_mq.enqueue(rpc_request)
+            response = self._result_mq.dequeue()
+            try:
+                unpack_diffusion_output_shm(response)
+            except Exception as e:
+                logger.warning("SHM unpack failed during stepwise execution (data may already be inline): %s", e)
+            if isinstance(response, dict) and response.get("status") == "error":
+                raise RuntimeError(
+                    f"Worker failed with error '{response.get('error')}', "
+                    "please check the stack trace above for the root cause"
+                )
+            if not (
+                hasattr(response, "req_id")
+                and hasattr(response, "finished")
+                and hasattr(response, "result")
+            ):
+                raise RuntimeError(f"Unexpected response type for execute_stepwise: {type(response)!r}")
+            return response
+        except Exception as e:
+            logger.error(f"Stepwise execution failed: {e}")
             raise
 
     def collective_rpc(

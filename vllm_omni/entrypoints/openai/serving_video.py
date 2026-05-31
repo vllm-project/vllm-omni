@@ -120,6 +120,7 @@ class OmniOpenAIServingVideo:
             gen_params.boundary_ratio,
         )
         if request.flow_shift is not None:
+            gen_params.flow_shift = request.flow_shift
             gen_params.extra_args["flow_shift"] = request.flow_shift
 
         # Apply model-specific extra parameters

@@ -19,7 +19,7 @@ from typing import Annotated, Any, Literal, cast
 
 import httpx
 import vllm.envs as envs
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
@@ -111,6 +111,12 @@ from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
+from vllm_omni.diffusion.super_p95 import (
+    SuperP95LoadSnapshot,
+    apply_super_p95_request_headers,
+    build_super_p95_response_headers,
+    get_super_p95_request_metadata,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
@@ -119,6 +125,54 @@ router = APIRouter()
 # Supported resolution buckets for layered models (e.g., Qwen-Image-Layered)
 SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
 profiler_router = APIRouter()
+
+
+def _get_super_p95_load_snapshot(raw_request: Request) -> SuperP95LoadSnapshot | None:
+    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None)
+    engine = getattr(diffusion_engine, "engine", diffusion_engine)
+    scheduler = getattr(engine, "scheduler", None)
+    if scheduler is None or not hasattr(scheduler, "get_load_snapshot"):
+        return None
+    try:
+        return scheduler.get_load_snapshot()
+    except Exception:
+        logger.exception("Failed to build super_p95 response headers from scheduler snapshot")
+        return None
+
+
+def _get_super_p95_response_headers(raw_request: Request) -> dict[str, str]:
+    snapshot = _get_super_p95_load_snapshot(raw_request)
+    if snapshot is None:
+        return {}
+    return build_super_p95_response_headers(snapshot)
+
+
+def _get_super_p95_post_arrival_headers(raw_request: Request, extra_args: dict[str, Any] | None) -> dict[str, str]:
+    snapshot = _get_super_p95_load_snapshot(raw_request)
+    if snapshot is None:
+        return {}
+
+    sacrificial, estimated_service_s = get_super_p95_request_metadata(extra_args)
+    if estimated_service_s is None:
+        return build_super_p95_response_headers(snapshot)
+
+    if sacrificial:
+        snapshot = SuperP95LoadSnapshot(
+            normal_load_s=snapshot.normal_load_s,
+            sacrificial_load_s=snapshot.sacrificial_load_s + estimated_service_s,
+        )
+    else:
+        snapshot = SuperP95LoadSnapshot(
+            normal_load_s=snapshot.normal_load_s + estimated_service_s,
+            sacrificial_load_s=snapshot.sacrificial_load_s,
+        )
+    return build_super_p95_response_headers(snapshot)
+
+
+def _apply_super_p95_response_headers(raw_request: Request, response: Response) -> None:
+    headers = _get_super_p95_response_headers(raw_request)
+    if headers:
+        response.headers.update(headers)
 
 
 def _should_enable_profiler_endpoints(stage_configs: list | None) -> bool:
@@ -1254,7 +1308,11 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
-async def generate_images(request: ImageGenerationRequest, raw_request: Request) -> ImageGenerationResponse:
+async def generate_images(
+    request: ImageGenerationRequest,
+    raw_request: Request,
+    raw_response: Response,
+) -> ImageGenerationResponse:
     """Generate images from text prompts using diffusion models.
 
     OpenAI DALL-E compatible endpoint for text-to-image generation.
@@ -1314,6 +1372,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
+        apply_super_p95_request_headers(gen_params.extra_args, raw_request.headers)
 
         request_id = f"img_gen-{random_uuid()}"
 
@@ -1342,6 +1401,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # Encode images to base64
         image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in images]
 
+        _apply_super_p95_response_headers(raw_request, raw_response)
         return ImageGenerationResponse(
             created=int(time.time()),
             data=image_data,
@@ -1949,6 +2009,7 @@ async def _run_video_generation_job(
 )
 async def create_video(
     raw_request: Request,
+    raw_response: Response,
     prompt: str = Form(...),
     input_reference: UploadFile | None = File(default=None),
     image_reference: str | None = Form(default=None),
@@ -2018,6 +2079,9 @@ async def create_video(
             detail="Provide either input_reference or image_reference, not both.",
         )
 
+    parsed_extra_params = _parse_form_json(extra_params, expected_type=dict) or {}
+    apply_super_p95_request_headers(parsed_extra_params, raw_request.headers)
+
     request_data: dict[str, Any] = {
         "prompt": prompt,
         "model": model,
@@ -2038,7 +2102,7 @@ async def create_video(
         "seed": seed,
         "negative_prompt": negative_prompt,
         "lora": _parse_form_json(lora, expected_type=dict),
-        "extra_params": _parse_form_json(extra_params, expected_type=dict),
+        "extra_params": parsed_extra_params or None,
     }
 
     request_data = {k: v for k, v in request_data.items() if v is not None}
@@ -2080,6 +2144,7 @@ async def create_video(
     await VIDEO_STORE.upsert(ref.id, ref)
     task = asyncio.create_task(_run_video_generation_job(handler, request, ref.id, reference_image))
     await VIDEO_TASKS.upsert(ref.id, task)
+    raw_response.headers.update(_get_super_p95_post_arrival_headers(raw_request, parsed_extra_params))
     return ref
 
 

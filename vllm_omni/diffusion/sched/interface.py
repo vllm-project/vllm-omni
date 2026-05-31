@@ -8,6 +8,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
+from typing import Any
 
 from vllm.logger import init_logger
 
@@ -143,6 +144,14 @@ class SchedulerInterface(ABC):
     @abstractmethod
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: DiffusionOutput) -> set[str]:
         """Update scheduler state from executor output."""
+
+    @abstractmethod
+    def update_from_runner_output(
+        self,
+        sched_output: DiffusionSchedulerOutput,
+        runner_output: Any,
+    ) -> set[str]:
+        """Update scheduler state from a single step-execution runner output."""
 
     @abstractmethod
     def get_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:

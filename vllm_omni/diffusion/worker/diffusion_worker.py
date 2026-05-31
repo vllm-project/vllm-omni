@@ -480,7 +480,23 @@ class WorkerProc:
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
-                        self.return_result(DiffusionOutput(error=str(e)))
+                        if isinstance(msg, dict) and msg.get("method") == "execute_stepwise":
+                            sched_output = msg.get("args", (None,))[0]
+                            sched_req_ids = (
+                                getattr(sched_output, "scheduled_req_ids", [])
+                                if sched_output is not None
+                                else []
+                            )
+                            req_id = sched_req_ids[0] if sched_req_ids else ""
+                            self.return_result(
+                                RunnerOutput(
+                                    req_id=req_id,
+                                    finished=True,
+                                    result=DiffusionOutput(error=str(e)),
+                                )
+                            )
+                        else:
+                            self.return_result(DiffusionOutput(error=str(e)))
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

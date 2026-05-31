@@ -233,6 +233,7 @@ class OmniDiffusionSamplingParams:
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
     boundary_ratio: float | None = None
+    flow_shift: float | None = None
 
     # Scheduler parameters – ``None`` means "not explicitly set by the caller";
     # each pipeline's ``forward()`` decides its own model-specific default.

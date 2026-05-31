@@ -541,9 +541,18 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
-        # TODO: remove hard code
-        initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
-        self.master_port = self.settle_port(initial_master_port, 37)
+        explicit_master_port = os.environ.get("VLLM_OMNI_MASTER_PORT")
+        if explicit_master_port is not None:
+            self.master_port = int(explicit_master_port)
+
+        # Respect an explicit master_port exactly to avoid backend launch races.
+        # Keep randomized probing only for the implicit/default case.
+        if self.master_port is not None:
+            if not is_port_available(self.master_port):
+                raise RuntimeError(f"Configured master_port {self.master_port} is already in use")
+        else:
+            initial_master_port = 30005 + random.randint(0, 100)
+            self.master_port = self.settle_port(initial_master_port, 37)
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig

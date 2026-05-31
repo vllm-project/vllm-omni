@@ -64,6 +64,11 @@ class DiffusionExecutor(ABC):
         pass
 
     @abstractmethod
+    def execute_stepwise(self, scheduler_output: Any) -> Any:
+        """Execute one scheduled diffusion step on workers."""
+        pass
+
+    @abstractmethod
     def collective_rpc(
         self,
         method: str,

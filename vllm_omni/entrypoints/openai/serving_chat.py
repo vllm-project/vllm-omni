@@ -85,6 +85,7 @@ from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
 from vllm_omni.entrypoints.openai.utils import parse_lora_request
+from vllm_omni.diffusion.super_p95 import apply_super_p95_request_headers
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -2122,6 +2123,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 num_outputs_per_prompt=num_outputs_per_prompt,
                 seed=seed,
             )
+            apply_super_p95_request_headers(gen_params.extra_args, raw_request.headers)
 
             # Only override defaults when the user explicitly provides values
             if num_inference_steps is not None:
@@ -2249,16 +2251,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 stop_reason=None,
             )
 
-            response = ChatCompletionResponse(
+            usage = UsageInfo(
+                prompt_tokens=len(prompt.split()),
+                completion_tokens=1,
+                total_tokens=len(prompt.split()) + 1,
+            )
+
+            response = OmniChatCompletionResponse(
                 id=request_id,
                 created=created_time,
                 model=self._diffusion_model_name,
                 choices=[choice],
-                usage=UsageInfo(
-                    prompt_tokens=len(prompt.split()),
-                    completion_tokens=1,
-                    total_tokens=len(prompt.split()) + 1,
-                ),
+                usage=usage.model_dump(exclude_none=True),
             )
 
             logger.info(
