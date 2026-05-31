@@ -230,9 +230,11 @@ def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, m
     cleanup_calls = []
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
 
-    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": False})
+    adapter._send_single_request(
+        {"pooling_output": None, "request": request, "is_finished": False, "is_segment_finished": False}
+    )
 
-    assert cleanup_calls == []  # no terminal cleanup; meta.finished is unobservable
+    assert cleanup_calls == []  # no terminal cleanup; meta.finished is false
 
 
 def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatch):
@@ -248,12 +250,50 @@ def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatc
     adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
 
-    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": False})
+    adapter._send_single_request(
+        {"pooling_output": None, "request": request, "is_finished": False, "is_segment_finished": False}
+    )
 
     assert connector.put.called
     sent_payload = connector.put.call_args.kwargs["data"]
     assert isinstance(sent_payload, OmniPayloadStruct)
-    assert sent_payload.meta is None  # confirms it's the empty struct on the wire
+    assert sent_payload.meta.finished.item() is False
+    assert sent_payload.meta.is_segment_finished.item() is False
+
+
+def test_send_single_request_struct_preserves_segment_finished(build_adapter, monkeypatch):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-segment", RequestStatus.WAITING, external_req_id="ext-segment")
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {"pooling_output": None, "request": request, "is_finished": False, "is_segment_finished": True}
+    )
+
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.meta.finished.item() is False
+    assert sent_payload.meta.is_segment_finished.item() is True
+
+
+def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+    request.resumable = True
+    request.num_computed_tokens = 0
+    adapter.requests_num_chunks_sent["ext-stream"] = 111
+
+    adapter.save_async(pooling_output=None, request=request, is_segment_finished=False)
+
+    assert len(adapter._pending_save_reqs) == 0
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 111
+
+    adapter.requests_num_chunks_sent.pop("ext-stream")
+    adapter.save_async(pooling_output=None, request=request, is_segment_finished=False)
+
+    assert len(adapter._pending_save_reqs) == 1
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 0
 
 
 def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):
@@ -266,7 +306,9 @@ def test_send_single_request_cleans_up_after_finished_payload(build_adapter, mon
     cleanup_calls = []
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
 
-    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": True})
+    adapter._send_single_request(
+        {"pooling_output": None, "request": request, "is_finished": True, "is_segment_finished": True}
+    )
 
     assert len(cleanup_calls) == 1
     args, _ = cleanup_calls[0]
