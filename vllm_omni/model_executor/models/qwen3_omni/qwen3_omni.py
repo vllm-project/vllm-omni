@@ -183,11 +183,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 # sync stall; build_mm_cpu handles the eventual D2H at payload time.
                 ("codes", "audio"),
             }
-            # Keys that need to be accumulated across streaming inputs
-            self.streaming_accumulated_keys: set[tuple[str, str]] = {
-                ("embed", "prefill"),
-                ("hidden_states", "output"),
-            }
 
         elif self.model_stage == "code2wav":
             multimodal_config.skip_mm_profiling = True
@@ -685,7 +680,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         is_prefill = bool(payload.get("_omni_is_prefill", span_len > 1))
         if is_prefill:
             num_computed_tokens = payload.get("_omni_num_computed_tokens")
-            if num_computed_tokens is not None:
+            request_resumable = meta.get("resumable", False)
+            if num_computed_tokens is not None and not request_resumable:
                 meta["num_processed_tokens"] = int(num_computed_tokens)
             input_ids, input_embeds, update_dict = self.talker_preprocess_prefill(input_ids, input_embeds, payload)
             code_predictor_codes = torch.zeros(

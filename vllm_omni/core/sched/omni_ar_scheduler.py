@@ -13,7 +13,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMSchedu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
-from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -426,8 +426,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
-                is_segment_finished = request.is_finished() and request.resumable
+                is_segment_finished = True
                 finished = self._handle_stopped_request(request)
+                if not finished:
+                    # for streaming input request only
+                    if self.chunk_transfer_adapter:
+                        if self.vllm_config.model_config.stage_id != 0:
+                            # Downstream async-chunk stages receive real payloads from the
+                            # connector. This update only resumes polling for the next segment.
+                            self.chunk_transfer_adapter.segment_finished_requests.discard(request.request_id)
+                    request.discard_latest_async_tokens = True
+                    request.num_output_placeholders = 0
+                    request.spec_token_ids = []
+                    request._output_token_ids.clear()
                 if finished:
                     kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
@@ -471,7 +482,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     )
                 )
                 if self.chunk_transfer_adapter is not None:
-                    self.chunk_transfer_adapter.save_async(pooler_output, request)
+                    self.chunk_transfer_adapter.save_async(pooler_output, request, is_segment_finished)
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
@@ -622,11 +633,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         req_id = session.request_id
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
-        if self.vllm_config.model_config.stage_id != 0:
-            self._replace_session_with_streaming_update(session, update)
+        outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
+        if outstanding_async_tokens > 0:
+            # Async scheduling may already have sampled the previous
+            # segment's next token. Drop that late token instead of
+            # appending it to the new streaming segment.
+            session.discard_latest_async_tokens = True
+            session.num_computed_tokens -= session.num_output_placeholders
+            session.num_output_placeholders = 0
+            session.spec_token_ids = []
+        if self.chunk_transfer_adapter:
+            self.chunk_transfer_adapter.requests_num_chunks_sent.pop(session.external_req_id, None)
+            if self.vllm_config.model_config.stage_id != 0:
+                # Downstream async-chunk stages receive real payloads from the
+                # connector. This update only resumes polling for the next segment.
+                self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
+                # Do not replace prompt/additional_information here; the next
+                # upstream chunk will populate them in chunk transfer adapter.
+                session.arrival_time = update.arrival_time
+                session.sampling_params = update.sampling_params
+                if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                    self.num_waiting_for_streaming_input -= 1
+                session.status = RequestStatus.WAITING
+                if session in self.skipped_waiting:
+                    self.skipped_waiting.remove_requests((session,))
+                    self._enqueue_waiting_request(session)
 
-        else:
-            super()._update_request_as_session(session, update)
+                if self.log_stats:
+                    session.record_event(EngineCoreEventType.QUEUED)
+                return
+        super()._update_request_as_session(session, update)
 
     def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred

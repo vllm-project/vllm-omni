@@ -18,10 +18,6 @@ Asynchronous chunk streaming operates as **enabled by default** within this bund
 Additionally, NPU, ROCm, and XPU per-platform configuration deltas are deterministically merged from the
 `platforms`: section of the corresponding YAML.
 
-**Note:** The OpenAI-style **`/v1/realtime`** WebSocket interface (facilitating streaming PCM audio input alongside audio and transcription output)
-is currently **unsupported** while the `async_chunk` configuration attribute is enabled.
-It is requisite to instantiate the default omni architecture or utilize a deployment configuration specifying `async_chunk: false` to facilitate real-time streaming sessions.
-
 To explicitly utilize a custom deployment YAML, mandate the configuration path accordingly:
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
@@ -289,7 +285,7 @@ python openai_realtime_client.py \
 | `--num-requests` | `1` | Number of sequential sessions (see `--concurrency`) |
 | `--concurrency` | `1` | Max concurrent WebSocket sessions when `--num-requests` > 1 |
 
-Ensure the server is running **without** `async_chunk` if you use `/v1/realtime`, for example:
+Ensure the server is running, for example:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
