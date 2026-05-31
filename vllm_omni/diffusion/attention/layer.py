@@ -242,6 +242,8 @@ class Attention(nn.Module):
         attn_metadata = self._with_kv_cache_dtype(attn_metadata)
 
         # 2. Kernel Execution (Computation)
+        if attn_metadata is not None and attn_metadata.is_varlen and self.use_ring:
+            raise ValueError("Dynamic varlen diffusion attention does not support ring attention yet.")
         if self.use_ring and strategy is not self._no_parallel_strategy:
             out = self._run_ring_attention(query, key, value, attn_metadata)
         else:
@@ -255,6 +257,10 @@ class Attention(nn.Module):
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if query.dtype == torch.float32:
+            if attn_metadata is not None and attn_metadata.is_varlen:
+                raise ValueError(
+                    "Dynamic varlen diffusion attention requires FlashAttention, not SDPA float32 fallback."
+                )
             logger.warning_once(
                 f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
                 f"attention_backend='{self.backend_pref}' to 'sdpa' for dtype={query.dtype}."
