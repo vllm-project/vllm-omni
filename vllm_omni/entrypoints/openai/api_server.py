@@ -1381,22 +1381,6 @@ async def streaming_video_chat(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
-    engine_client = getattr(websocket.app.state, "engine_client", None)
-    if engine_client is not None and getattr(engine_client, "async_chunk", False):
-        await websocket.accept()
-        await websocket.send_json(
-            {
-                "type": "error",
-                "error": (
-                    "The /v1/realtime API is not supported when async_chunk is enabled on the server. "
-                    "Use a stage configuration with async_chunk disabled and restart the server before using "
-                    "this endpoint."
-                ),
-                "code": "unsupported",
-            }
-        )
-        await websocket.close()
-        return
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
     if serving is None:
         await websocket.accept()
