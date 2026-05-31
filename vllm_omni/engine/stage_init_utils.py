@@ -824,6 +824,10 @@ def build_vllm_config(
     if upgraded is not vllm_config.quant_config:
         vllm_config = replace(vllm_config, quant_config=upgraded)
 
+    custom_voice_dir = engine_args_dict.get("custom_voice_dir")
+    if custom_voice_dir:
+        setattr(vllm_config.model_config.hf_config, "custom_voice_dir", custom_voice_dir)
+
     return vllm_config, executor_class
 
 
