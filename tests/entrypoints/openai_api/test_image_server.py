@@ -1249,6 +1249,26 @@ def test_image_file_response_format_multiple(test_client):
             assert img.format == "PNG"
 
 
+def test_image_file_response_format_single(test_client):
+    """Test response_format=file with n=1 returns a single image file."""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a dog",
+            "n": 1,
+            "response_format": "file",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert "attachment" in response.headers.get("content-disposition", "")
+    assert ".png" in response.headers.get("content-disposition", "")
+
+    img = Image.open(io.BytesIO(response.content))
+    assert img.format == "PNG"
+
+
 def make_test_image_bytes(size=(64, 64)) -> bytes:
     img = Image.new(
         "RGB",
