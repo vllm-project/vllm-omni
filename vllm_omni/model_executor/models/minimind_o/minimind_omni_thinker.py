@@ -296,7 +296,6 @@ class MiniMindModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        capture_layer_indices: Sequence[int] | None = None,
         return_hidden_states: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, CapturedHiddenStates | None]:
@@ -311,20 +310,14 @@ class MiniMindModel(nn.Module):
                 raise ValueError("input_ids must be provided when inputs_embeds is None.")
             hidden_states = self.embed_tokens(input_ids)
 
-        capture_set = set(capture_layer_indices) if capture_layer_indices else None
         captured_hidden_states: CapturedHiddenStates | None = {} if return_hidden_states else None
 
         for layer_idx, layer in enumerate(self.layers):
-            if capture_set is not None and captured_hidden_states is not None:
-                if layer_idx in capture_set:
-                    hs: dict[str, dict[int, torch.Tensor]] = captured_hidden_states.setdefault("hidden_states", {})
-                    layers: dict[int, torch.Tensor] = hs.setdefault("layers", {})
-                    layers[layer_idx] = hidden_states.clone().view(-1, hidden_states.shape[-1])
-
             hidden_states = layer(positions, hidden_states)
             if captured_hidden_states is not None and layer_idx == getattr(self.config, "bridge_layer", -1):
                 hs = captured_hidden_states.setdefault("hidden_states", {})
-                hs["bridge"] = hidden_states.clone().view(-1, hidden_states.shape[-1])
+                bridge = hidden_states.clone().view(-1, hidden_states.shape[-1])
+                hs["bridge"] = bridge
 
         hidden_states = self.norm(hidden_states)
         return hidden_states, captured_hidden_states
@@ -779,6 +772,7 @@ class MiniMindOmniThinkerForConditionalGeneration(
         self.quant_config = quant_config
         self.multimodal_config = multimodal_config
         self.device = get_local_device()
+        self.have_multimodal_outputs = True
 
         self.text_config = config.text_config
         self.text_config.bridge_layer = config.bridge_layer
@@ -1085,7 +1079,6 @@ class MiniMindOmniThinkerForConditionalGeneration(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        capture_layer_indices: Sequence[int] | None = None,
         return_hidden_states: bool = False,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
@@ -1097,7 +1090,6 @@ class MiniMindOmniThinkerForConditionalGeneration(
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
-            capture_layer_indices=capture_layer_indices,
             return_hidden_states=return_hidden_states,
             **kwargs,
         )

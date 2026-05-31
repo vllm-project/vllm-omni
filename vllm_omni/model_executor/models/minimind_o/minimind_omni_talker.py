@@ -9,7 +9,6 @@ from typing import Any
 import torch
 from torch import nn
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -30,8 +29,6 @@ from vllm_omni.model_executor.models.minimind_o.minimind_omni_thinker import (
     MiniMindBlock,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-
-logger = init_logger(__name__)
 
 
 class MiniMindOmniTalkerHead(nn.Module):
@@ -233,6 +230,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
             prefix=maybe_prefix(prefix, "spk_proj"),
         )
         self.sampler = Sampler()
+        self._pending_audio_steps: list[int] = []
         self.make_empty_intermediate_tensors = lambda: None
 
     def get_language_model(self) -> nn.Module:
@@ -285,7 +283,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         audio_ids[:, 0, :] = input_ids.to(dtype=torch.long).clamp(min=0, max=self.audio_vocab_size - 1)
         return audio_ids
 
-    def _get_bridge_states(self, info_dict: dict[str, Any], span_len: int, device: torch.device) -> torch.Tensor:
+    def _get_raw_bridge_states(self, info_dict: dict[str, Any], device: torch.device) -> torch.Tensor:
         hidden_info = info_dict.get("hidden_states", {}) if isinstance(info_dict, dict) else {}
         bridge = hidden_info.get("bridge")
         if bridge is None:
@@ -299,9 +297,35 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         bridge = bridge.to(device=device, dtype=self.text_scale.dtype)
         if bridge.ndim == 3:
             bridge = bridge.reshape(-1, bridge.shape[-1])
+        return bridge
+
+    def _select_bridge_states(
+        self,
+        info_dict: dict[str, Any],
+        span_len: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, bool, int, int]:
+        bridge = self._get_raw_bridge_states(info_dict, device)
         if bridge.shape[0] < span_len:
             raise ValueError(f"bridge hidden states length {bridge.shape[0]} is shorter than scheduled span {span_len}")
-        return bridge[-span_len:]
+
+        prompt_len = int(info_dict.get("_omni_prompt_len", 0) or 0)
+        ids = info_dict.get("ids") if isinstance(info_dict, dict) else None
+        if isinstance(ids, dict):
+            text_prompt_len = len(ids.get("prompt") or [])
+            if text_prompt_len > 0:
+                prompt_len = text_prompt_len
+
+        raw_num_computed = info_dict.get("_omni_num_computed_tokens")
+        num_computed = prompt_len if raw_num_computed is None else int(raw_num_computed)
+        raw_is_prefill = info_dict.get("_omni_is_prefill")
+        is_prefill = num_computed < prompt_len if raw_is_prefill is None else bool(raw_is_prefill)
+
+        # Decode input at position `num_computed` should be conditioned on
+        # the matching thinker bridge row, not on bridge[-1] for every step.
+        start = max(0, min(num_computed, max(0, bridge.shape[0] - span_len)))
+        end = start + span_len
+        return bridge[start:end], is_prefill, prompt_len, num_computed
 
     def _make_inputs_embeds(
         self,
@@ -350,9 +374,15 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         span_len = int(input_ids.shape[0])
-        bridge_states = self._get_bridge_states(info_dict, span_len, input_ids.device)
+        bridge_states, is_prefill, prompt_len, num_computed = self._select_bridge_states(
+            info_dict, span_len, input_ids.device
+        )
         spk_emb = info_dict.get("spk_emb")
-        embeds = self._make_inputs_embeds(input_ids.view(1, -1), bridge_states, spk_emb=spk_emb)
+        embeds = self._make_inputs_embeds(
+            input_ids.view(1, -1),
+            bridge_states,
+            spk_emb=spk_emb,
+        )
         update: dict[str, Any] = {}
         if span_len == 1:
             hidden = info_dict.get("hidden_states", {})
@@ -368,6 +398,8 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
                 last_hidden.reshape(1, -1).to(device=embeds.device, dtype=embeds.dtype),
                 text_step.reshape(1, -1),
             )
+            if not is_prefill:
+                self._pending_audio_steps.append(max(0, num_computed - prompt_len) - 1)
         else:
             update.setdefault("codes", {})["audio"] = torch.full(
                 (span_len, self.num_code_layers),
@@ -449,6 +481,13 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
                 )
             )
         audio_codes = torch.stack(codes, dim=-1).to(dtype=torch.long)
+        pending_steps = self._pending_audio_steps[:batch]
+        del self._pending_audio_steps[:batch]
+        if len(pending_steps) == batch:
+            audio_steps = torch.tensor(pending_steps, device=audio_codes.device, dtype=torch.long)
+            layer_ids = torch.arange(self.num_code_layers, device=audio_codes.device, dtype=torch.long)
+            active = audio_steps.unsqueeze(-1) >= layer_ids.unsqueeze(0)
+            audio_codes = torch.where(active, audio_codes, torch.full_like(audio_codes, self.audio_pad_token))
         code_embeds = self.codec_proj(self.embed_tokens(audio_codes.unsqueeze(-1)).reshape(batch, -1))
         next_embeds = (
             code_embeds * self.audio_scale
@@ -460,10 +499,71 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         )
         return next_embeds, audio_codes
 
-    def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
+    def _normalise_audio_code_rows(
+        self,
+        audio: Any,
+        device: torch.device | None = None,
+    ) -> torch.Tensor | None:
+        if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
+            return None
+        rows = audio.to(device=device if device is not None else audio.device, dtype=torch.long)
+        if rows.ndim == 1:
+            rows = rows.reshape(1, -1)
+        if rows.ndim != 2 or rows.shape[-1] != self.num_code_layers:
+            return None
+        return rows
+
+    def _ready_diagonal_audio_frames(
+        self,
+        history: torch.Tensor | None,
+        current: torch.Tensor,
+        emitted_frames: int,
+    ) -> torch.Tensor | None:
+        if history is not None:
+            history = self._normalise_audio_code_rows(history, device=current.device)
+        rows = current if history is None else torch.cat((history, current), dim=0)
+        total_rows = int(rows.shape[0])
+        ready_frames = max(0, total_rows - self.num_code_layers + 1)
+        if ready_frames <= emitted_frames:
+            return None
+
+        frames: list[torch.Tensor] = []
+        delay = self.num_code_layers - 1
+        for frame_idx in range(emitted_frames, ready_frames):
+            end = frame_idx + delay
+            frame = torch.stack([rows[end - delay + layer, layer] for layer in range(self.num_code_layers)])
+            # Upstream emits only fully active frames; stop/pad rows terminate audio.
+            if (frame >= 2048).any():
+                continue
+            frames.append(frame)
+        if not frames:
+            return None
+        return torch.stack(frames, dim=0).to(dtype=torch.long)
+
+    def postprocess(self, hidden_states: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
         if hidden_states.numel() == 0:
             return {}
-        return {"hidden_states": {"last": hidden_states[-1:].detach()}}
+
+        update: dict[str, Any] = {"hidden_states": {"last": hidden_states[-1:].detach()}}
+        if bool(kwargs.get("_omni_is_prefill", False)):
+            return update
+
+        codes = kwargs.get("codes", {}) if isinstance(kwargs, dict) else {}
+        current = self._normalise_audio_code_rows(
+            codes.get("audio") if isinstance(codes, dict) else None,
+        )
+        if current is None:
+            return update
+
+        history = self._normalise_audio_code_rows(
+            codes.get("history") if isinstance(codes, dict) else None,
+            device=current.device,
+        )
+        rows = current if history is None else torch.cat((history, current), dim=0)
+        ready_frames = max(0, int(rows.shape[0]) - self.num_code_layers + 1)
+        update.setdefault("codes", {})["history"] = rows.detach()
+        update.setdefault("meta", {})["emitted_audio_frames"] = ready_frames
+        return update
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **_kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
@@ -472,18 +572,22 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         audio_codes_list: list[torch.Tensor] = []
         if isinstance(info_dicts, list):
             for info in info_dicts:
-                codes = info.get("codes", {}) if isinstance(info, dict) else {}
-                audio = codes.get("audio") if isinstance(codes, dict) else None
-                if isinstance(audio, torch.Tensor) and audio.numel() > 0:
-                    if audio.ndim == 1:
-                        audio = audio.reshape(1, -1)
-                    audio_codes_list.append(audio.to(dtype=torch.long))
+                if not isinstance(info, dict):
+                    continue
+                codes = info.get("codes", {})
+                if not isinstance(codes, dict):
+                    continue
+                current = self._normalise_audio_code_rows(codes.get("audio"))
+                if current is None:
+                    continue
+                meta = info.get("meta", {})
+                emitted = int(meta.get("emitted_audio_frames", 0)) if isinstance(meta, dict) else 0
+                frames = self._ready_diagonal_audio_frames(codes.get("history"), current, emitted)
+                if frames is not None and frames.numel() > 0:
+                    audio_codes_list.append(frames)
         if not audio_codes_list:
-            logger.info("MiniMind talker make_omni_output: no audio codes found; emitting hidden only")
             return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs={})
         audio_codes = torch.cat(audio_codes_list, dim=0)
-        valid = (audio_codes < 2048).all(dim=-1)
-        audio_codes = audio_codes[valid]
         return OmniOutput(
             text_hidden_states=model_outputs[: audio_codes.shape[0]],
             multimodal_outputs={"codes": {"audio": audio_codes}},

@@ -115,7 +115,6 @@ class MiniMindOmniForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         **kwargs: Any,
     ) -> torch.Tensor | IntermediateTensors:
         if self.model_stage == "thinker":
-            kwargs.setdefault("capture_layer_indices", [self.config.bridge_layer])
             kwargs.setdefault("return_hidden_states", True)
         return self.model(
             input_ids=input_ids,
