@@ -115,44 +115,9 @@ from vllm_omni.entrypoints.openai.utils import (
 )
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 
 logger = init_logger(__name__)
-
-
-def _audio_chunk_pcm_bytes(omni_res: OmniRequestOutput) -> int:
-    """Best-effort PCM byte count of the last audio chunk in ``omni_res``.
-
-    Used by the audio-streaming continuity tracker to size the player buffer.
-    Returns 0 when the chunk shape can't be interpreted — caller drops the
-    sample rather than recording a wrong byte count.
-    """
-    try:
-        final_res = omni_res.request_output
-        mm_output = final_res.outputs[0].multimodal_output
-        audio_data = mm_output.get("audio")
-        if isinstance(audio_data, list):
-            if not audio_data:
-                return 0
-            audio_tensor = audio_data[-1]
-        else:
-            audio_tensor = audio_data
-        if audio_tensor is None:
-            return 0
-        n_samples = int(audio_tensor.numel() if hasattr(audio_tensor, "numel") else audio_tensor.size)
-        # PCM s16le mono → 2 bytes per sample. This matches what
-        # _create_audio_choice serialises via CreateAudio (response_format="wav").
-        return max(n_samples, 0) * 2
-    except Exception:
-        return 0
-
-
-def _audio_chunk_sample_rate(omni_res: OmniRequestOutput) -> int:
-    """Resolve audio sample rate for the request's audio stream."""
-    try:
-        mm_output = omni_res.request_output.outputs[0].multimodal_output
-    except Exception:
-        return _metric_defs.DEFAULT_AUDIO_SAMPLE_RATE
-    return _metric_defs.resolve_audio_sample_rate(mm_output)
 
 
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
@@ -1682,12 +1647,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # Record per-chunk PCM byte count + arrival timestamp for
                     # audio_underrun_s / audio_continuity_ok_total at finalize.
                     if req_state is not None and req_state.request_arrival_ts > 0:
-                        chunk_bytes = _audio_chunk_pcm_bytes(omni_res)
+                        chunk_bytes = audio_chunk_pcm_bytes(omni_res)
                         if chunk_bytes > 0:
                             req_state.audio_chunk_arrivals_s.append(max(now_ts - req_state.request_arrival_ts, 0.0))
                             req_state.audio_chunk_bytes.append(chunk_bytes)
                             if req_state.audio_sample_rate is None:
-                                req_state.audio_sample_rate = _audio_chunk_sample_rate(omni_res)
+                                req_state.audio_sample_rate = audio_chunk_sample_rate(omni_res)
                     chunk = OmniChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,
