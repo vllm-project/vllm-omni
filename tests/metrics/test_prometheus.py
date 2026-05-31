@@ -128,3 +128,71 @@ class TestScrapeOutput:
         # default registry is being scraped by checking for process_* metrics
         # from the Python prometheus_client runtime.
         assert "process_" in scrape_output
+
+
+class TestRequestLifecycleGauges:
+    """Regression tests for the running/waiting gauge race at request finalize.
+
+    Before the fix, the per-stage publish in OmniBase._process_single_result
+    ran while the completed request was still in self.request_states even
+    though the orchestrator had already decremented _running_counter — so a
+    single completed request briefly exposed running=0, total=1 → waiting=1,
+    which stuck on /metrics until another request triggered a refresh.
+
+    Two-layer fix: _process_single_result excludes the finalizing request
+    from `total`, and _log_summary_and_cleanup republishes gauges after the
+    pop as a fallback. These tests pin the post-cleanup state.
+    """
+
+    def test_running_and_waiting_zero_after_request_completes(self, registry: CollectorRegistry) -> None:
+        from types import SimpleNamespace
+
+        from vllm_omni.entrypoints.omni_base import OmniBase
+        from vllm_omni.metrics.prometheus import OmniPrometheusMetrics, OmniRequestCounter
+
+        obj = object.__new__(OmniBase)
+        obj.engine = SimpleNamespace(_running_counter=OmniRequestCounter())
+        obj.prom_metrics = OmniPrometheusMetrics(model_name="lifecycle-test")
+        obj.request_states = {}
+        obj.log_stats = False
+
+        # Simulate request lifecycle: start (counter 0→1, dict {} → {req}),
+        # then finalize (counter 1→0, dict still holds the request because
+        # _log_summary_and_cleanup hasn't run yet — this is the exact race
+        # window the fix addresses).
+        obj.engine._running_counter.increment()
+        obj.request_states["req-1"] = SimpleNamespace(metrics=SimpleNamespace(e2e_done={"req-1"}))
+        obj.engine._running_counter.decrement()
+
+        obj._log_summary_and_cleanup("req-1")
+
+        assert obj.engine._running_counter.value == 0
+        assert len(obj.request_states) == 0
+        out = generate_latest(registry).decode()
+        assert _sample_value(out, 'vllm:omni_num_requests_running{model_name="lifecycle-test"}') == 0.0
+        assert _sample_value(out, 'vllm:omni_num_requests_waiting{model_name="lifecycle-test"}') == 0.0
+
+    def test_gauges_reflect_remaining_requests_after_one_completes(self, registry: CollectorRegistry) -> None:
+        from types import SimpleNamespace
+
+        from vllm_omni.entrypoints.omni_base import OmniBase
+        from vllm_omni.metrics.prometheus import OmniPrometheusMetrics, OmniRequestCounter
+
+        obj = object.__new__(OmniBase)
+        obj.engine = SimpleNamespace(_running_counter=OmniRequestCounter())
+        obj.prom_metrics = OmniPrometheusMetrics(model_name="lifecycle-test-2")
+        obj.request_states = {}
+        obj.log_stats = False
+
+        # Two in flight, one finalizes — running should report 1, waiting 0.
+        obj.engine._running_counter.increment()
+        obj.engine._running_counter.increment()
+        obj.request_states["req-1"] = SimpleNamespace(metrics=SimpleNamespace(e2e_done={"req-1"}))
+        obj.request_states["req-2"] = SimpleNamespace(metrics=SimpleNamespace(e2e_done=set()))
+        obj.engine._running_counter.decrement()
+
+        obj._log_summary_and_cleanup("req-1")
+
+        out = generate_latest(registry).decode()
+        assert _sample_value(out, 'vllm:omni_num_requests_running{model_name="lifecycle-test-2"}') == 1.0
+        assert _sample_value(out, 'vllm:omni_num_requests_waiting{model_name="lifecycle-test-2"}') == 0.0

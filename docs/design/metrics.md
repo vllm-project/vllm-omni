@@ -20,7 +20,7 @@ vLLM's `unregister_vllm_metrics()` function strips every `prometheus_client` col
 
 ### The Problem
 
-vLLM-Omni runs multiple engine instances (stages × replicas) within a single process, coordinated by an Orchestrator. The pipeline needs its own metrics — aggregate request counts, end-to-end latency across all stages, per-modality SLO signals, and cross-stage transfer attribution — that do not exist in upstream vLLM. All pipeline-level metrics use the `vllm:omni_` prefix to distinguish them from upstream per-engine metrics. The `unregister_vllm_metrics()` function is monkey-patched to a no-op at import time (see `vllm_omni/patch.py`) so that these metrics are not destroyed during engine initialization.
+vLLM-Omni runs multiple engine instances (stages × replicas) within a single process, coordinated by an Orchestrator. The pipeline needs its own metrics — aggregate request counts, end-to-end latency across all stages, per-modality SLO signals, and cross-stage transfer attribution — that do not exist in upstream vLLM. All pipeline-level metrics use the `vllm:omni_` prefix to distinguish them from upstream per-engine metrics. At import time (see `vllm_omni/patch.py`) we replace `unregister_vllm_metrics()` with a scoped version that still strips upstream `vllm:*` collectors before each new `PrometheusStatLogger` registers (so multi-engine processes don't crash on duplicate registration), but preserves anything prefixed `vllm:omni_` / `vllm_omni`.
 
 Upstream per-engine metrics retain the `vllm:` prefix but are now registered by `OmniPrometheusStatLogger`, a thin subclass of upstream's `PrometheusStatLogger` that reshapes the single `engine` label into a `stage` + `replica` pair (see "OmniPrometheusStatLogger wrap" below).
 
@@ -181,7 +181,7 @@ After the wrap, every upstream `vllm:*` family — TTFT, ITL, TPOT, e2e latency,
   - `SECONDS_FAST_BUCKETS` (0.001 s – 60 s) for fine-grained cross-stage transfer and audio-underrun values that need millisecond-level resolution.
 - Counters use the `_total` suffix (auto-appended by `prometheus_client`).
 - Sizes use the `_bytes` suffix.
-- All omni-specific families are prefixed `vllm:omni_`. The upstream `unregister_vllm_metrics()` function is monkey-patched to a no-op so these are not destroyed during engine initialization.
+- All omni-specific families are prefixed `vllm:omni_`. The upstream `unregister_vllm_metrics()` function is monkey-patched to a scoped version that still strips upstream `vllm:*` collectors (so multi-engine init within one process does not crash on duplicate registration) but preserves anything prefixed `vllm:omni_` / `vllm_omni`.
 
 ## Logging vs. Prometheus
 

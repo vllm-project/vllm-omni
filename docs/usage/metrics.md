@@ -92,5 +92,5 @@ For the full list of upstream metrics, see [the vLLM docs](https://github.com/vl
 - All time-bearing metrics use the `_s` suffix (values in seconds). Buckets are `SECONDS_BUCKETS` for e2e / generation-style values and `SECONDS_FAST_BUCKETS` (1 ms → 60 s) for the fine-grained transfer and audio-underrun values.
 - Counters use the `_total` suffix (auto-appended by `prometheus_client`).
 - Sizes use the `_bytes` suffix.
-- All omni-specific families are prefixed `vllm:omni_`. The upstream `unregister_vllm_metrics()` function is monkey-patched to a no-op (see `vllm_omni/patch.py`) so these are not destroyed during engine initialization.
+- All omni-specific families are prefixed `vllm:omni_`. The upstream `unregister_vllm_metrics()` function is monkey-patched (see `vllm_omni/patch.py`) to a scoped version that still strips upstream `vllm:*` collectors so multi-engine init within one process does not crash on duplicate registration, but preserves anything prefixed `vllm:omni_` / `vllm_omni`.
 - Text and audio first-output use distinct families (`vllm:time_to_first_token_seconds` reused from upstream for text; `vllm:omni_audio_ttfp_s` for audio) rather than a single metric with a `modality` label.
