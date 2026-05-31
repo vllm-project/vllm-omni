@@ -88,8 +88,11 @@ class FeedForward(nn.Module):
         dim_out = dim_out if dim_out is not None else dim
 
         if quantize_down_proj_only and quant_config is not None:
+            # Conservative FP8 layout: quantize only the FFN down-projection
+            # (net.2). The up-projection (GELU.proj / net.0) stays in BF16 to
+            # limit quantization error accumulation and preserve image quality.
             proj_quant = None
-            row_quant = None
+            row_quant = quant_config
         else:
             proj_quant = quant_config
             row_quant = quant_config
@@ -250,7 +253,6 @@ class SD3CrossAttention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
     ):
-        hidden_states = hidden_states.contiguous()
         # Compute QKV for image stream (sample projections)
         qkv = self.to_qkv(hidden_states)
         qkv = qkv[0]
@@ -268,7 +270,6 @@ class SD3CrossAttention(nn.Module):
 
         if encoder_hidden_states is not None:
             # Compute QKV for text stream (context projections)
-            encoder_hidden_states = encoder_hidden_states.contiguous()
             qkv_add = self.add_kv_proj(encoder_hidden_states)
             qkv_add = qkv_add[0]
             txt_query, txt_key, txt_value = qkv_add.chunk(3, dim=-1)
@@ -306,11 +307,11 @@ class SD3CrossAttention(nn.Module):
                 hidden_states[:, :context_seqlen, :],  # Text part
             )
             if self.to_add_out is not None:
-                encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states.contiguous())
+                encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
 
         # Apply output projections
         if self.to_out is not None:
-            hidden_states, _ = self.to_out[0](hidden_states.contiguous())
+            hidden_states, _ = self.to_out[0](hidden_states)
 
         if encoder_hidden_states is None:
             return hidden_states
@@ -585,7 +586,7 @@ class SD3Transformer2DModel(nn.Module):
 
         hidden_states = self.pos_embed(hidden_states)
         temb = self.time_text_embed(timestep, pooled_projections)
-        encoder_hidden_states = self.context_embedder(encoder_hidden_states.contiguous())
+        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
@@ -595,7 +596,7 @@ class SD3Transformer2DModel(nn.Module):
             )
 
         hidden_states = self.norm_out(hidden_states, temb)
-        hidden_states = self.proj_out(hidden_states.contiguous())
+        hidden_states = self.proj_out(hidden_states)
 
         if isinstance(hidden_states, tuple | list):
             hidden_states = hidden_states[0]

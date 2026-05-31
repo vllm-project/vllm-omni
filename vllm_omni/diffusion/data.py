@@ -616,23 +616,18 @@ class OmniDiffusionConfig:
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
-    # SD3 / SD3.5: default is False — T5-XXL (text_encoder_3 + tokenizer_3) is
-    # loaded and used. Set True to skip T5 and use zero T5 embeddings (Diffusers
-    # drop-T5 style; lower VRAM).
-    sd3_disable_t5_text_encoder: bool = False
-
     # Supplementary model specific parameters
     extras: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def is_moe(self) -> bool:
         num_experts = self.tf_model_config.get("num_experts", None)
-        if not isinstance(num_experts, list | tuple | int):
+        if not isinstance(num_experts, (list, tuple, int)):
             return False
         if isinstance(num_experts, int):
             return num_experts > 0
 
-        if isinstance(num_experts, list | tuple):
+        if isinstance(num_experts, (list, tuple)):
             return any(isinstance(n, int) and n > 0 for n in num_experts)
 
         return False

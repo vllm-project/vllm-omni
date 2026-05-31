@@ -197,6 +197,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         self.tokenizer_2 = CLIPTokenizer.from_pretrained(
             model, subfolder="tokenizer_2", local_files_only=local_files_only
         )
+        self.tokenizer_3 = T5Tokenizer.from_pretrained(
+            model, subfolder="tokenizer_3", local_files_only=local_files_only
+        )
         self.text_encoder = CLIPTextModelWithProjection.from_pretrained(
             model,
             subfolder="text_encoder",
@@ -209,20 +212,12 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             torch_dtype=dtype,
             local_files_only=local_files_only,
         )
-        if od_config.sd3_disable_t5_text_encoder:
-            self.tokenizer_3 = None
-            self.text_encoder_3 = None
-            logger.info("SD3: T5 text encoder disabled (sd3_disable_t5_text_encoder=True); using zero T5 embeddings.")
-        else:
-            self.tokenizer_3 = T5Tokenizer.from_pretrained(
-                model, subfolder="tokenizer_3", local_files_only=local_files_only
-            )
-            self.text_encoder_3 = T5EncoderModel.from_pretrained(
-                model,
-                subfolder="text_encoder_3",
-                torch_dtype=dtype,
-                local_files_only=local_files_only,
-            )
+        self.text_encoder_3 = T5EncoderModel.from_pretrained(
+            model,
+            subfolder="text_encoder_3",
+            torch_dtype=dtype,
+            local_files_only=local_files_only,
+        )
         self.transformer = SD3Transformer2DModel(
             od_config=od_config,
             quant_config=od_config.quantization_config,
@@ -257,14 +252,12 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         dev = self.device
         self.text_encoder.to(dev)
         self.text_encoder_2.to(dev)
-        if self.text_encoder_3 is not None:
-            self.text_encoder_3.to(dev)
+        self.text_encoder_3.to(dev)
 
     def _offload_text_encoders_to_cpu_after_encode(self) -> None:
         self.text_encoder.cpu()
         self.text_encoder_2.cpu()
-        if self.text_encoder_3 is not None:
-            self.text_encoder_3.cpu()
+        self.text_encoder_3.cpu()
 
     def check_inputs(
         self,
@@ -395,11 +388,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         prompt: str | list[str] = "",
         num_images_per_prompt: int = 1,
         max_sequence_length: int = 256,
-        dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-        embedding_dtype = dtype or (
-            self.text_encoder_3.dtype if self.text_encoder_3 is not None else self.od_config.dtype
-        )
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
 
@@ -411,7 +400,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                     self.transformer.joint_attention_dim,
                 ),
                 device=self.device,
-                dtype=embedding_dtype,
+                dtype=self.od_config.dtype,
             )
 
         text_inputs = self.tokenizer_3(
@@ -434,7 +423,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
         prompt_embeds = self.text_encoder_3(text_input_ids.to(self.device))[0]
 
-        prompt_embeds = prompt_embeds.to(dtype=embedding_dtype, device=self.device)
+        prompt_embeds = prompt_embeds.to(dtype=self.od_config.dtype, device=self.device)
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)

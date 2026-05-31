@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
+from vllm_omni.diffusion.data import logger
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
@@ -154,14 +154,6 @@ def parse_args() -> argparse.Namespace:
         "--enable-layerwise-offload",
         action="store_true",
         help="Enable layerwise (blockwise) offloading on DiT modules.",
-    )
-    parser.add_argument(
-        "--sd3-disable-t5",
-        action="store_true",
-        help=(
-            "[SD3 / SD3.5 only] By default, T5-XXL (text_encoder_3) is loaded. "
-            "Pass this flag to skip T5 and use zero T5 embeddings to save VRAM (quality trade-off)."
-        ),
     )
     parser.add_argument(
         "--use-hsdp",
@@ -357,18 +349,6 @@ def main():
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
 
-    parallel_config = DiffusionParallelConfig(
-        ulysses_degree=args.ulysses_degree,
-        ring_degree=args.ring_degree,
-        ulysses_mode=args.ulysses_mode,
-        cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-        vae_patch_parallel_size=args.vae_patch_parallel_size,
-        enable_expert_parallel=args.enable_expert_parallel,
-        use_hsdp=args.use_hsdp,
-        hsdp_shard_size=args.hsdp_shard_size,
-        hsdp_replicate_size=args.hsdp_replicate_size,
-    )
     profiler_enabled = args.profiler_config is not None
 
     # Prepare LoRA kwargs for Omni initialization
@@ -404,7 +384,13 @@ def main():
         "cache_backend": args.cache_backend,
         "cache_config": cache_config,
         "enable_cache_dit_summary": args.enable_cache_dit_summary,
-        "parallel_config": parallel_config,
+        "ulysses_degree": args.ulysses_degree,
+        "ring_degree": args.ring_degree,
+        "ulysses_mode": args.ulysses_mode,
+        "cfg_parallel_size": args.cfg_parallel_size,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "vae_patch_parallel_size": args.vae_patch_parallel_size,
+        "enable_expert_parallel": args.enable_expert_parallel,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",
@@ -413,7 +399,6 @@ def main():
         "profiler_config": args.profiler_config,
         "init_timeout": args.init_timeout,
         "stage_init_timeout": args.stage_init_timeout,
-        "sd3_disable_t5_text_encoder": args.sd3_disable_t5,
         "auxiliary_text_encoder": args.auxiliary_text_encoder,
         **lora_args,
         **quant_kwargs,
@@ -436,9 +421,6 @@ def main():
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {cache_backend if cache_backend else 'None (no acceleration)'}")
     print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
-    print(
-        f"  SD3/3.5 T5-XXL: {'not loaded (zero T5, --sd3-disable-t5)' if args.sd3_disable_t5 else 'loaded (default)'}"
-    )
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")
     print(
