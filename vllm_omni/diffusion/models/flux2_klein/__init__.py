@@ -9,9 +9,11 @@ from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import (
     Flux2KleinPipeline,
     get_flux2_klein_post_process_func,
 )
+from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein_kv import Flux2KleinKVPipeline
 
 __all__ = [
     "Flux2KleinPipeline",
+    "Flux2KleinKVPipeline",
     "Flux2Transformer2DModel",
     "get_flux2_klein_post_process_func",
 ]
