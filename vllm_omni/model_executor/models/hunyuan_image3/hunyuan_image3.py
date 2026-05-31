@@ -74,6 +74,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.parse import (
     MultiModalDataItems,
+    MultiModalDataParser,
 )
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
@@ -982,6 +983,21 @@ class HunyuanImage3Processor:
         return image.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
 
 
+class HunyuanImage3DataParser(MultiModalDataParser):
+    """Treat image-edit ``img2img`` input as regular image input."""
+
+    def _get_subparsers(self):
+        parsers = super()._get_subparsers()
+        parsers["img2img"] = self._parse_image_data
+        return parsers
+
+    def parse_mm_data(self, mm_data, **kwargs):
+        normalized = {}
+        for key, value in mm_data.items():
+            normalized["image" if key == "img2img" else key] = value
+        return super().parse_mm_data(normalized, **kwargs)
+
+
 class HunyuanImage3ProcessingInfo(BaseProcessingInfo):
     """Processing information for HunyuanImage3 model."""
 
@@ -995,8 +1011,11 @@ class HunyuanImage3ProcessingInfo(BaseProcessingInfo):
             **kwargs,
         )
 
+    def get_data_parser(self) -> HunyuanImage3DataParser:
+        return HunyuanImage3DataParser()
+
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": None}
+        return {"image": None, "img2img": 1}
 
 
 class HunyuanImage3DummyInputsBuilder(BaseDummyInputsBuilder[HunyuanImage3ProcessingInfo]):

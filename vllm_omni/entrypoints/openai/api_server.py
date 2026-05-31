@@ -1941,6 +1941,7 @@ async def edit_images(
                 extra_body["sys_type"] = sys_type
             if system_prompt is not None:
                 extra_body["system_prompt"] = system_prompt
+            extra_body.setdefault("bot_task", "think")
 
             prompt_text = prompt.get("prompt", "")
             generation_result = await chat_handler.generate_diffusion_images(
