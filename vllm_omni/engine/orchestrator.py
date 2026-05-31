@@ -197,43 +197,7 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
-        self._running_counter = running_counter
-        # Optional handle to OmniTransferMetrics for direct TX-side emit from
-        # _forward_to_next_stage. Optional so unit-test contexts that don't
-        # spin up a Prometheus registry continue to work.
-        self._transfer_emitter = transfer_emitter
-
-        vllm_config_for_stats = next(
-            (p.stage_vllm_config for p in stage_pools if p.stage_vllm_config is not None),
-            None,
-        )
-        # Build flat engine_idx ↔ (stage_id, replica_id) maps so that the wrap
-        # exposes the ~37 vllm:* families with per-(stage, replica) labels.
-        # The reverse map is consulted at record() time to find the engine_idx
-        # to update from the orchestrator's (stage_id, replica_id) loop.
-        stage_replica_map: dict[int, tuple[str, str]] = {}
-        self._stage_replica_to_engine_idx: dict[tuple[int, int], int] = {}
-        flat_idx = 0
-        for stage_id, pool in enumerate(stage_pools):
-            for replica_id in range(pool.num_replicas):
-                stage_replica_map[flat_idx] = (str(stage_id), str(replica_id))
-                self._stage_replica_to_engine_idx[(stage_id, replica_id)] = flat_idx
-                flat_idx += 1
-
-        if vllm_config_for_stats is not None:
-            try:
-                self._stat_logger = OmniPrometheusStatLogger(
-                    vllm_config=vllm_config_for_stats,
-                    stage_replica_map=stage_replica_map,
-                )
-            except Exception:
-                # Minimal vllm_config in unit-test contexts can lack fields the
-                # upstream PrometheusStatLogger expects. Skip wrap rather than
-                # break orchestrator construction.
-                logger.exception("[Orchestrator] OmniPrometheusStatLogger init failed; metrics wrap disabled")
-                self._stat_logger = None
-        else:
-            self._stat_logger = None
+        self._init_metrics_state(stage_pools, running_counter, transfer_emitter)
 
         self._cfg_tracker = CfgCompanionTracker()
 
@@ -263,6 +227,58 @@ class Orchestrator:
             for pool in self.stage_pools:
                 pool.attach_hub(self._hub)
                 pool.attach_load_balancer(factory())
+
+    def _init_metrics_state(
+        self,
+        stage_pools: list[StagePool],
+        running_counter: OmniRequestCounter | None,
+        transfer_emitter: Any,
+    ) -> None:
+        """Wire up all metric-related orchestrator state.
+
+        Sets ``self._running_counter`` and ``self._transfer_emitter``
+        (both optional, used by request-add / forward paths), builds the
+        ``(stage_id, replica_id) ↔ engine_idx`` lookup used at record() time,
+        and best-effort constructs the ``OmniPrometheusStatLogger`` wrap
+        that exposes ~37 upstream ``vllm:*`` families with per-(stage,
+        replica) labels. Failure to build the wrap is logged and metrics
+        are simply disabled — orchestrator construction continues so unit
+        tests with a minimal ``vllm_config`` still pass.
+        """
+        self._running_counter = running_counter
+        self._transfer_emitter = transfer_emitter
+
+        # Flat engine_idx ↔ (stage, replica) maps. The reverse map is
+        # consulted at record() time to translate the orchestrator's
+        # (stage_id, replica_id) loop variables into an engine_idx the
+        # underlying PrometheusStatLogger can address.
+        stage_replica_map: dict[int, tuple[str, str]] = {}
+        self._stage_replica_to_engine_idx: dict[tuple[int, int], int] = {}
+        flat_idx = 0
+        for stage_id, pool in enumerate(stage_pools):
+            for replica_id in range(pool.num_replicas):
+                stage_replica_map[flat_idx] = (str(stage_id), str(replica_id))
+                self._stage_replica_to_engine_idx[(stage_id, replica_id)] = flat_idx
+                flat_idx += 1
+
+        vllm_config_for_stats = next(
+            (p.stage_vllm_config for p in stage_pools if p.stage_vllm_config is not None),
+            None,
+        )
+        if vllm_config_for_stats is None:
+            self._stat_logger = None
+            return
+        try:
+            self._stat_logger = OmniPrometheusStatLogger(
+                vllm_config=vllm_config_for_stats,
+                stage_replica_map=stage_replica_map,
+            )
+        except Exception:
+            # Minimal vllm_config in unit-test contexts can lack fields the
+            # upstream PrometheusStatLogger expects. Skip wrap rather than
+            # break orchestrator construction.
+            logger.exception("[Orchestrator] OmniPrometheusStatLogger init failed; metrics wrap disabled")
+            self._stat_logger = None
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
