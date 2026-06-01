@@ -2437,8 +2437,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 default_stage_params.stop_token_ids = ar_stop_token_ids
 
             # Inject target_h/w into AR stage for M-RoPE position pre-computation
-            # (e.g. GLM-Image). max_tokens comes from deploy YAML.
-            if comprehension_idx is not None and idx == comprehension_idx and height is not None and width is not None:
+            # (e.g. GLM-Image). HunyuanImage3's M-RoPE implementation does
+            # not accept these kwargs; when its ratio-token stop rule is active,
+            # keep the size signal on the prompt/DiT side only.
+            if (
+                comprehension_idx is not None
+                and idx == comprehension_idx
+                and ar_stop_token_ids is None
+                and height is not None
+                and width is not None
+            ):
                 extra_args = getattr(default_stage_params, "extra_args", None)
                 if extra_args is None:
                     extra_args = {}

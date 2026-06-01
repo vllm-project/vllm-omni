@@ -258,13 +258,14 @@ def test_build_multistage_generation_inputs_sets_hunyuan_image_ratio_stops(servi
         prompt="edit me",
         extra_body={"bot_task": "think_recaption", "sys_type": "en_unified"},
         reference_images=images,
-        gen_params=OmniDiffusionSamplingParams(),
+        gen_params=OmniDiffusionSamplingParams(height=720, width=1280),
         tokenizer=FakeTokenizer(),
     )
 
     expected = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=FakeTokenizer())
     assert sampling_params_list[0].stop_token_ids == expected
     assert 128025 not in sampling_params_list[0].stop_token_ids
+    assert getattr(sampling_params_list[0], "extra_args", None) in (None, {})
 
 
 def test_build_multistage_generation_inputs_bot_task_semantic_changes_trigger_and_sys(serving_chat):
