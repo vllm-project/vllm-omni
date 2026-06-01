@@ -78,10 +78,13 @@ def register_omni_models_to_vllm():
 
     _register_omni_hf_configs()
 
-    supported_archs = ModelRegistry.get_supported_archs()
+    # Always register every arch declared in _OMNI_MODELS — these are the
+    # archs vllm-omni explicitly owns, so we want our implementation to
+    # win even if a future vllm release ships a same-named built-in.
+    # vllm's ModelRegistry.register_model already emits a warning and
+    # overrides on collision; we let it handle that.
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
-        if arch not in supported_archs:
-            ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+        ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
 
 
 @dataclass
@@ -139,6 +142,10 @@ class OmniEngineArgs(EngineArgs):
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
     async_chunk: bool = False
+    # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
+    # Must be declared here so engine_args dict propagation does not silently
+    # drop the value when constructing OmniEngineArgs from kwargs.
+    active_stream_window: int = 0
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
@@ -339,6 +346,7 @@ class OmniEngineArgs(EngineArgs):
             # All kwargs below are Omni specific
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
+            active_stream_window=self.active_stream_window,
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,
