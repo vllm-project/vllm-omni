@@ -37,7 +37,9 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
     extract_speech_feat,
     extract_speech_token,
     extract_spk_embedding,
+    extract_spk_embedding_trt,
     extract_text_token,
+    unpad_prompt_conditioning,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
@@ -99,13 +101,105 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             providers=["CUDAExecutionProvider" if torch.cuda.is_available() else "CPUExecutionProvider"],
         )
         self.feat_extractor = partial(mel_spectrogram, **getattr(config, "feat_extractor", {}))
+        campplus_onnx_path = os.path.join(model_dir, config.campplus_onxx_path)
         self.campplus_session = onnxruntime.InferenceSession(
-            os.path.join(model_dir, config.campplus_onxx_path),
+            campplus_onnx_path,
             sess_options=option,
             providers=["CPUExecutionProvider"],
         )
+        # Optional TensorRT speaker-embedding path (default on). The CPU ONNX
+        # campplus session above dominates per-request prompt processing; a
+        # prebuilt TRT engine runs it on GPU. Falls back to ONNX if disabled,
+        # CUDA is unavailable, or the engine fails to build.
+        self.campplus_trt = None
+        if self._speaker_embedding_trt_enabled() and torch.cuda.is_available():
+            try:
+                from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import (
+                    CampplusTRT,
+                )
+
+                self.campplus_trt = CampplusTRT(campplus_onnx_path, device="cuda")
+                logger.info("CosyVoice3: using TensorRT campplus speaker embedding")
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                logger.warning(
+                    "CosyVoice3: TensorRT campplus build failed (%s); falling back to ONNX-Runtime speaker embedding",
+                    exc,
+                )
+                self.campplus_trt = None
         self._cached_model_dir = model_dir
         self._speaker_cache = get_speaker_cache()
+
+    @staticmethod
+    def _speaker_embedding_trt_enabled() -> bool:
+        """Whether to use the TensorRT campplus speaker-embedding path.
+
+        Default on; disable per process with ``COSYVOICE3_TRT=0``. This is an
+        env-var toggle (mirroring e.g. mimo_audio's
+        ``MIMO_AUDIO_TOKENIZER_CUDA_GRAPH``): the talker's multimodal processor
+        runs outside the stage worker process, so deploy-yaml ``hf_overrides`` /
+        per-stage ``env`` do not reach it.
+        """
+        return os.environ.get("COSYVOICE3_TRT", "1") not in ("0", "false", "False", "")
+
+    # Class-level cached s3tokenizer model — loaded once per process on first
+    # call to ``_extract_speech_token_via_s3`` and shared across all
+    # processor instances. Guarded by ``COSYVOICE3_USE_S3TOKENIZER=1``.
+    _s3_model = None
+
+    @classmethod
+    def _ensure_s3_model(cls):
+        if cls._s3_model is not None:
+            return cls._s3_model
+
+        # ``s3tokenizer`` is a regular dependency now; import it directly. No
+        # hard-coded source checkout path. ``S3TOKENIZER_CACHE`` optionally
+        # overrides the download cache; otherwise s3tokenizer's own default is
+        # used.
+        import s3tokenizer as _s3
+
+        cache_dir = os.environ.get("S3TOKENIZER_CACHE")
+        load_kwargs = {}
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            load_kwargs["download_root"] = cache_dir
+        model = _s3.load_model("speech_tokenizer_v3_25hz", **load_kwargs)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device).eval()
+        cls._s3_model = (model, _s3, device)
+        return cls._s3_model
+
+    def _extract_speech_token_via_s3(self, audio, return_device):
+        """Drop-in replacement for ``extract_speech_token`` that uses the
+        S3Tokenizer PyTorch model on GPU. Returns the same
+        ``(speech_token[1, T], speech_token_len[1])`` int32 tensors as the
+        ONNX path so the rest of ``_call_hf_processor`` is unchanged.
+        """
+        import numpy as np
+
+        model, _s3, dev = self._ensure_s3_model()
+
+        # audio is a (waveform_ndarray, sr) tuple; resample to 16 kHz mono float32.
+        wav, sr = audio
+        wav = np.asarray(wav, dtype=np.float32)
+        if wav.ndim == 2:
+            wav = wav.mean(axis=1)
+        if int(sr) != 16000:
+            from math import gcd
+
+            from scipy.signal import resample_poly
+
+            g = gcd(int(sr), 16000)
+            wav = resample_poly(wav, 16000 // g, int(sr) // g).astype(np.float32)
+        audio_t = torch.from_numpy(wav)
+
+        mel = _s3.log_mel_spectrogram(audio_t)
+        mels_p, mels_lens = _s3.padding([mel])
+        with torch.inference_mode():
+            codes, codes_lens = model.quantize(mels_p.to(dev), mels_lens.to(dev))
+        n = int(codes_lens[0].item())
+        speech_token = codes[:1, :n].to(dtype=torch.int32, device=return_device)
+        speech_token_len = torch.tensor([n], dtype=torch.int32, device=return_device)
+        return speech_token, speech_token_len
 
     def _call_hf_processor(
         self,
@@ -185,15 +279,75 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
                 )
                 return ft
 
-        speech_token, speech_token_len = extract_speech_token(audio, self.speech_tokenizer, device)
+        # Per-call timing of the three feature-extraction ONNX/mel pipelines.
+        # Aggregated stats are printed at process exit; enable with
+        # ``COSYVOICE3_TIME_PROCESSOR=1``.
+        import os as _os
+        import time as _time
+
+        _timing_on = _os.environ.get("COSYVOICE3_TIME_PROCESSOR") == "1"
+        _t_token0 = _time.perf_counter() if _timing_on else None
+        # Faster path: when ``COSYVOICE3_USE_S3TOKENIZER=1`` and the
+        # S3Tokenizer PyTorch package is importable, use it for speech-token
+        # extraction. It runs on GPU via PyTorch instead of the bundled
+        # ``speech_tokenizer_v3.onnx`` which falls back to CPU ONNX runtime in
+        # this venv (no onnxruntime-gpu installed), and is ~30× faster.
+        if _os.environ.get("COSYVOICE3_USE_S3TOKENIZER") == "1":
+            speech_token, speech_token_len = self._extract_speech_token_via_s3(audio, device)
+        else:
+            speech_token, speech_token_len = extract_speech_token(audio, self.speech_tokenizer, device)
+        _t_token1 = _time.perf_counter() if _timing_on else None
+
         speech_feat, speech_feat_len = extract_speech_feat(audio, self.feat_extractor, device)
+        _t_feat1 = _time.perf_counter() if _timing_on else None
 
         if config.sample_rate == 24000:
             token_len = min(int(speech_feat.shape[1] / 2), speech_token.shape[1])
             speech_feat, speech_feat_len[:] = speech_feat[:, : 2 * token_len], 2 * token_len
             speech_token, speech_token_len[:] = speech_token[:, :token_len], token_len
 
-        embedding = extract_spk_embedding(audio, self.campplus_session, device)
+        if self.campplus_trt is not None:
+            embedding = extract_spk_embedding_trt(audio, self.campplus_trt, device)
+        else:
+            embedding = extract_spk_embedding(audio, self.campplus_session, device)
+        _t_emb1 = _time.perf_counter() if _timing_on else None
+
+        if _timing_on:
+            _cls = type(self)
+            _bucket = getattr(_cls, "_cosyvoice3_timing_buckets", None)
+            if _bucket is None:
+                _bucket = {
+                    "speech_token_ms": [],
+                    "speech_feat_ms": [],
+                    "spk_embedding_ms": [],
+                }
+                _cls._cosyvoice3_timing_buckets = _bucket
+            _bucket["speech_token_ms"].append((_t_token1 - _t_token0) * 1000)
+            _bucket["speech_feat_ms"].append((_t_feat1 - _t_token1) * 1000)
+            _bucket["spk_embedding_ms"].append((_t_emb1 - _t_feat1) * 1000)
+            # Register atexit reporter once per process.
+            if not getattr(_cls, "_cosyvoice3_timing_registered", False):
+                _cls._cosyvoice3_timing_registered = True
+                import atexit as _atexit
+
+                def _report():
+                    import statistics as _st
+
+                    b = type(self)._cosyvoice3_timing_buckets
+                    if not any(b.values()):
+                        return
+                    print("\n=== CosyVoice3 _call_hf_processor feature-extraction timing ===")
+                    for name, xs in b.items():
+                        if not xs:
+                            continue
+                        print(
+                            f"  {name:<22} n={len(xs):>4} sum={sum(xs):>8.1f}ms "
+                            f"mean={_st.mean(xs):>7.2f}ms median={_st.median(xs):>7.2f}ms "
+                            f"min={min(xs):>6.2f}ms max={max(xs):>6.2f}ms"
+                        )
+                    print("=" * 64)
+
+                _atexit.register(_report)
 
         # Cache the extracted artifacts for named speakers
         if cache_key is not None:
@@ -469,26 +623,26 @@ class CosyVoice3Model(
         top_k: int,
         generator: torch.Generator | None,
     ) -> int:
+        """Vectorized nucleus + top-k sampling.
+
+        Bit-equivalent semantics to the reference iterative implementation
+        (token i is kept iff ``cumsum(sorted_probs)[i] - sorted_probs[i] < top_p``
+        AND ``i < top_k``), but without the Python loop's per-token ``.item()``
+        D2H syncs — those dominated the sampler CPU time in profiling.
+        """
         probs = weighted_scores.softmax(dim=0)
         sorted_prob, sorted_idx = probs.sort(descending=True, stable=True)
-        kept_probs: list[torch.Tensor] = []
-        kept_indices: list[torch.Tensor] = []
-        cum_prob = 0.0
-        max_keep = len(sorted_idx) if top_k <= 0 else min(int(top_k), len(sorted_idx))
-        for i in range(len(sorted_idx)):
-            if cum_prob < top_p and len(kept_probs) < max_keep:
-                cum_prob += float(sorted_prob[i].item())
-                kept_probs.append(sorted_prob[i])
-                kept_indices.append(sorted_idx[i])
-            else:
-                break
-
-        if not kept_probs:
-            return int(sorted_idx[0].item())
-
-        sample_probs = torch.stack(kept_probs)
-        sample_idx = cls._multinomial_sample(sample_probs, generator=generator)
-        return int(torch.stack(kept_indices)[int(sample_idx.item())].item())
+        cum_before = sorted_prob.cumsum(dim=0) - sorted_prob
+        mask = cum_before < top_p
+        if top_k > 0:
+            n = sorted_prob.shape[0]
+            mask = mask & (torch.arange(n, device=mask.device) < min(int(top_k), n))
+        weights = sorted_prob * mask.to(sorted_prob.dtype)
+        # First token always passes (cum_before[0] = 0 < top_p for any top_p > 0),
+        # so ``weights`` is guaranteed to have at least one nonzero entry. The
+        # final ``.item()`` is the ONLY D2H sync per call.
+        sample_idx = torch.multinomial(weights, 1, replacement=True, generator=generator)
+        return int(sorted_idx[sample_idx].item())
 
     @classmethod
     def _ras_sample_one(
@@ -627,11 +781,21 @@ class CosyVoice3Model(
         else:
             raise RuntimeError(f"compute_logits is only valid for {self.model_stage}.")
 
-    def embed_multimodal(self, **kwargs: object) -> torch.Tensor:
+    def embed_multimodal(self, **kwargs: object):
         if self.model_stage == "cosyvoice3_talker":
             speech_token = kwargs["speech_token"]
-            speech_token_emb = self.model.speech_embedding(speech_token)
-            return speech_token_emb
+            # vLLM's _execute_mm_encoder batches ALL multimodal items scheduled
+            # in one engine step into a single call, expecting one embedding
+            # tensor per item back. When >=2 requests prefill in the same step
+            # (likely once mm preprocessing is fast, e.g. TensorRT speaker
+            # embedding), speech_token arrives as a list of per-item tensors
+            # (variable length), so embed it per item and return a list of
+            # [T_i, emb] tensors. The single-item path keeps returning a
+            # [1, T, emb] tensor (the caller's extend() iterates dim 0).
+            if isinstance(speech_token, (list, tuple)):
+                emb_dim = self.model.speech_embedding.weight.shape[1]
+                return [self.model.speech_embedding(t).reshape(-1, emb_dim) for t in speech_token]
+            return self.model.speech_embedding(speech_token)
         else:
             raise RuntimeError(f"embed_multimodal is only valid for {self.model_stage}.")
 
@@ -720,6 +884,49 @@ class CosyVoice3Model(
         else:
             raise RuntimeError(f"embed_input_ids is not valid for {self.model_stage}.")
 
+    @staticmethod
+    def _split_prompt_conditioning(speech_token, speech_feat, embedding, speech_token_len):
+        """Split collated prompt conditioning into per-request lists.
+
+        Returns ``(speech_token_list, speech_feat_list, embedding_list,
+        speech_token_len_list)``, one rank-correct tensor per request:
+        ``speech_token`` ``[1, T]`` (possibly right-padded), ``speech_feat``
+        ``[1, 2T, F]``, ``embedding`` ``[1, D]``, ``speech_token_len`` ``[1, 1]``.
+
+        This runs inside the talker ``forward`` which may be CUDA-graph
+        captured, so it must NOT trigger any host<->device sync (no ``.item()``
+        / ``.tolist()`` / Python-int slicing by tensor value). Splitting is pure
+        on-device indexing; right-padding is dropped later in the (eager)
+        code2wav stage using the per-request ``speech_token_len``. Robust to
+        inputs arriving as padded ``[B, ...]`` batch tensors or per-request
+        lists.
+        """
+
+        def _rows(x, want_dim):
+            if isinstance(x, (list, tuple)):
+                items = list(x)
+            elif isinstance(x, torch.Tensor):
+                # ``x.shape[0]`` is a static Python int — no device sync.
+                items = [x[i] for i in range(x.shape[0])]
+            else:
+                return None
+            out = []
+            for t in items:
+                if isinstance(t, torch.Tensor):
+                    while t.dim() < want_dim:
+                        t = t.unsqueeze(0)
+                    if t.shape[0] != 1:
+                        t = t[:1]
+                    t = t.contiguous()
+                out.append(t)
+            return out
+
+        st_out = _rows(speech_token, 2)
+        sf_out = _rows(speech_feat, 3)
+        emb_out = _rows(embedding, 2)
+        stl_out = _rows(speech_token_len, 2)
+        return st_out, sf_out, emb_out, stl_out
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -741,12 +948,32 @@ class CosyVoice3Model(
             if "speech_token" in kwargs:
                 # Prompt conditioning tensors for code2wav: live under
                 # ``embed.*`` per OmniPayloadStruct schema.
+                #
+                # vLLM hands these mm fields to forward() as collated, padded
+                # batch tensors (speech_token [B, maxT], speech_feat
+                # [B, 2*maxT, F], embedding [B, D]). Emitting them raw makes the
+                # downstream per-request payload split fragile at batch>1: it
+                # intermittently de-batches speech_token to 1-D and leaks the
+                # whole [B, D] embedding to every request, which corrupts voice
+                # conditioning and crashes code2wav (`prompt_token.shape[1]`).
+                # Instead, split into an explicit per-request list of unpadded,
+                # correctly-ranked tensors so ``to_payload_element`` splits them
+                # deterministically by request index (list[idx]).
+                speech_token_list, speech_feat_list, embedding_list, speech_token_len_list = (
+                    self._split_prompt_conditioning(
+                        kwargs.get("speech_token"),
+                        kwargs.get("speech_feat"),
+                        kwargs.get("embedding"),
+                        kwargs.get("speech_token_len"),
+                    )
+                )
                 multimodal_outputs = to_dict(
                     OmniPayloadStruct(
                         embed=EmbeddingsStruct(
-                            speech_token=kwargs.get("speech_token"),
-                            speech_feat=kwargs.get("speech_feat"),
-                            embedding=kwargs.get("embedding"),
+                            speech_token=speech_token_list,
+                            speech_feat=speech_feat_list,
+                            speech_token_len=speech_token_len_list,
+                            embedding=embedding_list,
                         ),
                     )
                 )
@@ -784,6 +1011,11 @@ class CosyVoice3Model(
                 speech_token = embed.speech_token if embed else None
                 speech_feat = embed.speech_feat if embed else None
                 embedding = embed.embedding if embed else None
+                # Drop any right-padding carried from batched talker emission.
+                if speech_token is not None and speech_feat is not None:
+                    speech_token, speech_feat = unpad_prompt_conditioning(
+                        speech_token, speech_feat, embed.speech_token_len if embed else None
+                    )
                 if speech_token is None or speech_feat is None or embedding is None:
                     if stream_finished and req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
                         with self._stream_audio_cache_lock:
