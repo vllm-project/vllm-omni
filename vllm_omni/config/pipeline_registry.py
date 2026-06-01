@@ -130,6 +130,18 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.moss_tts_nano.pipeline",
         "MOSS_TTS_NANO_PIPELINE",
     ),
+    "omnivoice": (
+        "vllm_omni.model_executor.models.omnivoice.pipeline",
+        "OMNIVOICE_PIPELINE",
+    ),
+    "mammoth_moda2": (
+        "vllm_omni.model_executor.models.mammoth_moda2.pipeline",
+        "MAMMOTH_MODA2_PIPELINE",
+    ),
+    "mammoth_moda2_ar": (
+        "vllm_omni.model_executor.models.mammoth_moda2.pipeline",
+        "MAMMOTH_MODA2_AR_PIPELINE",
+    ),
     "higgs_audio_v2": (
         "vllm_omni.model_executor.models.higgs_audio_v2.pipeline",
         "HIGGS_AUDIO_V2_PIPELINE",
