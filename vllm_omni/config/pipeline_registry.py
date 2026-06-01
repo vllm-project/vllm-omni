@@ -141,6 +141,7 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "mammoth_moda2_ar": (
         "vllm_omni.model_executor.models.mammoth_moda2.pipeline",
         "MAMMOTH_MODA2_AR_PIPELINE",
+    ),
     "minicpmo_4_5": (
         "vllm_omni.model_executor.models.minicpmo_4_5.pipeline",
         "MINICPMO_4_5_PIPELINE",
