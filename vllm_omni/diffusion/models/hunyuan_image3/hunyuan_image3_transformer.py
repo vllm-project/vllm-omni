@@ -2878,7 +2878,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self.model.inject_ar_kv_into_layers(ar_kv_data, positive_reuse_len)
 
         # 3. negative cfg prefill
-        if self.do_classifier_free_guidance:
+        # For CFG distilled models, skip negative CFG prefill (cfg_factor=1, no negative prompt)
+        if self.do_classifier_free_guidance and not self.model.config.cfg_distilled:
             self._maybe_run_negative_cfg_prefill(
                 input_ids=input_ids,
                 model_kwargs=model_kwargs,
@@ -2986,7 +2987,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self._guidance_rescale = guidance_rescale
 
         # Detect CFG parallel configuration (only 2-branch layout is supported)
-        cfg_parallel_ready = self.do_classifier_free_guidance and get_classifier_free_guidance_world_size() == 2
+        # For CFG distilled models, skip CFG parallel (cfg_factor=1, no negative branch)
+        cfg_parallel_ready = self.do_classifier_free_guidance and not self.model.config.cfg_distilled and get_classifier_free_guidance_world_size() == 2
 
         # Define call parameters
         device = self._execution_device
@@ -3039,7 +3041,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             attention_mask = attention_mask[s]
             self._split_model_kwargs_for_cfg_parallel(model_kwargs, batch_size, cfg_rank)
         else:
-            cfg_factor = 1 + self.do_classifier_free_guidance
+            # For CFG distilled models, cfg_factor is always 1 (CFG embedded in model)
+            if self.model.config.cfg_distilled:
+                cfg_factor = 1
+            else:
+                cfg_factor = 1 + self.do_classifier_free_guidance
             cfg_rank = None
 
         b, _, q_len1, seq_len = attention_mask.shape
