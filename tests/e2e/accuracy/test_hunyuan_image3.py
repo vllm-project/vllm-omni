@@ -419,16 +419,16 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path, accuracy_
     image_clip_score = clip_scorer.image_image_score(online_image, image_ref)
     ssim_value, psnr_value = compute_image_ssim_psnr(prediction=online_image, reference=image_ref, compare_mode="RGB")
 
-    table = [
-        ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", 0.9644],
-        ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", 29],
-        ["Image-Image similarity", f"{image_clip_score:.4f}", 94.5538],
-        ["SSIM", f"{ssim_value:.4f}", 0.242],
-        ["PSNR (dB)", f"{psnr_value:.2f}", 14.1],
-    ]
-    print("[ONLINE] " + tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
-
     thresholds = _get_thresholds()
+    table = [
+        ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", thresholds["cot_semantic_sim"]],
+        ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", thresholds["text_prefix_match"]],
+        ["Image-Image similarity", f"{image_clip_score:.4f}", thresholds["clip_score"]],
+        ["SSIM", f"{ssim_value:.4f}", thresholds["ssim"]],
+        ["PSNR (dB)", f"{psnr_value:.2f}", thresholds["psnr"]],
+    ]
+    print("[ONLINE] " + tabulate(table, headers=["Metric", "Value", "Threshold"], tablefmt="grid"))
+
     assert cot_results["cot_semantic_sim"] >= thresholds["cot_semantic_sim"], (
         f"[ONLINE] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} below threshold {thresholds['cot_semantic_sim']}"
     )
