@@ -22,6 +22,7 @@ class TokenizerEncodeOutput(BaseOutput):
     tokens: torch.Tensor | None = None
     timestep_scatter_index: torch.Tensor | None = None
     guidance_scatter_index: torch.Tensor | None = None
+    timesteps_r_scatter_index: torch.Tensor | None = None  # For MeanFlow distilled models
     text_slices: list[slice] | None = None
     gen_image_slices: list[slice] | None = None
     joint_image_slices: list[slice] | None = None

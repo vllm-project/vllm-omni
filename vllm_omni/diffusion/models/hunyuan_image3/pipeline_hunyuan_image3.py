@@ -377,6 +377,11 @@ class HunyuanImage3Pipeline(
             out_norm=True,
         )
         self.time_embed_2 = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
+        # Distillation-specific embedding modules
+        if self.hf_config.cfg_distilled:
+            self.guidance_emb = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
+        if self.hf_config.use_meanflow:
+            self.timestep_r_emb = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
         self.lm_head = nn.Linear(self.hf_config.hidden_size, self.hf_config.vocab_size, bias=False)
         self.vllm_config = get_current_vllm_config()
         self.post_init()
@@ -407,11 +412,8 @@ class HunyuanImage3Pipeline(
             if mod:
                 mod.to(device)
 
-        unexpected_keywords = [
-            "guidance_emb",
-            "timestep_r_emb",
-        ]
-        skip_prefixes.extend(unexpected_keywords)
+        # Note: guidance_emb and timestep_r_emb are no longer skipped
+        # to support HunyuanImage-3.0-Distil and MeanFlow distilled models
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=skip_prefixes,
@@ -559,6 +561,70 @@ class HunyuanImage3Pipeline(
             src=timestep_scatter_src,
         )
 
+        return x
+
+    def instantiate_guidance_tokens(
+        self,
+        x: torch.Tensor,
+        guidance: BatchRaggedTensor | None = None,
+        guidance_scatter_index: torch.Tensor | None = None,
+    ):
+        """Instantiate guidance embedding tokens for CFG distilled models.
+
+        Args:
+            x: Input sequence tensor (batch_size, seq_len, n_embd)
+            guidance: Guidance scale values (as tensor, typically guidance_scale * 1000)
+            guidance_scatter_index: Index positions to scatter guidance embeddings
+        """
+        if guidance is None or guidance_scatter_index is None:
+            return x
+        if not hasattr(self, "guidance_emb"):
+            return x
+
+        batch_size, seq_len, n_embd = x.shape
+        guidance_src = self.guidance_emb(guidance.reshape(-1))  # (bsz * n, n_embd)
+        x.scatter_(
+            dim=1,
+            index=guidance_scatter_index.unsqueeze(-1).repeat(1, 1, n_embd),
+            src=guidance_src.reshape(batch_size, -1, n_embd),
+        )
+        return x
+
+    def instantiate_timestep_r_tokens(
+        self,
+        x: torch.Tensor,
+        timesteps_r: BatchRaggedTensor | None = None,
+        timesteps_r_scatter_index: torch.Tensor | None = None,
+    ):
+        """Instantiate timestep_r embedding tokens for MeanFlow distilled models.
+
+        Args:
+            x: Input sequence tensor (batch_size, seq_len, n_embd)
+            timesteps_r: Timestep r values for MeanFlow
+            timesteps_r_scatter_index: Index positions to scatter embeddings
+        """
+        if timesteps_r is None or timesteps_r_scatter_index is None:
+            return x
+        if not hasattr(self, "timestep_r_emb"):
+            return x
+
+        batch_size, seq_len, n_embd = x.shape
+
+        if isinstance(timesteps_r, list):
+            for i, timestep_r in enumerate(timesteps_r):
+                timestep_r_src = self.timestep_r_emb(timestep_r)  # (n, n_embd)
+                x[i:i+1].scatter_(
+                    dim=1,
+                    index=timesteps_r_scatter_index[i].unsqueeze(0).unsqueeze(-1).repeat(1, 1, n_embd),
+                    src=timestep_r_src.reshape(1, -1, n_embd),
+                )
+        else:
+            timesteps_r_src = self.timestep_r_emb(timesteps_r.reshape(-1))  # (bsz * n, n_embd)
+            x.scatter_(
+                dim=1,
+                index=timesteps_r_scatter_index.unsqueeze(-1).repeat(1, 1, n_embd),
+                src=timesteps_r_src.reshape(batch_size, -1, n_embd),
+            )
         return x
 
     def instantiate_vit_image_tokens(
@@ -835,7 +901,11 @@ class HunyuanImage3Pipeline(
             generator = [torch.Generator(self.device).manual_seed(seed) for seed in seeds]
 
         # 3. apply chat template
+        # For CFG distilled models, cfg_factor is always 1 (CFG is embedded in the model)
+        # For non-distilled models, cfg_factor depends on guidance_scale
         cfg_factor = {"gen_text": 1, "gen_image": 1 + int(guidance_scale > 1.0)}
+        if self.hf_config.cfg_distilled:
+            cfg_factor["gen_image"] = 1
         bot_task = kwargs.pop("bot_task", "auto")
         # If `drop_think` enabled, always drop <think> parts in the context.
         drop_think = kwargs.get("drop_think", self.generation_config.drop_think)
@@ -945,6 +1015,12 @@ class HunyuanImage3Pipeline(
             if vit_kwargs is not None
             else None,
             cond_timestep_scatter_index=to_device(output.cond_timestep_scatter_index, device),
+            # for CFG distilled models
+            guidance_scatter_index=to_device(output.guidance_scatter_index, device)
+            if hasattr(output, "guidance_scatter_index") and output.guidance_scatter_index is not None else None,
+            # for MeanFlow distilled models
+            timesteps_r_scatter_index=to_device(output.timesteps_r_scatter_index, device)
+            if hasattr(output, "timesteps_r_scatter_index") and output.timesteps_r_scatter_index is not None else None,
             # for inner usage
             tokenizer_output=output,
             batch_gen_image_info=batch_gen_image_info,
@@ -1196,6 +1272,12 @@ class HunyuanImage3Pipeline(
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        # for CFG distilled models
+        guidance: torch.Tensor | None = None,
+        guidance_scatter_index: torch.Tensor | None = None,
+        # for MeanFlow distilled models
+        timesteps_r: torch.Tensor | None = None,
+        timesteps_r_scatter_index: torch.Tensor | None = None,
     ) -> tuple | CausalMMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
@@ -1257,11 +1339,27 @@ class HunyuanImage3Pipeline(
                     inputs_embeds, images, timestep, image_mask
                 )
                 inputs_embeds = self.instantiate_timestep_tokens(inputs_embeds, timestep, gen_timestep_scatter_index)
+                # Instantiate guidance and timestep_r tokens for distilled models
+                inputs_embeds = self.instantiate_guidance_tokens(
+                    inputs_embeds, guidance, guidance_scatter_index
+                )
+                inputs_embeds = self.instantiate_timestep_r_tokens(
+                    inputs_embeds, timesteps_r, timesteps_r_scatter_index
+                )
             else:
                 t_emb = self.time_embed(timestep)
                 image_emb, token_h, token_w = self.patch_embed(images, t_emb)
                 timestep_emb = self.timestep_emb(timestep).reshape(bsz, -1, n_embd)
-                inputs_embeds = torch.cat([timestep_emb, image_emb], dim=1)
+                cat_list = [timestep_emb, image_emb]
+                # Handle guidance embedding for CFG distilled models in non-first-step
+                if hasattr(self, "guidance_emb") and guidance is not None:
+                    guidance_emb = self.guidance_emb(guidance.reshape(-1)).reshape(bsz, -1, n_embd)
+                    cat_list.insert(1, guidance_emb)  # Insert after timestep_emb
+                # Handle timestep_r embedding for MeanFlow models in non-first-step
+                if hasattr(self, "timestep_r_emb") and timesteps_r is not None:
+                    timesteps_r_emb = self.timestep_r_emb(timesteps_r.reshape(-1)).reshape(bsz, -1, n_embd)
+                    cat_list.insert(len(cat_list) - 1, timesteps_r_emb)  # Insert before image_emb
+                inputs_embeds = torch.cat(cat_list, dim=1)
 
         # Instantiate placeholder tokens: <timestep>, <img> for cond images
         # Should only run once with kv-cache enabled.

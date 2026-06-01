@@ -1302,6 +1302,9 @@ class HunyuanImage3Config(PretrainedConfig):
         vit=None,
         vit_processor=None,
         vit_aligner=None,
+        # Distillation flags
+        cfg_distilled: bool = False,
+        use_meanflow: bool = False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -1380,6 +1383,10 @@ class HunyuanImage3Config(PretrainedConfig):
         self.patch_size = patch_size
         self.patch_embed_hidden_dim = patch_embed_hidden_dim
         self.image_base_size = image_base_size
+
+        # Distillation flags
+        self.cfg_distilled = cfg_distilled
+        self.use_meanflow = use_meanflow
 
         # token id
         self.eod_token_id = eod_token_id
@@ -2098,8 +2105,8 @@ class HunyuanImage3Model(nn.Module):
             "timestep_emb",
             "time_embed",
             "time_embed_2",
-            "guidance_emb",
-            "timestep_r_emb",
+            # Note: guidance_emb and timestep_r_emb are removed from skip list
+            # to support HunyuanImage-3.0-Distil and MeanFlow distilled models
         ]
 
         def contains_unexpected_keyword(name, keywords):
@@ -3095,6 +3102,13 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     tc_prev_mod = cur_mod.detach()
 
                 if should_compute:
+                    # Handle guidance for CFG distilled models
+                    if self.model.config.cfg_distilled:
+                        model_kwargs["guidance"] = torch.tensor(
+                            [1000.0 * self._guidance_scale],
+                            device=self.device,
+                            dtype=torch.bfloat16,
+                        ).repeat(latent_model_input.shape[0])
                     model_inputs = self.model.prepare_inputs_for_generation(
                         input_ids,
                         images=latent_model_input,
@@ -3114,7 +3128,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     pred = tc_prev_pred
 
                 # Perform guidance
-                if cfg_parallel_ready:
+                # For CFG distilled models, guidance is already embedded in the model,
+                # so we skip the explicit CFG computation
+                if self.model.config.cfg_distilled:
+                    # CFG distilled: guidance is handled internally via guidance_emb
+                    pass
+                elif cfg_parallel_ready:
                     # CFG parallel: all_gather → all ranks combine locally (no broadcast needed)
                     gathered = cfg_group.all_gather(pred, separate_tensors=True)
                     pred = self.cfg_operator(gathered[0], gathered[1], self.guidance_scale, step=i)
