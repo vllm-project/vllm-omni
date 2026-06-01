@@ -364,10 +364,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
-        output_modalities = getattr(request, "modalities", self.engine_client.output_modalities)
-        request.modalities = (
-            output_modalities if output_modalities is not None else self.engine_client.output_modalities
-        )
+        # Some models will return a list like ["text", None, "audio"], better
+        # to strip None in the list
+        engine_output_modalities = [x for x in self.engine_client.output_modalities if x is not None]
+        output_modalities = getattr(request, "modalities", engine_output_modalities)
+        request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
 
         num_inference_steps = None
         cfg_text_scale = None
@@ -986,6 +987,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         num_choices = 1 if request.n is None else request.n
         previous_num_tokens = [0] * num_choices
         finish_reason_sent = [False] * num_choices
+        modality_finished: list[set[str]] = [set() for _ in range(num_choices)]
+        modality_seen: list[set[str]] = [set() for _ in range(num_choices)]
+        stop_reason_emitted: list[bool] = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
         if self.use_harmony:
@@ -1050,6 +1054,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if final_output_type not in first_iteration_dict:
                     logger.warning(f"final output type: {final_output_type} is not needed by the request")
                     continue
+
+                # Track which modalities have actually appeared in the stream.
+                # This is used to determine when all *produced* modalities have
+                # finished, which may be a subset of request.modalities when the
+                # engine does not produce every requested modality.
+                for output in res.outputs:
+                    modality_seen[output.index].add(final_output_type)
 
                 if omni_res.metrics:
                     last_metrics = omni_res.metrics
@@ -1581,6 +1592,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 finish_reason_ = "tool_calls"
                             else:
                                 finish_reason_ = output.finish_reason if output.finish_reason else "stop"
+                            # Only emit finish_reason on the last modality to
+                            # comply with OpenAI streaming spec: exactly one
+                            # chunk per choice carries finish_reason="stop".
+                            modality_finished[i].add("text")
+                            if modality_seen[i] < set(request.modalities) or not all(
+                                m in modality_finished[i] for m in modality_seen[i]
+                            ):
+                                finish_reason_ = None
+                            else:
+                                stop_reason_emitted[i] = True
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=i,
                                 delta=delta_message,
@@ -1654,6 +1675,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                     role = self.get_chat_request_role(request)
                     choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
+                    # Only emit finish_reason on the last modality to
+                    # comply with OpenAI streaming spec.
+                    for choice in choices_data:
+                        if choice.finish_reason is not None:
+                            modality_finished[choice.index].add("audio")
+                        if modality_seen[choice.index] < set(request.modalities) or not all(
+                            m in modality_finished[choice.index] for m in modality_seen[choice.index]
+                        ):
+                            choice.finish_reason = None
+                        else:
+                            stop_reason_emitted[choice.index] = True
                     # Record per-chunk PCM byte count + arrival timestamp for
                     # audio_underrun_s / audio_continuity_ok_total at finalize.
                     if req_state is not None and req_state.request_arrival_ts > 0:
@@ -1683,6 +1715,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     logger.warning(f"Unsupported streaming final output type: {final_output_type}")
                     continue
 
+            # Fallback: if a choice had modalities finish but no finish_reason="stop"
+            # was emitted (e.g. request.modalities included a modality the engine
+            # never produced), emit a final stop chunk for that choice.
+            for i in range(num_choices):
+                if modality_finished[i] and not stop_reason_emitted[i]:
+                    stop_choice = ChatCompletionResponseStreamChoice(
+                        index=i,
+                        delta=DeltaMessage(),
+                        finish_reason="stop",
+                    )
+                    stop_chunk = OmniChatCompletionStreamResponse(
+                        id=request_id,
+                        object=chunk_object_type,
+                        created=created_time,
+                        choices=[stop_choice],
+                        model=model_name,
+                    )
+                    data = stop_chunk.model_dump_json(exclude_unset=True)
+                    yield f"data: {data}\n\n"
             # Emit audio_underrun_s + audio_continuity_ok_total once per
             # request after the audio chunk stream is exhausted. The
             # captured reference (req_state_audio_ref) outlives the inner
