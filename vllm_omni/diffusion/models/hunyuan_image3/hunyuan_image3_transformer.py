@@ -2988,7 +2988,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         # Detect CFG parallel configuration (only 2-branch layout is supported)
         # For CFG distilled models, skip CFG parallel (cfg_factor=1, no negative branch)
-        cfg_parallel_ready = self.do_classifier_free_guidance and not self.model.config.cfg_distilled and get_classifier_free_guidance_world_size() == 2
+        cfg_parallel_ready = (
+            self.do_classifier_free_guidance
+            and not self.model.config.cfg_distilled
+            and get_classifier_free_guidance_world_size() == 2
+        )
 
         # Define call parameters
         device = self._execution_device
