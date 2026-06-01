@@ -83,23 +83,51 @@ SEED = 42
 AR_TP_SIZE = len(AR_DEVICES.split(","))
 DIT_TP_SIZE = len(DIT_DEVICES.split(","))
 
-# Precision thresholds
+# Precision thresholds organized by model variant and test type
 THRESHOLDS = {
-    # AR text comparison
-    "text_prefix_match": 10,  # First 10 characters must match exactly
-    "cot_semantic_sim": 0.9,  # Full CoT semantic similarity
-    # Image comparison
-    "clip_score": 90,  # CLIP image semantic similarity
-    "ssim": 0.26,  # Structural similarity
-    "psnr": 12.5,  # Peak signal-to-noise ratio (dB)
+    # Default thresholds for Instruct and Distil models (IT2I alignment tests)
+    "default": {
+        # AR text comparison
+        "text_prefix_match": 10,  # First 10 characters must match exactly
+        "cot_semantic_sim": 0.9,  # Full CoT semantic similarity
+        # Image comparison
+        "clip_score": 90,  # CLIP image semantic similarity
+        "ssim": 0.25,  # Structural similarity
+        "psnr": 12.5,  # Peak signal-to-noise ratio (dB)
+    },
+    # Thresholds for quantized DiT accuracy tests (bf16 vs quant comparison)
+    "quant": {
+        "psnr": 10.0,
+        "ssim": 0.20,
+        "clip_score": 20.0,  # Minimum CLIP score for quantized output
+        "clip_score_drop": float(
+            os.environ.get("HUNYUAN_IMAGE3_QUANT_CLIP_SCORE_DROP_THRESHOLD", "5.0")
+        ),  # Max allowed drop from bf16
+    },
+    "Instruct": {
+        # AR text comparison
+        "text_prefix_match": 10,  # First 10 characters must match exactly
+        "cot_semantic_sim": 0.9,  # Full CoT semantic similarity
+        # Image comparison
+        "clip_score": 90,  # CLIP image semantic similarity
+        "ssim": 0.26,  # Structural similarity
+        "psnr": 12.5,  # Peak signal-to-noise ratio (dB)
+    },
 }
 
+# Helper to get thresholds for current model variant
+def _get_thresholds() -> dict:
+    """Return appropriate thresholds based on test context."""
+    # Default thresholds work for both Instruct and Distil IT2I tests
+    return THRESHOLDS["default"] if IS_DISTIL else THRESHOLDS["Instruct"]
+
+def _get_quant_thresholds() -> dict:
+    """Return thresholds for quantization accuracy tests."""
+    return THRESHOLDS["quant"]
+
+# Quant test configuration
 QUANT_PROMPT = "A brown and white dog is running on the grass."
 QUANT_HEIGHT, QUANT_WIDTH = 1024, 1024
-QUANT_PSNR_THRESHOLD = 10.0
-QUANT_SSIM_THRESHOLD = 0.20
-QUANT_CLIP_SCORE_THRESHOLD = 20.0
-QUANT_CLIP_SCORE_DROP_THRESHOLD = float(os.environ.get("HUNYUAN_IMAGE3_QUANT_CLIP_SCORE_DROP_THRESHOLD", "5.0"))
 QUANT_RUN_ENV = "HUNYUAN_IMAGE3_RUN_QUANT_ACCURACY"
 QUANT_BF16_ENV = "HUNYUAN_IMAGE3_BF16_MODEL"
 QUANT_FP8_ENV = "HUNYUAN_IMAGE3_FP8_MODEL"
@@ -400,18 +428,19 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path, accuracy_
     ]
     print("[ONLINE] " + tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
 
-    assert cot_results["cot_semantic_sim"] >= THRESHOLDS["cot_semantic_sim"], (
-        f"[ONLINE] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} below threshold {THRESHOLDS['cot_semantic_sim']}"
+    thresholds = _get_thresholds()
+    assert cot_results["cot_semantic_sim"] >= thresholds["cot_semantic_sim"], (
+        f"[ONLINE] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} below threshold {thresholds['cot_semantic_sim']}"
     )
-    assert cot_results["text_prefix_match_count"] >= THRESHOLDS["text_prefix_match"], (
-        f"[ONLINE] COT prefix match {cot_results['text_prefix_match_count']} below threshold {THRESHOLDS['text_prefix_match']}"
+    assert cot_results["text_prefix_match_count"] >= thresholds["text_prefix_match"], (
+        f"[ONLINE] COT prefix match {cot_results['text_prefix_match_count']} below threshold {thresholds['text_prefix_match']}"
     )
-    assert image_clip_score >= THRESHOLDS["clip_score"], (
-        f"[ONLINE] Image-Image similarity {image_clip_score:.4f} below threshold {THRESHOLDS['clip_score']}"
+    assert image_clip_score >= thresholds["clip_score"], (
+        f"[ONLINE] Image-Image similarity {image_clip_score:.4f} below threshold {thresholds['clip_score']}"
     )
-    assert ssim_value >= THRESHOLDS["ssim"], f"[ONLINE] SSIM {ssim_value:.4f} below threshold {THRESHOLDS['ssim']}"
-    assert psnr_value >= THRESHOLDS["psnr"], (
-        f"[ONLINE] PSNR {psnr_value:.2f} dB below threshold {THRESHOLDS['psnr']} dB"
+    assert ssim_value >= thresholds["ssim"], f"[ONLINE] SSIM {ssim_value:.4f} below threshold {thresholds['ssim']}"
+    assert psnr_value >= thresholds["psnr"], (
+        f"[ONLINE] PSNR {psnr_value:.2f} dB below threshold {thresholds['psnr']} dB"
     )
 
 
@@ -499,27 +528,27 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path, accuracy_assets_
     image_clip_score = clip_scorer.image_image_score(omni_image, image_ref)
     ssim_value, psnr_value = compute_image_ssim_psnr(prediction=omni_image, reference=image_ref, compare_mode="RGB")
 
+    thresholds = _get_thresholds()
     table = [
-        ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", 0.9644],
-        ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", 29],
-        ["Image-Image similarity", f"{image_clip_score:.4f}", 94.5538],
-        ["SSIM", f"{ssim_value:.4f}", 0.242],
-        ["PSNR (dB)", f"{psnr_value:.2f}", 14.1],
+        ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", thresholds["cot_semantic_sim"]],
+        ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", thresholds["text_prefix_match"]],
+        ["Image-Image similarity", f"{image_clip_score:.4f}", thresholds["clip_score"]],
+        ["SSIM", f"{ssim_value:.4f}", thresholds["ssim"]],
+        ["PSNR (dB)", f"{psnr_value:.2f}", thresholds["psnr"]],
     ]
 
-    print(tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
-
-    assert cot_results["cot_semantic_sim"] >= THRESHOLDS["cot_semantic_sim"], (
-        f"COT semantic similarity {cot_results['cot_semantic_sim']:.4f} is below threshold {THRESHOLDS['cot_semantic_sim']}"
+    print(tabulate(table, headers=["Metric", "Value", "Threshold"], tablefmt="grid"))
+    assert cot_results["cot_semantic_sim"] >= thresholds["cot_semantic_sim"], (
+        f"COT semantic similarity {cot_results['cot_semantic_sim']:.4f} is below threshold {thresholds['cot_semantic_sim']}"
     )
-    assert cot_results["text_prefix_match_count"] >= THRESHOLDS["text_prefix_match"], (
-        f"COT prefix match count {cot_results['text_prefix_match_count']} is below threshold {THRESHOLDS['text_prefix_match']}"
+    assert cot_results["text_prefix_match_count"] >= thresholds["text_prefix_match"], (
+        f"COT prefix match count {cot_results['text_prefix_match_count']} is below threshold {thresholds['text_prefix_match']}"
     )
-    assert image_clip_score >= THRESHOLDS["clip_score"], (
-        f"Image-Image similarity{image_clip_score:.4f} is below threshold {THRESHOLDS['clip_score']}"
+    assert image_clip_score >= thresholds["clip_score"], (
+        f"Image-Image similarity{image_clip_score:.4f} is below threshold {thresholds['clip_score']}"
     )
-    assert ssim_value >= THRESHOLDS["ssim"], f"SSIM {ssim_value:.4f} is below threshold {THRESHOLDS['ssim']}"
-    assert psnr_value >= THRESHOLDS["psnr"], f"PSNR {psnr_value:.2f} dB is below threshold {THRESHOLDS['psnr']} dB"
+    assert ssim_value >= thresholds["ssim"], f"SSIM {ssim_value:.4f} is below threshold {thresholds['ssim']}"
+    assert psnr_value >= thresholds["psnr"], f"PSNR {psnr_value:.2f} dB is below threshold {thresholds['psnr']} dB"
 
 
 @pytest.mark.parametrize("case", _quant_accuracy_cases())
@@ -553,12 +582,13 @@ def test_quantized_dit_matches_bf16_accuracy(
         prediction=quant_image,
         reference=bf16_image,
     )
+    quant_thresholds = _get_quant_thresholds()
     assert_similarity(
         model_name=f"{MODEL_NAME} {case.name} vs bf16",
         vllm_image=quant_image,
         diffusers_image=bf16_image,
-        ssim_threshold=QUANT_SSIM_THRESHOLD,
-        psnr_threshold=QUANT_PSNR_THRESHOLD,
+        ssim_threshold=quant_thresholds["ssim"],
+        psnr_threshold=quant_thresholds["psnr"],
         width=QUANT_WIDTH,
         height=QUANT_HEIGHT,
     )
@@ -593,15 +623,15 @@ def test_quantized_dit_matches_bf16_accuracy(
     print(f"  bf16 model:       {bf16_model}")
     print(f"  quant model:      {quant_model}")
     print(f"  BF16 CLIP score:  {bf16_clip_score:.4f}")
-    print(f"  quant CLIP score: {quant_clip_score:.4f} threshold>={QUANT_CLIP_SCORE_THRESHOLD:.4f}")
-    print(f"  CLIP score drop:  {clip_score_drop:.4f} threshold<={QUANT_CLIP_SCORE_DROP_THRESHOLD:.4f}")
+    print(f"  quant CLIP score: {quant_clip_score:.4f} threshold>={quant_thresholds['clip_score']:.4f}")
+    print(f"  CLIP score drop:  {clip_score_drop:.4f} threshold<={quant_thresholds['clip_score_drop']:.4f}")
     print(f"  metrics:          {metrics_path}")
 
-    assert quant_clip_score >= QUANT_CLIP_SCORE_THRESHOLD, (
+    assert quant_clip_score >= quant_thresholds["clip_score"], (
         f"{case.name} CLIP score below threshold: got {quant_clip_score:.4f}, "
-        f"expected >= {QUANT_CLIP_SCORE_THRESHOLD:.4f}"
+        f"expected >= {quant_thresholds['clip_score']:.4f}"
     )
-    assert clip_score_drop <= QUANT_CLIP_SCORE_DROP_THRESHOLD, (
+    assert clip_score_drop <= quant_thresholds["clip_score_drop"], (
         f"{case.name} CLIP score drop too large: got {clip_score_drop:.4f}, "
-        f"expected <= {QUANT_CLIP_SCORE_DROP_THRESHOLD:.4f}"
+        f"expected <= {quant_thresholds['clip_score_drop']:.4f}"
     )
