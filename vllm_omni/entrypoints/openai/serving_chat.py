@@ -2337,6 +2337,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         ar_stop_token_ids: list[int] | None = None
         build_kwargs: dict[str, Any] = {}
 
+        logger.info(
+            "[HunyuanImage3 online debug] build inputs: bot_task=%r sys_type=%r "
+            "custom_system_prompt=%s height=%r width=%r num_reference_images=%d tokenizer=%s",
+            bot_task,
+            use_system_prompt,
+            custom_system_prompt is not None,
+            height,
+            width,
+            len(reference_images),
+            type(tokenizer).__name__ if tokenizer is not None else None,
+        )
+
         if bot_task is not None or use_system_prompt is not None or custom_system_prompt is not None:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
@@ -2361,6 +2373,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 task=build_kwargs["task"],
                 bot_task=build_kwargs.get("bot_task"),
                 tokenizer=tokenizer,
+            )
+            logger.info(
+                "[HunyuanImage3 online debug] resolved AR stops: task=%r bot_task=%r count=%d "
+                "first=%s last=%s",
+                build_kwargs["task"],
+                build_kwargs.get("bot_task"),
+                len(ar_stop_token_ids),
+                ar_stop_token_ids[0] if ar_stop_token_ids else None,
+                ar_stop_token_ids[-1] if ar_stop_token_ids else None,
             )
             if tokenizer is not None:
                 # Feed segment-tokenized prompt_token_ids so AR matches HF
@@ -2415,6 +2436,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             stage_configs,
             default_params_list,
             diffusion_params=gen_params,
+        )
+        logger.info(
+            "[HunyuanImage3 online debug] stage params before overrides: comprehension_idx=%r "
+            "num_stages=%d default_stop_summary=%s",
+            comprehension_idx,
+            len(sampling_params_list),
+            [
+                (
+                    len(getattr(sp, "stop_token_ids", []) or []),
+                    (getattr(sp, "stop_token_ids", []) or [None])[0],
+                    (getattr(sp, "stop_token_ids", []) or [None])[-1],
+                )
+                if hasattr(sp, "stop_token_ids")
+                else None
+                for sp in sampling_params_list
+            ],
         )
         for idx, stage_cfg in enumerate(stage_configs):
             stage_type = get_stage_type(stage_cfg)
@@ -2479,6 +2516,31 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 default_stage_params.lora_scale = lora_scale
                     except Exception as e:  # pragma: no cover - safeguard
                         logger.warning("Failed to parse LoRA request: %s", e)
+
+        logger.info(
+            "[HunyuanImage3 online debug] stage params after overrides: stop_summary=%s "
+            "ar_extra_args=%r diffusion_sizes=%s",
+            [
+                (
+                    len(getattr(sp, "stop_token_ids", []) or []),
+                    (getattr(sp, "stop_token_ids", []) or [None])[0],
+                    (getattr(sp, "stop_token_ids", []) or [None])[-1],
+                )
+                if hasattr(sp, "stop_token_ids")
+                else None
+                for sp in sampling_params_list
+            ],
+            (
+                getattr(sampling_params_list[comprehension_idx], "extra_args", None)
+                if comprehension_idx is not None and comprehension_idx < len(sampling_params_list)
+                else None
+            ),
+            [
+                (getattr(sp, "height", None), getattr(sp, "width", None))
+                for sp in sampling_params_list
+                if isinstance(sp, OmniDiffusionSamplingParams)
+            ],
+        )
 
         return engine_prompt, sampling_params_list
 
