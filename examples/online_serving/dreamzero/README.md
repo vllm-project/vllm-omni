@@ -27,6 +27,40 @@ vllm serve GEAR-Dreams/DreamZero-DROID --omni --port 8000 \
 
 Override `MODEL`, `PORT`, `HOST`, `DEPLOY_CONFIG`, or `SERVED_MODEL_NAME` through the script environment if needed.
 
+### Configure TP and CFG parallelism
+
+The bundled DreamZero configs intentionally keep only:
+
+| Config | Purpose |
+|---|---|
+| `vllm_omni/deploy/dreamzero.yaml` | Default TP=1, CFG parallel disabled |
+| `vllm_omni/deploy/dreamzero_tp1_cfg2.yaml` | TP=1, CFG parallel size=2 |
+
+For other topologies, use CLI parallelism flags and update stage 0 `devices` with `--stage-overrides`. The number of listed devices must match `tensor_parallel_size * cfg_parallel_size`.
+
+TP=2 with CFG parallel disabled:
+
+```bash
+vllm serve GEAR-Dreams/DreamZero-DROID --omni --port 8000 \
+    --served-model-name dreamzero-droid \
+    --deploy-config vllm_omni/deploy/dreamzero.yaml \
+    --tensor-parallel-size 2 \
+    --stage-overrides '{"0": {"devices": "0,1"}}' \
+    --enforce-eager --disable-log-stats
+```
+
+TP=2 with CFG parallel size=2:
+
+```bash
+vllm serve GEAR-Dreams/DreamZero-DROID --omni --port 8000 \
+    --served-model-name dreamzero-droid \
+    --deploy-config vllm_omni/deploy/dreamzero.yaml \
+    --tensor-parallel-size 2 \
+    --cfg-parallel-size 2 \
+    --stage-overrides '{"0": {"devices": "0,1,2,3"}}' \
+    --enforce-eager --disable-log-stats
+```
+
 ### Download example assets
 
 The OpenPI client and DROID sim-eval example expect the three camera MP4 files in `outputs/dreamzero/assets`.
