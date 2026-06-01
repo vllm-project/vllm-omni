@@ -22,6 +22,7 @@ class DiffusionRequestStatus(enum.IntEnum):
     WAITING = enum.auto()
     RUNNING = enum.auto()
     PREEMPTED = enum.auto()
+    BLOCKED = enum.auto()
 
     # if any status is after or equal to FINISHED_COMPLETED, it is considered finished
     FINISHED_COMPLETED = enum.auto()
@@ -104,6 +105,30 @@ class CachedRequestData:
 
 
 @dataclass
+class Layout:
+    """How the previous latent should be sliced.
+
+    - head [0:len(finished_idxs)] are chunks completing denoising (to decode)
+    - next [len(finished_idxs) : len(finished_idxs)+len(circulating_idxs)] are
+      re-admitted chunks
+    - rank 0 appends len(new_idxs) fresh randn rows at the tail before forwarding.
+    """
+
+    circulating_idxs: list[int]
+    finished_idxs: list[int]
+    new_idxs: list[int]
+
+
+@dataclass
+class RankTask:
+    """One unit of work for a rank in a stream-batch micro-step."""
+
+    request_id: str
+    chunk_indices: list[int]
+    layout: Layout
+
+
+@dataclass
 class DiffusionSchedulerOutput:
     """Output of a single scheduling cycle."""
 
@@ -113,6 +138,9 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
+
+    # stream-batch scheduling fields
+    assignment: list[RankTask] | None = None
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:

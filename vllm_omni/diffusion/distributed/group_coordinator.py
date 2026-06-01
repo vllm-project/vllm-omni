@@ -5,6 +5,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
 from collections import namedtuple
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -699,6 +700,16 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.send_shape: dict[str, dict[int, torch.Size]] = {}
         self.recv_buffer: dict[str, dict[int, torch.Size]] = {}
 
+        # Cached dict schema and pre-allocated recv buffers for
+        # `pipeline_isend_tensor_dict` / `pipeline_irecv_tensor_dict`.
+        # Keyed by (name, segment_idx). Recv buffer leaf is a length-2 list
+        # for double buffering. Caller picks the slot via buf_idx.
+        self.dict_schema_cache: dict[tuple[str, int], list[tuple[str, Any]]] = {}
+        self.dict_recv_buffer: dict[tuple[str, int], list[dict[str, torch.Tensor]]] = {}
+        self._comms_stream: Any = None  # Dedicated comms stream for PP P2P. None on CPU.
+
+        self.dict_schema_keepalive: list[torch.Tensor] = []
+
         self.skip_tensor_recv_buffer_set: bool = False
         self.recv_skip_tasks_queue: list[int | tuple[str, int]] = []
         self.receiving_skip_tasks: list[tuple[torch.distributed.Work, str, int]] = []
@@ -710,6 +721,45 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 self.skip_device_group = skip_device_group
         assert self.skip_device_group is not None
 
+        self._warmup_nccl_comms()
+
+    def _warmup_nccl_comms(self) -> None:
+        """Force eager ncclCommInit on every P2P group while all ranks are
+        synchronized at __init__. Otherwise the first real P2P op would
+        trigger a collective comm-init that blocks the early-arriving
+        rank — breaks temporal-PP where one rank deliberately runs ahead.
+        """
+        if self.world_size == 1:
+            return
+
+        dummy = torch.zeros(1, device=self.device, dtype=torch.uint8)
+
+        if self.world_size == 2:
+            for group_idx in (0, 1):
+                group = self.device_groups[group_idx]
+                if self.rank_in_group == group_idx:
+                    op = torch.distributed.P2POp(torch.distributed.isend, dummy, self.next_rank, group)
+                else:
+                    op = torch.distributed.P2POp(torch.distributed.irecv, dummy, self.prev_rank, group)
+                for req in torch.distributed.batch_isend_irecv([op]):
+                    req.wait()
+        else:
+            for req in torch.distributed.batch_isend_irecv(
+                [
+                    torch.distributed.P2POp(torch.distributed.isend, dummy, self.next_rank, self.device_group),
+                    torch.distributed.P2POp(torch.distributed.irecv, dummy, self.prev_rank, self.device_group),
+                ]
+            ):
+                req.wait()
+
+        for req in torch.distributed.batch_isend_irecv(
+            [
+                torch.distributed.P2POp(torch.distributed.isend, dummy, self.skip_rank, self.skip_device_group),
+                torch.distributed.P2POp(torch.distributed.irecv, dummy, self.skip_rank, self.skip_device_group),
+            ]
+        ):
+            req.wait()
+
     def reset_buffer(self):
         self.recv_tasks_queue = []
         self.receiving_tasks = []
@@ -717,9 +767,39 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.send_shape = {}
         self.recv_buffer = {}
 
+        self.dict_schema_cache = {}
+        self.dict_recv_buffer = {}
+        self.dict_schema_keepalive = []
+
         self.recv_skip_tasks_queue = []
         self.receiving_skip_tasks = []
         self.skip_tensor_recv_buffer = {}
+
+    @property
+    def comms_stream(self):
+        """Dedicated stream for PP P2P comms."""
+        if self._comms_stream is None and self.device.type != "cpu":
+            mod = getattr(torch, self.device.type, None)
+            if mod is not None and hasattr(mod, "Stream"):
+                self._comms_stream = mod.Stream(device=self.device)
+        return self._comms_stream
+
+    def _comms_stream_ctx(self):
+        """Context manager that makes ``comms_stream`` the current stream."""
+        stream = self.comms_stream
+        if stream is None:
+            return nullcontext()
+        return getattr(torch, self.device.type).stream(stream)
+
+    def _record_compute_event(self):
+        """Record an event on the default (compute) stream for later
+        ``comms_stream.wait_event``."""
+        if self.comms_stream is None:
+            return None
+        mod = getattr(torch, self.device.type)
+        ev = mod.Event()
+        ev.record(mod.current_stream(self.device))
+        return ev
 
     def set_config(self, dtype: torch.dtype):
         self.dtype = dtype
@@ -808,6 +888,8 @@ class PipelineGroupCoordinator(GroupCoordinator):
             recv_prev: boolean for whether tensor should be received from
                        previous rank.
         """
+        send_group = self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group
+        recv_group = self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group
 
         ops = []
         if recv_prev:
@@ -816,7 +898,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 torch.distributed.irecv,
                 recv_prev_dim_tensor,
                 self.prev_rank,
-                self.device_group,
+                recv_group,
             )
             ops.append(recv_prev_dim_op)
 
@@ -826,7 +908,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 torch.distributed.isend,
                 send_next_dim_tensor,
                 self.next_rank,
-                self.device_group,
+                send_group,
             )
             ops.append(send_next_dim_op)
 
@@ -849,7 +931,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 torch.distributed.irecv,
                 recv_prev_shape_tensor,
                 self.prev_rank,
-                self.device_group,
+                recv_group,
             )
             ops.append(recv_prev_shape_op)
 
@@ -859,7 +941,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 torch.distributed.isend,
                 send_next_shape_tensor,
                 self.next_rank,
-                self.device_group,
+                send_group,
             )
             ops.append(send_next_shape_op)
 
@@ -875,21 +957,169 @@ class PipelineGroupCoordinator(GroupCoordinator):
             recv_prev_shape = recv_prev_shape_tensor
         return torch.Size(recv_prev_shape)
 
+    def _isend_dict_schema(
+        self, send_metadata: list[tuple[str, Any]]
+    ) -> tuple[list[torch.distributed.Work], list[torch.Tensor]]:
+        """Non-blocking schema send. Returns (handles, keepalive_tensors).
+        Caller must keep the tensors alive until the handles complete.
+        """
+        send_group = self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group
+        payload_bytes = pickle.dumps(send_metadata)
+        payload_array = bytearray(payload_bytes)
+        payload_tensor = torch.frombuffer(payload_array, dtype=torch.uint8).to(self.device)
+        send_size_tensor = torch.tensor([payload_tensor.numel()], device=self.device, dtype=torch.int64)
+        handles = [
+            torch.distributed.isend(send_size_tensor, dst=self.next_rank, group=send_group),
+            torch.distributed.isend(payload_tensor, dst=self.next_rank, group=send_group),
+        ]
+        return handles, [send_size_tensor, payload_tensor]
+
+    def _recv_dict_schema(self) -> list[tuple[str, Any]]:
+        """Blocking schema recv - must wait because the size value is
+        needed before allocating the payload buffer.
+        """
+        recv_group = self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group
+        recv_size_tensor = torch.empty(1, device=self.device, dtype=torch.int64)
+        torch.distributed.recv(recv_size_tensor, src=self.prev_rank, group=recv_group)
+        recv_payload = torch.empty(int(recv_size_tensor.item()), device=self.device, dtype=torch.uint8)
+        torch.distributed.recv(recv_payload, src=self.prev_rank, group=recv_group)
+        return pickle.loads(recv_payload.cpu().numpy().tobytes())
+
     def pipeline_send(self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1) -> None:
         tensor = tensor.contiguous()
         self._check_shape_and_buffer(tensor_send_to_next=tensor, name=name, segment_idx=segment_idx)
         self._pipeline_isend(tensor).wait()
 
-    def pipeline_isend(self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1) -> None:
+    def pipeline_isend(
+        self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1
+    ) -> torch.distributed.Work:
         tensor = tensor.contiguous()
         self._check_shape_and_buffer(tensor_send_to_next=tensor, name=name, segment_idx=segment_idx)
-        self._pipeline_isend(tensor)
+        handle = self._pipeline_isend(tensor)
+        if tensor.is_cuda:
+            # Keep allocator from reusing this CUDA buffer before the async send finishes.
+            tensor.record_stream(torch.cuda.current_stream(tensor.device))
+        return handle
 
     def pipeline_recv(self, idx: int = -1, name: str = "latent") -> torch.Tensor:
         name = name or "latent"
         self._check_shape_and_buffer(recv_prev=True, name=name, segment_idx=idx)
         self._pipeline_irecv(self.recv_buffer[name][idx]).wait()
         return self.recv_buffer[name][idx]
+
+    def set_recv_dict_buffer(
+        self,
+        name: str,
+        segment_idx: int,
+        template_dict: dict[str, torch.Tensor | Any],
+        batch_size: int = 1,
+    ) -> None:
+        """Pre-populate schema cache + a double-buffer pair (indices 0/1) for
+        ``(name, segment_idx, batch_size)``.
+        """
+        metadata_list, _ = _split_tensor_dict(template_dict)
+        key = (name, segment_idx, batch_size)
+        self.dict_schema_cache[key] = metadata_list
+        buffer_pair: list[dict[str, torch.Tensor]] = []
+        for _ in range(2):
+            buffers: dict[str, torch.Tensor] = {}
+            for key_, value in metadata_list:
+                if isinstance(value, TensorMetadata):
+                    if torch.Size(value.size).numel() == 0:
+                        continue
+                    device = torch.device(value.device) if value.device == "cpu" else self.device
+                    buffers[key_] = torch.empty(value.size, dtype=value.dtype, device=device)
+            buffer_pair.append(buffers)
+        self.dict_recv_buffer[key] = buffer_pair
+
+    def pipeline_isend_tensor_dict(
+        self,
+        tensor_dict: dict[str, torch.Tensor | Any],
+        name: str = "dict",
+        segment_idx: int = -1,
+        batch_size: int = 1,
+    ) -> list[torch.distributed.Work]:
+        """Non-blocking dict send keyed by ``(name, segment_idx, batch_size)``."""
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+
+        key = (name, segment_idx, batch_size)
+        handles: list[torch.distributed.Work] = []
+        if key not in self.dict_schema_cache:
+            schema_handles, keepalive = self._isend_dict_schema(metadata_list)
+            handles.extend(schema_handles)
+            self.dict_schema_keepalive.extend(keepalive)
+            self.dict_schema_cache[key] = metadata_list
+
+        compute_done = self._record_compute_event()
+        comms = self.comms_stream
+        group = self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group
+        with self._comms_stream_ctx():
+            if comms is not None and compute_done is not None:
+                comms.wait_event(compute_done)
+            for tensor in tensor_list:
+                if tensor.numel() == 0:
+                    continue
+                tensor = tensor.contiguous()
+                if tensor.is_cuda and comms is not None:
+                    tensor.record_stream(comms)
+                handles.append(torch.distributed.isend(tensor, dst=self.next_rank, group=group))
+        return handles
+
+    def pipeline_irecv_tensor_dict(
+        self,
+        name: str = "dict",
+        segment_idx: int = -1,
+        buf_idx: int = 0,
+        batch_size: int = 1,
+    ) -> tuple[dict[str, torch.Tensor | Any], list[torch.distributed.Work], list]:
+        """Async tensor-dict recv into the ``buf_idx`` slot (0 or 1) of the
+        double-buffer pair for ``(name, segment_idx, batch_size)``. Caller picks
+        the slot — typically ``micro_step % 2`` — so consecutive recvs alternate
+        and the previous result stays readable until its consumer is done.
+        Posts irecvs on ``comms_stream``.
+        """
+        key = (name, segment_idx, batch_size)
+        if key not in self.dict_schema_cache:
+            metadata_list = self._recv_dict_schema()
+            self.dict_schema_cache[key] = metadata_list
+            buffer_pair: list[dict[str, torch.Tensor]] = []
+            for _ in range(2):
+                buffers: dict[str, torch.Tensor] = {}
+                for k, value in metadata_list:
+                    if isinstance(value, TensorMetadata):
+                        if torch.Size(value.size).numel() == 0:
+                            continue
+                        device = torch.device(value.device) if value.device == "cpu" else self.device
+                        buffers[k] = torch.empty(value.size, dtype=value.dtype, device=device)
+                buffer_pair.append(buffers)
+            self.dict_recv_buffer[key] = buffer_pair
+
+        metadata_list = self.dict_schema_cache[key]
+        buffers = self.dict_recv_buffer[key][buf_idx]
+        comms = self.comms_stream
+
+        tensor_dict: dict[str, Any] = {}
+        handles: list[torch.distributed.Work] = []
+        group = self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group
+        with self._comms_stream_ctx():
+            for k, value in metadata_list:
+                if isinstance(value, TensorMetadata):
+                    if torch.Size(value.size).numel() == 0:
+                        _update_nested_dict(
+                            tensor_dict,
+                            k,
+                            torch.empty(value.size, dtype=value.dtype, device=self.device),
+                        )
+                        continue
+                    tensor = buffers[k]
+                    if tensor.is_cuda and comms is not None:
+                        tensor.record_stream(comms)
+                    handles.append(torch.distributed.irecv(tensor, src=self.prev_rank, group=group))
+                    _update_nested_dict(tensor_dict, k, tensor)
+                else:
+                    _update_nested_dict(tensor_dict, k, value)
+
+        return tensor_dict, handles, []
 
     def add_pipeline_recv_task(self, idx: int = -1, name: str = "latent"):
         name = name or "latent"
@@ -911,18 +1141,12 @@ class PipelineGroupCoordinator(GroupCoordinator):
         return self.recv_buffer[name][idx]
 
     def _pipeline_irecv(self, tensor: torch.tensor):
-        return torch.distributed.irecv(
-            tensor,
-            src=self.prev_rank,
-            group=(self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group),
-        )
+        group = self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group
+        return torch.distributed.irecv(tensor, src=self.prev_rank, group=group)
 
     def _pipeline_isend(self, tensor: torch.tensor):
-        return torch.distributed.isend(
-            tensor,
-            dst=self.next_rank,
-            group=(self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group),
-        )
+        group = self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group
+        return torch.distributed.isend(tensor, dst=self.next_rank, group=group)
 
     def set_skip_tensor_recv_buffer(
         self,

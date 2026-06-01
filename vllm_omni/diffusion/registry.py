@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+from typing import Any
 
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -271,6 +272,11 @@ _DIFFUSION_MODELS = {
         "pipeline_diffusers_adapter",
         "DiffusersAdapterPipeline",
     ),
+    "LingbotWorldFastPipeline": (
+        "lingbot_world_fast",
+        "pipeline_lingbot_world_fast",
+        "LingbotWorldFastPipeline",
+    ),
     "HiDreamImagePipeline": (
         "hidream_image",
         "pipeline_hidream_image",
@@ -498,6 +504,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
+    "LingbotWorldFastPipeline": "get_lingbot_world_fast_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
 }
 
@@ -601,3 +608,30 @@ def get_diffusion_pre_process_func(od_config: OmniDiffusionConfig):
         return None  # Return None if no pre-processing function is registered (for backward compatibility)
     func_name = _DIFFUSION_PRE_PROCESS_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)
+
+
+_STREAM_BATCH_OVERRIDE_ATTRS: dict[str, str] = {
+    "chunk_frames": "STREAM_BATCH_CHUNK_FRAMES",
+    "num_inference_steps": "STREAM_BATCH_NUM_INFERENCE_STEPS",
+}
+
+
+def apply_required_sampling_overrides(sampling: Any, model_class_name: str) -> None:
+    """Overwrite sampling-param fields that the model has hard requirements on."""
+    pipeline_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if pipeline_cls is None:
+        return
+    for field, attr in _STREAM_BATCH_OVERRIDE_ATTRS.items():
+        required = getattr(pipeline_cls, attr, None)
+        if required is None:
+            continue
+        current = getattr(sampling, field, None)
+        if current != required:
+            logger.warning(
+                "%s requires sampling.%s=%s, got %r. Overriding.",
+                model_class_name,
+                field,
+                required,
+                current,
+            )
+            setattr(sampling, field, required)

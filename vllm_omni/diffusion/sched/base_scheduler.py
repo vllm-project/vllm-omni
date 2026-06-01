@@ -50,6 +50,7 @@ class _BaseScheduler(SchedulerInterface):
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
         self._running_sampling_params_key: SamplingParamsKey | None = None
+        self._blocked: set[str] = set()
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
 
@@ -60,6 +61,7 @@ class _BaseScheduler(SchedulerInterface):
         self._waiting.clear()
         self._running.clear()
         self._running_sampling_params_key = None
+        self._blocked.clear()
         self._finished_req_ids.clear()
         max_num_seqs = getattr(od_config, "max_num_seqs", 1)
         try:
@@ -126,7 +128,27 @@ class _BaseScheduler(SchedulerInterface):
         return scheduler_output
 
     def has_requests(self) -> bool:
-        return bool(self._waiting or self._running)
+        return bool(self._waiting or self._running or self._blocked)
+
+    def block_request(self, request_id: str) -> bool:
+        """Move a RUNNING request to BLOCKED. In-flight work continues."""
+
+        if request_id not in self._running:
+            return False
+        self._running.remove(request_id)
+        self._blocked.add(request_id)
+        self._request_states[request_id].status = DiffusionRequestStatus.BLOCKED
+        return True
+
+    def unblock_request(self, request_id: str) -> bool:
+        """Move a BLOCKED request to WAITING."""
+
+        if request_id not in self._blocked:
+            return False
+        self._blocked.discard(request_id)
+        self._waiting.append(request_id)
+        self._request_states[request_id].status = DiffusionRequestStatus.WAITING
+        return True
 
     def get_request_state(self, request_id: str) -> DiffusionRequestState | None:
         return self._request_states.get(request_id)
@@ -158,6 +180,7 @@ class _BaseScheduler(SchedulerInterface):
         self._waiting.clear()
         self._running.clear()
         self._running_sampling_params_key = None
+        self._blocked.clear()
         self._finished_req_ids.clear()
         self._reset_scheduler_state()
 
@@ -172,6 +195,7 @@ class _BaseScheduler(SchedulerInterface):
         finished_req_ids: set[str] = set()
         running_to_remove: set[str] = set()
         waiting_to_remove: set[str] = set()
+        blocked_to_remove: set[str] = set()
 
         for request_id, status in statuses.items():
             assert DiffusionRequestStatus.is_finished(status)
@@ -184,6 +208,8 @@ class _BaseScheduler(SchedulerInterface):
                 running_to_remove.add(request_id)
             if request_id in self._waiting:
                 waiting_to_remove.add(request_id)
+            if request_id in self._blocked:
+                blocked_to_remove.add(request_id)
 
         if running_to_remove:
             self._running = [request_id for request_id in self._running if request_id not in running_to_remove]
@@ -191,6 +217,8 @@ class _BaseScheduler(SchedulerInterface):
                 self._running_sampling_params_key = None
         if waiting_to_remove:
             self._waiting = deque(request_id for request_id in self._waiting if request_id not in waiting_to_remove)
+        if blocked_to_remove:
+            self._blocked -= blocked_to_remove
 
         for request_id in finished_req_ids:
             state = self._request_states[request_id]

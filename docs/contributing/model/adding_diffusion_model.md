@@ -776,6 +776,41 @@ turning them on. For Qwen-Image-style serving examples, document
 `--step-execution` as the feature gate and `--max-num-seqs N` as the
 companion batching knob.
 
+### Micro-Step Execution
+
+See detailed design guide: [How to add micro-step execution support](../../design/feature/diffusion_micro_step_execution.md)
+
+Use this only when your pipeline is built for *streaming chunked* output
+(e.g. video chunks) and you want stream batch —
+at each tick every PP rank denoises a different chunk at a different
+timestep, then chunks shift one rank downstream.
+
+Micro-step is a superset of step execution. On top of the four
+step-execution methods, the pipeline must also implement:
+
+1. `set_pp_recv_dict_buffers()` to pre-register PP recv buffers the request will use.
+2. `encode_chunk_inputs()` to build per-chunk initial latents and any
+   per-chunk conditioning.
+3. `prefetch_tensors()` to pre-post the next-step recv (latents on the
+   first rank, intermediate tensors elsewhere) so it overlaps with compute.
+
+`denoise_step()` and `step_scheduler()` are also redesigned to operate on a
+row-batched mix of chunks at different denoising step indices.
+`post_decode()` becomes incremental — it runs on rank 0 every tick that has
+freshly finished chunks, not just once at the end.
+
+Prerequisites:
+
+- The transformer is PP-partitioned (`make_layers`, `PPMissingLayer`) — see
+  [Pipeline Parallel](../../design/feature/pipeline_parallel.md).
+- The pipeline inherits `PipelineParallelMixin` and `CFGParallelMixin`r.
+- The pipeline declares `supports_micro_step_execution: ClassVar[bool] =
+  True`.
+- Each request sets `chunk_frames`, `num_chunks`, and
+  `num_inference_steps` in `OmniDiffusionSamplingParams`.
+
+Reference implementation: `LingbotWorldFastPipeline`
+
 ### Cache Acceleration
 
 #### TeaCache

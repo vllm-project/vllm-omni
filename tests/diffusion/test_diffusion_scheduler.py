@@ -19,6 +19,7 @@ from vllm_omni.diffusion.sched import (
     Scheduler,
     SchedulerInterface,
     StepScheduler,
+    StreamBatchScheduler,
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
 from vllm_omni.diffusion.worker.utils import RunnerOutput
@@ -928,3 +929,351 @@ class TestStepScheduler:
 
         with pytest.raises(ValueError):
             self.scheduler.add_request(request)
+
+
+def _make_stream_request(
+    req_id: str,
+    *,
+    num_inference_steps: int = 2,
+    num_chunks: int = 1,
+    chunk_frames: int = 1,
+) -> OmniDiffusionRequest:
+    num_frames = num_chunks * chunk_frames
+    video = [torch.zeros(3, 8, 8) for _ in range(num_frames)]
+    return OmniDiffusionRequest(
+        prompts=[
+            {
+                "prompt": f"prompt_{req_id}",
+                "multi_modal_data": {"video": video},
+            }
+        ],
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=num_inference_steps,
+            chunk_frames=chunk_frames,
+            num_chunks=num_chunks,
+            num_frames=num_frames,
+        ),
+        request_id=req_id,
+    )
+
+
+def _make_stream_output(
+    req_id: str,
+    *,
+    finished: bool = False,
+    error: str | None = None,
+    micro_step_wall_ns: int | None = None,
+):
+    return SimpleNamespace(
+        request_id=req_id,
+        step_index=None,
+        finished=finished,
+        result=DiffusionOutput(output=None, error=error) if error is not None else None,
+        micro_step_wall_ns=micro_step_wall_ns,
+    )
+
+
+def _make_od_config(pp_size: int) -> SimpleNamespace:
+    return SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size))
+
+
+def _ranks(sched_output) -> list[tuple[str, list[int]] | None]:
+    if sched_output.assignment is None:
+        return []
+    return [(t.request_id, list(t.chunk_indices)) if t.chunk_indices else None for t in sched_output.assignment]
+
+
+def _layout(sched_output, request_id: str) -> tuple[int, int, int] | None:
+    if sched_output.assignment is None:
+        return None
+    for task in sched_output.assignment:
+        if task.request_id == request_id:
+            layout = task.layout
+            return (len(layout.finished_idxs), len(layout.circulating_idxs), len(layout.new_idxs))
+    return None
+
+
+class TestStreamBatchScheduler:
+    def _make_scheduler(self, pp_size: int = 2) -> StreamBatchScheduler:
+        sched = StreamBatchScheduler()
+        sched.initialize(_make_od_config(pp_size))
+        return sched
+
+    def test_add_request_rejects_invalid_num_chunks(self) -> None:
+        scheduler = self._make_scheduler()
+        with pytest.raises(ValueError):
+            scheduler.add_request(_make_stream_request("bad-chunks", num_chunks=0))
+
+    def test_add_request_rejects_invalid_num_inference_steps(self) -> None:
+        scheduler = self._make_scheduler()
+        with pytest.raises(ValueError):
+            scheduler.add_request(_make_stream_request("bad-steps", num_inference_steps=0))
+
+    def test_pp1_single_chunk_single_step(self) -> None:
+        scheduler = self._make_scheduler(pp_size=1)
+        req_id = scheduler.add_request(_make_stream_request("a", num_inference_steps=1, num_chunks=1))
+
+        out0 = scheduler.schedule()
+        assert _new_ids(out0) == [req_id]
+        assert _ranks(out0) == [(req_id, [0])]
+        assert _layout(out0, req_id) == (0, 0, 1)
+        assert scheduler.update_from_output(out0, _make_stream_output(req_id)) == set()
+
+        out1 = scheduler.schedule()
+        assert _ranks(out1) == [None]
+        assert _layout(out1, req_id) == (1, 0, 0)
+        finished = scheduler.update_from_output(out1, _make_stream_output(req_id, finished=True))
+        assert finished == {req_id}
+        assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
+        assert scheduler.has_requests() is False
+
+    def test_pp1_single_chunk_multi_step_re_admits_same_chunk(self) -> None:
+        scheduler = self._make_scheduler(pp_size=1)
+        req_id = scheduler.add_request(_make_stream_request("multi", num_inference_steps=3, num_chunks=1))
+
+        out0 = scheduler.schedule()
+        assert _ranks(out0) == [(req_id, [0])]
+        assert _layout(out0, req_id) == (0, 0, 1)
+        scheduler.update_from_output(out0, _make_stream_output(req_id))
+
+        out1 = scheduler.schedule()
+        assert _ranks(out1) == [(req_id, [0])]
+        assert _layout(out1, req_id) == (0, 1, 0)
+        scheduler.update_from_output(out1, _make_stream_output(req_id))
+
+        out2 = scheduler.schedule()
+        assert _ranks(out2) == [(req_id, [0])]
+        assert _layout(out2, req_id) == (0, 1, 0)
+        scheduler.update_from_output(out2, _make_stream_output(req_id))
+
+        out3 = scheduler.schedule()
+        assert _ranks(out3) == [None]
+        assert _layout(out3, req_id) == (1, 0, 0)
+        assert scheduler.update_from_output(out3, _make_stream_output(req_id, finished=True)) == {req_id}
+
+    def test_pp1_multi_chunk_admits_in_order(self) -> None:
+        scheduler = self._make_scheduler(pp_size=1)
+        req_id = scheduler.add_request(_make_stream_request("multi", num_inference_steps=1, num_chunks=2))
+
+        out0 = scheduler.schedule()
+        assert _ranks(out0) == [(req_id, [0])]
+        assert _layout(out0, req_id) == (0, 0, 1)
+        scheduler.update_from_output(out0, _make_stream_output(req_id))
+
+        out1 = scheduler.schedule()
+        assert _ranks(out1) == [(req_id, [1])]
+        assert _layout(out1, req_id) == (1, 0, 1)
+        scheduler.update_from_output(out1, _make_stream_output(req_id))
+
+        out2 = scheduler.schedule()
+        assert _ranks(out2) == [None]
+        assert _layout(out2, req_id) == (1, 0, 0)
+        assert scheduler.update_from_output(out2, _make_stream_output(req_id, finished=True)) == {req_id}
+
+    def test_pp2_pipelined_chunks_advance_through_ranks(self) -> None:
+        scheduler = self._make_scheduler(pp_size=2)
+        req_id = scheduler.add_request(_make_stream_request("pp2", num_inference_steps=1, num_chunks=2))
+
+        out0 = scheduler.schedule()
+        assert _ranks(out0) == [(req_id, [0]), None]
+        assert _layout(out0, req_id) == (0, 0, 1)
+        scheduler.update_from_output(out0, _make_stream_output(req_id))
+
+        out1 = scheduler.schedule()
+        assert _ranks(out1) == [(req_id, [1]), (req_id, [0])]
+        assert _layout(out1, req_id) == (0, 0, 1)
+        scheduler.update_from_output(out1, _make_stream_output(req_id))
+
+        out2 = scheduler.schedule()
+        assert _ranks(out2) == [None, (req_id, [1])]
+        assert _layout(out2, req_id) == (1, 0, 0)
+        scheduler.update_from_output(out2, _make_stream_output(req_id))
+
+        out3 = scheduler.schedule()
+        assert _ranks(out3) == [None, None]
+        assert _layout(out3, req_id) == (1, 0, 0)
+        assert scheduler.update_from_output(out3, _make_stream_output(req_id, finished=True)) == {req_id}
+
+    def test_pp3_three_chunks_two_steps_each(self) -> None:
+        scheduler = self._make_scheduler(pp_size=3)
+        req_id = scheduler.add_request(_make_stream_request("pp3", num_inference_steps=2, num_chunks=3))
+
+        out0 = scheduler.schedule()
+        assert _ranks(out0) == [(req_id, [0]), None, None]
+        assert _layout(out0, req_id) == (0, 0, 1)
+        scheduler.update_from_output(out0, _make_stream_output(req_id))
+
+        out1 = scheduler.schedule()
+        assert _ranks(out1) == [(req_id, [1]), (req_id, [0]), None]
+        assert _layout(out1, req_id) == (0, 0, 1)
+        scheduler.update_from_output(out1, _make_stream_output(req_id))
+
+        out2 = scheduler.schedule()
+        assert _ranks(out2) == [(req_id, [2]), (req_id, [1]), (req_id, [0])]
+        assert _layout(out2, req_id) == (0, 0, 1)
+        scheduler.update_from_output(out2, _make_stream_output(req_id))
+
+        out3 = scheduler.schedule()
+        assert _ranks(out3) == [(req_id, [0]), (req_id, [2]), (req_id, [1])]
+        assert _layout(out3, req_id) == (0, 1, 0)
+        scheduler.update_from_output(out3, _make_stream_output(req_id))
+
+        out4 = scheduler.schedule()
+        assert _ranks(out4) == [(req_id, [1]), (req_id, [0]), (req_id, [2])]
+        assert _layout(out4, req_id) == (0, 1, 0)
+        scheduler.update_from_output(out4, _make_stream_output(req_id))
+
+        out5 = scheduler.schedule()
+        assert _ranks(out5) == [(req_id, [2]), (req_id, [1]), (req_id, [0])]
+        assert _layout(out5, req_id) == (0, 1, 0)
+        scheduler.update_from_output(out5, _make_stream_output(req_id))
+
+        out6 = scheduler.schedule()
+        assert _ranks(out6) == [None, (req_id, [2]), (req_id, [1])]
+        assert _layout(out6, req_id) == (1, 0, 0)
+        scheduler.update_from_output(out6, _make_stream_output(req_id))
+
+        out7 = scheduler.schedule()
+        assert _ranks(out7) == [None, None, (req_id, [2])]
+        assert _layout(out7, req_id) == (1, 0, 0)
+        scheduler.update_from_output(out7, _make_stream_output(req_id))
+
+        out8 = scheduler.schedule()
+        assert _ranks(out8) == [None, None, None]
+        assert _layout(out8, req_id) == (1, 0, 0)
+        assert scheduler.update_from_output(out8, _make_stream_output(req_id, finished=True)) == {req_id}
+        assert scheduler.has_requests() is False
+
+    def test_returning_chunk_leads_fresh_admits_in_fifo(self) -> None:
+        # Re-admit prepends; new admits append. Order: [returning..., new...].
+        scheduler = self._make_scheduler(pp_size=1)
+        req_id = scheduler.add_request(_make_stream_request("prio", num_inference_steps=2, num_chunks=2))
+
+        out0 = scheduler.schedule()
+        assert _ranks(out0) == [(req_id, [0])]
+        assert _layout(out0, req_id) == (0, 0, 1)
+        scheduler.update_from_output(out0, _make_stream_output(req_id))
+
+        out1 = scheduler.schedule()
+        assert _ranks(out1) == [(req_id, [0, 1])]
+        assert _layout(out1, req_id) == (0, 1, 1)
+
+    def test_chunk_progress_cleared_after_request_finishes(self) -> None:
+        scheduler = self._make_scheduler(pp_size=1)
+        req_id = scheduler.add_request(_make_stream_request("cleanup", num_inference_steps=1, num_chunks=1))
+
+        out0 = scheduler.schedule()
+        scheduler.update_from_output(out0, _make_stream_output(req_id))
+        out1 = scheduler.schedule()
+        scheduler.update_from_output(out1, _make_stream_output(req_id, finished=True))
+
+        scheduler.pop_request_state(req_id)
+        assert req_id not in scheduler._progress
+        assert scheduler.has_requests() is False
+
+    def test_schedule_with_no_requests_emits_no_assignment(self) -> None:
+        scheduler = self._make_scheduler(pp_size=2)
+        out = scheduler.schedule()
+        assert out.assignment is None
+        assert out.scheduled_request_ids == []
+
+    def test_fifo_two_requests(self) -> None:
+        scheduler = self._make_scheduler(pp_size=1)
+        req_a = scheduler.add_request(_make_stream_request("a", num_inference_steps=1, num_chunks=1))
+        req_b = scheduler.add_request(_make_stream_request("b", num_inference_steps=1, num_chunks=1))
+
+        out0 = scheduler.schedule()
+        assert _new_ids(out0) == [req_a]
+        assert _ranks(out0) == [(req_a, [0])]
+        scheduler.update_from_output(out0, _make_stream_output(req_a))
+
+        out1 = scheduler.schedule()
+        assert _new_ids(out1) == []
+        scheduler.update_from_output(out1, _make_stream_output(req_a, finished=True))
+        scheduler.pop_request_state(req_a)
+
+        out2 = scheduler.schedule()
+        assert _new_ids(out2) == [req_b]
+        assert _ranks(out2) == [(req_b, [0])]
+
+    def test_has_requests_state_transition(self) -> None:
+        scheduler = self._make_scheduler(pp_size=1)
+        assert scheduler.has_requests() is False
+
+        req_id = scheduler.add_request(_make_stream_request("has", num_inference_steps=1, num_chunks=1))
+        assert scheduler.has_requests() is True
+
+        out0 = scheduler.schedule()
+        assert scheduler.has_requests() is True
+        scheduler.update_from_output(out0, _make_stream_output(req_id))
+
+        out1 = scheduler.schedule()
+        assert scheduler.update_from_output(out1, _make_stream_output(req_id, finished=True)) == {req_id}
+        assert scheduler.has_requests() is False
+
+    def test_abort_waiting_and_running_requests(self) -> None:
+        scheduler = self._make_scheduler(pp_size=1)
+        req_a = scheduler.add_request(_make_stream_request("a", num_inference_steps=1, num_chunks=1))
+        req_b = scheduler.add_request(_make_stream_request("b", num_inference_steps=1, num_chunks=1))
+
+        scheduler.finish_requests(req_b, DiffusionRequestStatus.FINISHED_ABORTED)
+        assert scheduler.get_request_state(req_b).status == DiffusionRequestStatus.FINISHED_ABORTED
+
+        out = scheduler.schedule()
+        assert _new_ids(out) == [req_a]
+
+        scheduler.finish_requests(req_a, DiffusionRequestStatus.FINISHED_ABORTED)
+        assert scheduler.get_request_state(req_a).status == DiffusionRequestStatus.FINISHED_ABORTED
+        assert scheduler.has_requests() is False
+
+    def test_error_output_marks_finished_error(self) -> None:
+        scheduler = self._make_scheduler(pp_size=1)
+        req_id = scheduler.add_request(_make_stream_request("err", num_inference_steps=2, num_chunks=1))
+
+        out = scheduler.schedule()
+        finished = scheduler.update_from_output(out, _make_stream_output(req_id, error="worker failed"))
+
+        assert finished == {req_id}
+        state = scheduler.get_request_state(req_id)
+        assert state.status == DiffusionRequestStatus.FINISHED_ERROR
+        assert state.error == "worker failed"
+        assert scheduler.has_requests() is False
+
+    def test_preempt_request_preserves_chunk_progress(self) -> None:
+        scheduler = self._make_scheduler(pp_size=2)
+        req_id = scheduler.add_request(_make_stream_request("preempt", num_inference_steps=2, num_chunks=2))
+
+        out0 = scheduler.schedule()
+        assert _ranks(out0) == [(req_id, [0]), None]
+        scheduler.update_from_output(out0, _make_stream_output(req_id))
+
+        out1 = scheduler.schedule()
+        assert _ranks(out1) == [(req_id, [1]), (req_id, [0])]
+        scheduler.update_from_output(out1, _make_stream_output(req_id))
+
+        before = scheduler._progress[req_id]
+        assert before.next_chunk_idx == 2
+        snapshot = [[c.chunk_idx for c in q] for q in before.chunks_at]
+        assert snapshot == [[1], [0]]
+
+        assert scheduler.preempt_request(req_id) is True
+        assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.PREEMPTED
+
+        after = scheduler._progress[req_id]
+        assert after.next_chunk_idx == 2
+        assert [[c.chunk_idx for c in q] for q in after.chunks_at] == snapshot
+
+    def test_b_admission(self) -> None:
+        scheduler = self._make_scheduler(pp_size=1)
+        req_id = scheduler.add_request(_make_stream_request("b", num_inference_steps=2, num_chunks=4))
+        scheduler._slo.register(req_id, slo_fps=30.0, max_batch=4, chunk_frames=1)
+        scheduler._slo._reqs[req_id].batch_size = 2
+
+        out0 = scheduler.schedule()
+        assert _ranks(out0) == [(req_id, [0, 1])]
+        assert _layout(out0, req_id) == (0, 0, 2)
+        scheduler.update_from_output(out0, _make_stream_output(req_id))
+
+        out1 = scheduler.schedule()
+        assert _ranks(out1) == [(req_id, [0, 1, 2, 3])]
+        assert _layout(out1, req_id) == (0, 2, 2)

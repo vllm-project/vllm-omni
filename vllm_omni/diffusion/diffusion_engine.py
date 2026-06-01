@@ -27,11 +27,17 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
+    apply_required_sampling_overrides,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
-from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
+from vllm_omni.diffusion.sched import (
+    RequestScheduler,
+    SchedulerInterface,
+    StepScheduler,
+    StreamBatchScheduler,
+)
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -69,6 +75,13 @@ def supports_multimodal_input(od_config: OmniDiffusionConfig) -> tuple[bool, boo
         supports_image_input = bool(getattr(model_cls, "support_image_input", False))
         supports_audio_input = bool(getattr(model_cls, "support_audio_input", False))
     return supports_image_input, supports_audio_input
+
+
+def supports_camera_pos_input(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "support_camera_pos_input", False))
 
 
 def image_color_format(model_class_name: str) -> str:
@@ -145,9 +158,16 @@ class DiffusionEngine:
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
         self.step_execution = bool(getattr(od_config, "step_execution", False))
-        self.scheduler: SchedulerInterface = scheduler or (
-            StepScheduler() if self.step_execution else RequestScheduler()
-        )
+        self.stream_batch = bool(getattr(od_config, "stream_batch", False))
+
+        if scheduler is not None:
+            self.scheduler: SchedulerInterface = scheduler
+        elif self.stream_batch:
+            self.scheduler = StreamBatchScheduler()
+        elif self.step_execution:
+            self.scheduler = StepScheduler()
+        else:
+            self.scheduler = RequestScheduler()
         self.scheduler.initialize(od_config)
         if self.scheduler.max_num_running_reqs > 1 and not self.step_execution:
             max_num_seqs = self.scheduler.max_num_running_reqs
@@ -169,7 +189,12 @@ class DiffusionEngine:
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
-        self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
+        if self.stream_batch:
+            self.execute_fn = self.executor.execute_micro_step
+        elif self.step_execution:
+            self.execute_fn = self.executor.execute_step
+        else:
+            self.execute_fn = self.executor.execute_request
 
         try:
             self._dummy_run()
@@ -581,6 +606,11 @@ class DiffusionEngine:
         return DiffusionEngine(config, scheduler=scheduler)
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
+        apply_required_sampling_overrides(
+            request.sampling_params,
+            self.od_config.model_class_name,
+        )
+
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -609,6 +639,10 @@ class DiffusionEngine:
         return await self.get_result(request_id)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        apply_required_sampling_overrides(
+            request.sampling_params,
+            self.od_config.model_class_name,
+        )
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -697,6 +731,27 @@ class DiffusionEngine:
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
+            audio_duration_sec = 4
+            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
+            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
+        else:
+            dummy_audio = None
+
+        if supports_camera_pos_input(self.od_config.model_class_name):
+            camera_pos_len = 64
+            # Shape [N x 4]
+            intrinsics = np.random.rand(camera_pos_len, 4)
+            # Shape [N x 4 x 4]
+            poses = np.array([np.identity(4) for _ in range(camera_pos_len)])
+
+            dummy_camera_pos = {"intrinsics": intrinsics, "poses": poses}
+        else:
+            dummy_camera_pos = None
+
+        prompt: OmniTextPrompt = {
+            "prompt": "dummy run",
+            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio, "camera": dummy_camera_pos},
+        }
         num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
         req = OmniDiffusionRequest(
             prompts=[prompt],

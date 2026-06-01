@@ -55,6 +55,8 @@ class DiffusionRequestState:
     timesteps: torch.Tensor | list[torch.Tensor] | None = None
     step_index: int = 0
 
+    batched_timesteps: torch.Tensor | None = None
+
     # ── Per-request scheduler instance (set once by prepare_encode) ──
     scheduler: Any | None = None
 
@@ -110,6 +112,21 @@ class DiffusionRequestState:
         return self.step_index == 0 or self.timesteps is None
 
 
+@dataclass
+class ChunkState:
+    """Per-chunk state for one in-flight chunk of a streaming request.
+
+    Lives inside ``DiffusionRequestState.extra["chunks"]`` (keyed by
+    ``chunk_idx``).
+    """
+
+    idx: int
+    latents: torch.Tensor | None = None
+    step_index: int = 0
+    scheduler: Any | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
 class BaseRunnerOutput(ABC):
     @abstractmethod
     def get_request_output(self, request_id: str) -> RunnerOutput | None:
@@ -118,17 +135,24 @@ class BaseRunnerOutput(ABC):
 
 @dataclass
 class RunnerOutput(BaseRunnerOutput):
-    """Output of a single denoising step for a request.
+    """Output of a single execution step for a request.
 
-    NOTE: `latents` may be None when returned through IPC to avoid
-    serialization overhead. The actual latents are kept in Worker's
-    _request_state_cache.
+    Each scheduler reads the fields it needs:
+
+    - ``StepScheduler`` reads ``step_index`` / ``finished``.
+    - ``StreamBatchScheduler`` reads ``finished`` / ``result`` /
+      ``micro_step_wall_ns``.
+
+    Fields not relevant to an execution path are left as ``None`` / ``False``.
     """
 
     request_id: str
     step_index: int | None = None
     finished: bool = False
     result: DiffusionOutput | None = None
+
+    # ── Temporal-PP micro-step fields ──
+    micro_step_wall_ns: int | None = None
 
     def get_request_output(self, request_id: str) -> RunnerOutput | None:
         return self if self.request_id == request_id else None

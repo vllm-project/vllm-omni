@@ -29,6 +29,11 @@ class SupportAudioInput(Protocol):
 
 
 @runtime_checkable
+class SupportCameraPosInput(Protocol):
+    support_camera_pos_input: ClassVar[bool] = True
+
+
+@runtime_checkable
 class SupportAudioOutput(Protocol):
     support_audio_output: ClassVar[bool] = True
 
@@ -87,3 +92,32 @@ def supports_step_execution(pipeline: object) -> bool:
     """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
 
     return isinstance(pipeline, SupportsStepExecution)
+
+
+@runtime_checkable
+class SupportsMicroStepExecution(SupportsStepExecution, Protocol):
+    """Temporal-PP micro-step execution protocol.
+
+    Extends :class:`SupportsStepExecution` with the per-micro-step hooks
+    used by ``DiffusionModelRunner.execute_micro_step``:
+
+    - ``set_pp_recv_dict_buffers`` pre-registers PPGC dict channels for
+      this request to skip the blocking first-call schema exchange.
+    - ``prefetch_tensors`` pre-posts the next-step recv on the comms stream
+      so it overlaps with the current micro-step's compute (latents on the
+      first PP rank, intermediate tensors on the others).
+    """
+
+    supports_micro_step_execution: ClassVar[bool] = True
+
+    def set_pp_recv_dict_buffers(self, state: DiffusionRequestState, **kwargs: Any) -> None:
+        """Pre-register PP dict recv buffers and schema cache for this request."""
+
+    def prefetch_tensors(self, state: DiffusionRequestState, **kwargs: Any) -> None:
+        """Pre-post the next-step recv."""
+
+
+def supports_micro_step_execution(pipeline: object) -> bool:
+    """Return whether `pipeline` implements :class:`SupportsMicroStepExecution`."""
+
+    return isinstance(pipeline, SupportsMicroStepExecution)

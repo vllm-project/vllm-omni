@@ -612,6 +612,10 @@ class OmniDiffusionConfig:
 
     # sleep mode
     enable_sleep_mode: bool = False
+    # Temporal pipeline parallelism (StreamBatchScheduler-driven streaming chunks).
+    # When True, the engine uses ``StreamBatchScheduler`` and routes execution
+    # through ``executor.execute_micro_step``.
+    stream_batch: bool = False
 
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
@@ -972,6 +976,9 @@ class OmniDiffusionConfig:
                         self.model_class_name = "WanS2VPipeline"
                     self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
+                elif self.model_class_name == "LingbotWorldFastPipeline":
+                    self.tf_config_dict = get_hf_file_to_dict("config.json", self.model)
+                    self.tf_model_config = TransformerConfig.from_dict(self.tf_config_dict)
                 elif architectures and len(architectures) == 1:
                     self.model_class_name = architectures[0]
                 else:
