@@ -184,7 +184,12 @@ python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
 
 `end2end.py` is a one-shot script (init → one `generate()` → exit), so
 its reported RTF includes per-process compile + CUDA-Graph capture +
-first-request runtime warmup. To separate the warmup cost from the
+first-request runtime warmup. Note that the default `voxcpm2.yaml` sets
+`enforce_eager: true`, so vLLM's engine-level CUDA graphs are off by
+design; the "CUDA-Graph capture" referenced throughout this recipe is the
+talker's own `_CapturedGraph` over the CFM solver / AudioVAE, not the LM
+decode loop. Flipping `enforce_eager=false` does **not** remove this cost.
+To separate the warmup cost from the
 talker's true per-step throughput, the table below reports **5
 consecutive `engine.generate([prompt])` calls in the same process**
 after a one-off ~28 s engine init:
@@ -241,4 +246,4 @@ steps themselves run at the same per-step rate as zero-shot.
 - Memory usage: ~4.9 GiB model weights + ~15.2 GiB KV cache ≈ 22 GiB / 24 GiB resident with the default `voxcpm2.yaml`. On a shared GPU, pass `--gpu-memory-utilization 0.75` (or lower) if startup fails the free-memory check.
 - Key flags: `--omni` is required. `--trust-remote-code` is not needed — the HF config registers under `model_type=voxcpm2`.
 - Output: 48 kHz mono. When streaming PCM to a player, use `-r 48000`.
-- Cold start: ~60 s server boot + ~25 s first-inference overhead (torch.compile + flashinfer JIT + CUDA-Graph capture). Steady-state inference RTF is **~0.12** (~8× real-time on a single 4090; see T6 table for the per-call breakdown); online server requests run at ~RTF 0.5 wall-time (includes HTTP round-trip). Keep the server warm for interactive use.
+- Cold start: ~60 s server boot + ~25 s first-inference overhead (torch.compile + flashinfer JIT + the talker's own `_CapturedGraph` capture over CFM / AudioVAE — not vLLM engine CUDA graphs, which `enforce_eager: true` disables). Steady-state inference RTF is **~0.12** (~8× real-time on a single 4090; see T6 table for the per-call breakdown); online server requests run at ~RTF 0.5 wall-time (includes HTTP round-trip). Keep the server warm for interactive use.
