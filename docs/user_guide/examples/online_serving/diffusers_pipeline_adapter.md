@@ -10,7 +10,7 @@ vLLM-Omni supports running diffusion models with the diffusers backend, directly
 The diffusers backend is a black-box adapter. Its primary focus is to serve diffusion models online.
 Currently, the following features are NOT yet supported.
 Community contributions are welcome to add these features when they can be
-delegated cleanly to Diffusers or mapped conservatively from vLLM-Omni.
+implemented with clear Diffusers or vLLM-Omni behavior.
 
 - CFG parallel execution
 - Sequence parallel execution
@@ -69,18 +69,16 @@ But if that parameter is simultaneously set in both the vLLM-Omni interface and 
 
 ### Quantization
 
-`diffusers_load_kwargs` is the primary way to pass Diffusers-native loading
-options. If `diffusers_load_kwargs["quantization_config"]` is a JSON/Python
-dict, the diffusers backend builds the corresponding Diffusers
-`PipelineQuantizationConfig` before calling `DiffusionPipeline.from_pretrained()`.
+Use `diffusers_load_kwargs` for Diffusers-native quantization options. If
+`diffusers_load_kwargs["quantization_config"]` is provided as a dictionary, the
+diffusers backend builds a Diffusers quantization config and lets Diffusers
+validate it before calling `DiffusionPipeline.from_pretrained()`.
 
-For convenience, the diffusers backend also supports a small, verified set of
+The diffusers backend also provides a small compatibility shortcut for
 vLLM-Omni quantization configs when `diffusers_load_kwargs` does not already
-contain `quantization_config`. Currently this covers online/dynamic `fp8` and
-online/dynamic `int8` for Diffusers pipelines that expose transformer components
-such as `transformer` or `transformer_2`. The converted config uses
-Diffusers/TorchAO dynamic quantization; it does not try to emulate native
-vLLM-Omni checkpoint or low-bit post-load quantization. This path requires
+contain `quantization_config`. Currently this maps online/dynamic `fp8` and
+online/dynamic `int8` to Diffusers/TorchAO dynamic quantization for transformer
+components such as `transformer` or `transformer_2`. This path requires
 `torchao` to be installed.
 
 For example, the CLI can request dynamic FP8 through the vLLM-Omni interface:
@@ -93,12 +91,10 @@ vllm serve "Qwen/Qwen-Image" \
 ```
 
 Other vLLM-Omni quantization methods, such as `gguf`, `modelopt`, `mxfp4`,
-`mxfp8`, serialized checkpoints, and static FP8 configs, are not mapped by the
-diffusers backend yet and fail explicitly instead of silently falling back.
-Layer-name skip lists such as `ignored_layers` are also not mapped because
-vLLM-Omni and Diffusers module names may differ. Use Diffusers-native
-configuration through `diffusers_load_kwargs` or a native vLLM-Omni pipeline
-for those cases.
+`mxfp8`, serialized checkpoints, static FP8 configs, and layer-name skip lists
+such as `ignored_layers`, are intentionally not translated by this compatibility
+shortcut. Use Diffusers-native configuration through `diffusers_load_kwargs` or
+a native vLLM-Omni pipeline for those cases.
 
 ### Attention Backends
 
