@@ -61,6 +61,7 @@ curl -X POST http://localhost:8091/v1/images/generations \
     "model": "stabilityai/stable-diffusion-3.5-medium",
     "prompt": "a cute cat sitting on a windowsill, highly detailed, sharp focus",
     "negative_prompt": "blurry, out of focus",
+    "guidance_scale": 4.5,
     "n": 1,
     "size": "1024x1024"
   }' | python3 -c "
@@ -83,9 +84,10 @@ python examples/online_serving/text_to_image/openai_chat_client.py \
 
 #### Notes
 
-- Memory usage: Model weights ~15.6 GiB, peak VRAM ~17.0 GiB during inference.
-- Generation time: ~4 seconds for 1024×1024.
+- Memory usage: Model weights ~15.6 GiB, peak VRAM ~17.0 GiB (no CFG), ~20.9 GiB with `guidance_scale > 1` (CFG enabled).
+- Generation time: ~4 seconds without CFG, ~8 seconds with `guidance_scale=4.5`.
 - Model loading time: ~55 seconds (including weight download on first run).
+- `negative_prompt` requires `guidance_scale > 1` to take effect; SD3 defaults to 1.0 (no CFG).
 
 ### 1x NVIDIA RTX A6000 48GB — stable-diffusion-3.5-large
 
@@ -116,6 +118,7 @@ curl -X POST http://localhost:8091/v1/images/generations \
     "model": "stabilityai/stable-diffusion-3.5-large",
     "prompt": "a cute cat sitting on a windowsill, highly detailed, sharp focus",
     "negative_prompt": "blurry, out of focus",
+    "guidance_scale": 4.5,
     "n": 1,
     "size": "1024x1024"
   }' | python3 -c "
@@ -129,6 +132,8 @@ print('saved output.png')
 
 #### Notes
 
-- Memory usage: Peak VRAM ~33.6 GiB during inference.
-- Generation time: ~21 seconds for 1024×1024.
+- Memory usage: Peak VRAM ~31.6 GiB at 1024×1024, ~45.5 GiB at 2048×2048 with `guidance_scale=4.5`.
+- Generation time: ~19 seconds at 1024×1024, ~102 seconds at 2048×2048.
 - Image quality is noticeably better than medium, with sharper details.
+- `negative_prompt` requires `guidance_scale > 1` to take effect; SD3 defaults to 1.0 (no CFG).
+- 2048×2048 fits within 48 GB but leaves little headroom (~45.5 GiB used out of 49 GiB).
