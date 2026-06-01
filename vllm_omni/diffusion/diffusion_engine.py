@@ -867,7 +867,7 @@ class DiffusionEngine:
                 worker_thread.join(timeout=10)
             if worker_thread.is_alive():
                 logger.warning(
-                    "Worker thread did not terminate within 10s; scheduler and executor shutdown will be skipped."
+                    "Worker thread did not terminate within 10s; scheduler and executor shutdown will be deferred."
                 )
                 return
             else:

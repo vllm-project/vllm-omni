@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import gc
 import logging
-from copy import copy
 from dataclasses import replace
 
 import numpy as np
@@ -18,11 +17,6 @@ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    extract_routed_experts_for_current_batch,
-    get_global_experts_capturer,
-    issue_routing_d2h_copy,
-)
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
@@ -112,6 +106,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        if self.routed_experts_initialized:
+            self.routed_experts_capturer.clear_buffer()
+
         if hasattr(self, "_omni_connector"):
             for request in getattr(scheduler_output, "pending_input_registrations", []):
                 self.register_chunk_recv(request)
@@ -123,7 +120,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     self.flush_full_payload_outputs(flush_ids)
 
         if self.routed_experts_initialized:
-            capturer = get_global_experts_capturer()
+            capturer = self.routed_experts_capturer
             if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
                 capturer.finalize_pending_copy()
 
@@ -369,12 +366,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             deferred_state_corrections_fn()
 
         if self.routed_experts_initialized and hasattr(self, "_positions_cpu"):
-            issue_routing_d2h_copy(
-                input_batch_req_ids=self.input_batch.req_ids,
-                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                positions=self.positions,
-                positions_cpu=self._positions_cpu,
-            )
+            self._omni_routed_experts_d2h(scheduler_output)
 
         return None
 
@@ -390,18 +382,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         self.kv_connector_output = None
 
         if self.execute_model_state is None:
-            # Nothing to do (PP non-final rank case), output isn't used.
-            if not kv_connector_output:
-                return None  # type: ignore[return-value]
-
+            # receive sampled token ids from the last PP rank.
+            if self.use_async_scheduling and not get_pp_group().is_last_rank:
+                self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
-            if kv_connector_output.is_empty():
-                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
-
-            output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
-            output.kv_connector_output = kv_connector_output
-            return self.attach_omni_connector_output(output)
+            return self.attach_omni_connector_output(
+                OmniModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            )
 
         # Unpack ephemeral state.
         (
@@ -462,15 +450,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
-        routed_experts_dict = None
+        routed_experts_lists = None
         if self.routed_experts_initialized:
-            routed_experts_dict = extract_routed_experts_for_current_batch(
-                req_ids=req_ids_output_copy,
-                requests=self.requests,
-                req_id_to_index=self.input_batch.req_id_to_index,
-                num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
-                max_model_len=self.max_model_len,
-            )
+            routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
         if self._should_accumulate_full_payload_output():
             for i, rid in enumerate(req_ids_output_copy):
                 req_state = self.requests.get(rid)
@@ -488,9 +470,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             num_nans_in_logits={},
             cudagraph_stats=cudagraph_stats,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
-            routed_experts_dict=routed_experts_dict,
         )
         output.omni_connector_output = self.get_omni_connector_output()
+        output.routed_experts = routed_experts_lists
 
         if not self.use_async_scheduling:
             return output
@@ -544,9 +526,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         )
 
     @torch.inference_mode()
-    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logger.warning("Dummy sampler run is not implemented for generation model")
-        return None
+        return torch.tensor([])
 
     @torch.inference_mode()
     def _dummy_run(

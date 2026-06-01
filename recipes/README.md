@@ -47,6 +47,7 @@ recipes/
 | [`Wan-AI/Wan2.2-S2V.md`](./Wan-AI/Wan2.2-S2V.md) | Speech-to-video serving (Wan2.2 14B) | 2x A100/H100 80GB |
 | [`zai-org/GLM-TTS.md`](./zai-org/GLM-TTS.md) | Online serving for Chinese/English zero-shot voice-cloned TTS | 1x A40 48GB |
 | [`GLM/GLM-Image.md`](./GLM/GLM-Image.md) | Online serving for image generation | 1x A800 80GB / 2x A800 80GB |
+|
 
 Within a single recipe file, include different hardware support sections such
 as `GPU`, `ROCm`, and `NPU`, and add concrete tested configurations like

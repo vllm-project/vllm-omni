@@ -2,6 +2,7 @@ from vllm.model_executor.models.registry import (
     _VLLM_MODELS,
     _LazyRegisteredModel,
     _ModelRegistry,
+    _resolve_module_name,
 )
 
 _OMNI_MODELS = {
@@ -261,7 +262,7 @@ OmniModelRegistry = _ModelRegistry(
     {
         **{
             model_arch: _LazyRegisteredModel(
-                module_name=f"vllm.model_executor.models.{mod_relname}",
+                module_name=_resolve_module_name(mod_relname),
                 class_name=cls_name,
             )
             for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()

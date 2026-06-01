@@ -25,7 +25,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders, retry_on_missing_shard
 from vllm_omni.diffusion.model_metadata import QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
@@ -208,7 +208,7 @@ class QwenImageEditPlusPipeline(
         model = od_config.model
 
         # Check if model is a local path
-        local_files_only = os.path.exists(model)
+        local_files_only = os.path.isdir(model)
 
         # Defend against a transformers v5 multi-worker race where a peer
         # worker's partially-written shard set makes our from_pretrained
@@ -219,15 +219,16 @@ class QwenImageEditPlusPipeline(
         prefetch_subfolders(
             model,
             ["scheduler", "text_encoder", "vae", "tokenizer", "processor"],
-            local_files_only=local_files_only,
         )
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
-        ).to(self.device)
+        self.text_encoder = retry_on_missing_shard(
+            lambda: Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model, subfolder="text_encoder", local_files_only=local_files_only
+            ).to(self.device)
+        )
 
         self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
@@ -236,8 +237,8 @@ class QwenImageEditPlusPipeline(
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
         self.transformer = QwenImageTransformer2DModel(od_config=od_config, **transformer_kwargs)
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.processor = Qwen2VLProcessor.from_pretrained(
-            model, subfolder="processor", local_files_only=local_files_only
+        self.processor = retry_on_missing_shard(
+            lambda: Qwen2VLProcessor.from_pretrained(model, subfolder="processor", local_files_only=local_files_only)
         )
 
         self.stage = None
