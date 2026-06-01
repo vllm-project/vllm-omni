@@ -1,0 +1,106 @@
+# AURA Omni deploy profile: Qwen3-ASR -> AURA/Qwen3-VL -> Qwen3-TTS Talker -> Code2Wav.
+#
+# Pass `--deploy-config vllm_omni/deploy/aura_omni.yaml` and point the parent
+# `--model` at any local placeholder repo if needed; each stage overrides its
+# own model below.
+pipeline: aura_omni
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 72
+      initial_codec_chunk_frames: 1
+      decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.2
+    trust_remote_code: true
+    enable_prefix_caching: true
+    async_scheduling: true
+    max_model_len: 8192
+    max_num_batched_tokens: 4096
+    devices: "0"
+    model: /data/models/Qwen3-ASR-1.7B #Qwen/Qwen3-ASR-1.7B
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 256
+
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.45
+    trust_remote_code: true
+    enable_prefix_caching: true
+    async_scheduling: true
+    max_model_len: 262144
+    max_num_batched_tokens: 15360
+    devices: "0"
+    model: /data/models/AURA #aurateam/AURA
+    default_sampling_params:
+      temperature: 0.5
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 256
+      repetition_penalty: 1.0
+
+  - stage_id: 2
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.2
+    trust_remote_code: true
+    enable_prefix_caching: true
+    async_scheduling: true
+    max_num_batched_tokens: 512
+    max_model_len: 4096
+    devices: "1"
+    output_connectors:
+      to_stage_3: connector_of_shared_memory
+    model: /data/model/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3 #Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.05
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0
+
+  - stage_id: 3
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.2
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "1"
+    input_connectors:
+      from_stage_2: connector_of_shared_memory
+    model: /data/model/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3 #Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        enforce_eager: true
