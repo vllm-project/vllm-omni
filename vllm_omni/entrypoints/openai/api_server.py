@@ -55,13 +55,8 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
-from vllm.entrypoints.openai.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
-from vllm.entrypoints.openai.speech_to_text.serving import (
-    OpenAIServingTranscription,
-    OpenAIServingTranslation,
-)
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
@@ -74,6 +69,13 @@ from vllm.entrypoints.serve.disagg.serving import ServingTokens
 from vllm.entrypoints.serve.instrumentator.basic import base
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
+from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
+from vllm.entrypoints.speech_to_text.transcription.serving import (
+    OpenAIServingTranscription,
+)
+from vllm.entrypoints.speech_to_text.translation.serving import (
+    OpenAIServingTranslation,
+)
 from vllm.entrypoints.utils import (
     create_error_response,
     load_aware_call,
@@ -131,6 +133,7 @@ from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
+from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
@@ -355,7 +358,7 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     warnings_module.filterwarnings("ignore", message=".*PydanticSerializationUnexpectedValue.*", category=UserWarning)
 
     # Add process-specific prefix to stdout and stderr.
-    decorate_logs("APIServer")
+    decorate_logs("APIServer", skip_if_decorated=True)
 
     listen_address, sock = setup_openai_server(args)
 
@@ -631,6 +634,10 @@ async def omni_init_app_state(
         )
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
+        state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
+            engine_client=engine_client,
+            model_name=model_name,
+        )
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
@@ -645,6 +652,19 @@ async def omni_init_app_state(
             logger.warning("vllm_config is None, some features may not work correctly")
 
     state.vllm_config = vllm_config
+
+    # Propagate enable_in_reasoning to the API-server process. The engine core
+    # runs in a separate process, so the contextvar that backs
+    # `get_current_vllm_config_or_none()` is None on this stack. Tool parsers
+    # call `get_enable_structured_outputs_in_reasoning()` during request
+    # handling and need to see the real flag, otherwise they silently fall
+    # back to False and mismatch the engine-side bitmask gating.
+    if vllm_config is not None:
+        from vllm.tool_parsers.structural_tag_registry import (
+            set_enable_structured_outputs_in_reasoning,
+        )
+
+        set_enable_structured_outputs_in_reasoning(vllm_config.structured_outputs_config.enable_in_reasoning)
 
     # Get supported tasks
     supported_tasks: set[str] = {"generate"}
@@ -948,6 +968,7 @@ async def omni_init_app_state(
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
     )
+    state.openai_serving_realtime_robot = None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
@@ -1391,6 +1412,23 @@ async def realtime_websocket(websocket: WebSocket):
     await connection.handle_connection()
 
 
+@router.websocket("/v1/realtime/robot/openpi")
+async def realtime_robot_openpi(websocket: WebSocket):
+    """WebSocket endpoint for robot policy inference via OpenPI messages."""
+    from vllm_omni.entrypoints.openpi.connection import (
+        RobotRealtimeConnection,
+    )
+
+    serving = getattr(websocket.app.state, "openai_serving_realtime_robot", None)
+    if serving is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "Robot policy not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    connection = RobotRealtimeConnection(websocket, serving)
+    await connection.handle_connection()
+
+
 # Health and Model endpoints for diffusion mode
 
 
@@ -1531,6 +1569,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 prompt=request.prompt,
                 extra_body=extra_body,
                 request_id=f"img_gen-{random_uuid()}",
+                raw_request=raw_request,
             )
             if isinstance(generation_result, ErrorResponse):
                 return JSONResponse(
@@ -1937,6 +1976,7 @@ async def edit_images(
                 output_format=output_format,
                 output_compression=output_compression,
                 size=size_str,
+                raw_request=raw_request,
             )
             if stream and not isinstance(generation_result, ErrorResponse):
                 return StreamingResponse(

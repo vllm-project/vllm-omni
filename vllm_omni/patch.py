@@ -166,3 +166,25 @@ _logger.warning(
     "Monkey-patched unregister_vllm_metrics() to scope drops to non-omni vllm:* collectors. "
     "Remove this patch once vLLM adds _STAT_LOGGER_METRIC_NAMES."
 )
+
+
+# Patch: add qwen3_omni_moe to vllm's chat template fallback registry.
+# Qwen/Qwen3-Omni-30B-A3B-Instruct stores its chat_template in a standalone
+# chat_template.json (not in tokenizer_config.json).  transformers < 5.9.0
+# does not load this file, so the tokenizer has no chat_template attribute.
+# vllm's resolve_chat_template falls back to MODEL_TYPE_TO_CHAT_TEMPLATE
+# which has "qwen" but not "qwen3_omni_moe".  Register the same fallback.
+def _patch_chat_template_registry():
+    try:
+        from vllm.transformers_utils.chat_templates.registry import (
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK,
+            _get_qwen_chat_template_fallback,
+        )
+
+        if "qwen3_omni_moe" not in _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK:
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = _get_qwen_chat_template_fallback
+    except ImportError:
+        pass
+
+
+_patch_chat_template_registry()

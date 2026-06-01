@@ -1027,6 +1027,9 @@ class TestDeployConfigLoading:
             "async_scheduling",
             "compilation_config",
             "config_format",
+            "custom_voice_dir",
+            "data_parallel_size",
+            "devices",
             "disable_hybrid_kv_cache_manager",
             "enable_flashinfer_autotune",
             "enforce_eager",
@@ -1067,6 +1070,32 @@ class TestDeployConfigLoading:
         assert expected_fields == actual_fields, (
             f"added={actual_fields - expected_fields}, removed={expected_fields - actual_fields}"
         )
+
+    def test_custom_voice_dir_is_pipeline_wide_engine_arg(self, tmp_path):
+        import vllm_omni.model_executor.models.qwen3_tts.pipeline  # noqa: F401
+        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+        deploy_path = tmp_path / "qwen3_tts_custom_voice.yaml"
+        custom_voice_dir = tmp_path / "voices"
+        deploy_path.write_text(
+            f"""
+async_chunk: true
+custom_voice_dir: {custom_voice_dir}
+stages:
+  - stage_id: 0
+    devices: "0"
+  - stage_id: 1
+    devices: "0"
+""",
+            encoding="utf-8",
+        )
+
+        deploy = load_deploy_config(deploy_path)
+        pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert deploy.custom_voice_dir == str(custom_voice_dir)
+        assert {s.yaml_engine_args.get("custom_voice_dir") for s in stages} == {str(custom_voice_dir)}
 
     def test_load_qwen3_omni_moe_deploy_config(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"

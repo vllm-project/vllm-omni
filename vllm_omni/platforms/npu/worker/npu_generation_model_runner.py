@@ -15,11 +15,6 @@ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    extract_routed_experts_for_current_batch,
-    get_global_experts_capturer,
-    issue_routing_d2h_copy,
-)
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -78,7 +73,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | IntermediateTensors | None:
         if self.vllm_config.model_config.enable_return_routed_experts:
-            capturer = get_global_experts_capturer()
+            capturer = self.routed_experts_capturer
             if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
                 capturer.finalize_pending_copy()
         if self.ascend_config.profiling_chunk_config.enabled:
@@ -387,12 +382,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             deferred_state_corrections_fn()
 
         if self.vllm_config.model_config.enable_return_routed_experts and hasattr(self, "_positions_cpu"):
-            issue_routing_d2h_copy(
-                input_batch_req_ids=self.input_batch.req_ids,
-                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                positions=self.positions,
-                positions_cpu=self._positions_cpu,
-            )
+            self._omni_routed_experts_d2h(scheduler_output)
 
         return None
 
@@ -479,17 +469,11 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
-        routed_experts_dict = None
+        routed_experts_lists = None
         if self.vllm_config.model_config.enable_return_routed_experts and hasattr(
             self.input_batch, "num_tokens_no_spec"
         ):
-            routed_experts_dict = extract_routed_experts_for_current_batch(
-                req_ids=req_ids_output_copy,
-                requests=self.requests,
-                req_id_to_index=self.input_batch.req_id_to_index,
-                num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
-                max_model_len=self.max_model_len,
-            )
+            routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
         output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -500,8 +484,8 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
-            routed_experts_dict=routed_experts_dict,
         )
+        output.routed_experts = routed_experts_lists
         #  -------------------------------------- Omni-new -------------------------------------------------
 
         if self.speculative_config is not None:

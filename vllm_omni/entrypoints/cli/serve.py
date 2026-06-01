@@ -436,7 +436,7 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
         )
         omni_config_group.add_argument(
-            "--quantization-config",
+            "--diffusion-quantization-config",
             type=json.loads,
             default=None,
             help=(

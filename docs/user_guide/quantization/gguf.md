@@ -74,7 +74,7 @@ Online:
 vllm serve Qwen/Qwen-Image \
   --omni \
   --port 8000 \
-  --quantization-config '{"method":"gguf","gguf_model":"QuantStack/Qwen-Image-GGUF/Qwen_Image-Q4_K_M.gguf"}'
+  --diffusion-quantization-config '{"method":"gguf","gguf_model":"QuantStack/Qwen-Image-GGUF/Qwen_Image-Q4_K_M.gguf"}'
 ```
 
 ## Parameters
