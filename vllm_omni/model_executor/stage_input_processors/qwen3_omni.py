@@ -817,45 +817,39 @@ def talker2code2wav_async_chunk(
     if code_predictor_codes is None:
         return None
 
+    if code_predictor_codes.numel() == 0:
+        return None
+
+    if not code_predictor_codes.any():
+        return None
+
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size_config = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
+    configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
 
-    if code_predictor_codes is None:
-        return None
-    if isinstance(code_predictor_codes, torch.Tensor):
-        if code_predictor_codes.numel() == 0:
-            return None
-    elif hasattr(code_predictor_codes, "__len__"):
-        if len(code_predictor_codes) == 0:
-            return None
-
-    if isinstance(code_predictor_codes, torch.Tensor):
-        if not code_predictor_codes.any():
-            return None
-        sampling_params = getattr(request, "sampling_params", None)
-        stop_token_ids = set(getattr(sampling_params, "stop_token_ids", None) or [])
-        stop_token_id = getattr(sampling_params, "stop_token_id", None)
-        if stop_token_id is not None:
-            stop_token_ids.add(stop_token_id)
-        first_codebook = int(code_predictor_codes[0, 0].item())
-        if first_codebook in stop_token_ids:
-            logger.debug("skip stop-token codec frame: first_codebook=%s", first_codebook)
-            return None
-    else:
-        code_tensor = torch.tensor(code_predictor_codes, dtype=torch.long)
-        if not code_tensor.any():
-            return None
-
-    codec_codes = code_predictor_codes.to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
-    if sum(codec_codes) == 0:
+    sampling_params = getattr(request, "sampling_params", None)
+    stop_token_ids = set(getattr(sampling_params, "stop_token_ids", None) or [])
+    stop_token_id = getattr(sampling_params, "stop_token_id", None)
+    if stop_token_id is not None:
+        stop_token_ids.add(stop_token_id)
+    first_codebook = int(code_predictor_codes[0, 0].item())
+    if first_codebook in stop_token_ids:
+        logger.debug("skip stop-token codec frame: first_codebook=%s", first_codebook)
         return None
 
     request_id = request.external_req_id
-    transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+    chunk_id = transfer_manager.put_req_chunk[request_id]
+    transfer_manager.code_prompt_token_ids[request_id].append(code_predictor_codes)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
+
+    if configured_initial_chunk_size > 0:
+        if chunk_id == 0:
+            chunk_size_config = configured_initial_chunk_size
+        else:
+            length -= configured_initial_chunk_size
 
     chunk_length = length % chunk_size_config
     if chunk_length != 0 and not is_finished:
@@ -863,10 +857,16 @@ def talker2code2wav_async_chunk(
 
     context_length = chunk_length if chunk_length != 0 else chunk_size_config
     # ensure left context does not exceed available length
-    left_context_size = max(0, min(length - context_length, left_context_size_config))
-    end_index = min(length, left_context_size + context_length)
+    if configured_initial_chunk_size > 0 and chunk_id == 1:
+        left_context_size = configured_initial_chunk_size
+        end_index = length + configured_initial_chunk_size
+    else:
+        left_context_size = max(0, min(length - context_length, left_context_size_config))
+        end_index = min(length, left_context_size + context_length)
 
-    codes = torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:]).transpose(0, 1).reshape(-1)
+    codes = (
+        torch.cat(transfer_manager.code_prompt_token_ids[request_id][-end_index:], dim=0).transpose(0, 1).reshape(-1)
+    )
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=codes),
