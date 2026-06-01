@@ -278,6 +278,12 @@ class Qwen3OmniMoeForConditionalGeneration(
             return self.model.sampler
         return Sampler()
 
+    def get_language_model(self) -> torch.nn.Module:
+        """Delegate to the active stage's language model for upstream MoE resolution."""
+        if hasattr(self.model, "get_language_model"):
+            return self.model.get_language_model()
+        return self.model
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,

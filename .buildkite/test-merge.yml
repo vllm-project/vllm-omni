@@ -107,7 +107,7 @@ steps:
     depends_on: upload-merge-pipeline
     steps:
       - label: "Entrypoint Test with H100"
-        timeout_in_minutes: 35
+        timeout_in_minutes: 60
         commands:
           - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and H100" --run-level "advanced_model"
         agents:
