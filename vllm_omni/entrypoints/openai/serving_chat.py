@@ -2437,17 +2437,28 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 for k, v in engine_prompt_data.items()
             }
 
-        comprehension_idx = None
-        for idx, stage in enumerate(stage_configs):
-            if _is_comprehension_stage(stage):
-                comprehension_idx = idx
-                break
-
         sampling_params_list = build_stage_sampling_params_list(
             stage_configs,
             default_params_list,
             diffusion_params=gen_params,
         )
+
+        comprehension_idx = None
+        for idx, stage in enumerate(stage_configs):
+            if _is_comprehension_stage(stage):
+                comprehension_idx = idx
+                break
+        if comprehension_idx is None:
+            for idx, sp in enumerate(sampling_params_list):
+                if hasattr(sp, "stop_token_ids"):
+                    comprehension_idx = idx
+                    break
+        if comprehension_idx is None:
+            for idx, stage in enumerate(stage_configs):
+                if get_stage_type(stage) != "diffusion":
+                    comprehension_idx = idx
+                    break
+
         logger.info(
             "[HunyuanImage3 online debug] stage params before overrides: comprehension_idx=%r "
             "num_stages=%d default_stop_summary=%s",
