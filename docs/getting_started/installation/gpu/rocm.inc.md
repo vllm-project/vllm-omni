@@ -87,10 +87,10 @@ docker run --rm \
 --device /dev/dri \
 -v ~/.cache/huggingface:/root/.cache/huggingface \
 --env "HF_TOKEN=$HF_TOKEN" \
--p 8091:8091 \
+-p 8000:8000 \
 --ipc=host \
 vllm-omni-rocm \
---model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
+--model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8000
 ```
 
 ##### Launch with interactive session for development
@@ -131,7 +131,7 @@ docker run --rm \
   --env "HF_TOKEN=$HF_TOKEN" \
   -p 8091:8091 \
   vllm/vllm-omni-rocm:v0.22.0 \
-  --model Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000
 ```
 
 #### Launch an interactive terminal with prebuilt docker image.

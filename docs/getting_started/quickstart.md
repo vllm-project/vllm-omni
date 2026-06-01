@@ -99,11 +99,11 @@ For more usages, please refer to [offline inference](../user_guide/examples/offl
 Text-to-image generation quickstart with vLLM-Omni:
 
 ```bash
-vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091
+vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8000
 ```
 
 ```bash
-curl -s http://localhost:8091/v1/chat/completions \
+curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [

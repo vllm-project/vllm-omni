@@ -217,7 +217,7 @@ This optimization is **enabled by default** with 4 threads. No configuration is 
 
 ```bash
 # Default (multi-thread enabled, 4 threads)
-vllm serve Qwen/Qwen-Image --omni --port 8091
+vllm serve Qwen/Qwen-Image --omni --port 8000
 
 # Custom thread count
 vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers --omni --num-weight-load-threads 8

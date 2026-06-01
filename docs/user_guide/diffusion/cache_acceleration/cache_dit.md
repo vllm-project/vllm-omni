@@ -132,10 +132,10 @@ See the [image_edit.py](https://github.com/vllm-project/vllm-omni/blob/main/exam
 
 ```bash
 # Default configuration (recommended)
-vllm serve Qwen/Qwen-Image --omni --port 8091 --cache-backend cache_dit
+vllm serve Qwen/Qwen-Image --omni --port 8000 --cache-backend cache_dit
 
 # Custom configuration
-vllm serve Qwen/Qwen-Image --omni --port 8091 \
+vllm serve Qwen/Qwen-Image --omni --port 8000 \
   --cache-backend cache_dit \
   --cache-config '{"Fn_compute_blocks": 1, "residual_diff_threshold": 0.12}'
 ```

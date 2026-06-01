@@ -11,7 +11,7 @@ Usage:
         --ref-audio /path/to/reference.wav \
         --ref-text "Transcript of the reference audio." \
         --num-prompts 20 \
-        --port 8091
+        --port 8000
 
 The script runs two rounds:
   A) Inline ref_audio: every request sends base64 audio (no cache)
@@ -176,7 +176,7 @@ async def main():
         description="Benchmark Fish Speech voice cache (inline vs uploaded)",
     )
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8091)
+    parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--ref-audio", required=True, help="Path to reference audio file")
     parser.add_argument("--ref-text", required=True, help="Transcript of reference audio")
     parser.add_argument("--num-prompts", type=int, default=20)

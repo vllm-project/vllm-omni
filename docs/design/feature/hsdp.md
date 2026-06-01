@@ -121,7 +121,7 @@ output = omni.generate(
 **Or via command line:**
 
 ```bash
-vllm serve Your-org/your-model --omni --port 8091 --use-hsdp
+vllm serve Your-org/your-model --omni --port 8000 --use-hsdp
 ```
 
 **Verify:**

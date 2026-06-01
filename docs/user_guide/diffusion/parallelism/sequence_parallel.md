@@ -130,27 +130,27 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 
 ```bash
 # Text-to-image (requires >= 2 GPUs)
-vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2
+vllm serve Qwen/Qwen-Image --omni --port 8000 --usp 2
 ```
 
 **Ulysses-SP with UAA mode** (for models with non-divisible head counts):
 
 ```bash
-vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 --usp 4 --ulysses-mode advanced_uaa
+vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8000 --usp 4 --ulysses-mode advanced_uaa
 ```
 
 **Ring-Attention:**
 
 ```bash
 # Text-to-image (requires >= 2 GPUs)
-vllm serve Qwen/Qwen-Image --omni --port 8091 --ring 2
+vllm serve Qwen/Qwen-Image --omni --port 8000 --ring 2
 ```
 
 **Hybrid Ulysses + Ring:**
 
 ```bash
 # Text-to-image (requires >= 4 GPUs)
-vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
+vllm serve Qwen/Qwen-Image --omni --port 8000 --usp 2 --ring 2
 ```
 
 ---

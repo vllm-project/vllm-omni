@@ -147,7 +147,7 @@ outputs = omni.generate(om_inputs, sampling_params_list)
 Similar to vLLM, vLLM-Omni also provides a FastAPI-based server for online serving. Users can launch the server using the vllm serve command with the `--omni` flag:
 
 ```
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000
 ```
 
 Users can send requests to the server using curl:
@@ -174,7 +174,7 @@ user_content='[
     mm_processor_kwargs="{}"
 
 # send the request
-curl -sS -X POST http://localhost:8091/v1/chat/completions \
+curl -sS -X POST http://localhost:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d @- <<EOF
 {

@@ -80,11 +80,11 @@ You can enable tensor parallelism in online serving via `--tensor-parallel-size`
 
 ```bash
 # Text-to-Image with Qwen-Image on 2 GPUs
-vllm serve Qwen/Qwen-Image --omni --port 8091 \
+vllm serve Qwen/Qwen-Image --omni --port 8000 \
     --tensor-parallel-size 2
 
 # Text-to-Image with Z-Image (TP=2 only)
-vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 \
+vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8000 \
     --tensor-parallel-size 2
 ```
 

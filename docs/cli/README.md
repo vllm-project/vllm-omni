@@ -15,7 +15,7 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni
 Specify the port:
 
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8000
 ```
 
 If you have custom stage configs file, launch the server with command below

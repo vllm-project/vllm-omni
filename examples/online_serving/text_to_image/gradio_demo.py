@@ -3,7 +3,7 @@
 Qwen-Image Gradio Demo for online serving.
 
 Usage:
-    python gradio_demo.py [--server http://localhost:8091] [--port 7860]
+    python gradio_demo.py [--server http://localhost:8000] [--port 7860]
 """
 
 import argparse
@@ -174,7 +174,7 @@ def create_demo(server_url: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen-Image Gradio Demo")
-    parser.add_argument("--server", default="http://localhost:8091", help="Server URL")
+    parser.add_argument("--server", default="http://localhost:8000", help="Server URL")
     parser.add_argument("--port", type=int, default=7860, help="Gradio port")
     parser.add_argument("--share", action="store_true", help="Create public link")
 

@@ -60,7 +60,7 @@ Add more sections for other hardware as community validation lands.
 ```bash
 vllm serve baidu/ERNIE-Image --omni \
   --enable-layerwise-offload \
-  --port 8091
+  --port 8000
 ```
 
 **ERNIE-Image-Turbo (distilled, faster):**
@@ -68,7 +68,7 @@ vllm serve baidu/ERNIE-Image --omni \
 ```bash
 vllm serve baidu/ERNIE-Image-Turbo --omni \
   --enable-layerwise-offload \
-  --port 8091
+  --port 8000
 ```
 
 ### 2 x RTX 4090 (Multi-GPU, 24GB VRAM)
@@ -81,7 +81,7 @@ vllm serve baidu/ERNIE-Image-Turbo --omni \
 vllm serve baidu/ERNIE-Image --omni \
   --tensor-parallel-size 2 \
   --enable-cpu-offload \
-  --port 8091
+  --port 8000
 ```
 
 **ERNIE-Image-Turbo (distilled, faster):**
@@ -90,7 +90,7 @@ vllm serve baidu/ERNIE-Image --omni \
 vllm serve baidu/ERNIE-Image-Turbo --omni \
   --tensor-parallel-size 2 \
   --enable-cpu-offload \
-  --port 8091
+  --port 8000
 ```
 
 #### Verification
@@ -98,7 +98,7 @@ vllm serve baidu/ERNIE-Image-Turbo --omni \
 After the server is ready, test with a simple request:
 
 ```bash
-curl -X POST http://localhost:8091/v1/images/generations \
+curl -X POST http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "A photo of a cat sitting on a laptop keyboard, digital art style.",
@@ -112,7 +112,7 @@ curl -X POST http://localhost:8091/v1/images/generations \
 For ERNIE-Image-Turbo, reduce the inference steps:
 
 ```bash
-curl -X POST http://localhost:8091/v1/images/generations \
+curl -X POST http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "A photo of a cat sitting on a laptop keyboard, digital art style.",

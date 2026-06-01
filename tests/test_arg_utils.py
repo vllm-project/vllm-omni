@@ -112,7 +112,7 @@ def test_split_drops_unclassified():
     raw = {
         "max_num_seqs": 64,  # engine
         "host": "0.0.0.0",  # unclassified (server)
-        "port": 8091,  # unclassified (server)
+        "port": 8000,  # unclassified (server)
         "ssl_keyfile": "key.pem",  # unclassified (server)
     }
     orch, engine = split_kwargs(raw, engine_cls=_FakeEngineArgs)
@@ -138,7 +138,7 @@ def test_split_mixed_real_world():
         "log_stats": False,
         # server / unclassified
         "host": "0.0.0.0",
-        "port": 8091,
+        "port": 8000,
         "api_key": "secret",
         # None values
         "ray_address": None,
@@ -207,7 +207,7 @@ def test_unclassified_without_user_typed_silent():
     handler.setLevel(logging.WARNING)
     vllm_logger.addHandler(handler)
     try:
-        raw = {"host": "0.0.0.0", "port": 8091, "max_num_seqs": 64}
+        raw = {"host": "0.0.0.0", "port": 8000, "max_num_seqs": 64}
         split_kwargs(raw, engine_cls=_FakeEngineArgs, user_typed=None)
         assert "host" not in buf.getvalue()
     finally:

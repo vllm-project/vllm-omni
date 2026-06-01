@@ -118,13 +118,13 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 
 ```bash
 # TeaCache + Ulysses-SP
-vllm serve Qwen/Qwen-Image --omni --port 8091 \
+vllm serve Qwen/Qwen-Image --omni --port 8000 \
   --cache-backend tea_cache \
   --cache-config '{"rel_l1_thresh": 0.2}' \
   --usp 2
 
 # Cache-DiT + Ring-Attention
-vllm serve Qwen/Qwen-Image --omni --port 8091 \
+vllm serve Qwen/Qwen-Image --omni --port 8000 \
   --cache-backend cache_dit \
   --cache-config '{"Fn_compute_blocks": 1, "max_warmup_steps": 8}' \
   --ring 2
@@ -133,7 +133,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 ### Cache + CFG-Parallel
 
 ```bash
-vllm serve Qwen/Qwen-Image-Edit --omni --port 8091 \
+vllm serve Qwen/Qwen-Image-Edit --omni --port 8000 \
   --cache-backend cache_dit \
   --cfg-parallel-size 2
 ```
@@ -142,13 +142,13 @@ vllm serve Qwen/Qwen-Image-Edit --omni --port 8091 \
 
 ```bash
 # CFG-Parallel + Ulysses-SP (4 GPUs total)
-vllm serve Qwen/Qwen-Image-Edit --omni --port 8091 \
+vllm serve Qwen/Qwen-Image-Edit --omni --port 8000 \
   --cache-backend cache_dit \
   --cfg-parallel-size 2 \
   --usp 2
 
 # Hybrid Ulysses + Ring (4 GPUs total)
-vllm serve Qwen/Qwen-Image --omni --port 8091 \
+vllm serve Qwen/Qwen-Image --omni --port 8000 \
   --cache-backend cache_dit \
   --usp 2 \
   --ring 2

@@ -19,7 +19,7 @@ To use the Ray backend, specify `worker_backend="ray"` when initializing the eng
 ```bash
 vllm serve Qwen/Qwen2.5-Omni-7B \
   --omni \
-  --port 8091 \
+  --port 8000 \
   --worker-backend ray \
   --ray-address auto
 ```

@@ -5,13 +5,13 @@
 #   ./run_gradio_demo.sh [OPTIONS]
 #
 # Example:
-#   ./run_gradio_demo.sh --model Qwen/Qwen3-Omni-30B-A3B-Instruct --server-port 8091 --gradio-port 7861
+#   ./run_gradio_demo.sh --model Qwen/Qwen3-Omni-30B-A3B-Instruct --server-port 8000 --gradio-port 7861
 
 set -e
 
 # Default values
 MODEL="Qwen/Qwen3-Omni-30B-A3B-Instruct"
-SERVER_PORT=8091
+SERVER_PORT=8000
 GRADIO_PORT=7861
 STAGE_CONFIGS_PATH=""
 SERVER_HOST="0.0.0.0"
@@ -54,7 +54,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --model MODEL                 Model name/path (default: Qwen/Qwen3-Omni-30B-A3B-Instruct)"
-            echo "  --server-port PORT            Port for vLLM server (default: 8091)"
+            echo "  --server-port PORT            Port for vLLM server (default: 8000)"
             echo "  --gradio-port PORT            Port for Gradio demo (default: 7861)"
             echo "  --stage-configs-path PATH     Path to custom stage configs YAML file (optional)"
             echo "  --server-host HOST            Host for vLLM server (default: 0.0.0.0)"

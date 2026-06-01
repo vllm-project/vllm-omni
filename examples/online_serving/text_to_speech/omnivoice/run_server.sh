@@ -8,7 +8,7 @@
 set -e
 
 MODEL="${MODEL:-k2-fsa/OmniVoice}"
-PORT="${PORT:-8091}"
+PORT="${PORT:-8000}"
 
 echo "Starting OmniVoice server with model: $MODEL"
 

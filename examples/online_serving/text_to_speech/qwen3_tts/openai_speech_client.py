@@ -36,7 +36,7 @@ import os
 import httpx
 
 # Default server configuration
-DEFAULT_API_BASE = "http://localhost:8091"
+DEFAULT_API_BASE = "http://localhost:8000"
 DEFAULT_API_KEY = "EMPTY"
 
 

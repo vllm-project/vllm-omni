@@ -38,7 +38,7 @@ docker run -it -d --shm-size 10g \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   vllm-omni-xpu \
-  --model Qwen/Qwen2.5-Omni-3B --port 8091
+  --model Qwen/Qwen2.5-Omni-3B --port 8000
 ```
 
 # --8<-- [end:build-docker]

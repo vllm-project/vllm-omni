@@ -33,7 +33,7 @@ echo "Starting Qwen3-TTS server with model: $MODEL"
 vllm-omni serve "$MODEL" \
     --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --host 0.0.0.0 \
-    --port 8091 \
+    --port 8000 \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
     --omni

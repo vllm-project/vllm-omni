@@ -3,12 +3,12 @@
 #
 # Usage:
 #   ./run_gradio_demo.sh
-#   CUDA_VISIBLE_DEVICES=0 PORT=8091 GRADIO_PORT=7860 ./run_gradio_demo.sh
+#   CUDA_VISIBLE_DEVICES=0 PORT=8000 GRADIO_PORT=7860 ./run_gradio_demo.sh
 
 set -e
 
 MODEL="${MODEL:-fishaudio/s2-pro}"
-PORT="${PORT:-8091}"
+PORT="${PORT:-8000}"
 GRADIO_PORT="${GRADIO_PORT:-7860}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 

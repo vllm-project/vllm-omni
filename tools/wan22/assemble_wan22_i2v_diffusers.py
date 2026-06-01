@@ -377,7 +377,7 @@ def main() -> int:
     print(f"  transformer weight: {_weight_summary(transformer_copied)}")
     print(f"  transformer_2 weight: {_weight_summary(transformer_2_copied)}")
     print("\nUse it with vLLM-Omni, for example:")
-    print(f"  vllm serve {output_dir} --omni --port 8091")
+    print(f"  vllm serve {output_dir} --omni --port 8000")
     return 0
 
 

@@ -17,7 +17,7 @@ worker stages use GPU 1 via `CUDA_VISIBLE_DEVICES`.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
-    --port 8091 \
+    --port 8000 \
     --stage-id 0 \
     --omni-master-address 127.0.0.1 \
     --omni-master-port 26000
@@ -41,7 +41,7 @@ However, under the **stage-based CLI** paradigm, where each process strictly enc
 For example, as an alternative to the following composite configuration:
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --stage-overrides '{"1": {"gpu_memory_utilization": 0.5}}'
 ```
 

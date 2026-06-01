@@ -17,7 +17,7 @@ This example demonstrates how to deploy Stable Audio models for online text-to-a
 ```bash
 vllm-omni serve stabilityai/stable-audio-open-1.0 \
     --host 0.0.0.0 \
-    --port 8091 \
+    --port 8000 \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
     --enforce-eager \
@@ -33,7 +33,7 @@ vllm-omni serve stabilityai/stable-audio-open-1.0 \
 bash curl_examples.sh
 
 # Or execute directly
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "The sound of a cat purring",
@@ -68,7 +68,7 @@ python stable_audio_client.py \
 
 The Python client supports the following command-line arguments:
 
-- `--api_url`: API endpoint URL (default: `http://localhost:8091/v1/audio/generate`)
+- `--api_url`: API endpoint URL (default: `http://localhost:8000/v1/audio/generate`)
 - `--text`: Text prompt for audio generation (default: `"The sound of a cat purring"`)
 - `--audio_length`: Audio length in seconds (default: `10.0`, max ~47s for `stable-audio-open-1.0`)
 - `--audio_start`: Audio start time in seconds (default: `0.0`)
@@ -85,7 +85,7 @@ The Python client supports the following command-line arguments:
 import httpx
 
 response = httpx.post(
-    "http://localhost:8091/v1/audio/generate",
+    "http://localhost:8000/v1/audio/generate",
     json={
         "input": "The sound of ocean waves crashing on a beach",
         "audio_length": 10.0,

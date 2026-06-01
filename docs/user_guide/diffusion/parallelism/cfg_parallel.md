@@ -78,7 +78,7 @@ Enable CFG-Parallel in online serving:
 
 ```bash
 # Default configuration
-vllm serve Qwen/Qwen-Image-Edit --omni --port 8091 --cfg-parallel-size 2
+vllm serve Qwen/Qwen-Image-Edit --omni --port 8000 --cfg-parallel-size 2
 
 ```
 

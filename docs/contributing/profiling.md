@@ -208,7 +208,7 @@ Single-stage diffusion serving with torch profiler:
 ```bash
 vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers \
   --omni \
-  --port 8091 \
+  --port 8000 \
   --profiler-config '{
     "profiler": "torch",
     "torch_profiler_dir": "/tmp/vllm_profile_wan22_i2v",
@@ -237,7 +237,7 @@ nsys profile \
   -o serving_trace \
   vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers \
     --omni \
-    --port 8091 \
+    --port 8000 \
     --profiler-config '{"profiler": "cuda"}'
 ```
 
@@ -247,10 +247,10 @@ Example profiling flow for an online Qwen-Image request:
 
 ```bash
 # Start profiling.
-curl -X POST http://localhost:8091/start_profile
+curl -X POST http://localhost:8000/start_profile
 
 # Send a Qwen-Image generation request while profiling is active.
-curl http://localhost:8091/v1/images/generations \
+curl http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen-Image",
@@ -258,7 +258,7 @@ curl http://localhost:8091/v1/images/generations \
   }'
 
 # Stop profiling and flush profiler artifacts.
-curl -X POST http://localhost:8091/stop_profile
+curl -X POST http://localhost:8000/stop_profile
 ```
 
 ## 5. Diffusion Pipeline Profiler

@@ -32,7 +32,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Generate audio with Stable Audio via OpenAI-compatible API")
     parser.add_argument(
         "--api_url",
-        default="http://localhost:8091/v1/audio/generate",
+        default="http://localhost:8000/v1/audio/generate",
         help="API endpoint URL",
     )
     parser.add_argument(

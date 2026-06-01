@@ -26,7 +26,7 @@ Both topologies support all four modalities: `text2img`, `img2img`, `img2text`, 
 The default pipeline is auto-detected from the model. No extra flags needed:
 
 ```bash
-vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8000
 ```
 
 Or use the convenience script:
@@ -43,7 +43,7 @@ bash run_server_stage_cli.sh --stage 1
 To use a custom deploy YAML (note: `--stage-configs-path` is deprecated in favor of `--deploy-config`):
 
 ```bash
-vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8000 \
     --deploy-config /path/to/deploy_config.yaml
 ```
 
@@ -54,7 +54,7 @@ See [`bagel.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni
 The DiT stage contains a full LLM, ViT, VAE, and tokenizer, so it can handle all modalities (text2img, img2img, img2text, text2text, think) without a separate Thinker stage:
 
 ```bash
-vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8000 \
     --deploy-config vllm_omni/deploy/bagel_single_stage.yaml
 ```
 
@@ -65,7 +65,7 @@ See [`bagel_single_stage.yaml`](https://github.com/vllm-project/vllm-omni/tree/m
 For larger models or multi-GPU environments, enable TP via CLI:
 
 ```bash
-vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --tensor-parallel-size 2
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8000 --tensor-parallel-size 2
 ```
 
 Or set `tensor_parallel_size` per stage in a custom deploy YAML.
@@ -82,7 +82,7 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
     --port 8000 \
     --stage-id 0 \
     --omni-master-address <ORCHESTRATOR_IP> \
-    --omni-master-port 8091
+    --omni-master-port 8000
 ```
 
 **2. Launch Stage 1 (DiT)** on the remote node in headless mode:
@@ -92,7 +92,7 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
     --stage-id 1 \
     --headless \
     --omni-master-address <ORCHESTRATOR_IP> \
-    --omni-master-port 8091
+    --omni-master-port 8000
 ```
 
 Or use the convenience script:
@@ -152,7 +152,7 @@ python openai_chat_client.py \
 **curl:**
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>A beautiful sunset over mountains<|im_end|>"}]}],
@@ -198,7 +198,7 @@ cat <<EOF > payload.json
 }
 EOF
 
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d @payload.json
 ```
@@ -232,7 +232,7 @@ cat <<EOF > payload.json
 }
 EOF
 
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d @payload.json
 ```
@@ -250,7 +250,7 @@ python openai_chat_client.py \
 **curl:**
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"}]}],
@@ -264,7 +264,7 @@ curl http://localhost:8091/v1/chat/completions \
 | :------- | :------ | :---------- |
 | `--prompt` / `-p` | `A cute cat` | Text prompt |
 | `--output` / `-o` | `bagel_output.png` | Output file path |
-| `--server` / `-s` | `http://localhost:8091` | Server URL |
+| `--server` / `-s` | `http://localhost:8000` | Server URL |
 | `--image-url` / `-i` | `None` | Input image URL or local path (img2img/img2text) |
 | `--modality` / `-m` | `text2img` | `text2img`, `img2img`, `img2text`, `text2text` |
 | `--height` | `512` | Image height in pixels |

@@ -186,7 +186,7 @@ EOF
 )
 
 output=$(curl -sS --retry 3 --retry-delay 3 --retry-connrefused \
-    -X POST http://localhost:8091/v1/chat/completions \
+    -X POST http://localhost:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d "$request_body")
 

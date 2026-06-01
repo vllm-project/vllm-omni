@@ -21,7 +21,7 @@ or `height`. How you pass these extra fields depends on your client.
 Wrap generation parameters inside an `"extra_body"` key in the JSON body:
 
 ```bash
-curl -s http://localhost:8091/v1/chat/completions \
+curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [

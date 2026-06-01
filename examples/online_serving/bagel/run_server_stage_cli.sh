@@ -15,7 +15,7 @@
 set -euo pipefail
 
 MODEL="${MODEL:-ByteDance-Seed/BAGEL-7B-MoT}"
-PORT="${PORT:-8091}"
+PORT="${PORT:-8000}"
 MASTER_ADDRESS="${MASTER_ADDRESS:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-8092}"
 STAGE="all"

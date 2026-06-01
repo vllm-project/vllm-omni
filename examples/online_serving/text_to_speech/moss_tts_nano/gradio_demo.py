@@ -11,7 +11,7 @@ Also supports non-streaming mode (full audio download) via gr.Audio.
 
 Usage:
     # Start the server first (see run_server.sh), then:
-    python gradio_demo.py --api-base http://localhost:8091
+    python gradio_demo.py --api-base http://localhost:8000
 
     # Or use run_gradio_demo.sh to start both server and demo together.
 """
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # MOSS-TTS-Nano outputs 48 kHz stereo (2-channel interleaved).
 PCM_SAMPLE_RATE = 48000
 PCM_CHANNELS = 2
-DEFAULT_API_BASE = "http://localhost:8091"
+DEFAULT_API_BASE = "http://localhost:8000"
 
 # MOSS-TTS-Nano is voice-cloning-only — no built-in presets. Users must
 # upload a reference audio clip + transcript in the UI.

@@ -59,13 +59,13 @@ introducing another heavyweight GPU context in the API server process.
 Start the server:
 
 ```bash
-vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8091
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8000
 ```
 
 Run a sync request with interpolation enabled:
 
 ```bash
-curl -X POST http://localhost:8091/v1/videos/sync \
+curl -X POST http://localhost:8000/v1/videos/sync \
   -F "prompt=A dog running through a park" \
   -F "num_frames=81" \
   -F "width=832" \

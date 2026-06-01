@@ -13,7 +13,7 @@ Each server instance runs a single model (specified at startup via `vllm-omni se
 ```bash
 vllm-omni serve stabilityai/stable-audio-open-1.0 \
     --host 0.0.0.0 \
-    --port 8091 \
+    --port 8000 \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
     --enforce-eager \
@@ -25,7 +25,7 @@ vllm-omni serve stabilityai/stable-audio-open-1.0 \
 **Using curl:**
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "The sound of a cat purring",
@@ -39,7 +39,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 import httpx
 
 response = httpx.post(
-    "http://localhost:8091/v1/audio/generate",
+    "http://localhost:8000/v1/audio/generate",
     json={
         "input": "The sound of a cat purring",
         "audio_length": 10.0,
@@ -100,7 +100,7 @@ Returns binary audio data with the appropriate `Content-Type` header:
 Generate audio with only a text prompt (model defaults for all other parameters):
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "The sound of ocean waves crashing on a beach"
@@ -112,7 +112,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 Specify an explicit audio length in seconds:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "A dog barking",
@@ -125,7 +125,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 Use a negative prompt to steer generation away from undesired characteristics, and increase inference steps for higher quality:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "A piano playing a gentle melody",
@@ -141,7 +141,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 Set a `seed` to get deterministic results across runs:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Thunder and rain sounds",
@@ -155,7 +155,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 Combine all parameters for precise control over generation:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Thunder and rain sounds",
@@ -172,7 +172,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 For faster generation with slightly lower quality:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Birds chirping in a forest",
@@ -187,7 +187,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 import httpx
 
 response = httpx.post(
-    "http://localhost:8091/v1/audio/generate",
+    "http://localhost:8000/v1/audio/generate",
     json={
         "input": "Thunder and rain",
         "audio_length": 15.0,
@@ -302,7 +302,7 @@ The model finished but returned no audio data. Verify the server started success
 
 ```bash
 # Check if the server is healthy
-curl http://localhost:8091/health
+curl http://localhost:8000/health
 ```
 
 ### Audio Quality Issues
@@ -329,7 +329,7 @@ Enable debug logging:
 ```bash
 vllm-omni serve stabilityai/stable-audio-open-1.0 \
     --host 0.0.0.0 \
-    --port 8091 \
+    --port 8000 \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
     --enforce-eager \

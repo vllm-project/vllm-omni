@@ -34,7 +34,7 @@ exercised by repository examples and tests.
 From repository root:
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000
 ```
 
 Notes:
@@ -49,7 +49,7 @@ Notes:
 For advanced customization, pass an overlay YAML:
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
   --deploy-config /path/to/your_qwen3_omni_overrides.yaml
 ```
 
@@ -59,15 +59,15 @@ Prefer CLI overrides for day-to-day tuning:
 
 ```bash
 # Disable async chunking when using /v1/realtime
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
   --no-async-chunk
 
 # Example per-stage tuning in unified launch
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
   --stage-overrides '{"1": {"gpu_memory_utilization": 0.5}}'
 
 # Tune max_num_seqs per stage (single process launch)
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
   --stage-overrides '{
     "0": {"max_num_seqs": 8},
     "1": {"max_num_seqs": 4},
@@ -85,7 +85,7 @@ Default stage-based commands:
 ```bash
 # Stage 0: Thinker + API server
 CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
-  --port 8091 \
+  --port 8000 \
   --stage-id 0 \
   --omni-master-address 127.0.0.1 \
   --omni-master-port 26000 &
@@ -110,7 +110,7 @@ Optional: explicit per-stage `max_num_seqs` tuning:
 ```bash
 # Stage 0
 CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
-  --port 8091 \
+  --port 8000 \
   --stage-id 0 \
   --max-num-seqs 8 \
   --omni-master-address 127.0.0.1 \
@@ -143,14 +143,14 @@ After server startup, run a multimodal example client:
 python examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --query-type use_image \
-  --port 8091 \
+  --port 8000 \
   --host localhost
 ```
 
 Quick API smoke test (text-only output):
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
@@ -166,7 +166,7 @@ together.
 Quick API smoke test (text + audio output):
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
@@ -179,7 +179,7 @@ Realtime WebSocket check (`/v1/realtime`) requires async chunk disabled:
 
 ```bash
 python examples/online_serving/qwen3_omni/openai_realtime_client.py \
-  --url ws://localhost:8091/v1/realtime \
+  --url ws://localhost:8000/v1/realtime \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --input-wav /path/to/input_16k_mono.wav \
   --output-wav realtime_output.wav
@@ -196,7 +196,7 @@ Text-focused random workload:
 vllm bench serve \
   --omni \
   --host localhost \
-  --port 8091 \
+  --port 8000 \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --endpoint /v1/chat/completions \
   --backend openai-chat-omni \
@@ -223,7 +223,7 @@ Synthetic multimodal workload (`random-mm`):
 vllm bench serve \
   --omni \
   --host localhost \
-  --port 8091 \
+  --port 8000 \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --endpoint /v1/chat/completions \
   --backend openai-chat-omni \

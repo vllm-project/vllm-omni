@@ -403,7 +403,7 @@ The WebSocket protocol uses `audio.start` / binary PCM chunks / `audio.done` fra
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --omni \
-  --port 8091
+  --port 8000
 ```
 
 Notes:
@@ -417,7 +417,7 @@ Notes:
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --omni \
-  --port 8091 \
+  --port 8000 \
   --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_omni_moe_async_chunk.yaml
 ```
 

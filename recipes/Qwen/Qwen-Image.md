@@ -48,14 +48,14 @@ with more hardware sections as community validation lands.
 Start the baseline server:
 
 ```bash
-vllm serve Qwen/Qwen-Image --omni --port 8091
+vllm serve Qwen/Qwen-Image --omni --port 8000
 ```
 
 To enable the step-wise runtime without batching:
 
 ```bash
 vllm serve Qwen/Qwen-Image --omni \
-  --port 8091 \
+  --port 8000 \
   --step-execution \
   --max-num-seqs 1
 ```
@@ -64,7 +64,7 @@ To enable experimental compatible-request batching:
 
 ```bash
 vllm serve Qwen/Qwen-Image --omni \
-  --port 8091 \
+  --port 8000 \
   --step-execution \
   --max-num-seqs 8
 ```
@@ -81,7 +81,7 @@ Run the existing client example after the server is ready:
 
 ```bash
 python examples/online_serving/text_to_image/openai_chat_client.py \
-  --server http://localhost:8091 \
+  --server http://localhost:8000 \
   --prompt "A ceramic teapot on a wooden table" \
   --output /tmp/qwen_image_recipe.png
 ```
@@ -89,7 +89,7 @@ python examples/online_serving/text_to_image/openai_chat_client.py \
 For a direct API smoke test:
 
 ```bash
-curl http://localhost:8091/v1/images/generations \
+curl http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen-Image",

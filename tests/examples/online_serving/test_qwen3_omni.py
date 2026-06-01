@@ -34,7 +34,7 @@ stage_configs = [get_deploy_config_path("ci/qwen3_omni_moe.yaml")]
 example_dir = str(Path(__file__).parent.parent.parent.parent / "examples" / "online_serving")
 # Create parameter combinations for model and stage config
 test_params = [
-    OmniServerParams(model=model, port=8091, stage_config_path=stage_config)
+    OmniServerParams(model=model, port=8000, stage_config_path=stage_config)
     for model in models
     for stage_config in stage_configs
 ]

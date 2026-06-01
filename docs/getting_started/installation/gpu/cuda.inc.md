@@ -100,10 +100,10 @@ Here's an example deployment command that has been verified on 2 x H100's:
 docker run --runtime nvidia --gpus 2 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=$HF_TOKEN" \
-    -p 8091:8091 \
+    -p 8000:8000 \
     --ipc=host \
     vllm/vllm-omni:v0.22.0 \
-    vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+    vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000
 ```
 
 !!! tip

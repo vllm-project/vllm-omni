@@ -15,7 +15,7 @@ export MIMO_AUDIO_TOKENIZER_PATH="XiaomiMiMo/MiMo-Audio-Tokenizer"
 
 vllm serve XiaomiMiMo/MiMo-Audio-7B-Instruct --omni \
     --served-model-name "MiMo-Audio-7B-Instruct" \
-    --port 18091 \
+    --port 8000 \
     --chat-template ./examples/online_serving/mimo_audio/chat_template.jinja
 ```
 > ⚠️ **Important**  

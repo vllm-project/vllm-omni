@@ -9,7 +9,7 @@ Please refer to [README.md](../../../README.md)
 ### Launch the Server
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000
 ```
 
 The default deployment configuration, situated at `vllm_omni/deploy/qwen3_omni_moe.yaml`, is resolved and loaded
@@ -20,7 +20,7 @@ Additionally, NPU, ROCm, and XPU per-platform configuration deltas are determini
 
 To explicitly utilize a custom deployment YAML, mandate the configuration path accordingly:
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --deploy-config /path/to/your_deploy_config.yaml
 ```
 
@@ -28,7 +28,7 @@ For the bundled 3x-GPU multi-replica layout (talker/code2wav scale-out),
 use:
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --deploy-config vllm_omni/deploy/qwen3_omni_moe_multi_replicas.yaml
 ```
 
@@ -42,7 +42,7 @@ The example below pins Stage 0 to GPU 0 and Stage 1/2 to GPU 1 via
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
-    --port 8091 \
+    --port 8000 \
     --stage-id 0 \
     --omni-master-address 127.0.0.1 \
     --omni-master-port 26000
@@ -75,7 +75,7 @@ For standard **unified-process** launcher, stage-specific CLI configuration tuni
 via the `--stage-overrides` directive, as demonstrated below:
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --stage-overrides '{"1": {"gpu_memory_utilization": 0.5}}'
 ```
 
@@ -102,27 +102,27 @@ editing the YAML. There are three layers, in increasing specificity:
 
 ```bash
 # Tighter memory budget on a smaller GPU
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --gpu-memory-utilization 0.85
 
 # Disable cudagraphs (e.g. for debugging)
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --enforce-eager
 
 # Reduce context length
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --max-model-len 32768
 
 # Toggle prefix caching on every stage (yaml default: off)
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --enable-prefix-caching
 # ...or force it off if the yaml turned it on
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --no-enable-prefix-caching
 
 # Toggle pipeline-wide async chunked streaming between stages
 # (yaml default for qwen3_omni_moe: on)
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --no-async-chunk
 ```
 
@@ -149,7 +149,7 @@ parser defaults). If you don't pass a flag, the YAML value wins.
 
 ```bash
 # Lower stage 1's memory budget; leave others at the YAML default
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --stage-overrides '{
         "1": {"gpu_memory_utilization": 0.5},
         "2": {"max_num_batched_tokens": 65536}
@@ -244,7 +244,7 @@ cd examples/online_serving/qwen3_omni
 ####  Send request via python
 
 ```bash
-python examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --query-type use_image --port 8091 --host "localhost"
+python examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --query-type use_image --port 8000 --host "localhost"
 ```
 
 #### Realtime WebSocket client (`openai_realtime_client.py`)
@@ -263,7 +263,7 @@ pip install websockets
 
 ```bash
 python openai_realtime_client.py \
-  --url ws://localhost:8091/v1/realtime \
+  --url ws://localhost:8000/v1/realtime \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --input-wav /path/to/input_16k_mono.wav \
   --output-wav realtime_output.wav \
@@ -274,7 +274,7 @@ python openai_realtime_client.py \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--url` | `ws://localhost:8091/v1/realtime` | Full WebSocket URL including path |
+| `--url` | `ws://localhost:8000/v1/realtime` | Full WebSocket URL including path |
 | `--model` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | Must match the served model (sent in `session.update`) |
 | `--input-wav` | *(required)* | Input WAV: mono, 16-bit PCM, **16 kHz** |
 | `--output-wav` | `realtime_output.wav` | Output path for concatenated reply audio |
@@ -288,7 +288,7 @@ python openai_realtime_client.py \
 Ensure the server is running, for example:
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000
 ```
 
 The Python client supports the following command-line arguments:
@@ -338,7 +338,7 @@ You can control output modalities to specify which types of output the model sho
 #### Text only
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
@@ -350,7 +350,7 @@ curl http://localhost:8091/v1/chat/completions \
 #### Text + Audio
 
 ```bash
-curl -s http://localhost:8091/v1/chat/completions \
+curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
@@ -375,7 +375,7 @@ python examples/online_serving/openai_chat_completion_client_for_multimodal_gene
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
     model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
@@ -391,7 +391,7 @@ print(response.choices[0].message.content)
 import base64
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
     model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
@@ -416,7 +416,7 @@ When requesting audio output, you can choose the TTS speaker (voice) used for sy
 Pass a `speaker` field in the request body:
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
@@ -445,7 +445,7 @@ Pass `speaker` in `extra_body`:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
     model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
@@ -481,7 +481,7 @@ The Gradio demo connects to a vLLM API server. You have two options:
 The convenience script launches both the vLLM server and Gradio demo together:
 
 ```bash
-./run_gradio_demo.sh --model Qwen/Qwen3-Omni-30B-A3B-Instruct --server-port 8091 --gradio-port 7861
+./run_gradio_demo.sh --model Qwen/Qwen3-Omni-30B-A3B-Instruct --server-port 8000 --gradio-port 7861
 ```
 
 This script will:
@@ -492,7 +492,7 @@ This script will:
 
 The script supports the following arguments:
 - `--model`: Model name/path (default: Qwen/Qwen3-Omni-30B-A3B-Instruct)
-- `--server-port`: Port for vLLM server (default: 8091)
+- `--server-port`: Port for vLLM server (default: 8000)
 - `--gradio-port`: Port for Gradio demo (default: 7861)
 - `--deploy-config`: Path to custom deploy config YAML file (optional)
 - `--server-host`: Host for vLLM server (default: 0.0.0.0)
@@ -504,12 +504,12 @@ The script supports the following arguments:
 **Step 1: Launch the vLLM API server**
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000
 ```
 
 If you have custom stage configs file:
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --deploy-config /path/to/deploy_config_file
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 --deploy-config /path/to/deploy_config_file
 ```
 
 **Step 2: Run the Gradio demo**
@@ -517,7 +517,7 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --deploy-config /
 In a separate terminal:
 
 ```bash
-python gradio_demo.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --api-base http://localhost:8091/v1 --port 7861
+python gradio_demo.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --api-base http://localhost:8000/v1 --port 7861
 ```
 
 Then open `http://localhost:7861/` on your local browser to interact with the web UI.
@@ -525,7 +525,7 @@ Then open `http://localhost:7861/` on your local browser to interact with the we
 The gradio script supports the following arguments:
 
 - `--model`: Model name/path (should match the server model)
-- `--api-base`: Base URL for the vLLM API server (default: http://localhost:8091/v1)
+- `--api-base`: Base URL for the vLLM API server (default: http://localhost:8000/v1)
 - `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
 - `--port`: Port for Gradio server (default: 7861)
 - `--share`: Share the Gradio demo publicly (creates a public link)

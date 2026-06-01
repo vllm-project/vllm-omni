@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Server port
-PORT="${PORT:-8091}"
+PORT="${PORT:-8000}"
 # Default query type
 QUERY_TYPE="${1:-text}"
 

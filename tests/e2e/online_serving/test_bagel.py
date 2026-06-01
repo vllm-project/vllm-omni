@@ -8,7 +8,7 @@ This test validates that the Bagel model can serve image generation requests
 via the OpenAI-compatible chat completions API.
 
 Equivalent to running:
-    vllm-omni serve "ByteDance-Seed/BAGEL-7B-MoT" --omni --port 8091
+    vllm-omni serve "ByteDance-Seed/BAGEL-7B-MoT" --omni --port 8000
 
     # text2img
     python3 examples/online_serving/bagel/openai_chat_client.py \\
