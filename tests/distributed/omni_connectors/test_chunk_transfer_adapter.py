@@ -37,6 +37,7 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
         status=status,
         prompt_token_ids=[],
         num_computed_tokens=0,
+        num_output_placeholders=0,
         additional_information=None,
         is_finished=lambda: status == RequestStatus.FINISHED_STOPPED,
     )
@@ -44,9 +45,16 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
 
 @pytest.fixture
 def build_adapter(monkeypatch, mocker: MockerFixture):
-    def _build(*, stage_id: int = 1, model_mode: str = "ar", max_num_seqs: int = 2):
+    def _build(
+        *,
+        stage_id: int = 1,
+        model_mode: str = "ar",
+        max_num_seqs: int = 2,
+        connector_extra: dict | None = None,
+    ):
         connector = mocker.MagicMock()
         connector.stage_id = stage_id
+        connector.config = {"extra": connector_extra or {}}
         connector.get.return_value = None
         connector.put.return_value = (True, 1, {})
 
@@ -127,6 +135,61 @@ def test_load_poll(build_adapter):
     assert "req-1" not in adapter._pending_load_reqs
 
 
+def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="generation")
+    request = _req("req-tensor", RequestStatus.WAITING, external_req_id="external-tensor")
+
+    codes = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
+    payload: OmniPayload = {
+        "codes": {"audio": codes},
+        "meta": {
+            "left_context_size": 1,
+            "finished": torch.tensor(False, dtype=torch.bool),
+        },
+    }
+    connector.get.return_value = (payload, 16)
+
+    adapter._poll_single_request(request)
+
+    assert request.prompt_token_ids == [0]
+    assert request.num_computed_tokens == 0
+    assert torch.equal(request.additional_information["codes"]["audio"], codes)
+    assert request.additional_information["meta"]["left_context_size"] == 1
+    assert "finished" not in request.additional_information["meta"]
+    assert "req-tensor" in adapter._finished_load_reqs
+
+
+def test_load_poll_generation_empty_nonterminal_chunk_keeps_polling(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="generation")
+    request = _req("req-empty-tensor", RequestStatus.WAITING, external_req_id="external-empty")
+
+    empty_payload: OmniPayload = {
+        "codes": {"audio": torch.empty((4, 0), dtype=torch.long)},
+        "meta": {
+            "left_context_size": 0,
+            "finished": torch.tensor(False, dtype=torch.bool),
+        },
+    }
+    ready_payload: OmniPayload = {
+        "codes": {"audio": torch.tensor([[1, 2]], dtype=torch.long)},
+        "meta": {
+            "left_context_size": 0,
+            "finished": torch.tensor(False, dtype=torch.bool),
+        },
+    }
+    connector.get.side_effect = [(empty_payload, 16), (ready_payload, 16)]
+
+    assert adapter._poll_single_request(request) is False
+    assert request.request_id not in adapter._finished_load_reqs
+    assert request.request_id not in adapter.requests_with_ready_chunks
+    assert adapter.get_req_chunk[request.request_id] == 1
+
+    assert adapter._poll_single_request(request) is True
+    assert request.request_id in adapter._finished_load_reqs
+    assert torch.equal(request.additional_information["codes"]["audio"], ready_payload["codes"]["audio"])
+    assert adapter.get_req_chunk[request.request_id] == 2
+
+
 def test_save_async(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
@@ -138,6 +201,18 @@ def test_save_async(build_adapter):
 
     task = adapter._pending_save_reqs.popleft()
     assert task["is_finished"] is False
+
+
+def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-async", RequestStatus.WAITING, external_req_id="external-async")
+    request.num_computed_tokens = 10
+    request.num_output_placeholders = 2
+
+    adapter.save_async(pooling_output=None, request=request)
+
+    assert adapter.requests_num_chunks_sent["external-async"] == 8
+    assert len(adapter._pending_save_reqs) == 1
 
 
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):
@@ -155,9 +230,11 @@ def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, m
     cleanup_calls = []
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
 
-    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": False})
+    adapter._send_single_request(
+        {"pooling_output": None, "request": request, "is_finished": False, "is_segment_finished": False}
+    )
 
-    assert cleanup_calls == []  # no terminal cleanup; meta.finished is unobservable
+    assert cleanup_calls == []  # no terminal cleanup; meta.finished is false
 
 
 def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatch):
@@ -173,12 +250,50 @@ def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatc
     adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
 
-    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": False})
+    adapter._send_single_request(
+        {"pooling_output": None, "request": request, "is_finished": False, "is_segment_finished": False}
+    )
 
     assert connector.put.called
     sent_payload = connector.put.call_args.kwargs["data"]
     assert isinstance(sent_payload, OmniPayloadStruct)
-    assert sent_payload.meta is None  # confirms it's the empty struct on the wire
+    assert sent_payload.meta.finished.item() is False
+    assert sent_payload.meta.is_segment_finished.item() is False
+
+
+def test_send_single_request_struct_preserves_segment_finished(build_adapter, monkeypatch):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-segment", RequestStatus.WAITING, external_req_id="ext-segment")
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {"pooling_output": None, "request": request, "is_finished": False, "is_segment_finished": True}
+    )
+
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.meta.finished.item() is False
+    assert sent_payload.meta.is_segment_finished.item() is True
+
+
+def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+    request.resumable = True
+    request.num_computed_tokens = 0
+    adapter.requests_num_chunks_sent["ext-stream"] = 111
+
+    adapter.save_async(pooling_output=None, request=request, is_segment_finished=False)
+
+    assert len(adapter._pending_save_reqs) == 0
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 111
+
+    adapter.requests_num_chunks_sent.pop("ext-stream")
+    adapter.save_async(pooling_output=None, request=request, is_segment_finished=False)
+
+    assert len(adapter._pending_save_reqs) == 1
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 0
 
 
 def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):
@@ -191,7 +306,9 @@ def test_send_single_request_cleans_up_after_finished_payload(build_adapter, mon
     cleanup_calls = []
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
 
-    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": True})
+    adapter._send_single_request(
+        {"pooling_output": None, "request": request, "is_finished": True, "is_segment_finished": True}
+    )
 
     assert len(cleanup_calls) == 1
     args, _ = cleanup_calls[0]
@@ -456,6 +573,52 @@ def test_finish_requests_restores_status(build_adapter):
 
     assert request.status == prior
     assert req_id not in adapter.requests_origin_status
+
+
+def test_finish_requests_removes_zombies_from_chunk_waiting_deques(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    zombie = _req("req-zombie", RequestStatus.WAITING_FOR_CHUNK)
+    other = _req("req-live", RequestStatus.WAITING_FOR_CHUNK)
+    adapter.waiting_for_chunk_waiting_requests = deque([zombie, other])
+    adapter.waiting_for_chunk_running_requests = deque([other, zombie])
+    adapter.requests_with_ready_chunks.add("req-zombie")
+    adapter.finished_requests.add("req-zombie")
+    requests_map = {
+        "req-zombie": zombie,
+        "req-live": other,
+    }
+
+    adapter.finish_requests(
+        ["req-zombie"],
+        RequestStatus.FINISHED_ABORTED,
+        requests_map,
+    )
+
+    assert [req.request_id for req in adapter.waiting_for_chunk_waiting_requests] == ["req-live"]
+    assert [req.request_id for req in adapter.waiting_for_chunk_running_requests] == ["req-live"]
+    assert "req-zombie" not in adapter.requests_with_ready_chunks
+    assert "req-zombie" not in adapter.finished_requests
+
+
+def test_restore_queues_skips_requests_missing_from_scheduler_requests(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    zombie = _req("req-zombie", RequestStatus.WAITING_FOR_CHUNK)
+    live = _req("req-live", RequestStatus.WAITING_FOR_CHUNK)
+    waiting_queue = DummyWaitingQueue()
+    running_queue = []
+    adapter.waiting_for_chunk_waiting_requests = deque([zombie, live])
+    adapter.waiting_for_chunk_running_requests = deque([zombie, live])
+
+    adapter.restore_queues(
+        waiting_queue,
+        running_queue,
+        scheduler_requests={"req-live": live},
+    )
+
+    assert [req.request_id for req in waiting_queue] == ["req-live"]
+    assert [req.request_id for req in running_queue] == ["req-live"]
+    assert not adapter.waiting_for_chunk_waiting_requests
+    assert not adapter.waiting_for_chunk_running_requests
 
 
 # ---------------------------------------------------------------

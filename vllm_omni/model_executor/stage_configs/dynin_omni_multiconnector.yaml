@@ -6,6 +6,7 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: token2text
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.dynin_omni.token2text_to_token2image_full_payload
       model_arch: DyninOmniForConditionalGeneration
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler

@@ -17,7 +17,6 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 from vllm.logger import init_logger
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -44,6 +43,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
@@ -716,15 +716,17 @@ class QwenImageTransformerBlock(nn.Module):
         self.attention_head_dim = attention_head_dim
 
         # Image processing modules.
-        # Modulation linear is kept full precision (quant_config=None) — it
+        # Modulation linear is kept unquantized (quant_config=None) — it
         # produces shift/scale/gate values that are precision-sensitive
-        # (see #2728).
+        # (see #2728). Use column TP with gather_output=True so weights are
+        # sharded while downstream modulation still receives full [B, 6 * dim].
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            ColumnParallelLinear(
                 dim,
                 6 * dim,
                 bias=True,
+                gather_output=True,
                 return_bias=False,
                 quant_config=None,
                 prefix=_join_prefix(prefix, "img_mod.1"),
@@ -751,10 +753,11 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules.
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            ColumnParallelLinear(
                 dim,
                 6 * dim,
                 bias=True,
+                gather_output=True,
                 return_bias=False,
                 quant_config=None,
                 prefix=_join_prefix(prefix, "txt_mod.1"),

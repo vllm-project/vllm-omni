@@ -1,10 +1,10 @@
 [
     {
-        "test_name": "test_qwen_image_edit_2509_single_device",
+        "test_name": "test_qwen_image_edit_2511_single_device",
         "description": "Single-device baseline (two input images)",
         "server_type": "vllm-omni",
         "server_params": {
-            "model": "Qwen/Qwen-Image-Edit-2509",
+            "model": "Qwen/Qwen-Image-Edit-2511",
             "serve_args": {
                 "enable-diffusion-pipeline-profiler": true
             }
@@ -49,11 +49,11 @@
         ]
     },
     {
-        "test_name": "test_qwen_image_edit_2509_ulysses2_cfg2_vae_patch4",
+        "test_name": "test_qwen_image_edit_2511_ulysses2_cfg2_vae_patch4",
         "description": "Ulysses SP=2 + CFG=2 + VAE patch parallel=4",
         "server_type": "vllm-omni",
         "server_params": {
-            "model": "Qwen/Qwen-Image-Edit-2509",
+            "model": "Qwen/Qwen-Image-Edit-2511",
             "serve_args": {
                 "ulysses-degree": 2,
                 "cfg-parallel-size": 2,
@@ -63,24 +63,6 @@
             }
         },
         "benchmark_params": [
-            {
-                "name": "512x512_steps20_i2i_2img",
-                "dataset": "random",
-                "task": "i2i",
-                "width": 512,
-                "height": 512,
-                "num-inference-steps": 20,
-                "num-prompts": 10,
-                "max-concurrency": 1,
-                "num-input-images": 2,
-                "enable-negative-prompt": true,
-                "baseline": {
-                    "throughput_qps": 0.15,
-                    "latency_mean": 10,
-                    "peak_memory_mb_max": 55000,
-                    "peak_memory_mb_mean": 55000
-                }
-            },
             {
                 "name": "1536x1536_steps35_i2i_2img",
                 "dataset": "random",
@@ -102,11 +84,11 @@
         ]
     },
     {
-        "test_name": "test_qwen_image_edit_2509_ulysses2_cfg2_cache_dit",
+        "test_name": "test_qwen_image_edit_2511_ulysses2_cfg2_cache_dit",
         "description": "Ulysses SP=2 + CFG=2 + CacheDiT",
         "server_type": "vllm-omni",
         "server_params": {
-            "model": "Qwen/Qwen-Image-Edit-2509",
+            "model": "Qwen/Qwen-Image-Edit-2511",
             "serve_args": {
                 "ulysses-degree": 2,
                 "cfg-parallel-size": 2,

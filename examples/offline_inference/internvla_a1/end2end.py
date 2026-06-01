@@ -127,7 +127,12 @@ def run_one_path(
             ),
             args.device,
         )
-        pred = run_pipeline_forward(pipeline, batch_inputs, noise)
+        pred = run_pipeline_forward(
+            pipeline,
+            batch_inputs,
+            noise,
+            request_id=f"internvla-a1-sample-{index}",
+        )
         pred = pred[:, :, : dataset.physical_action_dim].to(torch.float32).cpu()
         results.append(
             {
@@ -150,6 +155,7 @@ def run_pipeline_forward(
     pipeline,
     batch_inputs: dict[str, torch.Tensor],
     noise: torch.Tensor,
+    request_id: str,
 ) -> torch.Tensor:
     output = pipeline.forward(
         OmniDiffusionRequest(
@@ -161,6 +167,7 @@ def run_pipeline_forward(
                     "decode_image": False,
                 }
             ),
+            request_id=request_id,
         )
     )
     if output.error:
@@ -212,23 +219,38 @@ def benchmark_forward(
 
     _synchronize(args.device)
     cold_start_begin = time.perf_counter()
-    pred = run_pipeline_forward(pipeline, batch_inputs, noise)
+    pred = run_pipeline_forward(
+        pipeline,
+        batch_inputs,
+        noise,
+        request_id=f"internvla-a1-benchmark-{index}-cold",
+    )
     _synchronize(args.device)
     cold_start_ms = (time.perf_counter() - cold_start_begin) * 1000.0
 
     warmup_ms: list[float] = []
-    for _ in range(args.warmup_iters):
+    for iter_idx in range(args.warmup_iters):
         _synchronize(args.device)
         begin = time.perf_counter()
-        _ = run_pipeline_forward(pipeline, batch_inputs, noise)
+        _ = run_pipeline_forward(
+            pipeline,
+            batch_inputs,
+            noise,
+            request_id=f"internvla-a1-benchmark-{index}-warmup-{iter_idx}",
+        )
         _synchronize(args.device)
         warmup_ms.append((time.perf_counter() - begin) * 1000.0)
 
     benchmark_ms: list[float] = []
-    for _ in range(args.benchmark_iters):
+    for iter_idx in range(args.benchmark_iters):
         _synchronize(args.device)
         begin = time.perf_counter()
-        _ = run_pipeline_forward(pipeline, batch_inputs, noise)
+        _ = run_pipeline_forward(
+            pipeline,
+            batch_inputs,
+            noise,
+            request_id=f"internvla-a1-benchmark-{index}-iter-{iter_idx}",
+        )
         _synchronize(args.device)
         benchmark_ms.append((time.perf_counter() - begin) * 1000.0)
 
@@ -295,7 +317,12 @@ def main() -> None:
             dataset=dataset,
             train_meta=train_meta,
             collate_samples=collate_open_loop_samples,
-            run_sample_actions=lambda policy, batch_inputs, noise: run_pipeline_forward(policy, batch_inputs, noise),
+            run_sample_actions=lambda policy, batch_inputs, noise: run_pipeline_forward(
+                policy,
+                batch_inputs,
+                noise,
+                request_id="internvla-a1-open-loop",
+            ),
             num_episodes=args.num_episodes,
             seed=args.seed,
             device=args.device,

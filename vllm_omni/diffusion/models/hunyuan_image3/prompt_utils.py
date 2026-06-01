@@ -146,6 +146,7 @@ def resolve_stop_token_ids(
     task: str = "it2i",
     bot_task: str | None | _DefaultBotTask = _DEFAULT_BOT_TASK,
     tokenizer: Any | None = None,
+    image_size: str | None = None,
 ) -> list[int]:
     """AR stop-token ids for a given (task, bot_task) generation request.
 
@@ -171,6 +172,14 @@ def resolve_stop_token_ids(
     if bot_task not in _BOT_TASK_PRESETS:
         raise ValueError(f"Unknown bot_task {bot_task!r}. Choose from: {available_bot_tasks()}")
     if task in ("it2i", "t2i"):
+        need_ratio = image_size is None or image_size == "auto"
+        if not need_ratio:
+            end_of_think_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"]
+            end_of_recaption_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"]
+            if bot_task in ("think_recaption", "recaption"):
+                return [end_of_recaption_id]
+            if bot_task == "think":
+                return [end_of_think_id, end_of_recaption_id]
         # Main ratio range: <img_ratio_0> .. <img_ratio_32>.
         start = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_0>"]
         end = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_32>"]
@@ -219,7 +228,7 @@ def build_prompt(
     effective_sys_type = sys_type or preset_sys_type
 
     system_prompt = get_system_prompt(effective_sys_type, bot_task, custom_system_prompt)
-    sys_text = system_prompt or ""
+    sys_text = system_prompt.strip() if system_prompt is not None else ""
 
     has_image_input = task in ("i2t", "it2i")
     if has_image_input:
@@ -288,7 +297,7 @@ def build_prompt_tokens(
         )
 
     system_prompt = get_system_prompt(effective_sys_type, bot_task, custom_system_prompt)
-    sys_text = system_prompt or ""
+    sys_text = system_prompt.strip() if system_prompt is not None else ""
 
     ids: list[int] = [bos_id]
     if sys_text:

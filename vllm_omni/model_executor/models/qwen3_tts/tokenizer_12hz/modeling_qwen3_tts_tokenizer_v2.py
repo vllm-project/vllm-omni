@@ -13,6 +13,7 @@
 # limitations under the License.
 """PyTorch Qwen3TTSTokenizerV2 model."""
 
+import inspect
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -565,12 +566,17 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
             # Prepare mask arguments
             mask_kwargs = {
                 "config": self.config,
-                "input_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
+            # Handle API changes across transformers versions
+            sig = inspect.signature(create_causal_mask)
+            if "input_embeds" in sig.parameters:
+                mask_kwargs["input_embeds"] = inputs_embeds
+                mask_kwargs["cache_position"] = cache_position
+            else:
+                mask_kwargs["inputs_embeds"] = inputs_embeds
             # Create the masks
             causal_mask_mapping = {
                 "full_attention": create_causal_mask(**mask_kwargs),
