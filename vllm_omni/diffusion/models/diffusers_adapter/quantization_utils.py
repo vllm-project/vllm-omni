@@ -182,9 +182,7 @@ def _build_torchao_pipeline_quant_config(
 
 def _get_diffusers_transformer_components(component_names: dict[str, Any]) -> list[str]:
     transformer_components = [
-        component_name
-        for component_name in component_names
-        if component_name in _DIFFUSERS_TRANSFORMER_COMPONENTS
+        component_name for component_name in component_names if component_name in _DIFFUSERS_TRANSFORMER_COMPONENTS
     ]
     if transformer_components:
         return transformer_components
