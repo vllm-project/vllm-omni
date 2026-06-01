@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from:
+# https://huggingface.co/openbmb/MiniCPM-o-4_5/blob/main/modeling_minicpmo.py
+#
 # Copyright 2025 The OpenBMB Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

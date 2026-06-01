@@ -1,3 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Stage input processor for MiniCPM-o 4.5: Thinker (LLM) -> Talker (TTS).
+
+This is the original vLLM-Omni bridge: it converts the thinker stage's
+hidden states + token ids into the talker stage's prompt payload. The
+talker model itself is adapted from openbmb/MiniCPM-o-4_5 (see the headers
+on vllm_omni/model_executor/models/minicpmo_4_5/*.py).
+"""
+
 from typing import Any
 
 import torch
