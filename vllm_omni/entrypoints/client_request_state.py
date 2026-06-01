@@ -19,7 +19,7 @@ class ClientRequestState:
         self.metrics: OrchestratorAggregator | None = None
         # Wall-clock time at which the user's request arrived in the engine
         # entrypoint. Set in async_omni.generate() before the orchestrator
-        # accepts the request. Used as the "起算" anchor for audio_ttfp.
+        # accepts the request. Used as the t0 anchor for audio_ttfp.
         self.request_arrival_ts: float = 0.0
         # Wall-clock time at which the first audio packet was observed for
         # this request. None means the streaming hook hasn't fired yet.
