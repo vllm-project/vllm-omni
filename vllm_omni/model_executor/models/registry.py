@@ -250,6 +250,22 @@ _OMNI_MODELS = {
         "ming_flash_omni",
         "MingFlashOmniForConditionalGeneration",
     ),
+    # MiniCPM-o 4.5 Omni models
+    "MiniCPMO45OmniForConditionalGeneration": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni",
+        "MiniCPMO45OmniForConditionalGeneration",
+    ),
+    "MiniCPMO45OmniLLMForConditionalGeneration": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni_llm",
+        "MiniCPMO45OmniLLMForConditionalGeneration",
+    ),
+    "MiniCPMO45OmniTTSForConditionalGeneration": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni_tts",
+        "MiniCPMO45OmniTTSForConditionalGeneration",
+    ),
 }
 
 
