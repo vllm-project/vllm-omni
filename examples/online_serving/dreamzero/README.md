@@ -27,6 +27,19 @@ vllm serve GEAR-Dreams/DreamZero-DROID --omni --port 8000 \
 
 Override `MODEL`, `PORT`, `HOST`, `DEPLOY_CONFIG`, or `SERVED_MODEL_NAME` through the script environment if needed.
 
+### Install example dependencies
+
+The core `pip install -e .` setup does not include the extra packages used by the DreamZero example scripts.
+
+- `openpi_client.py`:
+  `openpi-client`, `websockets`, `opencv-python`
+- `droid_sim_eval_client.py`:
+  `mediapy`, `websockets`, `openpi-client`
+
+The DROID sim-eval script also needs an Isaac Lab environment that provides `isaaclab`, `isaaclab_tasks`, `sim_evals`, and `gymnasium`.
+
+If you run the DROID client on Python < 3.12, also install `typing-extensions`.
+
 ### Configure TP and CFG parallelism
 
 The bundled DreamZero configs intentionally keep only:
