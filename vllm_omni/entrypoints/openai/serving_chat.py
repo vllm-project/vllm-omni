@@ -1619,16 +1619,26 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # Observe audio_ttfp_s on first audio packet for this request_id
                     # (once-per-request guard via first_audio_ts). The same hook
                     # also captures (stage, replica) for the streaming-continuity
-                    # emit at request finalize.
-                    req_state = self.engine_client.request_states.get(request_id)
+                    # emit at request finalize. self.engine_client.request_states
+                    # is keyed by the internal UUID-suffixed id (set by
+                    # AsyncOmni.generate via _get_unique_request_id), but the
+                    # `request_id` we have here is the external (user-visible) id,
+                    # so resolve via the external_request_id field.
+                    req_state = next(
+                        (s for s in self.engine_client.request_states.values() if s.external_request_id == request_id),
+                        None,
+                    )
                     if req_state is not None and req_state_audio_ref is None:
                         req_state_audio_ref = req_state
                     now_ts = time.time()
                     if req_state is not None and req_state.first_audio_ts is None:
                         req_state.first_audio_ts = now_ts
                         stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
+                        # The orchestrator binds requests by their internal id,
+                        # not the user-visible external id, so look up the
+                        # replica with req_state.request_id (internal).
                         replica_id = (
-                            stage_pools[omni_res.stage_id].get_bound_replica_id(request_id)
+                            stage_pools[omni_res.stage_id].get_bound_replica_id(req_state.request_id)
                             if stage_pools is not None and 0 <= omni_res.stage_id < len(stage_pools)
                             else None
                         )
