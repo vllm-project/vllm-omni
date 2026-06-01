@@ -53,7 +53,7 @@ python examples/offline_inference/ming_flash_omni/end2end.py \
     --image-path ./3_0.png
 ```
 
-### Omni-Speech (Thinker + Talker)
+### Omni-Speech (Thinker + Talker) {#omni-speech-thinker--talker}
 
 The default deploy YAML already runs thinker+talker, so spoken output only requires requesting `audio` (or `text,audio`) modalities.
 The thinker processes your multimodal input, generates text, then the talker synthesises the response as speech.
