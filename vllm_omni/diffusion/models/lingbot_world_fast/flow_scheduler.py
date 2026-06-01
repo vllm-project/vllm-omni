@@ -37,9 +37,7 @@ class LingbotFlowScheduler:
 
         if chunk_step + 1 < self.timesteps.shape[0] - 1:
             next_t = self.timesteps[chunk_step + 1]
-            noise = torch.randn(
-                x0.shape, generator=generator, device=x0.device, dtype=x0.dtype
-            )
+            noise = torch.randn(x0.shape, generator=generator, device=x0.device, dtype=x0.dtype)
             return (self._inner.add_noise(x0, noise, next_t),)
         return (x0,)
 

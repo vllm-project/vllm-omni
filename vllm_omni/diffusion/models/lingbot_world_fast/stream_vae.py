@@ -68,9 +68,7 @@ class StreamVAE:
     def _encode_group(self, pixels: torch.Tensor) -> torch.Tensor:
         """One ``(1|4)``-frame encoder pass using the live ``_enc_feat_map``."""
         self._model._enc_conv_idx = [0]
-        return self._model.encoder(
-            pixels, feat_cache=self._model._enc_feat_map, feat_idx=self._model._enc_conv_idx
-        )
+        return self._model.encoder(pixels, feat_cache=self._model._enc_feat_map, feat_idx=self._model._enc_conv_idx)
 
     def _apply_conv1_and_normalize(self, out: torch.Tensor) -> torch.Tensor:
         mu, _ = self._model.conv1(out).chunk(2, dim=1)

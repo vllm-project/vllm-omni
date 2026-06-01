@@ -55,13 +55,8 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
-from vllm.entrypoints.openai.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
-from vllm.entrypoints.openai.speech_to_text.serving import (
-    OpenAIServingTranscription,
-    OpenAIServingTranslation,
-)
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
@@ -74,6 +69,13 @@ from vllm.entrypoints.serve.disagg.serving import ServingTokens
 from vllm.entrypoints.serve.instrumentator.basic import base
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
+from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
+from vllm.entrypoints.speech_to_text.transcription.serving import (
+    OpenAIServingTranscription,
+)
+from vllm.entrypoints.speech_to_text.translation.serving import (
+    OpenAIServingTranslation,
+)
 from vllm.entrypoints.utils import (
     create_error_response,
     load_aware_call,
@@ -92,6 +94,7 @@ from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
     encode_image_base64,
+    encode_image_base64_with_compression,
     parse_size,
     validate_layered_layers,
 )
@@ -131,6 +134,7 @@ from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
+from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
@@ -355,7 +359,7 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     warnings_module.filterwarnings("ignore", message=".*PydanticSerializationUnexpectedValue.*", category=UserWarning)
 
     # Add process-specific prefix to stdout and stderr.
-    decorate_logs("APIServer")
+    decorate_logs("APIServer", skip_if_decorated=True)
 
     listen_address, sock = setup_openai_server(args)
 
@@ -636,6 +640,10 @@ async def omni_init_app_state(
         )
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
+        state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
+            engine_client=engine_client,
+            model_name=model_name,
+        )
 
         state.openai_serving_world_camera = ServingRealtimeWorldCamera.create_policy_server(
             engine_client=engine_client, model_name=model_name
@@ -654,6 +662,19 @@ async def omni_init_app_state(
             logger.warning("vllm_config is None, some features may not work correctly")
 
     state.vllm_config = vllm_config
+
+    # Propagate enable_in_reasoning to the API-server process. The engine core
+    # runs in a separate process, so the contextvar that backs
+    # `get_current_vllm_config_or_none()` is None on this stack. Tool parsers
+    # call `get_enable_structured_outputs_in_reasoning()` during request
+    # handling and need to see the real flag, otherwise they silently fall
+    # back to False and mismatch the engine-side bitmask gating.
+    if vllm_config is not None:
+        from vllm.tool_parsers.structural_tag_registry import (
+            set_enable_structured_outputs_in_reasoning,
+        )
+
+        set_enable_structured_outputs_in_reasoning(vllm_config.structured_outputs_config.enable_in_reasoning)
 
     # Get supported tasks
     supported_tasks: set[str] = {"generate"}
@@ -957,6 +978,7 @@ async def omni_init_app_state(
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
     )
+    state.openai_serving_realtime_robot = None
 
     state.openai_serving_world_camera = ServingRealtimeWorldCamera.create_policy_server(
         engine_client=engine_client, model_name=model_name
@@ -1394,22 +1416,6 @@ async def streaming_video_chat(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
-    engine_client = getattr(websocket.app.state, "engine_client", None)
-    if engine_client is not None and getattr(engine_client, "async_chunk", False):
-        await websocket.accept()
-        await websocket.send_json(
-            {
-                "type": "error",
-                "error": (
-                    "The /v1/realtime API is not supported when async_chunk is enabled on the server. "
-                    "Use a stage configuration with async_chunk disabled and restart the server before using "
-                    "this endpoint."
-                ),
-                "code": "unsupported",
-            }
-        )
-        await websocket.close()
-        return
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
     if serving is None:
         await websocket.accept()
@@ -1432,6 +1438,23 @@ async def realtime_world_camera_openpi(websocket: WebSocket):
         await websocket.close()
         return
     connection = WorldCameraRealtimeConnection(websocket, serving)
+    await connection.handle_connection()
+
+
+@router.websocket("/v1/realtime/robot/openpi")
+async def realtime_robot_openpi(websocket: WebSocket):
+    """WebSocket endpoint for robot policy inference via OpenPI messages."""
+    from vllm_omni.entrypoints.openpi.connection import (
+        RobotRealtimeConnection,
+    )
+
+    serving = getattr(websocket.app.state, "openai_serving_realtime_robot", None)
+    if serving is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "Robot policy not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    connection = RobotRealtimeConnection(websocket, serving)
     await connection.handle_connection()
 
 
@@ -1575,6 +1598,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 prompt=request.prompt,
                 extra_body=extra_body,
                 request_id=f"img_gen-{random_uuid()}",
+                raw_request=raw_request,
             )
             if isinstance(generation_result, ErrorResponse):
                 return JSONResponse(
@@ -1673,7 +1697,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
         # Encode images to base64 with the specified format
         image_data = [
-            ImageData(b64_json=_encode_image_base64_with_compression(img, format=output_format), revised_prompt=None)
+            ImageData(b64_json=encode_image_base64_with_compression(img, format=output_format), revised_prompt=None)
             for img in images
         ]
 
@@ -1723,6 +1747,7 @@ async def edit_images(
     output_format: str | None = Form("png"),
     background: str | None = Form("auto"),
     output_compression: Annotated[int, Form(ge=0, le=100)] = 100,
+    stream: bool = Form(False),
     user: str | None = Form(None),  # unused now
     # vllm-omni extensions for image editing
     mask_image: str | UploadFile | None = None,
@@ -1762,6 +1787,11 @@ async def edit_images(
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Only response_format 'b64_json' is supported now.",
+        )
+    if stream and len(stage_configs) <= 1:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="stream=true is only supported for multi-stage image editing pipelines.",
         )
     try:
         # 2. Build prompt & images params
@@ -1970,7 +2000,18 @@ async def edit_images(
                 extra_body=extra_body,
                 reference_images=ref_b64_list,
                 request_id=request_id,
+                stream=stream,
+                model=model_name,
+                output_format=output_format,
+                output_compression=output_compression,
+                size=size_str,
+                raw_request=raw_request,
             )
+            if stream and not isinstance(generation_result, ErrorResponse):
+                return StreamingResponse(
+                    content=generation_result,
+                    media_type="text/event-stream",
+                )
             if isinstance(generation_result, ErrorResponse):
                 raise HTTPException(
                     status_code=generation_result.error.code if generation_result.error else 400,
@@ -1993,7 +2034,7 @@ async def edit_images(
         # Encode images to base64
         image_data = [
             ImageData(
-                b64_json=_encode_image_base64_with_compression(
+                b64_json=encode_image_base64_with_compression(
                     img, format=output_format, output_compression=output_compression
                 ),
                 revised_prompt=None,
@@ -2316,48 +2357,6 @@ def _choose_output_format(output_format: str | None, background: str | None) -> 
         return "png"
     # Default
     return "jpeg"
-
-
-def _prepare_image_for_output_format(image: Image.Image, format: str) -> Image.Image:
-    fmt = format.lower()
-    if fmt not in {"jpg", "jpeg"}:
-        return image
-
-    if image.mode == "RGB":
-        return image
-
-    if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
-        alpha_image = image.convert("RGBA")
-        flattened = Image.new("RGB", alpha_image.size, (255, 255, 255))
-        flattened.paste(alpha_image, mask=alpha_image.getchannel("A"))
-        return flattened
-
-    return image.convert("RGB")
-
-
-def _encode_image_base64_with_compression(
-    image: Image.Image, format: str = "png", output_compression: int = 100
-) -> str:
-    """Encode PIL Image to a base64 image string.
-
-    Args:
-        image: PIL Image object
-        format: Output image format (e.g., "PNG", "JPEG", "WEBP")
-        output_compression: Compression level (0-100%), 100 for best quality
-    Returns:
-        Base64-encoded image as string
-    """
-    buffer = io.BytesIO()
-    image = _prepare_image_for_output_format(image, format)
-    save_kwargs = {}
-    if format in ("jpg", "jpeg", "webp"):
-        save_kwargs["quality"] = output_compression
-    elif format == "png":
-        save_kwargs["compress_level"] = max(0, min(9, 9 - output_compression // 11))  # Map 0-100 to 9-0
-
-    image.save(buffer, format=format, **save_kwargs)
-    buffer.seek(0)
-    return base64.b64encode(buffer.read()).decode("utf-8")
 
 
 def apply_stage_default_sampling_params(

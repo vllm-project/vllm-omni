@@ -142,6 +142,16 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
+    "LancePipeline": (
+        "lance",
+        "pipeline_lance",
+        "LancePipeline",
+    ),
+    "MingImagePipeline": (
+        "ming_flash_omni",
+        "pipeline_ming_imagegen",
+        "MingImagePipeline",
+    ),
     "InternVLAA1Pipeline": (
         "internvla_a1",
         "pipeline_internvla_a1",
@@ -288,7 +298,6 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
-    "SenseNovaU1Pipeline",
     "AudioXPipeline",
 }
 
@@ -473,6 +482,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
+    "LancePipeline": "get_lance_post_process_func",
+    "MingImagePipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
@@ -604,6 +615,7 @@ _STREAM_BATCH_OVERRIDE_ATTRS: dict[str, str] = {
     "num_inference_steps": "STREAM_BATCH_NUM_INFERENCE_STEPS",
 }
 
+
 def apply_required_sampling_overrides(sampling: Any, model_class_name: str) -> None:
     """Overwrite sampling-param fields that the model has hard requirements on."""
     pipeline_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
@@ -617,6 +629,9 @@ def apply_required_sampling_overrides(sampling: Any, model_class_name: str) -> N
         if current != required:
             logger.warning(
                 "%s requires sampling.%s=%s, got %r. Overriding.",
-                model_class_name, field, required, current,
+                model_class_name,
+                field,
+                required,
+                current,
             )
             setattr(sampling, field, required)

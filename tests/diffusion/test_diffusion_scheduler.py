@@ -32,13 +32,13 @@ def _make_request(req_id: str) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         prompts=[f"prompt_{req_id}"],
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
-        request_ids=[req_id],
+        request_id=req_id,
     )
 
 
 def _make_request_output(req_id: str, *, error: str | None = None, finished: bool = True):
     return RunnerOutput(
-        req_id=req_id,
+        request_id=req_id,
         step_index=None,
         finished=finished,
         result=DiffusionOutput(output=None, error=error),
@@ -53,7 +53,7 @@ def _make_step_output(
     error: str | None = None,
 ):
     return RunnerOutput(
-        req_id=req_id,
+        request_id=req_id,
         step_index=step_index,
         finished=finished,
         result=DiffusionOutput(output=None, error=error) if error is not None else None,
@@ -74,16 +74,16 @@ def _make_step_request(
             num_inference_steps=num_inference_steps,
             step_index=step_index,
         ),
-        request_ids=[req_id],
+        request_id=req_id,
     )
 
 
 def _new_ids(sched_output) -> list[str]:
-    return [req.sched_req_id for req in sched_output.scheduled_new_reqs]
+    return [req.request_id for req in sched_output.scheduled_new_reqs]
 
 
 def _cached_ids(sched_output) -> list[str]:
-    return list(sched_output.scheduled_cached_reqs.sched_req_ids)
+    return list(sched_output.scheduled_cached_reqs.request_ids)
 
 
 class _StubScheduler(SchedulerInterface):
@@ -91,7 +91,7 @@ class _StubScheduler(SchedulerInterface):
         self._request = request
         self._output = output
         self.initialized_with = None
-        self._sched_req_id = request.request_ids[0]
+        self._request_id = request.request_id
         self._state = None
         self._scheduled = False
         self.max_num_running_reqs = 1
@@ -101,22 +101,22 @@ class _StubScheduler(SchedulerInterface):
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         assert request is self._request
-        self._state = SimpleNamespace(sched_req_id=self._sched_req_id, req=request)
-        return self._sched_req_id
+        self._state = SimpleNamespace(request_id=self._request_id, req=request)
+        return self._request_id
 
     def schedule(self):
         if self._scheduled or self._state is None:
             return SimpleNamespace(
                 scheduled_new_reqs=[],
                 scheduled_cached_reqs=CachedRequestData.make_empty(),
-                scheduled_req_ids=[],
+                scheduled_request_ids=[],
                 is_empty=True,
             )
         self._scheduled = True
         return SimpleNamespace(
             scheduled_new_reqs=[NewRequestData.from_state(self._state)],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
-            scheduled_req_ids=[self._state.sched_req_id],
+            scheduled_request_ids=[self._state.request_id],
             is_empty=False,
         )
 
@@ -124,30 +124,25 @@ class _StubScheduler(SchedulerInterface):
         del sched_output
         assert output is self._output
         self._state.status = DiffusionRequestStatus.FINISHED_COMPLETED
-        return {self._sched_req_id}
+        return {self._request_id}
 
     def has_requests(self) -> bool:
         return not self._scheduled
 
-    def get_request_state(self, sched_req_id: str):
-        del sched_req_id
+    def get_request_state(self, request_id: str):
+        del request_id
         return self._state
 
-    def get_sched_req_id(self, request_id: str) -> str | None:
-        if request_id in self._request.request_ids:
-            return self._sched_req_id
-        return None
-
-    def pop_request_state(self, sched_req_id: str):
-        del sched_req_id
+    def pop_request_state(self, request_id: str):
+        del request_id
         return self._state
 
-    def preempt_request(self, sched_req_id: str) -> bool:
-        del sched_req_id
+    def preempt_request(self, request_id: str) -> bool:
+        del request_id
         return False
 
-    def finish_requests(self, sched_req_ids, status) -> None:
-        del sched_req_ids, status
+    def finish_requests(self, request_ids, status) -> None:
+        del request_ids, status
         return None
 
     def close(self) -> None:
@@ -172,7 +167,7 @@ class TestGetSamplingParamsKey:
         return OmniDiffusionRequest(
             prompts=["prompt"],
             sampling_params=sp,
-            request_ids=[f"req-{lora_int_id}-{lora_scale}"],
+            request_id=f"req-{lora_int_id}-{lora_scale}",
         )
 
     def test_distinguishes_lora_id(self) -> None:
@@ -292,7 +287,7 @@ class TestRequestScheduler:
             OmniDiffusionRequest(
                 prompts=["prompt_b"],
                 sampling_params=OmniDiffusionSamplingParams(width=768),
-                request_ids=["b"],
+                request_id="b",
             )
         )
         scheduler.add_request(_make_request("c"))
@@ -334,7 +329,7 @@ class TestRequestScheduler:
         assert state_a.status == DiffusionRequestStatus.FINISHED_ABORTED
 
         assert self.scheduler.has_requests() is False
-        assert self.scheduler.schedule().scheduled_req_ids == []
+        assert self.scheduler.schedule().scheduled_request_ids == []
 
     def test_has_requests_state_transition(self) -> None:
         assert self.scheduler.has_requests() is False
@@ -349,60 +344,28 @@ class TestRequestScheduler:
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
         assert self.scheduler.has_requests() is False
 
-    def test_request_id_mapping_lifecycle(self) -> None:
+    def test_request_id_is_scheduler_key(self) -> None:
         request = OmniDiffusionRequest(
             prompts=["prompt_map_a", "prompt_map_b"],
             sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
-            request_ids=["map-a", "map-b"],
             request_id="map-parent",
         )
 
-        sched_req_id = self.scheduler.add_request(request)
+        request_id = self.scheduler.add_request(request)
 
-        assert self.scheduler.get_sched_req_id("map-a") == sched_req_id
-        assert self.scheduler.get_sched_req_id("map-b") == sched_req_id
-        assert self.scheduler.get_sched_req_id("map-parent") == sched_req_id
+        assert request_id == "map-parent"
+        state = self.scheduler.get_request_state("map-parent")
+        assert state.request_id == "map-parent"
 
-        self.scheduler.pop_request_state(sched_req_id)
+        self.scheduler.pop_request_state("map-parent")
 
-        assert self.scheduler.get_sched_req_id("map-a") is None
-        assert self.scheduler.get_sched_req_id("map-b") is None
-        assert self.scheduler.get_sched_req_id("map-parent") is None
+        assert self.scheduler.get_request_state("map-parent") is None
 
-    def test_parent_request_id_registration_failure_rolls_back_child_ids(self) -> None:
-        self.scheduler.add_request(
-            OmniDiffusionRequest(
-                prompts=["prompt_existing"],
-                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
-                request_ids=["existing-child"],
-                request_id="duplicate-parent",
-            )
-        )
+    def test_duplicate_request_id_is_rejected(self) -> None:
+        self.scheduler.add_request(_make_request("dup"))
 
-        colliding_request = OmniDiffusionRequest(
-            prompts=["prompt_unique"],
-            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
-            request_ids=["unique-child"],
-            request_id="duplicate-parent",
-        )
-
-        with pytest.raises(ValueError, match="duplicate-parent"):
-            self.scheduler.add_request(colliding_request)
-
-        assert self.scheduler.get_request_state("unique-child") is None
-        assert self.scheduler.get_sched_req_id("unique-child") is None
-
-        valid_request = OmniDiffusionRequest(
-            prompts=["prompt_unique"],
-            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
-            request_ids=["unique-child"],
-            request_id="unique-parent",
-        )
-        sched_req_id = self.scheduler.add_request(valid_request)
-
-        assert sched_req_id == "unique-child"
-        assert self.scheduler.get_sched_req_id("unique-child") == sched_req_id
-        assert self.scheduler.get_sched_req_id("unique-parent") == sched_req_id
+        with pytest.raises(ValueError, match="request_id 'dup' is already active"):
+            self.scheduler.add_request(_make_request("dup"))
 
 
 class TestDiffusionEngine:
@@ -663,7 +626,7 @@ class TestStepScheduler:
         finished = self.scheduler.update_from_output(
             sched_output,
             RunnerOutput(
-                req_id=req_id,
+                request_id=req_id,
                 step_index=None,
                 finished=True,
                 result=None,
@@ -935,7 +898,7 @@ class TestStepScheduler:
 
         for _ in range(expected_steps - 1):
             sched_output = self.scheduler.schedule()
-            assert sched_output.scheduled_req_ids == [req_id]
+            assert sched_output.scheduled_request_ids == [req_id]
             next_step = request.sampling_params.step_index + 1
             assert (
                 self.scheduler.update_from_output(
@@ -946,7 +909,7 @@ class TestStepScheduler:
             )
 
         final_output = self.scheduler.schedule()
-        assert final_output.scheduled_req_ids == [req_id]
+        assert final_output.scheduled_request_ids == [req_id]
         assert self.scheduler.update_from_output(
             final_output,
             _make_step_output(req_id, step_index=expected_steps, finished=True),
@@ -978,17 +941,19 @@ def _make_stream_request(
     num_frames = num_chunks * chunk_frames
     video = [torch.zeros(3, 8, 8) for _ in range(num_frames)]
     return OmniDiffusionRequest(
-        prompts=[{
-            "prompt": f"prompt_{req_id}",
-            "multi_modal_data": {"video": video},
-        }],
+        prompts=[
+            {
+                "prompt": f"prompt_{req_id}",
+                "multi_modal_data": {"video": video},
+            }
+        ],
         sampling_params=OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
             chunk_frames=chunk_frames,
             num_chunks=num_chunks,
             num_frames=num_frames,
         ),
-        request_ids=[req_id],
+        request_id=req_id,
     )
 
 
@@ -1000,7 +965,7 @@ def _make_stream_output(
     micro_step_wall_ns: int | None = None,
 ):
     return SimpleNamespace(
-        req_id=req_id,
+        request_id=req_id,
         step_index=None,
         finished=finished,
         result=DiffusionOutput(output=None, error=error) if error is not None else None,
@@ -1015,17 +980,14 @@ def _make_od_config(pp_size: int) -> SimpleNamespace:
 def _ranks(sched_output) -> list[tuple[str, list[int]] | None]:
     if sched_output.assignment is None:
         return []
-    return [
-        (t.sched_req_id, list(t.chunk_indices)) if t.chunk_indices else None
-        for t in sched_output.assignment
-    ]
+    return [(t.request_id, list(t.chunk_indices)) if t.chunk_indices else None for t in sched_output.assignment]
 
 
-def _layout(sched_output, sched_req_id: str) -> tuple[int, int, int] | None:
+def _layout(sched_output, request_id: str) -> tuple[int, int, int] | None:
     if sched_output.assignment is None:
         return None
     for task in sched_output.assignment:
-        if task.sched_req_id == sched_req_id:
+        if task.request_id == request_id:
             layout = task.layout
             return (len(layout.finished_idxs), len(layout.circulating_idxs), len(layout.new_idxs))
     return None
@@ -1213,7 +1175,7 @@ class TestStreamBatchScheduler:
         scheduler = self._make_scheduler(pp_size=2)
         out = scheduler.schedule()
         assert out.assignment is None
-        assert out.scheduled_req_ids == []
+        assert out.scheduled_request_ids == []
 
     def test_fifo_two_requests(self) -> None:
         scheduler = self._make_scheduler(pp_size=1)

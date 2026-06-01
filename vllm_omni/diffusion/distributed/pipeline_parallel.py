@@ -234,7 +234,10 @@ class PipelineParallelMixin:
                 for i in range(n):
                     its[i] = AsyncIntermediateTensors(
                         *pp_group.pipeline_irecv_tensor_dict(
-                            name="intermediate", segment_idx=i, buf_idx=buf_idx, batch_size=batch_size,
+                            name="intermediate",
+                            segment_idx=i,
+                            buf_idx=buf_idx,
+                            batch_size=batch_size,
                         )
                     )
 
@@ -244,7 +247,10 @@ class PipelineParallelMixin:
                 result = self.predict_noise(**kwargs, intermediate_tensors=it)
                 self._pp_send_work.extend(
                     pp_group.pipeline_isend_tensor_dict(
-                        result.tensors, name="intermediate", segment_idx=i, batch_size=batch_size,
+                        result.tensors,
+                        name="intermediate",
+                        segment_idx=i,
+                        batch_size=batch_size,
                     )
                 )
             return None
@@ -298,21 +304,35 @@ class PipelineParallelMixin:
         """
         if get_pipeline_parallel_world_size() == 1:
             return self._scheduler_step_local(
-                noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator,
+                noise_pred,
+                t,
+                latents,
+                do_true_cfg,
+                per_request_scheduler,
+                generator,
             )
 
         pp_group = get_pp_group()
         if pp_group.is_last_rank:
             latents = self._scheduler_step_local(
-                noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator,
+                noise_pred,
+                t,
+                latents,
+                do_true_cfg,
+                per_request_scheduler,
+                generator,
             )
             self._pp_send_work = pp_group.pipeline_isend_tensor_dict(
-                {"latents": latents}, name="latents", batch_size=batch_size,
+                {"latents": latents},
+                name="latents",
+                batch_size=batch_size,
             )
         if pp_group.is_first_rank and receive_latents:
             latents = AsyncLatents(
                 *pp_group.pipeline_irecv_tensor_dict(
-                    name="latents", buf_idx=buf_idx, batch_size=batch_size,
+                    name="latents",
+                    buf_idx=buf_idx,
+                    batch_size=batch_size,
                 )
             )
         return latents
@@ -329,18 +349,28 @@ class PipelineParallelMixin:
         """Run scheduler.step on this rank — single call or per-chunk loop."""
         if not isinstance(per_request_scheduler, list):
             return super().scheduler_step_maybe_with_cfg(
-                noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator=generator,
+                noise_pred,
+                t,
+                latents,
+                do_true_cfg,
+                per_request_scheduler,
+                generator=generator,
             )
         new_rows: list[torch.Tensor] = []
         for i, sched in enumerate(per_request_scheduler):
             t_i = t[i] if t.ndim > 0 else t
             new_rows.append(
                 super().scheduler_step_maybe_with_cfg(
-                    noise_pred[i:i + 1], t_i, latents[i:i + 1], do_true_cfg, sched, generator=generator,
+                    noise_pred[i : i + 1],
+                    t_i,
+                    latents[i : i + 1],
+                    do_true_cfg,
+                    sched,
+                    generator=generator,
                 )
             )
         return torch.cat(new_rows, dim=0)
-    
+
     def prefetch_tensors_maybe_with_cfg(
         self,
         do_true_cfg: bool,
@@ -349,7 +379,7 @@ class PipelineParallelMixin:
     ) -> list[AsyncIntermediateTensors] | AsyncLatents | None:
         """Pre-post the next-step recv on this rank's comms stream.
 
-        First rank pre-posts the latents irecv from the last rank. 
+        First rank pre-posts the latents irecv from the last rank.
         Non-first ranks pre-post the intermediate-tensor irecv from the previous rank.
         """
         if get_pipeline_parallel_world_size() == 1:
@@ -358,7 +388,9 @@ class PipelineParallelMixin:
         if pp_group.is_first_rank:
             return AsyncLatents(
                 *pp_group.pipeline_irecv_tensor_dict(
-                    name="latents", buf_idx=buf_idx, batch_size=batch_size,
+                    name="latents",
+                    buf_idx=buf_idx,
+                    batch_size=batch_size,
                 )
             )
 
@@ -367,7 +399,10 @@ class PipelineParallelMixin:
         return [
             AsyncIntermediateTensors(
                 *pp_group.pipeline_irecv_tensor_dict(
-                    name="intermediate", segment_idx=i, buf_idx=buf_idx, batch_size=batch_size,
+                    name="intermediate",
+                    segment_idx=i,
+                    buf_idx=buf_idx,
+                    batch_size=batch_size,
                 )
             )
             for i in range(n)

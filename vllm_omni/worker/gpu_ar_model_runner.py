@@ -19,11 +19,6 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    extract_routed_experts_for_current_batch,
-    get_global_experts_capturer,
-    issue_routing_d2h_copy,
-)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.dflash import DFlashProposer
@@ -84,11 +79,23 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
-        # Only Qwen3-Omni currently consumes the connector-based full-payload
-        # handoff added in this PR. Other model architectures (e.g. Bagel
-        # diffusion) retain their pre-existing runner behavior so this PR
-        # does not perturb them.
-        if getattr(self.model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
+        # Worker-connector init is gated by a per-`model_arch` allowlist
+        # (covers both producer-side and consumer-side runners for the
+        # arches below).  Consumer-wait stages must be registered
+        # separately as `(model_arch, model_stage)` tuples in
+        # `omni_scheduling_coordinator._FULL_PAYLOAD_INPUT_STAGES`;
+        # forgetting that produces a Stage-1 hang on the consumer.
+        _OMNI_CONNECTOR_INIT_ARCHS = {
+            "Qwen3OmniMoeForConditionalGeneration",
+            "Qwen2_5OmniForConditionalGeneration",
+            "CovoAudioForConditionalGeneration",
+            "MiMoAudioModel",
+            "Qwen3TTSTalkerForConditionalGeneration",
+            "Qwen3TTSCode2Wav",
+            "CosyVoice3Model",
+            "DyninOmniForConditionalGeneration",
+        }
+        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(
                 vllm_config=self.vllm_config,
                 model_config=self.model_config,
@@ -108,6 +115,57 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # Use the context manager to temporarily disable pinning if needed
         with maybe_disable_pin_memory_for_ray(self, total_bytes):
             return super()._make_buffer(*size, dtype=dtype, numpy=numpy)
+
+    def _build_model_sampler_output_token_ids(self) -> list[list[int]]:
+        """Build decoded-token history for custom model samplers.
+
+        vLLM only populates sampling_metadata.output_token_ids when penalties or
+        logits processors require it. CosyVoice3's custom RAS sampler also
+        depends on this history, so we reconstruct it directly from the input
+        batch for prefer_model_sampler models.
+        """
+        req_output_token_ids = getattr(self.input_batch, "req_output_token_ids", [])
+        req_ids = list(getattr(self.input_batch, "req_ids", []))
+        output_token_ids = [list(req_output_token_ids[idx] or []) for idx in range(len(req_ids))]
+
+        sampled_token_ids_cpu = getattr(self.input_batch, "sampled_token_ids_cpu", None)
+        async_copy_ready_event = getattr(self.input_batch, "async_copy_ready_event", None)
+        prev_req_id_to_index = getattr(self.input_batch, "prev_req_id_to_index", None)
+        if sampled_token_ids_cpu is None or not output_token_ids or prev_req_id_to_index is None:
+            return output_token_ids
+
+        sampled_token_ids: list[list[int]] | None = None
+        for index, req_id in enumerate(req_ids):
+            prev_index = prev_req_id_to_index.get(req_id)
+            if prev_index is None:
+                continue
+            req_history = output_token_ids[index]
+            if not req_history or req_history[-1] != -1:
+                continue
+            if sampled_token_ids is None:
+                assert async_copy_ready_event is not None
+                async_copy_ready_event.synchronize()
+                sampled_token_ids = sampled_token_ids_cpu.tolist()
+            new_ids = list(sampled_token_ids[prev_index])
+            if not new_ids:
+                continue
+            num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
+            first_placeholder = req_history.index(-1)
+            num_placeholders = len(req_history) - first_placeholder
+            num_to_replace = min(num_sampled_ids, num_placeholders)
+            req_history[first_placeholder : first_placeholder + num_to_replace] = new_ids[:num_to_replace]
+
+        for index, req_history in enumerate(output_token_ids):
+            if -1 in req_history:
+                output_token_ids[index] = req_history[: req_history.index(-1)]
+
+        return output_token_ids
+
+    def _sampling_metadata_for_model_sampler(self, sampling_metadata):
+        output_token_ids = self._build_model_sampler_output_token_ids()
+        if output_token_ids == sampling_metadata.output_token_ids:
+            return sampling_metadata
+        return replace(sampling_metadata, output_token_ids=output_token_ids)
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
@@ -147,7 +205,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return result
 
     def _capture_talker_mtp_graphs(self) -> None:
-        from vllm_omni.worker.gpu_model_runner import CUDAGraphWrapper
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
 
         if not self.has_talker_mtp or not isinstance(self.talker_mtp, CUDAGraphWrapper):
             return
@@ -244,11 +302,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
 
             hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
+            # FIX: The .cpu attribute of slot_mapping is stale (not updated by the Triton
+            # _compute_slot_mapping_kernel which only writes to .gpu). We must use .gpu and
+            # sync back to CPU to get the correctly computed slot mapping.
+            slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
+            slot_mapping_cpu = slot_mapping_gpu[:num_tokens_padded].cpu()
             self.omni_prefix_cache.update_omni_tensor_prefix_cache(
                 hidden_states=hs_for_cache,
                 multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
-                slot_mapping=self.input_batch.block_table[0].slot_mapping.cpu,
+                slot_mapping=slot_mapping_cpu,
                 num_tokens_padded=num_tokens_padded,
                 skip_mm_cache_keys=self._deferred_prefix_cache_mm_keys(),
             )
@@ -294,6 +357,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+
+        if self.routed_experts_initialized:
+            self.routed_experts_capturer.clear_buffer()
 
         if not getattr(self, "_warmup_state_cleared", False):
             self._warmup_state_cleared = True
@@ -346,7 +412,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
 
         if self.routed_experts_initialized:
-            capturer = get_global_experts_capturer()
+            capturer = self.routed_experts_capturer
             if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
                 capturer.finalize_pending_copy()
 
@@ -509,6 +575,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 slot_mappings=slot_mappings_by_group,
             )
+            self._maybe_attach_attention_metadata_extensions(
+                attn_metadata=attn_metadata,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                max_query_len=max_num_scheduled_tokens,
+                pad_attn=pad_attn,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+            )
 
             (
                 input_ids,
@@ -603,7 +677,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
-                    hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     return hidden_states
 
@@ -616,7 +689,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
+                sample_hidden_states = hidden_states[logits_indices.to(hidden_states.device)]
                 # Try with sampling_metadata first; fall back to without for models that don't support it
                 try:
                     logits = self.model.compute_logits(
@@ -628,7 +701,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # Rare case.
                 assert not self.is_pooling_model
 
-                sample_hidden_states = hidden_states[logits_indices]
+                sample_hidden_states = hidden_states[logits_indices.to(hidden_states.device)]
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(self.vllm_config, num_tokens_padded)
@@ -677,12 +750,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             deferred_state_corrections_fn()
 
         if self.routed_experts_initialized and hasattr(self, "_positions_cpu"):
-            issue_routing_d2h_copy(
-                input_batch_req_ids=self.input_batch.req_ids,
-                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                positions=self.positions,
-                positions_cpu=self._positions_cpu,
-            )
+            self._omni_routed_experts_d2h(scheduler_output)
 
         return None
 
@@ -754,18 +822,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
-            # Nothing to do (PP non-final rank case), output isn't used.
-            if not kv_connector_output:
-                return None  # type: ignore[return-value]
-
+            # receive sampled token ids from the last PP rank.
+            if self.use_async_scheduling and not get_pp_group().is_last_rank:
+                self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
-            if kv_connector_output.is_empty():
-                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
-
-            output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
-            output.kv_connector_output = kv_connector_output
-            return self.attach_omni_connector_output(output)
+            return self.attach_omni_connector_output(
+                OmniModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            )
 
         # Unpack ephemeral state.
         (
@@ -966,7 +1030,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     req_hidden_states_cpu[rid] = hidden_states[start:end].detach().to("cpu").contiguous()
 
             pooler_output = []
-            for rid in req_ids_output_copy:
+            for out_idx, rid in enumerate(req_ids_output_copy):
                 if rid not in downstream_req_id_set:
                     pooler_output.append({})
                     continue
@@ -1032,15 +1096,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
-            routed_experts_dict = None
+            routed_experts_lists = None
             if self.routed_experts_initialized:
-                routed_experts_dict = extract_routed_experts_for_current_batch(
-                    req_ids=req_ids_output_copy,
-                    requests=self.requests,
-                    req_id_to_index=self.input_batch.req_id_to_index,
-                    num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
-                    max_model_len=self.max_model_len,
-                )
+                routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
             output = OmniModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -1052,10 +1110,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
-                routed_experts_dict=routed_experts_dict,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
             output.omni_connector_output = self.get_omni_connector_output()
+            output.routed_experts = routed_experts_lists
 
         if not self.use_async_scheduling:
             return output

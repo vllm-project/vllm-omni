@@ -36,12 +36,21 @@ from vllm.v1.engine.utils import (
 from vllm.v1.utils import shutdown
 
 from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
+from vllm_omni.engine.stage_init_utils import set_death_signal
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.executor import Executor
 
 logger = init_logger(__name__)
+
+
+_SIGNAL_EXIT_BASE = 128
+
+
+def _signal_exit_code(signum: int) -> int:
+    """Return the conventional process exit code for signal-driven exits."""
+    return _SIGNAL_EXIT_BASE + signum
 
 
 class StageEngineCoreProc(EngineCoreProc):
@@ -89,8 +98,14 @@ class StageEngineCoreProc(EngineCoreProc):
             # like upstream vLLM.
 
             stage_label = f"stage{omni_stage_id}" if omni_stage_id is not None else "noid"
+            set_death_signal(signal.SIGTERM)
             set_process_title(f"StageEngineCoreProc_{stage_label}_replica{omni_replica_id}_DP{dp_rank}")
             decorate_logs()
+            # Workaround for flashinfer/jit-cache version mismatch in CI.
+            # The parent process handles this gracefully via ring_globals.py,
+            # but the subprocess hits an unprotected import in TopKTopPSampler.
+            # Setting this env var allows the same graceful fallback to work.
+            os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
             os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
 
             engine_core = StageEngineCoreProc(
@@ -142,6 +157,7 @@ class StageEngineCoreProc(EngineCoreProc):
             def signal_handler(signum: int, frame: Any) -> None:
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
                 signal_callback.trigger()
+                raise SystemExit(_signal_exit_code(signum))
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)

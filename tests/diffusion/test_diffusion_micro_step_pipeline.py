@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for micro-step level diffusion execution across runner / worker / executor / engine."""
 
@@ -128,7 +128,7 @@ def _make_micro_request(
 ):
     return SimpleNamespace(
         prompts=["a prompt"],
-        request_ids=[req_id],
+        request_id=req_id,
         sampling_params=SimpleNamespace(
             generator=None,
             seed=None,
@@ -177,7 +177,7 @@ def _make_layout(
 def _make_micro_scheduler_output(
     *,
     req=None,
-    sched_req_id: str = "req-1",
+    request_id: str = "req-1",
     step_id: int = 0,
     chunk_indices: list[int] | None = None,
     is_new: bool = True,
@@ -188,13 +188,13 @@ def _make_micro_scheduler_output(
         layout = _make_layout()
     if chunk_indices is None:
         chunk_indices = [0]
-    assignment = [RankTask(sched_req_id=sched_req_id, chunk_indices=chunk_indices, layout=layout)]
+    assignment = [RankTask(request_id=request_id, chunk_indices=chunk_indices, layout=layout)]
     if is_new and req is not None:
-        new_reqs = [NewRequestData(sched_req_id=sched_req_id, req=req)]
+        new_reqs = [NewRequestData(request_id=request_id, req=req)]
         cached_reqs = CachedRequestData.make_empty()
     else:
         new_reqs = []
-        cached_reqs = CachedRequestData(sched_req_ids=[sched_req_id])
+        cached_reqs = CachedRequestData(request_ids=[request_id])
     return DiffusionSchedulerOutput(
         step_id=step_id,
         scheduled_new_reqs=new_reqs,
@@ -227,20 +227,23 @@ class TestRunner:
         out0 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                req=req, step_id=0,
+                req=req,
+                step_id=0,
                 chunk_indices=[0],
                 layout=_make_layout(new_idxs=[0]),
             ),
         )
-        assert out0.req_id == "req-1"
+        assert out0.request_id == "req-1"
         assert out0.finished is False
         assert "req-1" in runner.state_cache
 
         out1 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                sched_req_id="req-1", step_id=1,
-                chunk_indices=[], is_new=False,
+                request_id="req-1",
+                step_id=1,
+                chunk_indices=[],
+                is_new=False,
                 layout=_make_layout(finished_idxs=[0]),
             ),
         )
@@ -262,7 +265,8 @@ class TestRunner:
         DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                req=req, step_id=0,
+                req=req,
+                step_id=0,
                 chunk_indices=[0],
                 layout=_make_layout(new_idxs=[0]),
             ),
@@ -270,7 +274,8 @@ class TestRunner:
         out1 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                sched_req_id="req-1", step_id=1,
+                request_id="req-1",
+                step_id=1,
                 chunk_indices=[1],
                 is_new=False,
                 layout=_make_layout(finished_idxs=[0], new_idxs=[1]),
@@ -281,8 +286,10 @@ class TestRunner:
         out2 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                sched_req_id="req-1", step_id=2,
-                chunk_indices=[], is_new=False,
+                request_id="req-1",
+                step_id=2,
+                chunk_indices=[],
+                is_new=False,
                 layout=_make_layout(finished_idxs=[1]),
             ),
         )
@@ -302,7 +309,8 @@ class TestRunner:
         out0 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                req=req, step_id=0,
+                req=req,
+                step_id=0,
                 chunk_indices=[0],
                 layout=_make_layout(new_idxs=[0]),
             ),
@@ -312,7 +320,8 @@ class TestRunner:
         out1 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                sched_req_id="req-1", step_id=1,
+                request_id="req-1",
+                step_id=1,
                 chunk_indices=[0],
                 is_new=False,
                 layout=_make_layout(circulating_idxs=[0]),
@@ -324,8 +333,10 @@ class TestRunner:
         out2 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                sched_req_id="req-1", step_id=2,
-                chunk_indices=[], is_new=False,
+                request_id="req-1",
+                step_id=2,
+                chunk_indices=[],
+                is_new=False,
                 layout=_make_layout(finished_idxs=[0]),
             ),
         )
@@ -340,7 +351,8 @@ class TestRunner:
         DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                req=req, step_id=0,
+                req=req,
+                step_id=0,
                 chunk_indices=[0],
                 layout=_make_layout(new_idxs=[0]),
             ),
@@ -350,12 +362,14 @@ class TestRunner:
         out = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                sched_req_id="req-1", step_id=1,
-                chunk_indices=[], is_new=False,
+                request_id="req-1",
+                step_id=1,
+                chunk_indices=[],
+                is_new=False,
                 layout=_make_layout(),
             ),
         )
-        assert out.req_id == "req-1"
+        assert out.request_id == "req-1"
         assert out.finished is False
         assert runner.pipeline.denoise_calls == denoise_calls_before
         assert runner.pipeline.decode_calls == 0
@@ -369,12 +383,13 @@ class TestRunner:
         out = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                req=req, step_id=0,
+                req=req,
+                step_id=0,
                 chunk_indices=[0],
                 layout=_make_layout(new_idxs=[0]),
             ),
         )
-        assert out.req_id == "req-1"
+        assert out.request_id == "req-1"
         assert out.result is not None
         assert out.result.error == "micro-step denoise interrupted"
         assert runner.pipeline.denoise_calls == 1
@@ -409,7 +424,8 @@ class TestRunner:
         out = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                req=req, step_id=0,
+                req=req,
+                step_id=0,
                 chunk_indices=[0],
                 layout=_make_layout(new_idxs=[0]),
             ),
@@ -425,7 +441,8 @@ class TestRunner:
         out = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                req=req, step_id=0,
+                req=req,
+                step_id=0,
                 chunk_indices=[0, 1],
                 layout=_make_layout(new_idxs=[0, 1]),
             ),
@@ -433,7 +450,7 @@ class TestRunner:
 
         assert runner.pipeline.denoise_calls == 1
         assert runner.pipeline.scheduler_calls == 1
-        assert out.req_id == "req-1"
+        assert out.request_id == "req-1"
         assert out.finished is False
         assert out.micro_step_wall_ns is not None
 
@@ -445,7 +462,8 @@ class TestRunner:
         DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                req=req, step_id=0,
+                req=req,
+                step_id=0,
                 chunk_indices=[0, 1],
                 layout=_make_layout(new_idxs=[0, 1]),
             ),
@@ -453,8 +471,10 @@ class TestRunner:
         out = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
-                sched_req_id="req-1", step_id=1,
-                chunk_indices=[], is_new=False,
+                request_id="req-1",
+                step_id=1,
+                chunk_indices=[],
+                is_new=False,
                 layout=_make_layout(finished_idxs=[0, 1]),
             ),
         )
@@ -474,7 +494,7 @@ class TestWorker:
 
     def test_delegates_to_model_runner(self):
         worker = object.__new__(DiffusionWorker)
-        expected = RunnerOutput(req_id="req-1")
+        expected = RunnerOutput(request_id="req-1")
         scheduler_output = SimpleNamespace(
             scheduled_new_reqs=[
                 SimpleNamespace(req=SimpleNamespace(sampling_params=SimpleNamespace(lora_request=None)))
@@ -503,7 +523,7 @@ class TestWorker:
                 calls.append(adapter)
 
         worker.lora_manager = _FakeLoRAManager()
-        worker.model_runner = SimpleNamespace(execute_micro_step=lambda _: RunnerOutput(req_id="req-1"))
+        worker.model_runner = SimpleNamespace(execute_micro_step=lambda _: RunnerOutput(request_id="req-1"))
         worker._get_profiler = lambda: None
 
         DiffusionWorker.execute_micro_step(worker, scheduler_output)
@@ -517,7 +537,7 @@ class TestWorker:
             ]
         )
         worker.lora_manager = None
-        worker.model_runner = SimpleNamespace(execute_micro_step=lambda _: RunnerOutput(req_id="req-1"))
+        worker.model_runner = SimpleNamespace(execute_micro_step=lambda _: RunnerOutput(request_id="req-1"))
         worker._get_profiler = lambda: None
 
         with pytest.raises(ValueError, match="does not support LoRA"):
@@ -528,13 +548,14 @@ class TestWorker:
 # Executor
 # ---------------------------------------------------------------------------
 
+
 class TestExecutor:
     """MultiprocDiffusionExecutor.execute_micro_step collects rank-0's reply."""
 
     def test_passes_through_runner_output(self, mocker: MockerFixture):
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor._ensure_open = lambda: None
-        expected = RunnerOutput(req_id="req-1", finished=True)
+        expected = RunnerOutput(request_id="req-1", finished=True)
         rpc = mocker.Mock(return_value=expected)
         executor.collective_rpc = rpc
 

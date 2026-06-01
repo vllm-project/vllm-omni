@@ -155,6 +155,18 @@ def parse_args():
             "of extra CPU<->GPU transfers."
         ),
     )
+    parser.add_argument(
+        "--cache-backend",
+        type=str,
+        default=None,
+        choices=["cache_dit"],
+        help="Cache backend to use for image generation acceleration.",
+    )
+    parser.add_argument(
+        "--enable-cache-dit-summary",
+        action="store_true",
+        help="Enable cache-dit summary logging after diffusion forward passes.",
+    )
 
     nullify_stage_engine_defaults(parser)
     return parser.parse_args()
@@ -182,6 +194,8 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
+        cache_backend=args.cache_backend,
+        enable_cache_dit_summary=args.enable_cache_dit_summary,
     )
 
     extra_args = {
@@ -225,6 +239,7 @@ def main():
     print(f"  Seed           : {args.seed}")
     print(f"  Think mode     : {args.think}")
     print(f"  TP size        : {args.tensor_parallel_size}")
+    print(f"  Cache backend  : {args.cache_backend or 'none'}")
     print(f"{'=' * 60}\n")
 
     # Build prompt dict

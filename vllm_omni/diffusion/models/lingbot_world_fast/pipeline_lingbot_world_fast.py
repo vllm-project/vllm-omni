@@ -1,4 +1,3 @@
-import copy
 import logging
 import math
 import os
@@ -22,7 +21,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
     get_pp_group,
     is_pipeline_first_stage,
-    is_pipeline_last_stage,
 )
 from vllm_omni.diffusion.distributed.pipeline_parallel import (
     AsyncLatents,
@@ -129,9 +127,7 @@ class LingbotWorldFastPipeline(
 
         self.vae_stride = CONFIG["vae_stride"]
         self.patch_size = CONFIG["patch_size"]
-        base_vae = Wan2_1_VAE(
-            vae_pth=os.path.join(checkpoint_path, CONFIG["vae_checkpoint"]), device=self.device
-        )
+        base_vae = Wan2_1_VAE(vae_pth=os.path.join(checkpoint_path, CONFIG["vae_checkpoint"]), device=self.device)
         self.vae = StreamVAE(base_vae) if od_config.stream_batch else base_vae
 
         logger.info(f"Creating WanModelFast from {checkpoint_path}")
@@ -530,7 +526,7 @@ class LingbotWorldFastPipeline(
             raise ValueError("LingbotWorldFastPipeline only supports a single prompt.")
 
         sampling = state.sampling
-        if sampling.chunk_frames != 3*4:
+        if sampling.chunk_frames != 3 * 4:
             logger.warning(
                 "LingbotWorldFastPipeline requires chunk_frames=3*4=12, got %s. Overriding.",
                 sampling.chunk_frames,
@@ -725,8 +721,14 @@ class LingbotWorldFastPipeline(
 
         # noise
         noise = torch.randn(
-            B, 16, chunk_size, lat_h, lat_w,
-            dtype=torch.float32, generator=seed_g, device=self.device,
+            B,
+            16,
+            chunk_size,
+            lat_h,
+            lat_w,
+            dtype=torch.float32,
+            generator=seed_g,
+            device=self.device,
         )
 
         if not is_pipeline_first_stage():
@@ -762,10 +764,11 @@ class LingbotWorldFastPipeline(
         # plucker
         frame_indices = torch.tensor(
             [ci * chunk_size + f for ci in new_idxs for f in range(chunk_size)],
-            device=c2ws_infer_full.device, dtype=torch.long,
+            device=c2ws_infer_full.device,
+            dtype=torch.long,
         )
-        batched_c2ws = c2ws_infer_full[frame_indices]                # [B*chunk_size, 3, 4]
-        batched_Ks = Ks_t.repeat(B * chunk_size, 1)                  # [B*chunk_size, 4]
+        batched_c2ws = c2ws_infer_full[frame_indices]  # [B*chunk_size, 3, 4]
+        batched_Ks = Ks_t.repeat(B * chunk_size, 1)  # [B*chunk_size, 4]
         batched_plucker = get_plucker_embeddings(batched_c2ws, batched_Ks, h, w, only_rays_d=False)
         batched_plucker = rearrange(
             batched_plucker,
@@ -801,19 +804,13 @@ class LingbotWorldFastPipeline(
 
         for batch_size in range(1, slo_max_batch * n_steps + 1):
             latents_template = {
-                "latents": torch.empty(
-                    batch_size, 16, chunk_size, lat_h, lat_w, dtype=latents_dtype, device="meta"
-                )
+                "latents": torch.empty(batch_size, 16, chunk_size, lat_h, lat_w, dtype=latents_dtype, device="meta")
             }
             it_template = {
-                "hidden_states": torch.empty(
-                    batch_size, max_seq_len, self.model.dim, dtype=it_dtype, device="meta"
-                ),
+                "hidden_states": torch.empty(batch_size, max_seq_len, self.model.dim, dtype=it_dtype, device="meta"),
                 "grid_sizes": torch.empty(batch_size, 3, dtype=torch.long, device="meta"),
                 "seq_lens": torch.empty(batch_size, dtype=torch.long, device="meta"),
-                "c2ws_plucker_emb": torch.empty(
-                    batch_size, max_seq_len, self.model.dim, dtype=it_dtype, device="meta"
-                ),
+                "c2ws_plucker_emb": torch.empty(batch_size, max_seq_len, self.model.dim, dtype=it_dtype, device="meta"),
             }
             pp_group.set_recv_dict_buffer("latents", -1, latents_template, batch_size=batch_size)
             pp_group.set_recv_dict_buffer("intermediate", 0, it_template, batch_size=batch_size)
@@ -846,9 +843,7 @@ class LingbotWorldFastPipeline(
             y_list = [chunks[ci].extra["y"] for ci in chunk_idxs]
             plucker_list = [chunks[ci].extra["plucker"] for ci in chunk_idxs]
 
-        current_starts = [
-            start_token_offset + ci * chunk_size * frame_seqlen for ci in chunk_idxs
-        ]
+        current_starts = [start_token_offset + ci * chunk_size * frame_seqlen for ci in chunk_idxs]
 
         positive_kwargs = {
             "x": x_list,
@@ -910,7 +905,9 @@ class LingbotWorldFastPipeline(
             return
         buf_idx = state.step_index % 2
         preposted = self.prefetch_tensors_maybe_with_cfg(
-            do_true_cfg=False, buf_idx=buf_idx, batch_size=batch_size,
+            do_true_cfg=False,
+            buf_idx=buf_idx,
+            batch_size=batch_size,
         )
         if isinstance(preposted, AsyncLatents):
             state.latents = preposted
@@ -940,9 +937,7 @@ class LingbotWorldFastPipeline(
 
         extension = state.extra["extension"]
         if self.state.last_decoded_latent is not None:
-            warmup = self.state.last_decoded_latent.to(
-                pred_latent_chunks.device, pred_latent_chunks.dtype
-            )
+            warmup = self.state.last_decoded_latent.to(pred_latent_chunks.device, pred_latent_chunks.dtype)
             k = warmup.shape[1]
             drop = 4 * k - 3
             to_decode = torch.cat([warmup, pred_latent_chunks], dim=1)

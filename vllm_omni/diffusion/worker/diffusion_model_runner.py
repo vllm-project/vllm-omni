@@ -23,19 +23,23 @@ from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
+from vllm_omni.diffusion.cache.prompt_embed_cache import (
+    install_prompt_embed_cache,
+    resolve_prompt_embed_cache_config,
+)
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import supports_step_execution, supports_micro_step_execution
+from vllm_omni.diffusion.models.interface import supports_micro_step_execution, supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, Layout
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
-from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput, ChunkState
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, ChunkState, DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -72,6 +76,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.pipeline = None
         self.cache_backend = None
         self.offload_backend = None
+        self.prompt_embed_cache = None
 
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, DiffusionRequestState] = {}
@@ -98,7 +103,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self,
         memory_pool_context_fn: callable | None = None,
         load_format: str | None = None,
-        custom_pipeline_name: str | None = None,
+        custom_pipeline_name: str | type | None = None,
     ) -> None:
         """
         Load the diffusion model, apply compilation and offloading.
@@ -195,11 +200,37 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             else:
                 self.cache_backend.enable(self.pipeline)
 
+        # Install prompt-embedding cache (transparent wrapper around
+        # ``pipeline.encode_prompt``). Enabled via config or env var; a no-op
+        # when the pipeline does not expose ``encode_prompt``.
+        enable_pec, pec_size = resolve_prompt_embed_cache_config(
+            enable=getattr(self.od_config, "enable_prompt_embed_cache", False),
+            max_size=getattr(self.od_config, "prompt_embed_cache_size", 32),
+        )
+        if enable_pec:
+            self.prompt_embed_cache = install_prompt_embed_cache(
+                self.pipeline,
+                max_size=pec_size,
+                enabled=True,
+                model_tag=self.od_config.model_class_name,
+            )
+
         logger.info("Model runner: Initialization complete.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights into the pipeline."""
         return self.pipeline.load_weights(weights)
+
+    def clear_prompt_embed_cache(self) -> None:
+        """Evict all cached text-encoder outputs (e.g. between training epochs)."""
+        if self.prompt_embed_cache is not None:
+            self.prompt_embed_cache.clear()
+
+    def get_prompt_embed_cache_stats(self) -> dict | None:
+        """Return hit/miss statistics for the prompt-embedding cache, if enabled."""
+        if self.prompt_embed_cache is None:
+            return None
+        return self.prompt_embed_cache.stats()
 
     def _record_peak_memory(self, output: DiffusionOutput) -> None:
         """Record peak GPU memory for the current forward pass into output.
@@ -307,6 +338,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary:
                 self._record_peak_memory(output)
 
+            # Log prompt-embed cache activity (hits/misses accumulate across requests).
+            if is_primary and self.prompt_embed_cache is not None:
+                logger.debug("prompt-embed cache: %s", self.prompt_embed_cache.stats())
+
             # NOTE:
             if (
                 self.cache_backend is not None
@@ -330,50 +365,44 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self, scheduler_output: DiffusionSchedulerOutput
     ) -> tuple[list[DiffusionRequestState], list[str]]:
         """Step-before update: cleanup finished requests and get/create one running state."""
-        for req_id in scheduler_output.finished_req_ids:
-            self.state_cache.pop(req_id, None)
+        for request_id in scheduler_output.finished_req_ids:
+            self.state_cache.pop(request_id, None)
 
         resolved: list[DiffusionRequestState] = []
-        new_req_id: list[str] = []
+        new_request_ids: list[str] = []
         try:
             # process new requests
             for sched_new_req in scheduler_output.scheduled_new_reqs:
-                # new_req_data = scheduler_output.scheduled_new_reqs[0]
-                req_id = sched_new_req.sched_req_id
+                request_id = sched_new_req.request_id
                 req = sched_new_req.req
-                new_req_id.append(req_id)
-                if req_id in self.state_cache:
-                    raise ValueError(f"Received duplicate new-request payload for cached request {req_id}.")
-                request_ids = req.request_ids or [req_id]
-                if len(request_ids) != len(req.prompts):
-                    raise ValueError(
-                        f"request_ids length ({len(request_ids)}) does not match prompts length ({len(req.prompts)})"
-                    )
+                new_request_ids.append(request_id)
+                if request_id in self.state_cache:
+                    raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
                 new_state = DiffusionRequestState(
-                    req_id=req_id,
+                    request_id=request_id,
                     sampling=copy.deepcopy(req.sampling_params),
                     prompts=req.prompts,
                 )
-                self.state_cache[req_id] = new_state
+                self.state_cache[request_id] = new_state
                 resolved.append(new_state)
 
             # process cached requests
-            for req_id in scheduler_output.scheduled_cached_reqs.sched_req_ids:
-                state = self.state_cache.get(req_id)
+            for request_id in scheduler_output.scheduled_cached_reqs.request_ids:
+                state = self.state_cache.get(request_id)
                 if state is None:
-                    raise ValueError(f"Missing cached state for request {req_id}.")
+                    raise ValueError(f"Missing cached state for request {request_id}.")
                 resolved.append(state)
         except Exception:
-            for req_id in new_req_id:
-                self.state_cache.pop(req_id, None)
+            for request_id in new_request_ids:
+                self.state_cache.pop(request_id, None)
             raise
 
-        return resolved, new_req_id
+        return resolved, new_request_ids
 
     def _prepare_batch_inputs(self, states: list[DiffusionRequestState], new_request_ids: list[str]) -> InputBatch:
         # process new reqs
         for state in states:
-            if state.req_id in new_request_ids:
+            if state.request_id in new_request_ids:
                 # set generator
                 if state.sampling.generator is None and state.sampling.seed is not None:
                     if state.sampling.generator_device is not None:
@@ -415,7 +444,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         for state in states:
             if interrupted or state.denoise_completed:
-                self.state_cache.pop(state.req_id, None)
+                self.state_cache.pop(state.request_id, None)
 
     def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
         model_state = getattr(self, "model_state", None)
@@ -457,7 +486,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     for state in states:
                         runner_output_list.append(
                             RunnerOutput(
-                                req_id=state.req_id,
+                                request_id=state.request_id,
                                 step_index=state.step_index,
                                 finished=True,
                                 result=DiffusionOutput(error="stepwise denoise interrupted"),
@@ -478,7 +507,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             result = None
                         runner_output_list.append(
                             RunnerOutput(
-                                req_id=req.req_id,
+                                request_id=req.request_id,
                                 step_index=req.step_index,
                                 finished=req.denoise_completed,
                                 result=result,
@@ -494,6 +523,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self._update_states_after(states, input_batch, pipeline_interrupted)
 
                 return BatchRunnerOutput.from_list(runner_output_list)
+
     # ------------------------------------------------------------------
     # Temporal-PP micro-step execution
     # ------------------------------------------------------------------
@@ -522,11 +552,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         with grad_context:
             states, new_request_ids = self._update_states(sched_output)
             if len(states) != 1:
-                raise ValueError(
-                    f"Micro-step mode supports exactly one running request, got {len(states)}."
-                )
+                raise ValueError(f"Micro-step mode supports exactly one running request, got {len(states)}.")
             state = states[0]
-            is_new_request = state.req_id in new_request_ids
+            is_new_request = state.request_id in new_request_ids
 
             if is_new_request:
                 if state.sampling.generator is None and state.sampling.seed is not None:
@@ -560,15 +588,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                 if chunk_idxs:
                     state.extra["current_chunk_idxs"] = chunk_idxs
-                    
-                    chunks: list[ChunkState] = [
-                        self._get_or_create_chunk(state, idx)[0] for idx in chunk_idxs
-                    ]
+
+                    chunks: list[ChunkState] = [self._get_or_create_chunk(state, idx)[0] for idx in chunk_idxs]
 
                     # Per-row timesteps
-                    state.batched_timesteps = torch.stack(
-                        [state.timesteps[c.step_index] for c in chunks]
-                    )
+                    state.batched_timesteps = torch.stack([state.timesteps[c.step_index] for c in chunks])
 
                     batch_size = len(chunks)
                     noise_pred = self.pipeline.denoise_step(state, batch_size=batch_size)
@@ -576,14 +600,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     if noise_pred is None and getattr(self.pipeline, "interrupt", False):
                         self._update_state_after(state, layout, finished=True)
                         return RunnerOutput(
-                            req_id=state.req_id,
+                            request_id=state.request_id,
                             finished=True,
                             result=DiffusionOutput(error="micro-step denoise interrupted"),
                         )
 
                     schedulers = [c.scheduler for c in chunks]
                     self.pipeline.step_scheduler(
-                        state, noise_pred, per_request_scheduler=schedulers, batch_size=batch_size,
+                        state,
+                        noise_pred,
+                        per_request_scheduler=schedulers,
+                        batch_size=batch_size,
                     )
 
                     for c in chunks:
@@ -599,12 +626,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                 self._update_state_after(state, layout, finished=finished)
                 return RunnerOutput(
-                    req_id=state.req_id,
+                    request_id=state.request_id,
                     finished=finished,
                     result=result,
-                    micro_step_wall_ns=(
-                        time.perf_counter_ns() - t_start_ns if t_start_ns is not None else None
-                    ),
+                    micro_step_wall_ns=(time.perf_counter_ns() - t_start_ns if t_start_ns is not None else None),
                 )
 
     @staticmethod
@@ -617,7 +642,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         chunk.scheduler = copy.deepcopy(state.scheduler)
         chunks[chunk_idx] = chunk
         return chunk, True
-    
+
     def _prepare_chunk_latents(self, state: DiffusionRequestState, layout: Layout, is_first_rank: bool):
         pieces: list[torch.Tensor] = []
 
@@ -648,9 +673,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             state.latents = saved
 
             state.extra.setdefault("decoded_chunks", []).append(decoded)
-            state.extra["chunks_decoded"] = (
-                state.extra.get("chunks_decoded", 0) + n_finished
-            )
+            state.extra["chunks_decoded"] = state.extra.get("chunks_decoded", 0) + n_finished
 
         if state.extra.get("chunks_decoded", 0) >= state.sampling.num_chunks:
             return self._merge_chunk_outputs(state.extra["decoded_chunks"])
@@ -660,10 +683,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def _update_state_after(self, state: DiffusionRequestState, layout: Layout, finished: bool = False):
         for idx in layout.finished_idxs:
             state.extra.get("chunks", {}).pop(idx, None)
-        
+
         if finished:
-            self.state_cache.pop(state.req_id, None)
-    
+            self.state_cache.pop(state.request_id, None)
+
     @staticmethod
     def _merge_chunk_outputs(chunks: list[DiffusionOutput]) -> DiffusionOutput:
         """Merge decoded chunk outputs along the temporal axis.

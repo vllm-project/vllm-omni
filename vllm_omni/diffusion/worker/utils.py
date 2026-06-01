@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -39,7 +38,7 @@ class DiffusionRequestState:
     """
 
     # ── Identity / request-level inputs ──
-    req_id: str
+    request_id: str
     sampling: OmniDiffusionSamplingParams
     prompts: list[OmniPromptType] | None = None
 
@@ -130,7 +129,7 @@ class ChunkState:
 
 class BaseRunnerOutput(ABC):
     @abstractmethod
-    def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
+    def get_request_output(self, request_id: str) -> RunnerOutput | None:
         pass
 
 
@@ -147,7 +146,7 @@ class RunnerOutput(BaseRunnerOutput):
     Fields not relevant to an execution path are left as ``None`` / ``False``.
     """
 
-    req_id: str
+    request_id: str
     step_index: int | None = None
     finished: bool = False
     result: DiffusionOutput | None = None
@@ -155,8 +154,8 @@ class RunnerOutput(BaseRunnerOutput):
     # ── Temporal-PP micro-step fields ──
     micro_step_wall_ns: int | None = None
 
-    def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
-        return self if self.req_id == sched_req_id else None
+    def get_request_output(self, request_id: str) -> RunnerOutput | None:
+        return self if self.request_id == request_id else None
 
 
 @dataclass
@@ -165,18 +164,18 @@ class BatchRunnerOutput(BaseRunnerOutput):
     _id_to_idx: dict[str, int] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._id_to_idx = {out.req_id: i for i, out in enumerate(self.runner_outputs)}
+        self._id_to_idx = {out.request_id: i for i, out in enumerate(self.runner_outputs)}
 
-    def __getitem__(self, req_id: str) -> RunnerOutput | None:
-        """access single RunnerOutput by req_id"""
-        idx = self._id_to_idx.get(req_id)
+    def __getitem__(self, request_id: str) -> RunnerOutput | None:
+        """access single RunnerOutput by request_id"""
+        idx = self._id_to_idx.get(request_id)
         return self.runner_outputs[idx] if idx is not None else None
 
-    def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
-        return self[sched_req_id]
+    def get_request_output(self, request_id: str) -> RunnerOutput | None:
+        return self[request_id]
 
     @property
-    def req_ids(self) -> list[str]:
+    def request_ids(self) -> list[str]:
         return list(self._id_to_idx.keys())
 
     def __len__(self) -> int:

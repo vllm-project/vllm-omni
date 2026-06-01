@@ -416,7 +416,7 @@ class Orchestrator:
         stage_id = 0
         request_id = msg.request_id
         request = msg.prompt
-
+        final_stage_id = msg.final_stage_id
         req_state = self.request_states.get(request_id)
         if req_state is None:
             logger.warning(
@@ -448,6 +448,9 @@ class Orchestrator:
             request,
             prompt_text=msg.output_prompt_text,
         )
+
+        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+            await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -741,7 +744,10 @@ class Orchestrator:
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
 
+        # CFG companion: stash output so parent can bundle [parent, *companions]
+        # into source_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):
+            self._cfg_tracker.set_companion_output(req_id, output)
             await self._handle_cfg_companion_ready(req_id)
             await self._cleanup_request_ids([req_id])
             return
@@ -933,12 +939,34 @@ class Orchestrator:
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
 
         if next_pool.stage_type == "diffusion":
+            companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
+            expected = len(self._cfg_tracker.get_companion_request_ids(req_id))
+            if expected > len(companion_outputs):
+                logger.warning(
+                    "[Orchestrator] req=%s: only %d/%d CFG companion outputs arrived; "
+                    "downstream CFG conditioning may degrade",
+                    req_id,
+                    len(companion_outputs),
+                    expected,
+                )
+            diffusion_source_outputs = [output, *companion_outputs]
             if next_client.custom_process_input_func is not None:
                 _t_ar2d = _time.perf_counter()
-                diffusion_prompt = next_client.custom_process_input_func(
-                    source_outputs,
+                _fn = next_client.custom_process_input_func
+                _extra_kwargs: dict[str, Any] = {}
+                # TODO: replace signature probe with explicit kwarg contract.
+                try:
+                    import inspect as _inspect
+
+                    if "sampling_params" in _inspect.signature(_fn).parameters:
+                        _extra_kwargs["sampling_params"] = params
+                except (TypeError, ValueError):
+                    pass
+                diffusion_prompt = _fn(
+                    diffusion_source_outputs,
                     req_state.prompt,
                     requires_multimodal_data,
+                    **_extra_kwargs,
                 )
                 _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
                 req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
@@ -1135,12 +1163,13 @@ class Orchestrator:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-
+                downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
+                    resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)

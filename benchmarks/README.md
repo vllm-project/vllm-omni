@@ -1,44 +1,60 @@
-# Benchmarks Overview and Architecture
+# Benchmarks
 
-This document explains the benchmark architecture across all benchmark assets in this repo. It describes what we measure, and where to find or plug in new scenarios. Per-task details remain in subfolder READMEs (e.g., `benchmarks/<model>/README.md`).
+This directory contains benchmark suites for evaluating different model families and infrastructure components in vLLM-Omni. Each subfolder targets a different benchmark family with its own scripts, configs, and metrics. See the per-subfolder READMEs for detailed usage.
 
-## Scope and goals
-- Establish repeatable latency/throughput measurements for multimodal LLM pipelines.
-- Provide both HF Transformers (offline) and vLLM-Omni (multi-stage/pipeline) baselines.
-- Make it easy to plug in new datasets and models with minimal changes to the runner scripts.
+## Benchmark families
 
-## Dataset and inputs
-- Default example: SeedTTS top-100 prompts (`benchmarks/build_dataset/top100.txt`) via `benchmarks/build_dataset/`.
-- Extensible: drop in new prompt files or modality-aligned payloads; keep the expected format for the consuming scripts (e.g., one prompt per line).
-- If you add a new dataset, document it under `benchmarks/<model>/README.md` and point scripts to your data path.
+### [TTS](tts/README.md) — Text-to-Speech
 
-## Directory layout
-- `benchmarks/build_dataset/` — dataset prep utilities (e.g., SeedTTS top100).
-- `benchmarks/<model>/vllm_omni/` — vLLM-Omni pipeline benchmarks, logs, outputs.
-- `benchmarks/accuracy/` — accuracy benchmark integrations that adapt external
-  benchmark suites to vLLM-Omni serving and evaluation flows.
-- Add new tasks under `benchmarks/<model>/...` with the same pattern: `transformers/`, `vllm_omni/`, task-specific README, and (optionally) dataset prep notes.
+Model-agnostic serving benchmarks for TTS models, including Qwen3-TTS and VoxCPM2.
 
-## Reference workflows
-- **HF Transformers (offline, single process)**  
-  Script (example): `benchmarks/<model>/transformers/eval_qwen3_moe_omni_transformers.sh`  
-  Outputs: `benchmark_results/perf_stats.json`, `benchmark_results/results.json`, `benchmark_results/audio/` (if audio is produced).
+- **Layout**: `tts/bench_tts.py` (serving benchmark driver), `tts/model_configs.yaml` (model registry), `tts/plot_results.py` (result plotting)
+- **Dataset**: Seed-TTS full or text-only datasets, plus bundled smoke/design prompts under `build_dataset/`
+- **Key metrics**: TTFP (time to first audio packet), E2E latency, RTF (real-time factor), throughput (audio seconds / wall-clock second)
 
-- **vLLM-Omni end-to-end pipeline**  
-  Script (example): `benchmarks/<model>/vllm_omni/eval_qwen3_moe_omni.sh`  
-  Outputs: `vllm_omni/logs/*.stats.jsonl` (per-stage/overall latency & TPS), `vllm_omni/logs/stage*.log`, `vllm_omni/outputs/` (text/audio artifacts).
+### [Diffusion](diffusion/README.md) — Image and Video Generation
 
-- **Adding a new task/model**  
-  1) Create `benchmarks/<model>/transformers/` and/or `benchmarks/<model>/vllm_omni/` with scripts referencing your model and dataset.  
-  2) Add a task README describing dataset, configs, and expected outputs.  
-  3) Keep the output/log structure similar for easy comparison (perf_stats/results/audio or text outputs; stats.jsonl/logs for pipeline).
+Online-serving benchmark for diffusion image/video models, sending requests to the configured vLLM serving endpoint (`/v1/chat/completions`, `/v1/images/generations`, or `/v1/videos`, depending on backend/task).
 
-## Metrics to watch
-- **Throughput**: `overall_tps`, `*_tps_avg` per stage.
-- **Latency distribution**: look for long tails in `*.stats.jsonl`.
-- **Quality/completeness**: missing outputs or errors in stage logs indicate pipeline failures or misconfigurations.
+- **Tasks**: text-to-image, text-to-video, image-to-image, image-to-video, text+image-to-image, text+image-to-video
+- **Datasets**: `vbench`, `trace`, `random`
+- **Key metrics**: request throughput, latency percentiles, optional SLO attainment
 
-## Troubleshooting
-- Verify GPU/driver/FlashAttention2 requirements for your chosen model/config.
-- Ensure network access for dataset/model downloads (Google Drive, Hugging Face, etc.).
-- If outputs are missing or slow, inspect per-stage logs and `*.stats.jsonl` for errors, stragglers, or contention.
+### [GLM-Image](glm_image/README.md) — Text-to-Image and Image-to-Image
+
+Benchmarks for GLM-Image performance across HuggingFace baseline, vLLM-Omni offline inference, and vLLM-Omni online serving.
+
+- **Layout**: `glm_image/huggingface/` (HF baseline), `glm_image/vllm-omni/` (offline inference), `glm_image/benchmark_glm_image.py` (online serving)
+- **Tasks**: text-to-image and image-to-image
+- **Key metrics**: request/image throughput, latency percentiles, optional per-stage pipeline timings
+
+### [Distributed](distributed/omni_connectors/README.md) — RDMA Connector Testing
+
+RDMA environment setup and transfer tests for `MooncakeTransferEngineConnector`, including pytest-based single-node checks and manual cross-node benchmarks.
+
+- **Transfer modes**: `copy`, `zerocopy`, `gpu` (GPUDirect)
+- **Supports**: single-node pytest suites and manual multi-node/cross-node transfer testing
+
+### [Accuracy](accuracy/README.md) — Image Generation and Editing Quality
+
+Accuracy benchmarks for image generation/editing models, adapting external suites to vLLM-Omni serving and local judge-evaluation flows.
+
+- **Layout**: `accuracy/text_to_image/` (GEBench), `accuracy/image_to_image/` (GEdit-Bench)
+- **Method**: generation and judge scoring both run through local `vllm-omni serve` endpoints
+
+### Common serving metrics framework
+
+`vllm_omni/benchmarks/` extends `vllm bench serve --omni` with Omni-specific datasets, backends, and multimodal metrics. Key metrics include:
+
+- **Text output**: TTFT (time to first token), TPOT (time per output token), ITL (inter-token latency)
+- **Audio output**: TTFP (time to first audio packet), E2E latency, RTF (real-time factor)
+- **Throughput**: request throughput, output token throughput, total token throughput, audio throughput
+
+See `vllm_omni/benchmarks/serve.py` for the `vllm bench serve --omni` runner wrapper and `vllm_omni/benchmarks/metrics/` for Omni metric definitions.
+
+## Adding a new benchmark
+
+1. Create a subfolder under `benchmarks/<name>/` with scripts, configs if needed, and a `README.md`.
+2. If comparing against another runtime, use clear backend subfolders where applicable, such as `huggingface/` and `vllm-omni/`, or follow the shared TTS serving benchmark pattern in `tts/`.
+3. Add reusable dataset or prompt-building utilities to `build_dataset/` if applicable.
+4. Update this README with a link to the new benchmark family.

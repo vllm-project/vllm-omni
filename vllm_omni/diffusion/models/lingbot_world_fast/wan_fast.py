@@ -26,7 +26,7 @@ from .wan_model import WanLayerNorm, WanRMSNorm, WanSelfAttention, rope_params, 
 def causal_rope_apply(x, grid_sizes, freqs, start_frames=0):
     """Apply causal rotary position embedding per batch row.
 
-    start_frames: int or list[int] of per-row frame offsets. 
+    start_frames: int or list[int] of per-row frame offsets.
     An int broadcasts to all rows.
     """
     n, c = x.size(2), x.size(3) // 2
@@ -141,9 +141,7 @@ class CausalWanSelfAttention(nn.Module):
             sink_tokens = self.sink_size * frame_seqlen
             kv_cache_size = kv_cache[CacheIndex.K].shape[1]
 
-            if (current_end > global_end_index.item()) and (
-                num_new_tokens + local_end_index.item() > kv_cache_size
-            ):
+            if (current_end > global_end_index.item()) and (num_new_tokens + local_end_index.item() > kv_cache_size):
                 num_evicted_tokens = num_new_tokens + local_end_index.item() - kv_cache_size
                 num_rolled_tokens = local_end_index.item() - num_evicted_tokens - sink_tokens
                 kv_cache[CacheIndex.K][:, sink_tokens : sink_tokens + num_rolled_tokens] = kv_cache[CacheIndex.K][
@@ -597,9 +595,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
             if y is not None:
                 x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
             x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-            grid_sizes = torch.stack(
-                [torch.tensor(u.shape[2:], dtype=torch.long, device=device) for u in x]
-            )
+            grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long, device=device) for u in x])
             x = [u.flatten(2).transpose(1, 2) for u in x]
             seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long, device=device)
             assert seq_lens.max() <= seq_len
@@ -621,9 +617,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 t_full = t
             bt, btn = t_full.shape
             t_flat = t_full.flatten()
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t_flat).unflatten(0, (bt, btn)).float()
-            )
+            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t_flat).unflatten(0, (bt, btn)).float())
             e0 = self.time_projection(e).unflatten(2, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 

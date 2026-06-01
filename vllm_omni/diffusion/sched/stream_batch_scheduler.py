@@ -39,7 +39,7 @@ class _InFlightChunk:
 
 @dataclass
 class _Progress:
-    sched_req_id: str
+    request_id: str
     pp_size: int
     chunk_frames: int
     num_chunks: int
@@ -73,31 +73,38 @@ class _SLOController:
 
     def register(
         self,
-        sched_req_id: str,
+        request_id: str,
         slo_fps: float | None,
         max_batch: int,
         chunk_frames: int,
     ) -> None:
         if slo_fps is None or slo_fps <= 0:
             return
-        self._reqs[sched_req_id] = _SLOReqState(
+        self._reqs[request_id] = _SLOReqState(
             slo_fps=float(slo_fps),
             max_batch=max(1, max_batch),
             chunk_frames=max(1, chunk_frames),
         )
 
-    def get_target(self, sched_req_id: str) -> int:
-        st = self._reqs.get(sched_req_id)
+    def get_target(self, request_id: str) -> int:
+        st = self._reqs.get(request_id)
         return st.batch_size if st is not None else 1
 
-    def mark_warmed_up(self, sched_req_id: str) -> None:
-        st = self._reqs.get(sched_req_id)
+    def mark_warmed_up(self, request_id: str) -> None:
+        st = self._reqs.get(request_id)
         if st is not None:
             st.warmed_up = True
 
-    def observe(self, sched_req_id: str, latency_ns: int | None, b_current: int | None) -> None:
-        st = self._reqs.get(sched_req_id)
-        if st is None or not st.warmed_up or latency_ns is None or latency_ns <= 0 or b_current is None or b_current <= 0:
+    def observe(self, request_id: str, latency_ns: int | None, b_current: int | None) -> None:
+        st = self._reqs.get(request_id)
+        if (
+            st is None
+            or not st.warmed_up
+            or latency_ns is None
+            or latency_ns <= 0
+            or b_current is None
+            or b_current <= 0
+        ):
             return
 
         budget = (b_current * st.chunk_frames / st.slo_fps) * 1e9
@@ -111,12 +118,16 @@ class _SLOController:
         if new_b != st.batch_size:
             logger.info(
                 "SLO[%s]: B_target %d -> %d (latency=%.2fms budget=%.2fms)",
-                sched_req_id, st.batch_size, new_b, latency_ns / 1e6, budget / 1e6,
+                request_id,
+                st.batch_size,
+                new_b,
+                latency_ns / 1e6,
+                budget / 1e6,
             )
             st.batch_size = new_b
 
-    def unregister(self, sched_req_id: str) -> None:
-        self._reqs.pop(sched_req_id, None)
+    def unregister(self, request_id: str) -> None:
+        self._reqs.pop(request_id, None)
 
 
 class StreamBatchScheduler(_BaseScheduler):
@@ -150,24 +161,20 @@ class StreamBatchScheduler(_BaseScheduler):
         self._progress.clear()
         self._slo = _SLOController()
 
-    def _pop_extra_request_state(self, sched_req_id: str) -> None:
-        self._progress.pop(sched_req_id, None)
-        self._slo.unregister(sched_req_id)
+    def _pop_extra_request_state(self, request_id: str) -> None:
+        self._progress.pop(request_id, None)
+        self._slo.unregister(request_id)
 
     # ── Request admission ──────────────────────────────────────────────────
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         sampling = request.sampling_params
         if sampling.chunk_frames is None or sampling.chunk_frames <= 0:
-            raise ValueError(
-                f"chunk_frames must be a positive int when stream_batch=True, got {sampling.chunk_frames}"
-            )
+            raise ValueError(f"chunk_frames must be a positive int when stream_batch=True, got {sampling.chunk_frames}")
         if sampling.num_chunks is None or sampling.num_chunks <= 0:
             raise ValueError(f"num_chunks must be a positive int, got {sampling.num_chunks}")
         if sampling.num_inference_steps is None or sampling.num_inference_steps <= 0:
-            raise ValueError(
-                f"num_inference_steps must be a positive int, got {sampling.num_inference_steps}"
-            )
+            raise ValueError(f"num_inference_steps must be a positive int, got {sampling.num_inference_steps}")
         return super().add_request(request)
 
     # ── Scheduling ─────────────────────────────────────────────────────────
@@ -176,7 +183,7 @@ class StreamBatchScheduler(_BaseScheduler):
         base_output = super().schedule()
 
         for new_req in base_output.scheduled_new_reqs:
-            self._init_progress(new_req.sched_req_id, new_req.req)
+            self._init_progress(new_req.request_id, new_req.req)
 
         for progress in self._progress.values():
             self._advance_chunk_pipeline(progress)
@@ -186,32 +193,30 @@ class StreamBatchScheduler(_BaseScheduler):
 
         logger.info(
             "StreamBatchScheduler schedule: %d running req(s), assignment=%s",
-            len(self._running), base_output.assignment,
+            len(self._running),
+            base_output.assignment,
         )
 
         return base_output
 
-    def _init_progress(self, sched_req_id: str, req: OmniDiffusionRequest) -> None:
+    def _init_progress(self, request_id: str, req: OmniDiffusionRequest) -> None:
         sampling = req.sampling_params
         chunk_frames = sampling.chunk_frames
         num_chunks = sampling.num_chunks
         num_steps = sampling.num_inference_steps
 
-        self._progress[sched_req_id] = _Progress(
-            sched_req_id=sched_req_id,
+        self._progress[request_id] = _Progress(
+            request_id=request_id,
             chunk_frames=chunk_frames,
             num_chunks=num_chunks,
             num_steps=num_steps,
             pp_size=self.pp_size,
             chunks_at=[deque() for _ in range(self.pp_size)],
-            layouts_at=[
-                Layout(circulating_idxs=[], finished_idxs=[], new_idxs=[])
-                for _ in range(self.pp_size)
-            ],
+            layouts_at=[Layout(circulating_idxs=[], finished_idxs=[], new_idxs=[]) for _ in range(self.pp_size)],
         )
 
         self._slo.register(
-            sched_req_id=sched_req_id,
+            request_id=request_id,
             slo_fps=sampling.slo_fps,
             max_batch=sampling.slo_max_batch,
             chunk_frames=chunk_frames,
@@ -220,7 +225,12 @@ class StreamBatchScheduler(_BaseScheduler):
         logger.debug(
             "StreamBatchScheduler initialized progress for %s "
             "(chunk_frames=%d, num_chunks=%d, num_steps=%d, slo_fps=%s, pp_size=%d)",
-            sched_req_id, chunk_frames, num_chunks, num_steps, sampling.slo_fps, self.pp_size,
+            request_id,
+            chunk_frames,
+            num_chunks,
+            num_steps,
+            sampling.slo_fps,
+            self.pp_size,
         )
 
     def _advance_chunk_pipeline(self, progress: _Progress) -> None:
@@ -251,7 +261,7 @@ class StreamBatchScheduler(_BaseScheduler):
             progress.chunks_at[0].append(chunk)
 
         output_chunks_remaining = progress.num_chunks - progress.next_chunk_idx
-        b_target = self._slo.get_target(progress.sched_req_id)
+        b_target = self._slo.get_target(progress.request_id)
         batch_size = min(b_target, output_chunks_remaining)
 
         new_idxs: list[int] = []
@@ -270,39 +280,39 @@ class StreamBatchScheduler(_BaseScheduler):
         )
 
         if finished_idxs:
-            self._slo.mark_warmed_up(progress.sched_req_id)
+            self._slo.mark_warmed_up(progress.request_id)
 
     def _build_assignment(self) -> list[RankTask]:
-        assert len(self._progress) <= 1 #TODO: support multiple requests
+        assert len(self._progress) <= 1  # TODO: support multiple requests
         assignment: list[RankTask] = []
         for progress in self._progress.values():
             for r in range(self.pp_size):
                 queue = progress.chunks_at[r]
-                assignment.append(RankTask(
-                    sched_req_id=progress.sched_req_id,
-                    chunk_indices=[c.chunk_idx for c in queue],
-                    layout=progress.layouts_at[r],
-                ))
+                assignment.append(
+                    RankTask(
+                        request_id=progress.request_id,
+                        chunk_indices=[c.chunk_idx for c in queue],
+                        layout=progress.layouts_at[r],
+                    )
+                )
         return assignment
 
     # ── Output processing ──────────────────────────────────────────────────
 
-    def update_from_output(
-        self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput
-    ) -> set[str]:
-        sched_req_ids = sched_output.scheduled_req_ids
-        if not sched_req_ids:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
+        request_ids = sched_output.scheduled_request_ids
+        if not request_ids:
             return set()
-        
-        assert len(sched_req_ids) == 1, "Multiple scheduled requests not supported"
-        
-        sched_req_id = output.req_id
 
-        assert sched_req_id == sched_req_ids[0]
+        assert len(request_ids) == 1, "Multiple scheduled requests not supported"
 
-        progress = self._progress.get(sched_req_id)
+        request_id = output.request_id
+
+        assert request_id == request_ids[0]
+
+        progress = self._progress.get(request_id)
         if progress is not None and output.micro_step_wall_ns is not None:
-            self._slo.observe(sched_req_id, output.micro_step_wall_ns, progress.batch_size)
+            self._slo.observe(request_id, output.micro_step_wall_ns, progress.batch_size)
 
         terminal: dict[str, DiffusionRequestStatus] = {}
         terminal_errors: dict[str, str | None] = {}
@@ -310,9 +320,9 @@ class StreamBatchScheduler(_BaseScheduler):
         if progress is not None:
             err = output.result.error if output.result is not None else None
             if err is not None:
-                terminal[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
-                terminal_errors[sched_req_id] = err
+                terminal[request_id] = DiffusionRequestStatus.FINISHED_ERROR
+                terminal_errors[request_id] = err
             elif output.finished:
-                terminal[sched_req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
+                terminal[request_id] = DiffusionRequestStatus.FINISHED_COMPLETED
 
         return self._finalize_update_from_output(sched_output, terminal, terminal_errors)

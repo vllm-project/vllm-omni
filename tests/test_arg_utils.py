@@ -164,7 +164,8 @@ def test_split_mixed_real_world():
     # orchestrator-only keys never reach engine
     assert "stage_init_timeout" not in engine
     assert "deploy_config" not in engine
-    assert "async_chunk" not in engine
+    # async_chunk is in SHARED_FIELDS so it flows to both
+    assert "async_chunk" in engine
 
 
 # ============================================================================
@@ -172,24 +173,47 @@ def test_split_mixed_real_world():
 # ============================================================================
 
 
-def test_user_typed_unclassified_warns(caplog):
+def test_user_typed_unclassified_warns(monkeypatch):
     """If the user types a flag we can't route, warn — don't silently drop."""
-    raw = {"bogus_flag": "value", "max_num_seqs": 64}
-    with caplog.at_level(logging.WARNING, logger="vllm_omni.engine.arg_utils"):
+    import io
+
+    buf = io.StringIO()
+    vllm_logger = logging.getLogger("vllm")
+    orig_handlers = list(vllm_logger.handlers)
+    vllm_logger.handlers.clear()
+    handler = logging.StreamHandler(buf)
+    handler.setLevel(logging.WARNING)
+    vllm_logger.addHandler(handler)
+    try:
+        raw = {"bogus_flag": "value", "max_num_seqs": 64}
         split_kwargs(raw, engine_cls=_FakeEngineArgs, user_typed={"bogus_flag"})
-    assert any("bogus_flag" in rec.message for rec in caplog.records), (
-        f"Expected warning mentioning 'bogus_flag', got: {[rec.message for rec in caplog.records]}"
-    )
+        assert "bogus_flag" in buf.getvalue(), f"Expected 'bogus_flag' in log output, got: {buf.getvalue()!r}"
+    finally:
+        vllm_logger.handlers.clear()
+        for h in orig_handlers:
+            vllm_logger.addHandler(h)
 
 
-def test_unclassified_without_user_typed_silent(caplog):
+def test_unclassified_without_user_typed_silent():
     """Without user_typed, unclassified keys drop silently (argparse defaults
     for server flags shouldn't spam logs on every launch)."""
-    raw = {"host": "0.0.0.0", "port": 8091, "max_num_seqs": 64}
-    with caplog.at_level(logging.WARNING, logger="vllm_omni.engine.arg_utils"):
+    import io
+
+    vllm_logger = logging.getLogger("vllm")
+    orig_handlers = list(vllm_logger.handlers)
+    vllm_logger.handlers.clear()
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setLevel(logging.WARNING)
+    vllm_logger.addHandler(handler)
+    try:
+        raw = {"host": "0.0.0.0", "port": 8091, "max_num_seqs": 64}
         split_kwargs(raw, engine_cls=_FakeEngineArgs, user_typed=None)
-    # No warnings because we don't know these were user-typed.
-    assert not any("host" in rec.message or "port" in rec.message for rec in caplog.records)
+        assert "host" not in buf.getvalue()
+    finally:
+        vllm_logger.handlers.clear()
+        for h in orig_handlers:
+            vllm_logger.addHandler(h)
 
 
 # ============================================================================
@@ -290,7 +314,7 @@ def test_internal_blacklist_keys_derived_from_orchestrator():
     # Spot-check expected entries
     assert "stage_init_timeout" in blacklist
     assert "deploy_config" in blacklist
-    assert "async_chunk" in blacklist
+    assert "async_chunk" not in blacklist  # now in SHARED_FIELDS
     # Shared fields must NOT appear — they flow to both orchestrator and engine
     assert "model" not in blacklist
     assert "log_stats" not in blacklist
@@ -339,18 +363,31 @@ def test_ambiguous_field_strict_raises():
         split_kwargs({"deploy_config": "x"}, engine_cls=_AmbiguousEngine, strict=True)
 
 
-def test_ambiguous_field_non_strict_routes_to_orchestrator(caplog):
+def test_ambiguous_field_non_strict_routes_to_orchestrator():
     """strict=False logs ERROR but routes the ambiguous field to orchestrator."""
 
     @dataclass
     class _AmbiguousEngine:
         deploy_config: str | None = None
 
-    with caplog.at_level(logging.ERROR, logger="vllm_omni.engine.arg_utils"):
+    import io
+
+    vllm_logger = logging.getLogger("vllm")
+    orig_handlers = list(vllm_logger.handlers)
+    vllm_logger.handlers.clear()
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setLevel(logging.ERROR)
+    vllm_logger.addHandler(handler)
+    try:
         orch, engine = split_kwargs({"deploy_config": "x"}, engine_cls=_AmbiguousEngine, strict=False)
-    assert orch.deploy_config == "x"
-    assert "deploy_config" not in engine
-    assert any("both OrchestratorArgs" in r.message for r in caplog.records)
+        assert orch.deploy_config == "x"
+        assert "deploy_config" not in engine
+        assert "both OrchestratorArgs" in buf.getvalue()
+    finally:
+        vllm_logger.handlers.clear()
+        for h in orig_handlers:
+            vllm_logger.addHandler(h)
 
 
 # Sentinel-default precedence invariants (#3035)
@@ -393,16 +430,19 @@ def test_nullify_stage_engine_defaults_resets_inherited_defaults():
 def test_non_override_flags_keep_real_defaults_after_nullify():
     import argparse
 
+    from vllm_omni.config.stage_config import deploy_override_field_names
     from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hsdp-shard-size", type=int, default=-1, help="HSDP shard size.")
+    parser.add_argument("--batch-timeout", type=int, default=10, help="Batch timeout.")
     parser.add_argument("--max-num-seqs", type=int, default=64, help="Max num seqs.")
     nullify_stage_engine_defaults(parser)
 
-    hsdp = next(a for a in parser._actions if a.dest == "hsdp_shard_size")
+    assert "batch_timeout" not in deploy_override_field_names()
+
+    batch_timeout = next(a for a in parser._actions if a.dest == "batch_timeout")
     max_num_seqs = next(a for a in parser._actions if a.dest == "max_num_seqs")
-    assert hsdp.default == -1
+    assert batch_timeout.default == 10
     assert max_num_seqs.default is None
 
 
@@ -423,24 +463,20 @@ def test_help_text_preserves_default_after_nullify():
 
 _OMNIENGINEARGS_USER_INPUT_FIELDS = frozenset(
     {
-        "model_stage",
         "model_arch",
         "engine_output_type",
         "hf_config_name",
         "custom_process_next_stage_input_func",
         "subtalker_sampling_params",
-        "async_chunk",
         "omni_kv_config",
         "quantization_config",
         "worker_type",
         "task_type",
         "worker_cls",
-        "enable_sleep_mode",
         "omni_master_address",
         "omni_master_port",
         "stage_configs_path",
         "output_modalities",
-        "log_stats",
         "custom_pipeline_args",
     }
 )

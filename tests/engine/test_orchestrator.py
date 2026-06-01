@@ -964,6 +964,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
 
     pool = RecordingPool()
     orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = False
     orchestrator.request_states = {
         "req-stream": OrchestratorRequestState(
             request_id="req-stream",
