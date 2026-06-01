@@ -398,6 +398,8 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
+    if args.resolution and (args.width or args.height):
+        raise ValueError("--resolution and --width/--height cannot be specified together")
     if args.width is not None and args.width <= 0:
         raise ValueError("--width must be a positive integer")
     if args.height is not None and args.height <= 0:
