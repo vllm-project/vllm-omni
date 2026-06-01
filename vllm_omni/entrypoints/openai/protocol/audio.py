@@ -57,12 +57,6 @@ class WordTimestamp(BaseModel):
     word: str = Field(description="Aligned token (word for spaced languages, character for CJK).")
     start_ms: int = Field(ge=0, description="Start offset within the sentence, milliseconds.")
     end_ms: int = Field(ge=0, description="End offset within the sentence, milliseconds (>= start_ms).")
-    confidence: float | None = Field(
-        default=None,
-        ge=0.0,
-        le=1.0,
-        description="Optional alignment confidence in [0, 1]. None when the aligner does not score.",
-    )
 
     @model_validator(mode="after")
     def _validate_range(self) -> "WordTimestamp":

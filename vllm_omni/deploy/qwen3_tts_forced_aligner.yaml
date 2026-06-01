@@ -24,19 +24,22 @@ forced_aligner:
   runner: pooling
   architecture: Qwen3ASRForcedAlignerForTokenClassification
   pooling_task: token_classify
-  audio_placeholder: "<|audio_start|><|audio_pad|><|audio_end|>"
-  timestamp_token: "<timestamp>"
-
-  # Optional CUDA device for the in-process aligner. Omit to use the
-  # process default device. Override with --forced-aligner-device.
-  # device: cuda:1
+  # Note: the prompt tokens (audio placeholder, <timestamp> marker) are not
+  # configurable here — they are baked into forced_aligner._build_prompt
+  # alongside the Qwen-specific chat template and word splitter.
 
   # GPU memory cap for the aligner LLM. The aligner runs in the API
-  # server process, so this carves into the same GPU as the TTS
-  # workers. Set conservatively for the smallest deployment target
-  # (24 GB consumer cards); raise on H100-class boxes.
+  # server process, so by default it carves into the same GPU (cuda:0)
+  # as the TTS workers. Set conservatively for the smallest deployment
+  # target (24 GB consumer cards); raise on H100-class boxes.
   # Override with --forced-aligner-gpu-memory-utilization.
   gpu_memory_utilization: 0.30
+
+  # Optional: pin the aligner to a dedicated GPU (physical device index,
+  # e.g. "7") so it does not compete with the TTS stages for memory.
+  # The card must be visible to the API server process. Override with
+  # --forced-aligner-device. Leave unset to share cuda:0 with the TTS stages.
+  # device: "7"
 
   # FP16 for compute, BF16 also fine on Hopper. The classifier head
   # uses model dtype (not head_dtype) so this choice flows through.

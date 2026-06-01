@@ -177,16 +177,11 @@ class TestStreamingSpeechWebSocket:
                 yield (chunk, 1000) if include_sample_rate else chunk
 
         speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        # Sentence-level: aligner runs once over the whole sentence audio.
         mock_align = mocker.AsyncMock(
-            side_effect=[
-                [
-                    WordTimestamp("Hello", 0, 200),
-                    WordTimestamp("world.", 200, 900),
-                ],
-                [
-                    WordTimestamp("Hello", 0, 200),
-                    WordTimestamp("world.", 200, 900),
-                ],
+            return_value=[
+                WordTimestamp("Hello", 0, 200),
+                WordTimestamp("world", 200, 900),
             ]
         )
         mocker.patch.object(streaming_speech_module, "forced_align", mock_align)
@@ -209,29 +204,44 @@ class TestStreamingSpeechWebSocket:
                 assert start["type"] == "audio.start"
                 assert start["word_timestamps"] is True
 
+                # Audio streams first; timestamps are null until the sentence
+                # is fully aligned.
                 chunk = ws.receive_json()
                 assert chunk["type"] == "audio.chunk"
                 assert chunk["chunk_id"] == 0
+                assert chunk["chunk_start_ms"] == 0
+                assert chunk["chunk_end_ms"] == 500
                 assert chunk["sample_rate"] == 1000
                 assert base64.b64decode(chunk["audio_b64"]) == first_chunk
-                assert chunk["timestamps"] == [
-                    {"word": "Hello", "start_ms": 0, "end_ms": 200, "confidence": None},
-                ]
+                assert chunk["timestamps"] is None
 
                 chunk = ws.receive_json()
                 assert chunk["type"] == "audio.chunk"
                 assert chunk["chunk_id"] == 1
+                assert chunk["chunk_start_ms"] == 500
+                assert chunk["chunk_end_ms"] == 1000
                 assert chunk["sample_rate"] == 1000
                 assert base64.b64decode(chunk["audio_b64"]) == second_chunk
+                assert chunk["timestamps"] is None
+
+                # Final frame: empty audio carrying the whole-sentence timestamps.
+                chunk = ws.receive_json()
+                assert chunk["type"] == "audio.chunk"
+                assert chunk["chunk_id"] == 2
+                assert chunk["chunk_start_ms"] == 0
+                assert chunk["chunk_end_ms"] == 1000
+                assert chunk["sample_rate"] == 1000
+                assert base64.b64decode(chunk["audio_b64"]) == b""
                 assert chunk["timestamps"] == [
-                    {"word": "world.", "start_ms": 200, "end_ms": 900, "confidence": None},
+                    {"word": "Hello", "start_ms": 0, "end_ms": 200},
+                    {"word": "world", "start_ms": 200, "end_ms": 900},
                 ]
 
                 done = ws.receive_json()
                 assert done == {"type": "audio.done", "sentence_index": 0, "total_bytes": 2000, "error": False}
 
         assert captured_requests[0].word_timestamps is True
-        assert mock_align.await_count == 2
+        assert mock_align.await_count == 1
 
     def test_flush_on_input_done(self, mocker: MockerFixture):
         app, _ = _build_test_app(mocker=mocker)

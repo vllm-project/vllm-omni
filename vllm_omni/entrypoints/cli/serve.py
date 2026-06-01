@@ -239,16 +239,21 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
-            "--forced-aligner-device",
-            type=str,
-            default=None,
-            help="Optional CUDA device for the forced aligner, e.g. 'cuda:1' or '1'.",
-        )
-        omni_config_group.add_argument(
             "--forced-aligner-gpu-memory-utilization",
             type=float,
             default=None,
             help="Optional gpu_memory_utilization override for the forced aligner LLM.",
+        )
+        omni_config_group.add_argument(
+            "--forced-aligner-device",
+            type=str,
+            default=None,
+            help=(
+                "Pin the forced aligner LLM to a specific GPU, given as a physical "
+                "device index (e.g. '7'). The card must be visible to the API server "
+                "process. Omit to share the server's default visible device (cuda:0) "
+                "with the TTS stages."
+            ),
         )
         # TODO(@lishunyang12): deprecate once all models migrate to --deploy-config
         omni_config_group.add_argument(

@@ -57,21 +57,25 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "deploy" / "qwen3_tts_forced_aligner.yaml"
 
+# Prompt tokens for the Qwen3 forced aligner. These are baked in rather than
+# configurable because the surrounding prompt template (``<|im_start|>`` chat
+# wrapping in ``_build_prompt``) and the ``_tokenize_text`` word splitter are
+# already Qwen-specific: a different aligner family would need code changes
+# here regardless, so exposing just these two strings as config is misleading.
+_AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
+_TIMESTAMP_TOKEN = "<timestamp>"
+
 
 @dataclass(frozen=True, slots=True)
 class WordTimestamp:
     """Internal alignment record. Converted to the pydantic
     :class:`vllm_omni.entrypoints.openai.protocol.audio.WordTimestamp`
     at the HTTP/WebSocket boundary.
-
-    ``confidence`` is reserved for future calibration; currently the
-    decoder does not score per-word and leaves it ``None``.
     """
 
     word: str
     start_ms: int
     end_ms: int
-    confidence: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,13 +93,13 @@ class ForcedAlignerConfig:
     runner: str | None = None
     architecture: str | None = None
     pooling_task: str | None = None
-    device: str | None = None
     gpu_memory_utilization: float | None = None
     dtype: str | None = None
     max_model_len: int | None = None
     trust_remote_code: bool | None = None
-    audio_placeholder: str | None = None
-    timestamp_token: str | None = None
+    # Physical GPU index (as a string, e.g. "7") to pin the aligner LLM to.
+    # None shares the server's default visible device (cuda:0).
+    device: str | None = None
     extra_llm_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
@@ -122,12 +126,12 @@ def build_forced_aligner_config(args: Any) -> ForcedAlignerConfig | None:
         config_data.update(_load_forced_aligner_yaml(config_path))
     if model:
         config_data["model"] = str(model)
-    device = getattr(args, "forced_aligner_device", None)
-    if device:
-        config_data["device"] = str(device)
     gpu_mem = getattr(args, "forced_aligner_gpu_memory_utilization", None)
     if gpu_mem is not None:
         config_data["gpu_memory_utilization"] = float(gpu_mem)
+    device = getattr(args, "forced_aligner_device", None)
+    if device is not None:
+        config_data["device"] = str(device)
     model = config_data.get("model")
     if not model:
         return None
@@ -185,11 +189,7 @@ def _align_sync(
         return []
     audio_duration_ms = (audio_arr.size / sample_rate) * 1000.0
 
-    prompt = _build_prompt(
-        text,
-        audio_placeholder=config.audio_placeholder,
-        timestamp_token=config.timestamp_token,
-    )
+    prompt = _build_prompt(text)
     request = {
         "prompt": prompt,
         "multi_modal_data": {"audio": (audio_arr, sample_rate)},
@@ -251,14 +251,24 @@ def _ensure_loaded(config: ForcedAlignerConfig) -> None:
 
         # Lazy import: vllm pulls torch + CUDA, which we want to avoid
         # at module import time.
-        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        _set_cuda_device(config.device)
+        #
+        # Multiprocessing mode depends on whether we pin a GPU:
+        #   * No device pin: run the engine in-process (lighter, no extra
+        #     subprocess) sharing the API server's default visible device.
+        #   * Device pin: force a spawned engine subprocess. The API server
+        #     process has already initialized its own CUDA context, so an
+        #     in-process LLM can no longer be redirected to another card.
+        #     A fresh subprocess reads CUDA_VISIBLE_DEVICES at startup and
+        #     binds cleanly to the requested GPU.
+        if config.device is not None:
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
+        else:
+            os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         from vllm import LLM
 
         logger.info(
-            "Loading forced aligner %s (device=%s, gpu_memory_utilization=%s)",
+            "Loading forced aligner %s (gpu_memory_utilization=%s)",
             config.model,
-            config.device or "default",
             config.gpu_memory_utilization if config.gpu_memory_utilization is not None else "default",
         )
         llm_kwargs: dict[str, Any] = {"model": config.model}
@@ -275,7 +285,25 @@ def _ensure_loaded(config: ForcedAlignerConfig) -> None:
         if config.max_model_len is not None:
             llm_kwargs["max_model_len"] = config.max_model_len
         llm_kwargs.update(config.extra_llm_kwargs)
-        llm = LLM(**llm_kwargs)
+
+        # Pin the aligner to a specific GPU by scoping CUDA_VISIBLE_DEVICES
+        # around construction. The engine subprocess (forced above) reads this
+        # env var once at startup and binds its CUDA context to the requested
+        # card. ``torch.cuda.set_device`` does not work for this: vLLM
+        # initializes the device itself and ignores it.
+        prev_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if config.device is not None:
+            pinned = config.device.strip().removeprefix("cuda:")
+            os.environ["CUDA_VISIBLE_DEVICES"] = pinned
+            logger.info("Pinning forced aligner to CUDA_VISIBLE_DEVICES=%s", pinned)
+        try:
+            llm = LLM(**llm_kwargs)
+        finally:
+            if config.device is not None:
+                if prev_visible is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = prev_visible
 
         thinker_config = getattr(llm.llm_engine.model_config.hf_config, "thinker_config", None)
         if thinker_config is None or not hasattr(thinker_config, "classify_num"):
@@ -291,7 +319,7 @@ def _ensure_loaded(config: ForcedAlignerConfig) -> None:
             )
 
         tokenizer = llm.get_tokenizer()
-        timestamp_token_id = _resolve_timestamp_token_id(tokenizer, config.timestamp_token)
+        timestamp_token_id = _resolve_timestamp_token_id(tokenizer)
 
         # Publish in this order so a concurrent reader either sees
         # _llm == None (will block on the lock) or sees a fully
@@ -310,41 +338,16 @@ def _ensure_loaded(config: ForcedAlignerConfig) -> None:
         )
 
 
-def _set_cuda_device(device: str | None) -> None:
-    """Best-effort in-process device placement for the aligner LLM."""
-    if not device:
-        return
-    normalized = str(device).strip().lower()
-    if not normalized:
-        return
-    if normalized.isdigit():
-        index = int(normalized)
-    elif normalized.startswith("cuda:"):
-        index = int(normalized.split(":", 1)[1])
-    else:
-        raise ValueError(
-            f"Unsupported forced aligner device {device!r}. Expected an integer GPU id or 'cuda:N'."
-        )
-
-    import torch
-
-    torch.cuda.set_device(index)
-
-
 # --- pure helpers (testable without a GPU / vllm) ---
 
 
 def _build_prompt(
     text: str,
     *,
-    audio_placeholder: str | None = None,
-    timestamp_token: str | None = None,
+    audio_placeholder: str = _AUDIO_PLACEHOLDER,
+    timestamp_token: str = _TIMESTAMP_TOKEN,
 ) -> str:
     """Construct the prompt with start/end timestamp slots per word."""
-    if audio_placeholder is None or timestamp_token is None:
-        defaults = _load_forced_aligner_yaml(_DEFAULT_CONFIG_PATH)
-        audio_placeholder = audio_placeholder or defaults["audio_placeholder"]
-        timestamp_token = timestamp_token or defaults["timestamp_token"]
     words = _tokenize_text(text)
     if not words:
         # Pad with one timestamp so the decoder always has something to
@@ -390,8 +393,6 @@ def _tokenize_text(text: str) -> list[str]:
 
 def _resolve_timestamp_token_id(tokenizer: Any, timestamp_token: str | None = None) -> int:
     """Look up the integer id of the timestamp special token."""
-    if timestamp_token is None:
-        timestamp_token = _load_forced_aligner_yaml(_DEFAULT_CONFIG_PATH)["timestamp_token"]
     convert = getattr(tokenizer, "convert_tokens_to_ids", None)
     if not callable(convert):
         raise RuntimeError("Aligner tokenizer has no convert_tokens_to_ids method.")
@@ -468,7 +469,6 @@ def _decode_timestamps(
                 word=word,
                 start_ms=int(round(start_bin * bin_size_ms)),
                 end_ms=int(round(end_bin * bin_size_ms)),
-                confidence=None,
             )
         )
     return out

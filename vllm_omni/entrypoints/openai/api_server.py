@@ -1053,9 +1053,6 @@ async def omni_init_app_state(
         else None
     )
 
-    # Forced aligner / word timestamps (issue #3631). Default-off; the
-    # CLI helper returns None when --forced-aligner is not set, in
-    # which case the streaming layer keeps emitting raw binary frames.
     from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 
     forced_aligner_config = build_forced_aligner_config(args)

@@ -89,7 +89,6 @@ async def _run_alignment(args: Any, audio: torch.Tensor, sample_rate: int) -> li
             "word": item.word,
             "start_ms": item.start_ms,
             "end_ms": item.end_ms,
-            "confidence": item.confidence,
         }
         for item in timestamps
     ]
@@ -157,7 +156,6 @@ def parse_args() -> Any:
         default=None,
         help="Optional YAML file for forced aligner settings",
     )
-    parser.add_argument("--forced-aligner-device", default=None, help="Optional CUDA device for the forced aligner")
     parser.add_argument(
         "--forced-aligner-gpu-memory-utilization",
         type=float,

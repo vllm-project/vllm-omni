@@ -27,15 +27,17 @@ Protocol:
         {"type": "audio.done", "sentence_index": 0}
         ...
 
-    Notes on the timestamps path:
-      - The server keeps an in-memory sentence audio prefix and reruns
-        alignment as each PCM chunk arrives. Each frame carries newly
-        stable timestamps only. Offsets are sentence-relative.
+    Notes on the timestamps path (sentence-level, issue #3631):
+      - Audio chunks stream in real-time, each carrying ``timestamps: null``.
+        The server buffers the sentence audio and, once generation finishes,
+        runs the forced aligner once on the whole sentence. It then emits a
+        final ``audio.chunk`` frame (empty ``audio_b64``) whose ``timestamps``
+        array holds the complete word-level alignment. Offsets are
+        sentence-relative.
       - timestamps: []   -> aligner ran successfully but produced no
-                            tokens (silence / pause chunk).
-      - timestamps: null -> aligner failed for this chunk (decode error,
-                            timeout, model unavailable). Audio is always
-                            sent regardless.
+                            tokens (silence / empty sentence).
+      - timestamps: null -> aligner failed (decode error, timeout, model
+                            unavailable). Audio is always sent regardless.
 """
 
 import asyncio
@@ -66,7 +68,6 @@ _DEFAULT_CONFIG_TIMEOUT = 10.0  # seconds
 _PCM_SAMPLE_RATE = 24000
 _MAX_CONFIG_MESSAGE_SIZE = 4 * 1024 * 1024  # allow large ref_audio payloads
 _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
-_ALIGNMENT_STABILITY_GUARD_MS = 240
 
 
 class OmniStreamingSpeechHandler:
@@ -342,67 +343,48 @@ class OmniStreamingSpeechHandler:
         sentence_text: str,
         sentence_index: int,
     ) -> int:
-        """Stream PCM as JSON ``audio.chunk`` frames carrying alignment.
+        """Stream PCM as JSON ``audio.chunk`` frames, aligned per sentence.
 
-        Flow: keep a sentence-level PCM prefix in memory, align that prefix
-        as new chunks arrive, and send the previous PCM chunk with any newly
-        stable word timestamps. This adds at most one-chunk delay while
-        avoiding the larger latency of waiting for the whole sentence.
+        Flow (sentence-level, issue #3631): forward each PCM chunk to the
+        client as soon as it is produced (so audio stays real-time, each
+        frame carries ``timestamps: null``), while buffering the sentence
+        audio in memory. Once generation finishes, run the forced aligner
+        exactly once on the whole sentence and emit a final ``audio.chunk``
+        frame (empty audio) carrying the complete word-level timestamps.
+
+        This trades first-timestamp latency (timestamps arrive only after the
+        sentence completes) for a stable, single-pass alignment that avoids
+        the jitter and re-alignment cost of prefix-incremental decoding. A
+        low-latency incremental variant can layer on top later.
 
         Failure handling preserves the contract that audio always flows:
         an alignment failure surfaces as ``timestamps: null``;
-        the empty-tokens case (silence chunk) surfaces as
-        ``timestamps: []`` so clients can tell the two apart.
+        the empty-tokens case (silence) surfaces as ``timestamps: []`` so
+        clients can tell the two apart.
         """
         aligner_config = self._speech_service.forced_aligner_config
         assert aligner_config is not None  # gated by the precondition check
 
-        prefix_audio = bytearray()
-        pending_chunk: bytes | None = None
-        pending_sample_rate = _PCM_SAMPLE_RATE
+        sentence_audio = bytearray()
         total_bytes = 0
         sample_rate = _PCM_SAMPLE_RATE
         chunk_id = 0
-        emitted_timestamp_count = 0
 
-        async def align_prefix(*, final: bool) -> tuple[list[dict] | None, int]:
-            aligned = await forced_align(
-                audio=bytes(prefix_audio),
-                text=sentence_text,
-                sample_rate=sample_rate,
-                config=aligner_config,
-            )
-            if aligned is None:
-                return None, emitted_timestamp_count
-
-            stable_until_ms = None
-            if not final:
-                prefix_duration_ms = (len(prefix_audio) / 2 / sample_rate) * 1000.0
-                stable_until_ms = max(0.0, prefix_duration_ms - _ALIGNMENT_STABILITY_GUARD_MS)
-
-            timestamps_payload: list[dict] = []
-            next_emitted = emitted_timestamp_count
-            for ts in aligned[emitted_timestamp_count:]:
-                if stable_until_ms is not None and ts.end_ms > stable_until_ms:
-                    break
-                timestamps_payload.append(
-                    {
-                        "word": ts.word,
-                        "start_ms": ts.start_ms,
-                        "end_ms": ts.end_ms,
-                        "confidence": ts.confidence,
-                    }
-                )
-                next_emitted += 1
-            return timestamps_payload, next_emitted
-
-        async def send_chunk(chunk: bytes, chunk_sample_rate: int, timestamps_payload: list[dict] | None) -> None:
+        async def send_chunk(
+            chunk: bytes,
+            chunk_sample_rate: int,
+            timestamps_payload: list[dict] | None,
+            chunk_start_ms: int,
+            chunk_end_ms: int,
+        ) -> None:
             nonlocal chunk_id
             await websocket.send_json(
                 {
                     "type": "audio.chunk",
                     "sentence_index": sentence_index,
                     "chunk_id": chunk_id,
+                    "chunk_start_ms": chunk_start_ms,
+                    "chunk_end_ms": chunk_end_ms,
                     "sample_rate": chunk_sample_rate,
                     "audio_b64": base64.b64encode(chunk).decode("ascii"),
                     "timestamps": timestamps_payload,
@@ -419,21 +401,63 @@ class OmniStreamingSpeechHandler:
         ) as stream:
             async for chunk, chunk_sample_rate in stream:
                 sample_rate = chunk_sample_rate
-                prefix_audio.extend(chunk)
+                chunk_start_ms = int(round((len(sentence_audio) / 2 / sample_rate) * 1000.0))
+                sentence_audio.extend(chunk)
+                chunk_end_ms = int(round((len(sentence_audio) / 2 / sample_rate) * 1000.0))
                 total_bytes += len(chunk)
+                # Audio first, timestamps after the whole sentence is aligned.
+                await send_chunk(chunk, chunk_sample_rate, None, chunk_start_ms, chunk_end_ms)
 
-                if pending_chunk is not None:
-                    timestamps_payload, emitted_timestamp_count = await align_prefix(final=False)
-                    await send_chunk(pending_chunk, pending_sample_rate, timestamps_payload)
-
-                pending_chunk = chunk
-                pending_sample_rate = chunk_sample_rate
-
-        if pending_chunk is not None:
-            timestamps_payload, emitted_timestamp_count = await align_prefix(final=True)
-            await send_chunk(pending_chunk, pending_sample_rate, timestamps_payload)
+        # Single alignment pass over the full sentence, then emit timestamps.
+        timestamps_payload = await self._align_sentence(
+            audio=bytes(sentence_audio),
+            text=sentence_text,
+            sample_rate=sample_rate,
+            config=aligner_config,
+        )
+        sentence_end_ms = int(round((len(sentence_audio) / 2 / sample_rate) * 1000.0))
+        await send_chunk(b"", sample_rate, timestamps_payload, 0, sentence_end_ms)
 
         return total_bytes
+
+    @staticmethod
+    async def _align_sentence(
+        *,
+        audio: bytes,
+        text: str,
+        sample_rate: int,
+        config,
+    ) -> list[dict] | None:
+        """Align a whole sentence and return monotonic word timestamps.
+
+        Returns ``None`` when the aligner fails (clients render this as
+        "timestamps unavailable"); an empty list means the aligner ran but
+        produced no tokens.
+        """
+        aligned = await forced_align(
+            audio=audio,
+            text=text,
+            sample_rate=sample_rate,
+            config=config,
+        )
+        if aligned is None:
+            return None
+
+        timestamps_payload: list[dict] = []
+        for ts in aligned:
+            start_ms = ts.start_ms
+            # Keep timestamps non-overlapping even if the aligner emits a
+            # word whose start dips below the previous word's end.
+            if timestamps_payload and start_ms < timestamps_payload[-1]["end_ms"]:
+                start_ms = timestamps_payload[-1]["end_ms"]
+            timestamps_payload.append(
+                {
+                    "word": ts.word,
+                    "start_ms": start_ms,
+                    "end_ms": ts.end_ms,
+                }
+            )
+        return timestamps_payload
 
     @staticmethod
     async def _send_error(websocket: WebSocket, message: str) -> None:

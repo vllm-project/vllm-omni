@@ -198,19 +198,24 @@ class OmniEngineArgs(EngineArgs):
             pass
         try:
             parser.add_argument(
-                "--forced-aligner-device",
-                type=str,
+                "--forced-aligner-gpu-memory-utilization",
+                type=float,
                 default=None,
-                help="Optional CUDA device for the forced aligner, e.g. 'cuda:1' or '1'.",
+                help="Optional gpu_memory_utilization override for the forced aligner LLM.",
             )
         except argparse.ArgumentError:
             pass
         try:
             parser.add_argument(
-                "--forced-aligner-gpu-memory-utilization",
-                type=float,
+                "--forced-aligner-device",
+                type=str,
                 default=None,
-                help="Optional gpu_memory_utilization override for the forced aligner LLM.",
+                help=(
+                    "Pin the forced aligner LLM to a specific GPU, given as a "
+                    "physical device index (e.g. '7'). The card must be visible "
+                    "to the API server process. Omit to share the server's "
+                    "default visible device (cuda:0) with the TTS stages."
+                ),
             )
         except argparse.ArgumentError:
             pass
@@ -228,15 +233,15 @@ class OmniEngineArgs(EngineArgs):
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
 
-    # Forced aligner / word timestamps (issue #3631). Single flag —
+    # Forced aligner / word timestamps . Single flag —
     # passing a model path enables the feature, omitting disables.
     # Heavy knobs (gpu_memory_utilization, dtype, max_model_len) live
     # on ForcedAlignerConfig defaults; override via deploy yaml when
     # needed instead of cluttering the CLI.
     forced_aligner: str | None = None
     forced_aligner_config: str | None = None
-    forced_aligner_device: str | None = None
     forced_aligner_gpu_memory_utilization: float | None = None
+    forced_aligner_device: str | None = None
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:

@@ -504,6 +504,25 @@ python qwen3_tts/streaming_speech_client.py --text "Hello world. How are you? I 
 python qwen3_tts/streaming_speech_client.py --text "..." --simulate-stt --stt-delay 0.1
 ```
 
+To receive word-level timestamps, launch the server with a forced aligner:
+```bash
+vllm-omni serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --omni \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
+    --trust-remote-code \
+    --forced-aligner Qwen/Qwen3-ForcedAligner-0.6B
+```
+Then request PCM JSON sidecar chunks:
+```bash
+python qwen3_tts/streaming_speech_client.py \
+    --text "Hello world. How are you?" \
+    --stream-audio \
+    --response-format pcm \
+    --word-timestamps
+```
+The client writes one PCM file per sentence and a matching
+`sentence_XXX_timestamps.json` sidecar.
+
 ### Gradio demos
 ```bash
 ./qwen3_tts/run_gradio_demo.sh                              # CustomVoice (default)
