@@ -92,7 +92,7 @@ THRESHOLDS = {
         "cot_semantic_sim": 0.9,  # Full CoT semantic similarity
         # Image comparison
         "clip_score": 90,  # CLIP image semantic similarity
-        "ssim": 0.25,  # Structural similarity
+        "ssim": 0.26,  # Structural similarity
         "psnr": 12.5,  # Peak signal-to-noise ratio (dB)
     },
     # Thresholds for quantized DiT accuracy tests (bf16 vs quant comparison)
@@ -104,15 +104,6 @@ THRESHOLDS = {
             os.environ.get("HUNYUAN_IMAGE3_QUANT_CLIP_SCORE_DROP_THRESHOLD", "5.0")
         ),  # Max allowed drop from bf16
     },
-    "Instruct": {
-        # AR text comparison
-        "text_prefix_match": 10,  # First 10 characters must match exactly
-        "cot_semantic_sim": 0.9,  # Full CoT semantic similarity
-        # Image comparison
-        "clip_score": 90,  # CLIP image semantic similarity
-        "ssim": 0.26,  # Structural similarity
-        "psnr": 12.5,  # Peak signal-to-noise ratio (dB)
-    },
 }
 
 
@@ -120,7 +111,7 @@ THRESHOLDS = {
 def _get_thresholds() -> dict:
     """Return appropriate thresholds based on test context."""
     # Default thresholds work for both Instruct and Distil IT2I tests
-    return THRESHOLDS["default"] if IS_DISTIL else THRESHOLDS["Instruct"]
+    return THRESHOLDS["default"]
 
 
 def _get_quant_thresholds() -> dict:
