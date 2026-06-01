@@ -463,7 +463,7 @@ class OmniBase(PDDisaggregationMixin):
             peak_memory_mb=peak_memory_mb,
         )
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         logger.info("[%s] Shutting down", self.__class__.__name__)
         self._shutdown_base()
 

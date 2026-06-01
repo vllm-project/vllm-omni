@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import replace
 from functools import partial
 from threading import Lock
 
@@ -365,6 +364,12 @@ class CosyVoice3Model(
         else:
             raise ValueError(f"Model stage not supported {self.model_stage}")
 
+    def get_language_model(self) -> "nn.Module":
+        """Return the language model for upstream MoE detection."""
+        if hasattr(self.model, "get_language_model"):
+            return self.model.get_language_model()
+        return self.model
+
     def _create_llm_vllm_config(self, parent_config: VllmConfig) -> VllmConfig:
         """Create VllmConfig for the inner Qwen2 LLM.
 
@@ -542,17 +547,21 @@ class CosyVoice3Model(
         if self.model_stage != "cosyvoice3_talker":
             return None
 
-        sampler = getattr(self, "_talker_sampler", None)
-        if sampler is None:
-            sampler = Sampler()
-            self._talker_sampler = sampler
-
         if not self._cosyvoice3_ras_enabled(sampling_metadata):
+            sampler = getattr(self, "_talker_sampler", None)
+            if sampler is None:
+                sampler = Sampler()
+                self._talker_sampler = sampler
             return sampler(logits=logits, sampling_metadata=sampling_metadata)
 
         logits = logits.to(torch.float32)
-        sampling_for_processors = replace(sampling_metadata, no_penalties=True)
-        logits = sampler.apply_logits_processors(logits, sampling_for_processors, predict_bonus_token=False)
+        # Apply logits processors directly — RAS handles its own repetition
+        # logic.  We avoid instantiating Sampler() here because its import
+        # chain pulls in flashinfer / GPU deps that fail in CPU-only tests.
+        if sampling_metadata.allowed_token_ids_mask is not None:
+            logits.masked_fill_(sampling_metadata.allowed_token_ids_mask, float("-inf"))
+        for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+            logits = processor.apply(logits)
 
         sampling_cfg = dict(self.config.llm.get("sampling", {}))
         default_top_p = float(sampling_cfg.get("top_p", 0.8))

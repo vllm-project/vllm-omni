@@ -281,7 +281,7 @@ class TransformerConfig:
 @dataclass
 class DiffusionCacheConfig:
     """
-    Configuration for cache adapters (TeaCache, cache-dit, etc.).
+    Configuration for cache adapters (TeaCache, cache-dit, MagCache, etc.).
 
     This dataclass provides a unified interface for cache configuration parameters.
     It can be initialized from a dictionary and accessed via attributes.
@@ -291,6 +291,8 @@ class DiffusionCacheConfig:
         - cache-dit: Fn_compute_blocks, Bn_compute_blocks, max_warmup_steps,
                     residual_diff_threshold, enable_taylorseer, taylorseer_order,
                     scm_steps_mask_policy, scm_steps_policy
+        - MagCache: mag_threshold, mag_max_skip_steps, mag_retention_ratio,
+                    mag_ratios, mag_calibrate
 
     Example:
         >>> # From dict (user-facing API) - partial config uses defaults for missing keys
@@ -300,13 +302,25 @@ class DiffusionCacheConfig:
         >>> print(config.Fn_compute_blocks)  # 8 (default)
         >>> # Empty dict uses all defaults
         >>> default_config = DiffusionCacheConfig.from_dict({})
-        >>> print(default_config.rel_l1_thresh)  # 0.2 (default)
+        >>> print(config.rel_l1_thresh)  # 0.2 (default)
     """
 
     # TeaCache parameters [tea_cache only]
     # Default: 0.2 provides ~1.5x speedup with minimal quality loss (optimal balance)
     rel_l1_thresh: float = 0.2
     coefficients: list[float] | None = None  # Uses model-specific defaults if None
+
+    # MagCache parameters [mag_cache only]
+    # Default: 0.24 threshold for accumulated magnitude error
+    mag_threshold: float = 0.24
+    # Default: 5 maximum consecutive skip steps (K)
+    mag_max_skip_steps: int = 5
+    # Default: 0.1 fraction of initial steps where skipping is disabled (stability)
+    mag_retention_ratio: float = 0.1
+    # Default: None magnitude ratios (model-specific, required for inference)
+    mag_ratios: list[float] | None = None
+    # Default: False calibration mode (computes mag_ratios on first run)
+    mag_calibrate: bool = False
 
     # cache-dit parameters [cache-dit only]
     # Default: 1 forward compute block (optimized for single-transformer models)
@@ -431,6 +445,15 @@ class OmniDiffusionConfig:
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
+
+    # Prompt-embedding cache. When enabled, ``DiffusionModelRunner`` wraps the
+    # pipeline's ``encode_prompt`` so repeated calls with identical prompt
+    # arguments (e.g. GRPO rollouts that sample the same prompt many times
+    # with different seeds) reuse the text-encoder output instead of re-running
+    # it. Safe against inputs that cannot be hashed (tensors, PIL images):
+    # those calls transparently bypass the cache.
+    enable_prompt_embed_cache: bool = False
+    prompt_embed_cache_size: int = 32
 
     # Distributed executor backend
     distributed_executor_backend: str = "mp"

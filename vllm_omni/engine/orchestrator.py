@@ -416,7 +416,7 @@ class Orchestrator:
         stage_id = 0
         request_id = msg.request_id
         request = msg.prompt
-
+        final_stage_id = msg.final_stage_id
         req_state = self.request_states.get(request_id)
         if req_state is None:
             logger.warning(
@@ -448,6 +448,9 @@ class Orchestrator:
             request,
             prompt_text=msg.output_prompt_text,
         )
+
+        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+            await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -1160,12 +1163,13 @@ class Orchestrator:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-
+                downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
+                    resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)

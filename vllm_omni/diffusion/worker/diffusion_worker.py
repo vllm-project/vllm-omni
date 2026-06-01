@@ -823,11 +823,6 @@ class WorkerProc:
                     continue
 
         logger.info("event loop terminated.")
-        try:
-            self.worker.shutdown()
-        except Exception as exc:
-            logger.warning("Worker %s: Shutdown encountered an error: %s", self.gpu_id, exc)
-        self.context.term()
 
     @staticmethod
     def worker_main(
@@ -842,34 +837,62 @@ class WorkerProc:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
 
+        shutdown_triggered = False
+
+        def signal_handler(signum: int, frame) -> None:
+            nonlocal shutdown_triggered
+            if not shutdown_triggered:
+                shutdown_triggered = True
+                raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
         set_death_signal(signal.SIGTERM)
 
         # Set process title for visibility in nvidia-smi / htop (optional, non-fatal)
         try:
             import setproctitle
 
-            setproctitle.setproctitle(f"vLLM-Omni::StageDiffusionProc-{rank}")
+            setproctitle.setproctitle(f"vLLM-Omni::DiffusionWorker-{rank}")
         except ImportError:
             pass  # setproctitle not installed, skip process title setting
 
         load_omni_general_plugins()
-        worker_proc = WorkerProc(
-            od_config,
-            gpu_id=rank,
-            broadcast_handle=broadcast_handle,
-            wake_event=wake_event,
-            worker_extension_cls=worker_extension_cls,
-            custom_pipeline_args=custom_pipeline_args,
-        )
-        logger.info(f"Worker {rank}: Scheduler loop started.")
-        pipe_writer.send(
-            {
-                "status": "ready",
-                "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
-            }
-        )
-        worker_proc.worker_busy_loop()
-        logger.info(f"Worker {rank}: Shutdown complete.")
+        worker_proc = None
+        try:
+            worker_proc = WorkerProc(
+                od_config,
+                gpu_id=rank,
+                broadcast_handle=broadcast_handle,
+                wake_event=wake_event,
+                worker_extension_cls=worker_extension_cls,
+                custom_pipeline_args=custom_pipeline_args,
+            )
+            logger.info(f"Worker {rank}: Scheduler loop started.")
+            pipe_writer.send(
+                {
+                    "status": "ready",
+                    "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
+                }
+            )
+            worker_proc.worker_busy_loop()
+        except SystemExit:
+            logger.info("Worker %d: Shutdown signal received, starting cleanup.", rank)
+            raise
+        finally:
+            if worker_proc is not None:
+                try:
+                    worker_proc.worker.shutdown()
+                except Exception as exc:
+                    logger.warning("Worker %d: Shutdown encountered an error: %s", rank, exc)
+                worker_proc.context.term()
+            else:
+                # In case of signal interrupting worker_proc initialization
+                # where distributed env is initialized but worker_proc is still None
+                destroy_distributed_env()
+
+        logger.info("Worker %d: Shutdown complete.", rank)
 
 
 class WorkerWrapperBase:

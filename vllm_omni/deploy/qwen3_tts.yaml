@@ -64,6 +64,7 @@ stages:
       top_p: 1.0
 
   - stage_id: 1
+    # Tuned for Base voice clone; CustomVoice / VoiceDesign are TTFA-optimal at 1.
     max_num_seqs: 10
     gpu_memory_utilization: 0.3
     enforce_eager: false

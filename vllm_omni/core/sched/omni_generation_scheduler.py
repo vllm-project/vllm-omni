@@ -29,9 +29,11 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_full_payload_input_coordinator,
 )
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
+from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 
 logger = init_logger(__name__)
@@ -108,9 +110,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 break
             # async_chunk: don't schedule placeholder tokens when no new chunk is available.
             if required_tokens <= 0:
-                if (
-                    self.chunk_transfer_adapter is not None
-                    and request.request_id in self.chunk_transfer_adapter.finished_requests
+                if self.chunk_transfer_adapter is not None and self.chunk_transfer_adapter.is_done_receiving_chunks(
+                    request.request_id
                 ):
                     self._pending_finish_reqs.append(request)
                 req_index += 1
@@ -160,7 +161,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # async_chunk: wait for the first upstream chunk (don't start with placeholders).
             if self.chunk_transfer_adapter is not None and len(request.prompt_token_ids) == 0:
-                if request.request_id in self.chunk_transfer_adapter.finished_requests:
+                if self.chunk_transfer_adapter.is_done_receiving_chunks(request.request_id):
                     self.waiting.pop_request()
                     self._pending_finish_reqs.append(request)
                     continue
@@ -489,7 +490,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
                 or (
                     self.chunk_transfer_adapter is not None
-                    and request.request_id in self.chunk_transfer_adapter.finished_requests
+                    and self.chunk_transfer_adapter.is_done_receiving_chunks(request.request_id)
                     and request.num_computed_tokens >= len(request.prompt_token_ids)
                 )
             ):
@@ -500,13 +501,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 stopped = True
 
             if stopped:
-                if (
-                    model_runner_output.routed_experts_dict is not None
-                    and req_id in model_runner_output.routed_experts_dict
-                ):
-                    routed_experts = model_runner_output.routed_experts_dict[req_id]
+                if model_runner_output.routed_experts is not None:
+                    routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
+                if not finished:
+                    # for streaming input request only
+                    if self.chunk_transfer_adapter:
+                        self.chunk_transfer_adapter.segment_finished_requests.discard(req_id)
                 if finished:
                     kv_transfer_params = self._free_request(request)
                     if self.chunk_transfer_adapter is not None:
@@ -521,7 +523,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stopped_running_reqs.add(request)
 
             # Extract sample logprobs if needed.
-            if request.sampling_params is not None and request.sampling_params.logprobs is not None and logprobs:
+            if request.sampling_params is not None and request.sampling_params.num_logprobs is not None and logprobs:
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
@@ -540,7 +542,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
                 outputs[request.client_index].append(
-                    EngineCoreOutput(
+                    OmniEngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
                         finish_reason=finish_reason,
@@ -577,7 +579,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         getattr(request, "external_req_id", None),
                     )
             outputs[request.client_index].append(
-                EngineCoreOutput(
+                OmniEngineCoreOutput(
                     request_id=request.request_id,
                     new_token_ids=[],
                     finish_reason=finish_reason,
@@ -604,7 +606,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
                 outputs[request.client_index].append(
-                    EngineCoreOutput(
+                    OmniEngineCoreOutput(
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
@@ -669,4 +671,26 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         Do not expend prompt id using update.
         """
-        self._replace_session_with_streaming_update(session, update)
+        if self.chunk_transfer_adapter:
+            self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
+        session._output_token_ids.clear()
+        session._all_token_ids.clear()
+        new_prompt = update.prompt_token_ids or ()
+        session._all_token_ids.extend(new_prompt)
+        session.num_computed_tokens = 0
+        session.prompt_token_ids = update.prompt_token_ids or ()
+        session.additional_information = update.additional_information or None
+        # Update block hashes for the new tokens.
+        session.update_block_hashes()
+        session.num_prompt_tokens = len(session.prompt_token_ids)
+        session.arrival_time = update.arrival_time
+        session.sampling_params = update.sampling_params
+        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
+        session.status = RequestStatus.WAITING
+        if session in self.skipped_waiting:
+            self.skipped_waiting.remove_requests((session,))
+            self._enqueue_waiting_request(session)
+
+        if self.log_stats:
+            session.record_event(EngineCoreEventType.QUEUED)
