@@ -295,6 +295,15 @@ class AsyncOmni(EngineClient, OmniBase):
             # Start final output dispatcher on the first call to generate()
             self._final_output_handler()
 
+            # Forward bare sampling_params (e.g. from /v1/completions) as the stage-0 entry.
+            if sampling_params_list is None and sampling_params is not None:
+                if self.num_stages == 1:
+                    sampling_params_list = [sampling_params]
+                else:
+                    default = list(self.default_sampling_params_list)
+                    default[0] = sampling_params
+                    sampling_params_list = default
+
             # Expand sampling params for PD disaggregation (user may provide N-1 params)
             if (
                 sampling_params_list is not None
@@ -919,8 +928,14 @@ class AsyncOmni(EngineClient, OmniBase):
         for result in results:
             if isinstance(result, dict) and result.get("todo"):
                 continue
-            if isinstance(result, list):
-                merged.update(result)
+            if isinstance(result, (list, set)):
+                for item in result:
+                    if isinstance(item, (list, set)):
+                        merged.update(item)
+                    elif isinstance(item, int):
+                        merged.add(item)
+            elif isinstance(result, int):
+                merged.add(result)
         return sorted(merged)
 
     async def pin_lora(self, adapter_id: int) -> bool:

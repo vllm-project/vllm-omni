@@ -9,8 +9,8 @@ from uuid import uuid4
 
 import numpy as np
 from vllm.entrypoints.openai.engine.protocol import UsageInfo
-from vllm.entrypoints.openai.realtime.connection import RealtimeConnection as VllmRealtimeConnection
-from vllm.entrypoints.openai.realtime.protocol import TranscriptionDelta, TranscriptionDone
+from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
+from vllm.entrypoints.speech_to_text.realtime.protocol import TranscriptionDelta, TranscriptionDone
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni

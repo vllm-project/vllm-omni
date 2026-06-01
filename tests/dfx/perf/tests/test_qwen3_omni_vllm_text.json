@@ -5,7 +5,8 @@
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
             "use_omni": false,
             "extra_cli_args": [
-                "--no-enable-prefix-caching"
+                "--no-enable-prefix-caching",
+                "--skip-mm-profiling"
             ]
         },
         "benchmark_params": [
