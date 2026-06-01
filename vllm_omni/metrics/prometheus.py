@@ -37,16 +37,21 @@ class OmniPrometheusMetrics:
     strips every collector whose ``_name`` contains ``"vllm"``.
     """
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, log_stats: bool = True) -> None:
         self._model_name = model_name
+        self._log_stats = log_stats
         self._running = _running_family.labels(model_name=model_name)
         self._waiting = _waiting_family.labels(model_name=model_name)
         self._e2e_latency = _e2e_latency_family.labels(model_name=model_name)
 
     def set_running(self, n: int) -> None:
+        if not self._log_stats:
+            return
         self._running.set(n)
 
     def set_waiting(self, n: int) -> None:
+        if not self._log_stats:
+            return
         self._waiting.set(n)
 
     def request_succeeded(
@@ -54,6 +59,8 @@ class OmniPrometheusMetrics:
         e2e_seconds: float,
         finished_reason: str = "stop",
     ) -> None:
+        if not self._log_stats:
+            return
         _completion_family.labels(
             model_name=self._model_name,
             finished_reason=finished_reason,
@@ -61,6 +68,8 @@ class OmniPrometheusMetrics:
         self._e2e_latency.observe(e2e_seconds)
 
     def request_failed(self) -> None:
+        if not self._log_stats:
+            return
         # Pipeline-level "fail" maps to the upstream FinishReason.ABORT bucket;
         # a single counter family now covers both normal stops and aborts.
         _completion_family.labels(

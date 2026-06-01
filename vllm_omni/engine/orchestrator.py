@@ -178,6 +178,7 @@ class Orchestrator:
         load_balancer_factory: Callable[[], LoadBalancer] | None = None,
         remote_replica_factory: RemoteReplicaFactory | None = None,
         transfer_emitter: Any = None,
+        log_stats: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -197,7 +198,7 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
-        self._init_metrics_state(stage_pools, running_counter, transfer_emitter)
+        self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
 
         self._cfg_tracker = CfgCompanionTracker()
 
@@ -233,6 +234,7 @@ class Orchestrator:
         stage_pools: list[StagePool],
         running_counter: OmniRequestCounter | None,
         transfer_emitter: Any,
+        log_stats: bool = False,
     ) -> None:
         """Wire up all metric-related orchestrator state.
 
@@ -244,6 +246,14 @@ class Orchestrator:
         replica) labels. Failure to build the wrap is logged and metrics
         are simply disabled — orchestrator construction continues so unit
         tests with a minimal ``vllm_config`` still pass.
+
+        ``log_stats=False`` short-circuits the wrap entirely so the
+        ~65 upstream ``vllm:*`` families are not registered in the
+        Prometheus default registry at all. The per-step record() path
+        already no-ops on ``scheduler_stats is None`` (which is what
+        the upstream scheduler returns when its own log_stats is False),
+        so this gate is mainly to keep the ``/metrics`` surface clean
+        when the user did not request stats.
         """
         self._running_counter = running_counter
         self._transfer_emitter = transfer_emitter
@@ -260,6 +270,10 @@ class Orchestrator:
                 stage_replica_map[flat_idx] = (str(stage_id), str(replica_id))
                 self._stage_replica_to_engine_idx[(stage_id, replica_id)] = flat_idx
                 flat_idx += 1
+
+        if not log_stats:
+            self._stat_logger = None
+            return
 
         vllm_config_for_stats = next(
             (p.stage_vllm_config for p in stage_pools if p.stage_vllm_config is not None),

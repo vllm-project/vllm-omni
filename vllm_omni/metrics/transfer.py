@@ -64,8 +64,9 @@ class OmniTransferMetrics:
     (from_stage, from_replica) -> (to_stage, to_replica) edges.
     """
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, log_stats: bool = True) -> None:
         self._model_name = model_name
+        self._log_stats = log_stats
 
     # ---- TX side (record_transfer_tx hook) -------------------------------
 
@@ -77,6 +78,8 @@ class OmniTransferMetrics:
         to_replica: int,
         size_bytes: int,
     ) -> None:
+        if not self._log_stats:
+            return
         _transfer_size_bytes_family.labels(
             model_name=self._model_name,
             from_stage=str(from_stage),
@@ -93,6 +96,8 @@ class OmniTransferMetrics:
         to_replica: int,
         tx_time_s: float,
     ) -> None:
+        if not self._log_stats:
+            return
         _transfer_tx_family.labels(
             model_name=self._model_name,
             from_stage=str(from_stage),
@@ -111,6 +116,8 @@ class OmniTransferMetrics:
         to_replica: int,
         rx_time_s: float,
     ) -> None:
+        if not self._log_stats:
+            return
         _transfer_rx_family.labels(
             model_name=self._model_name,
             from_stage=str(from_stage),
@@ -127,6 +134,8 @@ class OmniTransferMetrics:
         to_replica: int,
         in_flight_time_s: float,
     ) -> None:
+        if not self._log_stats:
+            return
         _transfer_in_flight_family.labels(
             model_name=self._model_name,
             from_stage=str(from_stage),

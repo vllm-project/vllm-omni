@@ -83,33 +83,44 @@ class OmniModalityMetrics:
     stage+replica combinations.
     """
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, log_stats: bool = True) -> None:
         self._model_name = model_name
+        self._log_stats = log_stats
 
     # ---- Audio ------------------------------------------------------------
 
     def observe_audio_ttfp(self, stage: str, replica: str, ttfp_seconds: float) -> None:
+        if not self._log_stats:
+            return
         _audio_ttfp_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(ttfp_seconds)
 
     def observe_audio_duration(self, stage: str, replica: str, duration_seconds: float) -> None:
+        if not self._log_stats:
+            return
         _audio_duration_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(
             duration_seconds
         )
 
     def observe_audio_rtf(self, stage: str, replica: str, rtf: float) -> None:
+        if not self._log_stats:
+            return
         _audio_rtf_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(rtf)
 
     def inc_audio_frames(self, stage: str, replica: str, n_frames: int) -> None:
-        if n_frames <= 0:
+        if not self._log_stats or n_frames <= 0:
             return
         _audio_frames_family.labels(model_name=self._model_name, stage=stage, replica=replica).inc(n_frames)
 
     def observe_audio_underrun(self, stage: str, replica: str, underrun_s: float) -> None:
+        if not self._log_stats:
+            return
         _audio_underrun_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(
             max(underrun_s, 0.0)
         )
 
     def inc_audio_continuity_ok(self, stage: str, replica: str, threshold_ms: int) -> None:
+        if not self._log_stats:
+            return
         _audio_continuity_ok_family.labels(
             model_name=self._model_name,
             stage=stage,
@@ -118,6 +129,8 @@ class OmniModalityMetrics:
         ).inc()
 
     def inc_audio_skipped(self, stage: str, replica: str, reason: str) -> None:
+        if not self._log_stats:
+            return
         _audio_skipped_family.labels(
             model_name=self._model_name,
             stage=stage,

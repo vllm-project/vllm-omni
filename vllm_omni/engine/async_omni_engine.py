@@ -269,6 +269,7 @@ class AsyncOmniEngine:
         diffusion_batch_size: int = 1,
         single_stage_mode: bool = False,
         transfer_emitter: Any = None,
+        log_stats: bool = False,
         **kwargs: Any,
     ) -> None:
         self.model = model
@@ -279,6 +280,11 @@ class AsyncOmniEngine:
         # Optional: when None, Orchestrator silently skips TX emit (existing
         # RX path still works via OrchestratorAggregator).
         self._transfer_emitter = transfer_emitter
+        # Drives upstream EngineCore + scheduler stats production. When False
+        # the engine skips SchedulerStats / IterationStats; the per-(stage,
+        # replica) vllm:* wrap stays registered but reads zero. Respects the
+        # --log-stats CLI flag set by the user via OmniBase.
+        self._log_stats = log_stats
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
@@ -913,7 +919,7 @@ class AsyncOmniEngine:
                                         launch_omni_core_engines(
                                             vllm_config=vllm_config,
                                             executor_class=executor_class,
-                                            log_stats=True,
+                                            log_stats=self._log_stats,
                                             omni_master_server=self._omni_master_server,
                                             stage_id=plan.metadata.stage_id,
                                             stage_config=stage_cfg,
@@ -925,7 +931,7 @@ class AsyncOmniEngine:
                                     addresses, proc, handshake_address = spawn_stage_core(
                                         vllm_config=vllm_config,
                                         executor_class=executor_class,
-                                        log_stats=True,
+                                        log_stats=self._log_stats,
                                     )
                                 logger.info(
                                     "[AsyncOmniEngine] Stage %s engine launch started",
@@ -1237,7 +1243,7 @@ class AsyncOmniEngine:
             if plan.replicas[0].metadata.stage_type != "diffusion":
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 assert stage_vllm_config is not None
-                output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
+                output_processor = build_llm_stage_output_processor(plan, stage_vllm_config, log_stats=self._log_stats)
 
             stage_pools.append(
                 StagePool(
@@ -1387,6 +1393,7 @@ class AsyncOmniEngine:
                 load_balancer_factory=load_balancer_factory,
                 remote_replica_factory=remote_replica_factory,
                 transfer_emitter=self._transfer_emitter,
+                log_stats=self._log_stats,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
