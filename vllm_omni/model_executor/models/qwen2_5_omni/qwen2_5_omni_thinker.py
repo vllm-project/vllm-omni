@@ -425,6 +425,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         self,
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec],
+        **kwargs: object,
     ) -> tuple[torch.Tensor, int]:
         """
         Example:
