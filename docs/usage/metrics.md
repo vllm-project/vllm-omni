@@ -3,9 +3,11 @@
 vLLM-Omni exposes Prometheus metrics via the `/metrics` endpoint on the OpenAI-compatible API server. This page covers the text and audio surface; diffusion / image / video metrics are tracked in a follow-up PR.
 
 ```bash
-vllm-omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8000
+vllm-omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8000 --log-stats
 curl http://localhost:8000/metrics
 ```
+
+**`--log-stats` is required to populate metric data.** Without the flag, the endpoint still returns `200 OK` but the upstream `vllm:*` wrap is not registered at all, and the 15 `vllm:omni_*` families are registered as placeholders with no data written to them. This keeps the runtime cost essentially zero for deployments that don't need monitoring. With the flag, all ~80 families populate.
 
 ## Metric Namespaces
 
@@ -81,11 +83,11 @@ For the full list of upstream metrics, see [the vLLM docs](https://github.com/vl
 
 | Metric group | Multi-stage LLM (Qwen3-Omni) |
 |---|---|
-| `vllm:omni_` request tracking + latency | Yes |
-| `vllm:omni_` audio modality | If pipeline has a talker stage |
-| `vllm:omni_` transfer | If pipeline has ≥ 2 stages |
-| `vllm:` engine metrics (per `(stage, replica)`) | Yes |
-| `vllm:` MFU metrics | With `--enable-mfu-metrics` |
+| `vllm:omni_` request tracking + latency | With `--log-stats` |
+| `vllm:omni_` audio modality | With `--log-stats`, if pipeline has a talker stage |
+| `vllm:omni_` transfer | With `--log-stats`, if pipeline has ≥ 2 stages |
+| `vllm:` engine metrics (per `(stage, replica)`) | With `--log-stats` |
+| `vllm:` MFU metrics | With `--log-stats --enable-mfu-metrics` |
 
 ## Naming Convention
 
