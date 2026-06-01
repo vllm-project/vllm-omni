@@ -236,5 +236,18 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 #### Notes
 
-- Memory usage: Observed **~13.5 GiB / 24 GiB** (about 55%) at idle after
-  server startup. The 0.6B model leaves significant headroom on a 24 GB card.
+- Memory usage: **~13.5 GiB / 24 GiB** at idle with the default deploy config
+  (`gpu_memory_utilization: 0.3` per stage). The 0.6B model weights occupy only
+  ~2.4 GiB (Stage 0: 1.91 GiB, Stage 1: 0.45 GiB); the remainder is KV cache
+  pre-allocated at startup. To reduce idle footprint to ~5 GiB, use a custom
+  deploy config with lower utilization (inference peak ~10 GiB):
+
+  ```yaml
+  # Custom deploy config for Qwen3-TTS-12Hz-0.6B on RTX 4090
+  # Copy vllm_omni/deploy/qwen3_tts.yaml and override gpu_memory_utilization:
+  stages:
+    - stage_id: 0
+      gpu_memory_utilization: 0.15
+    - stage_id: 1
+      gpu_memory_utilization: 0.15
+  ```
