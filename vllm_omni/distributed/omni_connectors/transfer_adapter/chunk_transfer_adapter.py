@@ -41,6 +41,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
+        model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
+        if model_max_num_seqs <= 0:
+            model_max_num_seqs = self.scheduler_max_num_seqs
+        self._active_window = min(active_stream_window, model_max_num_seqs) if active_stream_window > 0 else 0
+        if self._active_window > 0:
+            logger.info(
+                "Bounded active-stream window enabled: K=%d. "
+                "Multi-replica deployments require sticky per-stream routing across Stage 1 "
+                "replicas (each replica owns an independent active-set; without sticky routing, "
+                "a stream can be active on one replica and non-active on another and both will "
+                "race to evict it).",
+                self._active_window,
+            )
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
@@ -64,6 +78,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
         self.requests_origin_status = {}
+        self._active_streams: dict[str, Any] = {}
+        # Private hold-queue for non-active running requests. Restored to
+        # running_queue inside restore_queues(). Avoids calling
+        # waiting_queue.prepend_requests mid-step, which trips vllm's
+        # per-step LogitsProcessor invariant
+        # ("Cannot register new removed request after self.removed has
+        #   been read").
+        self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
 
@@ -362,6 +384,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
+        if request_id in self.finished_requests:
+            self._evict_finished_active_streams({request_id})
+        else:
+            self._active_streams.pop(request_id, None)
         self.finished_requests.discard(request_id)
         self.segment_finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
@@ -424,16 +450,112 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         if self.connector.stage_id == 0:
             return
+        if self._active_window <= 0:
+            self._process_chunk_queue_legacy(
+                waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
+            )
+            self._process_chunk_queue_legacy(
+                running_queue,
+                self.waiting_for_chunk_running_requests,
+                RequestStatus.RUNNING,
+                self._finished_load_reqs,
+            )
+            while len(running_queue) > self.scheduler_max_num_seqs:
+                request = running_queue.pop()
+                request.status = RequestStatus.PREEMPTED
+                waiting_queue.prepend_requests([request])
+            return
+
+        self._promote_active_streams(running_queue)
+        self._promote_active_streams(waiting_queue)
         self._process_chunk_queue(
             waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
         )
         self._process_chunk_queue(
             running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
         )
-        while len(running_queue) > self.scheduler_max_num_seqs:
-            request = running_queue.pop()
-            request.status = RequestStatus.PREEMPTED
-            waiting_queue.prepend_requests([request])
+        self._promote_active_streams(waiting_queue)
+        self._preempt_non_active_running(waiting_queue, running_queue)
+
+    def _evict_finished_active_streams(self, request_ids: set[str] | None = None) -> None:
+        for request_id in list(self._active_streams):
+            if request_ids is not None and request_id not in request_ids:
+                continue
+            if request_id in self.finished_requests:
+                self._active_streams.pop(request_id, None)
+
+    def _promote_active_streams(self, queue: Any) -> None:
+        if len(self._active_streams) >= self._active_window:
+            return
+        for request in list(queue):
+            if len(self._active_streams) >= self._active_window:
+                return
+            request_id = request.request_id
+            if request_id in self._active_streams or request_id in self.finished_requests:
+                continue
+            # Iterating the existing queue preserves FIFO admission.
+            self._active_streams[request_id] = request
+
+    def _ensure_active_stream(self, request: Request) -> bool:
+        if self._active_window <= 0:
+            return True
+        request_id = request.request_id
+        if request_id in self._active_streams:
+            self._active_streams[request_id] = request
+            return True
+        if request_id in self.finished_requests or len(self._active_streams) >= self._active_window:
+            return False
+        self._active_streams[request_id] = request
+        return True
+
+    def _preempt_non_active_running(self, waiting_queue: Any, running_queue: list[Request]) -> None:
+        # Hold non-active running requests in a private deque rather than
+        # routing them back through waiting_queue. Routing through the
+        # vllm RequestQueue mid-step triggers
+        #   "Cannot register new removed request after self.removed has
+        #    been read"
+        # in vllm.v1.sample.logits_processor.state when the persistent
+        # batch was already snapshotted. They are returned to
+        # running_queue in restore_queues() so the next scheduler tick
+        # re-evaluates them through _promote_active_streams.
+        index = len(running_queue) - 1
+        while index >= 0:
+            request = running_queue[index]
+            if request.request_id in self._active_streams:
+                index -= 1
+                continue
+            request = running_queue.pop(index)
+            self._held_non_active.append(request)
+            index -= 1
+
+    def _process_chunk_queue_legacy(
+        self,
+        queue: Any,
+        waiting_for_chunk_list: deque[Any],
+        target_status: RequestStatus,
+        finished_load_reqs: set[str],
+    ) -> None:
+        queue_snapshot = list(queue)
+        for request in queue_snapshot:
+            if request.status != RequestStatus.WAITING_FOR_CHUNK:
+                if request.request_id in self.requests_with_ready_chunks:
+                    # Requests that have loaded chunk from last round
+                    # of schedule, but have not scheduled
+                    continue
+                if request.request_id in self.finished_requests:
+                    continue
+                # Requests that waiting for chunk
+                self.load_async(request)
+                request.status = RequestStatus.WAITING_FOR_CHUNK
+            else:
+                if request.request_id in finished_load_reqs:
+                    request.status = target_status
+                    finished_load_reqs.remove(request.request_id)
+                    self.requests_with_ready_chunks.add(request.request_id)
+                    continue
+            queue.remove(request)
+            self.requests_origin_status[request.request_id] = target_status
+            waiting_for_chunk_list.append(request)
 
     def restore_queues(
         self,
@@ -459,6 +581,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             running_queue.extend(live_running_requests)
         self.waiting_for_chunk_running_requests = deque()
 
+        if self._held_non_active:
+            running_queue.extend(self._held_non_active)
+            self._held_non_active = deque()
+
     def postprocess_scheduler_output(
         self,
         scheduler_output: Any,
@@ -475,7 +601,25 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
+        scheduled_req_ids = self._scheduled_request_ids(scheduler_output)
         self._clear_chunk_ready(scheduler_output)
+        if scheduled_req_ids:
+            # Terminal chunks must stay active until they are scheduled once.
+            self._evict_finished_active_streams(scheduled_req_ids)
+
+    @staticmethod
+    def _scheduled_request_ids(scheduler_output: Any) -> set[str]:
+        req_ids: set[str] = set()
+        if scheduler_output.scheduled_new_reqs:
+            for req_data in scheduler_output.scheduled_new_reqs:
+                req_id = getattr(req_data, "req_id", None)
+                if req_id:
+                    req_ids.add(req_id)
+        if scheduler_output.scheduled_cached_reqs:
+            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+                if req_id:
+                    req_ids.add(req_id)
+        return req_ids
 
     @staticmethod
     def attach_cached_additional_information(scheduler_output: Any, requests: dict[str, Request]) -> None:
@@ -500,6 +644,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     ) -> None:
         queue_snapshot = list(queue)
         for request in queue_snapshot:
+            if not self._ensure_active_stream(request):
+                continue
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request.request_id in self.requests_with_ready_chunks:
                     # Requests that have loaded chunk from last round
