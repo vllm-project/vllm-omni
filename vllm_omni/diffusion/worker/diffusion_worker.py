@@ -523,10 +523,11 @@ class DiffusionWorker:
 
             current_omni_platform.synchronize()
             free_before = current_omni_platform.get_free_memory(self.device)
-            self.sleep(level=task.level)
+            allocator_freed = self.sleep(level=task.level)
             current_omni_platform.synchronize()
             free_after = current_omni_platform.get_free_memory(self.device)
-            real_freed = max(0, free_after - free_before)
+            phys_freed = max(0, free_after - free_before)
+            real_freed = max(int(allocator_freed), phys_freed)
             logger.info(f"[Worker {self.rank}] Preparing ACK: freed_bytes={real_freed / GiB_bytes:.2f} GiB.")
 
             # Ensure all ranks have completed sleep before measuring memory and sending ACK
@@ -553,6 +554,8 @@ class DiffusionWorker:
                 metadata={
                     "source": f"Platform_{current_omni_platform.get_device_name()}",
                     "total_freed_gib": f"{real_freed / GiB_bytes:.2f}",
+                    "allocator_freed_gib": f"{allocator_freed / GiB_bytes:.2f}",
+                    "physical_freed_gib": f"{phys_freed / GiB_bytes:.2f}",
                     "rank_residual_gib": f"{residual_gib:.2f}",
                 },
             )
