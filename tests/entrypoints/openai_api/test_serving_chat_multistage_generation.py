@@ -242,8 +242,8 @@ def test_build_multistage_generation_inputs_sets_hunyuan_image_ratio_stops(servi
 
     engine = SimpleNamespace(
         stage_configs=[
-            SimpleNamespace(stage_type="llm", is_comprehension=True),
-            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+            {"stage_type": "llm", "is_comprehension": True},
+            {"stage_type": "diffusion", "is_comprehension": False},
         ],
         default_sampling_params_list=[
             SamplingParams(temperature=0.0, stop_token_ids=[128025]),

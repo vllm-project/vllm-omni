@@ -114,6 +114,17 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
+def _is_comprehension_stage(stage_cfg: Any) -> bool:
+    if isinstance(stage_cfg, dict):
+        return bool(stage_cfg.get("is_comprehension", False))
+    if hasattr(stage_cfg, "get"):
+        try:
+            return bool(stage_cfg.get("is_comprehension", False))
+        except Exception:
+            pass
+    return bool(getattr(stage_cfg, "is_comprehension", False))
+
+
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     """OpenAI-compatible chat serving for both LLM and Diffusion models.
 
@@ -2428,7 +2439,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         comprehension_idx = None
         for idx, stage in enumerate(stage_configs):
-            if getattr(stage, "is_comprehension", False):
+            if _is_comprehension_stage(stage):
                 comprehension_idx = idx
                 break
 
