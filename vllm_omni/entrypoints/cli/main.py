@@ -6,10 +6,15 @@ import importlib.metadata
 import sys
 
 
+def _should_use_omni_cli(argv: list[str]) -> bool:
+    """Return True when this invocation should be handled by vLLM-Omni."""
+    return "--omni" in argv or (len(argv) > 1 and argv[1] == "generate")
+
+
 def main():
     """Main CLI entry point that intercepts vLLM commands."""
-    # Check if --omni flag is present
-    if "--omni" not in sys.argv:
+    # Check if --omni flag is present or the standalone generate subcommand is used.
+    if not _should_use_omni_cli(sys.argv):
         from vllm.entrypoints.cli.main import main as vllm_main
 
         vllm_main()
@@ -27,10 +32,12 @@ def main():
         from vllm.utils.argparse_utils import FlexibleArgumentParser
 
         import vllm_omni.entrypoints.cli.benchmark.main
+        import vllm_omni.entrypoints.cli.generate
         import vllm_omni.entrypoints.cli.serve
 
         CMD_MODULES = [
             vllm_omni.entrypoints.cli.serve,
+            vllm_omni.entrypoints.cli.generate,
             vllm_omni.entrypoints.cli.benchmark.main,
         ]
 

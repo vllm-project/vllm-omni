@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import ast
+import importlib.util
 import logging
 import re
 import sys
@@ -66,6 +67,13 @@ logger = logging.getLogger("mkdocs")
 ROOT_DIR = Path(__file__).parent.parent.parent.parent
 ARGPARSE_DOC_DIR = ROOT_DIR / "docs/generated/argparse_omni"
 
+_DIFFUSION_ARGS_PATH = ROOT_DIR / "vllm_omni/entrypoints/cli/diffusion_args.py"
+_DIFFUSION_ARGS_SPEC = importlib.util.spec_from_file_location("_docs_diffusion_args", _DIFFUSION_ARGS_PATH)
+if _DIFFUSION_ARGS_SPEC is None or _DIFFUSION_ARGS_SPEC.loader is None:
+    raise RuntimeError(f"Unable to load diffusion args helper from {_DIFFUSION_ARGS_PATH}")
+_DIFFUSION_ARGS_MODULE = importlib.util.module_from_spec(_DIFFUSION_ARGS_SPEC)
+_DIFFUSION_ARGS_SPEC.loader.exec_module(_DIFFUSION_ARGS_MODULE)
+
 # Ensure the repo root is in sys.path for dynamic imports
 sys.path.insert(0, str(ROOT_DIR))
 
@@ -128,6 +136,16 @@ def extract_omni_serve_subparser_init():
                         "argparse": __import__("argparse"),
                         "json": __import__("json"),
                         "DESCRIPTION": DESCRIPTION,
+                        "add_diffusion_cfg_parallel_arg": _DIFFUSION_ARGS_MODULE.add_diffusion_cfg_parallel_arg,
+                        "add_diffusion_cpu_offload_arg": _DIFFUSION_ARGS_MODULE.add_diffusion_cpu_offload_arg,
+                        "add_diffusion_sequence_parallel_args": (
+                            _DIFFUSION_ARGS_MODULE.add_diffusion_sequence_parallel_args
+                        ),
+                        "add_diffusion_vae_memory_args": _DIFFUSION_ARGS_MODULE.add_diffusion_vae_memory_args,
+                        "add_diffusion_vae_patch_parallel_arg": (
+                            _DIFFUSION_ARGS_MODULE.add_diffusion_vae_patch_parallel_arg
+                        ),
+                        "add_diffusion_weight_loading_args": _DIFFUSION_ARGS_MODULE.add_diffusion_weight_loading_args,
                     }
                     exec(code, exec_globals, local_vars)
                     # Get the function

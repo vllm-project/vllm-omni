@@ -22,6 +22,12 @@ from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+from vllm_omni.entrypoints.cli.diffusion_args import (
+    add_diffusion_cpu_offload_arg,
+    add_diffusion_sequence_parallel_args,
+    add_diffusion_vae_memory_args,
+    add_diffusion_weight_loading_args,
+)
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
 
@@ -414,33 +420,7 @@ class OmniServeCommand(CLISubcommand):
                 '(e.g. \'{"num_inference_steps": 30, "guidance_scale": 7.5}\').'
             ),
         )
-        omni_config_group.add_argument(
-            "--usp",
-            "--ulysses-degree",
-            dest="ulysses_degree",
-            type=int,
-            default=None,
-            help="Ulysses Sequence Parallelism degree for diffusion models. "
-            "Equivalent to setting DiffusionParallelConfig.ulysses_degree.",
-        )
-        omni_config_group.add_argument(
-            "--ulysses-mode",
-            type=str,
-            default="strict",
-            choices=["strict", "advanced_uaa"],
-            help="Ulysses sequence-parallel mode for diffusion models. "
-            "'strict' keeps the original divisibility requirements; "
-            "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
-        )
-        omni_config_group.add_argument(
-            "--ring",
-            "--ring-degree",
-            dest="ring_degree",
-            type=int,
-            default=None,
-            help="Ring Sequence Parallelism degree for diffusion models. "
-            "Equivalent to setting DiffusionParallelConfig.ring_degree.",
-        )
+        add_diffusion_sequence_parallel_args(omni_config_group)
         omni_config_group.add_argument(
             "--diffusion-quantization-config",
             type=json.loads,
@@ -536,38 +516,13 @@ class OmniServeCommand(CLISubcommand):
         )
 
         # VAE memory optimization parameters
-        omni_config_group.add_argument(
-            "--vae-use-slicing",
-            action="store_true",
-            help="Enable VAE slicing for memory optimization (useful for mitigating OOM issues).",
-        )
-        omni_config_group.add_argument(
-            "--vae-use-tiling",
-            action="store_true",
-            help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
-        )
+        add_diffusion_vae_memory_args(omni_config_group)
 
         # Parallel weight loading (faster diffusion startup)
-        omni_config_group.add_argument(
-            "--disable-multithread-weight-load",
-            action="store_false",
-            dest="enable_multithread_weight_load",
-            default=True,
-            help="Disable multi-threaded safetensors loading (default: enabled with 4 threads).",
-        )
-        omni_config_group.add_argument(
-            "--num-weight-load-threads",
-            type=int,
-            default=4,
-            help="Number of threads for parallel weight loading (default: 4).",
-        )
+        add_diffusion_weight_loading_args(omni_config_group)
 
         # diffusion model offload parameters
-        omni_config_group.add_argument(
-            "--enable-cpu-offload",
-            action="store_true",
-            help="Enable CPU offloading for diffusion models.",
-        )
+        add_diffusion_cpu_offload_arg(omni_config_group)
         omni_config_group.add_argument(
             "--enable-layerwise-offload",
             action="store_true",
@@ -956,7 +911,6 @@ def run_headless(args: argparse.Namespace) -> None:
         stage_connector_spec=stage_connector_spec,
         cli_tokenizer=getattr(args, "tokenizer", None),
     )
-
     # Inject omni KV connector config so the engine runner can initialize the
     # correct connector (sender/receiver role, type, addresses, etc.).
     if omni_conn_cfg:

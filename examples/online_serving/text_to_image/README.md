@@ -43,6 +43,11 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
 
 For more details on parallelism acceleration, see the [Parallelism Acceleration Guide](../../diffusion/parallelism_acceleration.md).
 
+## Offline CLI Generation
+
+For one-shot local generation with `vllm generate`, see the
+[offline text-to-image example](../../offline_inference/text_to_image/README.md).
+
 ## API Calls
 
 ### Method 1: Using curl
