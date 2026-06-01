@@ -60,11 +60,11 @@ class BackgroundResources:
             for proc in self.processes:
                 if not proc.is_alive():
                     continue
-                proc.join(30)
+                proc.join(5)
                 if proc.is_alive():
                     logger.warning("Terminating diffusion worker %s after timeout", proc.name)
                     proc.terminate()
-                    proc.join(30)
+                    proc.join(5)
 
 
 class MultiprocDiffusionExecutor(DiffusionExecutor):
@@ -311,7 +311,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise RuntimeError(f"Unexpected response type for execute_request: {type(result)!r}")
 
         return RunnerOutput(
-            req_id=new_req.sched_req_id,
+            request_id=new_req.request_id,
             step_index=None,
             finished=True,
             result=result,
@@ -334,9 +334,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # TODO: Remove this fallback; DiffusionOutput cannot faithfully represent
         # failed multi-request step batches.
         if isinstance(result, DiffusionOutput):
-            req_id = scheduler_output.scheduled_req_ids[0] if scheduler_output.scheduled_req_ids else ""
+            request_id = scheduler_output.scheduled_request_ids[0] if scheduler_output.scheduled_request_ids else ""
             return RunnerOutput(
-                req_id=req_id,
+                request_id=request_id,
                 step_index=None,
                 finished=True,
                 result=result,

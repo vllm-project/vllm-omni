@@ -762,15 +762,14 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         encoder_hidden_states = torch.stack(new_encoder_hidden_states)
         encoder_attention_mask = torch.stack(new_encoder_attention_mask)
 
-        # Create explicit attn_mask for image tokens when SP auto_pad is active.
+        max_valid_encoder_tokens = int(encoder_attention_mask.sum(dim=1).max().item())
+        if max_valid_encoder_tokens < encoder_attention_mask.shape[1]:
+            encoder_hidden_states = encoder_hidden_states[:, :max_valid_encoder_tokens]
+            encoder_attention_mask = encoder_attention_mask[:, :max_valid_encoder_tokens]
+        if encoder_attention_mask.all():
+            encoder_attention_mask = None
+
         ctx = get_forward_context()
-        if not ctx.sp_active:
-            max_valid_encoder_tokens = int(encoder_attention_mask.sum(dim=1).max().item())
-            if max_valid_encoder_tokens < encoder_attention_mask.shape[1]:
-                encoder_hidden_states = encoder_hidden_states[:, :max_valid_encoder_tokens]
-                encoder_attention_mask = encoder_attention_mask[:, :max_valid_encoder_tokens]
-            if encoder_attention_mask.all():
-                encoder_attention_mask = None
         hidden_states_mask = None
         if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
             padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size

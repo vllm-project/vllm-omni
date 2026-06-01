@@ -35,7 +35,11 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.utils.speaker_cache import get_speaker_cache
+from vllm_omni.utils.speaker_cache import (
+    get_speaker_cache,
+    iter_custom_voice_profiles,
+    load_validated_profile_tensors,
+)
 
 from .minicpm4_paged import MiniCPM4PagedForVoxCPM2, MiniCPM4PagedResidualLM
 from .voxcpm2_import_utils import import_voxcpm2_core
@@ -97,6 +101,7 @@ def build_voxcpm2_prompt(
     ref_audio: Any | None = None,
     ref_sr: int | None = None,
     ref_text: str | None = None,
+    voice_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a VoxCPM2 prefill prompt whose ``prompt_token_ids`` length matches
     the talker-side prefill length.
@@ -110,7 +115,24 @@ def build_voxcpm2_prompt(
         ids = ids[1:]
     prefill_len = len(ids) + 1  # + audio_start
     additional: dict[str, Any] = {"text_token_ids": [ids]}
-    if ref_audio is not None:
+    if voice_profile is not None and ref_audio is None:
+        mode = str(voice_profile.get("mode") or "reference").lower()
+        ref_audio_feat_len = int(voice_profile.get("ref_audio_feat_len") or 0)
+        audio_feat_len = int(voice_profile.get("audio_feat_len") or 0)
+        prompt_text = voice_profile.get("prompt_text") or voice_profile.get("ref_text")
+        additional["voice_profile"] = dict(voice_profile)
+
+        if mode in ("reference", "ref_continuation"):
+            prefill_len += ref_audio_feat_len + 2  # ref_start / ref_end
+        if mode in ("continuation", "ref_continuation"):
+            if isinstance(prompt_text, str) and prompt_text:
+                additional["prompt_text"] = [prompt_text]
+                prompt_ids = split_multichar_chinese(tokenizer.encode(prompt_text, add_special_tokens=True), split_map)
+                if prompt_ids and prompt_ids[0] == bos:
+                    prompt_ids = prompt_ids[1:]
+                prefill_len += len(prompt_ids)
+            prefill_len += audio_feat_len
+    elif ref_audio is not None:
         vae = hf_config.audio_vae_config
         patch_samples = hf_config.patch_size * math.prod(vae["encoder_rates"])
         ref_len = math.ceil(math.ceil(len(ref_audio) * vae["sample_rate"] / ref_sr) / patch_samples)
@@ -450,6 +472,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         # Speaker cache for ref_audio_feat across requests
         self._speaker_cache = get_speaker_cache()
+        self._load_custom_voice_profiles()
 
         self._perf = _PerfTimer(enabled=_ENABLE_PROFILING)
         self._cfm_buffers: _CFMBufferManager | None = None
@@ -471,6 +494,51 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._active_state_warn_threshold = max(_ACTIVE_STATE_LEAK_WARN_MIN, 4 * self._max_batch_size)
         # one-shot by design: fires at most once per process to avoid log spam.
         self._active_state_warned = False
+
+    # -------------------- custom voice profiles --------------------
+
+    @staticmethod
+    def _clone_prompt_cache(cache: dict[str, Any]) -> dict[str, Any]:
+        cloned: dict[str, Any] = {}
+        for key, value in cache.items():
+            cloned[key] = value.clone() if isinstance(value, torch.Tensor) else value
+        return cloned
+
+    def _load_custom_voice_profiles(self) -> None:
+        """Preload offline VoxCPM2 prompt caches into the shared speaker cache."""
+        custom_voice_dir = getattr(self.config, "custom_voice_dir", None)
+        if not custom_voice_dir:
+            return
+
+        loaded = 0
+        for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type="voxcpm2"):
+            tensors = load_validated_profile_tensors(profile, expected_model_type="voxcpm2")
+            if tensors is None:
+                continue
+
+            ref_audio_feat = tensors.get("ref_audio_feat")
+            audio_feat = tensors.get("audio_feat")
+            mode = str(profile.get("mode") or "").lower()
+
+            prompt_cache: dict[str, Any] = {"mode": mode}
+            if ref_audio_feat is not None:
+                prompt_cache["ref_audio_feat"] = ref_audio_feat.contiguous().cpu()
+            if audio_feat is not None:
+                prompt_cache["audio_feat"] = audio_feat.contiguous().cpu()
+            prompt_text = profile.get("prompt_text") or profile.get("ref_text")
+            if isinstance(prompt_text, str) and prompt_text:
+                prompt_cache["prompt_text"] = prompt_text
+
+            key = self._speaker_cache.make_cache_key(
+                profile["voice_name_lower"],
+                model_type="voxcpm2",
+                created_at=0,
+            )
+            self._speaker_cache.put(key, prompt_cache)
+            loaded += 1
+
+        if loaded:
+            logger.info("Loaded %d precomputed VoxCPM2 custom voice profile(s) from %s", loaded, custom_voice_dir)
 
     @property
     def tts(self) -> nn.Module:
@@ -1161,6 +1229,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 prompt_audio = prompt_audio[0] if prompt_audio else None
             if isinstance(prompt_text, list):
                 prompt_text = prompt_text[0] if prompt_text else None
+            voice_profile = info_dict.get("voice_profile")
+            if isinstance(voice_profile, list):
+                voice_profile = voice_profile[0] if voice_profile else None
+            requires_precomputed_cache = isinstance(voice_profile, dict)
 
             state.prompt_cache = None
             voice_name = info_dict.get("voice_name")
@@ -1168,20 +1240,29 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 voice_name = voice_name[0] if voice_name else None
             _created_at = int(info_dict.get("voice_created_at") or 0)
 
-            if ref_audio or (prompt_audio and prompt_text):
-                # Check speaker cache for reference-only mode
-                if voice_name and ref_audio and not prompt_audio:
-                    _cache_key = self._speaker_cache.make_cache_key(
-                        voice_name, model_type="voxcpm2", created_at=_created_at
-                    )
-                    cached = self._speaker_cache.get(_cache_key)
-                    if cached is not None:
+            if voice_name:
+                _cache_key = self._speaker_cache.make_cache_key(
+                    voice_name, model_type="voxcpm2", created_at=_created_at
+                )
+                cached = self._speaker_cache.get(_cache_key)
+                if cached is not None:
+                    if "mode" in cached:
+                        state.prompt_cache = self._clone_prompt_cache(cached)
+                    elif "ref_audio_feat" in cached:
                         state.prompt_cache = {
                             "mode": "reference",
                             "ref_audio_feat": cached["ref_audio_feat"].clone(),
                         }
-                        logger.debug("Speaker cache HIT for VoxCPM2 speaker '%s'", voice_name)
+                    logger.debug("Speaker cache HIT for VoxCPM2 speaker '%s'", voice_name)
 
+            if state.prompt_cache is None and requires_precomputed_cache:
+                requested_mode = voice_profile.get("mode") if isinstance(voice_profile, dict) else None
+                raise ValueError(
+                    f"Precomputed VoxCPM2 voice '{voice_name}' was accepted by serving but is not loaded "
+                    f"in the model cache (voice_created_at={_created_at}, mode={requested_mode})"
+                )
+
+            if state.prompt_cache is None and (ref_audio or (prompt_audio and prompt_text)):
                 if state.prompt_cache is None:
                     try:
                         state.prompt_cache = self._build_prompt_cache(

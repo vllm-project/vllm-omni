@@ -2335,11 +2335,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         prompt_token_ids: list[int] | None = None
         system_prompt_type: str | None = None
         build_kwargs: dict[str, Any] = {}
+        ar_stop_token_ids: list[int] | None = None
 
         if bot_task is not None or use_system_prompt is not None or custom_system_prompt is not None:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
                 build_prompt_tokens,
+                resolve_stop_token_ids,
             )
 
             build_kwargs: dict[str, Any] = {
@@ -2367,6 +2369,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if reference_images and len(reference_images) == 1:
                 engine_prompt_data = {"image": reference_images[0]}
                 modalities = ["image"]
+
+            ar_task = "it2i" if reference_images else "t2i"
+            # ar_image_size: None -> need_ratio=True (AR predicts ratio);
+            # explicit size -> need_ratio=False (AR stops at terminator).
+            ar_image_size: str | None = None
+            if height is not None and width is not None:
+                ar_image_size = f"{width}x{height}"
+            ar_stop_token_ids = resolve_stop_token_ids(
+                task=ar_task,
+                bot_task=bot_task,
+                tokenizer=tokenizer,
+                image_size=ar_image_size,
+            )
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}
         if prompt_token_ids is not None:
@@ -2412,6 +2427,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         for idx, stage_cfg in enumerate(stage_configs):
             stage_type = get_stage_type(stage_cfg)
             default_stage_params = sampling_params_list[idx]
+
+            # AR stop tokens: use stage_type=="llm" instead of comprehension_idx
+            # (None for DictConfig where is_comprehension is nested in engine_args).
+            if stage_type == "llm" and ar_stop_token_ids is not None:
+                default_stage_params.stop_token_ids = ar_stop_token_ids
 
             if (
                 comprehension_idx is not None
@@ -2554,6 +2574,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         output_format: str = "png",
         output_compression: int = 100,
         size: str = "auto",
+        raw_request: Request | None = None,
     ) -> tuple[list[Image.Image], dict[str, Any], float, str | None] | ErrorResponse | AsyncIterator[str]:
         """Generate diffusion images and return raw images plus generation stats."""
         if request_id is None:
@@ -2615,6 +2636,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     output_format=output_format,
                     output_compression=output_compression,
                     size=size,
+                    raw_request=raw_request,
                 )
 
             result = None
@@ -2649,6 +2671,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if isinstance(ar_text, str) and ar_text.strip():
                         cot_output = ar_text
 
+        req_out = getattr(result, "request_output", None)
+        if req_out:
+            prompt_obj = getattr(req_out, "prompt", None)
+            if isinstance(prompt_obj, dict):
+                extra = prompt_obj.get("extra", {})
+                if isinstance(extra, dict):
+                    ar_text = extra.get("ar_generated_text")
+                    if isinstance(ar_text, str) and ar_text.strip():
+                        cot_output = ar_text
+
         return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb, cot_output
 
     async def _stream_diffusion_image_chunks(
@@ -2659,6 +2691,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         output_format: str,
         output_compression: int,
         size: str,
+        raw_request: Request | None = None,
     ) -> AsyncIterator[str]:
         """Yield image edit SSE chunks from multi-stage diffusion outputs."""
         created = int(time.time())
@@ -2710,7 +2743,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             logger.error("EngineDeadError during streaming image edit: %s", exc)
             data = self.create_streaming_error_response(exc)
             yield f"data: {data}\n\n"
-            terminate_if_errored(engine=self.engine_client)
+            if raw_request is not None:
+                terminate_if_errored(
+                    server=raw_request.app.state.server,
+                    engine=self.engine_client,
+                )
+            else:
+                logger.warning(
+                    "[OmniOpenAIServingChat] Engine dead during streaming image edit, "
+                    "but cannot terminate server (no raw_request context)."
+                )
         except Exception as exc:
             logger.exception("Streaming image edit failed: %s", exc)
             chunk = ImageEditStreamError(

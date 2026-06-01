@@ -39,6 +39,7 @@ MIMO_AUDIO_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.llm2code2wav_async_chunk"),
+            custom_process_next_stage_input_func=f"{_PROC}.llm2code2wav_full_payload",
             sampling_constraints={
                 "detokenize": True,
                 # Stop once the speech/text interleaved span ends. Code2Wav
@@ -55,7 +56,8 @@ MIMO_AUDIO_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",
-            sync_process_input_func=f"{_PROC}.llm2code2wav",
+            custom_process_input_func=f"{_PROC}.llm2code2wav",
+            sync_process_input_func=f"{_PROC}.llm2code2wav_token_only",
             sampling_constraints={"detokenize": False},
         ),
     ),
