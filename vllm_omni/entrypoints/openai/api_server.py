@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from numbers import Integral
+from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
 import httpx
@@ -133,6 +134,7 @@ from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
+from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
@@ -140,6 +142,51 @@ router = APIRouter()
 
 MAX_UINT32_SEED = 2**32 - 1
 profiler_router = APIRouter()
+
+
+def _load_model_chat_template_json(model: str) -> str | None:
+    """Load a model-level chat_template.json from a local path or HF cache.
+
+    Some multimodal HF repos, including Qwen3-Omni, ship the chat template as a
+    separate file instead of embedding it in tokenizer_config.json. Transformers
+    4.44+ no longer supplies a default template, so serving must pass that model
+    template explicitly when the user did not provide --chat-template.
+    """
+    candidate = Path(model) / "chat_template.json"
+    template_path: str | None = str(candidate) if candidate.is_file() else None
+
+    if template_path is None:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            template_path = hf_hub_download(
+                repo_id=model,
+                filename="chat_template.json",
+                local_files_only=True,
+            )
+        except Exception:
+            return None
+
+    try:
+        with open(template_path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        logger.warning("Failed to load chat template from %s: %s", template_path, exc)
+        return None
+
+    if isinstance(payload, dict):
+        template = payload.get("chat_template")
+    elif isinstance(payload, str):
+        template = payload
+    else:
+        template = None
+
+    if not isinstance(template, str) or not template.strip():
+        logger.warning("Ignoring malformed chat template payload in %s", template_path)
+        return None
+
+    logger.info("Loaded chat template from %s", template_path)
+    return template
 
 
 def _should_enable_profiler_endpoints(stage_configs: list | None) -> bool:
@@ -633,6 +680,10 @@ async def omni_init_app_state(
         )
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
+        state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
+            engine_client=engine_client,
+            model_name=model_name,
+        )
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
@@ -668,6 +719,14 @@ async def omni_init_app_state(
     logger.info("Supported tasks: %s", supported_tasks)
 
     resolved_chat_template = load_chat_template(args.chat_template)
+    if resolved_chat_template is None:
+        try:
+            tokenizer = await engine_client.get_tokenizer()
+        except Exception as exc:
+            logger.debug("Could not inspect tokenizer chat_template before serving init: %s", exc)
+            tokenizer = None
+        if tokenizer is None or getattr(tokenizer, "chat_template", None) is None:
+            resolved_chat_template = _load_model_chat_template_json(args.model)
 
     if args.tool_server == "demo":
         tool_server: ToolServer | None = DemoToolServer()
@@ -963,6 +1022,7 @@ async def omni_init_app_state(
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
     )
+    state.openai_serving_realtime_robot = None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
@@ -1403,6 +1463,23 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.close()
         return
     connection = RealtimeConnection(websocket, serving)
+    await connection.handle_connection()
+
+
+@router.websocket("/v1/realtime/robot/openpi")
+async def realtime_robot_openpi(websocket: WebSocket):
+    """WebSocket endpoint for robot policy inference via OpenPI messages."""
+    from vllm_omni.entrypoints.openpi.connection import (
+        RobotRealtimeConnection,
+    )
+
+    serving = getattr(websocket.app.state, "openai_serving_realtime_robot", None)
+    if serving is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "Robot policy not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    connection = RobotRealtimeConnection(websocket, serving)
     await connection.handle_connection()
 
 

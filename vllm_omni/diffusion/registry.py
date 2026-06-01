@@ -141,6 +141,11 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
+    "LancePipeline": (
+        "lance",
+        "pipeline_lance",
+        "LancePipeline",
+    ),
     "MingImagePipeline": (
         "ming_flash_omni",
         "pipeline_ming_imagegen",
@@ -471,6 +476,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
+    "LancePipeline": "get_lance_post_process_func",
     "MingImagePipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
