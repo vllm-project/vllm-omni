@@ -144,6 +144,20 @@ def parse_args() -> argparse.Namespace:
         required=False,
     )
     parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        metavar="W",
+        help="Output image width in pixels. Default: None (pipeline's default).",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        metavar="H",
+        help="Output image height in pixels. Default: None (pipeline's default).",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -384,6 +398,11 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
+    if args.width is not None and args.width <= 0:
+        raise ValueError("--width must be a positive integer")
+    if args.height is not None and args.height <= 0:
+        raise ValueError("--height must be a positive integer")
+
     # Validate input images exist and load them
     input_images = []
     for image_path in args.image:
@@ -464,6 +483,7 @@ def main():
     print(
         f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size}, enable_expert_parallel: {args.enable_expert_parallel}"
     )
+    print(f"  Output image size: {args.width or 'default'}x{args.height or 'default'}")
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()
@@ -480,6 +500,8 @@ def main():
             "multi_modal_data": {"image": input_image},
         },
         OmniDiffusionSamplingParams(
+            width=args.width,
+            height=args.height,
             generator=generator,
             true_cfg_scale=args.cfg_scale,
             guidance_scale=args.guidance_scale,
