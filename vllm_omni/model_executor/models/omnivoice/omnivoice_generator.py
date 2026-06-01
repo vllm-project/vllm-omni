@@ -242,6 +242,7 @@ def _gumbel_sample(logits: torch.Tensor, temperature: float, generator: torch.Ge
 # ---------------------------------------------------------------------------
 
 
+# Subclass keeps .weight name + ctor shape so the state_dict loader stays unchanged.
 class OmniVoiceRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -315,10 +316,9 @@ class OmniVoiceAttention(nn.Module):
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        # Convert [B, 1, S, S] bool mask to float mask for SDPA
-        # (0.0 where attend, -inf where masked)
-        sdpa_mask = None
-        if attention_mask is not None:
+        # Caller passes a float mask; materialize float form if a bool slips through.
+        sdpa_mask = attention_mask
+        if sdpa_mask is not None and sdpa_mask.dtype == torch.bool:
             sdpa_mask = torch.zeros_like(attention_mask, dtype=q.dtype).masked_fill_(~attention_mask, float("-inf"))
 
         out = F.scaled_dot_product_attention(
@@ -400,24 +400,48 @@ def _precompute_rope(
     theta: float = 1000000.0,
     device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Precompute RoPE cos/sin tensors."""
+    """Precompute RoPE cos/sin pre-doubled to full head_dim so the hot path skips a per-call cat."""
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
     t = torch.arange(max_seq_len, device=device, dtype=torch.float32)
     freqs = torch.outer(t, inv_freq)
-    cos = freqs.cos()
-    sin = freqs.sin()
+    cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1)
+    sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1)
     return cos, sin
 
 
 def _apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply rotary position embedding. x shape: (B, S, H, D)."""
+    """Apply rotary position embedding. x shape: (B, S, H, D). cos/sin are pre-doubled to width D."""
     seq_len = x.shape[1]
-    cos = cos[:seq_len].unsqueeze(0).unsqueeze(2)  # (1, S, 1, D/2)
+    cos = cos[:seq_len].unsqueeze(0).unsqueeze(2)  # (1, S, 1, D)
     sin = sin[:seq_len].unsqueeze(0).unsqueeze(2)
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     rotated = torch.cat([-x2, x1], dim=-1)
-    return x * torch.cat([cos, cos], dim=-1) + rotated * torch.cat([sin, sin], dim=-1)
+    return x * cos + rotated * sin
+
+
+# ---------------------------------------------------------------------------
+# TF32 opt-in (process-wide; default off)
+# ---------------------------------------------------------------------------
+
+_TF32_ENABLED = False
+
+
+def _maybe_enable_tf32() -> None:
+    """Enable TF32 matmuls process-wide (idempotent). Not bit-identical; opt-in via config.enable_tf32."""
+    global _TF32_ENABLED
+    if _TF32_ENABLED or not torch.cuda.is_available():
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    _TF32_ENABLED = True
+    logger.info(
+        "OmniVoice TF32 enabled process-wide: matmul.allow_tf32=%s cudnn.allow_tf32=%s float32_matmul_precision=%s",
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cudnn.allow_tf32,
+        torch.get_float32_matmul_precision(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -476,14 +500,16 @@ class _OmniVoiceCUDAGraphForward:
         mask_padded[:, :S] = audio_mask
 
         if attention_mask is not None:
-            attn_padded = torch.zeros(
-                two_b,
-                1,
-                bucket,
-                bucket,
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
+            # Float masks pad with -inf, bool masks with False; both mean "masked".
+            if attention_mask.dtype == torch.bool:
+                attn_padded = torch.zeros(two_b, 1, bucket, bucket, dtype=torch.bool, device=attention_mask.device)
+            else:
+                attn_padded = torch.full(
+                    (two_b, 1, bucket, bucket),
+                    float("-inf"),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
             attn_padded[:, :, :S, :S] = attention_mask
         else:
             attn_padded = None
@@ -564,7 +590,8 @@ class _OmniVoiceCUDAGraphForward:
             key = (two_b, bucket)
             dummy_ids = torch.zeros(two_b, num_cb, bucket, dtype=torch.long, device=device)
             dummy_mask = torch.zeros(two_b, bucket, dtype=torch.bool, device=device)
-            dummy_attn = torch.ones(two_b, 1, bucket, bucket, dtype=torch.bool, device=device)
+            # Capture with a float mask to match what forward() feeds at replay time.
+            dummy_attn = torch.zeros(two_b, 1, bucket, bucket, dtype=torch.float32, device=device)
             self._graphs[key] = self._capture_for_key(key, dummy_ids, dummy_mask, dummy_attn)
         logger.info("OmniVoice CUDA Graph warmup complete (%d graphs)", len(self._graphs))
 
@@ -655,6 +682,10 @@ class OmniVoiceGenerator(nn.Module):
         super().__init__()
         self.config = config
 
+        # Opt-in TF32; must run before any CUDA-graph capture so captured kernels honour it.
+        if getattr(config, "enable_tf32", False):
+            _maybe_enable_tf32()
+
         # Text embedding (shared with LLM)
         self.text_embedding = nn.Embedding(config.llm_vocab_size, config.llm_hidden_size)
 
@@ -703,6 +734,8 @@ class OmniVoiceGenerator(nn.Module):
         self,
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
+        text_embeds: torch.Tensor | None = None,
+        audio_mask_3d: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Prepare mixed text+audio embeddings.
 
@@ -710,30 +743,38 @@ class OmniVoiceGenerator(nn.Module):
             input_ids: [B, 8, S] - text tokens replicated across codebooks,
                        audio positions have per-codebook token IDs
             audio_mask: [B, S] - True for audio positions, False for text
+            text_embeds: optional cached [B, S, H] text-position embeddings
+            audio_mask_3d: optional cached [B, S, 1] audio_mask.unsqueeze(-1)
 
         Returns:
             embeddings: [B, S, hidden_size]
         """
-        # Text embeddings from first codebook row (all rows identical for text)
-        text_embeds = self.text_embedding(input_ids[:, 0, :])
+        # Cached across the denoising loop since text ids don't change.
+        if text_embeds is None:
+            text_embeds = self.text_embedding(input_ids[:, 0, :])
+        if audio_mask_3d is None:
+            audio_mask_3d = audio_mask.unsqueeze(-1)
 
         # Audio embeddings: offset per codebook, then sum across codebooks
         shifted_ids = (input_ids * audio_mask.unsqueeze(1)) + self.codebook_layer_offsets.view(1, -1, 1)
         audio_embeds = self.audio_embeddings(shifted_ids).sum(dim=1)
 
         # Merge: audio where audio_mask=True, text elsewhere
-        return torch.where(audio_mask.unsqueeze(-1), audio_embeds, text_embeds)
+        return torch.where(audio_mask_3d, audio_embeds, text_embeds)
 
     def _transformer_forward(
         self,
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run through transformer layers.
 
         Args:
             inputs_embeds: [B, S, hidden_size]
             attention_mask: [B, 1, S, S] or None
+            cos, sin: optional precomputed RoPE tables in target dtype
 
         Returns:
             hidden_states: [B, S, hidden_size]
@@ -743,8 +784,15 @@ class OmniVoiceGenerator(nn.Module):
         self._ensure_rope(seq_len, device)
 
         hidden_states = inputs_embeds
-        cos = self._rope_cos.to(device=device, dtype=hidden_states.dtype)
-        sin = self._rope_sin.to(device=device, dtype=hidden_states.dtype)
+        if cos is None or sin is None:
+            cos = self._rope_cos.to(device=device, dtype=hidden_states.dtype)
+            sin = self._rope_sin.to(device=device, dtype=hidden_states.dtype)
+
+        # Safety: convert bool mask if caller hasn't (e.g. external paths beyond forward()).
+        if attention_mask is not None and attention_mask.dtype == torch.bool:
+            attention_mask = torch.zeros_like(attention_mask, dtype=hidden_states.dtype).masked_fill_(
+                ~attention_mask, float("-inf")
+            )
 
         for layer in self.layers:
             hidden_states = layer(
@@ -859,21 +907,37 @@ class OmniVoiceGenerator(nn.Module):
 
         layer_ids = torch.arange(num_codebooks, device=device).view(1, -1, 1)
 
-        # Compute c_lens for extracting target region from full sequence
-        c_lens = []
-        for i in range(B):
-            # Conditional sequence length = number of non-padding positions
-            c_len = attention_mask[i, 0, 0].sum().item()
-            c_lens.append(int(c_len))
+        # Single D2H pull for all conditional lengths instead of B per-item .item() syncs.
+        c_lens = attention_mask[:B, 0, 0].sum(dim=-1).tolist()
+
+        # Materialize the SDPA float mask once so the captured graph (and eager path) skip per-layer conversion.
+        sdpa_attn_mask = torch.zeros_like(attention_mask, dtype=torch.float32).masked_fill_(
+            ~attention_mask, float("-inf")
+        )
+
+        use_cuda_graph = self._cuda_graph_fwd is not None and input_ids.is_cuda
+        if not use_cuda_graph:
+            # Eager-path-only constants (the cuda-graph captures its own).
+            text_embeds_cached = self.text_embedding(input_ids[:, 0, :])
+            audio_mask_3d = audio_mask.unsqueeze(-1)
+            self._ensure_rope(input_ids.shape[-1], device)
+            target_dtype = text_embeds_cached.dtype
+            cos = self._rope_cos.to(device=device, dtype=target_dtype)
+            sin = self._rope_sin.to(device=device, dtype=target_dtype)
 
         # Main iterative loop
         for step in range(num_step):
-            if self._cuda_graph_fwd is not None and input_ids.is_cuda:
-                batch_logits = self._cuda_graph_fwd(input_ids, audio_mask, attention_mask).to(torch.float32)
+            if use_cuda_graph:
+                # Float mask skips per-layer conversion; fp32 cast deferred to the per-item slices below.
+                batch_logits = self._cuda_graph_fwd(input_ids, audio_mask, sdpa_attn_mask)
             else:
-                inputs_embeds = self._prepare_embeddings(input_ids, audio_mask)
-                hidden_states = self._transformer_forward(inputs_embeds, attention_mask)
-                batch_logits = self._get_logits(hidden_states).to(torch.float32)
+                # Eager fallback reuses hoisted constants (text embeds, sdpa mask, cos/sin).
+                inputs_embeds = self._prepare_embeddings(
+                    input_ids, audio_mask, text_embeds=text_embeds_cached, audio_mask_3d=audio_mask_3d
+                )
+                hidden_states = self._transformer_forward(inputs_embeds, sdpa_attn_mask, cos=cos, sin=sin)
+                # fp32 cast deferred to the per-item slices below.
+                batch_logits = self._get_logits(hidden_states)
             # batch_logits: [2*B, 8, S, 1025]
 
             for i in range(B):
@@ -884,16 +948,17 @@ class OmniVoiceGenerator(nn.Module):
                 c_len = c_lens[i]
                 t_len = target_lens[i]
 
-                # Extract logits for target region
-                c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :]  # [1, 8, T, 1025]
-                u_logits = batch_logits[B + i : B + i + 1, :, :t_len, :]  # [1, 8, T, 1025]
+                # Extract logits for target region; upcast only the slices we actually consume.
+                c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :].to(torch.float32)
+                u_logits = batch_logits[B + i : B + i + 1, :, :t_len, :].to(torch.float32)
 
-                # Classifier-free guidance
+                # Classifier-free guidance. Fuse the chain: the two inner
+                # log_softmax normalizers are per-position scalars that the final
+                # shift-invariant log_softmax cancels, so guide on the raw logits
+                # with a single softmax: log_softmax((1+s)*c - s*u). Exact.
                 if guidance_scale != 0:
-                    c_log_probs = F.log_softmax(c_logits, dim=-1)
-                    u_log_probs = F.log_softmax(u_logits, dim=-1)
-                    log_probs = torch.log_softmax(
-                        c_log_probs + guidance_scale * (c_log_probs - u_log_probs),
+                    log_probs = F.log_softmax(
+                        (1.0 + guidance_scale) * c_logits - guidance_scale * u_logits,
                         dim=-1,
                     )
                 else:
@@ -922,15 +987,13 @@ class OmniVoiceGenerator(nn.Module):
                 sample_tokens = tokens[i : i + 1, :, :t_len]
                 scores.masked_fill_(sample_tokens != mask_id, -float("inf"))
 
-                # Select top-k positions to unmask
+                # Select top-k positions to unmask. .flatten() on this non-contiguous view already copies.
                 _, topk_idx = torch.topk(scores.flatten(), k)
-                flat_tokens = sample_tokens.flatten().clone()
+                flat_tokens = sample_tokens.flatten()
                 flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
                 sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
 
-                # Update tokens and batch inputs for next iteration
-                tokens[i : i + 1, :, :t_len] = sample_tokens
-                input_ids = input_ids.clone()
+                # Mirror update into both cond and uncond input_ids halves for the next step.
                 input_ids[i, :, c_len - t_len : c_len] = sample_tokens.squeeze(0)
                 input_ids[B + i, :, :t_len] = sample_tokens.squeeze(0)
 
