@@ -531,10 +531,6 @@ class OmniServerStageCli(OmniServer):
         if self.env_dict is not None:
             env.update(self.env_dict)
 
-        devices = self.stage_runtime_devices.get(stage_id)
-        if devices:
-            self._set_stage_device_env(stage_id, env, devices, replica_id=replica_id)
-
         cmd = self._build_stage_cmd(stage_id, headless=headless, replica_id=replica_id)
         print(f"Launching OmniServerStageCli stage {stage_id} replica {replica_id}: {' '.join(cmd)}")
         # Capture each subprocess's stdout+stderr to a per-stage log file so
@@ -1671,7 +1667,7 @@ class OpenAIClientHandler:
         # Qwen3-TTS custom fields, forwarded via extra_body.
         extra_body: dict[str, Any] = {}
         # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
-        for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens"):
+        for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens", "seed"):
             if key in request_config:
                 extra_body[key] = request_config[key]
 
@@ -2147,8 +2143,8 @@ class OmniRunner:
         _cache = self._prompt_len_estimate_cache
         try:
             from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
-            from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
-                Qwen3TTSTalkerForConditionalGeneration,
+            from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+                Qwen3TTSPromptEmbedsBuilder,
             )
 
             if model_name not in _cache:
@@ -2160,7 +2156,7 @@ class OmniRunner:
 
             tok, tcfg = _cache[model_name]
             task_type = (additional_information.get("task_type") or ["CustomVoice"])[0]
-            return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+            return Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
                 additional_information=additional_information,
                 task_type=task_type,
                 tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],

@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
-from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
@@ -33,6 +32,7 @@ from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -96,32 +96,34 @@ class OmniGPUModelRunner(GPUModelRunner):
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
+        self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
 
+    def _init_talker_mtp(self) -> None:
         # TODO move this model specific logic to a separate class
         # TTS model IS the talker (no .talker sub-attr); use getattr to support both Omni and TTS.
         self.has_talker_mtp = False
         talker_mtp = getattr(self.model, "talker_mtp", None)
-        if talker_mtp is not None:
-            self.talker_mtp = talker_mtp  # type: ignore[assignment]
-            self.has_talker_mtp = True
-            cudagraph_mode = self.compilation_config.cudagraph_mode
-            assert cudagraph_mode is not None
-            has_separate_talker = getattr(self.model, "talker", None) is not None
-            talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
-            if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
-                self.talker_mtp = CUDAGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
-            # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
-            hidden_size = int(
-                getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
-            )
-            max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
-            self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
-            self.talker_mtp_inputs_embeds = self._make_buffer(
-                max_batch_size, hidden_size, dtype=self.dtype, numpy=False
-            )
-            self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
-            self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+        if talker_mtp is None:
+            return
+        self.talker_mtp = talker_mtp  # type: ignore[assignment]
+        self.has_talker_mtp = True
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        assert cudagraph_mode is not None
+        has_separate_talker = getattr(self.model, "talker", None) is not None
+        talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
+        if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
+            graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
+            self.talker_mtp = graph_wrapper_cls(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+        # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
+        hidden_size = int(
+            getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
+        )
+        max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
+        self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
+        self.talker_mtp_inputs_embeds = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+        self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+        self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
 
     def _prewarm_attention_capture_workspaces(self) -> None:
         capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
@@ -435,7 +437,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             if req_id in self.requests:
-                self._update_streaming_input_additional_info(new_req_data, req_id)
+                self._update_streaming_input_additional_info(req_id)
                 req_state = self._update_streaming_request(req_id, new_req_data)
                 reqs_to_add.append(req_state)
                 continue
@@ -1645,9 +1647,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             use_cascade_attn=False,
         )
         # Force eager for unwrapped code predictors (AR loops / multinomial).
-        # When talker_mtp is not a CUDAGraphWrapper, it manages its own CUDA
-        # graphs internally (code_predictor has its own bucket sizes).
-        if not isinstance(self.talker_mtp, CUDAGraphWrapper):
+        # When talker_mtp is not wrapped by the platform's full-graph wrapper,
+        # it manages its own device graphs internally (code_predictor has its
+        # own bucket sizes).
+        if not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()):
             _cudagraph_mode = CUDAGraphMode.NONE
             num_tokens_padded = decode_batch_size
         else:
@@ -1711,7 +1714,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         }
         if generator is not None:
             talker_kwargs["generator"] = generator
-        with set_forward_context(
+        with current_omni_platform.set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
             req_embeds, code_predictor_codes = self.talker_mtp(
@@ -1765,7 +1768,12 @@ class OmniGPUModelRunner(GPUModelRunner):
             if key in gpu_keys:
                 dest[key] = value.detach().clone()
             else:
-                dest[key] = value.detach().to("cpu").contiguous()
+                t = value.detach()
+                if t.is_cuda:
+                    dest[key] = t.to("cpu").contiguous()
+                else:
+                    # If the tensor is already on the CPU, there is no need to unload it to the CPU.
+                    dest[key] = t.contiguous()
         elif isinstance(value, list):
             dest[key] = [
                 (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in value
@@ -1798,34 +1806,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         logger.warning_once("_merge_additional_information_update is deprecated, use _update_intermediate_buffer")
         return self._update_intermediate_buffer(req_id, upd)
 
-    def _update_streaming_input_additional_info(self, new_req_data, req_id):
-        # For streaming input prefill case only. Update buffer from last segment input
+    def _update_streaming_input_additional_info(self, req_id):
+        # For streaming input prefill case only. Set num processed tokens = 0 for new segment input
         cached_additional_info = self.model_intermediate_buffer.get(req_id, {})
         if cached_additional_info:
-            payload_info = getattr(new_req_data, "additional_information", None)
-            inc_info = deserialize_additional_information(payload_info)
-            if isinstance(inc_info, dict) and inc_info:
-                accumulated_keys: set[tuple[str, str]] = set()
-                if hasattr(self, "model") and hasattr(self.model, "streaming_accumulated_keys"):
-                    accumulated_keys = self.model.streaming_accumulated_keys
-                merged_info = dict(cached_additional_info)
-                for key, value in inc_info.items():
-                    if isinstance(value, dict):
-                        existing_sub = merged_info.get(key)
-                        merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
-                        for sk, sv in value.items():
-                            if (key, sk) in accumulated_keys and isinstance(sv, torch.Tensor):
-                                inc_tensor = sv.detach().to("cpu").contiguous()
-                                old_tensor = merged_sub.get(sk)
-                                if old_tensor is None:
-                                    merged_sub[sk] = inc_tensor
-                                else:
-                                    merged_sub[sk] = torch.cat((old_tensor, inc_tensor), dim=0)
-                            else:
-                                merged_sub[sk] = sv
-                        merged_info[key] = merged_sub
-                    else:
-                        merged_info[key] = value
-                merged_info.setdefault("meta", {})["num_processed_tokens"] = 0
-                self.model_intermediate_buffer[req_id] = merged_info
-                setattr(self.requests[req_id], "additional_information_cpu", merged_info)
+            merged_info = dict(cached_additional_info)
+            merged_info.setdefault("meta", {})["num_processed_tokens"] = 0
+            merged_info.setdefault("meta", {})["resumable"] = True
+            self.model_intermediate_buffer[req_id] = merged_info
+            setattr(self.requests[req_id], "additional_information_cpu", merged_info)
