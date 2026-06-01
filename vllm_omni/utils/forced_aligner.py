@@ -391,7 +391,7 @@ def _tokenize_text(text: str) -> list[str]:
     return words
 
 
-def _resolve_timestamp_token_id(tokenizer: Any, timestamp_token: str | None = None) -> int:
+def _resolve_timestamp_token_id(tokenizer: Any, timestamp_token: str = _TIMESTAMP_TOKEN) -> int:
     """Look up the integer id of the timestamp special token."""
     convert = getattr(tokenizer, "convert_tokens_to_ids", None)
     if not callable(convert):

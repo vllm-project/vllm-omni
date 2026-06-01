@@ -243,6 +243,57 @@ class TestStreamingSpeechWebSocket:
         assert captured_requests[0].word_timestamps is True
         assert mock_align.await_count == 1
 
+    def test_word_timestamps_overlapping_intervals_stay_ordered(self, mocker: MockerFixture):
+        # Regression: clamping an overlapping start must not leave end_ms behind
+        # it, or the frame would carry end_ms < start_ms.
+        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
+        speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"", "audio/wav"))
+        speech_service.engine_client = mocker.MagicMock()
+        speech_service.engine_client.abort = mocker.AsyncMock()
+        speech_service.forced_aligner_config = SimpleNamespace(model="aligner")
+        speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req", object(), {}))
+
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+            chunk = b"\x01" * 1000
+            yield (chunk, 1000) if include_sample_rate else chunk
+
+        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        # Second word fully precedes the first word's end.
+        mock_align = mocker.AsyncMock(
+            return_value=[
+                WordTimestamp("Hello", 0, 1000),
+                WordTimestamp("world", 900, 950),
+            ]
+        )
+        mocker.patch.object(streaming_speech_module, "forced_align", mock_align)
+        app, _ = _build_test_app(speech_service)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "stream_audio": True,
+                        "response_format": "pcm",
+                        "word_timestamps": True,
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
+
+                assert ws.receive_json()["type"] == "audio.start"
+                # Real-time audio chunk (timestamps null), then the timestamp frame.
+                assert ws.receive_json()["timestamps"] is None
+                final = ws.receive_json()
+                assert final["type"] == "audio.chunk"
+                timestamps = final["timestamps"]
+                assert timestamps == [
+                    {"word": "Hello", "start_ms": 0, "end_ms": 1000},
+                    {"word": "world", "start_ms": 1000, "end_ms": 1000},
+                ]
+                for ts in timestamps:
+                    assert ts["end_ms"] >= ts["start_ms"]
+
     def test_flush_on_input_done(self, mocker: MockerFixture):
         app, _ = _build_test_app(mocker=mocker)
 

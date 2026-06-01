@@ -450,11 +450,15 @@ class OmniStreamingSpeechHandler:
             # word whose start dips below the previous word's end.
             if timestamps_payload and start_ms < timestamps_payload[-1]["end_ms"]:
                 start_ms = timestamps_payload[-1]["end_ms"]
+            # After clamping the start, the end may now precede it (the aligner
+            # can emit an interval fully behind the previous word). Clamp the
+            # end up too so the frame never carries end_ms < start_ms.
+            end_ms = max(ts.end_ms, start_ms)
             timestamps_payload.append(
                 {
                     "word": ts.word,
                     "start_ms": start_ms,
-                    "end_ms": ts.end_ms,
+                    "end_ms": end_ms,
                 }
             )
         return timestamps_payload
