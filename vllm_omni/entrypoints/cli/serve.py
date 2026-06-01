@@ -96,6 +96,12 @@ class OmniServeCommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
+        if getattr(args, "no_guardrails", False):
+            existing = getattr(args, "model_config", None)
+            model_config = dict(existing) if isinstance(existing, dict) else {}
+            model_config["guardrails"] = False
+            args.model_config = model_config
+
         if args.headless:
             run_headless(args)
         else:
@@ -640,6 +646,15 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=None,
             help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
+        )
+
+        # Disable safety guardrails for this server (currently only applicable for Cosmos3)
+        # TODO: drop once --model-config-override lands (3/N config refactor)
+        omni_config_group.add_argument(
+            "--no-guardrails",
+            dest="no_guardrails",
+            action="store_true",
+            help="Disable Cosmos3 text/video safety guardrails for this server.",
         )
 
         # Enable diffusion pipeline profiling
