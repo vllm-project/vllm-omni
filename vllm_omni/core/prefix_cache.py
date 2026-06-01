@@ -121,25 +121,8 @@ class OmniTensorPrefixCache:
 
     @staticmethod
     def _coerce_to_cpu_tensor(maybe_gpu_tensor: torch.Tensor) -> torch.Tensor:
-        # D2H on a side stream: a main-stream sync here would deadlock with the KV connector.
-        if not maybe_gpu_tensor.is_cuda:
-            # CPU tensors no-op; XPU/NPU/MPS tensors still need .cpu() to reach host.
-            return maybe_gpu_tensor.detach().cpu().contiguous()
-        side_stream = OmniTensorPrefixCache._get_side_stream(maybe_gpu_tensor.device)
-        cpu = torch.empty_like(maybe_gpu_tensor, device="cpu", pin_memory=True)
-        side_stream.wait_stream(torch.cuda.current_stream(maybe_gpu_tensor.device))
-        with torch.cuda.stream(side_stream):
-            cpu.copy_(maybe_gpu_tensor.detach(), non_blocking=True)
-        side_stream.synchronize()
-        return cpu.contiguous()
-
-    @staticmethod
-    def _get_side_stream(device: torch.device) -> torch.cuda.Stream:
-        stream = getattr(OmniTensorPrefixCache, "_d2h_side_stream", None)
-        if stream is None or stream.device_index != device.index:
-            stream = torch.cuda.Stream(device=device)
-            OmniTensorPrefixCache._d2h_side_stream = stream
-        return stream
+        """Convert GPU tensors -> contiguous CPU tensors if needed."""
+        return maybe_gpu_tensor.detach().cpu().contiguous()
 
     @staticmethod
     def _resolve_hidden_states_cpu(
