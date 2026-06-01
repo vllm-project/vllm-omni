@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -20,31 +19,6 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "GEAR-Dreams/DreamZero-DROID"
-
-
-def _pick_test_gpus() -> str:
-    override = os.environ.get("DREAMZERO_TEST_GPUS") or os.environ.get("OPENPI_E2E_GPUS")
-    if override:
-        return override
-
-    try:
-        query = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,memory.used",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-        )
-    except Exception:
-        return "0,1"
-
-    gpu_rows = []
-    for line in query.strip().splitlines():
-        gpu_index, used_mb = [part.strip() for part in line.split(",", maxsplit=1)]
-        gpu_rows.append((int(used_mb), gpu_index))
-    gpu_rows.sort()
-    return ",".join(gpu_index for _, gpu_index in gpu_rows[:2]) or "0,1"
 
 
 test_params = [
@@ -61,7 +35,6 @@ test_params = [
             "ATTENTION_BACKEND": "torch",
             "DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA",
             "VLLM_DISABLE_COMPILE_CACHE": "1",
-            "CUDA_VISIBLE_DEVICES": _pick_test_gpus(),
             "MASTER_PORT": str(get_open_port()),
         },
     )
