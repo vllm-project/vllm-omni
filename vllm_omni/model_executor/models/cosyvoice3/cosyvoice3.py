@@ -48,6 +48,18 @@ from vllm_omni.utils.speaker_cache import get_speaker_cache
 logger = init_logger(__name__)
 
 
+def _cosyvoice3_trt_enabled() -> bool:
+    """COSYVOICE3_TRT env toggle (default on) for the optional TensorRT paths.
+
+    Gates both the talker speaker-embedding (campplus) engine and the code2wav
+    flow-decoder estimator engine. Env-var toggle (cf. mimo_audio's
+    ``MIMO_AUDIO_TOKENIZER_CUDA_GRAPH``) because these run outside the stage
+    worker, so deploy-yaml ``hf_overrides`` / per-stage ``env`` do not reach
+    them — export ``COSYVOICE3_TRT=0`` in the launching shell to disable.
+    """
+    return os.environ.get("COSYVOICE3_TRT", "1") not in ("0", "false", "False", "")
+
+
 class CosyVoice3MultiModalProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self):
         """If the config is not already present pass it
@@ -131,15 +143,8 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
 
     @staticmethod
     def _speaker_embedding_trt_enabled() -> bool:
-        """Whether to use the TensorRT campplus speaker-embedding path.
-
-        Default on; disable per process with ``COSYVOICE3_TRT=0``. This is an
-        env-var toggle (mirroring e.g. mimo_audio's
-        ``MIMO_AUDIO_TOKENIZER_CUDA_GRAPH``): the talker's multimodal processor
-        runs outside the stage worker process, so deploy-yaml ``hf_overrides`` /
-        per-stage ``env`` do not reach it.
-        """
-        return os.environ.get("COSYVOICE3_TRT", "1") not in ("0", "false", "False", "")
+        """Whether to use the TensorRT campplus speaker-embedding path (default on)."""
+        return _cosyvoice3_trt_enabled()
 
     # Class-level cached s3tokenizer model — loaded once per process on first
     # call to ``_extract_speech_token_via_s3`` and shared across all
@@ -927,6 +932,80 @@ class CosyVoice3Model(
         stl_out = _rows(speech_token_len, 2)
         return st_out, sf_out, emb_out, stl_out
 
+    def _resolve_flow_estimator_onnx(self) -> str | None:
+        """Locate the flow-decoder estimator ONNX for the TensorRT engine.
+
+        Prefers the fp16 (strongly-typed) ONNX → fp16 engine. Order: env
+        ``COSYVOICE3_ESTIMATOR_ONNX`` → ``<model_dir>/<fp16 name>`` → fetched
+        from ``flow_estimator_onnx_repo`` → bundled fp32 ONNX (fp32+TF32). Each
+        is checked for existence; returns ``None`` if nothing is found.
+        """
+        env_path = os.environ.get("COSYVOICE3_ESTIMATOR_ONNX")
+        if env_path and os.path.exists(env_path):
+            return env_path
+
+        fp16_name = getattr(self.config, "flow_estimator_onnx_path", "flow.decoder.estimator.autocast_fp16.onnx")
+        local_fp16 = os.path.join(self.model_dir, fp16_name)
+        if os.path.exists(local_fp16):
+            return local_fp16
+
+        repo = getattr(self.config, "flow_estimator_onnx_repo", None)
+        if repo:
+            try:
+                from huggingface_hub import snapshot_download
+
+                fetched_dir = snapshot_download(repo, allow_patterns=[fp16_name])
+                fetched = os.path.join(fetched_dir, fp16_name)
+                if os.path.exists(fetched):
+                    return fetched
+            except Exception as exc:  # pragma: no cover - network/repo issues
+                logger.warning("CosyVoice3 code2wav: could not fetch fp16 estimator ONNX from %s (%s)", repo, exc)
+
+        fp32_name = getattr(self.config, "flow_estimator_onnx_path_fp32", "flow.decoder.estimator.fp32.onnx")
+        local_fp32 = os.path.join(self.model_dir, fp32_name)
+        if os.path.exists(local_fp32):
+            logger.info("CosyVoice3 code2wav: fp16 estimator ONNX unavailable, falling back to fp32 (%s)", local_fp32)
+            return local_fp32
+        return None
+
+    def _maybe_enable_code2wav_trt(self) -> None:
+        """Swap the flow-decoder estimator to a TensorRT engine once (lazy).
+
+        Runs on the first code2wav step — after weights are loaded — so the
+        torch estimator is fully built first and then dropped. No-op unless
+        ``COSYVOICE3_TRT`` is on (default), CUDA is available, and the estimator
+        ONNX ships with the model. Falls back to the torch estimator on any
+        failure. The upstream ``CausalConditionalCFM.forward_estimator`` detects
+        the non-``nn.Module`` estimator and drives the TRT engine.
+        """
+        if getattr(self, "_code2wav_trt_done", False):
+            return
+        self._code2wav_trt_done = True
+        if not (_cosyvoice3_trt_enabled() and torch.cuda.is_available()):
+            return
+        onnx_path = self._resolve_flow_estimator_onnx()
+        if onnx_path is None:
+            logger.warning("CosyVoice3 code2wav: no flow-estimator ONNX available; keeping torch estimator")
+            return
+        try:
+            from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import (
+                build_flow_estimator_trt,
+            )
+
+            wrapper = build_flow_estimator_trt(onnx_path, device="cuda")
+            # ``estimator`` is a registered nn.Module submodule; delete it first
+            # (frees the torch estimator weights) so the TRT wrapper can be set
+            # as a plain attribute — nn.Module.__setattr__ rejects non-Modules.
+            decoder = self.code2wav.flow_model.decoder
+            del decoder.estimator
+            decoder.estimator = wrapper
+            logger.info("CosyVoice3: using TensorRT flow-decoder estimator (code2wav)")
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logger.warning(
+                "CosyVoice3 code2wav: TensorRT estimator build failed (%s); keeping torch estimator",
+                exc,
+            )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -980,6 +1059,11 @@ class CosyVoice3Model(
 
             return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs)
         elif self.model_stage == "cosyvoice3_code2wav":
+            # Lazily swap the flow-decoder estimator to a TensorRT engine on the
+            # first code2wav step (after weights are loaded), gated by the same
+            # COSYVOICE3_TRT env toggle as the talker speaker embedding.
+            self._maybe_enable_code2wav_trt()
+
             runtime_info = kwargs.get("model_intermediate_buffer")
             if runtime_info is None:
                 runtime_info = kwargs.get("runtime_additional_information", [])

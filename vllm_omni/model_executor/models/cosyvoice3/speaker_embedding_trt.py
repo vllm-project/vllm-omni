@@ -79,7 +79,7 @@ def _convert_onnx_to_trt(onnx_path: str, plan_path: str) -> None:
     logger.info("Wrote campplus TensorRT engine to %s", plan_path)
 
 
-def _resolve_plan_path(onnx_path: str) -> str:
+def _resolve_plan_path(onnx_path: str, prefix: str = "campplus") -> str:
     cache_dir = os.environ.get("COSYVOICE3_TRT_CACHE") or os.path.join(
         os.path.expanduser("~"), ".cache", "vllm_omni", "cosyvoice3_trt"
     )
@@ -95,7 +95,7 @@ def _resolve_plan_path(onnx_path: str) -> str:
     st = os.stat(onnx_path)
     key = f"{os.path.abspath(onnx_path)}|{st.st_size}|{int(st.st_mtime)}|{dev_name}|trt{trt.__version__}"
     digest = hashlib.sha1(key.encode()).hexdigest()[:16]
-    return os.path.join(cache_dir, f"campplus_{digest}.plan")
+    return os.path.join(cache_dir, f"{prefix}_{digest}.plan")
 
 
 class CampplusTRT:
