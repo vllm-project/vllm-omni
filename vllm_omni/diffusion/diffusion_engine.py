@@ -83,6 +83,18 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
+def _move_tensor_tree_to_cpu(value: object) -> object:
+    if isinstance(value, torch.Tensor):
+        return value.cpu() if value.device.type != "cpu" else value
+    if isinstance(value, dict):
+        return {key: _move_tensor_tree_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_tensor_tree_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_tensor_tree_to_cpu(item) for item in value)
+    return value
+
+
 def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
@@ -237,12 +249,8 @@ class DiffusionEngine:
         # post-processing to avoid device OOM — model weights may still
         # reside on the device and leave no headroom for intermediates.
         output_data = output.output
-        if (
-            self.od_config.enable_cpu_offload
-            and isinstance(output_data, torch.Tensor)
-            and output_data.device.type != "cpu"
-        ):
-            output_data = output_data.cpu()
+        if self.od_config.enable_cpu_offload:
+            output_data = _move_tensor_tree_to_cpu(output_data)
 
         postprocess_start_time = time.perf_counter()
         if self.post_process_func is not None:

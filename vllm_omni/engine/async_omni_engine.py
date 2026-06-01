@@ -1958,6 +1958,7 @@ class AsyncOmniEngine:
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
             "model_class_name": kwargs.get("model_class_name", None),
+            "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
