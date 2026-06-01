@@ -380,6 +380,31 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 ```
 Uploaded voices are then usable as `voice="custom_voice_1"` on subsequent requests.
 
+### Precomputed custom voices
+For reused Base voice-cloning speakers, precompute the reference artifacts once and load them at server startup:
+```bash
+python qwen3_tts/precompute_custom_voice.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --voice-name alice \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "Original transcript of the reference audio" \
+    --mode icl \
+    --output-dir /path/to/custom_voices
+```
+`--mode icl` stores both `speaker_embedding` and `ref_code`; `--mode xvec` stores only the speaker embedding. Add the output directory to a deploy config:
+```yaml
+custom_voice_dir: /path/to/custom_voices
+```
+Then start the server with that config and call the Speech API with only the voice name:
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --deploy-config /path/to/qwen3_tts_custom_voice.yaml
+
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"input":"Hello from a precomputed voice.","voice":"alice","task_type":"Base"}' \
+    --output alice.wav
+```
+
 ### Streaming PCM
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -419,7 +444,8 @@ python qwen3_tts/gradio_fastrtc_demo.py --api-base http://localhost:8000
 `qwen3_tts/batch_speech_client.py` issues many concurrent requests for throughput measurement.
 
 ### Notes
-- Base voice cloning has per-request reference-audio cost; the uniproc default keeps IPC overhead off the critical path. See the executor-backend section above for background.
+- Base voice cloning has uniproc-vs-mp tradeoffs depending on per-request reference audio cost; see the executor-backend section above.
+- With async chunking, Qwen3-TTS Base voice cloning sends the full reference context in the first Code2Wav packet, then caches that prefix on the Code2Wav stage for follow-up chunks in the same request.
 - `vllm_omni/deploy/qwen3_tts.yaml` is the default deploy config (loaded by HF `model_type`); per-stage runtime overrides are available via `--stage-N-<field> <value>`.
 
 ---
@@ -447,6 +473,23 @@ python voxcpm2/openai_speech_client.py \
     --ref-audio /path/to/reference.wav
 ```
 The `ref_audio` field accepts local file paths (auto-base64), HTTP URLs, or `data:audio/wav;base64,...` data URIs.
+
+### Precomputed custom voices
+For repeated VoxCPM2 speakers, precompute the prompt cache and load it through `custom_voice_dir`:
+```bash
+python voxcpm2/precompute_custom_voice.py \
+    --model openbmb/VoxCPM2 \
+    --voice-name alice \
+    --ref-audio /path/to/reference.wav \
+    --mode ref_continuation \
+    --prompt-text "Original transcript of the reference audio" \
+    --output-dir /path/to/custom_voices
+```
+Add the output directory to the deploy config:
+```yaml
+custom_voice_dir: /path/to/custom_voices
+```
+After startup, `/v1/audio/voices` lists `alice`, and `/v1/audio/speech` can use `voice="alice"` without sending `ref_audio`.
 
 ### Gradio demo (gapless streaming via AudioWorklet)
 ```bash

@@ -21,7 +21,7 @@ def cuda_marks(*, res: str, num_cards: int):
         return marks
     test_distributed = pytest.mark.distributed_cuda(num_cards=num_cards)
 
-    test_skipif = pytest.mark.skipif_cuda(
+    test_skipif = pytest.mark.skipif(
         not current_platform.is_cuda() or (current_platform.device_count() < num_cards),
         reason=f"Need at least {num_cards} CUDA GPUs to run the test.",
     )
@@ -52,7 +52,7 @@ def xpu_marks(*, res: str, num_cards: int):
         return marks
     test_distributed = pytest.mark.distributed_xpu(num_cards=num_cards)
 
-    test_skipif = pytest.mark.skipif_xpu(
+    test_skipif = pytest.mark.skipif(
         not current_platform.is_xpu() or (current_platform.device_count() < num_cards),
         reason=f"Need at least {num_cards} XPUs to run the test.",
     )

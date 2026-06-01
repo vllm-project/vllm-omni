@@ -55,13 +55,8 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
-from vllm.entrypoints.openai.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
-from vllm.entrypoints.openai.speech_to_text.serving import (
-    OpenAIServingTranscription,
-    OpenAIServingTranslation,
-)
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
@@ -74,6 +69,13 @@ from vllm.entrypoints.serve.disagg.serving import ServingTokens
 from vllm.entrypoints.serve.instrumentator.basic import base
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
+from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
+from vllm.entrypoints.speech_to_text.transcription.serving import (
+    OpenAIServingTranscription,
+)
+from vllm.entrypoints.speech_to_text.translation.serving import (
+    OpenAIServingTranslation,
+)
 from vllm.entrypoints.utils import (
     create_error_response,
     load_aware_call,
@@ -355,7 +357,7 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     warnings_module.filterwarnings("ignore", message=".*PydanticSerializationUnexpectedValue.*", category=UserWarning)
 
     # Add process-specific prefix to stdout and stderr.
-    decorate_logs("APIServer")
+    decorate_logs("APIServer", skip_if_decorated=True)
 
     listen_address, sock = setup_openai_server(args)
 
@@ -645,6 +647,19 @@ async def omni_init_app_state(
             logger.warning("vllm_config is None, some features may not work correctly")
 
     state.vllm_config = vllm_config
+
+    # Propagate enable_in_reasoning to the API-server process. The engine core
+    # runs in a separate process, so the contextvar that backs
+    # `get_current_vllm_config_or_none()` is None on this stack. Tool parsers
+    # call `get_enable_structured_outputs_in_reasoning()` during request
+    # handling and need to see the real flag, otherwise they silently fall
+    # back to False and mismatch the engine-side bitmask gating.
+    if vllm_config is not None:
+        from vllm.tool_parsers.structural_tag_registry import (
+            set_enable_structured_outputs_in_reasoning,
+        )
+
+        set_enable_structured_outputs_in_reasoning(vllm_config.structured_outputs_config.enable_in_reasoning)
 
     # Get supported tasks
     supported_tasks: set[str] = {"generate"}
@@ -1381,22 +1396,6 @@ async def streaming_video_chat(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
-    engine_client = getattr(websocket.app.state, "engine_client", None)
-    if engine_client is not None and getattr(engine_client, "async_chunk", False):
-        await websocket.accept()
-        await websocket.send_json(
-            {
-                "type": "error",
-                "error": (
-                    "The /v1/realtime API is not supported when async_chunk is enabled on the server. "
-                    "Use a stage configuration with async_chunk disabled and restart the server before using "
-                    "this endpoint."
-                ),
-                "code": "unsupported",
-            }
-        )
-        await websocket.close()
-        return
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
     if serving is None:
         await websocket.accept()
@@ -1547,6 +1546,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 prompt=request.prompt,
                 extra_body=extra_body,
                 request_id=f"img_gen-{random_uuid()}",
+                raw_request=raw_request,
             )
             if isinstance(generation_result, ErrorResponse):
                 return JSONResponse(
@@ -1953,6 +1953,7 @@ async def edit_images(
                 output_format=output_format,
                 output_compression=output_compression,
                 size=size_str,
+                raw_request=raw_request,
             )
             if stream and not isinstance(generation_result, ErrorResponse):
                 return StreamingResponse(

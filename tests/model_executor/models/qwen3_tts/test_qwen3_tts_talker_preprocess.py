@@ -2,6 +2,7 @@ from collections import OrderedDict
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
@@ -9,6 +10,7 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_REF_CODE_KEY,
     PRECOMPUTED_REF_IDS_KEY,
     PRECOMPUTED_TEXT_IDS_KEY,
+    REF_AUDIO_CACHE_KEY,
     Qwen3TTSPromptEmbedsBuilder,
 )
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
@@ -493,6 +495,41 @@ def test_base_voice_clone_batch_preprocess_skips_after_initial_prefill_state_exi
     assert NORMALIZED_REF_AUDIO_KEY not in buf["r1"]
 
 
+def test_base_voice_clone_batch_preprocess_uses_serving_artifact_cache_key_without_normalize():
+    builder = _make_minimal_builder()
+    ref_code = torch.full((2, 2), 5, dtype=torch.long)
+    builder.put_ref_audio_artifacts("same-ref", ref_code=ref_code)
+    builder.normalize_ref_audio = lambda _raw: (_ for _ in ()).throw(AssertionError("normalize not expected"))
+    builder._encode_ref_audio_batch_fn = lambda *a, **kw: (_ for _ in ()).throw(
+        AssertionError("speech tokenizer not expected")
+    )
+
+    class FakeTextTokenizer:
+        def __call__(self, texts, *, padding=False):
+            return {"input_ids": [[7, 8, 9] for _ in texts]}
+
+    builder._text_tokenizer = FakeTextTokenizer()
+    buf = {
+        "r1": {
+            "task_type": ["Base"],
+            "text": ["one"],
+            "ref_audio": ["a.wav"],
+            "ref_text": ["hello"],
+            "x_vector_only_mode": [False],
+            REF_AUDIO_CACHE_KEY: ["same-ref"],
+        }
+    }
+
+    builder.preprocess_batch(
+        req_ids=["r1"],
+        model_intermediate_buffer=buf,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(buf["r1"]["codes"][PRECOMPUTED_REF_CODE_KEY], ref_code)
+    assert NORMALIZED_REF_AUDIO_KEY not in buf["r1"]
+
+
 def test_base_voice_clone_uses_batched_ref_code_without_serial_encode():
     builder = _make_minimal_builder()
     device_param = torch.nn.Parameter(torch.empty(0))
@@ -536,3 +573,112 @@ def test_base_voice_clone_uses_batched_ref_code_without_serial_encode():
     assert speaker_wav_ids == [id(ref_audio)]
     assert ref_code_len == 2
     assert torch.equal(out_ref_code, ref_code)
+
+
+def test_voice_clone_prompt_artifacts_do_not_resolve_ref_audio_for_cache_fill():
+    builder = _make_minimal_builder()
+    device_param = torch.nn.Parameter(torch.empty(0))
+    builder._text_embedding = _stub_text_embedding(device_param)
+    builder._text_projection = lambda embeds: embeds
+    builder._codec_embed = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
+
+    class FakeTokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.arange(8, dtype=torch.long).reshape(1, -1)}
+
+    builder._text_tokenizer = FakeTokenizer()
+    builder._generate_icl_prompt = lambda **kwargs: (
+        torch.ones((1, 2, 4), device=kwargs["ref_code"].device),
+        torch.ones((1, 4), device=kwargs["ref_code"].device),
+    )
+    builder.normalize_ref_audio = lambda _raw: (_ for _ in ()).throw(AssertionError("normalize not expected"))
+    builder.encode_ref_audio_to_code = lambda _wav, _sr: (_ for _ in ()).throw(AssertionError("encode not expected"))
+    builder.extract_speaker_embedding = lambda _wav, _sr: (_ for _ in ()).throw(
+        AssertionError("speaker embedding not expected")
+    )
+    ref_code = torch.arange(4, dtype=torch.long).reshape(2, 2)
+
+    _prompt, _trailing, ref_code_len, out_ref_code = builder.build_prompt_embeds(
+        task_type="Base",
+        info_dict={
+            "text": ["hello"],
+            "ref_audio": ["ref.wav"],
+            "ref_ids": torch.arange(8, dtype=torch.long).reshape(1, -1),
+            "non_streaming_mode": [False],
+            "voice_clone_prompt": {
+                "ref_code": ref_code,
+                "ref_spk_embedding": torch.ones(4, dtype=torch.bfloat16),
+                "icl_mode": True,
+            },
+        },
+    )
+
+    assert ref_code_len == 2
+    assert torch.equal(out_ref_code, ref_code)
+
+
+def test_ref_audio_artifact_only_uses_cache_without_ref_audio_payload():
+    builder = _make_minimal_builder()
+    device_param = torch.nn.Parameter(torch.empty(0))
+    builder._text_embedding = _stub_text_embedding(device_param)
+    builder._text_projection = lambda embeds: embeds
+    builder._codec_embed = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
+
+    class FakeTokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.arange(8, dtype=torch.long).reshape(1, -1)}
+
+    builder._text_tokenizer = FakeTokenizer()
+    builder._generate_icl_prompt = lambda **kwargs: (
+        torch.ones((1, 2, 4), device=kwargs["ref_code"].device),
+        torch.ones((1, 4), device=kwargs["ref_code"].device),
+    )
+    builder.normalize_ref_audio = lambda _raw: (_ for _ in ()).throw(AssertionError("normalize not expected"))
+    builder.encode_ref_audio_to_code = lambda _wav, _sr: (_ for _ in ()).throw(AssertionError("encode not expected"))
+    builder.extract_speaker_embedding = lambda _wav, _sr: (_ for _ in ()).throw(
+        AssertionError("speaker embedding not expected")
+    )
+    ref_code = torch.arange(4, dtype=torch.long).reshape(2, 2)
+    builder.put_ref_audio_artifacts(
+        "same-ref",
+        ref_code=ref_code,
+        ref_spk_embedding=torch.ones(4, dtype=torch.bfloat16),
+    )
+
+    _prompt, _trailing, ref_code_len, out_ref_code = builder.build_prompt_embeds(
+        task_type="Base",
+        info_dict={
+            "text": ["hello"],
+            "ref_ids": torch.arange(8, dtype=torch.long).reshape(1, -1),
+            "non_streaming_mode": [False],
+            REF_AUDIO_CACHE_KEY: ["same-ref"],
+        },
+    )
+
+    assert ref_code_len == 2
+    assert torch.equal(out_ref_code, ref_code)
+
+
+def test_ref_audio_artifact_only_cache_miss_fails_fast():
+    builder = _make_minimal_builder()
+    device_param = torch.nn.Parameter(torch.empty(0))
+    builder._text_embedding = _stub_text_embedding(device_param)
+    builder._text_projection = lambda embeds: embeds
+    builder._codec_embed = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
+
+    class FakeTokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.arange(8, dtype=torch.long).reshape(1, -1)}
+
+    builder._text_tokenizer = FakeTokenizer()
+
+    with pytest.raises(RuntimeError, match="artifact cache miss"):
+        builder.build_prompt_embeds(
+            task_type="Base",
+            info_dict={
+                "text": ["hello"],
+                "ref_ids": torch.arange(8, dtype=torch.long).reshape(1, -1),
+                "non_streaming_mode": [False],
+                REF_AUDIO_CACHE_KEY: ["missing-ref"],
+            },
+        )

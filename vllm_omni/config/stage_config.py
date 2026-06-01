@@ -516,6 +516,7 @@ class DeployConfig:
     enable_chunked_prefill: bool | None = None
     data_parallel_size: int | None = None
     pipeline_parallel_size: int | None = None
+    custom_voice_dir: str | None = None
 
 
 _STAGE_RESERVED_KEYS = frozenset(
@@ -693,6 +694,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "enable_chunked_prefill",
         "data_parallel_size",
         "pipeline_parallel_size",
+        "custom_voice_dir",
     ):
         if name in raw_dict:
             kwargs[name] = raw_dict[name]
@@ -814,6 +816,7 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "enable_chunked_prefill",
     "data_parallel_size",
     "pipeline_parallel_size",
+    "custom_voice_dir",
 )
 
 
