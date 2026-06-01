@@ -52,6 +52,7 @@ from .mixfusion import (
     build_mixfusion_sequence_plan,
     merge_mixfusion_chunks_to_sequences,
     split_sequences_to_mixfusion_chunks,
+    validate_mixfusion_sequence_plan,
 )
 from .system_prompt import get_system_prompt
 
@@ -1798,6 +1799,7 @@ class HunyuanImage3Pipeline(
         if guidance_scale <= 1.0:
             logger.info("HunyuanImage3.0 runs without classifier-free guidance when guidance_scale <= 1.0.")
         image_size = (height, width)
+        enable_mixfusion = bool(extra_args.get("enable_mixfusion", False))
         batch_image_sizes = self._resolve_per_prompt_image_sizes(req, height, width)
         mixfusion_plan = None
         mixfusion_generator = None
@@ -1808,8 +1810,24 @@ class HunyuanImage3Pipeline(
         model_batch_gen_image_info = None
         original_image_infos = [self.image_processor.build_image_info(size) for size in batch_image_sizes]
         token_shapes = [(info.token_height, info.token_width) for info in original_image_infos]
-        if len(batch_image_sizes) > 1 and len(set(token_shapes)) > 1:
-            mixfusion_plan = build_mixfusion_sequence_plan(token_shapes)
+        if enable_mixfusion and len(batch_image_sizes) > 1 and len(set(token_shapes)) > 1:
+            candidate_plan = build_mixfusion_sequence_plan(token_shapes)
+            min_chunk_tokens = int(extra_args.get("mixfusion_min_chunk_tokens", 256))
+            max_chunks = int(extra_args.get("mixfusion_max_chunks", 128))
+            use_mixfusion, reject_reason = validate_mixfusion_sequence_plan(
+                candidate_plan,
+                min_chunk_tokens=min_chunk_tokens,
+                max_chunks=max_chunks,
+            )
+            if not use_mixfusion:
+                logger.warning(
+                    "Disable HunyuanImage3 MixFusion for this batch: %s. token_shapes=%s",
+                    reject_reason,
+                    token_shapes,
+                )
+            else:
+                mixfusion_plan = candidate_plan
+        if mixfusion_plan is not None:
             model_prompt = self._repeat_by_mixfusion_layout(prompt, mixfusion_plan.layouts)
             if isinstance(cot_text, list):
                 model_cot_text = self._repeat_by_mixfusion_layout(cot_text, mixfusion_plan.layouts)

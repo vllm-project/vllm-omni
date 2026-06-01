@@ -37,6 +37,41 @@ class MixFusionSequencePlan:
         return sum(layout.chunk_count for layout in self.layouts)
 
 
+def validate_mixfusion_sequence_plan(
+    plan: MixFusionSequencePlan,
+    *,
+    min_chunk_tokens: int = 256,
+    max_chunks: int = 128,
+) -> tuple[bool, str]:
+    """Return whether a MixFusion plan is worth executing.
+
+    Very small GCDs create many tiny chunk rows. That preserves math, but tends
+    to lose the expected padding savings to tokenizer/RoPE/mask/scatter overhead
+    and can also violate downstream batch-size assumptions.
+    """
+
+    if plan.chunk_size < min_chunk_tokens:
+        return False, f"chunk_size={plan.chunk_size} < min_chunk_tokens={min_chunk_tokens}"
+    if plan.chunk_count > max_chunks:
+        return False, f"chunk_count={plan.chunk_count} > max_chunks={max_chunks}"
+
+    seq_lens = [layout.seq_len for layout in plan.layouts]
+    max_seq_len = max(seq_lens)
+    padded_token_work = len(seq_lens) * max_seq_len
+    mixfusion_token_work = sum(seq_lens)
+    padded_attention_work = len(seq_lens) * max_seq_len * max_seq_len
+    mixfusion_attention_work = sum(seq_len * seq_len for seq_len in seq_lens)
+    if mixfusion_token_work >= padded_token_work and mixfusion_attention_work >= padded_attention_work:
+        return (
+            False,
+            "estimated padding savings are not positive "
+            f"(token_work={mixfusion_token_work}/{padded_token_work}, "
+            f"attention_work={mixfusion_attention_work}/{padded_attention_work})",
+        )
+
+    return True, "ok"
+
+
 def build_mixfusion_sequence_plan(token_shapes: list[tuple[int, int]]) -> MixFusionSequencePlan:
     """Build a DiT MixFusion plan from per-request `(token_h, token_w)` shapes.
 
