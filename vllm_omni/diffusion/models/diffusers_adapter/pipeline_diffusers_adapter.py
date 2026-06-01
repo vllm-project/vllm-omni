@@ -25,8 +25,8 @@ from torch import nn
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import BasePipelineUtils, get_pipeline_utils
 from vllm_omni.diffusion.models.diffusers_adapter.quantization_utils import (
-    _ensure_supported_diffusers_quantization_components,
     apply_diffusers_quantization_config,
+    convert_diffusers_quantization_config,
     ensure_supported_diffusers_quantization,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -98,15 +98,19 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             "torch_dtype": dtype,
             **self.od_config.diffusers_load_kwargs,
         }
-        injected_converted_quantization_config = apply_diffusers_quantization_config(self.od_config, load_kwargs)
-        logger.debug(f"Loading diffusers pipeline with kwargs: {load_kwargs}")
+        convert_diffusers_quantization_config(load_kwargs)
 
         pipeline_class = self.od_config.diffusers_pipeline_cls
         pipeline_class_name = pipeline_class.__name__ if pipeline_class is not None else None
         self._pipeline_utils = get_pipeline_utils(pipeline_class_name)
         self._pipeline_utils.update_load_kwargs(self.od_config, load_kwargs)
-        if injected_converted_quantization_config:
-            self._validate_quantization_components(model_id, load_kwargs)
+        component_names = (
+            self._load_diffusers_component_names(model_id, load_kwargs)
+            if self.od_config.quantization_config is not None and "quantization_config" not in load_kwargs
+            else {}
+        )
+        apply_diffusers_quantization_config(self.od_config, load_kwargs, component_names)
+        logger.debug(f"Loading diffusers pipeline with kwargs: {load_kwargs}")
 
         self._pipeline = DiffusionPipeline.from_pretrained(model_id, **load_kwargs)
         self._pipeline_utils.apply_post_load_updates(self._pipeline, self.od_config)
@@ -218,25 +222,23 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         ):
             ensure_supported_diffusers_quantization(self.od_config.quantization_config)
 
-    def _validate_quantization_components(
+    def _load_diffusers_component_names(
         self,
         model_id: str,
         load_kwargs: dict[str, Any],
-    ) -> None:
+    ) -> dict[str, Any]:
         config_load_kwargs = {k: load_kwargs[k] for k in _DIFFUSERS_CONFIG_LOAD_KWARGS if k in load_kwargs}
         pipeline_config = DiffusionPipeline.load_config(model_id, **config_load_kwargs)
-        _ensure_supported_diffusers_quantization_components(
-            {
-                name: value
-                for name, value in pipeline_config.items()
-                if (
-                    isinstance(value, list)
-                    and len(value) > 0
-                    and value[0] is not None
-                    and (name not in load_kwargs or load_kwargs[name] is not None)
-                )
-            }
-        )
+        return {
+            name: value
+            for name, value in pipeline_config.items()
+            if (
+                isinstance(value, list)
+                and len(value) > 0
+                and value[0] is not None
+                and (name not in load_kwargs or load_kwargs[name] is not None)
+            )
+        }
 
     # ------------------------------------------------------------------
     # Wrap settings, inputs, and outputs

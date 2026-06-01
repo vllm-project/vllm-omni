@@ -72,13 +72,16 @@ But if that parameter is simultaneously set in both the vLLM-Omni interface and 
 ### Quantization
 
 `diffusers_load_kwargs` is the primary way to pass Diffusers-native loading
-options. For convenience, the diffusers backend also supports a small, verified
-set of vLLM-Omni quantization configs when `diffusers_load_kwargs` does not
-already contain `quantization_config`.
+options. If `diffusers_load_kwargs["quantization_config"]` is a JSON/Python
+dict, the diffusers backend builds the corresponding Diffusers
+`PipelineQuantizationConfig` before calling `DiffusionPipeline.from_pretrained()`.
 
-Currently this covers online/dynamic `fp8` and online/dynamic `int8` for
-Diffusers pipelines that expose a `transformer` component. The converted config
-uses Diffusers/TorchAO dynamic quantization; it does not try to emulate native
+For convenience, the diffusers backend also supports a small, verified set of
+vLLM-Omni quantization configs when `diffusers_load_kwargs` does not already
+contain `quantization_config`. Currently this covers online/dynamic `fp8` and
+online/dynamic `int8` for Diffusers pipelines that expose transformer components
+such as `transformer` or `transformer_2`. The converted config uses
+Diffusers/TorchAO dynamic quantization; it does not try to emulate native
 vLLM-Omni checkpoint or low-bit post-load quantization. This path requires
 `torchao` to be installed.
 

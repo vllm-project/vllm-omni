@@ -67,13 +67,20 @@ def _make_request(**overrides) -> OmniDiffusionRequest:
 
 def _patch_fake_diffusers_quantization_backends(mocker):
     class FakePipelineQuantizationConfig:
-        def __init__(self, *, quant_mapping):
+        def __init__(self, *, quant_mapping=None, quant_backend=None, quant_kwargs=None, components_to_quantize=None):
             self.quant_mapping = quant_mapping
+            self.quant_backend = quant_backend
+            self.quant_kwargs = quant_kwargs
+            self.components_to_quantize = components_to_quantize
 
     class FakeTorchAoConfig:
         def __init__(self, quant_type, modules_to_not_convert=None):
             self.quant_type = quant_type
             self.modules_to_not_convert = modules_to_not_convert
+
+        @classmethod
+        def from_dict(cls, config):
+            return cls(quant_type=config["quant_type"])
 
     class FakeInt8DynamicActivationInt8WeightConfig:
         pass
@@ -89,6 +96,10 @@ def _patch_fake_diffusers_quantization_backends(mocker):
     mocker.patch(
         "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils._get_torchao_quant_type_cls",
         return_value=FakeInt8DynamicActivationInt8WeightConfig,
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils._get_diffusers_quantization_config_cls",
+        return_value=FakeTorchAoConfig,
     )
     return FakePipelineQuantizationConfig, FakeTorchAoConfig, FakeInt8DynamicActivationInt8WeightConfig
 
@@ -186,6 +197,7 @@ class TestPipelineArgumentsHandling:
                 "_class_name": "TransformerBackedPipeline",
                 "scheduler": ["diffusers", "SchedulerMixin"],
                 "transformer": ["diffusers", "Transformer2DModel"],
+                "transformer_2": ["diffusers", "Transformer2DModel"],
                 "vae": ["diffusers", "AutoencoderKL"],
             },
         )
@@ -203,6 +215,10 @@ class TestPipelineArgumentsHandling:
         assert isinstance(pipeline_quant_config, FakePipelineQuantizationConfig)
         assert isinstance(torchao_config, FakeTorchAoConfig)
         assert isinstance(torchao_config.quant_type, FakeInt8DynamicActivationInt8WeightConfig)
+        assert isinstance(
+            pipeline_quant_config.quant_mapping["transformer_2"].quant_type,
+            FakeInt8DynamicActivationInt8WeightConfig,
+        )
 
     @pytest.mark.parametrize(
         ("pipeline_config", "diffusers_load_kwargs", "diffusers_pipeline_cls"),
@@ -281,6 +297,42 @@ class TestPipelineArgumentsHandling:
 
         kwargs = mock_from_pretrained.call_args.kwargs
         assert kwargs["quantization_config"] is diffusers_native_quantization_config
+
+    def test_adapter_load_weights_builds_diffusers_native_quantization_config_from_dict(self, mocker):
+        FakePipelineQuantizationConfig, FakeTorchAoConfig, _ = _patch_fake_diffusers_quantization_backends(mocker)
+
+        class MockPipeline:
+            def __call__(self, prompt=None):
+                return None
+
+            def to(self, device):
+                return self
+
+        mock_from_pretrained = mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.from_pretrained",
+            return_value=MockPipeline(),
+        )
+
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(
+                diffusers_load_kwargs={
+                    "quantization_config": {
+                        "quant_mapping": {
+                            "transformer": {
+                                "quant_method": "torchao",
+                                "quant_type": "fake-int8-config",
+                            },
+                        },
+                    },
+                },
+            )
+        )
+        adapter.load_weights()
+
+        quant_config = mock_from_pretrained.call_args.kwargs["quantization_config"]
+        assert isinstance(quant_config, FakePipelineQuantizationConfig)
+        assert isinstance(quant_config.quant_mapping["transformer"], FakeTorchAoConfig)
+        assert quant_config.quant_mapping["transformer"].quant_type == "fake-int8-config"
 
     def test_adapter_guard_unknown_output_type(self, mocker):
         """Test that the adapter wraps an unknown output type as-is.
