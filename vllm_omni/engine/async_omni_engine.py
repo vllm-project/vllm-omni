@@ -260,6 +260,12 @@ class AsyncOmniEngine:
         **kwargs: Additional arguments
     """
 
+    # Class-level defaults so tests that bypass __init__ via object.__new__
+    # don't AttributeError when stage-init / forward paths touch these attrs.
+    _log_stats: bool = False
+    _coordinator_runtime: Any = None
+    _transfer_emitter: Any = None
+
     def __init__(
         self,
         model: str,
