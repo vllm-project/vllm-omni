@@ -115,15 +115,18 @@ THRESHOLDS = {
     },
 }
 
+
 # Helper to get thresholds for current model variant
 def _get_thresholds() -> dict:
     """Return appropriate thresholds based on test context."""
     # Default thresholds work for both Instruct and Distil IT2I tests
     return THRESHOLDS["default"] if IS_DISTIL else THRESHOLDS["Instruct"]
 
+
 def _get_quant_thresholds() -> dict:
     """Return thresholds for quantization accuracy tests."""
     return THRESHOLDS["quant"]
+
 
 # Quant test configuration
 QUANT_PROMPT = "A brown and white dog is running on the grass."

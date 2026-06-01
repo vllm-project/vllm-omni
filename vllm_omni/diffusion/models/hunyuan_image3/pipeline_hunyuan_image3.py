@@ -613,7 +613,7 @@ class HunyuanImage3Pipeline(
         if isinstance(timesteps_r, list):
             for i, timestep_r in enumerate(timesteps_r):
                 timestep_r_src = self.timestep_r_emb(timestep_r)  # (n, n_embd)
-                x[i:i+1].scatter_(
+                x[i : i + 1].scatter_(
                     dim=1,
                     index=timesteps_r_scatter_index[i].unsqueeze(0).unsqueeze(-1).repeat(1, 1, n_embd),
                     src=timestep_r_src.reshape(1, -1, n_embd),
@@ -1017,10 +1017,12 @@ class HunyuanImage3Pipeline(
             cond_timestep_scatter_index=to_device(output.cond_timestep_scatter_index, device),
             # for CFG distilled models
             guidance_scatter_index=to_device(output.guidance_scatter_index, device)
-            if hasattr(output, "guidance_scatter_index") and output.guidance_scatter_index is not None else None,
+            if hasattr(output, "guidance_scatter_index") and output.guidance_scatter_index is not None
+            else None,
             # for MeanFlow distilled models
             timesteps_r_scatter_index=to_device(output.timesteps_r_scatter_index, device)
-            if hasattr(output, "timesteps_r_scatter_index") and output.timesteps_r_scatter_index is not None else None,
+            if hasattr(output, "timesteps_r_scatter_index") and output.timesteps_r_scatter_index is not None
+            else None,
             # for inner usage
             tokenizer_output=output,
             batch_gen_image_info=batch_gen_image_info,
@@ -1340,9 +1342,7 @@ class HunyuanImage3Pipeline(
                 )
                 inputs_embeds = self.instantiate_timestep_tokens(inputs_embeds, timestep, gen_timestep_scatter_index)
                 # Instantiate guidance and timestep_r tokens for distilled models
-                inputs_embeds = self.instantiate_guidance_tokens(
-                    inputs_embeds, guidance, guidance_scatter_index
-                )
+                inputs_embeds = self.instantiate_guidance_tokens(inputs_embeds, guidance, guidance_scatter_index)
                 inputs_embeds = self.instantiate_timestep_r_tokens(
                     inputs_embeds, timesteps_r, timesteps_r_scatter_index
                 )
