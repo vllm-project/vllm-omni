@@ -1020,6 +1020,7 @@ class TestPipelineRegistry:
 class TestDeployConfigLoading:
     def test_deploy_override_fields_include_deploy_schema_fields(self):
         expected_fields = {
+            "active_stream_window",
             "async_chunk",
             # StageDeployConfig: stage placement and runtime fields.
             "devices",

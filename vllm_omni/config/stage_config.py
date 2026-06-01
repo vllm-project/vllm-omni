@@ -500,6 +500,8 @@ class DeployConfig:
     """
 
     async_chunk: bool = True
+    # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
+    active_stream_window: int = 0
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -677,6 +679,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
+        "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,
@@ -816,6 +819,7 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "enable_chunked_prefill",
     "data_parallel_size",
     "pipeline_parallel_size",
+    "active_stream_window",
     "custom_voice_dir",
 )
 
