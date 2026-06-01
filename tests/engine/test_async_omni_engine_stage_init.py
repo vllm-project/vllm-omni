@@ -312,7 +312,7 @@ def test_initialize_stages_exposes_logical_stage_views_and_builds_top_level_inpu
     monkeypatch.setattr(
         engine_mod,
         "build_llm_stage_output_processor",
-        lambda plan, _cfg: stage0_output_processor if plan.stage_idx == 0 else stage1_output_processor,
+        lambda plan, _cfg, **_kw: stage0_output_processor if plan.stage_idx == 0 else stage1_output_processor,
     )
     monkeypatch.setattr(engine_mod, "build_stage0_input_processor", lambda _cfg: top_level_input_processor)
 

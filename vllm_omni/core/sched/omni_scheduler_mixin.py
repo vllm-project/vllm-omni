@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
 
 logger = init_logger(__name__)
+
+_STATS_INTERVAL_S = 1.0
 
 # Upper bound on how long a request may sit in full-payload-input wait
 # (the state ``OmniSchedulingCoordinator`` records via ``_waiting_since``)
@@ -145,3 +149,10 @@ class OmniSchedulerMixin:
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_input_registrations=pending_input_registrations,
         )
+
+    def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
+        now = time.monotonic()
+        if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S:
+            return None
+        self._last_stats_time = now
+        return super().make_stats(*args, **kwargs)
