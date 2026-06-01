@@ -400,6 +400,13 @@ class MossTTSNanoForGeneration(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
+        if self._lm is None or self._audio_tokenizer is None:
+            # load_weights() loads the real LM from HuggingFace.  When
+            # load_format=dummy the vllm DummyModelLoader skips calling
+            # model.load_weights(), so we do it lazily on first forward.
+            # Must happen before _make_dummy_hidden so self._device is set.
+            self.load_weights([])
+
         sr = getattr(self.config, "audio_tokenizer_sample_rate", 48000)
         sr_tensor = torch.tensor(sr, dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32)
@@ -417,9 +424,6 @@ class MossTTSNanoForGeneration(nn.Module):
                     "sr": [sr_tensor] * len(infos),
                 },
             )
-
-        if self._lm is None or self._audio_tokenizer is None:
-            raise RuntimeError("MOSS-TTS-Nano model not loaded.  Was load_weights() called?")
 
         outputs: list[torch.Tensor] = []
         srs: list[torch.Tensor] = []
