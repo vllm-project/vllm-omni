@@ -19,11 +19,6 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    extract_routed_experts_for_current_batch,
-    get_global_experts_capturer,
-    issue_routing_d2h_copy,
-)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.dflash import DFlashProposer
@@ -57,6 +52,7 @@ class ExecuteModelState(NamedTuple):
     spec_decode_metadata: Any
     spec_decode_common_attn_metadata: Any
     hidden_states: torch.Tensor
+    hidden_states_cpu: torch.Tensor | None
     sample_hidden_states: torch.Tensor
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: Any
@@ -210,7 +206,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return result
 
     def _capture_talker_mtp_graphs(self) -> None:
-        from vllm_omni.worker.gpu_model_runner import CUDAGraphWrapper
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
 
         if not self.has_talker_mtp or not isinstance(self.talker_mtp, CUDAGraphWrapper):
             return
@@ -287,6 +283,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _maybe_update_prefix_cache(
         self,
         hidden_states: torch.Tensor,
+        hidden_states_cpu: torch.Tensor | None,
         multimodal_outputs: dict,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
@@ -297,7 +294,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         """
         # Cache hidden states if we've enabled hidden state prefix caching
         # unless this isn't the last pipeline parallelism rank.
-        if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
+        is_last_pp_rank = get_pp_group().is_last_rank
+        if hidden_states_cpu is not None and not is_last_pp_rank:
+            raise RuntimeError("hidden_states_cpu staging is only valid on the last pipeline parallel rank.")
+        if self.omni_prefix_cache is not None and is_last_pp_rank:
             # If this happens, it generally means the model is not following the correct
             # interface yet and is therefore currently not compatible with prefix cache.
             if multimodal_outputs is not None and not isinstance(multimodal_outputs, dict):
@@ -319,11 +319,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 slot_mapping=slot_mapping_cpu,
                 num_tokens_padded=num_tokens_padded,
                 skip_mm_cache_keys=self._deferred_prefix_cache_mm_keys(),
+                hidden_states_cpu=hidden_states_cpu,
             )
 
     def _maybe_get_combined_prefix_cache_tensors(
         self,
         hidden_states: torch.Tensor,
+        hidden_states_cpu: torch.Tensor | None,
         multimodal_outputs: dict,
         num_scheduled_tokens: dict[str, int],
     ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
@@ -333,7 +335,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # Prior to applying the post-processing func, extract
         # the prefix cached hidden states and multimodal states.
         combined_hidden_states, combined_multimodal_outputs = None, None
+        is_last_pp_rank = get_pp_group().is_last_rank
+        if hidden_states_cpu is not None and not is_last_pp_rank:
+            raise RuntimeError("hidden_states_cpu staging is only valid on the last pipeline parallel rank.")
         if self.omni_prefix_cache is not None:
+            if not is_last_pp_rank:
+                raise RuntimeError("Omni prefix-cache tensor merge is only valid on the last pipeline parallel rank.")
             if (
                 not self._model_needs_full_prefix_hidden_states()
                 and not self.omni_prefix_cache.has_prefix_cached_new_req_ids()
@@ -344,6 +351,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     query_start_loc=self.query_start_loc.cpu,
                     input_batch=self.input_batch,
                     hidden_states=hidden_states,
+                    hidden_states_cpu=hidden_states_cpu,
                     num_scheduled_tokens=num_scheduled_tokens,
                 )
             combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
@@ -362,6 +370,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+
+        if self.routed_experts_initialized:
+            self.routed_experts_capturer.clear_buffer()
 
         if not getattr(self, "_warmup_state_cleared", False):
             self._warmup_state_cleared = True
@@ -414,7 +425,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
 
         if self.routed_experts_initialized:
-            capturer = get_global_experts_capturer()
+            capturer = self.routed_experts_capturer
             if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
                 capturer.finalize_pending_copy()
 
@@ -664,11 +675,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 aux_hidden_states = None
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+            hidden_states_cpu = None
+            if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
+                hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
 
             # Cache hidden states & multimodal outputs if we've enabled hidden state
             # prefix caching unless this isn't the last pipeline parallelism rank.
             self._maybe_update_prefix_cache(
                 hidden_states=hidden_states,
+                hidden_states_cpu=hidden_states_cpu,
                 multimodal_outputs=multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
@@ -679,7 +694,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
-                    hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     return hidden_states
 
@@ -692,7 +706,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
+                sample_hidden_states = hidden_states[logits_indices.to(hidden_states.device)]
                 # Try with sampling_metadata first; fall back to without for models that don't support it
                 try:
                     logits = self.model.compute_logits(
@@ -704,7 +718,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # Rare case.
                 assert not self.is_pooling_model
 
-                sample_hidden_states = hidden_states[logits_indices]
+                sample_hidden_states = hidden_states[logits_indices.to(hidden_states.device)]
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(self.vllm_config, num_tokens_padded)
@@ -740,6 +754,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
+            hidden_states_cpu,
             sample_hidden_states,
             aux_hidden_states,
             ec_connector_output,
@@ -753,12 +768,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             deferred_state_corrections_fn()
 
         if self.routed_experts_initialized and hasattr(self, "_positions_cpu"):
-            issue_routing_d2h_copy(
-                input_batch_req_ids=self.input_batch.req_ids,
-                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                positions=self.positions,
-                positions_cpu=self._positions_cpu,
-            )
+            self._omni_routed_experts_d2h(scheduler_output)
 
         return None
 
@@ -830,18 +840,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
-            # Nothing to do (PP non-final rank case), output isn't used.
-            if not kv_connector_output:
-                return None  # type: ignore[return-value]
-
+            # receive sampled token ids from the last PP rank.
+            if self.use_async_scheduling and not get_pp_group().is_last_rank:
+                self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
-            if kv_connector_output.is_empty():
-                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
-
-            output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
-            output.kv_connector_output = kv_connector_output
-            return self.attach_omni_connector_output(output)
+            return self.attach_omni_connector_output(
+                OmniModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            )
 
         # Unpack ephemeral state.
         (
@@ -850,6 +856,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
+            staged_hidden_states_cpu,
             sample_hidden_states,
             aux_hidden_states,
             ec_connector_output,
@@ -975,7 +982,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         downstream_req_id_set = set(downstream_req_ids)
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
-        if needs_pooler_payload:
+        needs_scheduled_hidden_payload = needs_pooler_payload and (
+            self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states()
+        )
+        if needs_scheduled_hidden_payload and self.omni_prefix_cache is not None:
+            if staged_hidden_states_cpu is None:
+                raise RuntimeError("Prefix-cache hidden-state payload requires staged CPU hidden states.")
+            hidden_states_cpu = staged_hidden_states_cpu
+        elif needs_scheduled_hidden_payload:
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
                 int(hidden_states.shape[0]),
@@ -992,6 +1006,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 dtype=np.int32,
             )
         query_start_loc_cpu = self.query_start_loc.cpu
+        if callable(query_start_loc_cpu):
+            query_start_loc_cpu = query_start_loc_cpu()
         if self.omni_prefix_cache is not None:
             deferred_mm_cache_keys = self._deferred_prefix_cache_mm_keys()
             if deferred_mm_cache_keys:
@@ -1016,6 +1032,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     combined_multimodal_outputs,
                 ) = self._maybe_get_combined_prefix_cache_tensors(
                     hidden_states,
+                    staged_hidden_states_cpu,
                     multimodal_outputs,
                     scheduler_output.num_scheduled_tokens,
                 )
@@ -1108,15 +1125,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
-            routed_experts_dict = None
+            routed_experts_lists = None
             if self.routed_experts_initialized:
-                routed_experts_dict = extract_routed_experts_for_current_batch(
-                    req_ids=req_ids_output_copy,
-                    requests=self.requests,
-                    req_id_to_index=self.input_batch.req_id_to_index,
-                    num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
-                    max_model_len=self.max_model_len,
-                )
+                routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
             output = OmniModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -1128,10 +1139,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
-                routed_experts_dict=routed_experts_dict,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
             output.omni_connector_output = self.get_omni_connector_output()
+            output.routed_experts = routed_experts_lists
 
         if not self.use_async_scheduling:
             return output

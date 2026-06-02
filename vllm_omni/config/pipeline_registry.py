@@ -65,6 +65,11 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.bagel.pipeline",
         "BAGEL_SINGLE_STAGE_PIPELINE",
     ),
+    # Lance (ByteDance) — BAGEL-lineage unified AR+diffusion, single-stage DiT.
+    "lance": (
+        "vllm_omni.model_executor.models.lance.pipeline",
+        "LANCE_PIPELINE",
+    ),
     "glm_image": (
         "vllm_omni.model_executor.models.glm_image.pipeline",
         "GLM_IMAGE_PIPELINE",
@@ -124,6 +129,18 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "moss_tts_nano": (
         "vllm_omni.model_executor.models.moss_tts_nano.pipeline",
         "MOSS_TTS_NANO_PIPELINE",
+    ),
+    "moss_tts_delay": (
+        "vllm_omni.model_executor.models.moss_tts.pipeline",
+        "MOSS_TTS_PIPELINE",
+    ),
+    "moss_tts_realtime": (
+        "vllm_omni.model_executor.models.moss_tts.pipeline",
+        "MOSS_TTS_REALTIME_PIPELINE",
+    ),
+    "minicpmo_4_5": (
+        "vllm_omni.model_executor.models.minicpmo_4_5.pipeline",
+        "MINICPMO_4_5_PIPELINE",
     ),
     "higgs_audio_v2": (
         "vllm_omni.model_executor.models.higgs_audio_v2.pipeline",

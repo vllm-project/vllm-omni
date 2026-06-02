@@ -301,8 +301,4 @@ def test_vllm_set_forward_context_implementation(monkeypatch):
                 "vllm_config",
             ),
         ),
-        ("ir_op_priority", None),
-        ("enable_torch_wrap", vllm_config.compilation_config.ir_enable_torch_wrap),
-        ("enable_torch_wrap_exit", vllm_config.compilation_config.ir_enable_torch_wrap),
-        ("ir_op_priority_exit", None),
     ], ERROR_MESSAGE

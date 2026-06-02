@@ -305,40 +305,132 @@ class OmniServer:
             time.sleep(2)
         raise RuntimeError(f"Server failed to start within {max_wait} seconds")
 
+    @staticmethod
+    def _reap_zombie(proc: "psutil.Process") -> bool:
+        """Reap a zombie child process via ``os.waitpid``.
+
+        ``psutil.Process.wait()`` uses ``pidfd_open`` + ``poll()``, which
+        never fires for a zombie (the zombie is already dead and will not
+        change state).  Since the test process is the parent, we can reap
+        the zombie directly with ``os.waitpid(pid, os.WNOHANG)`` and
+        retrieve its exit code.
+
+        Returns True if the process was a zombie and was reaped.
+        """
+        if proc.status() != psutil.STATUS_ZOMBIE:
+            return False
+        try:
+            os.waitpid(proc.pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        return True
+
+    @staticmethod
+    def _wait_or_reap(proc: "psutil.Process", timeout: int) -> None:
+        """Wait for *proc* to exit, handling zombie state transparently.
+
+        When the process is already a zombie (e.g. orchestrator thread
+        hung during shutdown and the main process exited), ``pidfd_open``
+        + ``poll()`` inside ``psutil`` will never see a state change.
+        Fall back to ``os.waitpid`` to reap the zombie.
+        """
+        if OmniServer._reap_zombie(proc):
+            return
+        try:
+            proc.wait(timeout=timeout)
+        except psutil.TimeoutExpired:
+            OmniServer._reap_zombie(proc)
+
     def _kill_process_tree(self, pid):
+        """Kill the process tree rooted at *pid*.
+
+        Terminate the parent **first** so the OmniServer can gracefully shut
+        down its stage-engine children through the orchestrator.  This avoids
+        the ``subprocess died unexpectedly`` ERROR that the APIServer monitor
+        thread logs when children are killed before the parent, which in turn
+        can cause CI watchdogs to false-trigger on the upstream ``Shutdown
+        initiated`` message.
+
+        When the parent does not exit within the grace period (e.g. CPU-
+        offloaded workers stuck in CUDA D-state), the method falls back to
+        killing children first so the parent can be reaped cleanly.
+        """
         try:
             parent = psutil.Process(pid)
             children = parent.children(recursive=True)
-            all_pids = [pid] + [child.pid for child in children]
 
-            for child in children:
-                try:
-                    child.terminate()
-                except psutil.NoSuchProcess:
-                    pass
-
-            _, still_alive = psutil.wait_procs(children, timeout=10)
-
-            for child in still_alive:
-                try:
-                    child.kill()
-                except psutil.NoSuchProcess:
-                    pass
-
+            # 1. Terminate the parent first — let it run its graceful
+            #    shutdown cascade (orchestrator → stage pools → engine cores).
             try:
                 parent.terminate()
-                parent.wait(timeout=10)
-            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+            except psutil.NoSuchProcess:
+                pass
+
+            # 2. Give the parent time to shut down its children cleanly.
+            parent_exited = False
+            try:
+                parent.wait(timeout=15)
+                parent_exited = True
+            except psutil.NoSuchProcess:
+                parent_exited = True
+            except psutil.TimeoutExpired:
+                parent_exited = OmniServer._reap_zombie(parent)
+
+            if not parent_exited:
+                # Parent is stuck — children (e.g. CPU-offloaded CFG workers)
+                # are likely in uninterruptible sleep.  Kill children first
+                # so the parent can be reaped without lingering as a zombie.
+                for child in children:
+                    try:
+                        child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                psutil.wait_procs(children, timeout=5)
                 try:
                     parent.kill()
                 except psutil.NoSuchProcess:
                     pass
+                OmniServer._wait_or_reap(parent, timeout=5)
+            else:
+                # Parent exited cleanly — clean up any remaining children.
+                for child in children:
+                    try:
+                        if child.is_running():
+                            child.terminate()
+                    except psutil.NoSuchProcess:
+                        pass
 
+                gone, still_alive = psutil.wait_procs(children, timeout=10)
+
+                for child in still_alive:
+                    try:
+                        child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+
+                try:
+                    if parent.is_running() and not OmniServer._reap_zombie(parent):
+                        parent.kill()
+                        parent.wait(timeout=10)
+                except psutil.NoSuchProcess:
+                    pass
+
+            # 3. Final sweep — ``kill -9`` anything that escaped.
             time.sleep(1)
-            alive_processes = []
-            for check_pid in all_pids:
-                if psutil.pid_exists(check_pid):
-                    alive_processes.append(check_pid)
+            alive_processes: list[int] = []
+            for child in children:
+                try:
+                    if child.is_running():
+                        alive_processes.append(child.pid)
+                except psutil.NoSuchProcess:
+                    pass
+            # Only count the parent as alive if it is NOT a zombie
+            # (zombies are already dead — just waiting to be reaped).
+            try:
+                if parent.is_running() and parent.status() != psutil.STATUS_ZOMBIE:
+                    alive_processes.append(parent.pid)
+            except psutil.NoSuchProcess:
+                pass
 
             if alive_processes:
                 print(f"Warning: Processes still alive: {alive_processes}")
