@@ -878,8 +878,8 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument(
         "--stage-config-path",
         type=str,
-        default=str(repo_root / "vllm_omni/model_executor/stage_configs/dynin_omni.yaml"),
-        help="Path to stage config yaml.",
+        default=str(repo_root / "vllm_omni/deploy/dynin_omni.yaml"),
+        help="Path to deploy config yaml.",
     )
     parser.add_argument(
         "--dynin-config-path",
