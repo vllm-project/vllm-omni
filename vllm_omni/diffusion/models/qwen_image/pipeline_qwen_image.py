@@ -26,7 +26,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders, retry_on_missing_shard
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
@@ -275,21 +275,22 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         self.device = get_local_device()
         model = od_config.model
         # Check if model is a local path
-        local_files_only = os.path.exists(model)
+        local_files_only = os.path.isdir(model)
 
         # See pipeline_qwen_image_edit_plus: guard against transformers v5
         # multi-worker race on partial subfolder shard sets (Buildkite #1043).
         prefetch_subfolders(
             model,
             ["scheduler", "text_encoder", "vae", "tokenizer"],
-            local_files_only=local_files_only,
         )
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
+        self.text_encoder = retry_on_missing_shard(
+            lambda: Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model, subfolder="text_encoder", local_files_only=local_files_only
+            )
         )
         # Qwen2.5-VL ships a vision tower that text-to-image does not use.
         # Drop it while the model is still on CPU, before moving to GPU, so

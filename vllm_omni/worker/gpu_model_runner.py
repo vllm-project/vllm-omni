@@ -36,6 +36,7 @@ from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.outputs import RoutedExpertsLists
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
     xgr_torch_compile = LazyLoader(
@@ -56,6 +57,52 @@ class OmniGPUModelRunner(GPUModelRunner):
         # The Omni tensor prefix cache will be allocated
         # when we initialize the metadata builders if enabled
         self.omni_prefix_cache = None
+
+    def _omni_routed_experts_d2h(self, scheduler_output) -> None:
+        """Issue routed-experts D2H copy matching upstream GPUModelRunner pattern.
+
+        Upstream does this inline in ``execute_model``:
+            buf = self.routed_experts_capturer.get_device_buffer()
+            total = scheduler_output.total_num_scheduled_tokens
+            self.routed_experts_cpu[:total].copy_(buf[:total], non_blocking=True)
+            self.routed_experts_slot_mapping_cpu[:total].copy_(
+                self.routed_experts_slot_mapping_device[:total], non_blocking=True)
+        """
+        if not self.routed_experts_initialized:
+            return
+        buf = self.routed_experts_capturer.get_device_buffer()
+        total = scheduler_output.total_num_scheduled_tokens
+        self.routed_experts_cpu[:total].copy_(buf[:total], non_blocking=True)
+        if hasattr(self, "routed_experts_slot_mapping_device"):
+            self.routed_experts_slot_mapping_cpu[:total].copy_(
+                self.routed_experts_slot_mapping_device[:total],
+                non_blocking=True,
+            )
+
+    def _omni_extract_routed_experts(self, scheduler_output) -> "RoutedExpertsLists | None":
+        """Extract routed experts matching upstream GPUModelRunner pattern.
+
+        Upstream (sync path, sample_tokens):
+            total = scheduler_output.total_num_scheduled_tokens
+            output.routed_experts = RoutedExpertsLists(
+                routing_data=self.routed_experts_cpu[:total].numpy(),
+                slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
+            )
+
+        Returns RoutedExpertsLists (batch-level, with slot_mapping) so that
+        downstream schedulers can use slot_mapping to map back to requests.
+        """
+        from vllm.v1.outputs import RoutedExpertsLists
+
+        if not self.routed_experts_initialized:
+            return None
+        total = scheduler_output.total_num_scheduled_tokens
+        if total <= 0:
+            return None
+        return RoutedExpertsLists(
+            routing_data=self.routed_experts_cpu[:total].numpy(),
+            slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
+        )
 
     def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
         """Override to fix scheduler_metadata buffer size for FA3 + CUDA graph.
@@ -747,6 +794,15 @@ class OmniGPUModelRunner(GPUModelRunner):
             raise ValueError(f"Invalid hidden states type: {type(hidden_states)}")
         return text_hidden_states, multimodal_outputs
 
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Models loaded with load_format=dummy (e.g. MossTTSNano) may
+        # produce CPU hidden_states while the upstream sampler warmup
+        # expects GPU tensors.  Skip the warmup in that case — a
+        # meaningful warmup requires real weights anyway.
+        if hidden_states.device != self.device:
+            return torch.tensor([])
+        return super()._dummy_sampler_run(hidden_states=hidden_states)
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -1100,7 +1156,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        logit_indices_device = torch.from_numpy(logit_indices).to(self.device, non_blocking=True)
+        logit_indices_device = torch.from_numpy(logit_indices).to(hidden_states.device, non_blocking=True)
         return hidden_states, hidden_states[logit_indices_device]
 
     # ------------------------------------------------------------------

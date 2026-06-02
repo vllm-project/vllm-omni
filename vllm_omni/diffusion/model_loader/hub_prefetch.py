@@ -64,6 +64,7 @@ import contextlib
 import errno
 import logging
 import os
+import time
 from collections.abc import Iterable, Iterator
 
 logger = logging.getLogger(__name__)
@@ -112,9 +113,43 @@ def _safe_repo_filename(model: str) -> str:
     return model.replace("/", "__").replace(os.sep, "__") + ".lock"
 
 
+def _dotfile_lock_acquire(lock_dir: str, model: str, timeout: float = 300.0, poll_interval: float = 0.5) -> bool:
+    """Acquire an exclusive lock via atomic directory creation.
+
+    ``os.makedirs(path, exist_ok=False)`` is atomic on POSIX filesystems
+    (including Lustre and NFS), making it a reliable fallback when
+    ``fcntl.flock`` is unsupported (``ENOLCK`` on FSx/Lustre mounts
+    without the ``flock`` mount option).
+
+    Returns ``True`` if the lock was acquired, ``False`` on timeout.
+    The caller must call ``os.rmdir(lock_path)`` to release.
+    """
+    lock_path = os.path.join(lock_dir, _safe_repo_filename(model) + ".dir")
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.makedirs(lock_path, exist_ok=False)
+            logger.info("Acquired dotfile prefetch lock for %s at %s", model, lock_path)
+            return True
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "Timed out waiting for dotfile prefetch lock %s after %.0fs; proceeding unlocked",
+                    lock_path,
+                    timeout,
+                )
+                return False
+            time.sleep(poll_interval)
+
+
 @contextlib.contextmanager
 def _repo_prefetch_lock(model: str) -> Iterator[None]:
-    """Hold an exclusive ``fcntl.flock`` keyed on the HF repo id.
+    """Hold an exclusive lock keyed on the HF repo id.
+
+    Tries ``fcntl.flock`` first; falls back to an atomic directory-creation
+    dotfile lock when flock is unsupported (e.g. FSx for Lustre without the
+    ``flock`` mount option, which returns ``ENOLCK``).
 
     Why we still need a node-wide lock on top of ``snapshot_download``'s
     own per-blob ``.lock`` files:
@@ -131,71 +166,93 @@ def _repo_prefetch_lock(model: str) -> Iterator[None]:
     * Multiple unrelated processes on the same node (concurrent CI jobs,
       multiple ``OmniServer`` instances, every ``DiffusionWorker``
       subprocess from the multiproc executor) can enter this code path
-      in parallel. ``flock`` on a per-repo file makes the whole
+      in parallel. An exclusive lock makes the whole
       ``snapshot_download(...)`` call a true node-wide critical
       section, so the *first* entrant fully populates the cache and
       every subsequent ``from_pretrained`` sees a warm, complete tree.
 
-    Best-effort: if we cannot create / acquire the lock (no ``fcntl``,
-    read-only FS, NFS without flock support) we log and run the download
-    anyway. Worst case behaviour reverts to "snapshot_download +
-    transformers v5 race" which is exactly the pre-fix state.
+    Best-effort: if we cannot acquire any lock (no ``fcntl``, read-only
+    FS, dotfile lock timeout) we log and run the download anyway. Worst
+    case behaviour reverts to "snapshot_download + transformers v5 race"
+    which is exactly the pre-fix state.
     """
+    lock_dir = None
+    lock_path = None
+    dotfile_held = None
+    fd = None
+    flock_held = False
+
+    # --- fcntl.flock path ---
     try:
         import fcntl  # type: ignore[import-not-found]
     except ImportError:  # pragma: no cover - non-POSIX (Windows)
-        logger.debug("fcntl unavailable on this platform; running prefetch unlocked")
-        yield
-        return
+        fcntl = None
 
-    try:
-        lock_dir = _node_lock_dir()
-    except OSError as exc:
-        logger.warning("Could not allocate lock dir for prefetch of %s (%s); skipping flock", model, exc)
-        yield
-        return
-
-    lock_path = os.path.join(lock_dir, _safe_repo_filename(model))
-
-    try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-    except OSError as exc:
-        logger.warning("Could not open prefetch lock %s (%s); proceeding without flock", lock_path, exc)
-        yield
-        return
-
-    locked = False
-    try:
+    if fcntl is not None:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            locked = True
-            logger.debug("Acquired prefetch flock for %s at %s", model, lock_path)
+            lock_dir = _node_lock_dir()
         except OSError as exc:
-            # FS without flock support (ENOLCK / EOPNOTSUPP / EINVAL).
-            # EACCES on some Lustre configs without ``flock`` mount opt.
-            if exc.errno in (errno.ENOLCK, errno.EOPNOTSUPP, errno.EACCES, errno.EINVAL):
-                logger.warning(
-                    "fcntl.flock not supported on '%s' (%s: %s); running prefetch unlocked",
-                    lock_path,
-                    type(exc).__name__,
-                    exc,
-                )
-            else:
-                raise
+            logger.warning("Could not allocate lock dir for prefetch of %s (%s); skipping flock", model, exc)
+            fcntl = None  # force dotfile fallback
+
+    if fcntl is not None and lock_dir is not None:
+        lock_path = os.path.join(lock_dir, _safe_repo_filename(model))
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as exc:
+            logger.warning("Could not open prefetch lock %s (%s); falling back to dotfile lock", lock_path, exc)
+            fd = None
+
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                flock_held = True
+                logger.info("Acquired flock prefetch lock for %s at %s", model, lock_path)
+            except OSError as exc:
+                if exc.errno in (errno.ENOLCK, errno.EOPNOTSUPP, errno.EACCES, errno.EINVAL):
+                    logger.warning(
+                        "fcntl.flock not supported on '%s' (%s: %s); falling back to dotfile lock",
+                        lock_path,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    os.close(fd)
+                    fd = None
+                else:
+                    raise
+
+    # --- dotfile fallback ---
+    if not flock_held:
+        if lock_dir is None:
+            try:
+                lock_dir = _node_lock_dir()
+            except OSError as exc:
+                logger.warning("Could not allocate lock dir (%s); running prefetch unlocked", exc)
+                yield
+                return
+
+        if _dotfile_lock_acquire(lock_dir, model):
+            dotfile_held = os.path.join(lock_dir, _safe_repo_filename(model) + ".dir")
+
+    try:
         yield
     finally:
-        if locked:
+        if flock_held and fd is not None:
             with contextlib.suppress(OSError):
                 fcntl.flock(fd, fcntl.LOCK_UN)
-        with contextlib.suppress(OSError):
-            os.close(fd)
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if dotfile_held is not None:
+            with contextlib.suppress(OSError):
+                os.rmdir(dotfile_held)
 
 
 def prefetch_subfolders(
     model: str,
     subfolders: Iterable[str],
     *,
-    local_files_only: bool = False,
+    local_files_only: bool | None = None,
     include_root_metadata: bool = True,
 ) -> None:
     """Materialise ``model``'s ``subfolders`` in the HF cache before loading.
@@ -206,16 +263,20 @@ def prefetch_subfolders(
         subfolders: Iterable of subfolder names (e.g. ``["text_encoder",
             "vae"]``) whose contents need to be fully present before any
             worker calls ``from_pretrained(subfolder=...)``.
-        local_files_only: When True, skip the prefetch entirely. The caller
-            has explicitly promised the cache is already populated (as happens
-            for local model checkouts), so hitting the network would defeat
-            the intent and may fail in air-gapped environments.
+        local_files_only: When ``True``, skip the prefetch entirely.
+            When ``None`` (default), auto-detect: skip if *model* is a
+            local directory, run otherwise.
         include_root_metadata: When True, also pull ``*.json`` at the repo
             root so ``model_index.json`` / ``config.json`` resolution during
             ``from_pretrained`` also hits a warm cache.
     """
+    if local_files_only is None:
+        local_files_only = os.path.isdir(model)
+
     if local_files_only or not model or os.path.isdir(model):
         return
+
+    logger.info("Prefetching %s subfolders: %s", model, list(subfolders))
 
     try:
         from huggingface_hub import snapshot_download
@@ -251,6 +312,7 @@ def prefetch_subfolders(
                 repo_id=model,
                 allow_patterns=allow_patterns,
             )
+        logger.info("Prefetch complete for %s", model)
     except Exception as exc:
         # Best-effort: propagate only via logging. The subsequent
         # ``from_pretrained`` call will raise a clearer, call-site-specific
@@ -312,3 +374,31 @@ def _looks_like_auth_error(exc: BaseException) -> bool:
     # only load-bearing signal.
     msg = str(exc).lower()
     return "401 client error" in msg or "403 client error" in msg or "gatedrepo" in msg
+
+
+def retry_on_missing_shard(load_fn, *, max_retries: int = 3, base_delay: float = 5.0):
+    """Call *load_fn* with retry on the transformers v5 shard-resolution race.
+
+    When the prefetch lock cannot be acquired (e.g. flock unsupported on
+    the filesystem and dotfile lock times out), ``from_pretrained`` may
+    still hit the ``cached_files`` race. This wrapper retries with
+    exponential backoff when the OSError message matches the specific
+    "does not appear to have a file named" pattern.
+    """
+    for attempt in range(max_retries):
+        try:
+            return load_fn()
+        except OSError as exc:
+            if "does not appear to have a file" not in str(exc):
+                raise
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (attempt + 1)
+            logger.warning(
+                "from_pretrained failed with shard-resolution race (%s); retrying in %.1fs (attempt %d/%d)",
+                exc,
+                delay,
+                attempt + 1,
+                max_retries,
+            )
+            time.sleep(delay)

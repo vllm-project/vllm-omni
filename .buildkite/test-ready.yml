@@ -183,7 +183,7 @@ steps:
     depends_on: upload-ready-pipeline
     commands:
       - |
-        timeout 15m bash -c "
+        timeout 20m bash -c "
                   pytest -sv tests/distributed/ -m 'core_model and cuda' --run-level 'core_model'
         "
     agents:

@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import argparse
 import os
-import sys
 import time
-import warnings
 import weakref
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import huggingface_hub
 from vllm.logger import init_logger
@@ -23,12 +20,13 @@ from vllm_omni.engine.messages import (
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
+from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
+from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
+from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
-
-if TYPE_CHECKING:
-    from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 logger = init_logger(__name__)
 
@@ -102,48 +100,44 @@ class OmniBase(PDDisaggregationMixin):
     @classmethod
     def from_cli_args(
         cls,
-        args: argparse.Namespace,
-        *,
-        parser: argparse.ArgumentParser | None = None,
-        **overrides: Any,
+        args: TrackingNamespace,
+        model: str | None = None,
     ) -> OmniBase:
-        """Deprecated argparse builder.
-
-        Build from argparse. If ``parser`` is passed and not yet nullified,
-        un-typed engine fields are reset to ``None``. New callers should
-        nullify deploy-overriding parser defaults with
-        ``nullify_stage_engine_defaults(parser)`` and construct Omni/AsyncOmni
-        directly.
+        """Build from a TrackingNamespace parsed by TrackingArgumentParser.
+        Only args that are explicitly passed to parse_args are forwarded.
         """
-        warnings.warn(
-            "`from_cli_args()` is deprecated. Nullify deploy-overriding parser defaults "
-            "with `nullify_stage_engine_defaults(parser)` and construct Omni/AsyncOmni "
-            "directly from `vars(args)`.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        kwargs: dict[str, Any] = {k: v for k, v in vars(args).items() if not k.startswith("_")}
+        if not isinstance(args, TrackingNamespace):
+            raise TypeError(
+                f"expected args to be of type TrackingNamespace, got {type(args)}. "
+                "Hint: did you parse your args with TrackingArgumentParser?"
+            )
 
-        if parser is not None and not getattr(parser, "_omni_nullified", False):
-            from vllm_omni.config.stage_config import deploy_override_field_names
-            from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
+        explicit_kwargs = args.get_explicit_kwargs_dict()
+        args_model = explicit_kwargs.pop("model", None) or args.model
+        if model is not None and args_model is not None and model != args_model:
+            raise ValueError(
+                f"explicit model kwarg and args.model were both provided, but do not match [{model} != {args_model}]"
+            )
 
-            explicit = detect_explicit_cli_keys(sys.argv[1:], parser) or set()
-            override_dests = deploy_override_field_names()
-            for key in list(kwargs):
-                if key in override_dests and key not in explicit:
-                    kwargs[key] = None
+        if model is None and args_model is None:
+            raise ValueError(
+                "model must be explicitly passed as a parsed arg in the TrackingNamespace or directly provided."
+            )
 
-        kwargs.update(overrides)
-        return cls(**kwargs)
+        resolved_model = model or args_model
+        return cls(model=resolved_model, **explicit_kwargs)
 
     def __init__(
         self,
         model: str,
         **kwargs: Any,
     ) -> None:
-        engine_args: OmniEngineArgs | None = kwargs.pop("engine_args", None)
-
+        if "engine_args" in kwargs:
+            logger.warning(
+                "engine_args were passed as a kwarg to an Omni instance; this is not supported. "
+                "You should instead, pass the keyword arguments used to initialize the engine args "
+                "directly to this object's initializer."
+            )
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)
@@ -170,13 +164,18 @@ class OmniBase(PDDisaggregationMixin):
         self.tts_batch_max_items: int = kwargs.pop("tts_batch_max_items", 32)
 
         logger.info("[%s] Initializing with model %s", self.__class__.__name__, model)
+        # Construct transfer_metrics first so we can hand it to AsyncOmniEngine
+        # (which forwards it to the Orchestrator background thread for
+        # TX-side emit; see Orchestrator._forward_to_next_stage).
+        self.transfer_metrics = OmniTransferMetrics(model_name=model, log_stats=log_stats)
         st = time.time()
         self.engine = AsyncOmniEngine(
             model=model,
-            engine_args=engine_args,
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
             diffusion_batch_size=diffusion_batch_size,
+            transfer_emitter=self.transfer_metrics,
+            log_stats=log_stats,
             **kwargs,
         )
         self._shutdown_called = False
@@ -190,6 +189,8 @@ class OmniBase(PDDisaggregationMixin):
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
+        self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
+        self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         if not self.output_modalities:
@@ -272,11 +273,29 @@ class OmniBase(PDDisaggregationMixin):
             raise ValueError(f"Expected {self.num_stages} sampling params, got {len(normalized)}")
         return normalized
 
+    def _fire_failure_counter_if_alive(self, request_id: str) -> None:
+        """Fire the abort/exception bucket of requests_success_total.
+
+        Called from cancel / exception paths in async_omni.generate() BEFORE
+        _abort_internal_requests pops request_states — that method resolves
+        the internal id by dict lookup, so popping first would no-op it. We
+        keep this counter fire separate from _log_summary_and_cleanup (which
+        pops) so the abort path can still find the state to clean up.
+        """
+        req_state = self.request_states.get(request_id)
+        prom = getattr(self, "prom_metrics", None)
+        if req_state is None or req_state.metrics is None or prom is None:
+            return
+        if str(request_id) not in req_state.metrics.e2e_done:
+            prom.request_failed()
+
     def _log_summary_and_cleanup(self, request_id: str) -> None:
         req_state = self.request_states.get(request_id)
         try:
             if req_state is None or req_state.metrics is None:
                 return
+            if str(request_id) not in req_state.metrics.e2e_done:
+                self.prom_metrics.request_failed()
             if self.log_stats:
                 # Emit per-request orchestrator timing (including e2e_total_ms)
                 # before dropping request state.
@@ -289,6 +308,16 @@ class OmniBase(PDDisaggregationMixin):
             )
         finally:
             self.request_states.pop(request_id, None)
+            # Republish gauges so any stale value left by the per-stage
+            # publish in _process_single_result (which runs while the request
+            # is still in self.request_states) is corrected after the pop.
+            prom = getattr(self, "prom_metrics", None)
+            counter = getattr(getattr(self, "engine", None), "_running_counter", None)
+            if prom is not None:
+                total = len(self.request_states)
+                running = counter.value if counter is not None else total
+                prom.set_running(running)
+                prom.set_waiting(max(0, total - running))
 
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(
@@ -435,6 +464,8 @@ class OmniBase(PDDisaggregationMixin):
         if not stage_meta.final_output:
             return None
 
+        output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
+
         try:
             rid_key = str(req_id)
             if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done and finished:
@@ -443,10 +474,41 @@ class OmniBase(PDDisaggregationMixin):
                     req_id,
                     req_start_ts.get(req_id, wall_start_ts),
                 )
+                e2e_seconds = now - req_start_ts.get(req_id, wall_start_ts)
+                # Extract finished_reason from upstream CompletionOutput so
+                # the per-reason completion Counter is labelled correctly.
+                completion_outputs = getattr(engine_outputs, "outputs", None) or []
+                fr = (getattr(completion_outputs[0], "finish_reason", None) if completion_outputs else None) or "stop"
+                self.prom_metrics.request_succeeded(
+                    e2e_seconds,
+                    finished_reason=fr,
+                )
+
+                # Modality observe inside the same finalize guard so it fires
+                # once per request and inherits the try/except isolation.
+                observe_modality_at_finalize(
+                    self.mod_metrics,
+                    output_type=output_type,
+                    stage_id=stage_id,
+                    replica_id=result.replica_id,
+                    stage_metrics=_m,
+                    engine_outputs=engine_outputs,
+                )
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 
-        output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
+        # When this result finalizes the request, the orchestrator has
+        # already decremented _running_counter but _log_summary_and_cleanup
+        # hasn't popped self.request_states yet — exclude the finalizing
+        # request from `total` so waiting doesn't read 1 and stay stuck
+        # there until the next request arrives.
+        counter = getattr(self.engine, "_running_counter", None)
+        is_finalizing = finished and stage_id == final_stage_id_for_e2e
+        total = max(0, len(self.request_states) - (1 if is_finalizing else 0))
+        running = counter.value if counter is not None else total
+        self.prom_metrics.set_running(running)
+        self.prom_metrics.set_waiting(max(0, total - running))
+
         images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         return OmniRequestOutput(
             request_id=req_id or "",
@@ -463,7 +525,7 @@ class OmniBase(PDDisaggregationMixin):
             peak_memory_mb=peak_memory_mb,
         )
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         logger.info("[%s] Shutting down", self.__class__.__name__)
         self._shutdown_base()
 
