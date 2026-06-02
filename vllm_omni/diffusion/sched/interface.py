@@ -60,6 +60,10 @@ class SamplingParamsKey:
     true_cfg_scale: float | None = None
     cfg_normalize: bool = False
 
+    # Output count. Requests with different num_outputs_per_prompt produce
+    # differently shaped outputs and cannot share a batch.
+    num_outputs_per_prompt: int = 1
+
     # LoRA identity. Requests with different adapters or scales must run in
     # separate batches so the worker can activate exactly one adapter per step.
     lora_int_id: int | None = None
@@ -82,7 +86,12 @@ class DiffusionRequestState:
 
 @dataclass
 class NewRequestData:
-    """Full request payload for a newly scheduled diffusion request."""
+    """Payload for a newly scheduled diffusion request.
+
+    Carries the already-initialized request object so executors and workers do
+    not re-run ``OmniDiffusionRequest.__post_init__`` and mutate sentinel-based
+    fields like ``guidance_scale_provided``.
+    """
 
     request_id: str
     req: OmniDiffusionRequest

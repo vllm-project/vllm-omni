@@ -29,9 +29,6 @@ _KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {"lora
 
 def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey | None:
     """Build a batch-compatibility key from the request's sampling params."""
-    if len(request.prompts) != 1:
-        return None
-
     sampling = request.sampling_params
     lora_request = getattr(sampling, "lora_request", None)
     return SamplingParamsKey(

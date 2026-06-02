@@ -40,7 +40,8 @@ class DiffusionRequestState:
     # ── Identity / request-level inputs ──
     request_id: str
     sampling: OmniDiffusionSamplingParams
-    prompts: list[OmniPromptType] | None = None
+    prompt: OmniPromptType | None = None
+    kv_sender_info: dict | None = None
 
     # ── Encoded prompts (set once by prepare_encode) ──
     prompt_embeds: torch.Tensor | None = None
