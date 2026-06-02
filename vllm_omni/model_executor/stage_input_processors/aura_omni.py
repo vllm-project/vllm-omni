@@ -72,6 +72,10 @@ def _vision_placeholder(multi_modal_data: dict[str, Any]) -> str:
     return ""
 
 
+def _vision_multimodal_data(multi_modal_data: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in multi_modal_data.items() if key in {"image", "video"}}
+
+
 def _aura_prompt(system_prompt: str, transcript: str, multi_modal_data: dict[str, Any]) -> str:
     vision = _vision_placeholder(multi_modal_data)
     query = transcript.strip()
@@ -99,6 +103,7 @@ def asr2aura(
         multi_modal_data = src_prompt.get("multi_modal_data") or {}
         if not isinstance(multi_modal_data, dict):
             multi_modal_data = {}
+        multi_modal_data = _vision_multimodal_data(multi_modal_data)
 
         next_input: dict[str, Any] = {
             "prompt": _aura_prompt(str(system_prompt), transcript, multi_modal_data),

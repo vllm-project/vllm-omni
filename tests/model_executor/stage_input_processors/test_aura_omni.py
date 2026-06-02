@@ -33,6 +33,20 @@ def test_asr2aura_carries_video_payload_and_transcript():
     assert next_input["prompt"].startswith("<|im_start|>system\nsystem")
 
 
+def test_asr2aura_drops_audio_before_qwen3_vl_stage():
+    prompt = {
+        "multi_modal_data": {
+            "audio": ("wave", 16000),
+            "video": ["frame-0", "frame-1"],
+        },
+    }
+
+    [next_input] = asr2aura([_source_output("看看视频")], prompt=[prompt])
+
+    assert next_input["multi_modal_data"] == {"video": ["frame-0", "frame-1"]}
+    assert "<|video_pad|>" in next_input["prompt"]
+
+
 def test_asr2aura_supports_video_only_observation():
     prompt = {"multi_modal_data": {"video": ["frame-0", "frame-1"]}}
 

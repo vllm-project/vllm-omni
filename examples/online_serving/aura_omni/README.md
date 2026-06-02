@@ -14,6 +14,7 @@ Start the server with the deploy profile:
 ```bash
 vllm serve aurateam/AURA \
   --omni \
+  --port 8091 \
   --deploy-config vllm_omni/deploy/aura_omni.yaml \
   --trust-remote-code
 ```
@@ -43,3 +44,57 @@ Expected request shape:
 
 If AURA emits `<|silent|>`, the `aura2tts` processor returns no TTS request, so
 the TTS stages are skipped for that turn.
+
+## Python Client
+
+```bash
+python examples/online_serving/aura_omni/openai_chat_completion_client.py \
+  --host localhost \
+  --port 8091 \
+  --model aurateam/AURA \
+  --modalities text,audio
+```
+
+Use local media:
+
+```bash
+python examples/online_serving/aura_omni/openai_chat_completion_client.py \
+  --audio-path /path/to/input.wav \
+  --video-path /path/to/video.mp4 \
+  --output-dir output_aura_omni_online
+```
+
+## Curl
+
+```bash
+cd examples/online_serving/aura_omni
+bash run_curl_multimodal_generation.sh
+```
+
+Set `PORT`, `MODEL`, or `OUTPUT_DIR` to override defaults:
+
+```bash
+PORT=8666 MODEL=/data/models/AURA bash run_curl_multimodal_generation.sh
+```
+
+## Gradio
+
+Launch the server and Gradio UI together:
+
+```bash
+cd examples/online_serving/aura_omni
+bash run_gradio_demo.sh
+```
+
+If the server is already running:
+
+```bash
+python examples/online_serving/aura_omni/gradio_demo.py \
+  --model aurateam/AURA \
+  --api-base http://localhost:8091/v1
+```
+
+## Offline
+
+For offline inference, see
+[`examples/offline_inference/aura_omni`](../../offline_inference/aura_omni/).
