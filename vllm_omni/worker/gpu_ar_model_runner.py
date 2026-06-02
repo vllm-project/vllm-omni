@@ -52,6 +52,7 @@ class ExecuteModelState(NamedTuple):
     spec_decode_metadata: Any
     spec_decode_common_attn_metadata: Any
     hidden_states: torch.Tensor
+    hidden_states_cpu: torch.Tensor | None
     sample_hidden_states: torch.Tensor
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: Any
@@ -282,6 +283,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _maybe_update_prefix_cache(
         self,
         hidden_states: torch.Tensor,
+        hidden_states_cpu: torch.Tensor | None,
         multimodal_outputs: dict,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
@@ -292,7 +294,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         """
         # Cache hidden states if we've enabled hidden state prefix caching
         # unless this isn't the last pipeline parallelism rank.
-        if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
+        is_last_pp_rank = get_pp_group().is_last_rank
+        if hidden_states_cpu is not None and not is_last_pp_rank:
+            raise RuntimeError("hidden_states_cpu staging is only valid on the last pipeline parallel rank.")
+        if self.omni_prefix_cache is not None and is_last_pp_rank:
             # If this happens, it generally means the model is not following the correct
             # interface yet and is therefore currently not compatible with prefix cache.
             if multimodal_outputs is not None and not isinstance(multimodal_outputs, dict):
@@ -314,11 +319,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 slot_mapping=slot_mapping_cpu,
                 num_tokens_padded=num_tokens_padded,
                 skip_mm_cache_keys=self._deferred_prefix_cache_mm_keys(),
+                hidden_states_cpu=hidden_states_cpu,
             )
 
     def _maybe_get_combined_prefix_cache_tensors(
         self,
         hidden_states: torch.Tensor,
+        hidden_states_cpu: torch.Tensor | None,
         multimodal_outputs: dict,
         num_scheduled_tokens: dict[str, int],
     ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
@@ -328,7 +335,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # Prior to applying the post-processing func, extract
         # the prefix cached hidden states and multimodal states.
         combined_hidden_states, combined_multimodal_outputs = None, None
+        is_last_pp_rank = get_pp_group().is_last_rank
+        if hidden_states_cpu is not None and not is_last_pp_rank:
+            raise RuntimeError("hidden_states_cpu staging is only valid on the last pipeline parallel rank.")
         if self.omni_prefix_cache is not None:
+            if not is_last_pp_rank:
+                raise RuntimeError("Omni prefix-cache tensor merge is only valid on the last pipeline parallel rank.")
             if (
                 not self._model_needs_full_prefix_hidden_states()
                 and not self.omni_prefix_cache.has_prefix_cached_new_req_ids()
@@ -339,6 +351,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     query_start_loc=self.query_start_loc.cpu,
                     input_batch=self.input_batch,
                     hidden_states=hidden_states,
+                    hidden_states_cpu=hidden_states_cpu,
                     num_scheduled_tokens=num_scheduled_tokens,
                 )
             combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
@@ -662,11 +675,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 aux_hidden_states = None
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+            hidden_states_cpu = None
+            if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
+                hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
 
             # Cache hidden states & multimodal outputs if we've enabled hidden state
             # prefix caching unless this isn't the last pipeline parallelism rank.
             self._maybe_update_prefix_cache(
                 hidden_states=hidden_states,
+                hidden_states_cpu=hidden_states_cpu,
                 multimodal_outputs=multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
@@ -737,6 +754,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
+            hidden_states_cpu,
             sample_hidden_states,
             aux_hidden_states,
             ec_connector_output,
@@ -838,6 +856,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
+            staged_hidden_states_cpu,
             sample_hidden_states,
             aux_hidden_states,
             ec_connector_output,
@@ -963,7 +982,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         downstream_req_id_set = set(downstream_req_ids)
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
-        if needs_pooler_payload:
+        needs_scheduled_hidden_payload = needs_pooler_payload and (
+            self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states()
+        )
+        if needs_scheduled_hidden_payload and self.omni_prefix_cache is not None:
+            if staged_hidden_states_cpu is None:
+                raise RuntimeError("Prefix-cache hidden-state payload requires staged CPU hidden states.")
+            hidden_states_cpu = staged_hidden_states_cpu
+        elif needs_scheduled_hidden_payload:
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
                 int(hidden_states.shape[0]),
@@ -980,6 +1006,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 dtype=np.int32,
             )
         query_start_loc_cpu = self.query_start_loc.cpu
+        if callable(query_start_loc_cpu):
+            query_start_loc_cpu = query_start_loc_cpu()
         if self.omni_prefix_cache is not None:
             deferred_mm_cache_keys = self._deferred_prefix_cache_mm_keys()
             if deferred_mm_cache_keys:
@@ -1004,6 +1032,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     combined_multimodal_outputs,
                 ) = self._maybe_get_combined_prefix_cache_tensors(
                     hidden_states,
+                    staged_hidden_states_cpu,
                     multimodal_outputs,
                     scheduler_output.num_scheduled_tokens,
                 )

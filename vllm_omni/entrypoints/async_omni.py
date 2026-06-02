@@ -160,6 +160,20 @@ class AsyncOmni(EngineClient, OmniBase):
                 renderer = renderer_from_config(vllm_config)
             self.io_processor = get_io_processor(vllm_config, renderer, io_processor_plugin)
 
+    def _resolve_transfer_replica(self, stage_id: int, request_id: str) -> int | None:
+        """Look up the sticky-routed replica for (stage_id, request_id).
+
+        Used as the ``replica_resolver`` callback by ``OrchestratorAggregator``
+        to label transfer_* metrics without plumbing replica ids through
+        ``TransferEdgeStats`` / ``StageRequestStats`` / connector adapters.
+        Returns None when stage_id is out of range or the request hasn't been
+        bound to a replica yet — the metric emit then defensive-skips.
+        """
+        pools = getattr(self.engine, "stage_pools", None)
+        if pools is None or not (0 <= stage_id < len(pools)):
+            return None
+        return pools[stage_id].get_bound_replica_id(request_id)
+
     def _get_comprehension_stage_index(self) -> int | None:
         fallback_idx: int | None = None
         for idx, stage_client in enumerate(self.engine.stage_clients):
@@ -331,6 +345,8 @@ class AsyncOmni(EngineClient, OmniBase):
                 self.log_stats,
                 wall_start_ts,
                 final_stage_id_for_e2e,
+                transfer_emitter=getattr(self, "transfer_metrics", None),
+                replica_resolver=self._resolve_transfer_replica,
             )
 
             req_state = ClientRequestState(
@@ -338,6 +354,7 @@ class AsyncOmni(EngineClient, OmniBase):
                 external_request_id=external_request_id,
             )
             req_state.metrics = metrics
+            req_state.request_arrival_ts = wall_start_ts
             self.request_states[request_id] = req_state
 
             # PD disaggregation: modify prefill-stage sampling params per request
@@ -387,10 +404,12 @@ class AsyncOmni(EngineClient, OmniBase):
         except (asyncio.CancelledError, GeneratorExit):
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
+            self._fire_failure_counter_if_alive(request_id)
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
+            self._fire_failure_counter_if_alive(request_id)
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise

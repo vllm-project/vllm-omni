@@ -122,6 +122,13 @@ class ImageGenerationRequest(BaseModel):
         le=20.0,
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
+    flow_shift: float | None = Field(
+        default=None, description="Scheduler flow_shift (sigma shift) for flow-matching diffusion models."
+    )
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional model-specific parameters passed directly to the model's extra_args.",
+    )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,
