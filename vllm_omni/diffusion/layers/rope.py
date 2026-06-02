@@ -91,7 +91,6 @@ class RotaryEmbedding(CustomOp):
         self.is_neox_style = is_neox_style
         self.interleaved = not is_neox_style
         self.apply_rotary_emb_flash_attn = None
-        self.has_mindie = False
         # ``find_spec("flash_attn")`` is True as long as *any* package publishes
         # the ``flash_attn`` namespace — including ``flash-attn-4``, which ships
         # only ``flash_attn.cute`` and no ``flash_attn.ops``. Guard the import
@@ -104,8 +103,6 @@ class RotaryEmbedding(CustomOp):
                 self.apply_rotary_emb_flash_attn = apply_rotary
             except ImportError:
                 pass
-        if find_spec("mindiesd") is not None:
-            self.has_mindie = True
 
     def forward_cuda(
         self,
