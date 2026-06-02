@@ -149,4 +149,8 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.higgs_audio_v2.pipeline",
         "HIGGS_AUDIO_V2_PIPELINE",
     ),
+    "dynin_omni": (
+        "vllm_omni.model_executor.models.dynin_omni.pipeline",
+        "DYNIN_OMNI_PIPELINE",
+    ),
 }
