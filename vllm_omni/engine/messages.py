@@ -80,6 +80,7 @@ class OutputMessage(EngineQueueMessage, kw_only=True):
     type: Literal["output"] = "output"
     request_id: str
     stage_id: int
+    replica_id: int | None = None
     engine_outputs: OmniRequestOutput
     metrics: StageRequestMetrics | None = None
     finished: bool
@@ -90,6 +91,7 @@ class StageMetricsMessage(EngineQueueMessage, kw_only=True):
     type: Literal["stage_metrics"] = "stage_metrics"
     request_id: str
     stage_id: int
+    replica_id: int | None = None
     metrics: StageRequestMetrics
     stage_submit_ts: float | None = None
 
