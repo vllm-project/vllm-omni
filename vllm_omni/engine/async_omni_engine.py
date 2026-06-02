@@ -110,6 +110,7 @@ from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
 )
 from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -259,6 +260,12 @@ class AsyncOmniEngine:
         **kwargs: Additional arguments
     """
 
+    # Class-level defaults so tests that bypass __init__ via object.__new__
+    # don't AttributeError when stage-init / forward paths touch these attrs.
+    _log_stats: bool = False
+    _coordinator_runtime: Any = None
+    _transfer_emitter: Any = None
+
     def __init__(
         self,
         model: str,
@@ -267,11 +274,23 @@ class AsyncOmniEngine:
         init_timeout: int = 600,
         diffusion_batch_size: int = 1,
         single_stage_mode: bool = False,
+        transfer_emitter: Any = None,
+        log_stats: bool = False,
         **kwargs: Any,
     ) -> None:
         self.model = model
         self.diffusion_batch_size = diffusion_batch_size
         startup_timeout = int(init_timeout)
+        # Forwarded into Orchestrator so its _forward_to_next_stage path can
+        # emit per-edge transfer_tx_s / transfer_size_bytes histograms.
+        # Optional: when None, Orchestrator silently skips TX emit (existing
+        # RX path still works via OrchestratorAggregator).
+        self._transfer_emitter = transfer_emitter
+        # Drives upstream EngineCore + scheduler stats production. When False
+        # the engine skips SchedulerStats / IterationStats; the per-(stage,
+        # replica) vllm:* wrap stays registered but reads zero. Respects the
+        # --log-stats CLI flag set by the user via OmniBase.
+        self._log_stats = log_stats
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
@@ -357,6 +376,7 @@ class AsyncOmniEngine:
         self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
+        self._running_counter = OmniRequestCounter()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -905,7 +925,7 @@ class AsyncOmniEngine:
                                         launch_omni_core_engines(
                                             vllm_config=vllm_config,
                                             executor_class=executor_class,
-                                            log_stats=False,
+                                            log_stats=self._log_stats,
                                             omni_master_server=self._omni_master_server,
                                             stage_id=plan.metadata.stage_id,
                                             stage_config=stage_cfg,
@@ -917,7 +937,7 @@ class AsyncOmniEngine:
                                     addresses, proc, handshake_address = spawn_stage_core(
                                         vllm_config=vllm_config,
                                         executor_class=executor_class,
-                                        log_stats=False,
+                                        log_stats=self._log_stats,
                                     )
                                 logger.info(
                                     "[AsyncOmniEngine] Stage %s engine launch started",
@@ -1229,7 +1249,7 @@ class AsyncOmniEngine:
             if plan.replicas[0].metadata.stage_type != "diffusion":
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 assert stage_vllm_config is not None
-                output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
+                output_processor = build_llm_stage_output_processor(plan, stage_vllm_config, log_stats=self._log_stats)
 
             stage_pools.append(
                 StagePool(
@@ -1374,9 +1394,12 @@ class AsyncOmniEngine:
                 stage_pools=self.stage_pools,
                 async_chunk=self.async_chunk,
                 pd_config=pd_config,
+                running_counter=self._running_counter,
                 coordinator_pub_address=coordinator_pub_address,
                 load_balancer_factory=load_balancer_factory,
                 remote_replica_factory=remote_replica_factory,
+                transfer_emitter=self._transfer_emitter,
+                log_stats=self._log_stats,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -1784,6 +1807,12 @@ class AsyncOmniEngine:
             return {
                 "rel_l1_thresh": 0.2,
             }
+        if cache_backend == "mag_cache":
+            return {
+                "mag_threshold": 0.24,
+                "mag_max_skip_steps": 5,
+                "mag_retention_ratio": 0.1,
+            }
         return None
 
     @staticmethod
@@ -1929,6 +1958,7 @@ class AsyncOmniEngine:
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
             "model_class_name": kwargs.get("model_class_name", None),
+            "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
@@ -2118,7 +2148,7 @@ class AsyncOmniEngine:
                             kwargs.get("diffusion_attention_config"),
                             attention_backend=kwargs.get("diffusion_attention_backend"),
                         )
-                quantization_config = kwargs.get("quantization_config")
+                quantization_config = kwargs.get("diffusion_quantization_config")
                 if quantization_config is not None:
                     if (
                         not hasattr(cfg.engine_args, "quantization_config")

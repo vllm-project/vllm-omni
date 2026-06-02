@@ -103,7 +103,7 @@ echo ""
 
 if [[ "$QUERY_TYPE" == "use_image_gen" ]]; then
     # Image-gen branch: dual-stage diffusion endpoint, modalities=["image"].
-    # The shipped ming_flash_omni_dual.yaml runs the thinker on cards 0-3
+    # The shipped ming_flash_omni_image.yaml runs the thinker on cards 0-3
     # (TP=4) and the diffusion stage on card 4 (TP=1). See the image-gen
     # section in README.md for knobs and img2img.
     out_path="${OUT_PATH:-/tmp/ming_imagegen.png}"

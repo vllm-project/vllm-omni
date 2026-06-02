@@ -281,7 +281,7 @@ class TransformerConfig:
 @dataclass
 class DiffusionCacheConfig:
     """
-    Configuration for cache adapters (TeaCache, cache-dit, etc.).
+    Configuration for cache adapters (TeaCache, cache-dit, MagCache, etc.).
 
     This dataclass provides a unified interface for cache configuration parameters.
     It can be initialized from a dictionary and accessed via attributes.
@@ -291,6 +291,8 @@ class DiffusionCacheConfig:
         - cache-dit: Fn_compute_blocks, Bn_compute_blocks, max_warmup_steps,
                     residual_diff_threshold, enable_taylorseer, taylorseer_order,
                     scm_steps_mask_policy, scm_steps_policy
+        - MagCache: mag_threshold, mag_max_skip_steps, mag_retention_ratio,
+                    mag_ratios, mag_calibrate
 
     Example:
         >>> # From dict (user-facing API) - partial config uses defaults for missing keys
@@ -300,13 +302,25 @@ class DiffusionCacheConfig:
         >>> print(config.Fn_compute_blocks)  # 8 (default)
         >>> # Empty dict uses all defaults
         >>> default_config = DiffusionCacheConfig.from_dict({})
-        >>> print(default_config.rel_l1_thresh)  # 0.2 (default)
+        >>> print(config.rel_l1_thresh)  # 0.2 (default)
     """
 
     # TeaCache parameters [tea_cache only]
     # Default: 0.2 provides ~1.5x speedup with minimal quality loss (optimal balance)
     rel_l1_thresh: float = 0.2
     coefficients: list[float] | None = None  # Uses model-specific defaults if None
+
+    # MagCache parameters [mag_cache only]
+    # Default: 0.24 threshold for accumulated magnitude error
+    mag_threshold: float = 0.24
+    # Default: 5 maximum consecutive skip steps (K)
+    mag_max_skip_steps: int = 5
+    # Default: 0.1 fraction of initial steps where skipping is disabled (stability)
+    mag_retention_ratio: float = 0.1
+    # Default: None magnitude ratios (model-specific, required for inference)
+    mag_ratios: list[float] | None = None
+    # Default: False calibration mode (computes mag_ratios on first run)
+    mag_calibrate: bool = False
 
     # cache-dit parameters [cache-dit only]
     # Default: 1 forward compute block (optimized for single-transformer models)
@@ -833,6 +847,21 @@ class OmniDiffusionConfig:
         self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
 
+    @staticmethod
+    def _looks_like_lance_subfolder(model: str | None) -> bool:
+        """Return True when ``--model`` points at a Lance per-component subfolder.
+
+        Lance's HF repo bundles ``Lance_3B/``, ``Lance_3B_Video/`` and
+        ``Qwen2.5-VL-ViT/`` under a single top-level ``config.json``; users may
+        reasonably hand the AR-style sub-checkpoint path directly.  The
+        ``LancePipeline`` constructor knows to walk up to the repo root from
+        either subfolder name.
+        """
+        if not model:
+            return False
+        base = os.path.basename(str(model).rstrip("/"))
+        return base in {"Lance_3B", "Lance_3B_Video"}
+
     def enrich_config(self) -> None:
         """Load model metadata from HuggingFace and populate config fields.
 
@@ -886,6 +915,15 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model)
                 if cfg is None:
+                    # Lance ships its top-level config.json one directory above
+                    # the per-checkpoint subfolders (``Lance_3B/`` or
+                    # ``Lance_3B_Video/``).  Try to recover that case before
+                    # raising.
+                    if self._looks_like_lance_subfolder(self.model):
+                        self.model_class_name = "LancePipeline"
+                        self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                        return
                     raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
 
                 self.set_tf_model_config(TransformerConfig.from_dict(cfg))
@@ -894,6 +932,19 @@ class OmniDiffusionConfig:
 
                 if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                     self.model_class_name = "BagelPipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif (
+                    model_type == "lance"
+                    or "LancePipeline" in architectures
+                    or cfg.get("model_name") == "Lance"
+                    or self._looks_like_lance_subfolder(self.model)
+                ):
+                    # Lance ships a non-HF top-level config.json (model_name only)
+                    # plus per-component subfolders; resolve to the Lance pipeline.
+                    # Also accept --model pointing directly at the ``Lance_3B`` or
+                    # ``Lance_3B_Video`` subfolder by walking up to the repo root.
+                    self.model_class_name = "LancePipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif model_type == "neo_chat":

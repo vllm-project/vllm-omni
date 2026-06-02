@@ -243,6 +243,7 @@ def test_t2v_video_generation_form(test_client, mocker: MockerFixture):
     _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
 
     engine = test_client.app.state.openai_serving_video._engine_client
+    assert engine.captured_prompt["modalities"] == ["video"]
     captured = engine.captured_sampling_params_list[0]
     assert captured.num_outputs_per_prompt == 1
     assert captured.width == 640
@@ -1063,6 +1064,8 @@ def test_sync_t2v_returns_video_bytes(test_client, mocker: MockerFixture):
     assert float(response.headers["x-inference-time-s"]) >= 0
     assert json.loads(response.headers["x-stage-durations"]) == {}
     assert float(response.headers["x-peak-memory-mb"]) == 0.0
+    engine = test_client.app.state.openai_serving_video._engine_client
+    assert engine.captured_prompt["modalities"] == ["video"]
 
 
 def test_sync_t2v_returns_profiler_headers(test_client, mocker: MockerFixture):

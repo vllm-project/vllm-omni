@@ -153,3 +153,27 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def get_profiler_cls(cls) -> str:
         return "vllm_omni.platforms.npu.profiler.NPUTorchProfilerWrapper"
+
+    @classmethod
+    def get_graph_wrapper_cls(cls) -> type:
+        from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+        return ACLGraphWrapper
+
+    @classmethod
+    def set_forward_context(
+        cls,
+        attn_metadata,
+        vllm_config,
+        *,
+        cudagraph_runtime_mode,
+        batch_descriptor,
+    ):
+        from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+
+        return set_ascend_forward_context(
+            attn_metadata,
+            vllm_config,
+            aclgraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
+        )

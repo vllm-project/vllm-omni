@@ -1,6 +1,6 @@
-"""Unit tests for OmniSchedulerMixin streaming session replacement.
+"""Unit tests for generation streaming session replacement.
 
-These tests pin the behavior of `_replace_session_with_streaming_update` against
+These tests pin the behavior of `_update_request_as_session` against
 current vLLM `Request` / `StreamingUpdate` (and Omni patches). When upgrading
 vLLM, failures here should highlight incompatible changes to request state or
 update payloads early.
@@ -19,19 +19,34 @@ import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
 # isort: on
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-class _SchedulerStub(OmniSchedulerMixin):
-    """Minimal scheduler surface required by OmniSchedulerMixin."""
+class _SkippedWaitingStub:
+    def __contains__(self, request: Request) -> bool:
+        return False
+
+
+class _ChunkTransferAdapterStub:
+    def __init__(self) -> None:
+        self.segment_finished_requests: set[str] = set()
+
+
+class _SchedulerStub(OmniGenerationScheduler):
+    """Minimal scheduler surface required by OmniGenerationScheduler."""
 
     def __init__(self, *, log_stats: bool = False) -> None:
         self.num_waiting_for_streaming_input = 0
         self.log_stats = log_stats
+        self.chunk_transfer_adapter = _ChunkTransferAdapterStub()
+        self.skipped_waiting = _SkippedWaitingStub()
+
+    def _enqueue_waiting_request(self, session: Request) -> None:
+        raise AssertionError("unexpected enqueue for skipped_waiting miss")
 
 
 def _make_request(**kwargs) -> Request:
@@ -71,7 +86,7 @@ class TestReplaceSessionWithStreamingUpdate:
 
         update = _make_update(prompt_token_ids=[40, 41, 42])
         sched.num_waiting_for_streaming_input = 3
-        sched._replace_session_with_streaming_update(session, update)
+        sched._update_request_as_session(session, update)
 
         assert session._output_token_ids == []
         assert list(session._all_token_ids) == [40, 41, 42]
@@ -88,7 +103,7 @@ class TestReplaceSessionWithStreamingUpdate:
         session = _make_request()
         session.status = RequestStatus.RUNNING
         update = _make_update(prompt_token_ids=None)
-        sched._replace_session_with_streaming_update(session, update)
+        sched._update_request_as_session(session, update)
 
         assert session.prompt_token_ids == ()
         assert list(session._all_token_ids) == []
@@ -108,7 +123,7 @@ class TestReplaceSessionWithStreamingUpdate:
             pytest.skip("StreamingUpdate has no additional_information (Omni patch inactive?)")
         update = replace(base, additional_information=None)
 
-        sched._replace_session_with_streaming_update(session, update)
+        sched._update_request_as_session(session, update)
         assert session.additional_information is None
 
     def test_does_not_decrement_waiting_when_not_streaming_status(self) -> None:
@@ -116,14 +131,14 @@ class TestReplaceSessionWithStreamingUpdate:
         session = _make_request()
         session.status = RequestStatus.RUNNING
         sched.num_waiting_for_streaming_input = 5
-        sched._replace_session_with_streaming_update(session, _make_update())
+        sched._update_request_as_session(session, _make_update())
         assert sched.num_waiting_for_streaming_input == 5
 
     def test_records_queued_event_when_log_stats_enabled(self) -> None:
         sched = _SchedulerStub(log_stats=True)
         session = _make_request()
         session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-        sched._replace_session_with_streaming_update(session, _make_update())
+        sched._update_request_as_session(session, _make_update())
 
         assert session.events
         assert session.events[-1].type == EngineCoreEventType.QUEUED
