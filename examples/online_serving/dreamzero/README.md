@@ -108,16 +108,16 @@ ${ISAACLAB_LAUNCHER} -p examples/online_serving/dreamzero/droid_sim_eval_client.
 Set `ISAACLAB_LAUNCHER=path/to/isaaclab.sh` from the vLLM-Omni repository root before running the command.
 This launches Isaac Lab / sim-evals and runs the DROID benchmark loop against the same websocket endpoint.
 
-### Export comparison videos
+### Export comparison videos offline
 
 ```bash
-python examples/online_serving/dreamzero/export_prediction_video.py \
+python examples/offline_inference/dreamzero/export_prediction_video.py \
     --deploy-config vllm_omni/deploy/dreamzero_tp1_cfg2.yaml \
     --save-input-video \
     --save-gif
 ```
 
-The export script writes the input rollout video and the predicted output video artifacts for side-by-side inspection.
+The export script uses local `Omni` inference, not the websocket server. It writes the input rollout video and the predicted output video artifacts for side-by-side inspection.
 
 ### MolmoSpace demo
 

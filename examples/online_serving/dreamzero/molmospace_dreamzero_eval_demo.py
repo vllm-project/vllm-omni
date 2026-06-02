@@ -8,9 +8,6 @@ from pathlib import Path
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
-_DEMO_HOST = os.environ.get("VLLM_OMNI_DEMO_HOST", "127.0.0.1")
-_DEMO_PORT = int(os.environ.get("VLLM_OMNI_DEMO_PORT", "8000"))
-
 # Import base configs at module top level so the subclasses below are pickle-
 # resolvable (worker processes import this module fresh via __main__).
 from molmo_spaces.configs.policy_configs_baselines import (  # noqa: E402
@@ -23,7 +20,7 @@ from molmo_spaces.evaluation.configs.evaluation_configs import (  # noqa: E402
 
 # We only need to change the backend host and port to the vllm-host!
 class DreamZeroVllmOmniPolicyConfig(DreamZeroPolicyConfig):
-    remote_config: dict = dict(host=_DEMO_HOST, port=_DEMO_PORT)
+    remote_config: dict = dict(host="127.0.0.1", port=8000)
 
 
 class DreamZeroVllmOmniEvalConfig(DreamZeroPolicyEvalConfig):
@@ -53,9 +50,9 @@ def main() -> int:
     parser.add_argument("--episode_idx", type=int, default=None)
     args = parser.parse_args()
 
-    os.environ["VLLM_OMNI_DEMO_HOST"] = args.host
-    os.environ["VLLM_OMNI_DEMO_PORT"] = str(args.port)
-    DreamZeroVllmOmniPolicyConfig.model_fields["remote_config"].default = dict(host=args.host, port=args.port)
+    policy_config = DreamZeroVllmOmniPolicyConfig(remote_config=dict(host=args.host, port=args.port))
+    DreamZeroVllmOmniPolicyConfig.model_fields["remote_config"].default = policy_config.remote_config
+    DreamZeroVllmOmniEvalConfig.model_fields["policy_config"].default = policy_config
 
     # Import after env vars are set so MuJoCo picks EGL.
     from molmo_spaces.evaluation import run_evaluation

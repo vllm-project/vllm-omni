@@ -21,26 +21,19 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
     raise ImportError("DreamZero OpenPI example requires `opencv-python`.") from exc
 
 try:
-    import websockets.sync.client
-except ImportError as exc:  # pragma: no cover - runtime dependency guard
-    raise ImportError("DreamZero OpenPI example requires `websockets`.") from exc
-
-try:
     example_dir = str(Path(__file__).resolve().parent)
     removed_path = False
     if sys.path and sys.path[0] == example_dir:
         sys.path.pop(0)
         removed_path = True
     try:
-        from openpi_client import msgpack_numpy
+        from openpi_client.websocket_client_policy import WebsocketClientPolicy
     finally:
         if removed_path:
             sys.path.insert(0, example_dir)
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
     raise ImportError("DreamZero OpenPI example requires `openpi-client`.") from exc
 
-PING_INTERVAL_SECS = 300
-PING_TIMEOUT_SECS = 3600
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 DEFAULT_PATH = "/v1/realtime/robot/openpi"
@@ -58,14 +51,11 @@ CAMERA_FILES = {
 }
 
 
-def _decode_action_response(response: bytes | str) -> np.ndarray:
-    if isinstance(response, str):
-        raise RuntimeError(f"Inference failed: {response}")
-    decoded = msgpack_numpy.unpackb(response)
-    if isinstance(decoded, dict) and decoded.get("type") == "error":
-        message = decoded.get("message", decoded)
+def _as_action_array(response: Any) -> np.ndarray:
+    if isinstance(response, dict) and response.get("type") == "error":
+        message = response.get("message", response)
         raise RuntimeError(f"Inference failed: {message}")
-    return np.asarray(decoded, dtype=np.float32)
+    return np.asarray(response, dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -105,56 +95,16 @@ class DreamZeroServerMetadata:
         )
 
 
-class OpenPIWebsocketClient:
-    def __init__(
-        self,
-        *,
-        host: str = DEFAULT_HOST,
-        port: int = DEFAULT_PORT,
-        path: str = DEFAULT_PATH,
-    ) -> None:
-        self._uri = f"ws://{host}:{port}{path}"
-        self._packer = msgpack_numpy.Packer()
-        self._ws, self._server_metadata = self._connect()
+def _openpi_uri(host: str, port: int, path: str) -> str:
+    if host.startswith(("ws://", "wss://")):
+        return host
+    return f"ws://{host}:{port}{path}"
 
-    def _connect(self):
-        logging.info("Connecting to %s", self._uri)
-        conn = websockets.sync.client.connect(
-            self._uri,
-            compression=None,
-            max_size=None,
-            ping_interval=PING_INTERVAL_SECS,
-            ping_timeout=PING_TIMEOUT_SECS,
-        )
-        metadata = msgpack_numpy.unpackb(conn.recv())
-        if not isinstance(metadata, dict):
-            raise TypeError(f"Expected dict metadata from server, got {type(metadata)!r}")
-        return conn, metadata
 
-    def get_server_metadata(self) -> dict[str, Any]:
-        return dict(self._server_metadata)
-
-    def infer(self, obs: dict[str, Any]) -> np.ndarray:
-        payload = dict(obs)
-        payload["endpoint"] = "infer"
-        self._ws.send(self._packer.pack(payload))
-        response = self._ws.recv()
-        return _decode_action_response(response)
-
-    def reset(self, reset_info: dict[str, Any] | None = None) -> str:
-        payload = dict(reset_info or {})
-        payload["endpoint"] = "reset"
-        self._ws.send(self._packer.pack(payload))
-        response = self._ws.recv()
-        if isinstance(response, str):
-            return response
-        decoded = msgpack_numpy.unpackb(response)
-        if not isinstance(decoded, dict) or decoded.get("status") != "reset successful":
-            raise RuntimeError(f"Unexpected reset response: {decoded!r}")
-        return str(decoded["status"])
-
-    def close(self) -> None:
-        self._ws.close()
+def _close_policy_client(client: WebsocketClientPolicy) -> None:
+    ws = getattr(client, "_ws", None)
+    if ws is not None:
+        ws.close()
 
 
 def load_all_frames(video_path: Path) -> np.ndarray:
@@ -253,6 +203,7 @@ def validate_session_result(
     *,
     expected_action_horizon: int = ACTION_HORIZON,
     expected_action_dim: int = DEFAULT_ACTION_DIM,
+    expected_action_count: int | None = None,
 ) -> None:
     metadata = DreamZeroServerMetadata.from_dict(result["metadata"])
     if metadata.image_resolution != (180, 320):
@@ -265,8 +216,10 @@ def validate_session_result(
         raise AssertionError(f"Unexpected action_space: {metadata.action_space}")
 
     actions = result["actions"]
-    if len(actions) != 3:
-        raise AssertionError(f"Expected 3 action tensors, got {len(actions)}")
+    if expected_action_count is not None and len(actions) != expected_action_count:
+        raise AssertionError(f"Expected {expected_action_count} action tensors, got {len(actions)}")
+    if not actions:
+        raise AssertionError("Expected at least one action tensor")
     for index, action in enumerate(actions):
         if action.shape != (expected_action_horizon, expected_action_dim):
             raise AssertionError(
@@ -275,9 +228,6 @@ def validate_session_result(
             )
         if not np.isfinite(action).all():
             raise AssertionError(f"Action {index} contains non-finite values")
-
-    if result["reset_status"] != "reset successful":
-        raise AssertionError(f"Unexpected reset status: {result['reset_status']!r}")
 
 
 def run_policy_session(
@@ -299,20 +249,19 @@ def run_policy_session(
         num_chunks=num_chunks,
     )
 
-    client = OpenPIWebsocketClient(host=host, port=port, path=path)
+    uri = _openpi_uri(host, port, path)
+    logging.info("Connecting to %s", uri)
+    client = WebsocketClientPolicy(host=uri)
     try:
-        metadata = client.get_server_metadata()
-        actions = [client.infer(obs) for obs in observations]
-        reset_status = client.reset({})
-        actions.append(client.infer(observations[0]))
+        metadata = dict(client.get_server_metadata())
+        actions = [_as_action_array(client.infer(obs)) for obs in observations]
         return {
             "metadata": metadata,
             "actions": actions,
-            "reset_status": reset_status,
             "session_id": session_id,
         }
     finally:
-        client.close()
+        _close_policy_client(client)
 
 
 def format_action_summary(index: int, action: np.ndarray) -> str:
@@ -349,12 +298,11 @@ def main() -> int:
         session_id=args.session_id,
         num_chunks=args.num_chunks,
     )
-    validate_session_result(result)
+    validate_session_result(result, expected_action_count=args.num_chunks)
 
     print("Server metadata:", json.dumps(result["metadata"], sort_keys=True))
     for index, action in enumerate(result["actions"]):
         print(format_action_summary(index, action))
-    print("Reset status:", result["reset_status"])
     print("Session ID:", result["session_id"])
     return 0
 
