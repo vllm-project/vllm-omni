@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import argparse
 import os
-import sys
 import time
-import warnings
 import weakref
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import huggingface_hub
 from vllm.logger import init_logger
@@ -29,9 +26,7 @@ from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetric
 from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
-
-if TYPE_CHECKING:
-    from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 logger = init_logger(__name__)
 
@@ -105,48 +100,44 @@ class OmniBase(PDDisaggregationMixin):
     @classmethod
     def from_cli_args(
         cls,
-        args: argparse.Namespace,
-        *,
-        parser: argparse.ArgumentParser | None = None,
-        **overrides: Any,
+        args: TrackingNamespace,
+        model: str | None = None,
     ) -> OmniBase:
-        """Deprecated argparse builder.
-
-        Build from argparse. If ``parser`` is passed and not yet nullified,
-        un-typed engine fields are reset to ``None``. New callers should
-        nullify deploy-overriding parser defaults with
-        ``nullify_stage_engine_defaults(parser)`` and construct Omni/AsyncOmni
-        directly.
+        """Build from a TrackingNamespace parsed by TrackingArgumentParser.
+        Only args that are explicitly passed to parse_args are forwarded.
         """
-        warnings.warn(
-            "`from_cli_args()` is deprecated. Nullify deploy-overriding parser defaults "
-            "with `nullify_stage_engine_defaults(parser)` and construct Omni/AsyncOmni "
-            "directly from `vars(args)`.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        kwargs: dict[str, Any] = {k: v for k, v in vars(args).items() if not k.startswith("_")}
+        if not isinstance(args, TrackingNamespace):
+            raise TypeError(
+                f"expected args to be of type TrackingNamespace, got {type(args)}. "
+                "Hint: did you parse your args with TrackingArgumentParser?"
+            )
 
-        if parser is not None and not getattr(parser, "_omni_nullified", False):
-            from vllm_omni.config.stage_config import deploy_override_field_names
-            from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
+        explicit_kwargs = args.get_explicit_kwargs_dict()
+        args_model = explicit_kwargs.pop("model", None) or args.model
+        if model is not None and args_model is not None and model != args_model:
+            raise ValueError(
+                f"explicit model kwarg and args.model were both provided, but do not match [{model} != {args_model}]"
+            )
 
-            explicit = detect_explicit_cli_keys(sys.argv[1:], parser) or set()
-            override_dests = deploy_override_field_names()
-            for key in list(kwargs):
-                if key in override_dests and key not in explicit:
-                    kwargs[key] = None
+        if model is None and args_model is None:
+            raise ValueError(
+                "model must be explicitly passed as a parsed arg in the TrackingNamespace or directly provided."
+            )
 
-        kwargs.update(overrides)
-        return cls(**kwargs)
+        resolved_model = model or args_model
+        return cls(model=resolved_model, **explicit_kwargs)
 
     def __init__(
         self,
         model: str,
         **kwargs: Any,
     ) -> None:
-        engine_args: OmniEngineArgs | None = kwargs.pop("engine_args", None)
-
+        if "engine_args" in kwargs:
+            logger.warning(
+                "engine_args were passed as a kwarg to an Omni instance; this is not supported. "
+                "You should instead, pass the keyword arguments used to initialize the engine args "
+                "directly to this object's initializer."
+            )
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)
@@ -180,7 +171,6 @@ class OmniBase(PDDisaggregationMixin):
         st = time.time()
         self.engine = AsyncOmniEngine(
             model=model,
-            engine_args=engine_args,
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
             diffusion_batch_size=diffusion_batch_size,

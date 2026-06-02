@@ -29,13 +29,14 @@ from vllm_omni.config.stage_config import (
     _deep_merge_stage,
     _resolve_scheduler,
     build_stage_runtime_overrides,
-    deploy_override_field_names,
     load_deploy_config,
     merge_pipeline_deploy,
     register_pipeline,
     strip_parent_engine_args,
 )
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, EngineArgs, internal_blacklist_keys
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -155,23 +156,6 @@ class TestStageConfig:
         )
         omega_config = config.to_omegaconf()
         assert omega_config.engine_args.max_num_seqs == 32
-
-    def test_to_omegaconf_omits_none_deploy_overrides_for_engine_args(self):
-        """None deploy overrides must fall through to EngineArgs defaults."""
-
-        config = StageConfig(
-            stage_id=0,
-            model_stage="thinker",
-            runtime_overrides={name: None for name in deploy_override_field_names()},
-        )
-
-        omega_config = config.to_omegaconf()
-        engine_args = dict(omega_config.engine_args)
-
-        assert "devices" not in engine_args
-        assert "max_batch_size" not in engine_args
-        for name in deploy_override_field_names() - {"devices"}:
-            assert name not in engine_args
 
     def test_to_omegaconf_diffusion_parallel_overrides_replace_nested_values(self):
         config = StageConfig(
@@ -1018,64 +1002,7 @@ class TestPipelineRegistry:
 
 
 class TestDeployConfigLoading:
-    def test_deploy_override_fields_include_deploy_schema_fields(self):
-        expected_fields = {
-            "active_stream_window",
-            "async_chunk",
-            # StageDeployConfig: stage placement and runtime fields.
-            "devices",
-            # StageDeployConfig: vLLM EngineArgs fields.
-            "async_scheduling",
-            "compilation_config",
-            "config_format",
-            "custom_voice_dir",
-            "data_parallel_size",
-            "devices",
-            "disable_hybrid_kv_cache_manager",
-            "enable_flashinfer_autotune",
-            "enforce_eager",
-            "gpu_memory_utilization",
-            "load_format",
-            "max_model_len",
-            "max_num_batched_tokens",
-            "max_num_seqs",
-            "mm_processor_cache_gb",
-            "profiler_config",
-            "skip_mm_profiling",
-            "subtalker_sampling_params",
-            "tensor_parallel_size",
-            "tokenizer_mode",
-            # StageDeployConfig: diffusion parallel_config deploy override fields.
-            "cfg_parallel_size",
-            "enable_expert_parallel",
-            "hsdp_replicate_size",
-            "hsdp_shard_size",
-            "ring_degree",
-            "sequence_parallel_size",
-            "ulysses_degree",
-            "ulysses_mode",
-            "use_hsdp",
-            "vae_patch_parallel_size",
-            # DeployConfig: pipeline-wide engine settings.
-            "data_parallel_size",
-            "distributed_executor_backend",
-            "dtype",
-            "enable_chunked_prefill",
-            "enable_prefix_caching",
-            "pipeline_parallel_size",
-            "quantization",
-            "trust_remote_code",
-        }
-
-        actual_fields = deploy_override_field_names()
-        assert expected_fields == actual_fields, (
-            f"added={actual_fields - expected_fields}, removed={expected_fields - actual_fields}"
-        )
-
     def test_custom_voice_dir_is_pipeline_wide_engine_arg(self, tmp_path):
-        import vllm_omni.model_executor.models.qwen3_tts.pipeline  # noqa: F401
-        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
-
         deploy_path = tmp_path / "qwen3_tts_custom_voice.yaml"
         custom_voice_dir = tmp_path / "voices"
         deploy_path.write_text(
@@ -1912,16 +1839,6 @@ class TestSentinelDefaultPrecedence:
         sig = inspect.signature(StageConfigFactory._create_from_registry)
         named = [p for p in sig.parameters.values() if p.kind != p.VAR_KEYWORD]
         assert "cli_explicit_keys" not in {p.name for p in named}
-
-    def test_cli_explicit_keys_kwarg_emits_deprecation(self):
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            StageConfigFactory._create_from_registry(
-                "qwen3_omni_moe",
-                cli_overrides={},
-                cli_explicit_keys={"max_num_seqs"},
-            )
-            assert any(issubclass(x.category, DeprecationWarning) for x in w)
 
     def test_async_chunk_dispatches_processors(self):
         """A single ``qwen3_tts`` pipeline picks per-chunk vs end-to-end

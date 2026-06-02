@@ -18,8 +18,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
 TASK_CHOICES = ("t2t", "t2i", "t2s", "i2i", "i2t", "s2t", "v2t")
 
 TASK_DEFAULT_RUNTIME = {
@@ -972,8 +970,6 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument("--vq-model-audio-local-files-only", action=argparse.BooleanOptionalAction, default=None)
 
     parser.add_argument("--disable-hf-xet", action=argparse.BooleanOptionalAction, default=True)
-
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
