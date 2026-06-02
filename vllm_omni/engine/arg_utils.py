@@ -1,5 +1,4 @@
 import argparse
-import dataclasses
 import json
 import os
 import tempfile
@@ -190,30 +189,6 @@ class OmniEngineArgs(EngineArgs):
                 self.worker_cls = current_omni_platform.get_omni_generation_worker_cls()
         load_omni_general_plugins()
         super().__post_init__()
-
-    @classmethod
-    def from_cli_args(cls, args: argparse.Namespace) -> "OmniEngineArgs":
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
-        engine_args = cls(**{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)})
-        engine_args._explicit_fields = frozenset(
-            attr for attr in attrs if hasattr(args, attr) and getattr(args, attr) is not None
-        )
-        return engine_args
-
-    @classmethod
-    def create(cls, **explicit: Any) -> "OmniEngineArgs":
-        """Tracks caller-set fields for ``Omni(..., engine_args=ea)``."""
-        ea = cls(**explicit)
-        ea._explicit_fields = frozenset(explicit.keys())
-        return ea
-
-    def explicit_kwargs(self) -> dict[str, Any]:
-        explicit = getattr(self, "_explicit_fields", None)
-        if explicit is None:
-            return {
-                f.name: getattr(self, f.name) for f in dataclasses.fields(self) if getattr(self, f.name) is not None
-            }
-        return {k: getattr(self, k) for k in explicit}
 
     def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):
@@ -420,8 +395,7 @@ class OrchestratorArgs:
           forwarding).
 
     Fields that BOTH orchestrator and engine genuinely need (e.g. ``model``,
-    ``log_stats``) should be listed in ``SHARED_FIELDS`` below; ``split_kwargs``
-    will copy them to both buckets.
+    ``log_stats``) should be listed in ``SHARED_FIELDS`` below.
     """
 
     # === Lifecycle ===
@@ -530,163 +504,3 @@ def internal_blacklist_keys() -> frozenset[str]:
     dataclass — this function updates automatically.
     """
     return orchestrator_field_names() - SHARED_FIELDS
-
-
-def split_kwargs(
-    kwargs: dict[str, Any],
-    *,
-    engine_cls: type | None = None,
-    user_typed: set[str] | None = None,
-    strict: bool = False,
-) -> tuple[OrchestratorArgs, dict[str, Any]]:
-    """Partition CLI kwargs into (orchestrator, engine) buckets.
-
-    Args:
-        kwargs: Raw dict, typically ``vars(args)``.
-        engine_cls: Engine dataclass used to whitelist-filter the engine
-            bucket. Defaults to ``OmniEngineArgs``. Pass a custom class
-            for testing.
-        user_typed: Keys the user actually typed on the command line. Used
-            to warn when a user-typed flag is unclassifiable.
-        strict: If True, raise ``ValueError`` on ambiguous (double-classified
-            but not in ``SHARED_FIELDS``) fields. Default False to keep the
-            rollout non-breaking; flip to True in tests and CI.
-
-    Returns:
-        ``(orchestrator_args, engine_kwargs)``. ``engine_kwargs`` has already
-        been whitelist-filtered against ``engine_cls`` — safe to pass directly
-        to ``engine_cls(**engine_kwargs)``.
-    """
-    if engine_cls is None:
-        engine_cls = OmniEngineArgs
-
-    orch_fields = orchestrator_field_names()
-    engine_fields = {f.name for f in fields(engine_cls)}
-
-    orch_kwargs: dict[str, Any] = {}
-    engine_candidate: dict[str, Any] = {}
-    shared_values: dict[str, Any] = {}
-    unclassified: dict[str, Any] = {}
-
-    for key, value in kwargs.items():
-        in_orch = key in orch_fields
-        in_engine = key in engine_fields
-        is_shared = key in SHARED_FIELDS
-
-        if is_shared:
-            shared_values[key] = value
-        elif in_orch and in_engine:
-            # Declared in both but not marked shared → ambiguous.
-            msg = (
-                f"Field {key!r} is defined on both OrchestratorArgs and "
-                f"{engine_cls.__name__} but is not in SHARED_FIELDS. "
-                f"This causes double-routing. Either remove the duplicate or "
-                f"add {key!r} to SHARED_FIELDS if the sharing is intentional."
-            )
-            if strict:
-                raise ValueError(msg)
-            logger.error(msg)
-            # Default: treat as orchestrator-only to preserve existing behavior.
-            orch_kwargs[key] = value
-        elif in_orch:
-            orch_kwargs[key] = value
-        elif in_engine:
-            engine_candidate[key] = value
-        else:
-            unclassified[key] = value
-
-    # Warn on user-typed but unclassifiable flags so we don't silently drop
-    # something the user cared about (fixes the class of bug that spawned #873).
-    if unclassified and user_typed:
-        user_typed_unknown = sorted(k for k in unclassified if k in user_typed)
-        if user_typed_unknown:
-            logger.warning(
-                "CLI flags not consumed by vllm-omni and dropped before "
-                "per-stage engine construction: %s. If these are vllm "
-                "frontend/uvicorn flags (host, port, ssl_*, api_key, …) this "
-                "is expected; otherwise check your spelling.",
-                user_typed_unknown,
-            )
-
-    # Engine bucket: shared + engine-only. We do NOT pass through unclassified
-    # fields — that's exactly the server/uvicorn noise we want to shed.
-    engine_kwargs = {**shared_values, **engine_candidate}
-
-    # Construct the orchestrator dataclass. Shared fields that OrchestratorArgs
-    # also declares get copied into its constructor.
-    orch_init: dict[str, Any] = dict(orch_kwargs)
-    for key, value in shared_values.items():
-        if key in orch_fields:
-            orch_init[key] = value
-    orch_args = OrchestratorArgs(**orch_init)
-
-    return orch_args, engine_kwargs
-
-
-def derive_server_dests_from_vllm_parser() -> frozenset[str]:
-    """Derive the set of argparse dests that belong to vllm's frontend/server.
-
-    Returns every dest registered by ``make_arg_parser`` that is NOT a field
-    of ``OmniEngineArgs`` and NOT a field of ``OrchestratorArgs``. Useful for
-    CI tests to assert all CLI flags are classifiable without maintaining
-    a hardcoded server list.
-
-    Returns empty frozenset if vllm's parser cannot be built (e.g. in a
-    minimal test environment).
-    """
-    try:
-        from vllm.entrypoints.openai.cli_args import make_arg_parser
-        from vllm.utils.argparse_utils import FlexibleArgumentParser
-    except ImportError:
-        logger.debug("Cannot import vllm parser — server-dest derivation skipped")
-        return frozenset()
-
-    try:
-        parser = make_arg_parser(FlexibleArgumentParser())
-        all_dests = {a.dest for a in parser._actions if a.dest and a.dest != "help"}
-    except Exception as exc:
-        logger.debug("Failed to build vllm parser: %s", exc)
-        return frozenset()
-
-    engine_fields = {f.name for f in fields(OmniEngineArgs)}
-    orch_fields = orchestrator_field_names()
-
-    return frozenset(all_dests - engine_fields - orch_fields - SHARED_FIELDS)
-
-
-def orchestrator_args_from_argparse(args: Any) -> OrchestratorArgs:
-    """Build an ``OrchestratorArgs`` from an ``argparse.Namespace``.
-
-    Only copies attributes that exist on the namespace — missing fields fall
-    back to the dataclass default. Useful when the full parser is already
-    built and ``vars(args)`` would include noise.
-    """
-    kwargs: dict[str, Any] = {}
-    for f in fields(OrchestratorArgs):
-        if hasattr(args, f.name):
-            value = getattr(args, f.name)
-            if value is not None or f.default is None:
-                kwargs[f.name] = value
-    return OrchestratorArgs(**kwargs)
-
-
-def nullify_stage_engine_defaults(parser: argparse.ArgumentParser) -> None:
-    """Reset stage-level engine flag defaults to ``None``; preserve real
-    default in help text. Only deploy-YAML override fields are touched.
-    Idempotent."""
-    from vllm_omni.config.stage_config import deploy_override_field_names
-
-    override_dests = deploy_override_field_names()
-
-    for action in parser._actions:
-        if action.dest in ("help", "version") or not action.option_strings:
-            continue
-        if action.dest not in override_dests:
-            continue
-        if action.default is None or action.default is argparse.SUPPRESS:
-            continue
-        if action.help and "(default:" not in action.help and "%(default)" not in action.help:
-            action.help = f"{action.help} (default: {action.default})"
-        action.default = None
-
-    parser._omni_nullified = True  # type: ignore[attr-defined]
