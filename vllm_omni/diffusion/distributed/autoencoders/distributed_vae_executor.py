@@ -125,7 +125,7 @@ class DistributedVaeExecutor:
 
         # 2. local decode
         assigned = self._balance_tasks(tiletask_list, pp_size)
-        local_tasks = assigned[self.rank] if pp_size <= self.world_size else []
+        local_tasks = assigned[self.rank] if self.rank < pp_size else []
         local_results = [(t.tile_id, operator.exec(t)) for t in local_tasks]
 
         # 3. compute shape per rank

@@ -824,11 +824,25 @@ def build_vllm_config(
     if upgraded is not vllm_config.quant_config:
         vllm_config = replace(vllm_config, quant_config=upgraded)
 
+    custom_voice_dir = engine_args_dict.get("custom_voice_dir")
+    if custom_voice_dir:
+        setattr(vllm_config.model_config.hf_config, "custom_voice_dir", custom_voice_dir)
+
     return vllm_config, executor_class
 
 
-def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_config: Any) -> Any | None:
-    """Build one output processor per logical LLM stage."""
+def build_llm_stage_output_processor(
+    plan: LogicalStageInitPlan,
+    stage_vllm_config: Any,
+    log_stats: bool = False,
+) -> Any | None:
+    """Build one output processor per logical LLM stage.
+
+    ``log_stats`` controls whether the processor populates per-request
+    IterationStats (consumed by the Prometheus wrap). Default False matches
+    the upstream MultimodalOutputProcessor default and respects the
+    --log-stats CLI flag plumbed through AsyncOmniEngine.
+    """
 
     metadata = plan.replicas[0].metadata
     if stage_vllm_config.model_config.skip_tokenizer_init:
@@ -839,7 +853,7 @@ def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_conf
         )
     return MultimodalOutputProcessor(
         tokenizer=tokenizer,
-        log_stats=False,
+        log_stats=log_stats,
         engine_core_output_type=metadata.engine_output_type,
     )
 
@@ -854,6 +868,45 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
         renderer=input_processor.renderer,
     )
     return input_processor
+
+
+def _cleanup_stale_lock_if_dead(lock_file: str) -> bool:
+    """If *lock_file* exists and its recorded PID is dead, unlink the file.
+
+    Returns ``True`` if the stale lock was cleaned up (caller should retry),
+    ``False`` otherwise (lock holder appears alive, or file could not be read).
+    """
+    try:
+        with open(lock_file) as fh:
+            content = fh.read().strip()
+        if not content:
+            return False
+        pid = int(content)
+    except (OSError, ValueError):
+        return False
+
+    # Check whether the PID is still alive.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        # PID does not exist — stale lock.
+        logger.info(
+            "Removing stale device lock %s (PID %s is dead)",
+            lock_file,
+            pid,
+        )
+        try:
+            os.unlink(lock_file)
+            return True
+        except OSError:
+            logger.debug("Failed to unlink stale lock %s", lock_file)
+            return False
+    except PermissionError:
+        # PID exists but we cannot signal it (different user) — treat as alive.
+        return False
+
+    # PID is alive — legitimate lock holder.
+    return False
 
 
 def acquire_device_locks(
@@ -934,6 +987,7 @@ def acquire_device_locks(
         for device_id in devices_to_lock:
             lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
             lock_acquired = False
+            already_cleaned_stale = False  # only try stale cleanup once per device
 
             while not lock_acquired:
                 try:
@@ -948,6 +1002,11 @@ def acquire_device_locks(
                         logger.debug("Acquired exclusive lock for device %s", device_id)
                     except BlockingIOError:
                         os.close(lock_fd)
+                        # Detect and clean stale locks from dead processes.
+                        if not already_cleaned_stale:
+                            already_cleaned_stale = True
+                            if _cleanup_stale_lock_if_dead(lock_file):
+                                continue  # retry flock immediately
                         if time.time() - wait_start > stage_init_timeout:
                             logger.warning(
                                 "Timeout waiting for device %s initialization lock, proceeding anyway",

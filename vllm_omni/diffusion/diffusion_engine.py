@@ -83,6 +83,25 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
+def _move_tensor_tree_to_cpu(value: object) -> object:
+    if isinstance(value, torch.Tensor):
+        return value.cpu() if value.device.type != "cpu" else value
+    if isinstance(value, dict):
+        return {key: _move_tensor_tree_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_tensor_tree_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_tensor_tree_to_cpu(item) for item in value)
+    return value
+
+
+def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
+        return int(getattr(model_cls, "dummy_run_num_frames"))
+    return 2 if supports_audio_input or supports_audio_output(model_class_name) else 1
+
+
 def get_extra_body_params(model_class_name: str) -> frozenset[str]:
     """Return the set of extra_body keys accepted by a pipeline.
 
@@ -230,12 +249,8 @@ class DiffusionEngine:
         # post-processing to avoid device OOM — model weights may still
         # reside on the device and leave no headroom for intermediates.
         output_data = output.output
-        if (
-            self.od_config.enable_cpu_offload
-            and isinstance(output_data, torch.Tensor)
-            and output_data.device.type != "cpu"
-        ):
-            output_data = output_data.cpu()
+        if self.od_config.enable_cpu_offload:
+            output_data = _move_tensor_tree_to_cpu(output_data)
 
         postprocess_start_time = time.perf_counter()
         if self.post_process_func is not None:
@@ -690,10 +705,7 @@ class DiffusionEngine:
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
-        # Audio pipelines round audio token count from num_frames; the default
-        # of 1 yields seq_len=1 K/V which cuDNN SDPA refuses under torch.compile.
-        # 2 is the minimum that produces audio_num_frames > 1.
-        num_frames = 2 if supports_audio_input or supports_audio_output(self.od_config.model_class_name) else 1
+        num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_id=DUMMY_DIFFUSION_REQUEST_ID,
@@ -863,7 +875,7 @@ class DiffusionEngine:
                 worker_thread.join(timeout=10)
             if worker_thread.is_alive():
                 logger.warning(
-                    "Worker thread did not terminate within 10s; scheduler and executor shutdown will be skipped."
+                    "Worker thread did not terminate within 10s; scheduler and executor shutdown will be deferred."
                 )
                 return
             else:

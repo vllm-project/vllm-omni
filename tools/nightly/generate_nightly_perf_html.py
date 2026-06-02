@@ -250,7 +250,7 @@ def _collect_diffusion_records(input_dir: str) -> list[dict[str, Any]]:
 
 
 def _sort_omni_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_date_desc = sorted(records, key=lambda r: (r.get("date") or ""), reverse=True)
+    by_date_desc = sorted(records, key=lambda r: r.get("date") or "", reverse=True)
     return sorted(
         by_date_desc,
         key=lambda r: (
@@ -264,8 +264,8 @@ def _sort_omni_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _sort_diffusion_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_date_desc = sorted(records, key=lambda r: (r.get("date") or ""), reverse=True)
-    return sorted(by_date_desc, key=lambda r: (r.get("test_name") or ""))
+    by_date_desc = sorted(records, key=lambda r: r.get("date") or "", reverse=True)
+    return sorted(by_date_desc, key=lambda r: r.get("test_name") or "")
 
 
 def _ensure_parent_dir(path: str) -> None:

@@ -10,7 +10,7 @@ Please refer to [README.md](../../../README.md)
 |------|---------------|--------|
 | Thinker + Talker (omni-speech, default) | `vllm serve ... --omni` | Text + Audio |
 | Thinker only (multimodal understanding) | `vllm serve ... --omni --deploy-config vllm_omni/deploy/ming_flash_omni_thinker_only.yaml` | Text |
-| Thinker + Imagegen (text-to-image / img2img) | `vllm serve ... --omni --stage-configs-path vllm_omni/model_executor/stage_configs/ming_flash_omni_dual.yaml` | Image |
+| Thinker + Imagegen (text-to-image / img2img) | `vllm serve ... --omni --deploy-config vllm_omni/deploy/ming_flash_omni_image.yaml` | Image |
 
 For standalone TTS (talker only), see the [Ming-flash-omni-TTS section in the Text-To-Speech hub](../text_to_speech/README.md#ming-flash-omni-tts).
 
@@ -63,34 +63,27 @@ bash run_curl_multimodal_generation.sh use_image_gen
 ## Image generation (text-to-image)
 
 Ming-flash-omni-2.0 also exposes an image-generation (diffusion) stage.
-Launch with the dual-stage YAML, which adds an image-gen stage behind the
-thinker:
+Launch with the image deploy YAML, which adds an image-gen stage behind
+the thinker:
 
 ```bash
 vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/ming_flash_omni_dual.yaml \
+    --deploy-config vllm_omni/deploy/ming_flash_omni_image.yaml \
     --stage-init-timeout 1800 \
-    --port 8188
+    --init-timeout 1800 \
+    --port 8091
 ```
 
 Then request image output by passing `"modalities": ["image"]`:
 
 ```bash
-curl http://127.0.0.1:8188/v1/chat/completions \
+curl -s http://127.0.0.1:8091/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
       "model": "Jonathan1909/Ming-flash-omni-2.0",
-      "messages": [{"role": "user", "content": "Draw a beautiful girl with short black hair and red dress."}],
+      "messages": [{"role": "user", "content": "Please draw a cute cat."}],
       "modalities": ["image"]
-    }' -o /tmp/ming_response.json
-
-python - <<'PY'
-import base64, json
-r = json.load(open('/tmp/ming_response.json'))
-url = r['choices'][0]['message']['content'][0]['image_url']['url']
-open('/tmp/ming_gen.png', 'wb').write(base64.b64decode(url.split(',', 1)[1]))
-print('saved /tmp/ming_gen.png')
-PY
+    }' | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' | base64 -d > ming_imagegen.png
 ```
 
 ### Optional knobs
@@ -109,7 +102,7 @@ Pass image-gen overrides via the diffusion-stage `sampling_params_list[1].extra_
 Example with all the knobs:
 
 ```bash
-curl http://127.0.0.1:8188/v1/chat/completions \
+curl http://127.0.0.1:8091/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
       "model": "Jonathan1909/Ming-flash-omni-2.0",
@@ -122,7 +115,7 @@ curl http://127.0.0.1:8188/v1/chat/completions \
             "byte5_text":["理解与生成统一"]}}}
       ],
       "messages": [{"role": "user", "content": "Draw a poster."}]
-    }' -o /tmp/ming_response.json
+    }' | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' | base64 -d > ming_imagegen_knobs.png
 ```
 
 ### img2img (reference image)
@@ -142,9 +135,9 @@ into the diffusion stage as `extra[reference_image]`:
 
 ### GPU layout
 
-The shipped `ming_flash_omni_dual.yaml` allocates the thinker on GPUs 0–3
+The shipped `ming_flash_omni_image.yaml` allocates the thinker on GPUs 0–3
 (TP=4) and the diffusion stage on GPU 4 (TP=1). Copy the YAML and edit
-`runtime.devices` per stage to relocate; with fewer GPUs available, drop
+`devices` per stage to relocate; with fewer GPUs available, drop
 the thinker TP to 2 and run the diffusion stage on a free card. Image-gen
 warmup takes roughly an extra 30–60 s on top of the thinker — set
 `--stage-init-timeout 1800` if the default 300 s is too tight.
@@ -156,7 +149,7 @@ warmup takes roughly an extra 30–60 s on top of the thinker — set
 | `["text"]` or omitted | Thinker only | Text |
 | `["audio"]` | Thinker + Talker | Audio (speech) |
 | `["text", "audio"]` | Thinker + Talker | Text + Audio |
-| `["image"]` | Thinker + Imagegen (dual YAML) | Image (PNG, base64 in `choices[0].message.content`) |
+| `["image"]` | Thinker + Imagegen (image deploy YAML) | Image (PNG, base64 in `choices[0].message.content`) |
 
 For ready-to-copy curl examples (text / audio / multimodal input, SSE
 streaming, reasoning mode), see the recipe at
