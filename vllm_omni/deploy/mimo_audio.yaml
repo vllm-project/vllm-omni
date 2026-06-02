@@ -65,16 +65,16 @@ platforms:
     async_chunk: false
     stages:
       - stage_id: 0
-        gpu_memory_utilization: 0.5
+        gpu_memory_utilization: 0.95
         enforce_eager: true
         disable_hybrid_kv_cache_manager: true
         enable_prefix_caching: false
         skip_mm_profiling: true
-        max_num_batched_tokens: 8192
-        max_model_len: 8192
-        devices: "2"
+        max_num_batched_tokens: 3000
+        max_model_len: 3000
+        devices: "1"
       - stage_id: 1
-        gpu_memory_utilization: 0.35
+        gpu_memory_utilization: 0.9
         enforce_eager: true
         disable_hybrid_kv_cache_manager: true
         enable_prefix_caching: false
@@ -82,4 +82,4 @@ platforms:
         async_scheduling: false
         max_num_batched_tokens: 8192
         max_model_len: 8192
-        devices: "3"
+        devices: "2"
