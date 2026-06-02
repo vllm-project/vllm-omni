@@ -113,6 +113,82 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
     assert cache_summary_calls == [(runner.pipeline, True)]
 
 
+class _BatchPipeline:
+    """Pipeline returning a configurable list of outputs from forward()."""
+
+    supports_request_batch = True
+
+    def __init__(self, outputs):
+        self._outputs = outputs
+
+    def forward(self, batch):
+        del batch
+        return list(self._outputs)
+
+
+def _make_batch_runner(pipeline):
+    runner = object.__new__(DiffusionModelRunner)
+    runner.vllm_config = object()
+    runner.device = torch.device("cpu")
+    runner.pipeline = pipeline
+    runner.cache_backend = None
+    runner.offload_backend = None
+    runner.od_config = SimpleNamespace(
+        cache_backend="none",
+        enable_cache_dit_summary=False,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+    )
+    runner.kv_transfer_manager = SimpleNamespace(
+        receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None,
+    )
+    runner._record_peak_memory = lambda output: None
+    return runner
+
+
+def _make_scheduler_output(num_reqs: int):
+    reqs = [_make_request() for _ in range(num_reqs)]
+    for i, req in enumerate(reqs):
+        req.request_id = f"req-{i}"
+    return SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req=req) for req in reqs])
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_batch_rejects_output_count_mismatch(monkeypatch):
+    """A pipeline returning the wrong number of outputs must fail loudly,
+    not silently drop requests or IndexError on the per-request mapping."""
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(
+        model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
+    )
+    # forward returns 1 output for 2 scheduled requests
+    runner = _make_batch_runner(_BatchPipeline(outputs=[SimpleNamespace(output="only-one")]))
+    sched = _make_scheduler_output(num_reqs=2)
+
+    with pytest.raises(RuntimeError, match="returned 1 outputs for 2 requests"):
+        DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_batch_routes_one_output_per_request(monkeypatch):
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(
+        model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
+    )
+    outs = [SimpleNamespace(output="a"), SimpleNamespace(output="b")]
+    runner = _make_batch_runner(_BatchPipeline(outputs=outs))
+    sched = _make_scheduler_output(num_reqs=2)
+
+    result = DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
+
+    assert len(result.runner_outputs) == 2
+    assert result.runner_outputs[0].request_id == "req-0"
+    assert result.runner_outputs[0].result.output == "a"
+    assert result.runner_outputs[1].request_id == "req-1"
+    assert result.runner_outputs[1].result.output == "b"
+
+
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
