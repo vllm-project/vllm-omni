@@ -223,6 +223,25 @@ _OMNI_MODELS = {
         "modeling_moss_tts_nano",
         "MossTTSNanoForGeneration",
     ),
+    ## MOSS-TTS (full variants: Delay + Realtime)
+    # MossTTSDelayModel: MOSS-TTS (8B), MOSS-TTSD (8B), MOSS-SoundEffect (8B), MOSS-VoiceGenerator (1.7B)
+    "MossTTSDelayModel": (
+        "moss_tts",
+        "modeling_moss_tts_talker",
+        "MossTTSDelayTalkerForGeneration",
+    ),
+    # MossTTSRealtime: MOSS-TTS-Realtime (1.7B)
+    "MossTTSRealtime": (
+        "moss_tts",
+        "modeling_moss_tts_talker",
+        "MossTTSRealtimeTalkerForGeneration",
+    ),
+    # Stage-1 codec decoder (shared by all 5 variants)
+    "MossTTSCodecDecoder": (
+        "moss_tts",
+        "modeling_moss_tts_codec",
+        "MossTTSCodecDecoder",
+    ),
     "DyninOmniForConditionalGeneration": (
         "dynin_omni",
         "dynin_omni",

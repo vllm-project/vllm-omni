@@ -1270,6 +1270,17 @@ class StageConfigFactory:
             deploy_path = _DEPLOY_DIR / f"{model_type}.yaml"
         else:
             deploy_path = Path(deploy_config_path)
+            # Bare-name lookup: if the value isn't a real path, try the
+            # built-in deploy directory. This lets ``deploy_config="moss_tts"``
+            # resolve to ``vllm_omni/deploy/moss_tts.yaml`` when several model
+            # variants share an HF ``model_type`` and need different YAMLs.
+            if not deploy_path.exists() and deploy_path.parent == Path("."):
+                bare_name = deploy_path.name
+                if not bare_name.endswith(".yaml"):
+                    bare_name = f"{bare_name}.yaml"
+                candidate = _DEPLOY_DIR / bare_name
+                if candidate.exists():
+                    deploy_path = candidate
 
         if not deploy_path.exists():
             logger.warning(
