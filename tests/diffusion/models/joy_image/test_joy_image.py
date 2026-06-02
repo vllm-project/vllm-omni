@@ -1,0 +1,548 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import json
+from types import SimpleNamespace
+
+import pytest
+import torch
+from PIL import Image
+
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.diffusion.models.joy_image import (
+    pipeline_joy_image_edit as joy_pipeline_module,
+)
+from vllm_omni.diffusion.models.joy_image.joy_image_edit_transformer import (
+    JoyImageEditTransformer3DModel,
+)
+from vllm_omni.diffusion.models.joy_image.pipeline_joy_image_edit import (
+    JOY_MAX_IMAGE_SEQ_LEN,
+    JoyImageEditPipeline,
+    _get_transformer_config_kwargs_from_od_config,
+    get_joy_image_edit_pre_process_func,
+)
+
+
+def _write_model_configs(tmp_path):
+    (tmp_path / "vae").mkdir()
+    (tmp_path / "transformer").mkdir()
+    (tmp_path / "vae" / "config.json").write_text(
+        json.dumps(
+            {
+                "scale_factor_spatial": 8,
+                "z_dim": 16,
+                "latents_mean": [0.0] * 16,
+                "latents_std": [1.0] * 16,
+            }
+        )
+    )
+    (tmp_path / "transformer" / "config.json").write_text(
+        json.dumps(
+            {
+                "patch_size": [1, 2, 2],
+                "hidden_size": 32,
+                "num_attention_heads": 4,
+                "num_layers": 1,
+                "in_channels": 4,
+                "out_channels": 4,
+                "text_dim": 16,
+            }
+        )
+    )
+    return SimpleNamespace(
+        model=str(tmp_path),
+        model_class_name="JoyImageEditPipeline",
+    )
+
+
+def _make_params(**overrides):
+    guidance_scale = overrides.pop("guidance_scale", 0.0)
+    values = {
+        "height": None,
+        "width": None,
+        "guidance_scale": guidance_scale or 1.0,
+        "guidance_scale_provided": bool(guidance_scale),
+        "true_cfg_scale": None,
+        "num_outputs_per_prompt": 1,
+        "num_inference_steps": None,
+        "generator": None,
+        "seed": None,
+        "cfg_normalize": False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _make_request(*, prompt=None, params=None):
+    prompt = prompt or {
+        "prompt": "make it brighter",
+        "multi_modal_data": {"image": Image.new("RGB", (2048, 1024), color="white")},
+    }
+    params = params or _make_params()
+    return SimpleNamespace(
+        prompts=[prompt], sampling_params=params, request_id="joy-test"
+    )
+
+
+def test_joy_registry_and_metadata_entries(tmp_path):
+    from vllm_omni.diffusion.registry import (
+        DiffusionModelRegistry,
+        get_diffusion_post_process_func,
+        get_diffusion_pre_process_func,
+    )
+
+    od_config = _write_model_configs(tmp_path)
+    model_class = DiffusionModelRegistry._try_load_model_cls("JoyImageEditPipeline")
+    assert model_class is JoyImageEditPipeline
+    assert callable(get_diffusion_pre_process_func(od_config))
+    postprocess = get_diffusion_post_process_func(od_config)
+    assert callable(postprocess)
+    assert len(postprocess(torch.zeros(1, 3, 2, 2))) == 1
+
+    metadata = get_diffusion_model_metadata("JoyImageEditPipeline")
+    assert metadata.supports_multimodal_inputs is True
+    assert metadata.max_multimodal_image_inputs == 1
+
+
+def test_get_model_path_downloads_only_runtime_configs(monkeypatch):
+    captured = {}
+
+    def fake_download(model_name, revision, allow_patterns, **kwargs):
+        captured.update(
+            {
+                "model_name": model_name,
+                "revision": revision,
+                "allow_patterns": allow_patterns,
+                "kwargs": kwargs,
+            }
+        )
+        return "/tmp/joy-configs"
+
+    monkeypatch.setattr(
+        joy_pipeline_module,
+        "download_weights_from_hf_specific",
+        fake_download,
+    )
+
+    assert joy_pipeline_module._get_model_path("repo/joy") == "/tmp/joy-configs"
+    assert captured == {
+        "model_name": "repo/joy",
+        "revision": None,
+        "allow_patterns": ["vae/config.json", "transformer/config.json"],
+        "kwargs": {"require_all": True},
+    }
+
+
+def test_transformer_config_kwargs_from_od_config_filters_metadata():
+    class FakeTransformerConfig:
+        def to_dict(self):
+            return {
+                "_class_name": "JoyImageEditTransformer3DModel",
+                "_diffusers_version": "0.38.0",
+                "hidden_size": 32,
+                "num_layers": 1,
+                "num_attention_heads": 4,
+            }
+
+    od_config = SimpleNamespace(tf_model_config=FakeTransformerConfig())
+
+    assert _get_transformer_config_kwargs_from_od_config(od_config) == {
+        "hidden_size": 32,
+        "num_layers": 1,
+        "num_attention_heads": 4,
+    }
+
+
+def test_preprocess_requires_exactly_one_image(tmp_path):
+    od_config = _write_model_configs(tmp_path)
+    preprocess = get_joy_image_edit_pre_process_func(od_config)
+    no_image = _make_request(prompt={"prompt": "x", "multi_modal_data": {}})
+    with pytest.raises(ValueError, match="exactly one input image"):
+        preprocess(no_image)
+
+    multi_image = _make_request(
+        prompt={
+            "prompt": "x",
+            "multi_modal_data": {
+                "image": [Image.new("RGB", (32, 32)), Image.new("RGB", (32, 32))]
+            },
+        }
+    )
+    with pytest.raises(ValueError, match="exactly one image"):
+        preprocess(multi_image)
+
+
+def test_preprocess_rejects_batched_prompts_and_partial_size(tmp_path):
+    od_config = _write_model_configs(tmp_path)
+    preprocess = get_joy_image_edit_pre_process_func(od_config)
+    batched = _make_request()
+    batched.prompts.append(batched.prompts[0])
+    with pytest.raises(ValueError, match="exactly one prompt"):
+        preprocess(batched)
+
+    partial_size = _make_request(params=_make_params(height=512, width=None))
+    with pytest.raises(ValueError, match="both `height` and `width`"):
+        preprocess(partial_size)
+
+
+def test_preprocess_aligns_and_caps_default_image_size(tmp_path):
+    od_config = _write_model_configs(tmp_path)
+    preprocess = get_joy_image_edit_pre_process_func(od_config)
+
+    request = preprocess(_make_request())
+    prompt = request.prompts[0]
+    info = prompt["additional_information"]
+    height = info["height"]
+    width = info["width"]
+
+    assert height % 16 == 0
+    assert width % 16 == 0
+    assert (height // 16) * (width // 16) <= JOY_MAX_IMAGE_SEQ_LEN
+    assert info["image_tensor"].shape == (1, 3, 1, height, width)
+    assert info["original_size"] == (2048, 1024)
+    assert info["resized_size"] == (width, height)
+    assert request.sampling_params.height == height
+    assert request.sampling_params.width == width
+
+
+def test_preprocess_rejects_explicit_size_over_token_budget(tmp_path):
+    od_config = _write_model_configs(tmp_path)
+    preprocess = get_joy_image_edit_pre_process_func(od_config)
+    params = _make_params(height=2048, width=2048)
+
+    with pytest.raises(ValueError, match="token budget"):
+        preprocess(_make_request(params=params))
+
+
+def test_guidance_scale_alias_only_when_true_cfg_absent():
+    request = _make_request(params=_make_params(guidance_scale=3.5))
+    assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(request) == 3.5
+
+    canonical = _make_request(params=_make_params(true_cfg_scale=4.0))
+    assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(canonical) == 4.0
+
+    default_guidance = _make_request(
+        params=_make_params(guidance_scale=1.0, true_cfg_scale=4.0)
+    )
+    assert (
+        JoyImageEditPipeline.resolve_effective_true_cfg_scale(default_guidance) == 4.0
+    )
+
+    matching = _make_request(
+        params=_make_params(guidance_scale=4.0, true_cfg_scale=4.0)
+    )
+    assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(matching) == 4.0
+
+    conflict = _make_request(
+        params=_make_params(guidance_scale=3.0, true_cfg_scale=4.0)
+    )
+    with pytest.raises(ValueError, match="compatibility alias"):
+        JoyImageEditPipeline.resolve_effective_true_cfg_scale(conflict)
+
+
+def test_pad_prompt_embeds_keeps_last_tokens_and_builds_mask():
+    first = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    second = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    prompt_embeds, prompt_mask = JoyImageEditPipeline._pad_prompt_embeds(
+        [first, second],
+        max_sequence_length=3,
+    )
+
+    assert prompt_embeds.shape == (2, 3, 4)
+    assert torch.equal(prompt_embeds[0], first[-3:])
+    assert torch.equal(prompt_embeds[1, :2], second)
+    assert torch.equal(prompt_embeds[1, 2], torch.zeros(4))
+    assert torch.equal(
+        prompt_mask,
+        torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.long),
+    )
+
+    with pytest.raises(ValueError, match="greater than 0"):
+        JoyImageEditPipeline._pad_prompt_embeds([first], max_sequence_length=0)
+
+
+def test_transformer_shape_and_masked_forward():
+    transformer = JoyImageEditTransformer3DModel(
+        in_channels=4,
+        out_channels=4,
+        hidden_size=32,
+        text_dim=16,
+        num_layers=1,
+        num_attention_heads=4,
+        patch_size=(1, 2, 2),
+    )
+    hidden_states = torch.randn(2, 2, 4, 1, 4, 4)
+    encoder_hidden_states = torch.randn(2, 5, 16)
+    encoder_hidden_states_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]])
+
+    output = transformer(
+        hidden_states=hidden_states,
+        timestep=torch.tensor([1.0, 2.0]),
+        encoder_hidden_states=encoder_hidden_states,
+        encoder_hidden_states_mask=encoder_hidden_states_mask,
+        return_dict=False,
+    )[0]
+
+    assert output.shape == hidden_states.shape
+
+
+def test_transformer_from_config_file_loads_checkpoint_config(tmp_path):
+    _write_model_configs(tmp_path)
+
+    transformer = JoyImageEditTransformer3DModel.from_config_file(
+        tmp_path / "transformer" / "config.json"
+    )
+
+    assert transformer.patch_size == (1, 2, 2)
+    assert transformer.hidden_size == 32
+    assert transformer.num_attention_heads == 4
+    assert transformer.num_layers == 1
+    assert transformer.text_dim == 16
+    assert len(transformer.double_blocks) == 1
+
+
+def test_transformer_load_weights_maps_diffusers_prefix():
+    transformer = JoyImageEditTransformer3DModel(
+        in_channels=4,
+        out_channels=4,
+        hidden_size=32,
+        text_dim=16,
+        num_layers=1,
+        num_attention_heads=4,
+        patch_size=(1, 2, 2),
+    )
+    weight = torch.randn_like(transformer.img_in.weight)
+
+    loaded = transformer.load_weights([("transformer.patch_embedding.weight", weight)])
+
+    assert loaded == {"img_in.weight"}
+    assert torch.equal(transformer.img_in.weight, weight)
+
+    text_weight = torch.randn_like(transformer.condition_embedder.text_embedder.linear_1.weight)
+    loaded = transformer.load_weights(
+        [("transformer.condition_embedder.text_embedder.linear_1.weight", text_weight)]
+    )
+
+    assert loaded == {"condition_embedder.text_embedder.linear_1.weight"}
+    assert torch.equal(transformer.condition_embedder.text_embedder.linear_1.weight, text_weight)
+
+
+def test_latent_normalization_round_trip():
+    pipeline = object.__new__(JoyImageEditPipeline)
+    pipeline.latent_channels = 4
+    pipeline.vae = SimpleNamespace(
+        config=SimpleNamespace(
+            latents_mean=[0.1, -0.2, 0.3, -0.4],
+            latents_std=[0.5, 0.75, 1.25, 2.0],
+        )
+    )
+    latents = torch.randn(2, 4, 1, 2, 2)
+
+    latents_mean, latents_std = JoyImageEditPipeline._latent_stats(
+        pipeline,
+        latents.device,
+        latents.dtype,
+    )
+    normalized = (latents - latents_mean) / latents_std
+
+    assert torch.allclose(normalized * latents_std + latents_mean, latents)
+
+
+def test_decode_latents_unnormalizes_and_selects_target_slot():
+    class FakeVAE:
+        config = SimpleNamespace(
+            latents_mean=[0.1, -0.2, 0.3, -0.4],
+            latents_std=[0.5, 0.75, 1.25, 2.0],
+        )
+
+        def decode(self, latents, return_dict=False):
+            return (latents,)
+
+    pipeline = object.__new__(JoyImageEditPipeline)
+    pipeline.latent_channels = 4
+    pipeline.vae = FakeVAE()
+    latents = torch.zeros(1, 2, 4, 1, 2, 2)
+    latents[:, -1] = 2.0
+
+    decoded = JoyImageEditPipeline._decode_latents(pipeline, latents)
+
+    latents_mean, latents_std = JoyImageEditPipeline._latent_stats(
+        pipeline,
+        latents.device,
+        latents.dtype,
+    )
+    assert decoded.shape == (1, 4, 2, 2)
+    assert torch.equal(decoded, (latents[:, -1] * latents_std + latents_mean)[:, :, 0])
+
+
+def test_prepare_latents_stacks_reference_first_target_last():
+    pipeline = object.__new__(JoyImageEditPipeline)
+    pipeline.vae_scale_factor = 8
+    pipeline.latent_channels = 4
+    image_latents = torch.ones(1, 4, 1, 2, 2)
+    noise_latents = torch.zeros(1, 1, 4, 1, 2, 2)
+
+    latents, reference_latents = JoyImageEditPipeline.prepare_latents(
+        pipeline,
+        image=image_latents,
+        batch_size=1,
+        num_channels_latents=4,
+        height=16,
+        width=16,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        generator=None,
+        latents=noise_latents,
+    )
+
+    assert latents.shape == (1, 2, 4, 1, 2, 2)
+    assert torch.equal(latents[:, :1], reference_latents)
+    assert torch.equal(latents[:, -1:], noise_latents)
+
+
+def test_prepare_latents_validates_generator_and_latent_shapes():
+    pipeline = object.__new__(JoyImageEditPipeline)
+    pipeline.vae_scale_factor = 8
+    pipeline.latent_channels = 4
+    image_latents = torch.ones(1, 4, 1, 2, 2)
+
+    with pytest.raises(ValueError, match="Generator list length"):
+        JoyImageEditPipeline.prepare_latents(
+            pipeline,
+            image=image_latents,
+            batch_size=2,
+            num_channels_latents=4,
+            height=16,
+            width=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            generator=[torch.Generator()],
+        )
+
+    with pytest.raises(ValueError, match="noise latents must have shape"):
+        JoyImageEditPipeline.prepare_latents(
+            pipeline,
+            image=image_latents,
+            batch_size=1,
+            num_channels_latents=4,
+            height=16,
+            width=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            generator=None,
+            latents=torch.zeros(1, 1, 4, 1, 1, 2),
+        )
+
+
+def test_prepare_latents_validates_image_latent_shape():
+    pipeline = object.__new__(JoyImageEditPipeline)
+    pipeline.vae_scale_factor = 8
+    pipeline.latent_channels = 4
+
+    with pytest.raises(ValueError, match="image latents must have shape"):
+        JoyImageEditPipeline.prepare_latents(
+            pipeline,
+            image=torch.ones(1, 4, 2, 2),
+            batch_size=1,
+            num_channels_latents=4,
+            height=16,
+            width=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            generator=None,
+        )
+
+
+def test_diffuse_restores_reference_slots_each_step():
+    class FakeScheduler:
+        def set_begin_index(self, index):
+            self.begin_index = index
+
+        def step(self, noise_pred, timestep, latents, return_dict=False):
+            return (latents + 1.0,)
+
+    class FakeTransformer(torch.nn.Module):
+        def forward(self, hidden_states, **kwargs):
+            return (torch.zeros_like(hidden_states),)
+
+    pipeline = object.__new__(JoyImageEditPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.scheduler = FakeScheduler()
+    pipeline.transformer = FakeTransformer()
+    pipeline._interrupt = False
+    pipeline._current_timestep = None
+
+    latents = torch.zeros(1, 2, 4, 1, 2, 2)
+    image_latents = torch.full((1, 1, 4, 1, 2, 2), 7.0)
+    result = JoyImageEditPipeline.diffuse(
+        pipeline,
+        latents=latents,
+        image_latents=image_latents,
+        prompt_embeds=torch.zeros(1, 3, 8),
+        prompt_embeds_mask=torch.ones(1, 3, dtype=torch.long),
+        negative_prompt_embeds=None,
+        negative_prompt_embeds_mask=None,
+        timesteps=torch.tensor([2.0, 1.0]),
+        do_true_cfg=False,
+        true_cfg_scale=1.0,
+    )
+
+    assert torch.equal(result[:, :1], image_latents)
+    assert torch.equal(result[:, -1:], torch.full((1, 1, 4, 1, 2, 2), 2.0))
+
+
+def test_forward_synthesizes_empty_negative_prompt_for_cfg():
+    class FakeScheduler:
+        def set_timesteps(self, num_inference_steps, device):
+            self.num_inference_steps = num_inference_steps
+            self.timesteps = torch.tensor([1.0], device=device)
+
+    pipeline = object.__new__(JoyImageEditPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.latent_channels = 4
+    pipeline.scheduler = FakeScheduler()
+    encode_calls = []
+    diffuse_calls = []
+    cfg_checks = []
+
+    def encode_prompt(prompt, image, **kwargs):
+        encode_calls.append((kwargs["prompt_name"], prompt))
+        return torch.zeros(1, 3, 4), torch.ones(1, 3, dtype=torch.long)
+
+    def prepare_latents(**kwargs):
+        latents = torch.zeros(1, 2, 4, 1, 2, 2)
+        image_latents = torch.ones(1, 1, 4, 1, 2, 2)
+        return latents, image_latents
+
+    def diffuse(**kwargs):
+        diffuse_calls.append(kwargs)
+        return kwargs["latents"]
+
+    pipeline.encode_prompt = encode_prompt
+    pipeline.prepare_latents = prepare_latents
+    pipeline.diffuse = diffuse
+    pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 2, 2)
+    pipeline.check_cfg_parallel_validity = lambda scale: cfg_checks.append(scale) or True
+
+    request = _make_request(
+        prompt={
+            "prompt": "make it brighter",
+            "additional_information": {
+                "image_tensor": torch.zeros(1, 3, 1, 16, 16),
+                "prompt_image": Image.new("RGB", (16, 16)),
+                "height": 16,
+                "width": 16,
+            },
+        },
+        params=_make_params(true_cfg_scale=2.0),
+    )
+
+    output = JoyImageEditPipeline.forward(pipeline, request)
+
+    assert output.output.shape == (1, 3, 2, 2)
+    assert cfg_checks == [2.0]
+    assert encode_calls == [("prompt", "make it brighter"), ("negative_prompt", "")]
+    assert diffuse_calls[0]["do_true_cfg"] is True
+    assert diffuse_calls[0]["true_cfg_scale"] == 2.0

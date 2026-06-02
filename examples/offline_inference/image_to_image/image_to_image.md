@@ -23,6 +23,23 @@ python image_edit.py \
   --cfg-scale 4.0
 ```
 
+### JoyAI-Image-Edit
+
+JoyAI-Image-Edit uses the same `image_edit.py` CLI and supports one input
+image per request:
+
+```bash
+python image_edit.py \
+  --model jdopensource/JoyAI-Image-Edit-Diffusers \
+  --image input.png \
+  --prompt "Change the background to a clean studio while preserving the subject." \
+  --height 512 \
+  --width 512 \
+  --num-inference-steps 50 \
+  --cfg-scale 4.0 \
+  --output output_joyai_edit.png
+```
+
 ### Multiple Image Editing (Qwen-Image-Edit-2509)
 
 For multiple image inputs, use `Qwen/Qwen-Image-Edit-2509` or  `Qwen/Qwen-Image-Edit-2511`:
@@ -40,7 +57,7 @@ python image_edit.py \
 
 Key arguments:
 
-- `--model`: model name or path. Use `Qwen/Qwen-Image-Edit-2509` or later for multiple image support.
+- `--model`: model name or path. Use `Qwen/Qwen-Image-Edit-2509` or later for multiple image support. `jdopensource/JoyAI-Image-Edit-Diffusers` supports one input image.
 - `--image`: path(s) to the source image(s) (PNG/JPG, converted to RGB). Can specify multiple images.
 - `--prompt` / `--negative-prompt`: text description (string).
 - `--cfg-scale`: true classifier-free guidance scale (default: 4.0). Classifier-free guidance is enabled by setting cfg_scale > 1 and providing a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, usually at the expense of lower image quality.

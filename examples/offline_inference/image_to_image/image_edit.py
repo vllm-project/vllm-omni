@@ -39,6 +39,17 @@ Usage (multiple images):
         --cfg-scale 4.0 \
         --guidance-scale 1.0
 
+Usage (JoyAI-Image-Edit, single image):
+    python image_edit.py \
+        --model jdopensource/JoyAI-Image-Edit-Diffusers \
+        --image input.png \
+        --prompt "Change the background to a clean studio while preserving the subject." \
+        --height 512 \
+        --width 512 \
+        --num-inference-steps 50 \
+        --cfg-scale 4.0 \
+        --output output_joyai_edit.png
+
 Usage (with cache-dit acceleration):
     python image_edit.py \
         --image input.png \

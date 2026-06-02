@@ -7,6 +7,8 @@ This example demonstrates how to deploy Qwen-Image-Edit model for online image e
 
 For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPlusPipeline) and send multiple images in the user message content.
 
+For **JoyAI-Image-Edit**, use `jdopensource/JoyAI-Image-Edit-Diffusers` and send exactly one input image.
+
 ## Start Server
 
 ### Basic Start
@@ -22,6 +24,12 @@ vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
 
 ```bash
 vllm serve Qwen/Qwen-Image-Edit-2509 --omni --port 8092
+```
+
+### JoyAI-Image-Edit
+
+```bash
+vllm serve jdopensource/JoyAI-Image-Edit-Diffusers --omni --port 8092
 ```
 
 ### Start with Parameters
@@ -75,6 +83,10 @@ curl -s http://localhost:8092/v1/chat/completions \
   | jq -r '.choices[0].message.content[0].image_url.url' \
   | cut -d',' -f2 | base64 -d > output.png
 ```
+
+For JoyAI-Image-Edit, set classifier-free guidance with `true_cfg_scale`
+or `cfg_scale` in `extra_body`; `guidance_scale` is accepted only as a
+Diffusers compatibility alias when `true_cfg_scale` is not also set.
 
 ### Method 2: Using OpenAI Python SDK
 
