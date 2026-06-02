@@ -547,7 +547,7 @@ class TestDiffusionEngine:
                 num_inference_steps=1,
                 num_outputs_per_prompt=1,
             ),
-            request_ids=["req-0", "req-1"],
+            request_id="req-batch",
         )
 
         mocker.patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False)

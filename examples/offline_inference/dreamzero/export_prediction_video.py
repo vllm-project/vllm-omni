@@ -18,13 +18,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 WORKER_EXTENSION = "vllm_omni.diffusion.models.dreamzero.video_export_worker.DreamZeroVideoExportWorkerExtension"
-DEFAULT_MODEL = "GEAR-Dreams/DreamZero-DROID"
-DEFAULT_PROMPT = "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
-REPO_ROOT = Path(__file__).resolve().parents[3]
 ASSET_REPO_ID = "YangshenDeng/vllm-omni-dreamzero-assets"
-DEFAULT_VIDEO_DIR = REPO_ROOT / "outputs" / "dreamzero" / "assets"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "dreamzero" / "generated_predictions"
-DEFAULT_OUTPUT_STEM = "dreamzero_prediction"
 DEFAULT_SESSION_PREFIX = "dreamzero-export"
 RELATIVE_OFFSETS = [-23, -16, -8, 0]
 ACTION_HORIZON = 24
@@ -36,15 +30,24 @@ CAMERA_FILES = {
 
 
 def _parse_args() -> argparse.Namespace:
+    repo_root = Path(__file__).resolve().parents[3]
     parser = argparse.ArgumentParser(description="Export DreamZero prediction video from downloaded example inputs.")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model", default="GEAR-Dreams/DreamZero-DROID")
     parser.add_argument("--deploy-config", type=Path, required=True)
     parser.add_argument(
-        "--video-dir", type=Path, default=DEFAULT_VIDEO_DIR, help="Directory containing the three camera MP4 files."
+        "--video-dir",
+        type=Path,
+        default=repo_root / "outputs" / "dreamzero" / "assets",
+        help="Directory containing the three camera MP4 files.",
     )
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--output-stem", default=DEFAULT_OUTPUT_STEM)
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument(
+        "--output-dir", type=Path, default=repo_root / "outputs" / "dreamzero" / "generated_predictions"
+    )
+    parser.add_argument("--output-stem", default="dreamzero_prediction")
+    parser.add_argument(
+        "--prompt",
+        default="Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan",
+    )
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--save-input-video", action="store_true")
     parser.add_argument("--save-gif", action="store_true")
