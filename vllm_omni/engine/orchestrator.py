@@ -1085,6 +1085,7 @@ class Orchestrator:
                 output, params, req_state, already_submitted, requires_multimodal_data,
                 src_replica_id=src_replica_id, t_submit_start=_t_submit_start,
             )
+        # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
         elif self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
             await self._forward_to_pd_decode_stage(
                 req_id, src_stage_id, next_logical, next_pool, params, req_state,
