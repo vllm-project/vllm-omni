@@ -92,33 +92,33 @@ GLM_SP_2_DEPLOY = modify_stage_config(
 
 def _get_diffusion_feature_cases(model: str):
     return [
-        # # Baseline: default deploy (stage 0 -> GPU 0, stage 1 -> GPU 1)
-        # pytest.param(
-        #     OmniServerParams(
-        #         model=model,
-        #         stage_config_path=GLM_DEPLOY,
-        #     ),
-        #     id="baseline",
-        #     marks=TWO_CARD_FEATURE_MARKS,
-        # ),
-        # # Cache-DiT via runtime deploy patch (cache_backend -> engine_extras on stage 1)
-        # pytest.param(
-        #     OmniServerParams(
-        #         model=model,
-        #         stage_config_path=GLM_CACHEDIT_DEPLOY,
-        #     ),
-        #     id="cachedit",
-        #     marks=TWO_CARD_FEATURE_MARKS,
-        # ),
-        # # Tensor-Parallel (2 GPUs on diffusion stage)
-        # pytest.param(
-        #     OmniServerParams(
-        #         model=model,
-        #         stage_config_path=GLM_TP_2_DEPLOY,
-        #     ),
-        #     id="tensor_parallel_2",
-        #     marks=TWO_CARD_FEATURE_MARKS,
-        # ),
+        # Baseline: default deploy (stage 0 -> GPU 0, stage 1 -> GPU 1)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                stage_config_path=GLM_DEPLOY,
+            ),
+            id="baseline",
+            marks=TWO_CARD_FEATURE_MARKS,
+        ),
+        # Cache-DiT via runtime deploy patch (cache_backend -> engine_extras on stage 1)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                stage_config_path=GLM_CACHEDIT_DEPLOY,
+            ),
+            id="cachedit",
+            marks=TWO_CARD_FEATURE_MARKS,
+        ),
+        # Tensor-Parallel (2 GPUs on diffusion stage)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                stage_config_path=GLM_TP_2_DEPLOY,
+            ),
+            id="tensor_parallel_2",
+            marks=TWO_CARD_FEATURE_MARKS,
+        ),
         # HSDP (2 GPUs on diffusion stage)
         pytest.param(
             OmniServerParams(
