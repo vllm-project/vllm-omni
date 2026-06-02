@@ -32,7 +32,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
-from .autoencoder import AutoEncoder, AutoEncoderParams
+from .autoencoder import AutoEncoder, AutoEncoderParams, DistributedAutoEncoder
 from .bagel_transformer import Bagel, NaiveCache, Qwen2MoTConfig, Qwen2MoTForCausalLM
 
 logger = init_logger(__name__)
@@ -253,7 +253,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         )
         self.transformer = self.language_model.model
         ae_params: AutoEncoderParams = default_ae_params()
-        self.vae = AutoEncoder(ae_params)
+        self.vae = DistributedAutoEncoder(ae_params)
 
         self.bagel = Bagel(
             language_model=self.language_model,

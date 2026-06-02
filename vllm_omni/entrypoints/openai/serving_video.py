@@ -96,7 +96,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
-        prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
+        prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt, modalities=["video"])
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
@@ -259,18 +259,11 @@ class OmniOpenAIServingVideo:
 
     @staticmethod
     def _resolve_video_fps_multiplier(result: Any) -> int:
-        custom_output = getattr(result, "custom_output", None)
+        custom_output = OmniOpenAIServingVideo._extract_custom_output(result)
         if isinstance(custom_output, dict):
             multiplier = custom_output.get("video_fps_multiplier")
             if multiplier is not None:
                 return int(multiplier)
-        request_output = getattr(result, "request_output", None)
-        if request_output is not None:
-            custom_output = getattr(request_output, "custom_output", None)
-            if isinstance(custom_output, dict):
-                multiplier = custom_output.get("video_fps_multiplier")
-                if multiplier is not None:
-                    return int(multiplier)
         return 1
 
     def _resolve_default_sampling_params(self) -> OmniDiffusionSamplingParams:
@@ -442,6 +435,24 @@ class OmniOpenAIServingVideo:
             return config_sample_rate
 
         return 24000
+
+    @staticmethod
+    def _extract_custom_output(result: Any) -> dict[str, Any]:
+        custom_output = getattr(result, "custom_output", None)
+        if isinstance(custom_output, dict):
+            return custom_output
+
+        request_output = getattr(result, "request_output", None)
+        if isinstance(request_output, dict):
+            custom_output = request_output.get("custom_output")
+            if custom_output is None:
+                custom_output = request_output.get("_custom_output")
+        elif request_output is not None:
+            custom_output = getattr(request_output, "custom_output", None)
+            if custom_output is None:
+                custom_output = getattr(request_output, "_custom_output", None)
+
+        return custom_output if isinstance(custom_output, dict) else {}
 
     @staticmethod
     def _resolve_fps(result: Any) -> int | None:
