@@ -103,7 +103,7 @@ class _ConcurrencyTrackingExecutor:
         new_req = scheduler_output.scheduled_new_reqs[0]
         result = self.collective_rpc(
             "execute_model",
-            args=(new_req.req,),
+            args=(new_req,),
             unique_reply_rank=0,
             exec_all_ranks=True,
         )
@@ -121,7 +121,7 @@ class _ConcurrencyTrackingExecutor:
 def _make_request(tag: str):
     return SimpleNamespace(
         request_id=tag,
-        prompts=[f"prompt_{tag}"],
+        prompt=f"prompt_{tag}",
         sampling_params=SimpleNamespace(num_inference_steps=1, **_SAMPLING_KEY_DEFAULTS),
     )
 

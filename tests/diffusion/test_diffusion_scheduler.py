@@ -28,7 +28,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 def _make_request(req_id: str) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
-        prompts=[f"prompt_{req_id}"],
+        prompt=f"prompt_{req_id}",
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
         request_id=req_id,
     )
@@ -66,7 +66,7 @@ def _make_step_request(
     sampling_params: OmniDiffusionSamplingParams | None = None,
 ) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
-        prompts=[f"prompt_{req_id}"],
+        prompt=f"prompt_{req_id}",
         sampling_params=sampling_params
         or OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
@@ -163,7 +163,7 @@ class TestGetSamplingParamsKey:
             )
         sp.lora_scale = lora_scale
         return OmniDiffusionRequest(
-            prompts=["prompt"],
+            prompt="prompt",
             sampling_params=sp,
             request_id=f"req-{lora_int_id}-{lora_scale}",
         )
@@ -283,7 +283,7 @@ class TestRequestScheduler:
         req_id_a = scheduler.add_request(_make_request("a"))
         req_id_b = scheduler.add_request(
             OmniDiffusionRequest(
-                prompts=["prompt_b"],
+                prompt="prompt_b",
                 sampling_params=OmniDiffusionSamplingParams(width=768),
                 request_id="b",
             )
@@ -344,7 +344,7 @@ class TestRequestScheduler:
 
     def test_request_id_is_scheduler_key(self) -> None:
         request = OmniDiffusionRequest(
-            prompts=["prompt_map_a", "prompt_map_b"],
+            prompt="prompt_map_a",
             sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
             request_id="map-parent",
         )

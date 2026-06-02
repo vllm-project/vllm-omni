@@ -495,13 +495,10 @@ def test_diffusion_batching_async_concurrent(model_name: str):
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 @pytest.mark.parametrize("model_name", models)
-def test_diffusion_batching_async_explicit_batch(model_name: str):
-    """Test that AsyncOmni batch mode (generate(prompt=[...])) dispatches
-    all prompts in a single engine call and returns a single combined result.
-
-    The list-prompt path routes through the orchestrator's
-    ``add_batch_request_async`` → ``AsyncOmni.generate_batch``
-    and yields ONE ``OmniRequestOutput`` with ALL images combined.
+def test_diffusion_batching_list_prompt_rejected(model_name: str):
+    """Test that list-prompt batch requests are rejected at the diffusion
+    stage boundary.  Users should submit multiple independent requests to
+    leverage scheduler batching instead.
     """
 
     async def _inner():
@@ -511,25 +508,14 @@ def test_diffusion_batching_async_explicit_batch(model_name: str):
             sp = _default_sampling_params()
             request_id = f"explicit-batch-{uuid.uuid4().hex[:8]}"
 
-            # Batch mode: pass list of prompts → single request_id
-            result: OmniRequestOutput | None = None
-            async for output in omni.generate(
-                prompt=prompts,
-                request_id=request_id,
-                sampling_params_list=[sp],
-            ):
-                result = output
-
-            assert result is not None, "No output received from batch generate()"
-
-            images = _extract_images(result)
-            # One image per prompt, all in a single output
-            assert len(images) == len(prompts), f"Expected {len(prompts)} images in combined output, got {len(images)}"
-            assert result.request_id == request_id, f"Expected request_id={request_id}, got {result.request_id}"
-            for i, img in enumerate(images):
-                assert img.width == 256, f"Image {i} width mismatch"
-                assert img.height == 256, f"Image {i} height mismatch"
-            print(f"   ✅ Batch returned {len(images)} images, request_id={result.request_id}")
+            with pytest.raises((ValueError, RuntimeError)):
+                async for _output in omni.generate(
+                    prompt=prompts,
+                    request_id=request_id,
+                    sampling_params_list=[sp],
+                ):
+                    pass
+            print("   ✅ List-prompt batch correctly rejected")
         finally:
             omni.shutdown()
 

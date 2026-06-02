@@ -28,7 +28,7 @@ class _DummyPipeline:
     def forward(self, req):
         del req
         self.forward_calls += 1
-        return self._output
+        return [self._output]
 
 
 def _make_request(skip_cache_refresh: bool = True):
@@ -39,7 +39,7 @@ def _make_request(skip_cache_refresh: bool = True):
         num_inference_steps=4,
     )
     return SimpleNamespace(
-        prompts=["a prompt"],
+        prompt="a prompt",
         sampling_params=sampling_params,
         skip_cache_refresh=skip_cache_refresh,
     )

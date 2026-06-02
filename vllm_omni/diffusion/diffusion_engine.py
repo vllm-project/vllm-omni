@@ -46,7 +46,7 @@ from vllm_omni.diffusion.registry import (
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
+from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -137,10 +137,6 @@ class DiffusionEngine:
             StepScheduler() if self.step_execution else RequestScheduler()
         )
         self.scheduler.initialize(od_config)
-        if self.scheduler.max_num_running_reqs > 1 and not self.step_execution:
-            max_num_seqs = self.scheduler.max_num_running_reqs
-            self.scheduler.max_num_running_reqs = 1
-            logger.warning(f"Non-stepwise-execution does not support max-num-seqs={max_num_seqs}, set it to 1.")
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
         self.worker_thread: threading.Thread | None = None
@@ -157,7 +153,7 @@ class DiffusionEngine:
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
-        self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
+        self.execute_fn = self.executor.execute_step if self.step_execution else self._execute_request_mode
 
         try:
             self._dummy_run()
@@ -165,6 +161,18 @@ class DiffusionEngine:
             logger.error(f"Dummy run failed: {e}")
             self.close()
             raise e
+
+    def _execute_request_mode(self, sched_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Dispatch request-mode execution by the number of scheduled requests.
+
+        When more than one request is scheduled in a cycle, send the whole batch
+        to the workers in a single RPC (``execute_batch``); otherwise fall back to
+        the per-request path (``execute_request``). This keeps single-request and
+        dummy-run traffic on the original path while batching multi-request cycles.
+        """
+        if sched_output.num_scheduled_reqs > 1:
+            return self.executor.execute_batch(sched_output)
+        return self.executor.execute_request(sched_output)
 
     async def _check_and_start_background_loop(self):
         if self._closed:
@@ -552,7 +560,7 @@ class DiffusionEngine:
             logger.info("Skipping dummy warmup run (num_frames=0)")
             return
         req = OmniDiffusionRequest(
-            prompts=[prompt],
+            prompt=prompt,
             request_id=DUMMY_DIFFUSION_REQUEST_ID,
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
@@ -778,9 +786,12 @@ class DiffusionEngine:
             raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")
 
         if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
+            # Preserve runner-provided abort details when available.
+            if runner_output is not None and runner_output.result is not None and runner_output.result.aborted:
+                return runner_output.result
             return DiffusionOutput(
                 aborted=True,
-                abort_message=f"Request {state.req.request_id} aborted.",
+                abort_message=f"Request {request_id} aborted.",
             )
 
         if runner_output is not None and runner_output.result is not None:

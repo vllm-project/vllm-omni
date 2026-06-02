@@ -41,6 +41,9 @@ class RequestScheduler(_BaseScheduler):
             if result is None:
                 terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ERROR
                 terminal_errors[request_id] = "No output result"
+            elif result.aborted:
+                terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ABORTED
+                terminal_errors[request_id] = None
             elif result.error:
                 terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ERROR
                 terminal_errors[request_id] = result.error
