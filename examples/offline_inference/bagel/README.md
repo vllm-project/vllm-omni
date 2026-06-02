@@ -195,6 +195,101 @@ stages:
     devices: "0,1"
 ```
 
+### VAE Patch Parallelism
+
+[VAE Patch Parallelism](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/parallelism/vae_patch_parallel.html) splits Bagel VAE **decode/encode** tiles across multiple GPUs on the **DiT stage**, reducing **per-GPU peak memory during VAE decode**. Use it when high-resolution `text2img` or `img2img` hits VAE OOM or large decode spikes.
+
+**Bagel-specific notes:**
+
+- Implemented in `BagelPipeline` via `DistributedAutoEncoder` (DiT stage only).
+- **Single-stage** is the simplest path: one DiT process with TP + VAE patch parallel.
+- **Two-stage**: enable on **stage 1 (DiT)** only; stage 0 (Thinker) keeps encoder-only `VAEEncoder` and does not use VAE patch parallel.
+- You need a DiT `world_size` ≥ `vae_patch_parallel_size` (typically `tensor_parallel_size=2` on that stage). VAE PP reuses the DiT process group; it is not a standalone second-GPU VAE worker.
+
+**Single-stage via deploy YAML** (recommended for `end2end.py`):
+
+```yaml
+pipeline: bagel_single_stage
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 1
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0,1"
+    vae_use_tiling: true
+    parallel_config:
+      tensor_parallel_size: 2
+      vae_patch_parallel_size: 2
+    default_sampling_params:
+      seed: 52
+```
+
+```bash
+cd examples/offline_inference/bagel
+
+CUDA_VISIBLE_DEVICES=0,1 python end2end.py \
+    --model /path/to/BAGEL-7B-MoT \
+    --deploy-config /path/to/bagel_single_stage_vae_pp.yaml \
+    --modality text2img \
+    --prompts "A cute cat" \
+    --steps 10 \
+    --output ./out_vae_pp
+```
+
+**Single-stage via `Omni` kwargs** (same flags as online serving):
+
+```python
+from vllm_omni.entrypoints.omni import Omni
+
+omni = Omni(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    deploy_config="vllm_omni/deploy/bagel_single_stage.yaml",
+    tensor_parallel_size=2,
+    vae_patch_parallel_size=2,
+    vae_use_tiling=True,
+)
+# Then call omni.generate(...) as in end2end.py
+```
+
+**Two-stage (VAE PP on DiT only):**
+
+```yaml
+stages:
+  - stage_id: 0
+    devices: "0"
+    # AR Thinker — no vae_patch_parallel here
+
+  - stage_id: 1
+    devices: "0,1"
+    vae_use_tiling: true
+    parallel_config:
+      tensor_parallel_size: 2
+      vae_patch_parallel_size: 2
+```
+
+```bash
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+    --deploy-config /path/to/bagel_vae_pp.yaml \
+    --modality text2img \
+    --prompts "A cute cat"
+```
+
+**Startup log checks:**
+
+```text
+INFO ... vae_patch_parallel_size=2 requires vae_use_tiling; automatically enabling it.
+```
+
+| Setting | Role |
+| :------ | :--- |
+| `parallel_config.tensor_parallel_size` | DiT world size / TP (must be ≥ `vae_patch_parallel_size`) |
+| `parallel_config.vae_patch_parallel_size` | Number of ranks for distributed VAE tiles (`1` = off) |
+| `vae_use_tiling` | Enable spatial tiling (auto-enabled when `vae_patch_parallel_size > 1`) |
+
 #### Hybrid Sharded Data Parallel (HSDP)
 
 For larger Bagel deployments on multiple GPUs, you can enable HSDP (Hybrid Sharded Data Parallel) by modifying the stage configuration (for example, [`bagel.yaml`](../../../vllm_omni/deploy/bagel.yaml)). HSDP shards transformer weights across GPUs to reduce per-GPU memory usage.
