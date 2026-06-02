@@ -198,7 +198,14 @@ def _build_prompt_for_query_type(
         return query_func(custom_prompt=custom_prompt)
     if query_type == "use_audio_in_video":
         return query_func(video_path=video_path, custom_prompt=custom_prompt)
-    # use_mixed_modalities / use_multi_audios
+    if query_type == "use_mixed_modalities":
+        return query_func(
+            video_path=video_path,
+            image_path=image_path,
+            audio_path=audio_path,
+            custom_prompt=custom_prompt,
+        )
+    # use_multi_audios
     return query_func(custom_prompt=custom_prompt)
 
 
