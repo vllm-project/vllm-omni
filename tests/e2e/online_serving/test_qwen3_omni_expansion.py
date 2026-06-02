@@ -4,14 +4,13 @@
 E2E Online tests for Qwen3-Omni model.
 """
 
-import base64
 import os
 from pathlib import Path
 
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video, load_test_audio_data_url
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
@@ -495,8 +494,7 @@ def test_audio_to_audio(omni_server, openai_client) -> None:
     Datasets: single request
     """
 
-    audio_path = Path(__file__).parent.parent.parent / "assets" / "audio-prompt.wav"
-    audio_data_url = f"data:audio/wav;base64,{base64.b64encode(audio_path.read_bytes()).decode('utf-8')}"
+    audio_data_url = load_test_audio_data_url("audio-prompt.wav")
     messages = dummy_messages_from_mix_data(
         audio_data_url=audio_data_url,
         system_prompt=get_system_prompt(),
