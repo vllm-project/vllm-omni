@@ -504,7 +504,7 @@ class DistributedAutoEncoder(AutoEncoder, DistributedVaeMixin):
                 "tile_latent_stride_height": tile_latent_stride_height,
                 "tile_latent_stride_width": tile_latent_stride_width,
             },
-            output_dtype=x.dtype,
+            output_dtype=next(self.parameters()).dtype,
         )
         return tiletask_list, grid_spec
 

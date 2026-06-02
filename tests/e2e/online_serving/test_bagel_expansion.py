@@ -40,6 +40,21 @@ BAGEL_HSDP_2_DEPLOY = modify_stage_config(
     BAGEL_CI_DEPLOY,
     updates={"stages": {0: {"devices": "0"}, 1: {"devices": "0,1"}}},
 )
+BAGEL_TP_VAE_PP_2_DEPLOY = modify_stage_config(
+    BAGEL_CI_DEPLOY,
+    updates={
+        "stages": {
+            0: {"devices": "0"},
+            1: {
+                "devices": "0,1",
+                "parallel_config": {
+                    "tensor_parallel_size": 2,
+                    "vae_patch_parallel_size": 2,
+                },
+            },
+        },
+    },
+)
 
 
 def _get_diffusion_feature_cases(model: str):
@@ -142,14 +157,7 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
-                stage_config_path=BAGEL_PARALLEL_2_DEPLOY,
-                server_args=[
-                    "--tensor-parallel-size",
-                    "2",
-                    "--vae-patch-parallel-size",
-                    "2",
-                    "--vae-use-tiling",
-                ],
+                stage_config_path=BAGEL_TP_VAE_PP_2_DEPLOY,
             ),
             id="tp_vae_patch_parallel_2",
             marks=PARALLEL_2_FEATURE_MARKS,
