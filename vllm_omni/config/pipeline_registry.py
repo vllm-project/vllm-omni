@@ -141,6 +141,7 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "mammoth_moda2_ar": (
         "vllm_omni.model_executor.models.mammoth_moda2.pipeline",
         "MAMMOTH_MODA2_AR_PIPELINE",
+    ),
     "moss_tts_delay": (
         "vllm_omni.model_executor.models.moss_tts.pipeline",
         "MOSS_TTS_PIPELINE",
