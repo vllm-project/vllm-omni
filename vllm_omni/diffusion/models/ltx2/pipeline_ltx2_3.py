@@ -50,7 +50,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 
 from .pipeline_ltx2 import (
     _get_prompt_field,
@@ -131,6 +131,7 @@ class LTX23Pipeline(
     - Transformer: passes sigma for prompt_adaln
     """
 
+    supports_request_batch = True
     # Audio is diffused jointly with video; warmup must size audio tokens.
     dummy_run_num_frames = 2
     _dit_modules: ClassVar[list[str]] = ["transformer"]
@@ -830,7 +831,7 @@ class LTX23Pipeline(
     @torch.no_grad()
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: RequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -856,7 +857,7 @@ class LTX23Pipeline(
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
         max_sequence_length: int | None = None,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         # ---- Extract from request ----
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
         if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
@@ -1273,10 +1274,20 @@ class LTX23Pipeline(
 
             audio = self.vocoder(generated_mel_spectrograms)
 
-        return DiffusionOutput(
-            output=(video, audio),
-            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-        )
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        n = req.sampling_params.num_outputs_per_prompt
+        if req.num_reqs == 1:
+            return [DiffusionOutput(output=(video, audio), stage_durations=stage_durations)]
+        return [
+            DiffusionOutput(
+                output=(
+                    video[i * n : (i + 1) * n] if isinstance(video, list) else video[i * n : (i + 1) * n],
+                    audio[i * n : (i + 1) * n] if isinstance(audio, (list, torch.Tensor)) else audio,
+                ),
+                stage_durations=stage_durations,
+            )
+            for i in range(req.num_reqs)
+        ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

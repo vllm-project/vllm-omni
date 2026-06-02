@@ -49,6 +49,7 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -81,18 +82,15 @@ def get_glm_image_pre_process_func(od_config: OmniDiffusionConfig):
 
     def pre_process_func(request: OmniDiffusionRequest):
         """Pre-process condition images for Image Edit mode."""
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            if raw_image is None:
-                # Text-to-image mode, no preprocessing needed
-                continue
-
+        if raw_image is not None:
             if not isinstance(raw_image, list):
                 raw_image = [raw_image]
             images = [
@@ -128,12 +126,12 @@ def get_glm_image_pre_process_func(od_config: OmniDiffusionConfig):
                 prompt["additional_information"] = {}
             prompt["additional_information"]["preprocessed_image"] = processed  # type: ignore
             prompt["additional_information"]["prompt_image"] = images  # type: ignore
-            request.prompts[i] = prompt
             if request.sampling_params.height is None:
                 request.sampling_params.height = height
             if request.sampling_params.width is None:
                 request.sampling_params.width = width
 
+        request.prompt = prompt
         return request
 
     return pre_process_func
@@ -672,7 +670,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         return kv_caches
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: RequestBatch) -> list[DiffusionOutput]:
         """
         Main generation forward pass.
 
@@ -901,9 +899,11 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         latents = latents * latents_std + latents_mean
         image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
 
-        return DiffusionOutput(
-            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        return [
+            DiffusionOutput(
+                output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+            )
+        ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load transformer weights."""

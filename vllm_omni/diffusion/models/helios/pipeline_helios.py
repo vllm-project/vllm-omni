@@ -30,6 +30,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -269,7 +270,7 @@ class HeliosPipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: RequestBatch,
         prompt: str | None = None,
         negative_prompt: str | None = None,
         height: int = 384,
@@ -308,7 +309,7 @@ class HeliosPipeline(
         use_zero_init: bool = True,
         zero_steps: int = 1,
         **kwargs,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         if pyramid_num_inference_steps_list is None:
             pyramid_num_inference_steps_list = [10, 10, 10]
         if history_sizes is None:
@@ -669,9 +670,11 @@ class HeliosPipeline(
         else:
             output = history_video
 
-        return DiffusionOutput(
-            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        return [
+            DiffusionOutput(
+                output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+            )
+        ]
 
     def _stage1_sample(
         self,

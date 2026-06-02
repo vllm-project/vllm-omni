@@ -27,6 +27,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
@@ -392,7 +393,7 @@ class ErnieImagePipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: RequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = "",
         height: int = 1024,
@@ -408,7 +409,7 @@ class ErnieImagePipeline(
         return_dict: bool = True,
         callback_on_step_end: Callable[[int, int, dict], None] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         if len(req.prompts) > 1:
             logger.warning("This model only supports a single prompt. Taking only the first.")
         first_prompt = req.prompts[0]
@@ -536,7 +537,7 @@ class ErnieImagePipeline(
         self._current_timestep = None
 
         if output_type == "latent":
-            return DiffusionOutput(output=latents)
+            return [DiffusionOutput(output=latents)]
 
         bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(device)
         bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(device)
@@ -547,9 +548,11 @@ class ErnieImagePipeline(
 
         images = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(
-            output=images, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        return [
+            DiffusionOutput(
+                output=images, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+            )
+        ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded_weights = set()

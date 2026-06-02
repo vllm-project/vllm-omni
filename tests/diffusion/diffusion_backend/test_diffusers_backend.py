@@ -18,6 +18,7 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.models.diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
@@ -48,7 +49,7 @@ def _make_request(**overrides) -> OmniDiffusionRequest:
         prompt_obj["negative_prompt"] = negative_prompt
 
     defaults = {
-        "prompts": [prompt_obj],
+        "prompt": prompt_obj,
         "sampling_params": OmniDiffusionSamplingParams(
             num_inference_steps=20,
             guidance_scale=7.5,
@@ -64,6 +65,11 @@ def _make_request(**overrides) -> OmniDiffusionRequest:
     }
     defaults.update(overrides)
     return OmniDiffusionRequest(**defaults)
+
+
+def _make_batch(**overrides) -> RequestBatch:
+    """Wrap a single request in a RequestBatch, matching the forward contract."""
+    return RequestBatch(requests=[_make_request(**overrides)])
 
 
 @pytest.mark.core_model
@@ -84,11 +90,12 @@ class TestPipelineArgumentsHandling:
             "__call__",
             return_value=MockPipelineOutput(image=stub_image),
         )
-        output = adapter.forward(request)
+        outputs = adapter.forward(RequestBatch(requests=[request]))
 
-        assert isinstance(output, DiffusionOutput)
-        assert isinstance(output.output, MockPipelineOutput)
-        assert output.output.image is stub_image
+        assert isinstance(outputs, list) and len(outputs) == 1
+        assert isinstance(outputs[0], DiffusionOutput)
+        assert isinstance(outputs[0].output, MockPipelineOutput)
+        assert outputs[0].output.image is stub_image
 
     @pytest.mark.parametrize(
         "feature_id",
@@ -145,10 +152,11 @@ class TestPipelineArgumentsHandling:
             "__call__",
             return_value=raw_output,
         )
-        output = adapter.forward(_make_request())
+        outputs = adapter.forward(_make_batch())
 
-        assert isinstance(output, DiffusionOutput)
-        assert output.output == raw_output
+        assert isinstance(outputs, list) and len(outputs) == 1
+        assert isinstance(outputs[0], DiffusionOutput)
+        assert outputs[0].output == raw_output
 
     def test_adapter_build_call_kwargs(self, mocker):
         class MockPipeline:
@@ -205,7 +213,7 @@ class TestPipelineArgumentsHandling:
             ),
         )
 
-        kwargs = adapter._build_call_kwargs(req)
+        kwargs = adapter._build_call_kwargs(RequestBatch(requests=[req]))
 
         assert kwargs["prompt"] == "a cat on mars"
         assert kwargs["negative_prompt"] == "low quality"
@@ -403,7 +411,7 @@ class TestPipelineArgumentsHandling:
             ),
         )
         with pytest.raises(ValueError):
-            pipeline.forward(problematic_request)
+            pipeline.forward(RequestBatch(requests=[problematic_request]))
 
 
 @pytest.mark.advanced_model

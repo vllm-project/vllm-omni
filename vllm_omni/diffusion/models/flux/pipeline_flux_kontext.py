@@ -33,8 +33,8 @@ from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixi
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 from vllm_omni.logger import init_logger
 
 logger = init_logger(__name__)
@@ -468,7 +468,7 @@ class FluxKontextPipeline(
     @torch.no_grad()
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: RequestBatch,
         image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
         prompt: str | list[str] | None = None,
         prompt_2: str | list[str] | None = None,
@@ -493,7 +493,7 @@ class FluxKontextPipeline(
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
         sigmas: list[float] | None = None,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         # Handle multiple prompts - only take the first one, similar to Flux2KleinPipeline
         if len(req.prompts) > 1:
             logger.warning(
@@ -709,7 +709,7 @@ class FluxKontextPipeline(
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=image)
+        return [DiffusionOutput(output=image)]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

@@ -16,7 +16,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
     wrap_methods_by_paths,
 )
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 
 from .config import (
     DEFAULT_QWEN3_VL_MODEL,
@@ -228,19 +228,21 @@ class InternVLAA1Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
         )
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: RequestBatch) -> list[DiffusionOutput]:
         if len(req.prompts) > 1:
             logger.warning("InternVLAA1Pipeline only supports a single prompt/request; taking the first sample.")
         extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
         batch_inputs = extra_args.get("batch_inputs")
         if batch_inputs is None:
-            return DiffusionOutput(
-                error=(
-                    "InternVLAA1Pipeline.forward expects sampling_params.extra_args['batch_inputs'] "
-                    "with pre-built repo-side inputs."
-                ),
-                post_process_func=get_internvla_a1_post_process_func(self.od_config),
-            )
+            return [
+                DiffusionOutput(
+                    error=(
+                        "InternVLAA1Pipeline.forward expects sampling_params.extra_args['batch_inputs'] "
+                        "with pre-built repo-side inputs."
+                    ),
+                    post_process_func=get_internvla_a1_post_process_func(self.od_config),
+                )
+            ]
 
         output, decoded = self._predict_actions(
             batch_inputs,
@@ -250,8 +252,10 @@ class InternVLAA1Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
         custom_output: dict[str, Any] = {}
         if decoded is not None:
             custom_output["decoded"] = decoded
-        return DiffusionOutput(
-            output=output,
-            custom_output=custom_output,
-            post_process_func=get_internvla_a1_post_process_func(self.od_config),
-        )
+        return [
+            DiffusionOutput(
+                output=output,
+                custom_output=custom_output,
+                post_process_func=get_internvla_a1_post_process_func(self.od_config),
+            )
+        ]

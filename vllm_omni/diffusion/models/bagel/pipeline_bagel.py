@@ -29,7 +29,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 from .autoencoder import AutoEncoder, AutoEncoderParams, DistributedAutoEncoder
@@ -341,7 +341,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         )
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: RequestBatch) -> list[DiffusionOutput]:
         if len(req.prompts) > 1:
             logger.warning(
                 """This model only supports a single prompt, not a batched request.""",
@@ -733,11 +733,13 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                     if "<|im_start|>" in text_output:
                         text_output = text_output.split("<|im_start|>")[-1]
 
-            return DiffusionOutput(
-                output=text_output,
-                custom_output={"text_output": text_output},
-                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-            )
+            return [
+                DiffusionOutput(
+                    output=text_output,
+                    custom_output={"text_output": text_output},
+                    stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+                )
+            ]
 
         # ---- Image generation (text2img / img2img) ----
         if req.sampling_params.seed is not None:
@@ -851,15 +853,17 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         # uses this pattern.
         custom["image"] = img
 
-        return DiffusionOutput(
-            output=img,
-            trajectory_latents=trajectory_latents_stacked,
-            trajectory_timesteps=trajectory_timesteps_stacked,
-            trajectory_log_probs=trajectory_log_probs_stacked,
-            trajectory_decoded=trajectory_decoded,
-            custom_output=custom,
-            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-        )
+        return [
+            DiffusionOutput(
+                output=img,
+                trajectory_latents=trajectory_latents_stacked,
+                trajectory_timesteps=trajectory_timesteps_stacked,
+                trajectory_log_probs=trajectory_log_probs_stacked,
+                trajectory_decoded=trajectory_decoded,
+                custom_output=custom,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+        ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         state = self.state_dict()

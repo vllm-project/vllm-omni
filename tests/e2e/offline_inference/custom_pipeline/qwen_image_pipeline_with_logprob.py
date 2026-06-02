@@ -239,8 +239,8 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         sde_type: Literal["sde", "cps"] = "sde",
         logprobs: bool = True,
     ) -> DiffusionOutput:
-        # Extract prompt data from OmniCustomPrompt in req.prompts[0]
-        custom_prompt = req.prompts[0] if req.prompts else {}
+        # Extract prompt data from OmniCustomPrompt in req.prompt
+        custom_prompt = req.prompt if req.prompt is not None else {}
         if isinstance(custom_prompt, dict):
             prompt_ids = custom_prompt.get("prompt_ids", prompt_ids)
             prompt_mask = custom_prompt.get("prompt_mask", prompt_mask)

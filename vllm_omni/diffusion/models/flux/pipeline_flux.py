@@ -31,8 +31,8 @@ from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixi
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,8 @@ def get_flux_post_process_func(
 class FluxPipeline(
     nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
 ):
+    supports_request_batch = True
+
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -502,7 +504,7 @@ class FluxPipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: RequestBatch,
         prompt: str | list[str] | None = None,
         prompt_2: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
@@ -525,7 +527,7 @@ class FluxPipeline(
         joint_attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
-    ):
+    ) -> list[DiffusionOutput]:
         """Forward pass for flux."""
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
@@ -666,9 +668,17 @@ class FluxPipeline(
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(
-            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        n = req.sampling_params.num_outputs_per_prompt
+        if req.num_reqs == 1:
+            return [DiffusionOutput(output=image, stage_durations=stage_durations)]
+        return [
+            DiffusionOutput(
+                output=image[i * n : (i + 1) * n] if isinstance(image, list) else image[i * n : (i + 1) * n],
+                stage_durations=stage_durations,
+            )
+            for i in range(req.num_reqs)
+        ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

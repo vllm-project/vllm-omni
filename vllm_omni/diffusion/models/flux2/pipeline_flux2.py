@@ -34,8 +34,8 @@ from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComp
 from vllm_omni.diffusion.models.mistral_encoder import MistralEncoderModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = logging.getLogger(__name__)
@@ -859,7 +859,7 @@ class Flux2Pipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: RequestBatch,
         image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
         prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -880,7 +880,7 @@ class Flux2Pipeline(
         max_sequence_length: int = 512,
         text_encoder_out_layers: tuple[int, ...] = (10, 20, 30),
         caption_upsample_temperature: float = None,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         if len(req.prompts) > 1:
             logger.warning(
                 """This model only supports a single prompt, not a batched request.""",
@@ -1145,7 +1145,7 @@ class Flux2Pipeline(
                 latents = latents.to(self.vae.dtype)
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=image)
+        return [DiffusionOutput(output=image)]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

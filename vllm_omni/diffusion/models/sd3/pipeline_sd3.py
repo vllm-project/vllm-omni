@@ -26,7 +26,7 @@ from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -132,6 +132,8 @@ def retrieve_timesteps(
 
 
 class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+    supports_request_batch = True
+
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2", "text_encoder_3"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -628,7 +630,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: RequestBatch,
         prompt: str | list[str] = "",
         prompt_2: str | list[str] = "",
         prompt_3: str | list[str] = "",
@@ -647,7 +649,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         pooled_prompt_embeds: torch.Tensor | None = None,
         negative_pooled_prompt_embeds: torch.Tensor | None = None,
         max_sequence_length: int = 256,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
@@ -751,9 +753,17 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(
-            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        n = req.sampling_params.num_outputs_per_prompt
+        if req.num_reqs == 1:
+            return [DiffusionOutput(output=image, stage_durations=stage_durations)]
+        return [
+            DiffusionOutput(
+                output=image[i * n : (i + 1) * n],
+                stage_durations=stage_durations,
+            )
+            for i in range(req.num_reqs)
+        ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

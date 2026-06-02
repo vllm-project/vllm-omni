@@ -50,6 +50,7 @@ from vllm_omni.diffusion.utils.size_utils import (
     normalize_min_aligned_size,
 )
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -88,18 +89,16 @@ def get_qwen_image_edit_plus_pre_process_func(
         request: OmniDiffusionRequest,
     ):
         """Pre-process requests for QwenImageEditPlusPipeline."""
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            # Handle single image or list of images
-            if raw_image is None:
-                continue
-
+        # Handle single image or list of images
+        if raw_image is not None:
             if not isinstance(raw_image, list):
                 raw_image = [raw_image]
             if len(raw_image) > MAX_QWEN_IMAGE_EDIT_PLUS_INPUT_IMAGES:
@@ -155,7 +154,7 @@ def get_qwen_image_edit_plus_pre_process_func(
             prompt["additional_information"]["vae_images"] = vae_images
             prompt["additional_information"]["condition_image_sizes"] = condition_image_sizes
             prompt["additional_information"]["vae_image_sizes"] = vae_image_sizes
-            request.prompts[i] = prompt
+        request.prompt = prompt
         return request
 
     return pre_process_func
@@ -622,7 +621,7 @@ class QwenImageEditPlusPipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: RequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         image: PIL.Image.Image | list[PIL.Image.Image] | torch.Tensor | None = None,
@@ -643,7 +642,7 @@ class QwenImageEditPlusPipeline(
         attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 1024,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         """Forward pass for image editing with support for multiple images."""
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
@@ -858,9 +857,11 @@ class QwenImageEditPlusPipeline(
             latents = latents / latents_std + latents_mean
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
 
-        return DiffusionOutput(
-            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        return [
+            DiffusionOutput(
+                output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+            )
+        ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

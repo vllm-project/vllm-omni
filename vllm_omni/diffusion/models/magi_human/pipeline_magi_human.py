@@ -53,6 +53,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 
 from .magi_human_dit import (
     DiTModel,
@@ -2160,7 +2161,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery,
     @torch.inference_mode()
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: RequestBatch,
         prompt: str | None = None,
         height: int = 256,
         width: int = 448,
@@ -2170,7 +2171,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery,
         image_path: str | None = None,
         audio_path: str | None = None,
         **kwargs,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         if len(req.prompts) >= 1:
             p = req.prompts[0]
             prompt = p if isinstance(p, str) else p.get("prompt", prompt)
@@ -2302,4 +2303,4 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery,
         torch.accelerator.empty_cache()
         audio_np = self._decode_audio(final_latent_audio)
 
-        return DiffusionOutput(output=(videos_np, audio_np))
+        return [DiffusionOutput(output=(videos_np, audio_np))]

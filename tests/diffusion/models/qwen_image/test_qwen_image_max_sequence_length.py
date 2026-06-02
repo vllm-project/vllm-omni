@@ -160,7 +160,7 @@ def test_prepare_encode_defaults_to_tokenizer_max_length():
 
     pipeline._prepare_generation_context = _fake_prepare_generation_context
     state = SimpleNamespace(
-        prompts=["prompt"],
+        prompt="prompt",
         sampling=SimpleNamespace(
             height=None,
             width=None,

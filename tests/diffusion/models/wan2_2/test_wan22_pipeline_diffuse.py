@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -77,8 +78,9 @@ def test_forward_delegates_denoising_to_diffuse(monkeypatch) -> None:
 
     pipeline.diffuse = _fake_diffuse  # type: ignore[method-assign]
 
-    req = SimpleNamespace(
-        prompts=["prompt"],
+    mock_req = SimpleNamespace(
+        prompt="prompt",
+        request_id="test-req",
         sampling_params=SimpleNamespace(
             height=None,
             width=None,
@@ -96,10 +98,11 @@ def test_forward_delegates_denoising_to_diffuse(monkeypatch) -> None:
             extra_args={},
         ),
     )
+    batch = RequestBatch(requests=[mock_req])
 
-    output = pipeline.forward(req, prompt_embeds=prompt_embeds, output_type="latent", guidance_scale=1.0)
+    outputs = pipeline.forward(batch, prompt_embeds=prompt_embeds, output_type="latent", guidance_scale=1.0)
 
-    assert torch.equal(output.output, torch.ones((1, 4, 1, 8, 8)))
+    assert torch.equal(outputs[0].output, torch.ones((1, 4, 1, 8, 8)))
     assert torch.equal(captured["timesteps"], pipeline.scheduler.timesteps)
     assert captured["guidance_low"] == 1.0
     assert captured["guidance_high"] == 1.0

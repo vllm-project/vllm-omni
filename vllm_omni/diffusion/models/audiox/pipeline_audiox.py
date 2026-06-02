@@ -27,7 +27,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.audiox.audiox_transformer import MMDiffusionTransformer
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
 from vllm_omni.transformers_utils.processors import audiox as _audiox_transforms
 
 _VIDEO_ONLY_TASKS = _audiox_transforms.VIDEO_ONLY_TASKS
@@ -359,6 +359,7 @@ class _BrownianTreeNoiseSampler:
 
 
 class AudioXPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMixin):
+    supports_request_batch = True
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 44100
     audio_channels: ClassVar[int] = 2
@@ -811,7 +812,7 @@ class AudioXPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMix
                 )
         return batch
 
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: RequestBatch) -> list[DiffusionOutput]:
         if req.prompts is None or len(req.prompts) == 0:
             raise ValueError("AudioXPipeline requires at least one prompt.")
         normalized_prompts = _normalize_prompts(list(req.prompts))
@@ -913,10 +914,22 @@ class AudioXPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMix
             target_samples = int(seconds_total * self._sample_rate)
             audio = audio[..., :target_samples]
 
-        return DiffusionOutput(
-            output=audio,
-            custom_output={"audiox_task": task_norm},
-            stage_durations=self.stage_durations
-            if getattr(self, "enable_diffusion_pipeline_profiler", False)
-            else None,
-        )
+        stage_durations = self.stage_durations if getattr(self, "enable_diffusion_pipeline_profiler", False) else None
+        custom_output = {"audiox_task": task_norm}
+        n = req.sampling_params.num_outputs_per_prompt
+        if req.num_reqs == 1:
+            return [
+                DiffusionOutput(
+                    output=audio,
+                    custom_output=custom_output,
+                    stage_durations=stage_durations,
+                )
+            ]
+        return [
+            DiffusionOutput(
+                output=audio[i * n : (i + 1) * n],
+                custom_output=custom_output,
+                stage_durations=stage_durations,
+            )
+            for i in range(req.num_reqs)
+        ]
