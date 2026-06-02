@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import re
 import warnings
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -242,6 +243,18 @@ class PipelineConfig:
     # matches ``hf_config.architectures[*]`` against this tuple to route
     # to the correct pipeline. Leave empty for models with unique model_type.
     hf_architectures: tuple[str, ...] = ()
+    # Optional second-stage predicate for resolving an arch-name collision
+    # between sibling model generations that ship the same
+    # ``architectures=[...]`` entry. When the arch-fallback in
+    # ``StageConfigFactory.create_from_model`` finds an intersection with
+    # ``hf_architectures``, it additionally evaluates this predicate against
+    # the loaded ``hf_config`` and only selects this pipeline when it
+    # returns ``True``. Leave ``None`` to skip the extra check (default).
+    # Example: MiniCPM-o 4.5 and 2.6 both ship ``architectures=["MiniCPMO"]``
+    # but differ on the ``version`` field, so the 4.5 pipeline declares
+    # ``hf_config_predicate=lambda c: getattr(c, "version", "") == "4.5"``
+    # to avoid misrouting 2.6 checkpoints.
+    hf_config_predicate: Callable[[Any], bool] | None = None
     # Diffusers pipeline class name: for models that ship a ``model_index.json``
     # (no root ``config.json``), the ``_class_name`` field is matched against
     # this value to auto-detect the pipeline.  Only needed for diffusers-style
@@ -500,6 +513,8 @@ class DeployConfig:
     """
 
     async_chunk: bool = True
+    # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
+    active_stream_window: int = 0
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -516,6 +531,7 @@ class DeployConfig:
     enable_chunked_prefill: bool | None = None
     data_parallel_size: int | None = None
     pipeline_parallel_size: int | None = None
+    custom_voice_dir: str | None = None
 
 
 _STAGE_RESERVED_KEYS = frozenset(
@@ -676,6 +692,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
+        "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,
@@ -693,6 +710,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "enable_chunked_prefill",
         "data_parallel_size",
         "pipeline_parallel_size",
+        "custom_voice_dir",
     ):
         if name in raw_dict:
             kwargs[name] = raw_dict[name]
@@ -814,6 +832,8 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "enable_chunked_prefill",
     "data_parallel_size",
     "pipeline_parallel_size",
+    "active_stream_window",
+    "custom_voice_dir",
 )
 
 
@@ -1172,12 +1192,35 @@ class StageConfigFactory:
         # --- HF architecture fallback: some models report a generic
         # model_type that collides with another model. Match by the
         # hf_architectures declared on each registered PipelineConfig.
+        # When a pipeline declares ``hf_config_predicate`` (e.g. to
+        # disambiguate generation-revision collisions like MiniCPM-o 2.6 vs
+        # 4.5 which share ``architectures=["MiniCPMO"]``), the predicate
+        # must also accept the loaded ``hf_config``.
         if hf_config is not None:
             hf_archs = set(getattr(hf_config, "architectures", []) or [])
             if hf_archs:
                 for registered in _PIPELINE_REGISTRY.values():
-                    if hf_archs.intersection(registered.hf_architectures):
-                        return cls._create_from_registry(registered.model_type, cli_overrides, deploy_config_path)
+                    if not hf_archs.intersection(registered.hf_architectures):
+                        continue
+                    predicate = registered.hf_config_predicate
+                    if predicate is not None:
+                        try:
+                            if not predicate(hf_config):
+                                logger.debug(
+                                    "Pipeline %r matched on architectures %s but its "
+                                    "hf_config_predicate rejected the loaded config; "
+                                    "continuing fallback search.",
+                                    registered.model_type,
+                                    sorted(hf_archs.intersection(registered.hf_architectures)),
+                                )
+                                continue
+                        except Exception:
+                            logger.exception(
+                                "Pipeline %r hf_config_predicate raised; skipping.",
+                                registered.model_type,
+                            )
+                            continue
+                    return cls._create_from_registry(registered.model_type, cli_overrides, deploy_config_path)
 
         # --- Legacy path: load from pipeline YAML ---
         pipeline = cls._load_pipeline(model, trust_remote_code=trust_remote_code)

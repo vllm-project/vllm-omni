@@ -17,7 +17,7 @@ AUDIO_MODEL = {
 }
 
 IMAGE_VIDEO_MODELS = {
-    "riverclouds/qwen_image_random": {"cuda": 2500, "rocm": 2100},
+    "riverclouds/qwen_image_random": {"cuda": 2200, "rocm": 2100},
 }
 
 MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}

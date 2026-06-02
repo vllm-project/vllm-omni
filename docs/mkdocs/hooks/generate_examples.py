@@ -16,6 +16,7 @@ ROOT_DIR_RELATIVE = "../../../../.."
 EXAMPLE_DIR = ROOT_DIR / "examples"
 EXAMPLE_DOC_DIR = ROOT_DIR / "docs/user_guide/examples"
 NAV_FILE = ROOT_DIR / "docs/.nav.yml"
+MAX_INLINE_MATERIAL_SIZE = 8 * 1024
 
 
 def fix_case(text: str) -> str:
@@ -191,18 +192,21 @@ class Example:
 
         return re.sub(link_pattern, replace_link, content)
 
+    def github_url(self, path: Path) -> str:
+        url = "https://github.com/vllm-project/vllm-omni/"
+        url += "tree/main" if path.is_dir() else "blob/main"
+        return f"{url}/{path.relative_to(ROOT_DIR).as_posix()}"
+
     def generate(self) -> str:
         content = f"# {self.title}\n\n"
-        url = "https://github.com/vllm-project/vllm-omni/"
-        url += "tree/main" if self.path.is_dir() else "blob/main"
-        content += f"Source <{url}/{self.path.relative_to(ROOT_DIR)}>.\n\n"
+        content += f"Source <{self.github_url(self.path)}>.\n\n"
 
         # Use long code fence to avoid issues with
         # included files containing code fences too
         code_fence = "``````"
 
         if self.is_code:
-            main_file_rel = self.main_file.relative_to(ROOT_DIR)
+            main_file_rel = self.main_file.relative_to(ROOT_DIR).as_posix()
             content += f'{code_fence}{self.main_file.suffix[1:]}\n--8<-- "{main_file_rel}"\n{code_fence}\n'
         else:
             with open(self.main_file, encoding="utf-8") as f:
@@ -216,10 +220,15 @@ class Example:
 
         content += "## Example materials\n\n"
         for file in sorted(self.other_files):
-            content += f'??? abstract "{file.relative_to(self.path)}"\n'
+            content += f'??? abstract "{file.relative_to(self.path).as_posix()}"\n'
+            if file.stat().st_size > MAX_INLINE_MATERIAL_SIZE:
+                content += (
+                    f"    Large file omitted from the rendered docs. View it on GitHub: <{self.github_url(file)}>.\n\n"
+                )
+                continue
             if file.suffix != ".md":
                 content += f"    {code_fence}{file.suffix[1:]}\n"
-            content += f'    --8<-- "{file.relative_to(ROOT_DIR)}"\n'
+            content += f'    --8<-- "{file.relative_to(ROOT_DIR).as_posix()}"\n'
             if file.suffix != ".md":
                 content += f"    {code_fence}\n"
 
@@ -291,7 +300,7 @@ def update_nav_file(examples: list[Example]):
         for example in category_examples:
             doc_path = EXAMPLE_DOC_DIR / example.category / f"{example.path.stem}.md"
             rel_path = doc_path.relative_to(ROOT_DIR / "docs")
-            category_items.append({example.title: str(rel_path)})
+            category_items.append({example.title: rel_path.as_posix()})
 
         if category_items:
             # Format category name (e.g., "offline_inference" -> "Offline Inference")

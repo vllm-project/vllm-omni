@@ -13,6 +13,7 @@ via FlashAttention/SageAttention/SDPA backends.
 from __future__ import annotations
 
 import math
+import random
 import threading
 from collections import OrderedDict
 
@@ -225,9 +226,13 @@ def _get_time_steps(
     return shifted
 
 
-def _gumbel_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+def _gumbel_sample(logits: torch.Tensor, temperature: float, generator: torch.Generator) -> torch.Tensor:
     """Add Gumbel noise for stochastic position selection."""
-    noise = -torch.log(-torch.log(torch.rand_like(logits).clamp(min=1e-8)))
+    noise = -torch.log(
+        -torch.log(
+            torch.rand(logits.shape, generator=generator, device=logits.device, dtype=logits.dtype).clamp(min=1e-8)
+        )
+    )
     return logits / max(temperature, 1e-8) + noise
 
 
@@ -791,6 +796,7 @@ class OmniVoiceGenerator(nn.Module):
         audio_mask: torch.Tensor,
         attention_mask: torch.Tensor,
         target_lens: list[int],
+        seed: int | None = None,
         num_step: int = 32,
         guidance_scale: float = 2.0,
         t_shift: float = 0.1,
@@ -820,6 +826,9 @@ class OmniVoiceGenerator(nn.Module):
         max_target_len = max(target_lens)
         mask_id = self.config.audio_mask_id
         num_codebooks = self.config.num_audio_codebook
+        if seed is None:
+            seed = random.randint(0, 2**63 - 1)
+        generator = torch.Generator(device=device).manual_seed(seed)
 
         # Initialize all target tokens as [MASK]
         tokens = torch.full(
@@ -896,7 +905,7 @@ class OmniVoiceGenerator(nn.Module):
 
                 # Token prediction
                 if class_temperature > 0.0:
-                    pred_tokens = _gumbel_sample(log_probs, class_temperature).argmax(dim=-1)
+                    pred_tokens = _gumbel_sample(log_probs, class_temperature, generator).argmax(dim=-1)
                 else:
                     pred_tokens = log_probs.argmax(dim=-1)  # [1, 8, T]
 
@@ -908,7 +917,7 @@ class OmniVoiceGenerator(nn.Module):
 
                 # Gumbel noise for position selection
                 if position_temperature > 0.0:
-                    scores = _gumbel_sample(scores, position_temperature)
+                    scores = _gumbel_sample(scores, position_temperature, generator)
 
                 # Mask out already unmasked positions
                 sample_tokens = tokens[i : i + 1, :, :t_len]

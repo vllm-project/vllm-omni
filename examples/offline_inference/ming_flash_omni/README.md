@@ -8,7 +8,7 @@ vLLM-Omni supports three deployment modes:
 |------|--------------|--------|
 | Thinker + Talker (omni-speech, default) | `vllm_omni/deploy/ming_flash_omni.yaml` | Text + Audio |
 | Thinker only (multimodal understanding) | `vllm_omni/deploy/ming_flash_omni_thinker_only.yaml` | Text |
-| Thinker + Imagegen (text-to-image / img2img) | `vllm_omni/model_executor/stage_configs/ming_flash_omni_dual.yaml` | Image (online-serving only at the moment) |
+| Thinker + Imagegen (text-to-image / img2img) | `vllm_omni/deploy/ming_flash_omni_image.yaml` | Image (online-serving only at the moment) |
 
 For standalone TTS (talker only), see the [Ming-flash-omni-TTS section in the Text-To-Speech hub](../text_to_speech/README.md#ming-flash-omni-tts).
 
@@ -53,7 +53,7 @@ python examples/offline_inference/ming_flash_omni/end2end.py \
     --image-path ./3_0.png
 ```
 
-### Omni-Speech (Thinker + Talker)
+### Omni-Speech (Thinker + Talker) {#omni-speech-thinker--talker}
 
 The default deploy YAML already runs thinker+talker, so spoken output only requires requesting `audio` (or `text,audio`) modalities.
 The thinker processes your multimodal input, generates text, then the talker synthesises the response as speech.

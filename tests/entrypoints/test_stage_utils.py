@@ -4,7 +4,7 @@ import sys
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.entrypoints.stage_utils import set_stage_devices
+from vllm_omni.entrypoints.stage_utils import _map_device_list, set_stage_devices
 
 
 def _make_dummy_torch(call_log):
@@ -130,3 +130,90 @@ def test_set_stage_devices_npu_platform(mocker: MockerFixture, monkeypatch: pyte
     set_stage_devices(stage_id=0, devices="0,1")
 
     assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "4,5"
+
+
+# ---- _map_device_list unit tests ----
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_idempotency():
+    """Device IDs already in the visible set are returned as-is (idempotency)."""
+    result = _map_device_list(0, ["0", "1"], ["0", "1", "2", "3"])
+    assert result == ["0", "1"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_idempotency_single():
+    """Single device ID in visible set passes through."""
+    result = _map_device_list(1, ["1"], ["0", "1"])
+    assert result == ["1"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_index_mapping():
+    """Device IDs < num_visible not in set are treated as indices."""
+    result = _map_device_list(0, ["0", "1"], ["6", "7", "8", "9"])
+    assert result == ["6", "7"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_physical_fallback():
+    """Device IDs >= num_visible are treated as physical IDs and passed through."""
+    result = _map_device_list(1, ["2"], ["0", "1"])
+    assert result == ["2"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_physical_fallback_multi():
+    """Multiple device IDs >= num_visible all pass through as physical IDs."""
+    result = _map_device_list(1, ["2", "3"], ["0", "1"])
+    assert result == ["2", "3"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_physical_fallback_mixed():
+    """When some devices are >= num_visible but some < num_visible, index mapping applies for the subset."""
+    # "1" < num_visible(2) so index mapping applies: visible[1] = "5"
+    # "2" >= num_visible(2) so it's dropped via the partial mapping path
+    result = _map_device_list(1, ["1", "2"], ["0", "5"])
+    assert result == ["5"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_index_with_gaps():
+    """Index-based mapping works with non-contiguous visible device lists."""
+    result = _map_device_list(0, ["0", "1"], ["4", "5", "7"])
+    assert result == ["4", "5"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_index_mapping_no_idempotency():
+    """Device IDs < num_visible not in visible set map via index even when no ID matches literally."""
+    # "0","1" with visible ["2","3"]: idempotency check fails (none in set),
+    # but index mapping succeeds: visible[0]="2", visible[1]="3"
+    result = _map_device_list(0, ["0", "1"], ["2", "3"])
+    assert result == ["2", "3"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_partial_mapping():
+    """When only a subset can map, returns the mapped subset (no error)."""
+    result = _map_device_list(0, ["0", "1", "2"], ["5", "6"])
+    assert result == ["5", "6"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_raises_on_non_numeric():
+    """Non-numeric device IDs raise ValueError."""
+    with pytest.raises(ValueError, match="must be non-negative integers"):
+        _map_device_list(0, ["a"], ["0", "1"])

@@ -25,6 +25,7 @@ class _FakeDecoder(nn.Module):
         self.total_upsample = total_upsample
         self.decode_calls: list[dict[str, int]] = []
         self.batched_decode_calls: list[dict[str, int]] = []
+        self.decode_codes: list[torch.Tensor] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
 
     def to(self, *args, **kwargs):
@@ -37,6 +38,7 @@ class _FakeDecoder(nn.Module):
         chunk_size: int = 300,
         left_context_size: int = 25,
     ) -> torch.Tensor:
+        self.decode_codes.append(codes.detach().cpu().clone())
         self.decode_calls.append(
             {
                 "chunk_size": chunk_size,
@@ -179,6 +181,136 @@ def test_forward_trims_trailing_padding_without_context():
     audio = out.multimodal_outputs["model_outputs"][0]
     expected = torch.arange(24, dtype=torch.float32)
     torch.testing.assert_close(audio, expected)
+
+
+def test_forward_reuses_cached_ref_context_for_followup_chunk():
+    model = _make_model()
+
+    first_codes = torch.tensor(
+        [
+            9,
+            8,
+            1,
+            2,
+            9,
+            8,
+            3,
+            4,
+        ],
+        dtype=torch.long,
+    )
+    model.forward(
+        input_ids=first_codes,
+        runtime_additional_information=[
+            {
+                "meta": {
+                    "left_context_size": 2,
+                    "ref_context_size": 2,
+                    "ref_context_request_id": "rid",
+                    "ref_context_included": True,
+                }
+            }
+        ],
+    )
+
+    followup_codes = torch.tensor([5, 6, 7, 15, 16, 17], dtype=torch.long)
+    model.forward(
+        input_ids=followup_codes,
+        runtime_additional_information=[
+            {
+                "meta": {
+                    "left_context_size": 3,
+                    "ref_context_size": 2,
+                    "ref_context_request_id": "rid",
+                    "ref_context_included": False,
+                    "finished": torch.tensor(True),
+                }
+            }
+        ],
+    )
+
+    torch.testing.assert_close(
+        model.decoder.decode_codes[-1],
+        torch.tensor(
+            [
+                [
+                    [9, 8, 5, 6, 7],
+                    [9, 8, 15, 16, 17],
+                ]
+            ],
+            dtype=torch.long,
+        ),
+    )
+    assert "rid" not in model._ref_context_cache
+
+
+def test_forward_fails_fast_when_ref_context_cache_is_missing():
+    model = _make_model()
+
+    followup_codes = torch.tensor([5, 6, 7, 15, 16, 17], dtype=torch.long)
+    with pytest.raises(ValueError, match="Missing Qwen3-TTS ref context cache"):
+        model.forward(
+            input_ids=followup_codes,
+            runtime_additional_information=[
+                {
+                    "meta": {
+                        "left_context_size": 3,
+                        "ref_context_size": 2,
+                        "ref_context_request_id": "rid",
+                        "ref_context_included": False,
+                    }
+                }
+            ],
+        )
+
+
+def test_ref_context_cache_evicts_lru_entries_when_requests_abort():
+    model = _make_model()
+    model._ref_context_cache_max_entries = 2
+
+    first_codes = torch.tensor([9, 8, 1, 2, 9, 8, 3, 4], dtype=torch.long)
+    for rid in ("a", "b", "c"):
+        model.forward(
+            input_ids=first_codes,
+            runtime_additional_information=[
+                {
+                    "meta": {
+                        "left_context_size": 2,
+                        "ref_context_size": 2,
+                        "ref_context_request_id": rid,
+                        "ref_context_included": True,
+                    }
+                }
+            ],
+        )
+
+    assert list(model._ref_context_cache) == ["b", "c"]
+    assert model._ref_context_cache_bytes == sum(model._tensor_nbytes(t) for t in model._ref_context_cache.values())
+
+
+def test_ref_context_cache_evicts_to_byte_cap():
+    model = _make_model()
+    model._ref_context_cache_max_entries = 100
+    model._ref_context_cache_max_bytes = 33
+
+    first_codes = torch.tensor([9, 8, 1, 2, 9, 8, 3, 4], dtype=torch.long)
+    for rid in ("a", "b"):
+        model.forward(
+            input_ids=first_codes,
+            runtime_additional_information=[
+                {
+                    "meta": {
+                        "left_context_size": 2,
+                        "ref_context_size": 2,
+                        "ref_context_request_id": rid,
+                        "ref_context_included": True,
+                    }
+                }
+            ],
+        )
+
+    assert list(model._ref_context_cache) == ["b"]
+    assert model._ref_context_cache_bytes == 32
 
 
 def test_connector_codec_chunking_does_not_override_decode_chunking():

@@ -96,6 +96,12 @@ class OmniServeCommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
+        if getattr(args, "no_guardrails", False):
+            existing = getattr(args, "model_config", None)
+            model_config = dict(existing) if isinstance(existing, dict) else {}
+            model_config["guardrails"] = False
+            args.model_config = model_config
+
         if args.headless:
             run_headless(args)
         else:
@@ -436,7 +442,7 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
         )
         omni_config_group.add_argument(
-            "--quantization-config",
+            "--diffusion-quantization-config",
             type=json.loads,
             default=None,
             help=(
@@ -507,13 +513,16 @@ class OmniServeCommand(CLISubcommand):
             "--cache-backend",
             type=str,
             default="none",
-            help="Cache backend for diffusion models, options: 'tea_cache', 'cache_dit'",
+            help="Cache backend for diffusion models, options: 'tea_cache', 'cache_dit', 'mag_cache'",
         )
         omni_config_group.add_argument(
             "--cache-config",
             type=str,
             default=None,
-            help="JSON string of cache configuration (e.g., '{\"rel_l1_thresh\": 0.2}').",
+            help="JSON string of cache configuration. "
+            "TeaCache: '{\"rel_l1_thresh\": 0.2}'. "
+            'MagCache: \'{"mag_threshold": 0.24, "mag_max_skip_steps": 5, "mag_retention_ratio": 0.1}\'. '
+            "Calibration mode: add '\"mag_calibrate\": true'",
         )
         omni_config_group.add_argument(
             "--enable-cache-dit-summary",
@@ -637,6 +646,15 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=None,
             help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
+        )
+
+        # Disable safety guardrails for this server (currently only applicable for Cosmos3)
+        # TODO: drop once --model-config-override lands (3/N config refactor)
+        omni_config_group.add_argument(
+            "--no-guardrails",
+            dest="no_guardrails",
+            action="store_true",
+            help="Disable Cosmos3 text/video safety guardrails for this server.",
         )
 
         # Enable diffusion pipeline profiling

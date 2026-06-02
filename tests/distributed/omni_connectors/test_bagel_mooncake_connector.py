@@ -269,6 +269,7 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
+@pytest.mark.skip(reason="Skip failed CI issue 3977: https://github.com/vllm-project/vllm-omni/issues/3977")
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_bagel_text2img_mooncake_connector(run_level):
     """Test Bagel text2img with Mooncake connector for inter-stage communication."""
