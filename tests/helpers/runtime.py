@@ -888,6 +888,12 @@ class OpenAIClientHandler:
                         audio_data.append(content)
                     elif modality == "text" and content:
                         text_content += content
+                # Usage is yielded after the last token
+                if chunk.usage:
+                    result.prompt_tokens = chunk.usage.prompt_tokens
+                    if details := getattr(chunk.usage, "prompt_tokens_details", None):
+                        result.cached_tokens = details.cached_tokens
+
             audio_content = None
             if audio_data:
                 merged_seg = _merge_base64_audio_to_segment(audio_data)
@@ -1582,6 +1588,8 @@ class OpenAIClientHandler:
             create_kwargs["logprobs"] = request_config["logprobs"]
         if "top_logprobs" in request_config:
             create_kwargs["top_logprobs"] = request_config["top_logprobs"]
+        if "stream_options" in request_config:
+            create_kwargs["stream_options"] = request_config["stream_options"]
         if extra_body:
             create_kwargs["extra_body"] = extra_body
 
