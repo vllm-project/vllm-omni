@@ -17,11 +17,10 @@ Adding a new pipeline:
        ``vllm_omni/.../pipeline.py``.
     2. Add one line to ``_OMNI_PIPELINES`` below.
 
-Single-stage diffusion models continue to use the
-``_create_default_diffusion_stage_cfg`` fallback in
-``async_omni_engine.py`` — they don't need a registry entry. The empty
-``_DIFFUSION_PIPELINES`` placeholder previously here (#2915) was removed
-once #2987 (which would have populated it) was deferred.
+Plain single-stage diffusion models continue to use the
+``_create_default_diffusion_stage_cfg`` fallback in ``async_omni_engine.py``.
+The empty ``_DIFFUSION_PIPELINES`` placeholder previously here (#2915) was
+removed once #2987 (which would have populated it) was deferred.
 
 ``register_pipeline(config)`` in ``stage_config`` is still supported for
 out-of-tree plugins and tests that create pipelines at runtime; those override
@@ -65,6 +64,15 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.bagel.pipeline",
         "BAGEL_SINGLE_STAGE_PIPELINE",
     ),
+    # Lance (ByteDance) — BAGEL-lineage unified AR+diffusion, single-stage DiT.
+    "lance": (
+        "vllm_omni.model_executor.models.lance.pipeline",
+        "LANCE_PIPELINE",
+    ),
+    "dreamzero": (
+        "vllm_omni.model_executor.models.dreamzero.pipeline",
+        "DREAMZERO_PIPELINE",
+    ),
     "glm_image": (
         "vllm_omni.model_executor.models.glm_image.pipeline",
         "GLM_IMAGE_PIPELINE",
@@ -97,6 +105,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.voxtral_tts.pipeline",
         "VOXTRAL_TTS_PIPELINE",
     ),
+    "glm_tts": (
+        "vllm_omni.model_executor.models.glm_tts.pipeline",
+        "GLM_TTS_PIPELINE",
+    ),
     "fish_qwen3_omni": (
         "vllm_omni.model_executor.models.fish_speech.pipeline",
         "FISH_SPEECH_PIPELINE",
@@ -113,8 +125,32 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.ming_flash_omni.pipeline",
         "MING_FLASH_OMNI_THINKER_ONLY_PIPELINE",
     ),
+    "ming_flash_omni_image": (
+        "vllm_omni.model_executor.models.ming_flash_omni.pipeline",
+        "MING_FLASH_OMNI_IMAGE_PIPELINE",
+    ),
     "moss_tts_nano": (
         "vllm_omni.model_executor.models.moss_tts_nano.pipeline",
         "MOSS_TTS_NANO_PIPELINE",
+    ),
+    "moss_tts_delay": (
+        "vllm_omni.model_executor.models.moss_tts.pipeline",
+        "MOSS_TTS_PIPELINE",
+    ),
+    "moss_tts_realtime": (
+        "vllm_omni.model_executor.models.moss_tts.pipeline",
+        "MOSS_TTS_REALTIME_PIPELINE",
+    ),
+    "minicpmo_4_5": (
+        "vllm_omni.model_executor.models.minicpmo_4_5.pipeline",
+        "MINICPMO_4_5_PIPELINE",
+    ),
+    "higgs_audio_v2": (
+        "vllm_omni.model_executor.models.higgs_audio_v2.pipeline",
+        "HIGGS_AUDIO_V2_PIPELINE",
+    ),
+    "dynin_omni": (
+        "vllm_omni.model_executor.models.dynin_omni.pipeline",
+        "DYNIN_OMNI_PIPELINE",
     ),
 }

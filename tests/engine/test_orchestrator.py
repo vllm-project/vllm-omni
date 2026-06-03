@@ -79,7 +79,7 @@ class FakeStageClient:
         self._diffusion_outputs = queue.Queue()
 
     # Orchestrator-facing interface.
-    async def add_request_async(self, *args, **_kwargs) -> None:
+    async def add_request_async(self, *args, **kwargs) -> None:
         self.add_request_calls.append(args)
 
     async def get_output_async(self):
@@ -448,7 +448,7 @@ def test_stage_engine_core_client_shutdown_cleans_children_if_base_shutdown_fail
             assert recursive
             return [fake_child]
 
-    def fail_base_shutdown(self):
+    def fail_base_shutdown(self, **kwargs):
         raise RuntimeError("base shutdown failed")
 
     monkeypatch.setattr(psutil, "Process", FakePsutilProcess)
@@ -480,7 +480,7 @@ def test_stage_engine_core_client_shutdown_kills_stubborn_children(monkeypatch):
 
     monkeypatch.setattr(psutil, "Process", FakePsutilProcess)
     monkeypatch.setattr(psutil, "wait_procs", lambda procs, timeout: ([], list(procs)))
-    monkeypatch.setattr(AsyncMPClient, "shutdown", lambda self: None)
+    monkeypatch.setattr(AsyncMPClient, "shutdown", lambda self, **kwargs: None)
 
     client = object.__new__(StageEngineCoreClient)
     client._proc = fake_proc
@@ -964,6 +964,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
 
     pool = RecordingPool()
     orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = False
     orchestrator.request_states = {
         "req-stream": OrchestratorRequestState(
             request_id="req-stream",
@@ -994,7 +995,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
 @pytest.mark.asyncio
 async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client_submit_fails() -> None:
     class FailingStageClient(FakeStageClient):
-        async def add_request_async(self, *args, **_kwargs) -> None:
+        async def add_request_async(self, *args, **kwargs) -> None:
             raise RuntimeError("submit failed")
 
     class TrackingOutputProcessor(FakeOutputProcessor):
@@ -1052,7 +1053,7 @@ async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) ->
         target_logger.setLevel(prev_level)
 
     assert not stage0.abort_calls
-    assert "abort: no binding for req=missing-req in stage-0" in caplog.text
+    assert "abort: no live binding for req=missing-req in stage-0" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1156,3 +1157,37 @@ async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator
         assert stage0_r1.add_request_calls[1][0].request_id == "parent-neg"
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+def test_orchestrator_does_not_re_introduce_global_stats_throttle() -> None:
+    """Regression: each (stage, replica) must independently publish its wrapped
+    vllm:* stats when its scheduler emits non-None scheduler_stats.
+
+    A previous version of Orchestrator carried a global self._last_stats_ts /
+    _stats_interval_s gate around _stat_logger.record(). Because
+    OmniSchedulerMixin.make_stats() already throttles at 1 Hz per scheduler
+    (one per (stage, replica)), the extra global gate starved every replica
+    other than the first to emit within each second — their {stage, replica}
+    gauges/counters went stale.
+
+    The fix removed the global gate entirely; the only signal needed is
+    'this replica's scheduler emitted non-None scheduler_stats'. This test
+    fails loudly if someone reintroduces the global throttle.
+    """
+    import inspect
+
+    from vllm_omni.engine.orchestrator import Orchestrator
+
+    source = inspect.getsource(Orchestrator)
+    assert "_last_stats_ts" not in source, (
+        "Orchestrator must not gate stat recording on a global timestamp. "
+        "OmniSchedulerMixin.make_stats() already throttles per scheduler "
+        "(per (stage, replica)); an outer global gate starves all but the "
+        "first replica to emit within each 1s window."
+    )
+    assert "_stats_interval_s" not in source
+    assert "raw_outputs.scheduler_stats is not None" in source, (
+        "Orchestrator must gate stat recording solely on "
+        "raw_outputs.scheduler_stats being non-None — the per-scheduler 1Hz "
+        "throttle in OmniSchedulerMixin.make_stats() is the only gate needed."
+    )

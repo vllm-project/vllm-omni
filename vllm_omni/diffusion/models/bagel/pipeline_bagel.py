@@ -32,7 +32,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
-from .autoencoder import AutoEncoder, AutoEncoderParams
+from .autoencoder import AutoEncoder, AutoEncoderParams, DistributedAutoEncoder
 from .bagel_transformer import Bagel, NaiveCache, Qwen2MoTConfig, Qwen2MoTForCausalLM
 
 logger = init_logger(__name__)
@@ -253,7 +253,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         )
         self.transformer = self.language_model.model
         ae_params: AutoEncoderParams = default_ae_params()
-        self.vae = AutoEncoder(ae_params)
+        self.vae = DistributedAutoEncoder(ae_params)
 
         self.bagel = Bagel(
             language_model=self.language_model,
@@ -319,6 +319,27 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         image = (image * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0) * 255
         return Image.fromarray(image.to(torch.uint8).cpu().numpy())
 
+    def _regen_init_noise_on_device(self, gen_input: dict, seed: int | None) -> None:
+        """Resample ``gen_input["packed_init_noises"]`` on-device with a fresh
+        per-call ``torch.Generator``.
+
+        ``Bagel.prepare_input`` (and the Lance video equivalent) call
+        ``torch.randn`` with no device or generator, falling back to CPU+fp32
+        via the global RNG.  Upstream Lance samples directly on CUDA+bf16 via
+        ``torch.Generator(device=cuda).manual_seed(seed)`` (lance.py:1536),
+        so for the same seed the two sides land on different noise streams.
+        Mutates ``gen_input`` in place; no-op if seed is unset or device is CPU.
+        """
+        if seed is None or self.device.type != "cuda":
+            return
+        ref = gen_input["packed_init_noises"]
+        gen_input["packed_init_noises"] = torch.randn(
+            ref.shape,
+            generator=torch.Generator(device=self.device).manual_seed(int(seed)),
+            device=self.device,
+            dtype=self.od_config.dtype,
+        )
+
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         if len(req.prompts) > 1:
@@ -355,7 +376,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
 
         gen_params = BagelGenParams(
             num_timesteps=int(req.sampling_params.num_inference_steps or 50),
-            timestep_shift=3.0,
+            timestep_shift=float(extra_args.get("timestep_shift", 3.0)),
             cfg_text_scale=cfg_text_scale,
             cfg_img_scale=cfg_img_scale,
             cfg_interval=cfg_interval,
@@ -756,6 +777,8 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
+        self._regen_init_noise_on_device(generation_input, req.sampling_params.seed)
+
         # text cfg
         generation_input_cfg_text = self.bagel.prepare_vae_latent_cfg(
             curr_kvlens=cfg_text_context["kv_lens"],
@@ -793,13 +816,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 cfg_renorm_type=gen_params.cfg_renorm_type,
                 **generation_input,
                 cfg_text_packed_position_ids=generation_input_cfg_text["cfg_packed_position_ids"],
-                cfg_text_packed_query_indexes=generation_input_cfg_text["cfg_packed_query_indexes"],
-                cfg_text_key_values_lens=generation_input_cfg_text["cfg_key_values_lens"],
-                cfg_text_packed_key_value_indexes=generation_input_cfg_text["cfg_packed_key_value_indexes"],
                 cfg_img_packed_position_ids=generation_input_cfg_img["cfg_packed_position_ids"],
-                cfg_img_packed_query_indexes=generation_input_cfg_img["cfg_packed_query_indexes"],
-                cfg_img_key_values_lens=generation_input_cfg_img["cfg_key_values_lens"],
-                cfg_img_packed_key_value_indexes=generation_input_cfg_img["cfg_packed_key_value_indexes"],
                 return_trajectory_latents=req.sampling_params.return_trajectory_latents,
                 scheduler=self.scheduler,
                 scheduler_kwargs=self.scheduler_kwargs,
@@ -826,6 +843,11 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         custom = {}
         if think_text is not None:
             custom["think_text"] = think_text
+        # Mirror the PIL image into ``custom_output`` so callers reading via
+        # the orchestrator IPC boundary (which strips the bare ``output``
+        # field) can still recover the result.  ``video_frames`` already
+        # uses this pattern.
+        custom["image"] = img
 
         return DiffusionOutput(
             output=img,

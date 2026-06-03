@@ -54,6 +54,21 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Transcript of reference audio for voice cloning (Base task)",
     )
+    ref_audio_2: str | None = Field(
+        default=None,
+        description="Second reference audio for two-speaker dialogue (MOSS-TTSD). "
+        "URL, base64, or file URI. Ignored by single-speaker models.",
+    )
+    ambient_sound: str | None = Field(
+        default=None,
+        description="Sound description for ambient/effect synthesis (MOSS-SoundEffect). "
+        "Natural language, e.g. 'ocean waves crashing on a rocky beach'.",
+    )
+    duration_seconds: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Target audio duration in seconds (MOSS-SoundEffect). Converted to ~12.5 frames/s internally.",
+    )
     x_vector_only_mode: bool | None = Field(
         default=None,
         description="Use speaker embedding only without in-context learning (Base task)",
@@ -99,6 +114,50 @@ class OpenAICreateSpeechRequest(BaseModel):
         if v is not None and not all(math.isfinite(x) for x in v):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_higgs_audio_v2_unsupported_aliases(cls, data):
+        """Reject unsupported rich-input aliases for higgs_audio_v2 BEFORE pydantic strips them.
+
+        OpenAICreateSpeechRequest is a permissive schema (it accepts any extra
+        field that the OpenAI Speech API didn't promise to ban) but several
+        of those aliases pull a request out of the v1 higgs_audio_v2 scope.
+        Catching them at parse time lets the API return a deterministic 4xx
+        with a model-specific error message instead of silently dropping the
+        field and proceeding with a degraded request.
+        """
+        # Keys that are silently dropped by pydantic when posted to /v1/audio/speech
+        # (the schema doesn't declare them) but which a model-specific
+        # validator MUST be able to reject. Kept inline to avoid clashing
+        # with pydantic's ModelPrivateAttr discovery for class-level
+        # underscore-prefixed attributes.
+        higgs_audio_v2_reserved_keys = (
+            "messages",  # ChatML rich content (out of scope for v1)
+            "reference_audio",  # voice-cloning alias 1
+            "voice_prompt",  # voice-cloning alias 2
+            "speaker_audio",  # voice-cloning alias 3
+            "speakers",  # multi-speaker dialogue
+        )
+        if not isinstance(data, dict):
+            return data
+        model_id = data.get("model")
+        if not isinstance(model_id, str):
+            return data
+        # Match the "higgs_audio_v2" model_type label, the HF architecture id
+        # in pipeline_registry.hf_architectures, and the hyphenated HF repo id
+        # (e.g. "bosonai/higgs-audio-v2-generation-3B-base") by normalizing
+        # both underscores and hyphens out of the id before substring matching.
+        normalized = model_id.lower().replace("-", "").replace("_", "")
+        if "higgsaudiov2" not in normalized:
+            return data
+        offending = sorted(k for k in higgs_audio_v2_reserved_keys if k in data)
+        if offending:
+            raise ValueError(
+                "higgs_audio_v2 v1 does not support these rich-input fields: "
+                f"{offending}. Supply plain text via the 'input' field instead."
+            )
+        return data
 
     @model_validator(mode="after")
     def validate_embedding_constraints(self) -> "OpenAICreateSpeechRequest":

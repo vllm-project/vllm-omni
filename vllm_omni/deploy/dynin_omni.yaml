@@ -1,0 +1,38 @@
+# Dynin-Omni 3-stage deploy: token2text → token2image → token2audio.
+#
+# Topology (stages, processor functions, model_arch) is frozen in
+# vllm_omni/model_executor/models/dynin_omni/pipeline.py. This file carries
+# only the deploy-time knobs (devices, GPU memory, batched tokens).
+#
+# async_chunk=false: dynin hands the full token payload across stages through
+# the worker-connector data plane (``*_full_payload`` producers), not chunked
+# streaming. Pipeline-wide ``trust_remote_code`` is required by the custom
+# Dynin HF modeling code.
+async_chunk: false
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.5
+    max_num_batched_tokens: 32768
+    enforce_eager: true
+    async_scheduling: false
+
+  - stage_id: 1
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.1
+    max_num_batched_tokens: 32768
+    enforce_eager: true
+    async_scheduling: false
+
+  - stage_id: 2
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.1
+    max_num_batched_tokens: 32768
+    enforce_eager: true
+    async_scheduling: false

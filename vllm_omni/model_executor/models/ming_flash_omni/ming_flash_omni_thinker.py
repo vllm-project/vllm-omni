@@ -6,6 +6,7 @@
 
 """Ming-flash-omni-2.0 Thinker stage implementation (multimodal understanding)."""
 
+import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Annotated, Any
 
@@ -113,7 +114,9 @@ class MingFlashOmniThinkerProcessingInfo(Qwen2VLProcessingInfo):
         return 1
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": None, "video": None, "audio": None}
+        # ``img2img`` is the serving-layer alias for a reference image in the
+        # image-gen path; treated as a regular image by ``_MingMultiModalDataParser``.
+        return {"image": None, "video": None, "audio": None, "img2img": 1}
 
     def get_mm_max_tokens_per_item(
         self,
@@ -137,7 +140,14 @@ class MingFlashOmniThinkerProcessingInfo(Qwen2VLProcessingInfo):
 
         return mm_max_tokens
 
-    def get_feature_extractor(self, **kwargs: object) -> MingWhisperFeatureExtractor:
+    def get_feature_extractor(self, **kwargs: object):
+        """Return the audio feature extractor from the processor.
+
+        The processor may be loaded via trust_remote_code paths that return
+        a stock transformers ``WhisperFeatureExtractor`` rather than
+        vllm-omni's subclass ``MingWhisperFeatureExtractor``. We accept both
+        as long as the caller-needed attributes (``sampling_rate``) exist.
+        """
         hf_processor = self.get_hf_processor(**kwargs)
         feature_extractor = hf_processor.audio_processor
         assert isinstance(feature_extractor, MingWhisperFeatureExtractor)
@@ -145,11 +155,54 @@ class MingFlashOmniThinkerProcessingInfo(Qwen2VLProcessingInfo):
 
     def get_data_parser(self):
         feature_extractor = self.get_feature_extractor()
-        return MultiModalDataParser(
+        return _MingMultiModalDataParser(
             target_sr=feature_extractor.sampling_rate,
             target_channels=self.get_target_channels(),
             expected_hidden_size=self._get_expected_hidden_size(),
         )
+
+
+class _MingMultiModalDataParser(MultiModalDataParser):
+    """Rewrite ``img2img`` → ``image`` in-place so the thinker embeds the ref.
+
+    Matches Ming's upstream (``processing_bailingmm2.py::__call__``): when
+    ``images`` is provided the image_processor runs → pixel_values + image_grid_thw,
+    and ``_expand_image_tokens`` expands ``<IMAGE>`` placeholders in the text
+    to ``<imagePatch>*N``. The same PIL then ALSO goes to the diffusion stage
+    as ``image_gen_pixel_values_reference``.
+
+    On vllm-omni's serving path serving_chat emits
+    ``multi_modal_data={"img2img": PIL}`` (Bagel convention). We mutate the
+    caller's mm_data dict here — moving the PIL from the ``img2img`` key into
+    the ``image`` key — so that:
+
+      * vLLM's renderer validator sees consistent keys in
+        ``mm_data`` and the parser output (``mm_data_items["image"]``)
+      * The thinker-side image path (``_call_hf_processor`` reads
+        ``mm_data["images"]``, ``_get_prompt_updates`` replaces ``<IMAGE>``
+        placeholders, ``_get_mm_fields_config`` declares image field layout)
+        all run normally with the ref PIL acting as a regular image input
+      * ``thinker2imagegen`` still finds the ref PIL — but now under
+        ``multi_modal_data["image"]`` rather than ``["img2img"]``.
+
+    A companion prepend in ``_apply_hf_processor_main`` ensures the prompt
+    text carries a matching ``<IMAGE>`` placeholder when needed.
+    """
+
+    def parse_mm_data(self, mm_data):
+        if "img2img" in mm_data:
+            img2img = mm_data.pop("img2img")
+            if not isinstance(img2img, list):
+                img2img = [img2img]
+            existing = mm_data.get("image")
+            if existing is None:
+                existing_list: list[Any] = []
+            elif isinstance(existing, list):
+                existing_list = list(existing)
+            else:
+                existing_list = [existing]
+            mm_data["image"] = existing_list + img2img
+        return super().parse_mm_data(mm_data)
 
 
 class MingFlashOmniThinkerDummyInputsBuilder(BaseDummyInputsBuilder[MingFlashOmniThinkerProcessingInfo]):
@@ -185,6 +238,8 @@ class MingFlashOmniThinkerDummyInputsBuilder(BaseDummyInputsBuilder[MingFlashOmn
 
         audio_length = int(audio_duration * sample_rate)
 
+        num_img2img = mm_counts.get("img2img", 0)
+
         mm_data: MultiModalDataDict = {
             "image": self._get_dummy_images(
                 width=image_width,
@@ -199,6 +254,13 @@ class MingFlashOmniThinkerDummyInputsBuilder(BaseDummyInputsBuilder[MingFlashOmn
             ),
             "audio": [(np.random.randn(audio_length).astype(np.float32), sample_rate) for _ in range(num_audios)],
         }
+
+        if num_img2img > 0:
+            mm_data["img2img"] = self._get_dummy_images(
+                width=image_width,
+                height=image_height,
+                num_images=num_img2img,
+            )
 
         return mm_data
 
@@ -396,6 +458,61 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
     ) -> bool:
         return False
 
+    def _apply_hf_processor_main(
+        self,
+        prompt: str | list[int],
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+        *,
+        enable_hf_prompt_update: bool,
+    ):
+        """Apply Ming-specific prompt rewrites before delegating to vllm's
+        default text / multimodal processing pipeline.
+
+        This is the single point in the base MM-processor call graph where we
+        still have BOTH the full prompt and the request-level
+        ``hf_processor_mm_kwargs`` together. Downstream, vllm's MM caching
+        design splits the work into
+        :meth:`_apply_hf_processor_text_only` (prompt, empty kwargs) and
+        :meth:`_apply_hf_processor_mm_only` (dummy text, real kwargs), so a
+        per-request flag like ``modalities`` cannot reach the real
+        tokenization from inside :meth:`_call_hf_processor`.
+
+        For Ming-flash-omni-2.0, image-generation requests carry
+        ``mm_processor_kwargs["modalities"]`` set to ``["image"]`` (t2i) or
+        ``["img2img"]`` (image edit). We expand the prompt here with the
+        ``<image><imagePatch>*N</image>`` query-token block so the expanded
+        form flows through both the tokenization and (eventual) MM paths.
+        For img2img, we also prepend ``<IMAGE>`` so the thinker-side prompt
+        replacement can locate the reference-image placeholder.
+        """
+        modalities = hf_processor_mm_kwargs.get("modalities") or []
+        is_image_gen = "image" in modalities or "img2img" in modalities
+        if isinstance(prompt, str) and is_image_gen:
+            from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
+                DEFAULT_NUM_QUERY_TOKENS,
+                maybe_expand_image_gen_prompt,
+            )
+
+            # img2img: prepend ``<IMAGE>`` so the ref-image placeholder survives
+            # MM caching (when the ref image is cache-warm, the thinker sees 0
+            # missing items and cannot inject the placeholder itself).
+            if "img2img" in modalities:
+                prompt = "<IMAGE>" + prompt
+
+            ig = getattr(self.info.ctx.model_config.hf_config, "image_gen_config", None)
+            num_query_tokens = getattr(ig, "num_query_tokens", DEFAULT_NUM_QUERY_TOKENS)
+            prompt = maybe_expand_image_gen_prompt(prompt, num_query_tokens=int(num_query_tokens))
+
+        return super()._apply_hf_processor_main(
+            prompt=prompt,
+            mm_items=mm_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+            enable_hf_prompt_update=enable_hf_prompt_update,
+        )
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -408,6 +525,11 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         We call the image/audio sub-processors directly (instead of going
         through `MingFlashOmniProcessor.__call__`) so that the high-level
         placeholder tokens remain **unexpanded** in the tokenized output.
+
+        NOTE: Image-gen prompt expansion is handled in
+        :meth:`_apply_hf_processor_main` — by the time we get here, vllm's
+        MM caching has already split text/mm processing and ``mm_kwargs``
+        is empty on the text-only branch.
         """
         hf_processor = self.info.get_hf_processor()
         tokenizer = self.info.get_tokenizer()
@@ -425,6 +547,8 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
 
         videos = mm_data.get("videos", None)
         if videos is not None:
+            # TODO: ``videos=`` on image_processor is deprecated since
+            # transformers v4.57 (removed in v5); migrate to Qwen2VLVideoProcessor.
             video_outputs = hf_processor.image_processor(
                 images=None,
                 videos=videos,
@@ -487,8 +611,13 @@ class MingFlashOmniThinkerForConditionalGeneration(
             return "<VIDEO>"
         elif modality.startswith("audio"):
             return "<AUDIO>"
+        elif modality == "img2img":
+            # Ming's img2img ref image is consumed only by the diffusion stage
+            # (``thinker2imagegen`` reads the raw PIL). No text-side placeholder
+            # is emitted for the thinker.
+            return None
 
-        raise ValueError("Only image, video, or audio modality is supported")
+        raise ValueError("Only image, video, audio, or img2img modality is supported")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -548,10 +677,79 @@ class MingFlashOmniThinkerForConditionalGeneration(
             )
         logger.info("Initialized WhisperAudioEncoder and AudioProjector")
 
+        # Image-generation learnable query tokens. Stored as a ParameterDict
+        # keyed by scale name (e.g. "16x16" -> [256, hidden_size]) to mirror
+        # the upstream Ming layout in ``mlp/query_tokens_dict.<scale>``. These
+        # are substituted in at ``<imagePatch>`` token positions during
+        # text-to-image requests; image-comprehension requests continue to
+        # fill those positions with vision features as before.
+        self.query_tokens_dict = nn.ParameterDict()
+        self._load_image_gen_query_tokens(vllm_config.model_config.model)
+
         # Expose interfaces
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 
-        logger.info("MingFlashOmniThinker initialized with vision and audio towers")
+        logger.info(
+            f"MingFlashOmniThinker initialized with: "
+            f"vision={'yes' if self.vision else 'no'}, "
+            f"audio={'yes' if self.audio else 'no'}, "
+            f"image_gen_scales={list(self.query_tokens_dict.keys())}"
+        )
+
+    def _load_image_gen_query_tokens(self, model_path: str) -> None:
+        """Load learnable query tokens used for image generation.
+
+        Expected layout (observed on inclusionAI/Ming-flash-omni-2.0):
+            <model_path>/mlp/model.safetensors
+                key ``query_tokens_dict.<scale>`` -> [num_tokens, hidden_size]
+                e.g. ``query_tokens_dict.16x16`` -> [256, 4096]
+
+        Missing files are logged as a warning and image-gen is disabled
+        (text-only inference still works).
+        """
+        from pathlib import Path
+
+        p = Path(model_path) / "mlp" / "model.safetensors"
+        if not p.exists() and not os.path.exists(model_path):
+            from vllm_omni.model_executor.model_loader.weight_utils import (
+                download_weights_from_hf_specific,
+            )
+
+            try:
+                local_path = download_weights_from_hf_specific(model_path, None, ["mlp/*"])
+                p = Path(local_path) / "mlp" / "model.safetensors"
+            except Exception:
+                logger.exception("[MingFlashOmniThinker] failed to download mlp/ from %s", model_path)
+        if not p.exists():
+            logger.warning(
+                "[MingFlashOmniThinker] mlp/model.safetensors not found at %s; "
+                "text-to-image will be disabled (text-only inference still works).",
+                p,
+            )
+            return
+        try:
+            from safetensors.torch import load_file  # type: ignore
+
+            state = load_file(str(p))
+        except Exception:
+            logger.exception("[MingFlashOmniThinker] failed to read %s", p)
+            return
+        loaded = 0
+        for key, tensor in state.items():
+            if not key.startswith("query_tokens_dict."):
+                continue
+            scale_name = key.split(".", 1)[1]
+            param = nn.Parameter(tensor.clone(), requires_grad=False)
+            self.query_tokens_dict[scale_name] = param
+            loaded += 1
+            logger.info(
+                "[MingFlashOmniThinker] loaded query_tokens_dict[%s] shape=%s dtype=%s",
+                scale_name,
+                tuple(tensor.shape),
+                tensor.dtype,
+            )
+        if loaded == 0:
+            logger.warning("[MingFlashOmniThinker] no query_tokens_dict.* keys in mlp/model.safetensors")
 
     def extract_image_feature(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         """Extract and project image features.
@@ -732,14 +930,86 @@ class MingFlashOmniThinkerForConditionalGeneration(
     ) -> torch.Tensor:
         inputs_embeds = self.language_model.model.word_embeddings(input_ids)
 
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return inputs_embeds
+        # Step 1: if vision/audio features were extracted, merge them into
+        # inputs_embeds at their <patch> positions first. This fills ref-image
+        # and other normal vision-input positions with real features.
+        if multimodal_embeddings is not None and len(multimodal_embeddings) > 0:
+            assert is_multimodal is not None, "`is_multimodal` mask required when `multimodal_embeddings` provided"
+            inputs_embeds = _merge_multimodal_embeddings(
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=multimodal_embeddings,
+                is_multimodal=is_multimodal,
+            )
 
-        assert is_multimodal is not None, "`is_multimodal` mask required when `multimodal_embeddings` provided"
-        return _merge_multimodal_embeddings(
-            inputs_embeds=inputs_embeds,
-            multimodal_embeddings=multimodal_embeddings,
-            is_multimodal=is_multimodal,
+        # Step 2: image-gen query tokens are appended at the tail of the prompt
+        # as a contiguous block of ``<imagePatch>`` tokens. Inject the learnable
+        # ``query_tokens_dict`` entries at those positions. Running AFTER step 1
+        # is safe because the query-token block is disjoint from ref-image
+        # patch positions (ref patches are earlier in the prompt, filled by
+        # step 1; query tokens occupy the trailing block and get overwritten
+        # here). Injecting always — including when multimodal embeddings are
+        # present — matches Ming's img2img-edit flow where BOTH a real image
+        # input AND the learnable query tokens need to reach the LLM.
+        if len(self.query_tokens_dict) > 0:
+            self._maybe_inject_image_gen_query_embeds(input_ids, inputs_embeds)
+        return inputs_embeds
+
+    def _maybe_inject_image_gen_query_embeds(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+    ) -> None:
+        """Overwrite the trailing ``<imagePatch>`` block with learnable query tokens.
+
+        The image-gen query-token block is appended at the tail of the prompt
+        by ``maybe_expand_image_gen_prompt`` as literal text
+        ``<image><imagePatch>*N</image>``. After tokenization:
+
+            ... <image_start_token> <imagePatch>*N <image_end_token>
+
+        is the exact trailing pattern. We verify that signature before
+        injecting — without the check, a pure vision-understanding request
+        whose final ref-image block ends in N or more ``<imagePatch>`` tokens
+        would be misidentified as image-gen and its vision features silently
+        overwritten. Decode-phase calls (``input_ids`` is one next-token)
+        naturally fail the signature check and return early.
+        """
+        if input_ids.numel() == 0:
+            return
+        patch_token_id = self.config.image_patch_token
+        image_end_token_id = getattr(self.config, "image_end_token", None)
+        if image_end_token_id is None:
+            return
+
+        scale_items = list(self.query_tokens_dict.items())
+        if not scale_items:
+            return
+        scale_name, query_param = scale_items[-1]
+        num_query_tokens = int(query_param.shape[0])
+
+        flat = input_ids.view(-1)
+        L = int(flat.numel())
+        # Need at least num_query_tokens patch tokens + 1 <image_end> token.
+        if L < num_query_tokens + 1:
+            return
+
+        # Signature: the prompt must end with <image_end_token>, and the
+        # N positions immediately before it must all be <imagePatch>.
+        if int(flat[-1].item()) != image_end_token_id:
+            return
+        tail_start = L - 1 - num_query_tokens
+        tail_end = L - 1  # exclusive — last index is <image_end_token>
+        if not (flat[tail_start:tail_end] == patch_token_id).all():
+            return
+
+        query_embeds = query_param.to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+        inputs_embeds[tail_start:tail_end] = query_embeds
+        logger.debug(
+            "[MingFlashOmniThinker] injected %d image-gen query embeddings (scale=%s) at positions [%d, %d)",
+            num_query_tokens,
+            scale_name,
+            tail_start,
+            tail_end,
         )
 
     def forward(

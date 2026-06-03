@@ -49,43 +49,30 @@ def get_batch_token_config(default_path):
     )
 
 
-def get_default_config(default_path):
-    """Flip async_chunk on and bump stage 0 thinker output to 2048 tokens.
-
-    Pipeline registry (qwen3_omni/pipeline.py) already wires
-    thinker2talker_async_chunk / talker2code2wav_async_chunk on stages 0/1,
-    so no per-stage processor override is needed. Using only flat-schema
-    writes so _parse_stage_deploy stays in its flat branch (nested
-    ``engine_args:`` would drop other overlay fields).
-    """
-    return modify_stage_config(
-        default_path,
-        updates={
-            "stages": {0: {"default_sampling_params.max_tokens": 2048}},
-        },
-    )
-
-
 # CI deploy YAML (single file; xpu deltas applied via ``platforms:`` section).
 # The overlay explicitly sets ``async_chunk: False``, so ``default`` tests the
 # sync path and ``async_chunk`` tests the streaming path with a longer thinker
 # output — two distinct scenarios, kept as separate parametrizations.
-default_path = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
+default_path = get_deploy_config_path("qwen3_omni_moe.yaml")
 
 test_params = [
     pytest.param(
         OmniServerParams(
             model=model,
-            stage_config_path=get_default_config(default_path),
+            stage_config_path=default_path,
             use_stage_cli=True,
-            server_args=["--no-async-chunk"],
+            server_args=[
+                "--no-async-chunk",
+                "--stage-overrides",
+                '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
+            ],
         ),
         id="default",
     ),
     pytest.param(
         OmniServerParams(
             model=model,
-            stage_config_path=get_default_config(default_path),
+            stage_config_path=default_path,
             use_stage_cli=True,
             server_args=["--async-chunk"],
         ),
@@ -556,3 +543,24 @@ def test_language_001(omni_server, openai_client) -> None:
     }
 
     openai_client.send_omni_request(request_config)
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text only (long-form generation prompt).
+    Output Modal: text, audio (default ``modalities``);
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text="Tell a 300-word story.",
+    )
+
+    request_config = {"model": omni_server.model, "messages": messages, "stream": True}
+    responses = openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    text = responses[0].text_content if responses else ""
+    word_count = len(text.split())
+    assert word_count >= 200, f"Expected at least 200 words in long output, got {word_count}"

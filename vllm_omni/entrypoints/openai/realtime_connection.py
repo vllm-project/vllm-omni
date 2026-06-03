@@ -16,10 +16,8 @@ from uuid import uuid4
 import numpy as np
 from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel, UsageInfo
-from vllm.entrypoints.openai.realtime.connection import (
-    RealtimeConnection as VllmRealtimeConnection,
-)
-from vllm.entrypoints.openai.realtime.protocol import (
+from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
+from vllm.entrypoints.speech_to_text.realtime.protocol import (
     InputAudioBufferCommit,
     TranscriptionDelta,
     TranscriptionDone,
@@ -371,7 +369,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         """Override generation to add text streaming and tool call detection."""
         request_id = f"rt-{self.connection_id}-{uuid4()}"
         sent_audio = False
-        done_sent = False
+        audio_done_sent = False
         self._realtime_audio_ref = None
 
         self.current_tool_calls = []
@@ -433,8 +431,11 @@ class RealtimeConnection(VllmRealtimeConnection):
                             full_text = ""
                         last_prompt_token_ids_len = cur_prompt_token_ids_len
 
-                        if not prompt_token_ids_len and output.prompt_token_ids:
-                            prompt_token_ids_len = len(output.prompt_token_ids)
+                        if output.prompt_token_ids:
+                            prompt_token_ids_len = max(
+                                prompt_token_ids_len,
+                                len(output.prompt_token_ids),
+                            )
                         if new_token_ids:
                             input_stream.put_nowait(new_token_ids)
                         delta_text = first_output.text or ""
@@ -465,13 +466,13 @@ class RealtimeConnection(VllmRealtimeConnection):
 
             if sent_audio:
                 await self.send(ResponseAudioDone())
-                done_sent = True
+                audio_done_sent = True
 
         except Exception as e:
             logger.exception("Error in generation: %s", e)
             await self.send_error(str(e), "processing_error")
         finally:
-            if self._is_connected and not done_sent and sent_audio:
+            if self._is_connected and not audio_done_sent and sent_audio:
                 try:
                     await self.send(ResponseAudioDone())
                 except Exception:
@@ -488,7 +489,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         talker's hidden_projection sees purely acoustic states for bootstrap.
         """
         sent_audio = False
-        done_sent = False
+        audio_done_sent = False
         self._realtime_audio_ref = None
         try:
             # Wait for the side-channel STT so the current user item has a
@@ -721,7 +722,7 @@ class RealtimeConnection(VllmRealtimeConnection):
 
             if sent_audio:
                 await self.send(ResponseAudioDone())
-                done_sent = True
+                audio_done_sent = True
 
             if append_response and not audio_pass_tool_call_detected:
                 # Only append when no tool call was detected — the detection
@@ -741,7 +742,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             logger.exception("Error in audio-from-tool-context pass: %s", exc)
             await self.send_error(str(exc), "processing_error")
         finally:
-            if not done_sent and sent_audio:
+            if not audio_done_sent and sent_audio:
                 try:
                     await self.send(ResponseAudioDone())
                 except Exception:

@@ -14,6 +14,7 @@ models:
     supported_tasks: [default_voice, voice_design]
     backend: openai-audio-speech
     endpoint: /v1/audio/speech
+    trust_remote_code: true
     task_extra_body:
       default_voice:
         voice: Vivian
@@ -27,13 +28,76 @@ models:
     supported_tasks: [voice_clone]
     backend: openai-audio-speech
     endpoint: /v1/audio/speech
+    trust_remote_code: true
     task_extra_body:
       voice_clone:
         task_type: Base
 
   openbmb/VoxCPM2:
+    supported_tasks: [voice_clone, default_voice]
+    trust_remote_code: true
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      voice_clone: {}
+      default_voice:
+        voice: default
+
+  # MOSS-TTS family. After the serving_speech.py variant-detection refactor
+  # all five variants now go through OpenAI /v1/audio/speech with the
+  # variant-specific request fields (ambient_sound, ref_audio_2, instructions).
+  OpenMOSS-Team/MOSS-TTS:
     supported_tasks: [voice_clone]
     backend: openai-audio-speech
     endpoint: /v1/audio/speech
     task_extra_body:
       voice_clone: {}
+
+  # MOSS-TTS-v1.5: continued-training upgrade of MOSS-TTS 1.0 — same
+  # MossTTSDelay-8B architecture and API, so identical wiring. Adds 31-language
+  # synthesis via the `language` field and inline `[pause Xs]` markers.
+  OpenMOSS-Team/MOSS-TTS-v1.5:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
+
+  OpenMOSS-Team/MOSS-TTS-Realtime:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
+
+  # MOSS-TTSD synthesizes [S1]/[S2] dialogue. The seed-tts voice_clone dataset
+  # has single-speaker rows; bench piggybacks on it (both speakers share the
+  # same ref_audio). For real dialogue evaluation use the ttsd dataset.
+  OpenMOSS-Team/MOSS-TTSD-v1.0:
+    supported_tasks: [voice_clone, dialogue]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
+      dialogue: {}
+
+  # MOSS-SoundEffect ignores text/ref_audio; expects ambient_sound +
+  # duration_seconds. The sound_effect dataset module emits those.
+  OpenMOSS-Team/MOSS-SoundEffect:
+    supported_tasks: [sound_effect]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      sound_effect:
+        duration_seconds: 10
+
+  # MOSS-VoiceGenerator: instructions-driven (no ref_audio). seed-tts-design
+  # dataset already emits {instructions, target_text}, so voice_design works
+  # out of the box once the serving validator accepts instructions.
+  OpenMOSS-Team/MOSS-VoiceGenerator:
+    supported_tasks: [voice_design]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_design: {}

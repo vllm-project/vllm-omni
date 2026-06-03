@@ -21,7 +21,6 @@ import os
 import numpy as np
 import soundfile as sf
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -80,7 +79,12 @@ def run_e2e():
         default=600,
         help="Stage initialization timeout in seconds",
     )
-    nullify_stage_engine_defaults(parser)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for generation",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.stage_config):
@@ -122,7 +126,7 @@ def run_e2e():
     if mm_processor_kwargs:
         prompts["mm_processor_kwargs"] = mm_processor_kwargs
 
-    sampling_params_list = [OmniDiffusionSamplingParams()]
+    sampling_params_list = [OmniDiffusionSamplingParams(extra_args={"seed": args.seed})]
 
     print(f"Generating speech for: {args.text}")
 

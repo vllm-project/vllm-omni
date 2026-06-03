@@ -4,12 +4,20 @@ Orchestrator for vLLM-Omni multi-stage runtime.
 Runs inside a background thread with its own asyncio event loop.
 Owns logical request progression across stage pools and handles
 stage-to-stage transfer logic.
+
+In distributed mode (``coordinator_pub_address`` provided), it also
+owns the single :class:`OmniCoordClientForHub`, runs a
+:meth:`_watch_replica_list` task that converts replica disappearances
+into ``unregister_remote_replica`` control messages, and handles the
+``register_remote_replica`` / ``unregister_remote_replica`` flow that
+attaches / detaches head-side stage clients for headless replicas.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time as _time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,7 +29,14 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.distributed.omni_coordinator import (
+    LoadBalancer,
+    OmniCoordClientForHub,
+    RandomBalancer,
+    ReplicaStatus,
+)
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import (
@@ -32,13 +47,27 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
     OutputMessage,
+    RegisterRemoteReplicaMessage,
     ShutdownRequestMessage,
     StageMetricsMessage,
     StageSubmissionMessage,
+    UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
+
+# Factory signature for building a head-side stage client for a
+# *dynamically attached* (auto-assigned) remote replica.
+#
+# Receives ``(stage_id, replica_id)`` and returns an awaitable yielding the
+# constructed client (any type — it must satisfy the shape expected by the
+# matching :class:`StagePool`, i.e. expose ``client_addresses["input_address"]``
+# or ``request_address``, plus the usual ``add_request_async`` /
+# ``get_output_async`` / ``shutdown`` surface).
+RemoteReplicaFactory = Callable[[int, int], Awaitable[Any]]
 
 logger = init_logger(__name__)
 
@@ -81,7 +110,7 @@ def build_engine_core_request_from_tokens(
         pooling_params=pooling_params,
         arrival_time=arrival_time,
         lora_request=getattr(params, "lora_request", None),
-        cache_salt=None,
+        cache_salt=prompt.get("cache_salt"),
         data_parallel_rank=None,
         prompt_embeds=prompt_embeds,
         resumable=resumable,
@@ -125,15 +154,31 @@ class StreamingInputState:
 class Orchestrator:
     """Runs inside a background thread's asyncio event loop."""
 
+    # Cadence at which the replica-list watcher polls for disappearances.
+    _WATCH_REPLICA_INTERVAL_S: float = 0.5
+    _WATCH_REPLICA_IDLE_INTERVAL_S: float = 1.0
+
+    # Class-level defaults so tests that bypass __init__ via object.__new__
+    # don't AttributeError when transfer / counter emit paths access them.
+    _running_counter: OmniRequestCounter | None = None
+    _transfer_emitter: Any = None
+    _stat_logger: OmniPrometheusStatLogger | None = None
+
     def __init__(
         self,
         request_async_queue: janus.AsyncQueue[EngineQueueMessage],
-        output_async_queue: janus.AsyncQueue[EngineQueueMessage],
-        rpc_async_queue: janus.AsyncQueue[EngineQueueMessage],
+        output_async_queue: janus.AsyncQueue[dict[str, Any]],
+        rpc_async_queue: janus.AsyncQueue[dict[str, Any]],
         stage_pools: list[StagePool],
         *,
         async_chunk: bool = False,
         pd_config: dict[str, Any] | None = None,
+        running_counter: OmniRequestCounter | None = None,
+        coordinator_pub_address: str | None = None,
+        load_balancer_factory: Callable[[], LoadBalancer] | None = None,
+        remote_replica_factory: RemoteReplicaFactory | None = None,
+        transfer_emitter: Any = None,
+        log_stats: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -153,12 +198,101 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
+        self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
+
         self._cfg_tracker = CfgCompanionTracker()
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
         self._fatal_error: str | None = None
         self._fatal_error_stage_id: int | None = None
+
+        # Background tasks for fire-and-forget message handlers (currently
+        # only ``register_remote_replica`` and ``unregister_remote_replica``).
+        # Held as a set so each task's reference survives the loop and the
+        # task can self-deregister on completion.
+        self._membership_tasks: set[asyncio.Task[None]] = set()
+
+        # Distributed-mode wiring. The hub is constructed on the
+        # orchestrator's asyncio loop because it spawns a SUB background
+        # thread; building it from another thread would race the
+        # ``_init_done`` event.
+        self._hub: OmniCoordClientForHub | None = (
+            OmniCoordClientForHub(coordinator_pub_address) if coordinator_pub_address is not None else None
+        )
+        self._remote_replica_factory = remote_replica_factory
+        # Inject hub + per-pool LB into each StagePool so they can run
+        # distributed dispatch via ``StagePool.pick``.
+        if self._hub is not None:
+            factory = load_balancer_factory or RandomBalancer
+            for pool in self.stage_pools:
+                pool.attach_hub(self._hub)
+                pool.attach_load_balancer(factory())
+
+    def _init_metrics_state(
+        self,
+        stage_pools: list[StagePool],
+        running_counter: OmniRequestCounter | None,
+        transfer_emitter: Any,
+        log_stats: bool = False,
+    ) -> None:
+        """Wire up all metric-related orchestrator state.
+
+        Sets ``self._running_counter`` and ``self._transfer_emitter``
+        (both optional, used by request-add / forward paths), builds the
+        ``(stage_id, replica_id) ↔ engine_idx`` lookup used at record() time,
+        and best-effort constructs the ``OmniPrometheusStatLogger`` wrap
+        that exposes ~37 upstream ``vllm:*`` families with per-(stage,
+        replica) labels. Failure to build the wrap is logged and metrics
+        are simply disabled — orchestrator construction continues so unit
+        tests with a minimal ``vllm_config`` still pass.
+
+        ``log_stats=False`` short-circuits the wrap entirely so the
+        ~65 upstream ``vllm:*`` families are not registered in the
+        Prometheus default registry at all. The per-step record() path
+        already no-ops on ``scheduler_stats is None`` (which is what
+        the upstream scheduler returns when its own log_stats is False),
+        so this gate is mainly to keep the ``/metrics`` surface clean
+        when the user did not request stats.
+        """
+        self._running_counter = running_counter
+        self._transfer_emitter = transfer_emitter
+
+        # Flat engine_idx ↔ (stage, replica) maps. The reverse map is
+        # consulted at record() time to translate the orchestrator's
+        # (stage_id, replica_id) loop variables into an engine_idx the
+        # underlying PrometheusStatLogger can address.
+        stage_replica_map: dict[int, tuple[str, str]] = {}
+        self._stage_replica_to_engine_idx: dict[tuple[int, int], int] = {}
+        flat_idx = 0
+        for stage_id, pool in enumerate(stage_pools):
+            for replica_id in range(pool.num_replicas):
+                stage_replica_map[flat_idx] = (str(stage_id), str(replica_id))
+                self._stage_replica_to_engine_idx[(stage_id, replica_id)] = flat_idx
+                flat_idx += 1
+
+        if not log_stats:
+            self._stat_logger = None
+            return
+
+        vllm_config_for_stats = next(
+            (p.stage_vllm_config for p in stage_pools if p.stage_vllm_config is not None),
+            None,
+        )
+        if vllm_config_for_stats is None:
+            self._stat_logger = None
+            return
+        try:
+            self._stat_logger = OmniPrometheusStatLogger(
+                vllm_config=vllm_config_for_stats,
+                stage_replica_map=stage_replica_map,
+            )
+        except Exception:
+            # Minimal vllm_config in unit-test contexts can lack fields the
+            # upstream PrometheusStatLogger expects. Skip wrap rather than
+            # break orchestrator construction.
+            logger.exception("[Orchestrator] OmniPrometheusStatLogger init failed; metrics wrap disabled")
+            self._stat_logger = None
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -169,21 +303,35 @@ class Orchestrator:
             self._orchestration_output_handler(),
             name="orchestrator-stage-output-handler",
         )
+        # The replica watcher only runs in distributed mode. It's still
+        # created in both cases so ``run()`` has a uniform task graph;
+        # ``_watch_replica_list`` is a no-op poll when ``self._hub`` is None.
+        watch_task = asyncio.create_task(
+            self._watch_replica_list(),
+            name="orchestrator-replica-watcher",
+        )
 
         try:
-            await asyncio.gather(request_task, output_task)
+            await asyncio.gather(request_task, output_task, watch_task)
         except asyncio.CancelledError:
             raise
+        except EngineDeadError as e:
+            # EngineDeadError from _orchestration_loop means the diffusion
+            # engine died.  All pending requests were already notified and
+            # _shutdown_event was already set by the loop's handler.
+            # During teardown this is expected; the finally block handles
+            # proper cleanup.  Do not re-raise.
+            logger.info("[Orchestrator] Engine dead during shutdown: %s", e)
         except Exception:
             logger.exception("[Orchestrator] Fatal error in orchestrator tasks")
             raise
         finally:
             self._shutdown_event.set()
-            for task in (request_task, output_task):
+            for task in (request_task, output_task, watch_task):
                 if not task.done():
                     task.cancel()
             try:
-                await asyncio.gather(request_task, output_task, return_exceptions=True)
+                await asyncio.gather(request_task, output_task, watch_task, return_exceptions=True)
             except Exception:
                 pass
 
@@ -193,7 +341,31 @@ class Orchestrator:
             if self._fatal_error is not None:
                 await self._drain_pending_requests_on_fatal()
 
+            # Wait briefly for any in-flight membership handlers (register /
+            # unregister remote replica) to finish so they don't leave the
+            # head-side pool in a half-attached state. Cancel anything that
+            # hasn't completed in time; the generic pending-task sweep below
+            # will collect the cancellations.
+            if self._membership_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*self._membership_tasks, return_exceptions=True),
+                        timeout=10.0,
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    for t in self._membership_tasks:
+                        if not t.done():
+                            t.cancel()
+
             self._shutdown_stages()
+
+            # Close the hub last so any in-flight dispatch still has access.
+            if self._hub is not None:
+                try:
+                    self._hub.close()
+                except RuntimeError:
+                    pass
+                self._hub = None
 
             loop = asyncio.get_running_loop()
             pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task() and not t.done()]
@@ -202,33 +374,72 @@ class Orchestrator:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
 
+    # ---- Background task helpers ----
+
+    def _spawn_membership_task(self, coro: Awaitable[None], *, label: str) -> None:
+        """Run a fire-and-forget membership-change coroutine.
+
+        Holds a strong reference until completion (asyncio would otherwise
+        garbage-collect a bare task), and logs any uncaught exception.
+        """
+        task = asyncio.create_task(coro, name=f"orchestrator-{label}")
+        self._membership_tasks.add(task)
+
+        def _on_done(t: asyncio.Task[None]) -> None:
+            self._membership_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.error("[Orchestrator] %s task crashed", label, exc_info=exc)
+
+        task.add_done_callback(_on_done)
+
     # ---- Request handling ----
 
     async def _request_handler(self) -> None:
         """Read messages from the main thread via request_async_queue."""
         while True:
             msg = await self.request_async_queue.get()
+            msg_type = msg.type
 
-            if isinstance(msg, StageSubmissionMessage):
-                if msg.type == "add_request":
-                    await self._handle_add_request(msg)
-                elif msg.type == "streaming_update":
-                    await self._handle_streaming_update(msg)
-                else:
-                    logger.warning("[Orchestrator] Unknown stage submission type: %s", msg.type)
-            elif isinstance(msg, AddCompanionRequestMessage):
+            if msg_type == "add_request":
+                await self._handle_add_request(msg)
+            elif msg_type == "streaming_update":
+                await self._handle_streaming_update(msg)
+            elif msg_type == "add_companion_request":
                 await self._handle_add_companion(msg)
-            elif isinstance(msg, AbortRequestMessage):
+            elif msg_type == "abort":
                 await self._handle_abort(msg)
-            elif isinstance(msg, CollectiveRPCRequestMessage):
+            elif msg_type == "collective_rpc":
                 await self._handle_collective_rpc(msg)
+            elif isinstance(msg, RegisterRemoteReplicaMessage):
+                # Dynamic-attach involves a ~5s blocking handshake (run in a
+                # thread by ``_build_remote_replica``); ``await`` here would
+                # block the queue and stall the next ``add_request`` until
+                # the attach finishes. Dispatch as a background task so the
+                # main message loop keeps draining.
+                self._spawn_membership_task(self._handle_register_remote_replica(msg), label="register_remote_replica")
+            elif isinstance(msg, UnregisterRemoteReplicaMessage):
+                # Symmetric with register: keep the main queue flowing.
+                self._spawn_membership_task(
+                    self._handle_unregister_remote_replica(msg),
+                    label="unregister_remote_replica",
+                )
             elif isinstance(msg, ShutdownRequestMessage):
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
+                # Pre-mark stage clients as shutting down to prevent
+                # proc_monitor daemon threads from flagging normal
+                # process exit as EngineDeadError during teardown.
+                for pool in self.stage_pools:
+                    for client in pool.clients:
+                        if hasattr(client, "_shutting_down"):
+                            client._shutting_down = True
                 self._shutdown_stages()
                 break
             else:
-                logger.warning("[Orchestrator] Unknown message type: %s", type(msg).__name__)
+                logger.warning("[Orchestrator] Unknown message type: %s", msg_type)
 
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
@@ -261,6 +472,8 @@ class Orchestrator:
             mm_features=getattr(prompt, "mm_features", None),
         )
         self.request_states[request_id] = req_state
+        if self._running_counter is not None:
+            self._running_counter.increment()
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
@@ -288,7 +501,7 @@ class Orchestrator:
         stage_id = 0
         request_id = msg.request_id
         request = msg.prompt
-
+        final_stage_id = msg.final_stage_id
         req_state = self.request_states.get(request_id)
         if req_state is None:
             logger.warning(
@@ -325,7 +538,7 @@ class Orchestrator:
         # At this point the thinker has the complete prompt and will start
         # decoding immediately, so downstream stages need to be ready.
         is_final = not bool(getattr(request, "resumable", True))
-        if self.async_chunk and stage_id == 0 and req_state.final_stage_id > 0 and is_final:
+        if self.async_chunk and stage_id == 0 and final_stage_id > 0 and is_final:
             if not self._next_stage_already_submitted(stage_id, req_state):
                 await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
@@ -399,8 +612,8 @@ class Orchestrator:
         rpc_id = msg.rpc_id
         method = msg.method
         timeout = msg.timeout
-        args = msg.args
-        kwargs = dict(msg.kwargs)
+        args = tuple(msg.args)
+        kwargs = dict(msg.kwargs or {})
         requested_stage_ids = msg.stage_ids
 
         target_pools: list[StagePool] = []
@@ -416,7 +629,7 @@ class Orchestrator:
         results: list[Any] = []
         stage_ids: list[int] = []
         for pool in target_pools:
-            for replica_id in range(pool.num_replicas):
+            for replica_id in pool.live_replica_ids():
                 stage_result = await pool.collective_rpc(
                     replica_id=replica_id,
                     method=method,
@@ -452,7 +665,7 @@ class Orchestrator:
             idle = True
             for stage_id in range(self.num_stages):
                 pool = self.stage_pools[stage_id]
-                for replica_id in range(pool.num_replicas):
+                for replica_id in pool.live_replica_ids():
                     if self._shutdown_event.is_set():
                         return
 
@@ -480,7 +693,24 @@ class Orchestrator:
                                     "new_prompt_len_snapshot",
                                     None,
                                 )
-                            raw_output = await pool.process_llm_raw_outputs(replica_id, raw_outputs)
+                            # OmniSchedulerMixin.make_stats() already throttles
+                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
+                            # being non-None means this replica passed its own gate.
+                            # A second global throttle here would drop stats for
+                            # other (stage, replica) pairs in the same 1s window.
+                            record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
+                            iteration_stats = IterationStats() if record_stats else None
+                            raw_output = await pool.process_llm_raw_outputs(
+                                replica_id,
+                                raw_outputs,
+                                iteration_stats=iteration_stats,
+                            )
+                            if record_stats:
+                                self._stat_logger.record(
+                                    raw_outputs.scheduler_stats,
+                                    iteration_stats,
+                                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                                )
                         except asyncio.CancelledError:
                             raise
                         except EngineDeadError as e:
@@ -558,7 +788,7 @@ class Orchestrator:
                 )
                 stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
-            await self._route_output(stage_id, output, req_state, stage_metrics)
+            await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
     async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
         """Emit a frontend-visible error and clean up request state."""
@@ -590,7 +820,8 @@ class Orchestrator:
         self._release_request_bindings(request_ids)
         for request_id in request_ids:
             self._pd_kv_params.pop(request_id, None)
-            self.request_states.pop(request_id, None)
+            if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
+                self._running_counter.decrement()
 
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""
@@ -612,6 +843,7 @@ class Orchestrator:
     async def _route_output(
         self,
         stage_id: int,
+        replica_id: int,
         output: Any,
         req_state: OrchestratorRequestState,
         stage_metrics: Any,
@@ -621,7 +853,10 @@ class Orchestrator:
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
 
+        # CFG companion: stash output so parent can bundle [parent, *companions]
+        # into source_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):
+            self._cfg_tracker.set_companion_output(req_id, output)
             await self._handle_cfg_companion_ready(req_id)
             await self._cleanup_request_ids([req_id])
             return
@@ -631,6 +866,7 @@ class Orchestrator:
                 OutputMessage(
                     request_id=req_id,
                     stage_id=stage_id,
+                    replica_id=replica_id,
                     engine_outputs=output,
                     metrics=stage_metrics,
                     finished=finished and stage_id == req_state.final_stage_id,
@@ -642,6 +878,7 @@ class Orchestrator:
                 StageMetricsMessage(
                     request_id=req_id,
                     stage_id=stage_id,
+                    replica_id=replica_id,
                     metrics=stage_metrics,
                     stage_submit_ts=submit_ts,
                 )
@@ -671,6 +908,7 @@ class Orchestrator:
                     stage_id,
                     output,
                     req_state,
+                    src_replica_id=replica_id,
                     is_streaming_session=req_state.streaming.enabled,
                     is_final_update=False,
                 )
@@ -681,6 +919,7 @@ class Orchestrator:
                         stage_id,
                         output,
                         req_state,
+                        src_replica_id=replica_id,
                         is_streaming_session=True,
                         is_final_update=True,
                     )
@@ -792,6 +1031,41 @@ class Orchestrator:
         )
         return sp
 
+    def _emit_tx_edge(
+        self,
+        *,
+        from_stage: int,
+        from_replica: int,
+        to_stage: int,
+        to_pool: StagePool,
+        request_id: str,
+        tx_ms: float,
+    ) -> None:
+        """Emit per-edge transfer_tx_s + transfer_size_bytes histograms.
+
+        ``tx_ms`` is the orchestrator-side wall-clock spent in ``next_pool.
+        submit_*`` (serialize + queue submit to the receiving worker). Best-
+        effort size_bytes left at 0 — orchestrator doesn't have a cheap handle
+        on the serialized payload size; a follow-up can plumb that from the
+        connector adapter.
+        """
+        if self._transfer_emitter is None:
+            return
+        to_replica = to_pool.get_bound_replica_id(request_id)
+        if to_replica is None:
+            return
+        try:
+            self._transfer_emitter.observe_size(from_stage, from_replica, to_stage, to_replica, 0)
+            self._transfer_emitter.observe_tx_time(from_stage, from_replica, to_stage, to_replica, tx_ms / 1000.0)
+        except Exception:
+            logger.debug(
+                "[Orchestrator] transfer_tx emit failed for edge %d->%d req=%s",
+                from_stage,
+                to_stage,
+                request_id,
+                exc_info=True,
+            )
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -799,126 +1073,117 @@ class Orchestrator:
         output: Any,
         req_state: OrchestratorRequestState,
         *,
+        src_replica_id: int | None = None,
         is_streaming_session: bool = False,
         is_final_update: bool = False,
     ) -> None:
         """Forward output from the current logical stage to the next one."""
         next_logical = src_stage_id + 1
         next_pool = self.stage_pools[next_logical]
-
-        if next_pool.stage_type == "diffusion":
-            await self._forward_to_diffusion_stage(
-                req_id,
-                src_stage_id,
-                output,
-                req_state,
-            )
-        else:
-            await self._forward_to_llm_stage(
-                req_id,
-                src_stage_id,
-                output,
-                req_state,
-                is_streaming_session=is_streaming_session,
-                is_final_update=is_final_update,
-            )
-
-    async def _forward_to_diffusion_stage(
-        self,
-        req_id: str,
-        src_stage_id: int,
-        output: Any,
-        req_state: OrchestratorRequestState,
-    ) -> None:
-        """Forward output from an LLM stage to the next diffusion stage."""
-        next_logical = src_stage_id + 1
-        next_pool = self.stage_pools[next_logical]
-        params = req_state.sampling_params_list[next_logical]
-        source_outputs = [output]
-        already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
-
-        diffusion_client = next_pool.stage_client
-        if diffusion_client.custom_process_input_func is not None:
-            _t_ar2d = _time.perf_counter()
-            diffusion_prompt = diffusion_client.custom_process_input_func(
-                source_outputs,
-                req_state.prompt,
-                getattr(diffusion_client, "requires_multimodal_data", False),
-            )
-            _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
-            req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
-            logger.info(
-                "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
-                req_id,
-                _dt_ar2d,
-                src_stage_id,
-                next_logical,
-            )
-            if isinstance(diffusion_prompt, list):
-                if not diffusion_prompt:
-                    error_output = OmniRequestOutput.from_error(
-                        req_id,
-                        f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
-                    )
-                    logger.warning(
-                        "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
-                        "routing terminal error output",
-                        req_id,
-                        src_stage_id,
-                        next_logical,
-                    )
-                    await self.output_async_queue.put(
-                        OutputMessage(
-                            request_id=req_id,
-                            stage_id=next_logical,
-                            engine_outputs=error_output,
-                            metrics=None,
-                            finished=True,
-                        )
-                    )
-                    await self._cleanup_request_ids(
-                        [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
-                    )
-                    return
-                if already_submitted and len(diffusion_prompt) == 1:
-                    diffusion_prompt = diffusion_prompt[0]
-        else:
-            diffusion_prompt = req_state.prompt
-
-        if already_submitted:
-            await next_pool.submit_update(req_id, req_state, diffusion_prompt)
-        else:
-            await next_pool.submit_initial(
-                req_id,
-                req_state,
-                diffusion_prompt,
-                submit_kwargs={
-                    "kv_sender_info": self._build_kv_sender_info(
-                        list(getattr(diffusion_client, "engine_input_source", None) or [src_stage_id]),
-                        request_id=req_id,
-                    )
-                },
-                params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
-            )
-        req_state.stage_submit_ts[next_logical] = _time.time()
-
-    async def _forward_to_llm_stage(
-        self,
-        req_id: str,
-        src_stage_id: int,
-        output: Any,
-        req_state: OrchestratorRequestState,
-        *,
-        is_streaming_session: bool = False,
-        is_final_update: bool = False,
-    ) -> None:
-        """Forward output from the current stage to the next LLM stage."""
-        next_logical = src_stage_id + 1
-        next_pool = self.stage_pools[next_logical]
+        next_client = next_pool.stage_client
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
         already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
+        requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
+        _t_submit_start = _time.perf_counter()
+
+        if next_pool.stage_type == "diffusion":
+            companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
+            expected = len(self._cfg_tracker.get_companion_request_ids(req_id))
+            if expected > len(companion_outputs):
+                logger.warning(
+                    "[Orchestrator] req=%s: only %d/%d CFG companion outputs arrived; "
+                    "downstream CFG conditioning may degrade",
+                    req_id,
+                    len(companion_outputs),
+                    expected,
+                )
+            diffusion_source_outputs = [output, *companion_outputs]
+            if next_client.custom_process_input_func is not None:
+                _t_ar2d = _time.perf_counter()
+                _fn = next_client.custom_process_input_func
+                _extra_kwargs: dict[str, Any] = {}
+                # TODO: replace signature probe with explicit kwarg contract.
+                try:
+                    import inspect as _inspect
+
+                    if "sampling_params" in _inspect.signature(_fn).parameters:
+                        _extra_kwargs["sampling_params"] = params
+                except (TypeError, ValueError):
+                    pass
+                diffusion_prompt = _fn(
+                    diffusion_source_outputs,
+                    req_state.prompt,
+                    requires_multimodal_data,
+                    **_extra_kwargs,
+                )
+                _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
+                req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
+                logger.info(
+                    "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
+                    req_id,
+                    _dt_ar2d,
+                    src_stage_id,
+                    next_logical,
+                )
+                if isinstance(diffusion_prompt, list):
+                    if not diffusion_prompt:
+                        error_output = OmniRequestOutput.from_error(
+                            req_id,
+                            f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
+                        )
+                        logger.warning(
+                            "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
+                            "routing terminal error output",
+                            req_id,
+                            src_stage_id,
+                            next_logical,
+                        )
+                        await self.output_async_queue.put(
+                            OutputMessage(
+                                request_id=req_id,
+                                stage_id=next_logical,
+                                engine_outputs=error_output,
+                                metrics=None,
+                                finished=True,
+                            )
+                        )
+                        await self._cleanup_request_ids(
+                            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                        )
+                        return
+                    if already_submitted and len(diffusion_prompt) == 1:
+                        diffusion_prompt = diffusion_prompt[0]
+            else:
+                diffusion_prompt = req_state.prompt
+
+            if already_submitted:
+                await next_pool.submit_update(req_id, req_state, diffusion_prompt)
+            else:
+                await next_pool.submit_initial(
+                    req_id,
+                    req_state,
+                    diffusion_prompt,
+                    submit_kwargs={
+                        "kv_sender_info": self._build_kv_sender_info(
+                            list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
+                            request_id=req_id,
+                        )
+                    },
+                    params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                )
+            req_state.stage_submit_ts[next_logical] = _time.time()
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            self._emit_tx_edge(
+                from_stage=src_stage_id,
+                from_replica=src_replica_id if src_replica_id is not None else 0,
+                to_stage=next_logical,
+                to_pool=next_pool,
+                request_id=req_id,
+                tx_ms=_tx_ms,
+            )
+            return
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
         if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
@@ -957,6 +1222,15 @@ class Orchestrator:
                     await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
             req_state.stage_submit_ts[next_logical] = _time.time()
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            self._emit_tx_edge(
+                from_stage=src_stage_id,
+                from_replica=src_replica_id if src_replica_id is not None else 0,
+                to_stage=next_logical,
+                to_pool=next_pool,
+                request_id=req_id,
+                tx_ms=_tx_ms,
+            )
             return
 
         if req_state.pd_prefill_multimodal_output is not None:
@@ -965,7 +1239,6 @@ class Orchestrator:
                 {},
             )[req_id] = req_state.pd_prefill_multimodal_output
 
-        next_client = next_pool.llm_stage_client
         try:
             next_inputs = next_client.process_engine_inputs(
                 source_outputs,
@@ -984,7 +1257,7 @@ class Orchestrator:
         for next_input in next_inputs:
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
-            model_stage = next_client.model_stage
+            model_stage = getattr(next_client, "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,
@@ -1002,6 +1275,15 @@ class Orchestrator:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
         req_state.stage_submit_ts[next_logical] = _time.time()
+        _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+        self._emit_tx_edge(
+            from_stage=src_stage_id,
+            from_replica=src_replica_id if src_replica_id is not None else 0,
+            to_stage=next_logical,
+            to_pool=next_pool,
+            request_id=req_id,
+            tx_ms=_tx_ms,
+        )
 
     async def _prewarm_async_chunk_stages(
         self,
@@ -1026,6 +1308,7 @@ class Orchestrator:
             params = req_state.sampling_params_list[next_stage_id]
 
             req_state.stage_submit_ts[next_stage_id] = _time.time()
+            _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
                 await next_pool.submit_initial(
@@ -1034,7 +1317,7 @@ class Orchestrator:
                     req_state.prompt,
                     submit_kwargs={
                         "kv_sender_info": self._build_kv_sender_info(
-                            list(next_pool.stage_client.engine_input_source or [next_stage_id - 1]),
+                            list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
                             request_id=request_id,
                         )
                     },
@@ -1058,15 +1341,30 @@ class Orchestrator:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-
+                downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
+                    resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)
+
+            # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
+            # replica is stage 0's bound replica (single-replica thinker in
+            # all current configs); fall back to 0 if unknown.
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            src_replica = self.stage_pools[next_stage_id - 1].get_bound_replica_id(request_id)
+            self._emit_tx_edge(
+                from_stage=next_stage_id - 1,
+                from_replica=src_replica if src_replica is not None else 0,
+                to_stage=next_stage_id,
+                to_pool=next_pool,
+                request_id=request_id,
+                tx_ms=_tx_ms,
+            )
 
     def _build_kv_sender_info(
         self,
@@ -1081,14 +1379,14 @@ class Orchestrator:
                 continue
 
             sender_pool = self.stage_pools[sender_stage_id]
-            if sender_pool.stage_type == "diffusion":
+            sender_stage = sender_pool.get_bound_client(request_id) if request_id is not None else None
+            if sender_stage is None:
+                sender_stage = sender_pool.stage_client
+            get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
+            if not callable(get_sender_info):
                 continue
 
-            sender_stage = sender_pool.get_bound_llm_client(request_id) if request_id is not None else None
-            if sender_stage is None:
-                sender_stage = sender_pool.llm_stage_client
-
-            sender_info = sender_stage.get_kv_sender_info()
+            sender_info = get_sender_info()
             if not sender_info:
                 logger.warning(
                     "[Orchestrator] Stage-%s has no KV sender info available",
@@ -1122,7 +1420,7 @@ class Orchestrator:
                 msg = self.request_async_queue.get_nowait()
             except Exception:
                 break
-            if isinstance(msg, StageSubmissionMessage) and msg.type == "add_request":
+            if msg.type == "add_request":
                 req_id = msg.request_id
                 await self.output_async_queue.put(
                     ErrorMessage(
@@ -1149,14 +1447,137 @@ class Orchestrator:
                 )
             self.request_states.pop(req_id, None)
 
+    # ---- Distributed-mode replica attach / detach ----
+
+    async def _watch_replica_list(self) -> None:
+        """Convert hub replica disappearances into unregister control messages."""
+        last_up: set[tuple[int, str]] = set()
+        while not self._shutdown_event.is_set():
+            if self._hub is None:
+                # No coordinator wired up; sleep coarsely and re-check shutdown.
+                try:
+                    await asyncio.sleep(self._WATCH_REPLICA_IDLE_INTERVAL_S)
+                except asyncio.CancelledError:
+                    raise
+                continue
+
+            try:
+                snap = self._hub.get_replica_list()
+                current = {(rep.stage_id, rep.input_addr) for rep in snap.replicas if rep.status == ReplicaStatus.UP}
+                for stage_id, addr in last_up - current:
+                    await self.request_async_queue.put(
+                        UnregisterRemoteReplicaMessage(
+                            stage_id=stage_id,
+                            input_addr=addr,
+                        )
+                    )
+                last_up = current
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[Orchestrator] _watch_replica_list iteration failed")
+
+            try:
+                await asyncio.sleep(self._WATCH_REPLICA_INTERVAL_S)
+            except asyncio.CancelledError:
+                raise
+
+    async def _handle_register_remote_replica(self, msg: RegisterRemoteReplicaMessage) -> None:
+        """Bind a head-side client for a newly registered remote replica."""
+        stage_id = int(msg.stage_id)
+        replica_id = int(msg.replica_id)
+        if not (0 <= stage_id < self.num_stages):
+            logger.warning(
+                "[Orchestrator] register_remote_replica: stage_id %d out of range (num_stages=%d)",
+                stage_id,
+                self.num_stages,
+            )
+            return
+        if self._remote_replica_factory is None:
+            logger.warning(
+                "[Orchestrator] register_remote_replica received for stage=%d replica=%d but no factory installed",
+                stage_id,
+                replica_id,
+            )
+            return
+
+        try:
+            await self._attach_remote_replica(stage_id, replica_id)
+        except Exception:
+            logger.exception(
+                "[Orchestrator] failed to attach remote replica stage=%d replica=%d",
+                stage_id,
+                replica_id,
+            )
+
+    async def _handle_unregister_remote_replica(self, msg: UnregisterRemoteReplicaMessage) -> None:
+        """Tear down the head-side client for a vanished remote replica."""
+        stage_id = int(msg.stage_id)
+        input_addr = str(msg.input_addr)
+        if not (0 <= stage_id < self.num_stages):
+            return
+        pool = self.stage_pools[stage_id]
+        affected = pool.invalidate_addr(input_addr)
+        self._detach_remote_replica(stage_id, input_addr)
+        if affected:
+            await self._cleanup_request_ids(affected, abort=True)
+            for req_id in affected:
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        error="stage replica disappeared",
+                        request_id=req_id,
+                        stage_id=stage_id,
+                    )
+                )
+
+    async def _attach_remote_replica(self, stage_id: int, replica_id: int) -> None:
+        """Build a head-side stage client via the injected factory and register it."""
+        factory = self._remote_replica_factory
+        if factory is None:
+            return
+        pool = self.stage_pools[stage_id]
+        client = await factory(stage_id, replica_id)
+        input_addr = StagePool._client_input_addr(client)
+        if input_addr is None:
+            raise RuntimeError(
+                f"remote replica factory for stage {stage_id} produced a client without a discoverable input address"
+            )
+        pool.add_client(input_addr, client)
+        logger.info(
+            "[Orchestrator] attached remote replica stage=%d replica=%d addr=%s",
+            stage_id,
+            replica_id,
+            input_addr,
+        )
+
+    def _detach_remote_replica(self, stage_id: int, input_addr: str) -> None:
+        """Shut down + remove the head-side client at ``input_addr``."""
+        pool = self.stage_pools[stage_id]
+        client = pool.remove_client(input_addr)
+        if client is None:
+            return
+        try:
+            client.shutdown()
+        except Exception:
+            logger.exception(
+                "[Orchestrator] failed to shutdown client for stage=%d addr=%s",
+                stage_id,
+                input_addr,
+            )
+        logger.info(
+            "[Orchestrator] detached remote replica stage=%d addr=%s",
+            stage_id,
+            input_addr,
+        )
+
     def _shutdown_stages(self) -> None:
         """Shutdown all stage pools."""
         if self._stages_shutdown:
             return
 
         self._stages_shutdown = True
-        total = sum(pool.num_replicas for pool in self.stage_pools)
+        total = sum(pool.live_num_replicas for pool in self.stage_pools)
         logger.info("[Orchestrator] Shutting down all %d client(s)", total)
         for pool in self.stage_pools:
-            for replica_id in range(pool.num_replicas):
+            for replica_id in pool.live_replica_ids():
                 pool.shutdown_replica(replica_id)
