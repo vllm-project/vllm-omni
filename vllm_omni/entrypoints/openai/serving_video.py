@@ -148,6 +148,10 @@ class OmniOpenAIServingVideo:
         )
         if "flow_shift" in provided_fields and request.flow_shift is not None:
             gen_params.extra_args["flow_shift"] = request.flow_shift
+        if "generate_sound" in provided_fields:
+            gen_params.extra_args["generate_sound"] = request.generate_sound
+        if "sound_duration" in provided_fields and request.sound_duration is not None:
+            gen_params.extra_args["sound_duration"] = request.sound_duration
 
         # Apply model-specific extra parameters
         if request.extra_params is not None:

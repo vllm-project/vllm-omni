@@ -149,6 +149,15 @@ class VideoGenerationRequest(BaseModel):
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    generate_sound: bool = Field(
+        default=False,
+        description="Request model-generated audio for video models that support sound generation.",
+    )
+    sound_duration: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Duration in seconds for model-generated audio. Defaults to the generated video duration.",
+    )
 
     # vllm-omni extensions for post-generation frame interpolation.
     enable_frame_interpolation: bool = Field(
