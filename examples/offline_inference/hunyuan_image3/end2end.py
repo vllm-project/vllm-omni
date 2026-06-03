@@ -21,6 +21,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
 )
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
+from vllm_omni.platforms import current_omni_platform
 
 # task -> (sys_type, bot_task, trigger_tag)
 _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
@@ -109,6 +110,32 @@ def parse_args():
     parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-timeout", type=int, default=300, help="Initialization timeout in seconds.")
     parser.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8", "int8", "gguf"],
+        help="Quantization method for the transformer. "
+        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), 'int8' (Int8 W8A8), 'gguf' (GGUF quantized weights). "
+        "Default: None (no quantization, uses BF16).",
+    )
+    parser.add_argument(
+        "--gguf-model",
+        type=str,
+        default=None,
+        help=("GGUF file path or HF reference for transformer weights. Required when --quantization gguf is set."),
+    )
+    parser.add_argument(
+        "--ignored-layers",
+        type=str,
+        default=None,
+        help="Comma-separated list of layer name patterns to skip quantization. "
+        "Only used when --quantization is set. "
+        "Available layers: to_qkv, to_out, add_kv_proj, to_add_out, img_mlp, txt_mlp, proj_out. "
+        "Example: --ignored-layers 'add_kv_proj,to_add_out'",
+    )
+
+    current_omni_platform.pre_register_and_update(parser)
 
     from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
@@ -125,6 +152,24 @@ def main():
 
     # Determine stage config
     stage_configs_path = args.stage_configs_path or _MODALITY_DEFAULT_CONFIG[args.modality]
+    # Build quantization kwargs: use quantization_config dict when
+    # ignored_layers is specified so the list flows through OmniDiffusionConfig
+    quant_kwargs: dict[str, Any] = {}
+    ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
+    if args.quantization == "gguf":
+        if not args.gguf_model:
+            raise ValueError("--gguf-model is required when --quantization gguf is set.")
+        quant_kwargs["quantization_config"] = {
+            "method": "gguf",
+            "gguf_model": args.gguf_model,
+        }
+    elif args.quantization and ignored_layers:
+        quant_kwargs["quantization_config"] = {
+            "method": args.quantization,
+            "ignored_layers": ignored_layers,
+        }
+    elif args.quantization:
+        quant_kwargs["quantization"] = args.quantization
 
     # Build Omni
     omni_kwargs = {
@@ -134,6 +179,7 @@ def main():
         "log_stats": args.log_stats,
         "init_timeout": args.init_timeout,
         "enforce_eager": args.enforce_eager,
+        **quant_kwargs,
     }
     if args.modality in ("text2img", "img2img"):
         omni_kwargs["mode"] = "text-to-image"
