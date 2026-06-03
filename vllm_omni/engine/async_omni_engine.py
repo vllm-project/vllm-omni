@@ -59,9 +59,7 @@ from vllm_omni.engine.stage_runtime import (
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
 from vllm_omni.inputs.data import OmniSamplingParams
-
-if TYPE_CHECKING:
-    from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
 
@@ -201,37 +199,40 @@ class AsyncOmniEngine:
         **kwargs: Additional arguments
     """
 
+    # Class-level defaults so tests that bypass __init__ via object.__new__
+    # don't AttributeError when stage-init / forward paths touch these attrs.
+    _log_stats: bool = False
+    _coordinator_runtime: Any = None
+    _transfer_emitter: Any = None
+
     def __init__(
         self,
         model: str,
-        engine_args: OmniEngineArgs | None = None,
         stage_init_timeout: int = 300,
         init_timeout: int = 600,
         diffusion_batch_size: int = 1,
         single_stage_mode: bool = False,
+        transfer_emitter: Any = None,
+        log_stats: bool = False,
+        tokenizer: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.model = model
+        self.tokenizer = tokenizer
         self.diffusion_batch_size = diffusion_batch_size
         startup_timeout = int(init_timeout)
+        # Forwarded into Orchestrator so its _forward_to_next_stage path can
+        # emit per-edge transfer_tx_s / transfer_size_bytes histograms.
+        # Optional: when None, Orchestrator silently skips TX emit (existing
+        # RX path still works via OrchestratorAggregator).
+        self._transfer_emitter = transfer_emitter
+        # Drives upstream EngineCore + scheduler stats production. When False
+        # the engine skips SchedulerStats / IterationStats; the per-(stage,
+        # replica) vllm:* wrap stays registered but reads zero. Respects the
+        # --log-stats CLI flag set by the user via OmniBase.
+        self._log_stats = log_stats
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
-
-        # Merge tracked engine_args fields into kwargs; explicit kwargs take priority.
-        if engine_args is not None:
-            if not hasattr(engine_args, "_explicit_fields"):
-                raise TypeError(
-                    "engine_args=OmniEngineArgs(...) is ambiguous under "
-                    "sentinel-default precedence. Use "
-                    "OmniEngineArgs.create(**explicit) or pass explicit kwargs "
-                    "directly."
-                )
-            ea_dict = engine_args.explicit_kwargs()
-            # Remove model since it is passed as a positional arg already.
-            ea_dict.pop("model", None)
-            kwargs = {**ea_dict, **kwargs}
-
-        self.tokenizer: str | None = kwargs.get("tokenizer")
 
         # ------------------------------------------------------------------ #
         # Single-stage mode detection                                        #
@@ -291,6 +292,7 @@ class AsyncOmniEngine:
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
+        self._running_counter = OmniRequestCounter()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -320,6 +322,7 @@ class AsyncOmniEngine:
         )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
+
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors via StageRuntime and assign to self."""
@@ -402,6 +405,9 @@ class AsyncOmniEngine:
                 async_chunk=self.async_chunk,
                 pd_config=pd_config,
                 membership_controller=membership_controller,
+                running_counter=self._running_counter,
+                transfer_emitter=self._transfer_emitter,
+                log_stats=self._log_stats,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -809,6 +815,12 @@ class AsyncOmniEngine:
             return {
                 "rel_l1_thresh": 0.2,
             }
+        if cache_backend == "mag_cache":
+            return {
+                "mag_threshold": 0.24,
+                "mag_max_skip_steps": 5,
+                "mag_retention_ratio": 0.1,
+            }
         return None
 
     @staticmethod
@@ -954,6 +966,7 @@ class AsyncOmniEngine:
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
             "model_class_name": kwargs.get("model_class_name", None),
+            "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
@@ -974,6 +987,8 @@ class AsyncOmniEngine:
                 "mp" if kwargs.get("distributed_executor_backend") is None else kwargs["distributed_executor_backend"]
             ),
             "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
+            "enable_prompt_embed_cache": kwargs.get("enable_prompt_embed_cache", False),
+            "prompt_embed_cache_size": kwargs.get("prompt_embed_cache_size", 32),
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
@@ -1065,7 +1080,6 @@ class AsyncOmniEngine:
         stage_configs_path = kwargs.get("stage_configs_path", None)
         deploy_config_path = kwargs.pop("deploy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
-        kwargs.pop("_cli_explicit_keys", None)
         explicit_stage_configs = kwargs.pop("stage_configs", None)
         if explicit_stage_configs is not None:
             logger.warning(
@@ -1141,7 +1155,7 @@ class AsyncOmniEngine:
                             kwargs.get("diffusion_attention_config"),
                             attention_backend=kwargs.get("diffusion_attention_backend"),
                         )
-                quantization_config = kwargs.get("quantization_config")
+                quantization_config = kwargs.get("diffusion_quantization_config")
                 if quantization_config is not None:
                     if (
                         not hasattr(cfg.engine_args, "quantization_config")

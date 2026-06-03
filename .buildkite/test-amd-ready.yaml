@@ -1,6 +1,6 @@
 steps:
 
-- label: "Simple Unit Test"
+- label: "Simple · Diffusion & Model Executor Test"
   agent_pool: mi325_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
@@ -9,7 +9,18 @@ steps:
     - export VLLM_ROCM_USE_AITER=0
     # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
     # that is not supported on CPU
-    - "timeout 60m pytest -v -s -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+    - "timeout 40m pytest -sv tests/diffusion tests/model_executor -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+
+- label: "Simple · Other Test"
+  agent_pool: mi325_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export VLLM_ROCM_USE_AITER=0
+    # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
+    # that is not supported on CPU
+    - "timeout 40m pytest -sv tests/diffusion tests/model_executor -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
 
 - label: "Voxtral TTS CUDA Unit Test"
   agent_pool: mi325_1
@@ -19,13 +30,13 @@ steps:
   commands:
     - timeout 10m pytest -s -v tests/model_executor/models/voxtral_tts/test_cuda_graph_acoustic_transformer.py
 
-- label: "Diffusion Batching Test"
+- label: "Diffusion · Batch Test"
   agent_pool: mi325_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
   grade: Blocking
   commands:
-    - timeout 20m pytest -s -v tests/diffusion/batching/test_diffusion_batching.py -m "core_model and diffusion" --run-level "core_model"
+    - timeout 20m pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
 
 - label: "Custom Pipeline Test"
   agent_pool: mi325_1

@@ -24,6 +24,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -44,6 +45,8 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -131,6 +134,12 @@ class StreamingInputState:
 class Orchestrator:
     """Runs inside a background thread's asyncio event loop."""
 
+    # Class-level defaults so tests that bypass __init__ via object.__new__
+    # don't AttributeError when transfer / counter emit paths access them.
+    _running_counter: OmniRequestCounter | None = None
+    _transfer_emitter: Any = None
+    _stat_logger: OmniPrometheusStatLogger | None = None
+
     def __init__(
         self,
         request_async_queue: janus.AsyncQueue[EngineQueueMessage],
@@ -141,6 +150,9 @@ class Orchestrator:
         async_chunk: bool = False,
         pd_config: dict[str, Any] | None = None,
         membership_controller: MembershipController | None = None,
+        running_counter: OmniRequestCounter | None = None,
+        transfer_emitter: Any = None,
+        log_stats: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -160,6 +172,8 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
+        self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
+
         self._cfg_tracker = CfgCompanionTracker()
 
         self._shutdown_event = asyncio.Event()
@@ -169,6 +183,71 @@ class Orchestrator:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
+
+    def _init_metrics_state(
+        self,
+        stage_pools: list[StagePool],
+        running_counter: OmniRequestCounter | None,
+        transfer_emitter: Any,
+        log_stats: bool = False,
+    ) -> None:
+        """Wire up all metric-related orchestrator state.
+
+        Sets ``self._running_counter`` and ``self._transfer_emitter``
+        (both optional, used by request-add / forward paths), builds the
+        ``(stage_id, replica_id) ↔ engine_idx`` lookup used at record() time,
+        and best-effort constructs the ``OmniPrometheusStatLogger`` wrap
+        that exposes ~37 upstream ``vllm:*`` families with per-(stage,
+        replica) labels. Failure to build the wrap is logged and metrics
+        are simply disabled — orchestrator construction continues so unit
+        tests with a minimal ``vllm_config`` still pass.
+
+        ``log_stats=False`` short-circuits the wrap entirely so the
+        ~65 upstream ``vllm:*`` families are not registered in the
+        Prometheus default registry at all. The per-step record() path
+        already no-ops on ``scheduler_stats is None`` (which is what
+        the upstream scheduler returns when its own log_stats is False),
+        so this gate is mainly to keep the ``/metrics`` surface clean
+        when the user did not request stats.
+        """
+        self._running_counter = running_counter
+        self._transfer_emitter = transfer_emitter
+
+        # Flat engine_idx ↔ (stage, replica) maps. The reverse map is
+        # consulted at record() time to translate the orchestrator's
+        # (stage_id, replica_id) loop variables into an engine_idx the
+        # underlying PrometheusStatLogger can address.
+        stage_replica_map: dict[int, tuple[str, str]] = {}
+        self._stage_replica_to_engine_idx: dict[tuple[int, int], int] = {}
+        flat_idx = 0
+        for stage_id, pool in enumerate(stage_pools):
+            for replica_id in range(pool.num_replicas):
+                stage_replica_map[flat_idx] = (str(stage_id), str(replica_id))
+                self._stage_replica_to_engine_idx[(stage_id, replica_id)] = flat_idx
+                flat_idx += 1
+
+        if not log_stats:
+            self._stat_logger = None
+            return
+
+        vllm_config_for_stats = next(
+            (p.stage_vllm_config for p in stage_pools if p.stage_vllm_config is not None),
+            None,
+        )
+        if vllm_config_for_stats is None:
+            self._stat_logger = None
+            return
+        try:
+            self._stat_logger = OmniPrometheusStatLogger(
+                vllm_config=vllm_config_for_stats,
+                stage_replica_map=stage_replica_map,
+            )
+        except Exception:
+            # Minimal vllm_config in unit-test contexts can lack fields the
+            # upstream PrometheusStatLogger expects. Skip wrap rather than
+            # break orchestrator construction.
+            logger.exception("[Orchestrator] OmniPrometheusStatLogger init failed; metrics wrap disabled")
+            self._stat_logger = None
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -303,6 +382,8 @@ class Orchestrator:
             mm_features=getattr(prompt, "mm_features", None),
         )
         self.request_states[request_id] = req_state
+        if self._running_counter is not None:
+            self._running_counter.increment()
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
@@ -326,7 +407,7 @@ class Orchestrator:
         stage_id = 0
         request_id = msg.request_id
         request = msg.prompt
-
+        final_stage_id = msg.final_stage_id
         req_state = self.request_states.get(request_id)
         if req_state is None:
             logger.warning(
@@ -358,6 +439,9 @@ class Orchestrator:
             request,
             prompt_text=msg.output_prompt_text,
         )
+
+        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+            await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -510,7 +594,24 @@ class Orchestrator:
                                     "new_prompt_len_snapshot",
                                     None,
                                 )
-                            raw_output = await pool.process_llm_raw_outputs(replica_id, raw_outputs)
+                            # OmniSchedulerMixin.make_stats() already throttles
+                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
+                            # being non-None means this replica passed its own gate.
+                            # A second global throttle here would drop stats for
+                            # other (stage, replica) pairs in the same 1s window.
+                            record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
+                            iteration_stats = IterationStats() if record_stats else None
+                            raw_output = await pool.process_llm_raw_outputs(
+                                replica_id,
+                                raw_outputs,
+                                iteration_stats=iteration_stats,
+                            )
+                            if record_stats:
+                                self._stat_logger.record(
+                                    raw_outputs.scheduler_stats,
+                                    iteration_stats,
+                                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                                )
                         except asyncio.CancelledError:
                             raise
                         except EngineDeadError as e:
@@ -588,7 +689,7 @@ class Orchestrator:
                 )
                 stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
-            await self._route_output(stage_id, output, req_state, stage_metrics)
+            await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
     async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
         """Emit a frontend-visible error and clean up request state."""
@@ -620,7 +721,8 @@ class Orchestrator:
         self._release_request_bindings(request_ids)
         for request_id in request_ids:
             self._pd_kv_params.pop(request_id, None)
-            self.request_states.pop(request_id, None)
+            if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
+                self._running_counter.decrement()
 
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""
@@ -642,6 +744,7 @@ class Orchestrator:
     async def _route_output(
         self,
         stage_id: int,
+        replica_id: int,
         output: Any,
         req_state: OrchestratorRequestState,
         stage_metrics: Any,
@@ -664,6 +767,7 @@ class Orchestrator:
                 OutputMessage(
                     request_id=req_id,
                     stage_id=stage_id,
+                    replica_id=replica_id,
                     engine_outputs=output,
                     metrics=stage_metrics,
                     finished=finished and stage_id == req_state.final_stage_id,
@@ -675,6 +779,7 @@ class Orchestrator:
                 StageMetricsMessage(
                     request_id=req_id,
                     stage_id=stage_id,
+                    replica_id=replica_id,
                     metrics=stage_metrics,
                     stage_submit_ts=submit_ts,
                 )
@@ -704,6 +809,7 @@ class Orchestrator:
                     stage_id,
                     output,
                     req_state,
+                    src_replica_id=replica_id,
                     is_streaming_session=req_state.streaming.enabled,
                     is_final_update=False,
                 )
@@ -714,6 +820,7 @@ class Orchestrator:
                         stage_id,
                         output,
                         req_state,
+                        src_replica_id=replica_id,
                         is_streaming_session=True,
                         is_final_update=True,
                     )
@@ -825,6 +932,41 @@ class Orchestrator:
         )
         return sp
 
+    def _emit_tx_edge(
+        self,
+        *,
+        from_stage: int,
+        from_replica: int,
+        to_stage: int,
+        to_pool: StagePool,
+        request_id: str,
+        tx_ms: float,
+    ) -> None:
+        """Emit per-edge transfer_tx_s + transfer_size_bytes histograms.
+
+        ``tx_ms`` is the orchestrator-side wall-clock spent in ``next_pool.
+        submit_*`` (serialize + queue submit to the receiving worker). Best-
+        effort size_bytes left at 0 — orchestrator doesn't have a cheap handle
+        on the serialized payload size; a follow-up can plumb that from the
+        connector adapter.
+        """
+        if self._transfer_emitter is None:
+            return
+        to_replica = to_pool.get_bound_replica_id(request_id)
+        if to_replica is None:
+            return
+        try:
+            self._transfer_emitter.observe_size(from_stage, from_replica, to_stage, to_replica, 0)
+            self._transfer_emitter.observe_tx_time(from_stage, from_replica, to_stage, to_replica, tx_ms / 1000.0)
+        except Exception:
+            logger.debug(
+                "[Orchestrator] transfer_tx emit failed for edge %d->%d req=%s",
+                from_stage,
+                to_stage,
+                request_id,
+                exc_info=True,
+            )
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -832,6 +974,7 @@ class Orchestrator:
         output: Any,
         req_state: OrchestratorRequestState,
         *,
+        src_replica_id: int | None = None,
         is_streaming_session: bool = False,
         is_final_update: bool = False,
     ) -> None:
@@ -844,6 +987,7 @@ class Orchestrator:
         next_stage_resumable = is_streaming_session and not is_final_update
         already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
+        _t_submit_start = _time.perf_counter()
 
         if next_pool.stage_type == "diffusion":
             companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
@@ -931,6 +1075,15 @@ class Orchestrator:
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
             req_state.stage_submit_ts[next_logical] = _time.time()
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            self._emit_tx_edge(
+                from_stage=src_stage_id,
+                from_replica=src_replica_id if src_replica_id is not None else 0,
+                to_stage=next_logical,
+                to_pool=next_pool,
+                request_id=req_id,
+                tx_ms=_tx_ms,
+            )
             return
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
@@ -970,6 +1123,15 @@ class Orchestrator:
                     await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
             req_state.stage_submit_ts[next_logical] = _time.time()
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            self._emit_tx_edge(
+                from_stage=src_stage_id,
+                from_replica=src_replica_id if src_replica_id is not None else 0,
+                to_stage=next_logical,
+                to_pool=next_pool,
+                request_id=req_id,
+                tx_ms=_tx_ms,
+            )
             return
 
         if req_state.pd_prefill_multimodal_output is not None:
@@ -1014,6 +1176,15 @@ class Orchestrator:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
         req_state.stage_submit_ts[next_logical] = _time.time()
+        _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+        self._emit_tx_edge(
+            from_stage=src_stage_id,
+            from_replica=src_replica_id if src_replica_id is not None else 0,
+            to_stage=next_logical,
+            to_pool=next_pool,
+            request_id=req_id,
+            tx_ms=_tx_ms,
+        )
 
     async def _prewarm_async_chunk_stages(
         self,
@@ -1038,6 +1209,7 @@ class Orchestrator:
             params = req_state.sampling_params_list[next_stage_id]
 
             req_state.stage_submit_ts[next_stage_id] = _time.time()
+            _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
                 await next_pool.submit_initial(
@@ -1070,15 +1242,30 @@ class Orchestrator:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-
+                downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
+                    resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)
+
+            # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
+            # replica is stage 0's bound replica (single-replica thinker in
+            # all current configs); fall back to 0 if unknown.
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            src_replica = self.stage_pools[next_stage_id - 1].get_bound_replica_id(request_id)
+            self._emit_tx_edge(
+                from_stage=next_stage_id - 1,
+                from_replica=src_replica if src_replica is not None else 0,
+                to_stage=next_stage_id,
+                to_pool=next_pool,
+                request_id=request_id,
+                tx_ms=_tx_ms,
+            )
 
     def _build_kv_sender_info(
         self,

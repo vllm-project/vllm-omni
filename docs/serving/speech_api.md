@@ -381,6 +381,44 @@ are cached in-process with a shared LRU so repeated requests with the same
 all TTS model types; deleting a voice invalidates every model-type slot at
 once.
 
+### Precomputed Custom Voices
+
+Qwen3-TTS Base and VoxCPM2 can load offline-precomputed voices at startup.
+Generate a directory containing `custom_voice_manifest.json` plus one
+`.safetensors` file per voice, then set the pipeline-wide deploy config field:
+
+```yaml
+custom_voice_dir: /path/to/custom_voices
+```
+
+Qwen3-TTS profiles are created with:
+
+```bash
+python examples/online_serving/text_to_speech/qwen3_tts/precompute_custom_voice.py \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --voice-name alice \
+  --ref-audio /path/to/reference.wav \
+  --ref-text "Original transcript of the reference audio" \
+  --mode icl \
+  --output-dir /path/to/custom_voices
+```
+
+VoxCPM2 profiles are created with:
+
+```bash
+python examples/online_serving/text_to_speech/voxcpm2/precompute_custom_voice.py \
+  --model openbmb/VoxCPM2 \
+  --voice-name alice \
+  --ref-audio /path/to/reference.wav \
+  --mode ref_continuation \
+  --prompt-text "Original transcript of the reference audio" \
+  --output-dir /path/to/custom_voices
+```
+
+Only profiles whose safetensors payload can be loaded and validated are exposed
+by `GET /v1/audio/voices`. Valid precomputed voices can be used in
+`POST /v1/audio/speech` by passing `voice="alice"` without `ref_audio`.
+
 **Configuration (environment variables):**
 
 | Variable | Default | Description |

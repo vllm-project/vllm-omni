@@ -4,65 +4,56 @@ from __future__ import annotations
 
 import argparse
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand, run_headless
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_serve_parser_accepts_no_async_chunk() -> None:
-    """``--no-async-chunk`` should parse after deploy-overriding parser
-    defaults are nullified."""
-    try:
-        from vllm.utils.argparse_utils import FlexibleArgumentParser
-    except Exception as exc:
-        pytest.skip(f"Cannot build parser in this environment: {exc}")
-
-    root = FlexibleArgumentParser()
-    subparsers = root.add_subparsers(dest="subcommand")
+def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
+    """``--no-async-chunk`` should parse to ``async_chunk=False`` and mark the
+    shared deploy-level dest as explicitly provided by the user."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
     cmd = OmniServeCommand()
     cmd.subparser_init(subparsers)
 
     argv = ["serve", "fake-model", "--omni", "--no-async-chunk"]
-    args = root.parse_args(argv)
-
+    args = parser.parse_args(argv)
     assert args.async_chunk is False
 
+    explicit = args.get_explicit_kwargs_dict()
+    assert args.get_explicit_kwargs_dict()
+    assert not explicit["async_chunk"]
 
-# ---------------------------------------------------------------------------
-# run_headless validation
-# ---------------------------------------------------------------------------
 
-
-def _make_headless_args(**overrides: Any) -> argparse.Namespace:
-    """Build an argparse.Namespace shaped like the headless CLI passes in.
-
-    Defaults pass every validation gate so individual tests can mutate just
-    the field they're exercising.
-    """
-    defaults = dict(
-        model="fake-model",
-        stage_id=0,
-        replica_id=0,
-        omni_master_address="127.0.0.1",
-        omni_master_port=26000,
-        omni_replica_address=None,
-        omni_dp_size_local=1,
-        api_server_count=0,
-        worker_backend="multi_process",
-        stage_configs_path=None,
-        deploy_config=None,
-        log_stats=False,
-        disable_log_stats=False,
-        stage_init_timeout=600,
-        tokenizer=None,
+def _make_headless_args(**kwargs) -> TrackingNamespace:
+    defaults = {
+        "model": "fake-model",
+        "stage_id": 0,
+        "replica_id": 0,
+        "omni_master_address": "127.0.0.1",
+        "omni_master_port": 26000,
+        "omni_replica_address": None,
+        "omni_dp_size_local": 1,
+        "worker_backend": "multi_process",
+        "stage_configs_path": None,
+        "deploy_config": None,
+        "log_stats": False,
+        "disable_log_stats": False,
+        "stage_init_timeout": 600,
+        "tokenizer": None,
+    }
+    ns_kwargs = {**defaults, **kwargs}
+    ns = argparse.Namespace(**ns_kwargs)
+    return TrackingNamespace(
+        unfiltered_ns=ns,
+        explicit_keys=frozenset(ns.__dict__.keys()),
     )
-    defaults.update(overrides)
-    return argparse.Namespace(**defaults)
 
 
 def test_run_headless_requires_stage_id() -> None:
@@ -80,12 +71,6 @@ def test_run_headless_requires_master_address() -> None:
 def test_run_headless_requires_master_port() -> None:
     args = _make_headless_args(omni_master_port=None)
     with pytest.raises(ValueError, match="--omni-master-address and --omni-master-port"):
-        run_headless(args)
-
-
-def test_run_headless_rejects_multi_api_server_count() -> None:
-    args = _make_headless_args(api_server_count=2)
-    with pytest.raises(ValueError, match="api_server_count can't be set"):
         run_headless(args)
 
 

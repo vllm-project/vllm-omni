@@ -707,7 +707,17 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         return out.past_key_values, out.hidden_states
 
     def _t2i_predict_v(
-        self, input_embeds, indexes_image, attn_mask, past_key_values, t, z, image_token_num, image_size=None, **_kw
+        self,
+        input_embeds,
+        indexes_image,
+        attn_mask,
+        past_key_values,
+        t,
+        z,
+        image_token_num,
+        image_size=None,
+        cache_dit_skip=False,
+        **_kw,
     ):
         B, L = z.shape[0], z.shape[1]
         outputs = self.language_model(
@@ -719,6 +729,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             attention_mask=attn_mask,
             past_key_values=past_key_values,
             update_cache=False,
+            cache_dit_skip=cache_dit_skip,
             use_cache=True,
             compute_logits=False,
         )
@@ -1066,6 +1077,13 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         kv_cond = caches["cond"]
         idx_cond = caches["idx_cond"]
         mask_cond = caches["mask_cond"]
+        is_it2i = "img_cond" in caches
+        if is_it2i:
+            use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
+            needs_cfg = not (p.cfg_scale == 1 and p.img_cfg_scale == 1)
+            has_cached_partner = use_cfg and needs_cfg
+        else:
+            has_cached_partner = t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1
 
         out_cond = self._t2i_predict_v(
             image_embeds,
@@ -1076,9 +1094,9 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             z,
             image_token_num=ns.token_h * ns.token_w,
             image_size=p.image_size,
+            cache_dit_skip=not has_cached_partner,
         )
 
-        is_it2i = "img_cond" in caches
         if is_it2i:
             return self._denoise_step_it2i(out_cond, image_embeds, ns, t, z, caches, p, step_i)
         return self._denoise_step_t2i(out_cond, image_embeds, ns, t, z, caches, p, step_i)
@@ -1153,6 +1171,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                 caches["img_cond"],
                 t,
                 z,
+                cache_dit_skip=True,
                 **predict_kw,
             )
             out_uncond = self._t2i_predict_v(

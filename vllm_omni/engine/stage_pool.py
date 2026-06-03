@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
@@ -22,6 +23,7 @@ from vllm_omni.engine.stage_client import (
     StagePoolDiffusionClient,
     StagePoolLLMClient,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
@@ -509,6 +511,7 @@ class StagePool:
             stage_gen_time_ms=stage_gen_time_ms,
             batch_id=batch_id,
             batch_size=1,
+            replica_id=replica_id,
             rx_decode_time_ms=0.0,
             rx_transfer_bytes=0,
             rx_in_flight_time_ms=0.0,
@@ -533,6 +536,10 @@ class StagePool:
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
+        # Convert plain vllm SamplingParams for single-stage diffusion models
+        # that receive sampling params from the user/caller directly.
+        if self.stage_type == "diffusion" and not isinstance(params, OmniDiffusionSamplingParams):
+            params = OmniDiffusionSamplingParams()
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
             replica_id = await self._pick_or_select(
@@ -593,6 +600,8 @@ class StagePool:
     ) -> int:
         """Submit a streaming update to an already admitted request."""
         params = req_state.sampling_params_list[self.stage_id]
+        if self.stage_type == "diffusion" and not isinstance(params, OmniDiffusionSamplingParams):
+            params = OmniDiffusionSamplingParams()
         replica_id = self.get_bound_replica_id(request_id)
         if replica_id is None or self.clients[replica_id] is None:
             replica_id = await self._pick_or_select(request_id)
@@ -641,6 +650,7 @@ class StagePool:
         self,
         replica_id: int,
         raw_outputs: EngineCoreOutputs,
+        iteration_stats: IterationStats | None = None,
     ) -> list[Any]:
         """Run the shared LLM output processor on one raw poll result."""
         raw_client = self.clients[replica_id]
@@ -651,7 +661,7 @@ class StagePool:
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
-            None,
+            iteration_stats,
         )
 
         if processed.reqs_to_abort:

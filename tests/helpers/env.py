@@ -160,8 +160,40 @@ def _print_gpu_processes() -> None:
     print("=" * 80)
 
 
+def _cleanup_stale_device_locks() -> None:
+    """Remove stale device-initialization lock files whose recorded PID is dead.
+
+    Lock files at ``/tmp/vllm_omni_device_*_init.lock`` may persist after a
+    crashed / killed test run and block subsequent orchestrator startups.
+    """
+    import glob as _glob
+
+    for lock_file in _glob.glob("/tmp/vllm_omni_device_*_init.lock"):
+        try:
+            with open(lock_file) as fh:
+                content = fh.read().strip()
+            if not content:
+                continue
+            pid = int(content)
+        except (OSError, ValueError):
+            continue
+
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            print(f"  Removing stale device lock {lock_file} (PID {pid} is dead)")
+            try:
+                os.unlink(lock_file)
+            except OSError:
+                pass
+        except PermissionError:
+            pass
+
+
 def run_pre_test_cleanup() -> None:
     print("Pre-test GPU status:")
+
+    _cleanup_stale_device_locks()
 
     num_gpus = current_omni_platform.device_count()
     if num_gpus > 0:

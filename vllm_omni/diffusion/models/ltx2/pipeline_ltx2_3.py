@@ -123,7 +123,7 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
     """
 
     # Audio is diffused jointly with video; warmup must size audio tokens.
-    support_audio_output = True
+    dummy_run_num_frames = 2
 
     def __init__(
         self,
