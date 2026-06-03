@@ -33,6 +33,9 @@ class OmniTextPrompt(TextPrompt):
     """
 
     negative_prompt: NotRequired[str]
+    # Using modalities field to differentiate between different tasks for the same pipeline
+    # for example Cosmos3OmniDiffusersPipeline handles t2i and t2v in the same pipeline.
+    modalities: NotRequired[list[str]]
     prompt_embeds: NotRequired[torch.Tensor]
     negative_prompt_embeds: NotRequired[torch.Tensor]
     additional_information: NotRequired[dict[str, Any]]

@@ -482,6 +482,15 @@ def prepare_engine_environment() -> None:
         pass
 
 
+def _maybe_set_qwen3_omni_moe_env(engine_args_dict: dict[str, Any]) -> None:
+    if (
+        engine_args_dict.get("model_arch") == "Qwen3OmniMoeForConditionalGeneration"
+        and "VLLM_USE_FLASHINFER_MOE_FP16" not in os.environ
+    ):
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
+        logger.info("[stage_init] Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni stage")
+
+
 def split_devices_for_replicas(
     devices_str: str | None,
     num_replicas: int,
@@ -762,6 +771,10 @@ def build_engine_args_dict(
     default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
     engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
 
+    # TODO: Remove this after the performance regression is fixed
+    # Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni to avoid performance regression
+    _maybe_set_qwen3_omni_moe_env(engine_args_dict)
+
     return engine_args_dict
 
 
@@ -831,8 +844,18 @@ def build_vllm_config(
     return vllm_config, executor_class
 
 
-def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_config: Any) -> Any | None:
-    """Build one output processor per logical LLM stage."""
+def build_llm_stage_output_processor(
+    plan: LogicalStageInitPlan,
+    stage_vllm_config: Any,
+    log_stats: bool = False,
+) -> Any | None:
+    """Build one output processor per logical LLM stage.
+
+    ``log_stats`` controls whether the processor populates per-request
+    IterationStats (consumed by the Prometheus wrap). Default False matches
+    the upstream MultimodalOutputProcessor default and respects the
+    --log-stats CLI flag plumbed through AsyncOmniEngine.
+    """
 
     metadata = plan.replicas[0].metadata
     if stage_vllm_config.model_config.skip_tokenizer_init:
@@ -843,7 +866,7 @@ def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_conf
         )
     return MultimodalOutputProcessor(
         tokenizer=tokenizer,
-        log_stats=False,
+        log_stats=log_stats,
         engine_core_output_type=metadata.engine_output_type,
     )
 

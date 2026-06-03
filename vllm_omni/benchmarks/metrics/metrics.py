@@ -7,6 +7,8 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncOutput
 from vllm.benchmarks.serve import MILLISECONDS_TO_SECONDS_CONVERSION, TERM_PLOTLIB_AVAILABLE, BenchmarkMetrics, TaskType
 from vllm.tokenizers import TokenizerLike
 
+from vllm_omni.metrics import definitions as defs
+
 
 @dataclass
 class MultiModalsBenchmarkMetrics(BenchmarkMetrics):
@@ -109,17 +111,17 @@ def process_one_metric(
         "tpot": "Time per Output Token (excl. 1st token)",
         "itl": "Inter-token Latency",
         "e2el": "End-to-end Latency",
-        "audio_ttfp": "Time to First Packet",
-        "audio_rtf": "Real Time Factor",
-        "audio_duration": "Audio Duration",
-        "audio_underrun": "Streaming Audio Underrun",
+        defs.AUDIO_TTFP: "Time to First Packet",
+        defs.AUDIO_RTF: "Real Time Factor",
+        defs.AUDIO_DURATION: "Audio Duration",
+        defs.AUDIO_UNDERRUN: "Streaming Audio Underrun",
     }
 
     header = metric_header_map.get(metric_attribute_name, metric_attribute_name)
     print("{s:{c}^{n}}".format(s=header, n=50, c="-"))
 
-    is_audio_rtf = metric_attribute_name == "audio_rtf"
-    is_audio_duration_or_underrun = metric_attribute_name in ("audio_duration", "audio_underrun")
+    is_audio_rtf = metric_attribute_name == defs.AUDIO_RTF
+    is_audio_duration_or_underrun = metric_attribute_name in (defs.AUDIO_DURATION, defs.AUDIO_UNDERRUN)
 
     suffix = "_ms"
     unit_suffix = " (ms)"
@@ -216,12 +218,12 @@ def calculate_metrics(
             all_tpots.append(tpot)
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
-            audio_ttfps.append(getattr(outputs[i], "audio_ttfp", 0.0))
-            audio_rtfs.append(getattr(outputs[i], "audio_rtf", 0.0))
-            audio_duration.append(getattr(outputs[i], "audio_duration", 0.0))
-            audio_frames.append(getattr(outputs[i], "audio_frames", 0.0))
-            audio_underruns.append(getattr(outputs[i], "audio_underrun_s", 0.0))
-            audio_continuity_ok.append(bool(getattr(outputs[i], "audio_continuity_ok", True)))
+            audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0))
+            audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
+            audio_duration.append(getattr(outputs[i], defs.AUDIO_DURATION, 0.0))
+            audio_frames.append(getattr(outputs[i], defs.AUDIO_FRAMES, 0.0))
+            audio_underruns.append(getattr(outputs[i], f"{defs.AUDIO_UNDERRUN}_s", 0.0))
+            audio_continuity_ok.append(bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True)))
             e2els.append(outputs[i].latency)
             input_audio_duration += outputs[i].input_audio_duration
             completed += 1

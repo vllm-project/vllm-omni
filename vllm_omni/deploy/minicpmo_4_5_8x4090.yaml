@@ -1,0 +1,60 @@
+# MiniCPM-o 4.5 deploy: 8x4090 layout (24GB cards).
+#
+# Stage 0 (thinker): GPU 0,1,2,3 — 4-way TP, ~85% mem (≈20.4 GB / card,
+#                                  thinker weights take ~17.5 GB per card
+#                                  on 4090, leaving ~3 GB for KV cache /
+#                                  activations).
+# Stage 1 (talker) : GPU 4       — MiniCPMTTS + Token2Wav, ~90% mem
+#                                  (covers both the talker LM and the
+#                                  in-process Token2Wav vocoder that emits
+#                                  the waveform).
+#
+# max_model_len is pinned to 4096 because the upstream config.json
+# advertises max_position_embeddings=40960 (tuned for H20 141GB); on a
+# 24 GB 4090 a 40k-token KV cache request OOMs the worker process
+# before serving the first request. 8192 also OOMs in practice with
+# this thinker model + vision/audio encoders + Whisper preallocation,
+# so 4096 is the empirically-verified safe ceiling.
+pipeline: minicpmo_4_5
+async_chunk: false
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.85
+    enforce_eager: true
+    tensor_parallel_size: 4
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    devices: "0,1,2,3"
+    limit_mm_per_prompt:
+      video: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    # Talker only consumes runtime_additional_information[0]; any value > 1
+    # makes concurrent requests share request-0's audio (mm_outputs fallback).
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    devices: "4"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false
+
+platforms: {}
