@@ -6,9 +6,11 @@ Coverage:
 - CPU offloading (model-level sequential offload via --enable-cpu-offload)
 - Cache-DiT
 - SP (Ulysses)
+- HSDP
 
 This validates:
- - Successful image generation at the expected 768x1344 resolution with recommended feature combinations
+  - Successful image generation at the expected 768x1344 resolution with recommended feature combinations
+  - HSDP/non-HSDP generation paths produce the same output shape through the OpenAI serving surface
 """
 
 import pytest
@@ -48,6 +50,18 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="parallel_001",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--use-hsdp",
+                    "--hsdp-shard-size",
+                    "2",
+                ],
+            ),
+            id="parallel_hsdp_shard2",
             marks=PARALLEL_FEATURE_MARKS,
         ),
     ]

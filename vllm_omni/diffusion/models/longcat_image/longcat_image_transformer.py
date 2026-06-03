@@ -584,6 +584,14 @@ class LongCatImageTransformer2DModel(nn.Module):
     _repeated_blocks = ["LongCatImageTransformerBlock", "LongCatImageSingleTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 
+    @staticmethod
+    def _is_transformer_block(name: str, _module: nn.Module) -> bool:
+        return (name.startswith("transformer_blocks.") or name.startswith("single_transformer_blocks.")) and name.split(
+            "."
+        )[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
     # Sequence Parallelism for LongCat (following diffusers' _cp_plan pattern)
     _sp_plan = {
         "": {
