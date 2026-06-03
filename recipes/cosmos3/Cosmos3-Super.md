@@ -104,5 +104,9 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
   - (NVIDIA's reference: 8×H200 @ 50 steps ≈ 55 s/video; 2×H200 @ 35 steps ≈ 3 min/video.)
 - **Memory:** ~61.5 GiB per GPU when sharded across 2 GPUs (HSDP shard 2); repo ~135 GB on disk.
 - Same generation defaults, supported sizes, and `generate_sound`/`sound_duration`
-  semantics as Nano. Action (policy / forward- / inverse-dynamics) modalities are
-  not part of this integration yet.
+  semantics as Nano, including the **action** modality: `forward_dynamics`
+  (sync `/v1/videos/sync`) and `policy` (async `/v1/videos`, predicted action under
+  the top-level `action` field) — see the Cosmos3-Nano recipe for the request shape.
+  Online inference of inverse dynamics will be added in a follow-up MR. Verified on
+  the 64B Super under `--cfg-parallel-size 2`: async `policy` returns the predicted
+  action (`[16, 10]`) and the rollout video reliably.

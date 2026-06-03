@@ -220,12 +220,24 @@ class VideoGenerationRequest(BaseModel):
         return vp
 
 
+class VideoAction(BaseModel):
+    """Generated action sequence returned by action-capable video models."""
+
+    data: list[Any] = Field(..., description="JSON-serializable nested action values")
+    shape: list[int] = Field(..., description="Shape of the returned action data")
+    dtype: str | None = Field(default=None, description="Source action dtype, if available")
+    raw_action_dim: int | None = Field(default=None, description="Raw action dimension requested by the model")
+    action_mode: str | None = Field(default=None, description="Action generation mode")
+    domain_id: int | None = Field(default=None, description="Action embodiment domain id")
+
+
 class VideoData(BaseModel):
     """Single generated video data."""
 
     b64_json: str | None = Field(default=None, description="Base64-encoded MP4 video")
     url: str | None = Field(default=None, description="Video URL (not implemented)")
     revised_prompt: str | None = Field(default=None, description="Revised prompt (OpenAI compatibility, always null)")
+    action: VideoAction | None = Field(default=None, description="Generated action sequence metadata, if any")
 
 
 class VideoGenerationResponse(BaseModel):
@@ -298,6 +310,7 @@ class VideoResponse(BaseModel):
         default=0.0,
         description="Peak device memory usage in MB reported by the diffusion pipeline.",
     )
+    action: VideoAction | None = Field(default=None, description="Generated action sequence metadata, if any")
 
     @property
     def file_extension(self) -> str:
