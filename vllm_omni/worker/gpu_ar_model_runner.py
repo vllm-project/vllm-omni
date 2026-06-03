@@ -200,6 +200,33 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             downstream_req_ids = req_ids_output_copy
         return engine_output_type, downstream_req_ids
 
+    @staticmethod
+    def _sparse_mm_req_ids(multimodal_outputs: Any) -> list[str] | None:
+        if not isinstance(multimodal_outputs, dict):
+            return None
+        meta = multimodal_outputs.get("meta")
+        req_ids = None
+        sparse_audio = False
+        if isinstance(meta, dict):
+            req_ids = meta.get("req_id")
+            sparse_audio = GPUARModelRunner._is_sparse_audio_marker(meta.get("sparse_audio"))
+        if req_ids is None:
+            req_ids = multimodal_outputs.get("meta.req_id")
+            sparse_audio = GPUARModelRunner._is_sparse_audio_marker(multimodal_outputs.get("meta.sparse_audio"))
+        if not sparse_audio:
+            return None
+        if not isinstance(req_ids, list):
+            return None
+        return [rid for rid in req_ids if isinstance(rid, str)]
+
+    @staticmethod
+    def _is_sparse_audio_marker(value: Any) -> bool:
+        if isinstance(value, list):
+            return any(str(item).lower() in ("1", "true", "yes", "on") for item in value)
+        if isinstance(value, str):
+            return value.lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
     def capture_model(self) -> int:
         result = super().capture_model()
         self._capture_talker_mtp_graphs()
@@ -978,10 +1005,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self.kv_connector_output = None
 
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        sparse_mm_req_ids = self._sparse_mm_req_ids(multimodal_outputs)
+        sparse_mm_index = {rid: i for i, rid in enumerate(sparse_mm_req_ids or [])}
+        if engine_output_type == "audio" and sparse_mm_req_ids is not None:
+            sparse_req_id_set = set(sparse_mm_req_ids)
+            downstream_req_ids = [rid for rid in req_ids_output_copy if rid in sparse_req_id_set]
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
+        audio_sparse_output = engine_output_type == "audio" and sparse_mm_req_ids is not None
         needs_scheduled_hidden_payload = needs_pooler_payload and (
             self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states()
         )
@@ -994,7 +1027,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 int(scheduler_output.total_num_scheduled_tokens),
                 int(hidden_states.shape[0]),
             )
-            if len(downstream_req_ids) == len(req_ids_output_copy):
+            if audio_sparse_output:
+                pass
+            elif len(downstream_req_ids) == len(req_ids_output_copy):
                 hidden_states_cpu = hidden_states[:num_valid_tokens].detach().to("cpu").contiguous()
             else:
                 req_hidden_states_cpu = {}
@@ -1024,8 +1059,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         pooler_output: list[dict[str, object]] | None = None
         if needs_pooler_payload:
             mm_cpu = None
-            # Prior to applying the post-processing func, extract
-            # the prefix cached hidden states and multimodal states.
             if self.omni_prefix_cache is not None:
                 (
                     combined_hidden_states,
@@ -1036,7 +1069,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     multimodal_outputs,
                     scheduler_output.num_scheduled_tokens,
                 )
-            # Otherwise we don't have the mm CPU data yet, so we still need to build it
             if self.omni_prefix_cache is None or combined_multimodal_outputs is None:
                 mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs)
 
@@ -1059,7 +1091,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     req_hidden_states_cpu[rid] = hidden_states[start:end].detach().to("cpu").contiguous()
 
             pooler_output = []
-            for out_idx, rid in enumerate(req_ids_output_copy):
+            for rid in req_ids_output_copy:
                 if rid not in downstream_req_id_set:
                     pooler_output.append({})
                     continue
@@ -1067,31 +1099,24 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 start = int(query_start_loc_cpu[idx])
                 sched = int(num_scheduled_tokens_np[idx])
                 end = start + sched
-                # If prefix cache is enabled, we have already split everything
-                # by request and converted the states to CPU tensors
-                if req_hidden_states_cpu is not None and combined_hidden_states is None:
-                    req_hidden_states = req_hidden_states_cpu[rid]
-                else:
-                    req_hidden_states = self._resolve_req_hidden_states(
-                        hidden_states_cpu,
-                        combined_hidden_states,
-                        rid,
-                        start,
-                        end,
-                    )
-                payload: dict[str, object] = {"hidden": req_hidden_states}
+                payload: dict[str, object] = {}
+                if not audio_sparse_output:
+                    if req_hidden_states_cpu is not None and combined_hidden_states is None:
+                        req_hidden_states = req_hidden_states_cpu[rid]
+                    else:
+                        req_hidden_states = self._resolve_req_hidden_states(
+                            hidden_states_cpu,
+                            combined_hidden_states,
+                            rid,
+                            start,
+                            end,
+                        )
+                    payload["hidden"] = req_hidden_states
 
                 mm_payload: dict[str, object] = {}
                 if combined_multimodal_outputs or mm_cpu:
                     if combined_multimodal_outputs:
-                        # Prefix cache enabled; all items have already been processed
-                        # and split apart for each request as needed, and all tensors
-                        # have already been detached to the CPU.  Lists are kept as
-                        # passthrough data for consistent behavior in postprocess.
-                        # Recurse into nested dicts so list-valued sub-keys (e.g.
-                        # embed.tts_bos = [tensor]) are unwrapped to bare tensors
-                        # at the leaves; downstream flatten_payload then yields a
-                        # wire-clean dict[str, torch.Tensor].
+
                         def _unwrap_lists(v):
                             if isinstance(v, list):
                                 return v[idx] if idx < len(v) else v[0]
@@ -1103,8 +1128,26 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                             mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
 
                     else:
-                        # Prefix cache disabled; we still need to process the data
                         for mm_key, mm_val in mm_cpu.items():
+                            if mm_key in {"meta.req_id", "meta.sparse_audio"}:
+                                continue
+                            if audio_sparse_output and isinstance(mm_val, list):
+                                sparse_idx = sparse_mm_index.get(rid)
+                                if sparse_idx is None:
+                                    continue
+                                if sparse_idx >= len(mm_val):
+                                    logger.warning(
+                                        "Sparse multimodal payload mismatch for request %s: index %d >= %d.",
+                                        rid,
+                                        sparse_idx,
+                                        len(mm_val),
+                                    )
+                                    continue
+                                sparse_val = mm_val[sparse_idx]
+                                mm_payload[mm_key] = (
+                                    sparse_val.clone() if isinstance(sparse_val, torch.Tensor) else sparse_val
+                                )
+                                continue
                             mm_payload[mm_key] = to_payload_element(
                                 element=mm_val,
                                 idx=idx,
@@ -1114,8 +1157,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                                 seq_len=seq_len,
                             )
                     payload.update(mm_payload)
-                # Flatten nested dicts to dotted keys so pooling_output
-                # stays dict[str, torch.Tensor] for msgspec serialization.
                 pooler_output.append(flatten_payload(payload))
 
         if pooler_output and self._should_accumulate_full_payload_output():
