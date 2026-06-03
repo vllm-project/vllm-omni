@@ -125,9 +125,9 @@ class DiffusionWorker:
         try:
             hf_config = get_config(self.od_config.model, trust_remote_code=self.od_config.trust_remote_code)
         except ValueError:
-            hf_config = None
-            logger.info("Skipping hf_config loading for diffusion model %r", self.od_config.model_class_name)
-        hf_text_config = get_hf_text_config(hf_config) if hf_config is not None else None
+            hf_config = getattr(self.od_config, "tf_model_config", None)
+            logger.info("Using diffusion tf_model_config for model %r", self.od_config.model_class_name)
+        hf_text_config = get_hf_text_config(hf_config) if hasattr(hf_config, "get_text_config") else hf_config
         vllm_config.model_config = SimpleNamespace(
             hf_config=hf_config,
             hf_text_config=hf_text_config,
