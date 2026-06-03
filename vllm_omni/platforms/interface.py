@@ -11,6 +11,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.platforms import Platform
+from vllm.platforms.interface import PlatformEnum
 
 logger = init_logger(__name__)
 
@@ -239,6 +240,7 @@ class OmniPlatform(Platform):
 
 class UnspecifiedOmniPlatform(OmniPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED
+    _enum = PlatformEnum.UNSPECIFIED
     device_type = ""
 
     @classmethod

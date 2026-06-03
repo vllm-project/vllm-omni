@@ -1,3 +1,4 @@
+import logging
 import sys
 from functools import cached_property
 
@@ -128,3 +129,62 @@ for module_name, module in list(sys.modules.items()):
         module.StreamingUpdate = OmniStreamingUpdate
     if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
         module.EngineCoreRequest = OmniEngineCoreRequest
+
+# =============================================================================
+# Patch unregister_vllm_metrics to skip vllm:omni_* collectors
+# =============================================================================
+# WHY: Upstream unregister_vllm_metrics() uses `"vllm" in collector._name` to
+# strip collectors before each new PrometheusStatLogger registers, which is
+# how it avoids "Duplicated timeseries" when the same process spawns multiple
+# engines / orchestrators.  But its substring match also wipes our vllm:omni_*
+# families, so we must replace it with a scoped version that keeps ours.
+#
+# REMOVAL: Remove this patch once upstream vLLM adds
+# _STAT_LOGGER_METRIC_NAMES to vllm.v1.metrics.prometheus and scopes
+# unregister_vllm_metrics() to that set.  Track:
+# https://github.com/vllm-project/vllm/pull/42331
+import vllm.v1.metrics.prometheus as _vllm_prometheus  # noqa: E402
+
+_logger = logging.getLogger(__name__)
+
+
+def _scoped_unregister_vllm_metrics():
+    """Drop upstream vllm:* collectors but preserve vllm:omni_* (ours)."""
+    from prometheus_client import REGISTRY
+
+    for collector in list(REGISTRY._collector_to_names):
+        name = getattr(collector, "_name", "")
+        if "vllm" not in name:
+            continue
+        if name.startswith("vllm:omni_") or name.startswith("vllm_omni"):
+            continue
+        REGISTRY.unregister(collector)
+
+
+_vllm_prometheus.unregister_vllm_metrics = _scoped_unregister_vllm_metrics
+_logger.warning(
+    "Monkey-patched unregister_vllm_metrics() to scope drops to non-omni vllm:* collectors. "
+    "Remove this patch once vLLM adds _STAT_LOGGER_METRIC_NAMES."
+)
+
+
+# Patch: add qwen3_omni_moe to vllm's chat template fallback registry.
+# Qwen/Qwen3-Omni-30B-A3B-Instruct stores its chat_template in a standalone
+# chat_template.json (not in tokenizer_config.json).  transformers < 5.9.0
+# does not load this file, so the tokenizer has no chat_template attribute.
+# vllm's resolve_chat_template falls back to MODEL_TYPE_TO_CHAT_TEMPLATE
+# which has "qwen" but not "qwen3_omni_moe".  Register the same fallback.
+def _patch_chat_template_registry():
+    try:
+        from vllm.transformers_utils.chat_templates.registry import (
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK,
+            _get_qwen_chat_template_fallback,
+        )
+
+        if "qwen3_omni_moe" not in _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK:
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = _get_qwen_chat_template_fallback
+    except ImportError:
+        pass
+
+
+_patch_chat_template_registry()

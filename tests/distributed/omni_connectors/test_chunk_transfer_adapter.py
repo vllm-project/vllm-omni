@@ -50,6 +50,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         stage_id: int = 1,
         model_mode: str = "ar",
         max_num_seqs: int = 2,
+        active_stream_window: int = 0,
         connector_extra: dict | None = None,
     ):
         connector = mocker.MagicMock()
@@ -76,7 +77,11 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             classmethod(lambda cls, _model_config: connector),
         )
 
-        model_config = SimpleNamespace(worker_type=model_mode)
+        model_config = SimpleNamespace(
+            worker_type=model_mode,
+            max_num_seqs=max_num_seqs,
+            active_stream_window=active_stream_window,
+        )
         scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
         adapter = OmniChunkTransferAdapter(
             SimpleNamespace(model_config=model_config, scheduler_config=scheduler_config)
@@ -396,6 +401,75 @@ def test_process_and_restore_queues(build_adapter):
     assert adapter.waiting_for_chunk_running_requests == deque()
 
 
+def test_fifo_promotion(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=2, active_stream_window=2)
+    reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
+    waiting_queue = DummyWaitingQueue(reqs)
+    running_queue = []
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert list(adapter._active_streams) == ["req-1", "req-2"]
+    assert waiting_queue == reqs[2:]
+    assert reqs[0].status == RequestStatus.WAITING_FOR_CHUNK
+    assert reqs[1].status == RequestStatus.WAITING_FOR_CHUNK
+    assert reqs[2].status == RequestStatus.WAITING
+
+    adapter.finished_requests.add("req-1")
+    # Eviction is deferred to postprocess_scheduler_output in the runtime path
+    # (commit c4d95fd9 — otherwise the terminal chunk deadlocks at c=8 K=2).
+    # Simulate it here so promotion can pick up the freed slot.
+    adapter._evict_finished_active_streams({"req-1"})
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert list(adapter._active_streams) == ["req-2", "req-3"]
+    # Promotion + chunk processing happen in the same call, so req-3 is
+    # already WAITING_FOR_CHUNK by the time we check.
+    assert reqs[2].status == RequestStatus.WAITING_FOR_CHUNK
+
+
+def test_legacy_k0(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1, active_stream_window=0)
+    waiting_req = _req("waiting", RequestStatus.WAITING)
+    running_req_1 = _req("running-1", RequestStatus.RUNNING)
+    running_req_2 = _req("running-2", RequestStatus.RUNNING)
+    waiting_queue = DummyWaitingQueue([waiting_req])
+    running_queue = [running_req_1, running_req_2]
+
+    adapter.requests_with_ready_chunks.update({"running-1", "running-2"})
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert waiting_req.status == RequestStatus.WAITING_FOR_CHUNK
+    assert adapter.waiting_for_chunk_waiting_requests == deque([waiting_req])
+    assert running_queue == [running_req_1]
+    assert waiting_queue == [running_req_2]
+    assert running_req_2.status == RequestStatus.PREEMPTED
+    assert adapter._active_streams == {}
+
+
+def test_finished_releases_slot(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1, active_stream_window=1)
+    req_1 = _req("req-1", RequestStatus.WAITING)
+    req_2 = _req("req-2", RequestStatus.WAITING)
+    waiting_queue = DummyWaitingQueue([req_1, req_2])
+    running_queue = []
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    assert list(adapter._active_streams) == ["req-1"]
+    assert waiting_queue == [req_2]
+
+    adapter.finished_requests.add("req-1")
+    # Eviction is deferred to postprocess_scheduler_output in the runtime path
+    # (commit c4d95fd9). Simulate it so promotion can pick up the freed slot.
+    adapter._evict_finished_active_streams({"req-1"})
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert list(adapter._active_streams) == ["req-2"]
+    # Promotion + chunk processing happen in the same call, so req-2 is
+    # already WAITING_FOR_CHUNK by the time we check.
+    assert req_2.status == RequestStatus.WAITING_FOR_CHUNK
+
+
 def test_postprocess_scheduler_output(build_adapter):
     adapter, _ = build_adapter()
     adapter.requests_with_ready_chunks = {"new-ready", "cached-ready", "leftover"}
@@ -422,6 +496,7 @@ def test_postprocess_scheduler_output(build_adapter):
 def _populate_adapter_state(adapter, req_id="req-1", ext_id="ext-1"):
     """Fill every per-request structure so cleanup can be verified."""
     adapter.finished_requests.add(req_id)
+    adapter._active_streams[req_id] = SimpleNamespace(request_id=req_id)
     adapter.get_req_chunk[req_id] = 3
     adapter.requests_with_ready_chunks.add(req_id)
     adapter.request_ids_mapping[req_id] = ext_id
@@ -442,6 +517,7 @@ def test_cleanup_clears_all_state(build_adapter):
     adapter.cleanup(req_id, ext_id)
 
     assert req_id not in adapter.finished_requests
+    assert req_id not in adapter._active_streams
     assert req_id not in adapter.get_req_chunk
     assert req_id not in adapter.requests_with_ready_chunks
     assert req_id not in adapter.request_ids_mapping
@@ -703,6 +779,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
         kv_connector_output=None,
         cudagraph_stats=None,
         req_id_to_index={"req-s1": 0},
+        routed_experts=None,
         routed_experts_dict=None,
     )
 
@@ -789,6 +866,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
         cudagraph_stats=None,
         req_id_to_index={"req-ar": 0},
         kv_extracted_req_ids=None,
+        routed_experts=None,
         routed_experts_dict=None,
     )
 

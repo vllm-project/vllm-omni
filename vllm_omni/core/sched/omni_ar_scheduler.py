@@ -24,9 +24,11 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
 )
+from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
@@ -321,7 +323,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     req = self.requests.get(req_id)
                     if req is not None and not req.is_finished():
                         outputs[req.client_index].append(
-                            EngineCoreOutput(
+                            OmniEngineCoreOutput(
                                 request_id=req_id,
                                 new_token_ids=[],
                                 kv_transfer_params={"kv_ready": True},
@@ -417,11 +419,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stopped = True
 
             if stopped:
-                if (
-                    model_runner_output.routed_experts_dict is not None
-                    and req_id in model_runner_output.routed_experts_dict
-                ):
-                    routed_experts = model_runner_output.routed_experts_dict[req_id]
+                if model_runner_output.routed_experts is not None:
+                    routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
@@ -435,7 +434,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                             # Downstream async-chunk stages receive real payloads from the
                             # connector. This update only resumes polling for the next segment.
                             self.chunk_transfer_adapter.segment_finished_requests.discard(request.request_id)
-                    request.discard_latest_async_tokens = True
+                    request.async_tokens_to_discard = 1
                     request.num_output_placeholders = 0
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
@@ -452,7 +451,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stopped_preempted_reqs.add(request)
 
             # Extract sample logprobs if needed.
-            if request.sampling_params is not None and request.sampling_params.logprobs is not None and logprobs:
+            if request.sampling_params is not None and request.sampling_params.num_logprobs is not None and logprobs:
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
@@ -463,7 +462,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
-                    EngineCoreOutput(
+                    OmniEngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
                         finish_reason=finish_reason,
@@ -501,7 +500,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
                 outputs[request.client_index].append(
-                    EngineCoreOutput(
+                    OmniEngineCoreOutput(
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
@@ -638,7 +637,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Async scheduling may already have sampled the previous
             # segment's next token. Drop that late token instead of
             # appending it to the new streaming segment.
-            session.discard_latest_async_tokens = True
+            session.async_tokens_to_discard = 1
             session.num_computed_tokens -= session.num_output_placeholders
             session.num_output_placeholders = 0
             session.spec_token_ids = []

@@ -243,6 +243,7 @@ def test_t2v_video_generation_form(test_client, mocker: MockerFixture):
     _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
 
     engine = test_client.app.state.openai_serving_video._engine_client
+    assert engine.captured_prompt["modalities"] == ["video"]
     captured = engine.captured_sampling_params_list[0]
     assert captured.num_outputs_per_prompt == 1
     assert captured.width == 640
@@ -398,6 +399,8 @@ def test_sampling_params_pass_through(test_client, mocker: MockerFixture):
             "true_cfg_scale": "4.0",
             "boundary_ratio": "0.7",
             "flow_shift": "0.25",
+            "generate_sound": "true",
+            "sound_duration": "2.5",
         },
     )
 
@@ -412,6 +415,8 @@ def test_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.true_cfg_scale == 4.0
     assert captured.boundary_ratio == 0.7
     assert captured.extra_args["flow_shift"] == 0.25
+    assert captured.extra_args["generate_sound"] is True
+    assert captured.extra_args["sound_duration"] == 2.5
 
 
 def test_frame_interpolation_params_pass_to_diffusion_sampling_params(test_client, mocker: MockerFixture):
@@ -755,6 +760,9 @@ def test_invalid_uploaded_input_reference_returns_400(test_client):
 def test_video_request_validation():
     req = VideoGenerationRequest(prompt="test")
     assert req.prompt == "test"
+    assert req.generate_sound is False
+    assert req.sound_duration is None
+    assert VideoGenerationRequest(prompt="test", generate_sound=True, sound_duration=1.5).generate_sound is True
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", size="invalid")
 
@@ -767,6 +775,8 @@ def test_video_request_validation():
         VideoGenerationRequest(prompt="test", frame_interpolation_exp=0)
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", frame_interpolation_scale=0)
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(prompt="test", sound_duration=0)
 
 
 def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerFixture):
@@ -1063,6 +1073,8 @@ def test_sync_t2v_returns_video_bytes(test_client, mocker: MockerFixture):
     assert float(response.headers["x-inference-time-s"]) >= 0
     assert json.loads(response.headers["x-stage-durations"]) == {}
     assert float(response.headers["x-peak-memory-mb"]) == 0.0
+    engine = test_client.app.state.openai_serving_video._engine_client
+    assert engine.captured_prompt["modalities"] == ["video"]
 
 
 def test_sync_t2v_returns_profiler_headers(test_client, mocker: MockerFixture):

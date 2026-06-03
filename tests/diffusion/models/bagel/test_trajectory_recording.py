@@ -19,8 +19,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 NUM_TOKENS = 8
 HIDDEN_DIM = 16
 NUM_TIMESTEPS = 5
-# generate_image uses timesteps[:-1], so actual steps = NUM_TIMESTEPS - 1
-EXPECTED_STEPS = NUM_TIMESTEPS - 1
+# generate_image samples (num_timesteps + 1) points then drops the last, matching
+# upstream lance: see Bagel.generate_image in bagel_transformer.py.
+EXPECTED_STEPS = NUM_TIMESTEPS
 
 
 def _make_mock_bagel(mocker: MockerFixture):
@@ -178,7 +179,7 @@ class TestTrajectoryRecording:
         bagel, args = bagel_and_args
 
         # Recompute the expected timestep schedule (mirrors generate_image logic)
-        ts = torch.linspace(1, 0, args["num_timesteps"])
+        ts = torch.linspace(1, 0, args["num_timesteps"] + 1)
         shift = args.get("timestep_shift", 1.0)
         ts = shift * ts / (1 + (shift - 1) * ts)
         expected_timesteps = ts[:-1]  # last element is dropped
@@ -196,7 +197,7 @@ class TestTrajectoryRecording:
         bagel, args = bagel_and_args
 
         # Compute the number of denoising steps the same way generate_image does
-        ts = torch.linspace(1, 0, args["num_timesteps"])
+        ts = torch.linspace(1, 0, args["num_timesteps"] + 1)
         shift = args.get("timestep_shift", 1.0)
         ts = shift * ts / (1 + (shift - 1) * ts)
         num_steps = len(ts) - 1  # timesteps = ts[:-1]
