@@ -1065,11 +1065,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if omni_res.metrics:
                     last_metrics = omni_res.metrics
 
-                if res.prompt_token_ids is not None:
-                    num_prompt_tokens = len(res.prompt_token_ids)
-                    if res.encoder_prompt_token_ids is not None:
-                        num_prompt_tokens += len(res.encoder_prompt_token_ids)
-
                 # Initialize role before conditional blocks to avoid UnboundLocalError
                 # when handling audio/image responses
                 role = self.get_chat_request_role(request)
@@ -1081,6 +1076,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # the result_generator, it needs to be sent as the FIRST
                 # response (by the try...catch).
                 if first_iteration_dict[final_output_type] and final_output_type == "text":
+                    # NOTE: prompt token IDs / cached tokens are based on the first iteration
+                    # of the stage that producing text output for consistency for current
+                    # non-stream behaviors.
+                    if res.prompt_token_ids is not None:
+                        num_prompt_tokens = len(res.prompt_token_ids)
+                        if res.encoder_prompt_token_ids is not None:
+                            num_prompt_tokens += len(res.encoder_prompt_token_ids)
+
                     num_cached_tokens = res.num_cached_tokens
                     # Send first response for each choice with role
                     # NOTE: num_choices defaults to 1 so this usually executes once per request
@@ -1703,11 +1706,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         model=model_name,
                         modality=final_output_type,
                     )
-                    chunk.usage = UsageInfo(
-                        prompt_tokens=num_prompt_tokens,
-                        completion_tokens=0,
-                        total_tokens=num_prompt_tokens,
-                    )
+                    # NOTE: Currently usage is only set the text stages to align with the behavior
+                    # of the full generator. TODO (Alex): Add support for usage on all stages for
+                    # both streaming and non-streaming.
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
 
