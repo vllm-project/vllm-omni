@@ -434,7 +434,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                             # Downstream async-chunk stages receive real payloads from the
                             # connector. This update only resumes polling for the next segment.
                             self.chunk_transfer_adapter.segment_finished_requests.discard(request.request_id)
-                    request.discard_latest_async_tokens = True
+                    request.async_tokens_to_discard = 1
                     request.num_output_placeholders = 0
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
@@ -632,13 +632,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         req_id = session.request_id
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
-        session.discard_latest_async_tokens = False
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         if outstanding_async_tokens > 0:
             # Async scheduling may already have sampled the previous
             # segment's next token. Drop that late token instead of
             # appending it to the new streaming segment.
-            session.discard_latest_async_tokens = True
+            session.async_tokens_to_discard = 1
             session.num_computed_tokens -= session.num_output_placeholders
             session.num_output_placeholders = 0
             session.spec_token_ids = []
