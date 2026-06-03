@@ -18,7 +18,7 @@ import uuid
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import Any, Literal, cast
 
 import janus
 import torch
@@ -322,7 +322,6 @@ class AsyncOmniEngine:
         )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
-
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors via StageRuntime and assign to self."""
