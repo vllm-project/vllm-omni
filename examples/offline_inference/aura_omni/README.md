@@ -26,6 +26,31 @@ python end2end.py \
   --modalities text,audio
 ```
 
+Base voice clone mode is the default. It uses the AURA reference audio unless
+you override it:
+
+```bash
+python end2end.py \
+  --tts-task-type Base \
+  --tts-ref-audio /data/yrr/rein_test/shuhan.mp3 \
+  --tts-x-vector-only-mode
+```
+
+CustomVoice mode requires stages 2 and 3 in `vllm_omni/deploy/aura_omni.yaml`
+to point at a Qwen3-TTS CustomVoice checkpoint:
+
+```bash
+python end2end.py \
+  --tts-task-type CustomVoice \
+  --tts-speaker Vivian
+```
+
+Experimental AURA-to-TTS token passthrough:
+
+```bash
+python end2end.py --tts-use-aura-token-ids
+```
+
 For local checkpoints, edit the stage `model` entries in
 `vllm_omni/deploy/aura_omni.yaml` or pass a copied deploy config with
 `--deploy-config`.

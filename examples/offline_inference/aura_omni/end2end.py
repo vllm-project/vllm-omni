@@ -73,9 +73,14 @@ def build_query(args) -> QueryResult:
             },
             "additional_information": {
                 "aura_system_prompt": args.aura_system_prompt,
+                "tts_task_type": args.tts_task_type,
                 "tts_language": args.tts_language,
                 "tts_speaker": args.tts_speaker,
                 "tts_instruct": args.tts_instruct,
+                "tts_ref_audio": args.tts_ref_audio,
+                "tts_ref_text": args.tts_ref_text,
+                "tts_x_vector_only_mode": args.tts_x_vector_only_mode,
+                "tts_use_aura_token_ids": args.tts_use_aura_token_ids,
             },
         },
         limit_mm_per_prompt={"audio": 1, "video": 1},
@@ -192,9 +197,22 @@ def parse_args():
         ),
         help="System prompt for the AURA stage.",
     )
+    parser.add_argument("--tts-task-type", default="Base", choices=["Base", "CustomVoice"], help="Qwen3-TTS task.")
     parser.add_argument("--tts-language", default="Chinese", help="Qwen3-TTS language.")
     parser.add_argument("--tts-speaker", default="Vivian", help="Qwen3-TTS speaker.")
     parser.add_argument("--tts-instruct", default="", help="Optional Qwen3-TTS style instruction.")
+    parser.add_argument("--tts-ref-audio", default=None, help="Base-mode reference audio path/URL.")
+    parser.add_argument("--tts-ref-text", default=None, help="Base-mode reference audio transcript.")
+    parser.add_argument(
+        "--tts-x-vector-only-mode",
+        action="store_true",
+        help="Use speaker embedding only for Base mode (disable ICL ref_text conditioning).",
+    )
+    parser.add_argument(
+        "--tts-use-aura-token-ids",
+        action="store_true",
+        help="Experimental: pass AURA generated token ids directly into Qwen3-TTS text ids.",
+    )
     parser.add_argument("--init-timeout", type=int, default=2000, help="Overall initialization timeout.")
     parser.add_argument("--stage-init-timeout", type=int, default=2000, help="Per-stage initialization timeout.")
     parser.add_argument("--log-stats", action="store_true", default=False, help="Enable stats logging.")

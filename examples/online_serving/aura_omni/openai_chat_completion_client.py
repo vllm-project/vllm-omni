@@ -14,7 +14,7 @@ from vllm.assets.audio import AudioAsset
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 SEED = 42
-DEFAULT_MODEL = "aurateam/AURA"
+DEFAULT_MODEL = "aura_omni"
 DEFAULT_VIDEO_URL = "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4"
 
 
@@ -127,9 +127,14 @@ def main(args) -> None:
             "sampling_params_list": sampling_params_list(),
             "additional_information": {
                 "aura_system_prompt": args.aura_system_prompt,
+                "tts_task_type": args.tts_task_type,
                 "tts_language": args.tts_language,
                 "tts_speaker": args.tts_speaker,
                 "tts_instruct": args.tts_instruct,
+                "tts_ref_audio": args.tts_ref_audio,
+                "tts_ref_text": args.tts_ref_text,
+                "tts_x_vector_only_mode": args.tts_x_vector_only_mode,
+                "tts_use_aura_token_ids": args.tts_use_aura_token_ids,
             },
         },
         timeout=args.timeout,
@@ -157,9 +162,22 @@ def parse_args():
             "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in Chinese."
         ),
     )
+    parser.add_argument("--tts-task-type", default="Base", choices=["Base", "CustomVoice"])
     parser.add_argument("--tts-language", default="Chinese")
     parser.add_argument("--tts-speaker", default="Vivian")
     parser.add_argument("--tts-instruct", default="")
+    parser.add_argument("--tts-ref-audio", default=None, help="Base-mode reference audio path/URL visible to server.")
+    parser.add_argument("--tts-ref-text", default=None, help="Base-mode reference audio transcript.")
+    parser.add_argument(
+        "--tts-x-vector-only-mode",
+        action="store_true",
+        help="Use speaker embedding only for Base mode (disable ICL ref_text conditioning).",
+    )
+    parser.add_argument(
+        "--tts-use-aura-token-ids",
+        action="store_true",
+        help="Experimental: pass AURA generated token ids directly into Qwen3-TTS text ids.",
+    )
     parser.add_argument("--timeout", type=float, default=600.0)
     return parser.parse_args()
 

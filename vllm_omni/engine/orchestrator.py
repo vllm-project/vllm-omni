@@ -180,6 +180,7 @@ class Orchestrator:
         self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
 
         self._cfg_tracker = CfgCompanionTracker()
+        self._stage_input_processors: dict[int, Any] = {}
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
@@ -884,6 +885,77 @@ class Orchestrator:
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
 
+    def _get_stage_input_processor(self, stage_id: int) -> Any:
+        processor = self._stage_input_processors.get(stage_id)
+        if processor is None:
+            from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
+
+            processor = build_stage0_input_processor(self.stage_pools[stage_id].stage_vllm_config)
+            self._stage_input_processors[stage_id] = processor
+        return processor
+
+    def _upgrade_processed_stage_request(self, request: Any, raw_prompt: Any) -> Any:
+        prompt_embeds = getattr(request, "prompt_embeds", None)
+        additional_information = None
+
+        if isinstance(raw_prompt, dict):
+            if prompt_embeds is None:
+                raw_prompt_embeds = raw_prompt.get("prompt_embeds")
+                if isinstance(raw_prompt_embeds, torch.Tensor):
+                    prompt_embeds = raw_prompt_embeds
+            additional_information = serialize_additional_information(
+                raw_prompt.get("additional_information"),
+                log_prefix="Orchestrator stage input",
+            )
+
+        if prompt_embeds is None and additional_information is None:
+            return request
+
+        return OmniEngineCoreRequest.from_request(
+            request,
+            prompt_embeds=prompt_embeds,
+            additional_information=additional_information,
+        )
+
+    def _next_stage_input_is_tokens(self, next_input: Any) -> bool:
+        return isinstance(next_input, dict) and "prompt_token_ids" in next_input
+
+    def _build_next_stage_request(
+        self,
+        req_id: str,
+        next_stage_id: int,
+        next_input: Any,
+        params: SamplingParams | PoolingParams,
+        *,
+        mm_features: list | None = None,
+        resumable: bool = False,
+    ) -> Any:
+        next_pool = self.stage_pools[next_stage_id]
+        if self._next_stage_input_is_tokens(next_input):
+            request = build_engine_core_request_from_tokens(
+                request_id=req_id,
+                prompt=next_input,
+                params=params,
+                model_config=next_pool.stage_vllm_config.model_config,
+                mm_features=mm_features,
+                resumable=resumable,
+            )
+            request.external_req_id = request.request_id
+            return request
+
+        processor = self._get_stage_input_processor(next_stage_id)
+        request = processor.process_inputs(
+            request_id=req_id,
+            prompt=next_input,
+            params=params,
+            supported_tasks=("generate",),
+            arrival_time=_time.time(),
+            resumable=resumable,
+        )
+        request = self._upgrade_processed_stage_request(request, next_input)
+        request.external_req_id = req_id
+        return request
+
     async def _handle_cfg_companion_ready(self, req_id: str) -> None:
         """Mark a CFG companion as done; if all companions are done, flush deferred parent."""
         parent_id = self._cfg_tracker.on_companion_completed(req_id)
@@ -1213,16 +1285,15 @@ class Orchestrator:
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
-            request = build_engine_core_request_from_tokens(
-                request_id=req_id,
-                prompt=next_input,
+            request = self._build_next_stage_request(
+                req_id,
+                next_logical,
+                next_input,
                 params=params,
-                model_config=next_pool.stage_vllm_config.model_config,
                 mm_features=mm_features,
                 resumable=next_stage_resumable,
             )
 
-            request.external_req_id = request.request_id
             if already_submitted:
                 await next_pool.submit_update(req_id, req_state, request)
             else:

@@ -24,7 +24,7 @@ SEED = 42
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Gradio demo for AURA Omni online inference.")
-    parser.add_argument("--model", default="aurateam/AURA", help="Model name/path served by vLLM.")
+    parser.add_argument("--model", default="aura_omni", help="Model name served by vLLM.")
     parser.add_argument("--api-base", default="http://localhost:8091/v1", help="OpenAI-compatible API base.")
     parser.add_argument("--ip", default="127.0.0.1", help="Gradio host.")
     parser.add_argument("--port", type=int, default=7862, help="Gradio port.")
@@ -113,17 +113,47 @@ def build_interface(client: OpenAI, model: str):
         video_file,
         prompt: str,
         aura_system_prompt: str,
+        tts_task_type: str,
+        tts_language: str,
         tts_speaker: str,
         tts_instruct: str,
+        tts_ref_audio: str,
+        tts_ref_text: str,
+        tts_x_vector_only_mode: bool,
+        tts_use_aura_token_ids: bool,
     ):
         audio_url = _audio_to_data_url(audio_file)
         video_url = _video_to_data_url(video_file)
         if not audio_url:
             return "Please provide audio input for the ASR stage.", None
+        if tts_task_type == "Base" and (not (tts_ref_audio or "").strip() or not (tts_ref_text or "").strip()):
+            return "Base TTS requires both reference audio and reference transcript.", None
         content: list[dict[str, Any]] = [{"type": "audio_url", "audio_url": {"url": audio_url}}]
         if video_url:
             content.append({"type": "video_url", "video_url": {"url": video_url}})
         content.append({"type": "text", "text": prompt or "请结合语音和视频判断是否需要回应。"})
+
+        additional_information: dict[str, Any] = {
+            "aura_system_prompt": aura_system_prompt,
+            "tts_task_type": tts_task_type,
+            "tts_instruct": tts_instruct,
+            "tts_use_aura_token_ids": bool(tts_use_aura_token_ids),
+        }
+        if tts_task_type == "CustomVoice":
+            additional_information.update(
+                {
+                    "tts_language": tts_language or "Chinese",
+                    "tts_speaker": tts_speaker or "Vivian",
+                }
+            )
+        else:
+            additional_information.update(
+                {
+                    "tts_ref_audio": tts_ref_audio.strip() if tts_ref_audio else None,
+                    "tts_ref_text": tts_ref_text.strip() if tts_ref_text else None,
+                    "tts_x_vector_only_mode": bool(tts_x_vector_only_mode),
+                }
+            )
 
         response = client.chat.completions.create(
             model=model,
@@ -131,12 +161,7 @@ def build_interface(client: OpenAI, model: str):
             modalities=["text", "audio"],
             extra_body={
                 "sampling_params_list": _sampling_params_list(),
-                "additional_information": {
-                    "aura_system_prompt": aura_system_prompt,
-                    "tts_language": "Chinese",
-                    "tts_speaker": tts_speaker,
-                    "tts_instruct": tts_instruct,
-                },
+                "additional_information": additional_information,
             },
             timeout=600.0,
         )
@@ -155,6 +180,14 @@ def build_interface(client: OpenAI, model: str):
         "You are receiving a live video stream where the final frame is the present moment. "
         "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in Chinese."
     )
+
+    def _toggle_tts_advanced(task_type: str):
+        is_base = task_type == "Base"
+        return (
+            gr.update(visible=not is_base),
+            gr.update(visible=is_base),
+        )
+
     with gr.Blocks() as demo:
         gr.Markdown("# AURA Omni")
         gr.Markdown("ASR -> AURA/Qwen3-VL -> Qwen3-TTS Talker -> Code2Wav")
@@ -168,15 +201,57 @@ def build_interface(client: OpenAI, model: str):
         )
         with gr.Accordion("Advanced", open=False):
             aura_system_prompt = gr.Textbox(label="AURA system prompt", value=default_system, lines=4)
-            tts_speaker = gr.Textbox(label="TTS speaker", value="Vivian")
+            tts_task_type = gr.Radio(choices=["Base", "CustomVoice"], value="Base", label="TTS task type")
             tts_instruct = gr.Textbox(label="TTS instruction", value="")
+
+            with gr.Group(visible=False) as customvoice_config_group:
+                tts_language = gr.Dropdown(
+                    choices=["Chinese", "English", "Japanese", "Korean", "Cantonese"],
+                    value="Chinese",
+                    label="CustomVoice language",
+                )
+                tts_speaker = gr.Textbox(label="CustomVoice speaker", value="Vivian")
+
+            with gr.Group(visible=True) as base_config_group:
+                tts_ref_audio = gr.Textbox(
+                    label="Base reference audio path/URL",
+                    value="/data/yrr/rein_test/shuhan.mp3",
+                )
+                tts_ref_text = gr.Textbox(label="Base reference transcript", value="", lines=3)
+                tts_x_vector_only_mode = gr.Checkbox(
+                    label="Base x-vector only mode (disable ICL)",
+                    value=False,
+                )
+
+            tts_use_aura_token_ids = gr.Checkbox(
+                label="Experimental: pass AURA token ids to TTS",
+                value=False,
+            )
+            tts_task_type.change(
+                _toggle_tts_advanced,
+                inputs=[tts_task_type],
+                outputs=[customvoice_config_group, base_config_group],
+            )
         button = gr.Button("Generate", variant="primary")
         with gr.Row():
             text_output = gr.Textbox(label="Text output", lines=8)
             audio_output = gr.Audio(label="Audio output", interactive=False)
         button.click(
             run,
-            inputs=[audio_input, video_input, prompt, aura_system_prompt, tts_speaker, tts_instruct],
+            inputs=[
+                audio_input,
+                video_input,
+                prompt,
+                aura_system_prompt,
+                tts_task_type,
+                tts_language,
+                tts_speaker,
+                tts_instruct,
+                tts_ref_audio,
+                tts_ref_text,
+                tts_x_vector_only_mode,
+                tts_use_aura_token_ids,
+            ],
             outputs=[text_output, audio_output],
         )
         demo.queue()

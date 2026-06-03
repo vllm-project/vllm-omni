@@ -74,6 +74,7 @@ from vllm.entrypoints.serve.utils.api_utils import should_include_usage
 from vllm.entrypoints.serve.utils.tool_calls_utils import maybe_filter_parallel_tool_calls
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.multimodal.media.connector import MediaConnector
 from vllm.outputs import RequestOutput
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
@@ -104,6 +105,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 )
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
+    clone_sampling_params,
     get_default_sampling_params_list,
 )
 from vllm_omni.entrypoints.openai.utils import (
@@ -654,6 +656,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
 
+        aura_multi_modal_data: dict[str, Any] | None = None
+        if self._is_aura_omni_pipeline():
+            messages, aura_multi_modal_data = await self._strip_aura_videos_for_asr(
+                messages,
+                request,
+            )
+
         (conversation,), (engine_prompt,) = await renderer.render_chat_async(
             [messages],
             chat_params,
@@ -698,6 +707,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if hasattr(request, "cache_salt") and request.cache_salt is not None:
             engine_prompt["cache_salt"] = request.cache_salt
 
+        additional_information = getattr(request, "additional_information", None)
+        if isinstance(additional_information, dict):
+            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
+                engine_prompt["additional_information"] = {}
+            engine_prompt["additional_information"].update(additional_information)
+
+        if aura_multi_modal_data:
+            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
+                engine_prompt["additional_information"] = {}
+            engine_prompt["additional_information"]["aura_multi_modal_data"] = aura_multi_modal_data
+
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
         if normalized is not None:
@@ -723,14 +743,162 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return conversation, [engine_prompt]
 
+    def _is_aura_omni_pipeline(self) -> bool:
+        stage_names: set[str] = set()
+        for stage in getattr(self.engine_client, "stage_configs", []) or []:
+            engine_args = getattr(stage, "engine_args", None)
+            model_stage = getattr(engine_args, "model_stage", None) or getattr(stage, "model_stage", None)
+            if model_stage:
+                stage_names.add(str(model_stage))
+        return {"asr", "aura", "code2wav"}.issubset(stage_names)
+
+    async def _strip_aura_videos_for_asr(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        request: ChatLikeRequest | ResponsesRequest,
+    ) -> tuple[list[ChatCompletionMessageParam], dict[str, Any] | None]:
+        """Keep videos for AURA while hiding them from the ASR stage renderer."""
+        video_urls: list[str] = []
+        stripped_messages: list[ChatCompletionMessageParam] = []
+
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                stripped_messages.append(message)
+                continue
+
+            stripped_content: list[Any] = []
+            changed = False
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "video_url":
+                    video_url = part.get("video_url")
+                    if isinstance(video_url, dict):
+                        video_url = video_url.get("url")
+                    if isinstance(video_url, str) and video_url:
+                        video_urls.append(video_url)
+                    changed = True
+                    continue
+                stripped_content.append(part)
+
+            if changed:
+                stripped_message = dict(message)
+                stripped_message["content"] = stripped_content
+                stripped_messages.append(cast(ChatCompletionMessageParam, stripped_message))
+            else:
+                stripped_messages.append(message)
+
+        if not video_urls:
+            return messages, None
+
+        media_connector = MediaConnector(
+            media_io_kwargs=getattr(request, "media_io_kwargs", None),
+            allowed_local_media_path=getattr(self.model_config, "allowed_local_media_path", "") or "",
+            allowed_media_domains=getattr(self.model_config, "allowed_media_domains", None),
+        )
+        videos = await asyncio.gather(*(media_connector.fetch_video_async(url) for url in video_urls))
+        return stripped_messages, {"video": list(videos)}
+
+    async def _inject_audio_from_video_urls(
+        self,
+        messages: list[ChatCompletionMessageParam],
+    ) -> list[ChatCompletionMessageParam]:
+        """Pre-extract audio from video URLs and inject as audio_url content items.
+
+        When use_audio_in_video=True, the qwen2_5_omni_thinker multimodal
+        processor requires that the number of audio items equals the number of
+        video items (it subtracts mm_counts["video"] from mm_counts["audio"]).
+        The client only sends video_url items; this method adds the matching
+        audio_url items on the server side before the renderer processes them.
+        """
+        import io
+
+        from vllm_omni.entrypoints.chat_utils import extract_audio_from_video_async
+
+        new_messages: list[ChatCompletionMessageParam] = []
+        for msg in messages:
+            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+            if not isinstance(content, list):
+                new_messages.append(msg)
+                continue
+
+            video_urls = [
+                part.get("video_url", {}).get("url")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "video_url" and part.get("video_url", {}).get("url")
+            ]
+
+            if not video_urls:
+                new_messages.append(msg)
+                continue
+
+            audios = await asyncio.gather(*(extract_audio_from_video_async(u) for u in video_urls))
+
+            audio_items: list[dict] = []
+            for audio_array, sample_rate in audios:
+                buf = io.BytesIO()
+                if soundfile is not None:
+                    soundfile.write(buf, audio_array, samplerate=int(sample_rate), format="WAV")
+                else:
+                    import struct
+
+                    import numpy as np
+
+                    audio_np = np.asarray(audio_array, dtype=np.float32)
+                    sr = int(sample_rate)
+                    num_channels = 1
+                    bits_per_sample = 32
+                    num_frames = len(audio_np)
+                    data_size = num_frames * num_channels * (bits_per_sample // 8)
+                    # Write minimal RIFF/WAV header
+                    buf.write(b"RIFF")
+                    buf.write(struct.pack("<I", 36 + data_size))
+                    buf.write(b"WAVE")
+                    buf.write(b"fmt ")
+                    buf.write(
+                        struct.pack(
+                            "<IHHIIHH",
+                            16,
+                            3,
+                            num_channels,
+                            sr,
+                            sr * num_channels * (bits_per_sample // 8),
+                            num_channels * (bits_per_sample // 8),
+                            bits_per_sample,
+                        )
+                    )
+                    buf.write(b"data")
+                    buf.write(struct.pack("<I", data_size))
+                    buf.write(audio_np.tobytes())
+
+                audio_b64 = base64.b64encode(buf.getvalue()).decode()
+                audio_items.append(
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": f"data:audio/wav;base64,{audio_b64}"},
+                    }
+                )
+
+            new_content = list(content) + audio_items
+            if isinstance(msg, dict):
+                new_msg = {**msg, "content": new_content}
+            else:
+                new_msg = msg.model_copy(update={"content": new_content})
+            new_messages.append(new_msg)
+
+        return new_messages
+
     def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[Any]:
         """Convert request dicts to stage-typed sampling params objects.
 
         For diffusion stages, build ``OmniDiffusionSamplingParams`` so
         downstream ``StageDiffusionClient._sampling_params_to_dict`` (which
         requires a dataclass) works. For LLM stages build ``SamplingParams``.
+        If callers provide params for fewer stages than the native pipeline has
+        (for example AURA has three semantic models but four engine stages),
+        append cloned deploy defaults for the omitted tail stages.
         """
         stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        default_params_list = list(getattr(self.engine_client, "default_sampling_params_list", []) or [])
         final_sampling_params_list: list[Any] = []
         for idx, sampling_params in enumerate(sampling_params_list):
             stage_type = get_stage_type(stage_configs[idx]) if idx < len(stage_configs) else "llm"
@@ -750,6 +918,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 final_sampling_params_list.append(target_cls(**as_dict))
             else:
                 raise ValueError(f"Invalid sampling params: {sampling_params}")
+        for idx in range(len(final_sampling_params_list), len(stage_configs)):
+            if idx < len(default_params_list):
+                final_sampling_params_list.append(clone_sampling_params(default_params_list[idx]))
+            else:
+                final_sampling_params_list.append(SamplingParams())
         return final_sampling_params_list
 
     def _get_comprehension_stage_index(self) -> int:

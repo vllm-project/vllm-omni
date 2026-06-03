@@ -16,6 +16,7 @@ vllm serve aurateam/AURA \
   --omni \
   --port 8091 \
   --deploy-config vllm_omni/deploy/aura_omni.yaml \
+  --served-model-name aura_omni \
   --trust-remote-code
 ```
 
@@ -30,6 +31,10 @@ For local weights, edit the `model` value on each stage in
 `pipeline: aura_omni`, so the server uses this four-stage topology even when
 the command-line model path points at one component checkpoint.
 
+Use `aura_omni` as the OpenAI API `model` value. The component checkpoint paths
+belong in the deploy YAML; they are not valid request model names unless you
+also register them with `--served-model-name`.
+
 Expected request shape:
 
 - Send microphone audio as the Stage 0 multimodal audio input.
@@ -37,10 +42,14 @@ Expected request shape:
   `asr2aura` processor carries them forward to AURA.
 - Optional `additional_information` keys:
   - `aura_system_prompt`
+  - `tts_task_type`
   - `tts_language`
   - `tts_speaker`
   - `tts_instruct`
-  - `tts_task_type`
+  - `tts_ref_audio`
+  - `tts_ref_text`
+  - `tts_x_vector_only_mode`
+  - `tts_use_aura_token_ids`
 
 If AURA emits `<|silent|>`, the `aura2tts` processor returns no TTS request, so
 the TTS stages are skipped for that turn.
@@ -51,7 +60,7 @@ the TTS stages are skipped for that turn.
 python examples/online_serving/aura_omni/openai_chat_completion_client.py \
   --host localhost \
   --port 8091 \
-  --model aurateam/AURA \
+  --model aura_omni \
   --modalities text,audio
 ```
 
@@ -64,6 +73,31 @@ python examples/online_serving/aura_omni/openai_chat_completion_client.py \
   --output-dir output_aura_omni_online
 ```
 
+Base voice clone mode (default, recommended as x-vector while debugging ICL):
+
+```bash
+python examples/online_serving/aura_omni/openai_chat_completion_client.py \
+  --tts-task-type Base \
+  --tts-ref-audio /data/yrr/rein_test/shuhan.mp3 \
+  --tts-x-vector-only-mode
+```
+
+CustomVoice mode requires stages 2 and 3 in `aura_omni.yaml` to point at a
+Qwen3-TTS CustomVoice checkpoint:
+
+```bash
+python examples/online_serving/aura_omni/openai_chat_completion_client.py \
+  --tts-task-type CustomVoice \
+  --tts-speaker Vivian
+```
+
+To try AURA token passthrough into Qwen3-TTS:
+
+```bash
+python examples/online_serving/aura_omni/openai_chat_completion_client.py \
+  --tts-use-aura-token-ids
+```
+
 ## Curl
 
 ```bash
@@ -74,7 +108,7 @@ bash run_curl_multimodal_generation.sh
 Set `PORT`, `MODEL`, or `OUTPUT_DIR` to override defaults:
 
 ```bash
-PORT=8666 MODEL=/data/models/AURA bash run_curl_multimodal_generation.sh
+PORT=8666 MODEL=aura_omni bash run_curl_multimodal_generation.sh
 ```
 
 ## Gradio
@@ -90,7 +124,7 @@ If the server is already running:
 
 ```bash
 python examples/online_serving/aura_omni/gradio_demo.py \
-  --model aurateam/AURA \
+  --model aura_omni \
   --api-base http://localhost:8091/v1
 ```
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PORT="${PORT:-8091}"
-MODEL="${MODEL:-aurateam/AURA}"
+MODEL="${MODEL:-aura_omni}"
 OUTPUT_DIR="${OUTPUT_DIR:-output_aura_omni_online}"
 mkdir -p "$OUTPUT_DIR"
 

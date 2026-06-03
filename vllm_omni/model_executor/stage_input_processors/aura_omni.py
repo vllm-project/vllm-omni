@@ -6,6 +6,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    PRECOMPUTED_TEXT_IDS_KEY,
+)
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 DEFAULT_AURA_SYSTEM_PROMPT = (
@@ -15,6 +18,20 @@ DEFAULT_AURA_SYSTEM_PROMPT = (
 )
 
 SILENT_TEXT = "<|silent|>"
+QWEN_IM_START_ID = 151644
+QWEN_IM_END_ID = 151645
+QWEN_ASSISTANT_ID = 77091
+QWEN_NEWLINE_ID = 198
+QWEN_ASSISTANT_PREFIX_IDS = [QWEN_IM_START_ID, QWEN_ASSISTANT_ID, QWEN_NEWLINE_ID]
+QWEN_ASSISTANT_SUFFIX_IDS = [
+    QWEN_IM_END_ID,
+    QWEN_NEWLINE_ID,
+    QWEN_IM_START_ID,
+    QWEN_ASSISTANT_ID,
+    QWEN_NEWLINE_ID,
+]
+DEFAULT_QWEN3_TTS_REF_AUDIO = "vllm-omni/tests/assets/qwen3_tts/clone_2.wav"
+DEFAULT_QWEN3_TTS_REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -31,6 +48,24 @@ def _first_value(value: Any, default: Any = None) -> Any:
     if isinstance(value, list):
         return value[0] if value else default
     return default if value is None else value
+
+
+def _first_bool(value: Any, default: bool = False) -> bool:
+    value = _first_value(value, default)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _normalize_qwen3_tts_speaker(speaker: Any) -> Any:
+    if not isinstance(speaker, str):
+        return speaker
+    speaker = speaker.strip()
+    if not speaker:
+        return speaker
+    if "_" in speaker:
+        return speaker
+    return speaker[0].upper() + speaker[1:].lower()
 
 
 def _extract_output(source_output: Any) -> Any:
@@ -54,6 +89,32 @@ def _extract_text(source_output: Any) -> str:
             if isinstance(value, list) and value and isinstance(value[0], str):
                 return value[0]
     return ""
+
+
+def _extract_token_ids(source_output: Any) -> list[int]:
+    output = _extract_output(source_output)
+    token_ids = getattr(output, "cumulative_token_ids", None)
+    if isinstance(token_ids, list):
+        return [int(token_id) for token_id in token_ids if isinstance(token_id, int)]
+    return []
+
+
+def _trim_aura_response_token_ids(token_ids: list[int]) -> list[int]:
+    ids = list(token_ids)
+    if ids[: len(QWEN_ASSISTANT_PREFIX_IDS)] == QWEN_ASSISTANT_PREFIX_IDS:
+        ids = ids[len(QWEN_ASSISTANT_PREFIX_IDS) :]
+    if QWEN_IM_END_ID in ids:
+        ids = ids[: ids.index(QWEN_IM_END_ID)]
+    while ids and ids[-1] in {QWEN_IM_START_ID, QWEN_IM_END_ID, QWEN_NEWLINE_ID}:
+        ids.pop()
+    return ids
+
+
+def _qwen3_tts_assistant_token_ids_from_aura(source_output: Any) -> list[int]:
+    content_ids = _trim_aura_response_token_ids(_extract_token_ids(source_output))
+    if not content_ids:
+        return []
+    return QWEN_ASSISTANT_PREFIX_IDS + content_ids + QWEN_ASSISTANT_SUFFIX_IDS
 
 
 def _source_prompt_by_request_id(source_outputs: list[Any], prompt: Any) -> dict[str, dict[str, Any]]:
@@ -100,9 +161,13 @@ def asr2aura(
         additional_info = src_prompt.get("additional_information") or {}
         system_prompt = _first_value(additional_info.get("aura_system_prompt"), DEFAULT_AURA_SYSTEM_PROMPT)
         transcript = _extract_text(source_output)
-        multi_modal_data = src_prompt.get("multi_modal_data") or {}
-        if not isinstance(multi_modal_data, dict):
-            multi_modal_data = {}
+        multi_modal_data = {}
+        source_multi_modal_data = src_prompt.get("multi_modal_data") or {}
+        if isinstance(source_multi_modal_data, dict):
+            multi_modal_data.update(source_multi_modal_data)
+        aura_multi_modal_data = additional_info.get("aura_multi_modal_data") or {}
+        if isinstance(aura_multi_modal_data, dict):
+            multi_modal_data.update(aura_multi_modal_data)
         multi_modal_data = _vision_multimodal_data(multi_modal_data)
 
         next_input: dict[str, Any] = {
@@ -139,14 +204,31 @@ def aura2tts(
 
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
+        task_type = _first_value(additional_info.get("tts_task_type"), "Base")
         tts_info = {
-            "task_type": [_first_value(additional_info.get("tts_task_type"), "CustomVoice")],
+            "task_type": [task_type],
             "text": [text],
             "language": [_first_value(additional_info.get("tts_language"), "Chinese")],
-            "speaker": [_first_value(additional_info.get("tts_speaker"), "Vivian")],
             "instruct": [_first_value(additional_info.get("tts_instruct"), "")],
             "max_new_tokens": [int(_first_value(additional_info.get("tts_max_new_tokens"), 2048))],
         }
+        if task_type == "Base":
+            ref_audio = _first_value(additional_info.get("tts_ref_audio"), DEFAULT_QWEN3_TTS_REF_AUDIO)
+            ref_text = _first_value(additional_info.get("tts_ref_text"), DEFAULT_QWEN3_TTS_REF_TEXT)
+            x_vector_only_mode = _first_bool(additional_info.get("tts_x_vector_only_mode"), False)
+            if ref_audio:
+                tts_info["ref_audio"] = [ref_audio]
+            if ref_text:
+                tts_info["ref_text"] = [ref_text]
+            tts_info["x_vector_only_mode"] = [x_vector_only_mode]
+        elif task_type == "CustomVoice":
+            tts_info["speaker"] = [
+                _normalize_qwen3_tts_speaker(_first_value(additional_info.get("tts_speaker"), "Vivian"))
+            ]
+        if _first_bool(additional_info.get("tts_use_aura_token_ids"), False):
+            assistant_token_ids = _qwen3_tts_assistant_token_ids_from_aura(source_output)
+            if assistant_token_ids:
+                tts_info[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids]
         next_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * _estimate_tts_prompt_len(text),
