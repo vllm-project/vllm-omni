@@ -76,6 +76,66 @@ def _tf_config_get(config: Any, key: str, default: Any) -> Any:
     return getattr(config, key, default)
 
 
+def _nested_get(value: Any, key: str) -> Any:
+    if isinstance(value, dict):
+        if key in value:
+            return value[key]
+        for child in value.values():
+            found = _nested_get(child, key)
+            if found is not None:
+                return found
+    elif isinstance(value, list | tuple):
+        for child in value:
+            found = _nested_get(child, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _od_config_get(od_config: Any, key: str, default: Any = None) -> Any:
+    """Read Cosmos3 options from runtime, model, or transformer config."""
+    if od_config is None:
+        return default
+    for attr in ("custom_pipeline_args", "model_config"):
+        source = getattr(od_config, attr, None) or {}
+        if isinstance(source, dict):
+            if key in source:
+                return source[key]
+            found = _nested_get(source, key)
+            if found is not None:
+                return found
+    tf_model_config = getattr(od_config, "tf_model_config", None)
+    if isinstance(tf_model_config, dict):
+        if key in tf_model_config:
+            return tf_model_config[key]
+        found = _nested_get(tf_model_config, key)
+        if found is not None:
+            return found
+    value = _tf_config_get(tf_model_config, key, None)
+    return default if value is None else value
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def resolve_sound_gen(od_config: Any) -> bool:
+    """Capability gate shared by the pipeline and transformer.
+
+    Explicit ``sound_gen`` flag wins (including an explicit False);
+    otherwise infer from the presence of any sound-width key in od_config.
+    """
+    sound_gen_value = _od_config_get(od_config, "sound_gen", None)
+    if sound_gen_value is not None:
+        return _as_bool(sound_gen_value)
+    for key in ("sound_dim", "io_channels", "vocoder_input_dim", "latent_ch"):
+        if _od_config_get(od_config, key, None) is not None:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Rotary Position Embeddings (mRoPE)
 # ---------------------------------------------------------------------------
@@ -136,6 +196,28 @@ def compute_mrope_position_ids_vision(
 
     next_offset = math.floor(mrope_ids.max().item()) + 1
     return mrope_ids, next_offset
+
+
+def compute_mrope_position_ids_sound(
+    grid_t: int,
+    temporal_offset: int | float,
+    sound_latent_fps: float,
+    base_fps: float = 24.0,
+    temporal_compression_factor_sound: int = 1,
+    enable_fps_modulation: bool = True,
+) -> tuple[torch.Tensor, int | float]:
+    """Generate mRoPE IDs for sound tokens as a (T, 1, 1) grid."""
+    return compute_mrope_position_ids_vision(
+        grid_t=grid_t,
+        grid_h=1,
+        grid_w=1,
+        temporal_offset=temporal_offset,
+        fps=sound_latent_fps,
+        base_fps=base_fps,
+        temporal_compression_factor=temporal_compression_factor_sound,
+        base_temporal_compression_factor=temporal_compression_factor_sound,
+        enable_fps_modulation=enable_fps_modulation,
+    )
 
 
 class Qwen3VLTextRotaryEmbedding(nn.Module):
@@ -839,6 +921,9 @@ class Cosmos3VFMTransformer(nn.Module):
         od_config: OmniDiffusionConfig,
         *,
         temporal_compression_factor: int | None = None,
+        sound_gen: bool = False,
+        sound_dim: int | None = None,
+        sound_latent_fps: float | None = None,
     ) -> None:
         super().__init__()
         model_config = od_config.tf_model_config
@@ -859,9 +944,22 @@ class Cosmos3VFMTransformer(nn.Module):
         self.latent_channel_size = int(_tf_config_get(model_config, "latent_channel", 48))
         self.timestep_scale = float(_tf_config_get(model_config, "timestep_scale", 0.001))
         self.base_fps = float(_tf_config_get(model_config, "base_fps", 24.0))
+        self.sound_gen = sound_gen
+        self.sound_dim = sound_dim
+        self.sound_latent_fps = sound_latent_fps
+
+        if self.sound_gen and (sound_dim is None or sound_latent_fps is None):
+            raise ValueError(
+                "Cosmos3VFMTransformer requires an explicit sound_dim and sound_latent_fps when sound_gen is True; "
+                "the pipeline must pass Cosmos3SoundTokenizer.latent_ch so the audio projection "
+                "layers are sized from the authoritative AVAE latent width."
+            )
         if temporal_compression_factor is None:
             temporal_compression_factor = _tf_config_get(model_config, "temporal_compression_factor", 4)
         self.temporal_compression_factor = int(temporal_compression_factor)
+        self.temporal_compression_factor_sound = int(
+            _tf_config_get(model_config, "temporal_compression_factor_sound", 1)
+        )
         self.enable_fps_modulation = bool(_tf_config_get(model_config, "enable_fps_modulation", True))
         self.temporal_modality_margin = int(
             _tf_config_get(
@@ -894,6 +992,10 @@ class Cosmos3VFMTransformer(nn.Module):
         self.proj_in = nn.Linear(self.patch_latent_dim, self.hidden_size)
         self.proj_out = nn.Linear(self.hidden_size, self.patch_latent_dim)
         self.time_embedder = TimestepEmbedder(self.hidden_size, target_dtype=dtype)
+        if self.sound_gen:
+            self.audio_proj_in = nn.Linear(self.sound_dim, self.hidden_size)
+            self.audio_proj_out = nn.Linear(self.hidden_size, self.sound_dim)
+            self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
 
         self.gen_layers = nn.ModuleList(
             [
@@ -962,6 +1064,21 @@ class Cosmos3VFMTransformer(nn.Module):
             x = x[:, :, :, :h, :w]
         return x
 
+    def pack_sound(self, sound_latents: torch.Tensor) -> torch.Tensor:
+        """[B, C_sound, T_sound] -> [B, T_sound, C_sound]."""
+        if sound_latents.ndim != 3:
+            raise ValueError(f"Cosmos3 sound latents must have shape [B, C, T], got {tuple(sound_latents.shape)}.")
+        if sound_latents.shape[1] != self.sound_dim:
+            raise ValueError(
+                f"Cosmos3 sound latent channel mismatch: expected {self.sound_dim}, got {sound_latents.shape[1]}."
+            )
+        return sound_latents.permute(0, 2, 1).contiguous()
+
+    @staticmethod
+    def unpack_sound(tokens: torch.Tensor) -> torch.Tensor:
+        """[B, T_sound, C_sound] -> [B, C_sound, T_sound]."""
+        return tokens.permute(0, 2, 1).contiguous()
+
     # -- RoPE computation ----------------------------------------------------
 
     def _compute_rope_freqs(
@@ -973,12 +1090,14 @@ class Cosmos3VFMTransformer(nn.Module):
         fps: float | None,
         device: torch.device,
         dtype: torch.dtype,
+        t_sound: int | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
         """Compute mRoPE cos/sin for UND text and GEN media pathways."""
         B = text_mask.shape[0]
         S_text = text_mask.shape[1]
         text_lengths = text_mask.sum(dim=1).long()
         effective_fps = fps if fps is not None and t > 1 else None
+        sound_frames = int(t_sound or 0)
 
         text_pos_list = []
         gen_pos_list = []
@@ -996,6 +1115,21 @@ class Cosmos3VFMTransformer(nn.Module):
                 temporal_compression_factor=self.temporal_compression_factor,
                 enable_fps_modulation=self.enable_fps_modulation,
             )
+            gen_positions = [v_pos]
+            if sound_frames > 0:
+                s_pos, _ = compute_mrope_position_ids_sound(
+                    sound_frames,
+                    temporal_offset=media_temporal_offset,
+                    sound_latent_fps=self.sound_latent_fps,
+                    base_fps=self.base_fps,
+                    temporal_compression_factor_sound=getattr(self, "temporal_compression_factor_sound", 1),
+                    enable_fps_modulation=self.enable_fps_modulation,
+                )
+                gen_positions.append(s_pos)
+            pos_dtype = gen_positions[0].dtype
+            for pos in gen_positions[1:]:
+                pos_dtype = torch.promote_types(pos_dtype, pos.dtype)
+            v_pos = torch.cat([pos.to(pos_dtype) for pos in gen_positions], dim=1)
             if real_len < S_text:
                 t_pos = torch.cat(
                     [t_pos, torch.zeros(3, S_text - real_len, dtype=t_pos.dtype)],
@@ -1026,16 +1160,31 @@ class Cosmos3VFMTransformer(nn.Module):
     def _validate_gen_sequence_parallel(
         *,
         s_gen: int,
+        s_video: int,
+        s_sound: int,
+        has_sound: bool,
         ulysses_size: int,
     ) -> None:
         if ulysses_size <= 1 or s_gen % ulysses_size == 0:
             return
 
+        detail_parts = [f"video tokens {s_video}"]
+        if has_sound:
+            detail_parts.append(f"sound tokens {s_sound}")
+        detail = " = " + " + ".join(detail_parts) if len(detail_parts) > 1 else ""
         adjust_detail = (
-            "Adjust the spatial resolution so that t * ceil(h/patch) * ceil(w/patch) is a multiple of ulysses_degree."
+            "Adjust the spatial resolution, frame count, sound duration, "
+            "or sound latent FPS so the combined media sequence is a "
+            "multiple of ulysses_degree."
+            if has_sound
+            else (
+                "Adjust the spatial resolution so that "
+                "t * ceil(h/patch) * ceil(w/patch) is a multiple "
+                "of ulysses_degree."
+            )
         )
         raise ValueError(
-            f"GEN sequence length ({s_gen} video tokens) must be divisible by "
+            f"GEN sequence length ({s_gen}{detail}) must be divisible by "
             f"ulysses_degree ({ulysses_size}). {adjust_detail}"
         )
 
@@ -1049,9 +1198,10 @@ class Cosmos3VFMTransformer(nn.Module):
         text_mask: torch.Tensor,
         video_shape: tuple[int, int, int],
         fps: float | None = None,
+        sound_latents: torch.Tensor | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
         Args:
             hidden_states: [B, C, t, h, w] noisy latents
@@ -1060,13 +1210,15 @@ class Cosmos3VFMTransformer(nn.Module):
             text_mask: [B, S_text] attention mask (1=real, 0=pad)
             video_shape: (t, h, w) in latent space
             fps: video frame rate for temporal mRoPE modulation
+            sound_latents: Optional [B, C_sound, T_sound] noisy sound latents.
             noisy_frame_mask: Optional [B, 1, t, 1, 1] mask where 1=noisy (add
                 timestep embedding, predict velocity) and 0=conditioned (clean
                 context, skip timestep embedding).  None means all frames noisy
                 (T2V mode).
 
         Returns:
-            [B, C, t, h, w] velocity prediction.
+            [B, C, t, h, w] velocity prediction, or
+            tuple outputs in video, sound order when sound latents are provided.
         """
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
@@ -1078,12 +1230,31 @@ class Cosmos3VFMTransformer(nn.Module):
                 f"Cosmos3 requires identical real text lengths within a batch "
                 f"(got min={min_real_len}, max={max_real_len})."
             )
+        has_sound = sound_latents is not None
+        if has_sound and not self.sound_gen:
+            raise ValueError(
+                "Cosmos3 sound generation was requested, but this transformer "
+                "was initialized without sound modules. Check that the "
+                "transformer config enables sound_gen or defines sound_dim."
+            )
 
         # Query Ulysses state at runtime
         ulysses_size, _, _ = _get_ulysses_state()
 
         # Patchify latents and project to hidden space
         hidden_video = self.proj_in(self.patchify(hidden_states, t, h, w))
+        s_video = hidden_video.shape[1]
+        s_sound = 0
+        hidden_sound = None
+        if sound_latents is not None:
+            if sound_latents.shape[0] != hidden_states.shape[0]:
+                raise ValueError(
+                    "Cosmos3 sound and video batch sizes must match: "
+                    f"video={hidden_states.shape[0]}, sound={sound_latents.shape[0]}."
+                )
+            hidden_sound = self.audio_proj_in(self.pack_sound(sound_latents))
+            hidden_sound = hidden_sound + self.audio_modality_embed.to(hidden_sound.dtype)
+            s_sound = hidden_sound.shape[1]
 
         # Timestep embedding (fp32 for precision).
         # For I2V: only add to noisy tokens, not conditioned ones.
@@ -1106,7 +1277,12 @@ class Cosmos3VFMTransformer(nn.Module):
         else:
             hidden_video = hidden_video + time_embed.unsqueeze(1)
 
-        hidden_gen = hidden_video
+        if hidden_sound is not None:
+            hidden_sound = hidden_sound + time_embed.unsqueeze(1)
+        hidden_parts = [hidden_video]
+        if hidden_sound is not None:
+            hidden_parts.append(hidden_sound)
+        hidden_gen = torch.cat(hidden_parts, dim=1)
 
         # Run UND pathway once and cache K/V (replicated across all ranks)
         if self.cached_kv is None:
@@ -1118,6 +1294,7 @@ class Cosmos3VFMTransformer(nn.Module):
                 fps,
                 hidden_states.device,
                 hidden_states.dtype,
+                t_sound=s_sound,
             )
             cached_kv_full = self.language_model(text_ids, freqs_und)
             self.cached_freqs_gen = freqs_gen
@@ -1133,6 +1310,9 @@ class Cosmos3VFMTransformer(nn.Module):
             raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
         self._validate_gen_sequence_parallel(
             s_gen=hidden_gen.shape[1],
+            s_video=s_video,
+            s_sound=s_sound,
+            has_sound=has_sound,
             ulysses_size=ulysses_size,
         )
         freqs_cos, freqs_sin = self.cached_freqs_gen
@@ -1166,7 +1346,21 @@ class Cosmos3VFMTransformer(nn.Module):
 
         # Final norm and project back to latent space
         hidden_gen = self.norm_moe_gen(hidden_gen)
-        return self.unpatchify(self.proj_out(hidden_gen), t, h, w)
+        if not has_sound:
+            return self.unpatchify(self.proj_out(hidden_gen), t, h, w)
+
+        split_sizes = [s_video]
+        if has_sound:
+            split_sizes.append(s_sound)
+        split_hidden = hidden_gen.split(split_sizes, dim=1)
+        hidden_video = split_hidden[0]
+        video_pred = self.unpatchify(self.proj_out(hidden_video), t, h, w)
+        outputs: list[torch.Tensor] = [video_pred]
+        split_idx = 1
+        if has_sound:
+            hidden_sound = split_hidden[split_idx]
+            outputs.append(self.unpack_sound(self.audio_proj_out(hidden_sound)))
+        return tuple(outputs)
 
     def post_load_weights(self) -> None:
         """Post-load processing: ensure correct dtypes."""
