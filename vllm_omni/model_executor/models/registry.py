@@ -285,6 +285,17 @@ _OMNI_MODELS = {
         "minicpmo_4_5_omni_tts",
         "MiniCPMO45OmniTTSForConditionalGeneration",
     ),
+    ## SongGen (text-to-song, single-stage AR)
+    "SongGenMixedForConditionalGeneration": (
+        "songgen",
+        "modeling_songgen",
+        "SongGenForGeneration",
+    ),
+    "SongGenDualTrackForConditionalGeneration": (
+        "songgen",
+        "modeling_songgen",
+        "SongGenForGeneration",
+    ),
 }
 
 
