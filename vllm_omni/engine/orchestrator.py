@@ -1057,6 +1057,34 @@ class Orchestrator:
                 exc_info=True,
             )
 
+    def _record_stage_submit(
+        self,
+        *,
+        req_state: OrchestratorRequestState,
+        next_logical: int,
+        src_stage_id: int,
+        src_replica_id: int | None,
+        next_pool: StagePool,
+        req_id: str,
+        t_submit_start: float,
+    ) -> None:
+        """Record submission timestamp and emit the transfer-edge metric.
+
+        Called at the end of every _forward_to_* helper to avoid repeating the
+        same three-line tail (stage_submit_ts / perf_counter delta / emit_tx_edge)
+        in each branch.
+        """
+        req_state.stage_submit_ts[next_logical] = _time.time()
+        _tx_ms = (_time.perf_counter() - t_submit_start) * 1000.0
+        self._emit_tx_edge(
+            from_stage=src_stage_id,
+            from_replica=src_replica_id if src_replica_id is not None else 0,
+            to_stage=next_logical,
+            to_pool=next_pool,
+            request_id=req_id,
+            tx_ms=_tx_ms,
+        )
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -1225,15 +1253,14 @@ class Orchestrator:
                 },
                 params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
             )
-        req_state.stage_submit_ts[next_logical] = _time.time()
-        _tx_ms = (_time.perf_counter() - t_submit_start) * 1000.0
-        self._emit_tx_edge(
-            from_stage=src_stage_id,
-            from_replica=src_replica_id if src_replica_id is not None else 0,
-            to_stage=next_logical,
-            to_pool=next_pool,
-            request_id=req_id,
-            tx_ms=_tx_ms,
+        self._record_stage_submit(
+            req_state=req_state,
+            next_logical=next_logical,
+            src_stage_id=src_stage_id,
+            src_replica_id=src_replica_id,
+            next_pool=next_pool,
+            req_id=req_id,
+            t_submit_start=t_submit_start,
         )
 
     async def _forward_to_pd_decode_stage(
@@ -1285,15 +1312,14 @@ class Orchestrator:
             else:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
-        req_state.stage_submit_ts[next_logical] = _time.time()
-        _tx_ms = (_time.perf_counter() - t_submit_start) * 1000.0
-        self._emit_tx_edge(
-            from_stage=src_stage_id,
-            from_replica=src_replica_id if src_replica_id is not None else 0,
-            to_stage=next_logical,
-            to_pool=next_pool,
-            request_id=req_id,
-            tx_ms=_tx_ms,
+        self._record_stage_submit(
+            req_state=req_state,
+            next_logical=next_logical,
+            src_stage_id=src_stage_id,
+            src_replica_id=src_replica_id,
+            next_pool=next_pool,
+            req_id=req_id,
+            t_submit_start=t_submit_start,
         )
 
     async def _forward_to_llm_stage(
@@ -1354,15 +1380,14 @@ class Orchestrator:
             else:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
-        req_state.stage_submit_ts[next_logical] = _time.time()
-        _tx_ms = (_time.perf_counter() - t_submit_start) * 1000.0
-        self._emit_tx_edge(
-            from_stage=src_stage_id,
-            from_replica=src_replica_id if src_replica_id is not None else 0,
-            to_stage=next_logical,
-            to_pool=next_pool,
-            request_id=req_id,
-            tx_ms=_tx_ms,
+        self._record_stage_submit(
+            req_state=req_state,
+            next_logical=next_logical,
+            src_stage_id=src_stage_id,
+            src_replica_id=src_replica_id,
+            next_pool=next_pool,
+            req_id=req_id,
+            t_submit_start=t_submit_start,
         )
 
     async def _prewarm_async_chunk_stages(
