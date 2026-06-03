@@ -61,7 +61,7 @@ def test_stage0_streaming_update_discards_outstanding_async_placeholder_token() 
 
     sched._update_request_as_session(session, _make_update([10, 20]))
 
-    assert session.discard_latest_async_tokens is True
+    assert session.async_tokens_to_discard == 1
     assert session.num_output_placeholders == 0
     assert session.spec_token_ids == []
     # The async placeholder makes token 9 unconfirmed, so only 7 and 8 are
@@ -83,7 +83,7 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
 
     sched._update_request_as_session(session, _make_update([10, 20]))
 
-    assert session.discard_latest_async_tokens is False
+    assert getattr(session, "async_tokens_to_discard", 0) == 0
     assert session.num_output_placeholders == 0
     assert session.prompt_token_ids == [1, 2, 3, 7, 8, 9, 10, 20]
     assert list(session._all_token_ids) == [1, 2, 3, 7, 8, 9, 10, 20]
