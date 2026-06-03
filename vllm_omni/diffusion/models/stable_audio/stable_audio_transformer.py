@@ -447,6 +447,14 @@ class StableAudioDiTBlock(nn.Module):
 
 
 class StableAudioDiTModel(nn.Module):
+    _layerwise_offload_blocks_attr = "transformer_blocks"
+
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        return name.startswith("transformer_blocks.") and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
     """
     Optimized Stable Audio DiT model using vLLM layers.
 

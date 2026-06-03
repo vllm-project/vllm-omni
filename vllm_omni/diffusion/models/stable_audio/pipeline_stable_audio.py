@@ -15,7 +15,6 @@ from collections.abc import Iterable
 from typing import ClassVar
 
 import torch
-from diffusers import AutoencoderOobleck
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
 from diffusers.pipelines.stable_audio.modeling_stable_audio import StableAudioProjectionModel
 from diffusers.schedulers import CosineDPMSolverMultistepScheduler
@@ -26,6 +25,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_stable_audio import (
+    DistributedAutoencoderKLStableAudio,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
@@ -124,8 +126,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
             local_files_only=local_files_only,
         ).to(self.device)
 
-        # Load VAE (AutoencoderOobleck for audio)
-        self.vae = AutoencoderOobleck.from_pretrained(
+        # Load VAE (DistributedAutoencoderKLStableAudio for audio)
+        self.vae = DistributedAutoencoderKLStableAudio.from_pretrained(
             model,
             subfolder="vae",
             torch_dtype=torch.float32,
