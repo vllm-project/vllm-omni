@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import asyncio
 import queue
 import threading
 from types import SimpleNamespace
@@ -447,11 +446,7 @@ class TestDiffusionEngine:
     @pytest.mark.asyncio
     async def test_step_raises_aborted_error(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine._closed = False
-        engine._loop_started = True
-        engine._init_lock = asyncio.Lock()
-        engine.main_loop = asyncio.get_running_loop()
-        engine.stop_event = threading.Event()
+        engine._check_and_start_background_loop = mocker.AsyncMock()
         engine.pre_process_func = None
         engine.async_add_req_and_wait_for_response = mocker.AsyncMock(
             return_value=DiffusionOutput(aborted=True, abort_message="Request req-abort aborted.")
@@ -525,6 +520,52 @@ class TestDiffusionEngine:
 
         with pytest.raises(RuntimeError, match="Dummy run failed: boom"):
             engine._dummy_run()
+
+    @pytest.mark.asyncio
+    async def test_step_multi_request_reuses_multimodal_slice_logic(self, mocker: MockerFixture) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(
+            model_class_name="mock_model",
+            enable_cpu_offload=False,
+        )
+        engine.pre_process_func = None
+        engine.post_process_func = None
+        engine._check_and_start_background_loop = mocker.AsyncMock()
+        engine.async_add_req_and_wait_for_response = mocker.AsyncMock(
+            return_value=DiffusionOutput(
+                output={
+                    "video": ["frame-0", "frame-1"],
+                    "audio": ["audio-0", "audio-1"],
+                    "actions": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                }
+            )
+        )
+
+        request = OmniDiffusionRequest(
+            prompts=["prompt-0", "prompt-1"],
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=1,
+                num_outputs_per_prompt=1,
+            ),
+            request_id="req-batch",
+        )
+
+        mocker.patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False)
+        outputs = await engine.step(request)
+
+        assert len(outputs) == 2
+        assert outputs[0].images == ["frame-0"]
+        assert outputs[1].images == ["frame-1"]
+        assert outputs[0].multimodal_output["audio"] == "audio-0"
+        assert outputs[1].multimodal_output["audio"] == "audio-1"
+        torch.testing.assert_close(
+            outputs[0].multimodal_output["actions"],
+            torch.tensor([1.0, 2.0]),
+        )
+        torch.testing.assert_close(
+            outputs[1].multimodal_output["actions"],
+            torch.tensor([3.0, 4.0]),
+        )
 
 
 class TestStepScheduler:

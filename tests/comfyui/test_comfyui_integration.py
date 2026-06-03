@@ -30,12 +30,12 @@ from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import SamplingParams
 from vllm.outputs import CompletionOutput, RequestOutput
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni as RealAsyncOmni
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -444,7 +444,7 @@ def mock_async_omni(
 @pytest.fixture
 def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni):
     """Set up a API server in background process from command line with parametrized model name and mocked AsyncOmni."""
-    parser = FlexibleArgumentParser()
+    parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     cmd = OmniServeCommand()
     cmd.subparser_init(subparsers)

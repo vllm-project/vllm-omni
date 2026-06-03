@@ -1,0 +1,55 @@
+# MOSS-TTS-Realtime (MossTTSRealtime, 1.7B, n_vq=16, 24 kHz)
+# HF: OpenMOSS-Team/MOSS-TTS-Realtime
+# Real-time streaming TTS with TTFB ~180 ms and LLM+TTS first-sentence ~377 ms.
+# Uses local depth transformer (no delay warm-up) — lowest latency variant.
+async_chunk: true
+
+connectors:
+  shm:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.005
+      connector_get_max_wait_first_chunk: 1000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 15          # smaller chunks for lower TTFA
+      codec_left_context_frames: 0
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.60
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: shm
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.12
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: shm
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0

@@ -83,6 +83,18 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
+def _move_tensor_tree_to_cpu(value: object) -> object:
+    if isinstance(value, torch.Tensor):
+        return value.cpu() if value.device.type != "cpu" else value
+    if isinstance(value, dict):
+        return {key: _move_tensor_tree_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_tensor_tree_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_tensor_tree_to_cpu(item) for item in value)
+    return value
+
+
 def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
@@ -237,12 +249,8 @@ class DiffusionEngine:
         # post-processing to avoid device OOM — model weights may still
         # reside on the device and leave no headroom for intermediates.
         output_data = output.output
-        if (
-            self.od_config.enable_cpu_offload
-            and isinstance(output_data, torch.Tensor)
-            and output_data.device.type != "cpu"
-        ):
-            output_data = output_data.cpu()
+        if self.od_config.enable_cpu_offload:
+            output_data = _move_tensor_tree_to_cpu(output_data)
 
         postprocess_start_time = time.perf_counter()
         if self.post_process_func is not None:
@@ -258,8 +266,10 @@ class DiffusionEngine:
         custom_output = output.custom_output or {}
         model_audio_sample_rate = None
         model_fps = None
+        action_payload = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
+            action_payload = outputs.get("actions")
             custom_output.update(outputs.get("custom_output") or {})
             model_audio_sample_rate = outputs.get("audio_sample_rate")
             model_fps = outputs.get("fps")
@@ -353,6 +363,8 @@ class DiffusionEngine:
                     mm_output["audio_sample_rate"] = model_audio_sample_rate
                 if model_fps is not None:
                     mm_output["fps"] = model_fps
+                if action_payload is not None:
+                    mm_output["actions"] = action_payload
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -422,6 +434,18 @@ class DiffusionEngine:
                         mm_output["audio_sample_rate"] = model_audio_sample_rate
                     if model_fps is not None:
                         mm_output["fps"] = model_fps
+                    if action_payload is not None:
+                        sliced_actions = action_payload
+                        if isinstance(action_payload, (list, tuple)):
+                            sliced_actions = action_payload[start_idx:end_idx]
+                            if len(sliced_actions) == 1:
+                                sliced_actions = sliced_actions[0]
+                        elif hasattr(action_payload, "shape") and getattr(action_payload, "shape", None) is not None:
+                            if len(action_payload.shape) > 0 and action_payload.shape[0] >= end_idx:
+                                sliced_actions = action_payload[start_idx:end_idx]
+                                if num_outputs == 1:
+                                    sliced_actions = sliced_actions[0]
+                        mm_output["actions"] = sliced_actions
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
