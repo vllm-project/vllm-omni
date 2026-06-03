@@ -1,11 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from importlib.util import find_spec
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
+from vllm_omni.diffusion.layers.sglangnorm import _layer_norm_fwd_1pass_kernel
 
 logger = init_logger(__name__)
 
@@ -17,7 +21,12 @@ class LayerNorm(nn.LayerNorm, CustomOp):
     LayerNorm implementation that inherits from both ``nn.LayerNorm`` and ``CustomOp``.
     NPU:
         Uses ``mindiesd.fast_layernorm(self, x)`` when MindIE-SD is installed.
-    CUDA / HIP / XPU / native:
+    CUDA:
+        Uses a single-pass Triton kernel (adapted from SGLang) that avoids the
+        FP32 cast round-trip and operates natively in bf16/fp16.
+        Falls back to ``forward_native`` for CPU tensors or when
+        ``elementwise_affine=False``.
+    HIP / XPU / native:
         Falls back to FP32 nn.LayerNorm implementation.
     """
 
@@ -31,7 +40,73 @@ class LayerNorm(nn.LayerNorm, CustomOp):
         return self._forward_method(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
+        if not x.is_cuda or self.weight is None:
+            return self.forward_native(x)
+
+        weight = self.weight
+        bias = self.bias
+        has_bias = bias is not None
+        eps = self.eps
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1])  # (M, N)
+        M, N = x_2d.shape
+
+        y = torch.empty_like(x_2d)
+        mean = torch.empty(M, dtype=torch.float32, device=x.device)
+        rstd = torch.empty(M, dtype=torch.float32, device=x.device)
+
+        BLOCK_N = triton.next_power_of_2(N)
+        assert BLOCK_N <= 131072, f"hidden_dim {N} too large for single-block kernel"
+
+        bias_ptr = bias if has_bias else weight  # harmless dummy when HAS_BIAS=False
+        grid = (M,)
+        _layer_norm_fwd_1pass_kernel[grid](
+            # data pointers
+            x_2d,
+            y,
+            weight,
+            bias_ptr,
+            # unused optional pointers — pass x_2d as a harmless dummy
+            x_2d,
+            x_2d,
+            weight,
+            bias_ptr,
+            y,
+            x_2d,
+            x_2d,
+            x_2d,
+            x_2d,
+            x_2d,
+            mean,
+            rstd,
+            # strides
+            x_2d.stride(0),
+            y.stride(0),
+            x_2d.stride(0),
+            x_2d.stride(0),
+            x_2d.stride(0),
+            y.stride(0),
+            # scalars
+            M,
+            N,
+            eps,
+            0.0,  # dropout_p
+            False,  # zero_centered_weight
+            # constexprs — only the ones we actually need are True
+            IS_RMS_NORM=False,
+            BLOCK_N=BLOCK_N,
+            HAS_RESIDUAL=False,
+            STORE_RESIDUAL_OUT=False,
+            HAS_WEIGHT=True,
+            HAS_BIAS=has_bias,
+            HAS_DROPOUT=False,
+            STORE_DROPOUT_MASK=False,
+            HAS_ROWSCALE=False,
+            HAS_X1=False,
+            HAS_W1=False,
+            HAS_B1=False,
+        )
+        return y.reshape(orig_shape)
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)

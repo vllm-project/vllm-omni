@@ -451,3 +451,47 @@ def test_rmsnorm_with_single_element_batch():
     out = norm(x)
 
     assert out.shape == (1, 1, hidden_size)
+
+
+# ── CUDA-specific LayerNorm tests (Triton kernel path) ──
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (2, 64),
+        (2, 4, 64),
+        (1, 4096, 1536),
+    ],
+)
+def test_layernorm_forward_cuda_matches_native(dtype, shape):
+    """forward_cuda (Triton kernel) must match forward_native within tolerance."""
+    from vllm_omni.diffusion.layers.norm import LayerNorm
+
+    dim = shape[-1]
+    torch.manual_seed(0)
+    norm = LayerNorm(dim).cuda().to(dtype)
+    x = torch.randn(*shape, dtype=dtype, device="cuda")
+
+    out_cuda = norm.forward_cuda(x)
+    out_native = norm.forward_native(x)
+
+    assert out_cuda.shape == x.shape
+    assert out_cuda.dtype == dtype
+    torch.testing.assert_close(out_cuda, out_native, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_layernorm_forward_cuda_no_weight_falls_back():
+    """forward_cuda falls back to forward_native when elementwise_affine=False."""
+    from vllm_omni.diffusion.layers.norm import LayerNorm
+
+    norm = LayerNorm(64, elementwise_affine=False).cuda()
+    x = torch.randn(2, 4, 64, device="cuda")
+
+    out_cuda = norm.forward_cuda(x)
+    out_native = norm.forward_native(x)
+
+    torch.testing.assert_close(out_cuda, out_native, atol=1e-5, rtol=1e-5)
