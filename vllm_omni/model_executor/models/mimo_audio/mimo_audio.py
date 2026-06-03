@@ -303,6 +303,11 @@ class MiMoAudioDataParser(MultiModalDataParser):
             audio_tokenizer_path=self.audio_tokenizer_path,
         )
 
+    # Maximum reference audio length in samples at target_sr (24kHz).
+    # Long reference clips cause the model to lose voice identity (repetition /
+    # timbre drift). 8 seconds is the empirical safe upper bound.
+    MAX_REF_AUDIO_SAMPLES = 8 * 24000  # 8 seconds at 24kHz
+
     def _parse_audio_data(
         self,
         data: ModalityData[AudioItem],
@@ -343,8 +348,11 @@ class MiMoAudioDataParser(MultiModalDataParser):
                     wav_mono = wav_tensor[0]
             audio_codes = self.mimo_tokenizer.encode(audio=(wav_mono, self.target_sr))
             new_audio = audio_codes.detach().cpu().numpy().astype(np.int64).tolist()
+            logger.info("[MiMo _parse_audio_data] Encoded audio codes shape: channels=%d, T=%d",
+                        len(new_audio), len(new_audio[0]) if new_audio else 0)
             new_audios.append(new_audio)
 
+        logger.info("[MiMo _parse_audio_data] Total parsed audios: %d", len(new_audios))
         return AudioProcessorItems(new_audios)
 
 
@@ -369,7 +377,12 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         sampling_rate = 24000
-        audios = mm_data.pop("audios", [])
+        mm_data = dict(mm_data)
+        logger.info("[MiMo _call_hf_processor] mm_data keys: %s", list(mm_data.keys()))
+        audios = mm_data.pop("audios", []) or mm_data.pop("audio", [])
+        logger.info("[MiMo _call_hf_processor] audios count: %d, types: %s",
+                    len(audios) if audios else 0,
+                    [type(a).__name__ for a in audios] if audios else [])
         tokenizer = self.info.get_tokenizer()
         if audios:
             mm_data["audio"] = audios
@@ -394,6 +407,8 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
         audio_lengths = [len(x) for x in audios]
         if all(audio_length == 8 for audio_length in audio_lengths):
             audio_lengths = [len(x[0]) for x in audios]
+
+        logger.info("[MiMo _call_hf_processor] audio_lengths: %s", audio_lengths)
 
         return BatchFeature(
             data={
@@ -448,8 +463,11 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
         audio_kwargs = out_mm_kwargs.get("audio", [])
         # feature_attention_mask = out_mm_kwargs.get("feature_attention_mask", None)
 
+        logger.info("[MiMo _get_prompt_updates] audio_kwargs count: %d", len(audio_kwargs) if audio_kwargs else 0)
+
         if audio_kwargs:
             audio_output_lengths = [item["audio_lengths"].data for item in audio_kwargs]
+            logger.info("[MiMo _get_prompt_updates] audio_output_lengths from kwargs: %s", audio_output_lengths)
         else:
             audio_output_lengths = []
             if mm_items and "audio" in mm_items:
@@ -458,6 +476,7 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
                     if audios is not None:
                         num_audios = audios.get_count()
                         audio_output_lengths = [audios.get_audio_length(i) for i in range(num_audios)]
+                        logger.info("[MiMo _get_prompt_updates] audio_output_lengths from mm_items: %s", audio_output_lengths)
                 except Exception as e:
                     logger.error(f"_get_prompt_updates failed: {e}")
 
@@ -622,6 +641,7 @@ class MiMoAudioForConditionalGeneration(
         mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
         mm_features = info_dict.get("mm_features", [])
         mm_embeddings = []
+
         prompt_ids = torch.tensor(
             interleave_5_and_5_in_span(input_ids.tolist()),
             dtype=torch.int64,

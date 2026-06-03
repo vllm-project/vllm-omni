@@ -289,17 +289,12 @@ def llm2code2wav(
         code_final = prepend_and_flatten_colmajor(codec_codes, pad_vec)
         code_final = code_final.tolist()
 
-        # Guard against flattened sequences longer than code2wav's max_model_len.
-        # Without this, add_request raises ``could not broadcast input array
-        # from shape (N,) into shape (max_model_len,)`` and kills the engine
-        # core (see issue #2683). Mirrors the offline end2end.py safeguard.
+        # Truncate to Stage-1 max_model_len
+        MAX_CODE2WAV_TOKENS = 2048
         if len(code_final) > MAX_CODE2WAV_TOKENS:
-            request_id = getattr(talker_output, "request_id", f"unknown_{i}")
             logger.warning(
-                "Request %s: code_final len=%d > MAX_CODE2WAV_TOKENS=%d, truncating.",
-                request_id,
-                len(code_final),
-                MAX_CODE2WAV_TOKENS,
+                "Truncating code2wav input from %d to %d tokens",
+                len(code_final), MAX_CODE2WAV_TOKENS,
             )
             code_final = code_final[:MAX_CODE2WAV_TOKENS]
 

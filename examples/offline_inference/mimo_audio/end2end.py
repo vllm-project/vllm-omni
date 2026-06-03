@@ -30,6 +30,11 @@ SEED = 42
 
 MAX_CODE2WAV_TOKENS = 18192  # Maximum tokens supported by code2wav model
 
+# MiMoAudio was trained with short reference clips (~3-10 s).
+# Long reference audio confuses the model, causing repetition and loss of
+# speaker identity. Limit to 8 seconds at 24 kHz.
+MAX_REF_AUDIO_SAMPLES = 8 * 24000  # 192000 samples = 8 seconds
+
 
 class QueryResult(NamedTuple):
     inputs: dict
@@ -230,15 +235,24 @@ def main(args):
         query_result = query_func(text=text, instruct=instruct, read_text_only=True)
     elif args.query_type == "tts_sft_with_audio":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type tts_sft_with_audio --audio_path "./spoken_dialogue_assistant_turn_1.wav"
-        audio_list = [get_audio_data(audio_path)]
+        if text is None:
+            text = "The weather is so nice today."
+        raw_audio = get_audio_data(audio_path)
+        # Truncate reference audio to avoid model confusion (repetition / voice loss)
+        sig, sr = raw_audio
+        if len(sig) > MAX_REF_AUDIO_SAMPLES:
+            sig = sig[:MAX_REF_AUDIO_SAMPLES]
+        audio_list = [(sig, sr)]
         query_result = query_func(text=text, read_text_only=True, prompt_speech=audio_path, audio_list=audio_list)
     elif args.query_type == "tts_sft_with_natural_instruction":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type tts_sft_with_natural_instruction --text "In a panting young male voice, he said: I can't run anymore, wait for me!"
         query_result = query_func(text=text, read_text_only=False)
     elif args.query_type == "audio_trancribing_sft":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type audio_trancribing_sft --audio_path "./spoken_dialogue_assistant_turn_1.wav"
-        audio_path = "spoken_dialogue_assistant_turn_1.wav"
-        text = "Please transcribe this audio and repeat it once."
+        if audio_path is None:
+            audio_path = "spoken_dialogue_assistant_turn_1.wav"
+        if text is None:
+            text = "Please transcribe this audio and repeat it once."
         query_result = query_func(text=text, audio_path=audio_path, use_sostm=True)
     elif args.query_type == "audio_understanding_sft":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type audio_understanding_sft --text "Summarize the audio." --audio_path "./spoken_dialogue_assistant_turn_1.wav"
@@ -253,7 +267,12 @@ def main(args):
         s1_audio_path = "weather_of_today.mp3"
         s2_audio_path = "spoken_dialogue_assistant_turn_1.wav"
         s3_audio_path = "beijing.mp3"
-        audio_list.append(get_audio_data(audio_path))
+        # Truncate reference voice audio to avoid model confusion
+        ref_raw = get_audio_data(audio_path)
+        ref_sig, ref_sr = ref_raw
+        if len(ref_sig) > MAX_REF_AUDIO_SAMPLES:
+            ref_sig = ref_sig[:MAX_REF_AUDIO_SAMPLES]
+        audio_list.append((ref_sig, ref_sr))
         audio_list.append(get_audio_data(s1_audio_path))
         audio_list.append(get_audio_data(s2_audio_path))
         audio_list.append(get_audio_data(s3_audio_path))
@@ -339,6 +358,11 @@ def main(args):
             # Ensure audio is 1D (flatten if needed)
             if audio_numpy.ndim > 1:
                 audio_numpy = audio_numpy.flatten()
+
+            # Skip if audio is too short to be valid (e.g. text-only output)
+            if audio_numpy.size < 240:  # less than 10ms at 24kHz
+                print(f"Request ID: {request_id}, Skipping invalid/empty audio ({audio_numpy.size} samples)")
+                continue
 
             # Save audio file with explicit WAV format
             sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
