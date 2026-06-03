@@ -77,13 +77,10 @@ def register_omni_models_to_vllm():
 
     _register_omni_hf_configs()
 
-    # Always register every arch declared in _OMNI_MODELS — these are the
-    # archs vllm-omni explicitly owns, so we want our implementation to
-    # win even if a future vllm release ships a same-named built-in.
-    # vllm's ModelRegistry.register_model already emits a warning and
-    # overrides on collision; we let it handle that.
+    supported_archs = ModelRegistry.get_supported_archs()
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
-        ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+        if arch not in supported_archs:
+            ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
 
 
 @dataclass
