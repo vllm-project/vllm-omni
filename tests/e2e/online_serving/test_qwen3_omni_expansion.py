@@ -5,12 +5,16 @@ E2E Online tests for Qwen3-Omni model.
 """
 
 import os
-from pathlib import Path
 
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video, load_test_audio_data_url
+from tests.helpers.media import (
+    generate_synthetic_audio,
+    generate_synthetic_image,
+    generate_synthetic_video,
+    load_test_audio_data_url,
+)
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT
