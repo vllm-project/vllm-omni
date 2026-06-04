@@ -697,10 +697,6 @@ class DiffusionEngine:
             audio_sr = 16000
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
-
-            audio_duration_sec = 4
-            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
-            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
         else:
             dummy_audio = None
 
@@ -710,15 +706,9 @@ class DiffusionEngine:
             intrinsics = np.random.rand(camera_pos_len, 4)
             # Shape [N x 4 x 4]
             poses = np.array([np.identity(4) for _ in range(camera_pos_len)])
-
             dummy_camera_pos = {"intrinsics": intrinsics, "poses": poses}
-        else:
-            dummy_camera_pos = None
+            prompt.setdefault("multi_modal_data", {})["camera"] = dummy_camera_pos
 
-        prompt: OmniTextPrompt = {
-            "prompt": "dummy run",
-            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio, "camera": dummy_camera_pos},
-        }
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_ids=["dummy_req_id"],

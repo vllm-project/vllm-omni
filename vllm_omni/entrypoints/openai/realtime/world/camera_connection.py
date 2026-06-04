@@ -23,7 +23,7 @@ from vllm_omni.entrypoints.openai.realtime.world.camera_serving import ServingRe
 from vllm_omni.entrypoints.openai.video_api_utils import _normalize_frames
 
 logger = init_logger(__name__)
-_DEFAULT_IDLE_TIMEOUT = 30.0
+_DEFAULT_IDLE_TIMEOUT = 300.0
 DEFAULT_FRAMES_PER_CHUNK = 4
 
 

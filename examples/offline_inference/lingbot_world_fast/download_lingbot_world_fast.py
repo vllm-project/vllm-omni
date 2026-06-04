@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import site
 import tempfile
 import time
 from pathlib import Path
@@ -15,16 +14,6 @@ LOCK_FILE = CACHE_DIR / ".install.lock"
 DEPENDENCY_DIR = CACHE_DIR / "Lingbot-World"
 
 
-def download_dependency():
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # write .pth to site-packages
-    site_packages = Path(site.getsitepackages()[0])
-    pth_file = site_packages / "vllm_omni_dependency.pth"
-    pth_file.write_text(str(DEPENDENCY_DIR))
-    print(f"Added {DEPENDENCY_DIR} to site-packages via {pth_file}")
-
-
 def timed_download(repo_id: str, local_dir: str, allow_patterns: list | None = None):
     """Download files from HF repo and log time + destination."""
     if os.path.exists(local_dir):
@@ -36,7 +25,6 @@ def timed_download(repo_id: str, local_dir: str, allow_patterns: list | None = N
     snapshot_download(
         repo_id=repo_id,
         local_dir=local_dir,
-        local_dir_use_symlinks=False,
         allow_patterns=allow_patterns,
     )
 
@@ -74,14 +62,12 @@ def main(output_dir: str):
         "text_len": 512,
     }
 
-    with open(
-        os.path.join(output_dir, "lingbot-world-base-cam", "Lingbot-World-Fast", "config.json"), "w", encoding="utf-8"
-    ) as f:
+    config_path = os.path.join(output_dir, "lingbot-world-base-cam", "Lingbot-World-Fast", "config.json")
+
+    with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
-    print(f"model_index.json created at {os.path.join(output_dir, 'model_index.json')}")
-
-    download_dependency()
+    print(f"config.json created at {config_path}")
 
 
 if __name__ == "__main__":

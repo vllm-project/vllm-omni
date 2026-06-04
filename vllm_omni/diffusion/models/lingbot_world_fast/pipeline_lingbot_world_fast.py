@@ -3,6 +3,8 @@ import math
 import os
 import random
 import sys
+import time
+from collections.abc import Iterable
 from contextlib import contextmanager
 
 import numpy as np
@@ -12,10 +14,12 @@ import torchvision.transforms.functional as TF
 from einops import rearrange
 from torch import nn
 from tqdm import tqdm
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportCameraPosInput, SupportImageInput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -34,26 +38,13 @@ from .wan_fast import WanModelFast
 logger = logging.getLogger(__name__)
 
 CONFIG = {
-    "text_len": 512,
     "num_train_timesteps": 1000,
-    "vae_stride": (4, 8, 8),
-    "patch_size": (1, 2, 2),
     "timesteps_index": [0, 179, 358, 679],
     "sample_shift": 10.0,
-    "max_area": 480 * 832,
-    "latent_frames_per_chunk": 3,
     "t5_checkpoint": "models_t5_umt5-xxl-enc-bf16.pth",
     "t5_tokenizer": "google/umt5-xxl",
     "vae_checkpoint": "Wan2.1_VAE.pth",
     "fast_noise_checkpoint": "Lingbot-World-Fast",
-    "negative_prompt_sample": (
-        "画面突变，色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，"
-        "整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，"
-        "画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，"
-        "三条腿，背景人很多，倒着走，镜头晃动，画面闪烁，模糊，噪点，水印，签名，文字，变形，"
-        "扭曲，液化，不合逻辑的结构，卡顿，PPT幻灯片感，过暗，欠曝，低对比度，霓虹灯光感，"
-        "过度锐化，3D渲染感，人物，行人，游客，身体，皮肤，肢体，面部特征，汽车，电线"
-    ),
 }
 
 
@@ -90,30 +81,48 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         assert checkpoint_path is not None, "lingbot_dir is None"
 
         self.text_encoder = T5EncoderModel(
-            text_len=CONFIG["text_len"],
+            text_len=od_config.tf_model_config.get("text_len"),
             dtype=self.target_dtype,
-            device=torch.device("cpu"),
+            device=self.device,
             checkpoint_path=os.path.join(checkpoint_path, CONFIG["t5_checkpoint"]),
             tokenizer_path=os.path.join(checkpoint_path, CONFIG["t5_tokenizer"]),
         )
 
-        self.vae_stride = CONFIG["vae_stride"]
-        self.patch_size = CONFIG["patch_size"]
+        self.vae_stride = od_config.model_config["vae_stride"]
+        self.patch_size = od_config.model_config["patch_size"]
         self.vae = Wan2_1_VAE(vae_pth=os.path.join(checkpoint_path, CONFIG["vae_checkpoint"]), device=self.device)
 
         logger.info(f"Creating WanModelFast from {checkpoint_path}")
-        self.model = WanModelFast.from_pretrained(
-            checkpoint_path,
-            subfolder=CONFIG["fast_noise_checkpoint"],
-            torch_dtype=torch.bfloat16,
-            control_type=self.control_type,
-        ).to(self.device)
+
+        self.model = WanModelFast(
+            in_dim=od_config.tf_model_config.get("in_dim"),
+            dim=od_config.tf_model_config.get("dim"),
+            ffn_dim=od_config.tf_model_config.get("ffn_dim"),
+            num_layers=od_config.tf_model_config.get("num_layers"),
+            num_heads=od_config.tf_model_config.get("num_heads"),
+        )
+
+        # Tell the loader where the transformer weights live. Without this,
+        # get_all_weights() yields nothing and load_weights() runs empty.
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=checkpoint_path,
+                subfolder=CONFIG["fast_noise_checkpoint"],
+                revision=None,
+                prefix="model.",
+                fall_back_to_pt=True,
+            ),
+        ]
+        # self.model = WanModelFast.from_pretrained(
+        #     checkpoint_path,
+        #     subfolder=CONFIG["fast_noise_checkpoint"],
+        #     torch_dtype=torch.bfloat16,
+        #     control_type=self.control_type,
+        # ).to(self.device)
 
         self.scheduler = FlowUniPCMultistepScheduler(
             num_train_timesteps=self.num_train_timesteps, shift=1, use_dynamic_shifting=False
         )
-
-        self.sample_neg_prompt = CONFIG["negative_prompt_sample"]
 
     def _configure_model(self, model):
         """
@@ -166,7 +175,13 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         prompt = req.prompts[0].get("prompt")
         multi_modal_data = req.prompts[0].get("multi_modal_data", {})
 
-        session_id = str(req.sampling_params.extra_args.get("session_id") or None)
+        session_id = req.sampling_params.extra_args.get("session_id")
+
+        if session_id is None:
+            # Create a unique id if none is specified without messing with RNG state
+            session_id = time.time()
+
+        session_id = str(session_id)
 
         force_reset = req.sampling_params.extra_args.get("force_reset") or False
 
@@ -181,8 +196,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
 
         camera = multi_modal_data.get("camera", None)
         if camera is None:
-            self.od_config.model
-            raise ValueError("A path to camera positions must be passed to this model through action_path.")
+            raise ValueError("Camera positions are required by this model.")
 
         if extension:
             assert multi_modal_data.get("image") is None, (
@@ -199,8 +213,8 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         num_frames = max(25, num_frames)
 
         c2ws = camera.get("poses")
-        latent_frames_per_chunk = CONFIG["latent_frames_per_chunk"]
-        max_area = CONFIG["max_area"]
+        latent_frames_per_chunk = self.od_config.model_config["latent_frames_per_chunk"]
+        max_area = self.od_config.model_config["max_area"]
 
         # Fresh:     4N+1 pixel frames → N+1 latents, the first slot is the anchor.
         # Extension: 4N   pixel frames → N regular latents, no anchor.
@@ -264,7 +278,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         self.scheduler.set_timesteps(self.num_train_timesteps, shift=CONFIG["sample_shift"])
         timesteps = self.scheduler.timesteps[CONFIG["timesteps_index"]]
 
-        context = self.text_encoder([prompt], torch.device("cpu"))
+        context = self.text_encoder([prompt], self.device)
         context = [t.to(self.device) for t in context]
 
         dit_cond_dict = None
@@ -387,7 +401,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
                     "seq_len": max_seq_len,
                     "y": [current_condition],
                     "dit_cond_dict": dit_cond_dict,
-                    "kv_cache": self.state.get_kv_caches(),
+                    "kv_cache": self.state.get_kv_cache(),
                     "local_end_index": self.state.local_end_index,
                     "global_end_index": self.state.global_end_index,
                     "crossattn_cache": self.state.get_crossattn_caches(),
@@ -428,15 +442,13 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
 
             pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
 
+            videos = None
             if self.device.index == 0:
-                # Wan VAE decode() calls clear_cache() internally, so the very
-                # first latent always runs the i==0 path (no temporal upsample,
-                # single-frame output) and leaves feat_map polluted with that
-                # bias. The decoder's stacked temporal-causal layers also need
-                # ~2 latents of streaming context before deeper feat_map slots
-                # match a true mid-stream decode. On extension, prepend the
-                # prior chunk's last 2 latents so warmup_0 absorbs the i==0
-                # bias and warmup_1 fully primes the cache. Then discard the
+                # Wan VAE decode() calls clear_cache() internally, so the very first latent always runs the i==0 path
+                # (no temporal upsample, single-frame output) and leaves feat_map polluted with thatbias.
+                # The decoder's stacked temporal-causal layers also need ~2 latents of streaming context before deeper
+                # feat_map slots match a true mid-stream decode. On extension, prepend the prior chunk's last 2 latents
+                # so warmup_0 absorbs the i==0 bias and warmup_1 fully primes the cache. Then discard the
                 # 4*K - 3 leading pixels (re-decodes of already-shown frames).
                 if extension and self.state.last_decoded_latent is not None:
                     warmup = self.state.last_decoded_latent.to(pred_latent_chunks.device, pred_latent_chunks.dtype)
@@ -463,5 +475,6 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
 
         return DiffusionOutput(output=videos[0])
 
-    def load_weights(self, weights):
-        pass
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
