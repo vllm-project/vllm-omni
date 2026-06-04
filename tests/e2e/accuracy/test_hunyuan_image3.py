@@ -418,7 +418,8 @@ def _run_offline(
         task="it2i",
         bot_task="think_recaption",
         tokenizer=tokenizer,
-        need_ratio=False,
+        height=720,
+        width=1280,
     )
     with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path) as runner:
         params_list = list(runner.omni.default_sampling_params_list)

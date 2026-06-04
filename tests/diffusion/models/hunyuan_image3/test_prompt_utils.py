@@ -132,13 +132,15 @@ def test_resolve_stop_token_ids_fixed_size_think_recaption_stops_on_recaption_en
         task="it2i",
         bot_task="think_recaption",
         tokenizer=tok,
-        need_ratio=False,
+        height=720,
+        width=1280,
     ) == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"]]
     assert resolve_stop_token_ids(
         task="t2i",
         bot_task="think_recaption",
         tokenizer=tok,
-        need_ratio=False,
+        height=720,
+        width=1280,
     ) == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"]]
 
 
@@ -149,8 +151,8 @@ def test_resolve_stop_token_ids_fixed_size_think_stops_on_think_or_recaption_end
         HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
         HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
     ]
-    assert resolve_stop_token_ids(task="it2i", bot_task="think", tokenizer=tok, need_ratio=False) == expected
-    assert resolve_stop_token_ids(task="t2i", bot_task="think", tokenizer=tok, need_ratio=False) == expected
+    assert resolve_stop_token_ids(task="it2i", bot_task="think", tokenizer=tok, height=720, width=1280) == expected
+    assert resolve_stop_token_ids(task="t2i", bot_task="think", tokenizer=tok, height=720, width=1280) == expected
 
 
 @pytest.mark.parametrize(

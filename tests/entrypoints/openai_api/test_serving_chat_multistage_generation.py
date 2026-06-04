@@ -269,7 +269,8 @@ def test_build_multistage_generation_inputs_sets_hunyuan_image_fixed_size_stops(
         task="it2i",
         bot_task="think_recaption",
         tokenizer=FakeTokenizer(),
-        need_ratio=False,
+        height=720,
+        width=1280,
     )
     assert sampling_params_list[0].stop_token_ids == expected
     assert 128025 not in sampling_params_list[0].stop_token_ids

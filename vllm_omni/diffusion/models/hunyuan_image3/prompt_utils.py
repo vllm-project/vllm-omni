@@ -146,6 +146,8 @@ def resolve_stop_token_ids(
     task: str = "it2i",
     bot_task: str | None | _DefaultBotTask = _DEFAULT_BOT_TASK,
     tokenizer: Any | None = None,
+    height: int | None = None,
+    width: int | None = None,
     need_ratio: bool | None = None,
 ) -> list[int]:
     """AR stop-token ids for a given (task, bot_task) generation request.
@@ -156,11 +158,12 @@ def resolve_stop_token_ids(
     * ``need_ratio=True``: stop on any ``<img_ratio_*>`` token. This
       matches the official auto-size path, where AR emits the final
       ratio token and ``ar2diffusion`` derives the target size from it.
-    * ``need_ratio=False``: stop at ``</recaption>`` for recaption-style
+    * ``need_ratio=False`` (or explicit ``height`` / ``width`` with
+      ``need_ratio`` omitted): stop at ``</recaption>`` for recaption-style
       tasks, or at either ``</think>`` / ``</recaption>`` for think-only
-      tasks. This matches the official fixed-size path, where DiT reads
-      the explicit ``height`` / ``width`` from the prompt instead of
-      requiring AR to emit an image-ratio token.
+      tasks. This matches the official fixed-size path, where DiT reads the
+      explicit prompt size instead of requiring AR to emit an image-ratio
+      token.
 
     Text-output tasks (``i2t`` / ``t2t``) stop on ``<answer>`` -- the AR
     is the final stage, and the comprehension response sits inside the
@@ -173,6 +176,8 @@ def resolve_stop_token_ids(
     if bot_task not in _BOT_TASK_PRESETS:
         raise ValueError(f"Unknown bot_task {bot_task!r}. Choose from: {available_bot_tasks()}")
     if task in ("it2i", "t2i"):
+        if need_ratio is None:
+            need_ratio = not (height is not None and width is not None)
         if need_ratio is False:
             if bot_task is not None and "recaption" in bot_task:
                 return [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"]]

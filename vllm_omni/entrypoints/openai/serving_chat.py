@@ -2380,14 +2380,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # Explicit None from the caller is plain-mode; omitted lets
                 # each task fall back to its default trigger.
                 build_kwargs["bot_task"] = extra_body["bot_task"]
-            need_ratio = None
-            if build_kwargs["task"] in ("it2i", "t2i") and height is not None and width is not None:
-                need_ratio = False
             ar_stop_token_ids = resolve_stop_token_ids(
                 task=build_kwargs["task"],
                 bot_task=build_kwargs.get("bot_task"),
                 tokenizer=tokenizer,
-                need_ratio=need_ratio,
+                height=height,
+                width=width,
             )
             logger.info(
                 "[HunyuanImage3 online debug] resolved AR stops: task=%r bot_task=%r count=%d "
@@ -2502,8 +2500,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 default_stage_params.stop_token_ids = ar_stop_token_ids
 
             # Inject target_h/w into AR stage for M-RoPE position pre-computation
-            # (e.g. GLM-Image). HunyuanImage3 keeps the explicit-size signal on
-            # the prompt/DiT side instead.
+            # (e.g. GLM-Image). HunyuanImage3 keeps the size signal on the
+            # prompt/DiT side instead.
             if (
                 comprehension_idx is not None
                 and idx == comprehension_idx
