@@ -126,6 +126,11 @@ class OrchestratorRequestState:
     prompt: Any = None
     sampling_params_list: list[Any] = field(default_factory=list)
     final_stage_id: int = -1
+    final_output_stage_ids: set[int] = field(default_factory=set)
+    finished_final_output_stage_ids: set[int] = field(default_factory=set)
+
+    # Wall-clock timestamp when the client-facing engine request was accepted.
+    request_timestamp: float = 0.0
 
     # Metrics: timestamp when request was submitted to each stage.
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
@@ -451,6 +456,7 @@ class Orchestrator:
         if not sampling_params_list:
             raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
         final_stage_id = msg.final_stage_id
+        final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
 
         logger.debug(
             "[Orchestrator] _handle_add_request: stage=%s req=%s "
@@ -469,6 +475,8 @@ class Orchestrator:
             prompt=original_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
+            request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
         )
         self.request_states[request_id] = req_state
@@ -512,7 +520,9 @@ class Orchestrator:
                 output_prompt_text=msg.output_prompt_text,
                 sampling_params_list=msg.sampling_params_list,
                 final_stage_id=msg.final_stage_id,
+                final_output_stage_ids=msg.final_output_stage_ids,
                 preprocess_ms=msg.preprocess_ms,
+                request_timestamp=msg.request_timestamp,
                 enqueue_ts=msg.enqueue_ts,
             )
             await self._handle_add_request(fallback_msg)
@@ -558,6 +568,8 @@ class Orchestrator:
             prompt=companion_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=0,
+            final_output_stage_ids={0},
+            request_timestamp=parent_state.request_timestamp,
         )
         self.request_states[companion_id] = companion_state
         companion_state.stage_submit_ts[0] = _time.time()
@@ -665,6 +677,7 @@ class Orchestrator:
                         if output is None:
                             continue
 
+                        pool.record_output_timestamps([output])
                         await self._handle_processed_outputs(stage_id, replica_id, [output])
                         idle = False
                     else:
@@ -775,7 +788,9 @@ class Orchestrator:
                 stage_metrics = pool.build_stage_metrics(
                     [output],
                     submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
+                    request_timestamp=req_state.request_timestamp,
                     replica_id=replica_id,
+                    sampling_params=req_state.sampling_params_list[stage_id],
                 )
                 stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
@@ -852,6 +867,12 @@ class Orchestrator:
             await self._cleanup_request_ids([req_id])
             return
 
+        request_finished = False
+        if finished and self.stage_pools[stage_id].final_output:
+            req_state.finished_final_output_stage_ids.add(stage_id)
+            final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+            request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
+
         if self.stage_pools[stage_id].final_output:
             await self.output_async_queue.put(
                 OutputMessage(
@@ -860,7 +881,7 @@ class Orchestrator:
                     replica_id=replica_id,
                     engine_outputs=output,
                     metrics=stage_metrics,
-                    finished=finished and stage_id == req_state.final_stage_id,
+                    finished=request_finished,
                     stage_submit_ts=submit_ts,
                 )
             )
@@ -915,7 +936,7 @@ class Orchestrator:
                         is_final_update=True,
                     )
 
-        if finished and stage_id == req_state.final_stage_id:
+        if request_finished:
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
@@ -1341,7 +1362,12 @@ class Orchestrator:
                     resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id
-                await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)
+                await next_pool.submit_initial(
+                    request_id,
+                    req_state,
+                    request,
+                    prompt_text=None,
+                )
 
             # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
             # replica is stage 0's bound replica (single-replica thinker in
