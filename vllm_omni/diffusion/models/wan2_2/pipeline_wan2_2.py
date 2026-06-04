@@ -26,7 +26,7 @@ from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, Pipe
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
@@ -336,18 +336,39 @@ class Wan22Pipeline(
             )
 
         # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
+        component_subfolders = ["tokenizer", "text_encoder", "vae"]
         prefetch_subfolders(
             model,
-            ["tokenizer", "text_encoder", "vae"],
+            component_subfolders,
             local_files_only=local_files_only,
         )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+        # ``from_pretrained_with_prefetch`` re-prefetches and retries if the
+        # cache is still half-written (the missing-shard ``OSError`` and the
+        # default-``UMT5Config`` size-mismatch ``RuntimeError`` seen on multi
+        # -worker HSDP / ring launches), instead of crashing the worker.
+        self.tokenizer = from_pretrained_with_prefetch(
+            AutoTokenizer.from_pretrained,
+            model,
+            subfolder="tokenizer",
+            prefetch_list=component_subfolders,
+            local_files_only=local_files_only,
+        )
+        self.text_encoder = from_pretrained_with_prefetch(
+            UMT5EncoderModel.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=component_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
-        self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
+        self.vae = from_pretrained_with_prefetch(
+            DistributedAutoencoderKLWan.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=component_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         # Initialize transformers with correct config (weights loaded via load_weights)

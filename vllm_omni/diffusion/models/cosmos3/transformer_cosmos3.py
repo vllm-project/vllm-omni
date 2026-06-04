@@ -136,6 +136,47 @@ def resolve_sound_gen(od_config: Any) -> bool:
     return False
 
 
+class DomainAwareLinear(nn.Module):
+    """Linear projection with one weight/bias pair per action embodiment domain."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        num_domains: int,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        self.input_size = int(input_size)
+        self.output_size = int(output_size)
+        self.num_domains = int(num_domains)
+        self.fc = nn.Embedding(self.num_domains, self.output_size * self.input_size, dtype=dtype)
+        self.bias = nn.Embedding(self.num_domains, self.output_size, dtype=dtype)
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.zeros_(self.bias.weight)
+
+    def forward(self, x: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
+        if domain_id.ndim == 0:
+            domain_id = domain_id.unsqueeze(0)
+        domain_id = domain_id.to(device=x.device, dtype=torch.long).reshape(-1)
+        if x.shape[0] != domain_id.shape[0]:
+            raise ValueError(
+                "Cosmos3 action domain_id batch size must match action tokens: "
+                f"tokens={x.shape[0]}, domain_id={domain_id.shape[0]}."
+            )
+        if torch.any((domain_id < 0) | (domain_id >= self.num_domains)):
+            raise ValueError(f"Cosmos3 action domain_id must be in [0, {self.num_domains}), got {domain_id.tolist()}.")
+
+        weight = self.fc(domain_id).view(domain_id.shape[0], self.input_size, self.output_size)
+        bias = self.bias(domain_id).view(domain_id.shape[0], self.output_size)
+        if x.ndim == 2:
+            return torch.bmm(x.unsqueeze(1), weight).squeeze(1) + bias
+        if x.ndim == 3:
+            return torch.bmm(x, weight) + bias.unsqueeze(1)
+        raise ValueError(f"Cosmos3 DomainAwareLinear expected rank-2 or rank-3 input, got {tuple(x.shape)}.")
+
+
 # ---------------------------------------------------------------------------
 # Rotary Position Embeddings (mRoPE)
 # ---------------------------------------------------------------------------
@@ -163,6 +204,7 @@ def compute_mrope_position_ids_vision(
     temporal_compression_factor: int = 4,
     base_temporal_compression_factor: int | None = None,
     enable_fps_modulation: bool = True,
+    start_frame_offset: int = 0,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate 3D mRoPE position IDs for vision tokens.
 
@@ -180,10 +222,17 @@ def compute_mrope_position_ids_vision(
         )
         base_tps = base_fps / effective_base_tcf
         frame_indices = torch.arange(grid_t, dtype=torch.float32)
-        t_index = (frame_indices / tps * base_tps + temporal_offset).view(-1, 1).expand(-1, grid_h * grid_w).flatten()
+        t_index = (
+            ((frame_indices + start_frame_offset) / tps * base_tps + temporal_offset)
+            .view(-1, 1)
+            .expand(-1, grid_h * grid_w)
+            .flatten()
+        )
     else:
-        t_index = torch.arange(grid_t, dtype=torch.long).view(-1, 1).expand(-1, grid_h * grid_w).flatten() + int(
-            temporal_offset
+        t_index = (
+            torch.arange(grid_t, dtype=torch.long).view(-1, 1).expand(-1, grid_h * grid_w).flatten()
+            + int(temporal_offset)
+            + start_frame_offset
         )
 
     h_index = torch.arange(grid_h, dtype=torch.long).view(1, -1, 1).expand(grid_t, -1, grid_w).flatten()
@@ -217,6 +266,30 @@ def compute_mrope_position_ids_sound(
         temporal_compression_factor=temporal_compression_factor_sound,
         base_temporal_compression_factor=temporal_compression_factor_sound,
         enable_fps_modulation=enable_fps_modulation,
+    )
+
+
+def compute_mrope_position_ids_action(
+    grid_t: int,
+    temporal_offset: int | float,
+    action_fps: float | None,
+    base_fps: float = 24.0,
+    base_temporal_compression_factor: int = 4,
+    enable_fps_modulation: bool = True,
+    start_frame_offset: int = 1,
+) -> tuple[torch.Tensor, int | float]:
+    """Generate mRoPE IDs for action tokens as a frame-rate (T, 1, 1) grid."""
+    return compute_mrope_position_ids_vision(
+        grid_t=grid_t,
+        grid_h=1,
+        grid_w=1,
+        temporal_offset=temporal_offset,
+        fps=action_fps,
+        base_fps=base_fps,
+        temporal_compression_factor=1,
+        base_temporal_compression_factor=base_temporal_compression_factor,
+        enable_fps_modulation=enable_fps_modulation,
+        start_frame_offset=start_frame_offset,
     )
 
 
@@ -947,16 +1020,25 @@ class Cosmos3VFMTransformer(nn.Module):
         self.sound_gen = sound_gen
         self.sound_dim = sound_dim
         self.sound_latent_fps = sound_latent_fps
-
         if self.sound_gen and (sound_dim is None or sound_latent_fps is None):
             raise ValueError(
                 "Cosmos3VFMTransformer requires an explicit sound_dim and sound_latent_fps when sound_gen is True; "
                 "the pipeline must pass Cosmos3SoundTokenizer.latent_ch so the audio projection "
                 "layers are sized from the authoritative AVAE latent width."
             )
+        action_gen_value = _od_config_get(od_config, "action_gen", None)
+        action_dim_value = _od_config_get(od_config, "action_dim", None)
+        if action_dim_value is None:
+            action_dim_value = _od_config_get(od_config, "max_action_dim", None)
+        self.action_gen = _as_bool(action_gen_value) if action_gen_value is not None else False
+        self.action_dim = int(action_dim_value if action_dim_value is not None else 64)
+        self.num_embodiment_domains = int(_od_config_get(od_config, "num_embodiment_domains", 32))
         if temporal_compression_factor is None:
             temporal_compression_factor = _tf_config_get(model_config, "temporal_compression_factor", 4)
         self.temporal_compression_factor = int(temporal_compression_factor)
+        self.temporal_compression_factor_sound = int(
+            _tf_config_get(model_config, "temporal_compression_factor_sound", 1)
+        )
         self.temporal_compression_factor_sound = int(
             _tf_config_get(model_config, "temporal_compression_factor_sound", 1)
         )
@@ -992,6 +1074,20 @@ class Cosmos3VFMTransformer(nn.Module):
         self.proj_in = nn.Linear(self.patch_latent_dim, self.hidden_size)
         self.proj_out = nn.Linear(self.hidden_size, self.patch_latent_dim)
         self.time_embedder = TimestepEmbedder(self.hidden_size, target_dtype=dtype)
+        if self.action_gen:
+            self.action_proj_in = DomainAwareLinear(
+                self.action_dim,
+                self.hidden_size,
+                self.num_embodiment_domains,
+                dtype=dtype,
+            )
+            self.action_proj_out = DomainAwareLinear(
+                self.hidden_size,
+                self.action_dim,
+                self.num_embodiment_domains,
+                dtype=dtype,
+            )
+            self.action_modality_embed = nn.Parameter(torch.zeros(self.hidden_size, dtype=dtype))
         if self.sound_gen:
             self.audio_proj_in = nn.Linear(self.sound_dim, self.hidden_size)
             self.audio_proj_out = nn.Linear(self.hidden_size, self.sound_dim)
@@ -1079,6 +1175,21 @@ class Cosmos3VFMTransformer(nn.Module):
         """[B, T_sound, C_sound] -> [B, C_sound, T_sound]."""
         return tokens.permute(0, 2, 1).contiguous()
 
+    def pack_action(self, action_latents: torch.Tensor) -> torch.Tensor:
+        """Validate and return action latents as [B, T_action, D_action] tokens."""
+        if action_latents.ndim != 3:
+            raise ValueError(f"Cosmos3 action latents must have shape [B, T, D], got {tuple(action_latents.shape)}.")
+        if action_latents.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"Cosmos3 action latent dimension mismatch: expected {self.action_dim}, got {action_latents.shape[-1]}."
+            )
+        return action_latents.contiguous()
+
+    @staticmethod
+    def unpack_action(tokens: torch.Tensor) -> torch.Tensor:
+        """Return [B, T_action, D_action] action predictions."""
+        return tokens.contiguous()
+
     # -- RoPE computation ----------------------------------------------------
 
     def _compute_rope_freqs(
@@ -1090,6 +1201,9 @@ class Cosmos3VFMTransformer(nn.Module):
         fps: float | None,
         device: torch.device,
         dtype: torch.dtype,
+        t_action: int | None = None,
+        action_start_frame_offset: int = 1,
+        action_fps: float | None = None,
         t_sound: int | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
         """Compute mRoPE cos/sin for UND text and GEN media pathways."""
@@ -1097,6 +1211,7 @@ class Cosmos3VFMTransformer(nn.Module):
         S_text = text_mask.shape[1]
         text_lengths = text_mask.sum(dim=1).long()
         effective_fps = fps if fps is not None and t > 1 else None
+        action_frames = int(t_action or 0)
         sound_frames = int(t_sound or 0)
 
         text_pos_list = []
@@ -1116,6 +1231,17 @@ class Cosmos3VFMTransformer(nn.Module):
                 enable_fps_modulation=self.enable_fps_modulation,
             )
             gen_positions = [v_pos]
+            if action_frames > 0:
+                a_pos, _ = compute_mrope_position_ids_action(
+                    action_frames,
+                    temporal_offset=media_temporal_offset,
+                    action_fps=action_fps if action_fps is not None else fps,
+                    base_fps=self.base_fps,
+                    base_temporal_compression_factor=self.temporal_compression_factor,
+                    enable_fps_modulation=self.enable_fps_modulation,
+                    start_frame_offset=action_start_frame_offset,
+                )
+                gen_positions.append(a_pos)
             if sound_frames > 0:
                 s_pos, _ = compute_mrope_position_ids_sound(
                     sound_frames,
@@ -1161,7 +1287,9 @@ class Cosmos3VFMTransformer(nn.Module):
         *,
         s_gen: int,
         s_video: int,
+        s_action: int,
         s_sound: int,
+        has_action: bool,
         has_sound: bool,
         ulysses_size: int,
     ) -> None:
@@ -1169,14 +1297,16 @@ class Cosmos3VFMTransformer(nn.Module):
             return
 
         detail_parts = [f"video tokens {s_video}"]
+        if has_action:
+            detail_parts.append(f"action tokens {s_action}")
         if has_sound:
             detail_parts.append(f"sound tokens {s_sound}")
         detail = " = " + " + ".join(detail_parts) if len(detail_parts) > 1 else ""
         adjust_detail = (
-            "Adjust the spatial resolution, frame count, sound duration, "
-            "or sound latent FPS so the combined media sequence is a "
+            "Adjust the spatial resolution, frame count, action chunk size, "
+            "sound duration, or sound latent FPS so the combined media sequence is a "
             "multiple of ulysses_degree."
-            if has_sound
+            if has_action or has_sound
             else (
                 "Adjust the spatial resolution so that "
                 "t * ceil(h/patch) * ceil(w/patch) is a multiple "
@@ -1198,6 +1328,11 @@ class Cosmos3VFMTransformer(nn.Module):
         text_mask: torch.Tensor,
         video_shape: tuple[int, int, int],
         fps: float | None = None,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
+        action_start_frame_offset: int = 1,
+        action_fps: float | None = None,
         sound_latents: torch.Tensor | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         **kwargs,
@@ -1210,6 +1345,10 @@ class Cosmos3VFMTransformer(nn.Module):
             text_mask: [B, S_text] attention mask (1=real, 0=pad)
             video_shape: (t, h, w) in latent space
             fps: video frame rate for temporal mRoPE modulation
+            action_latents: Optional [B, T_action, D_action] noisy action latents.
+            action_domain_ids: Optional [B] embodiment domain IDs for action projections.
+            action_noisy_mask: Optional [B, T_action, 1] mask where 1=noisy
+                action token and 0=clean conditioned token.
             sound_latents: Optional [B, C_sound, T_sound] noisy sound latents.
             noisy_frame_mask: Optional [B, 1, t, 1, 1] mask where 1=noisy (add
                 timestep embedding, predict velocity) and 0=conditioned (clean
@@ -1218,7 +1357,7 @@ class Cosmos3VFMTransformer(nn.Module):
 
         Returns:
             [B, C, t, h, w] velocity prediction, or
-            tuple outputs in video, sound order when sound latents are provided.
+            tuple outputs in video, action, sound order when extra modalities are provided.
         """
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
@@ -1230,7 +1369,14 @@ class Cosmos3VFMTransformer(nn.Module):
                 f"Cosmos3 requires identical real text lengths within a batch "
                 f"(got min={min_real_len}, max={max_real_len})."
             )
+        has_action = action_latents is not None
         has_sound = sound_latents is not None
+        if has_action and not self.action_gen:
+            raise ValueError(
+                "Cosmos3 action generation was requested, but this transformer "
+                "was initialized without action modules. Check that the "
+                "transformer config enables action_gen."
+            )
         if has_sound and not self.sound_gen:
             raise ValueError(
                 "Cosmos3 sound generation was requested, but this transformer "
@@ -1244,8 +1390,21 @@ class Cosmos3VFMTransformer(nn.Module):
         # Patchify latents and project to hidden space
         hidden_video = self.proj_in(self.patchify(hidden_states, t, h, w))
         s_video = hidden_video.shape[1]
+        s_action = 0
+        hidden_action = None
         s_sound = 0
         hidden_sound = None
+        if action_latents is not None:
+            if action_latents.shape[0] != hidden_states.shape[0]:
+                raise ValueError(
+                    "Cosmos3 action and video batch sizes must match: "
+                    f"video={hidden_states.shape[0]}, action={action_latents.shape[0]}."
+                )
+            if action_domain_ids is None:
+                action_domain_ids = torch.zeros(action_latents.shape[0], dtype=torch.long, device=action_latents.device)
+            hidden_action = self.action_proj_in(self.pack_action(action_latents), action_domain_ids)
+            hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
+            s_action = hidden_action.shape[1]
         if sound_latents is not None:
             if sound_latents.shape[0] != hidden_states.shape[0]:
                 raise ValueError(
@@ -1277,9 +1436,22 @@ class Cosmos3VFMTransformer(nn.Module):
         else:
             hidden_video = hidden_video + time_embed.unsqueeze(1)
 
+        if hidden_action is not None:
+            if action_noisy_mask is None:
+                hidden_action = hidden_action + time_embed.unsqueeze(1)
+            else:
+                if action_noisy_mask.shape != (hidden_action.shape[0], hidden_action.shape[1], 1):
+                    raise ValueError(
+                        "Cosmos3 action_noisy_mask must have shape [B, T_action, 1], "
+                        f"got {tuple(action_noisy_mask.shape)}."
+                    )
+                hidden_action = hidden_action + time_embed.unsqueeze(1) * action_noisy_mask.to(hidden_action.dtype)
+
         if hidden_sound is not None:
             hidden_sound = hidden_sound + time_embed.unsqueeze(1)
         hidden_parts = [hidden_video]
+        if hidden_action is not None:
+            hidden_parts.append(hidden_action)
         if hidden_sound is not None:
             hidden_parts.append(hidden_sound)
         hidden_gen = torch.cat(hidden_parts, dim=1)
@@ -1294,6 +1466,9 @@ class Cosmos3VFMTransformer(nn.Module):
                 fps,
                 hidden_states.device,
                 hidden_states.dtype,
+                t_action=s_action,
+                action_start_frame_offset=action_start_frame_offset,
+                action_fps=action_fps,
                 t_sound=s_sound,
             )
             cached_kv_full = self.language_model(text_ids, freqs_und)
@@ -1311,7 +1486,9 @@ class Cosmos3VFMTransformer(nn.Module):
         self._validate_gen_sequence_parallel(
             s_gen=hidden_gen.shape[1],
             s_video=s_video,
+            s_action=s_action,
             s_sound=s_sound,
+            has_action=has_action,
             has_sound=has_sound,
             ulysses_size=ulysses_size,
         )
@@ -1346,10 +1523,12 @@ class Cosmos3VFMTransformer(nn.Module):
 
         # Final norm and project back to latent space
         hidden_gen = self.norm_moe_gen(hidden_gen)
-        if not has_sound:
+        if not has_action and not has_sound:
             return self.unpatchify(self.proj_out(hidden_gen), t, h, w)
 
         split_sizes = [s_video]
+        if has_action:
+            split_sizes.append(s_action)
         if has_sound:
             split_sizes.append(s_sound)
         split_hidden = hidden_gen.split(split_sizes, dim=1)
@@ -1357,6 +1536,11 @@ class Cosmos3VFMTransformer(nn.Module):
         video_pred = self.unpatchify(self.proj_out(hidden_video), t, h, w)
         outputs: list[torch.Tensor] = [video_pred]
         split_idx = 1
+        if has_action:
+            hidden_action = split_hidden[split_idx]
+            split_idx += 1
+            assert action_domain_ids is not None
+            outputs.append(self.unpack_action(self.action_proj_out(hidden_action, action_domain_ids)))
         if has_sound:
             hidden_sound = split_hidden[split_idx]
             outputs.append(self.unpack_sound(self.audio_proj_out(hidden_sound)))
