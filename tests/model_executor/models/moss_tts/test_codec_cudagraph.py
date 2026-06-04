@@ -49,7 +49,7 @@ class SyntheticCodecModel(nn.Module):
         super().__init__()
         self.downsample_rate = downsample_rate
         hidden = 32
-        # embed: treat codes as float feature vectors summed across NQ
+        # embed: treat NQ quantizers as input channels for Conv1d
         self.embed = nn.Conv1d(num_quantizers, hidden, kernel_size=3, padding=1)
         self.conv = nn.Conv1d(hidden, hidden, kernel_size=3, padding=1)
         self.upsample = nn.ConvTranspose1d(hidden, 1, kernel_size=downsample_rate, stride=downsample_rate)
@@ -58,7 +58,7 @@ class SyntheticCodecModel(nn.Module):
         """codes: [NQ, B, T], lengths: [B] → audio [B, 1, T*upsample]."""
         nq, b, t = codes.shape
         # treat NQ as channel dim → [B, NQ, T] for Conv1d (expects [B, C, T])
-        x = codes.permute(1, 0, 2).float()  # [B, NQ, T]
+        x = codes.permute(1, 0, 2).to(dtype=self.embed.weight.dtype)  # [B, NQ, T]
         x = torch.relu(self.embed(x))  # [B, hidden, T]
         x = torch.relu(self.conv(x))  # [B, hidden, T]
         audio = self.upsample(x)  # [B, 1, T * upsample]
