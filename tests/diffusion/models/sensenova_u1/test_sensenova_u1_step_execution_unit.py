@@ -10,17 +10,14 @@ Usage:
 """
 
 import os
-import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 import torch.nn as nn
 
-sys.path.insert(
-    0,
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))),
-)
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 PATCH_SIZE = 16
 MERGE_SIZE = 1
@@ -52,7 +49,7 @@ def _make_pipeline():
     return pipeline
 
 
-def _make_fake_state(req_id="test_req", **extra_args_overrides):
+def _make_fake_state(request_id="test_req", **extra_args_overrides):
     """Create a SimpleNamespace mimicking DiffusionRequestState."""
     sampling = SimpleNamespace(
         height=IMAGE_SIZE[1],
@@ -62,7 +59,7 @@ def _make_fake_state(req_id="test_req", **extra_args_overrides):
         extra_args=extra_args_overrides,
     )
     return SimpleNamespace(
-        req_id=req_id,
+        request_id=request_id,
         prompts=["test prompt"],
         sampling=sampling,
         extra={},
@@ -189,7 +186,7 @@ def test_step_scheduler_advances_step_index():
     pipeline._step_states["req1"] = extra
 
     state = SimpleNamespace(
-        req_id="req1",
+        request_id="req1",
         step_index=0,
         latents=image_pred.clone(),
     )
@@ -220,7 +217,7 @@ def test_step_scheduler_updates_image_prediction():
     pipeline._step_states["req1"] = extra
 
     state = SimpleNamespace(
-        req_id="req1",
+        request_id="req1",
         step_index=0,
         latents=image_pred.clone(),
     )
@@ -244,7 +241,7 @@ def test_post_decode_cleans_up_step_states():
 
     image_pred = torch.randn(1, 3, IMAGE_SIZE[1], IMAGE_SIZE[0])
     state = SimpleNamespace(
-        req_id="req1",
+        request_id="req1",
         latents=image_pred,
         extra={"caches": {}, "think_text": ""},
     )
@@ -263,7 +260,7 @@ def test_post_decode_returns_diffusion_output():
 
     image_pred = torch.randn(1, 3, IMAGE_SIZE[1], IMAGE_SIZE[0])
     state = SimpleNamespace(
-        req_id="req1",
+        request_id="req1",
         latents=image_pred,
         extra={"caches": {}, "think_text": ""},
     )
@@ -281,7 +278,7 @@ def test_post_decode_passes_think_text():
 
     image_pred = torch.randn(1, 3, IMAGE_SIZE[1], IMAGE_SIZE[0])
     state = SimpleNamespace(
-        req_id="req1",
+        request_id="req1",
         latents=image_pred,
         extra={"caches": {}, "think_text": "I should draw a cat."},
     )

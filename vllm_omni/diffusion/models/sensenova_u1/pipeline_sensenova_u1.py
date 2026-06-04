@@ -614,7 +614,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
             ),
         ]
 
-        # Per-request state cache for step-wise execution.  Maps req_id to
+        # Per-request state cache for step-wise execution.  Maps request_id to
         # the dict stored in state.extra during prepare_encode.
         self._step_states: dict[str, dict[str, Any]] = {}
 
@@ -1667,7 +1667,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
         state.extra["_current_step_index"] = 0
 
         # Register in pipeline's step-state cache for denoise_step lookup
-        self._step_states[state.req_id] = state.extra
+        self._step_states[state.request_id] = state.extra
 
         return state
 
@@ -1712,14 +1712,14 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
         **kwargs: Any,
     ) -> torch.Tensor | None:
         """Run one denoise step for all requests in the batch."""
-        if len(input_batch.req_ids) > 1:
+        if len(input_batch.request_ids) > 1:
             return self._batched_denoise_step(input_batch)
 
         # Single-request fast path
-        req_id = input_batch.req_ids[0]
-        extra = self._step_states.get(req_id)
+        request_id = input_batch.request_ids[0]
+        extra = self._step_states.get(request_id)
         if extra is None:
-            raise ValueError(f"No step state found for request {req_id}")
+            raise ValueError(f"No step state found for request {request_id}")
         step_index = extra.get("_current_step_index", 0)
         image_prediction = extra["_image_prediction"]
         v_pred = self._step_denoise_single(image_prediction, step_index, extra)
@@ -1854,10 +1854,10 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
         cond + img_cond + uncond) requests in the same batch.
         """
         per_req_data = []
-        for req_id in input_batch.req_ids:
-            extra = self._step_states.get(req_id)
+        for request_id in input_batch.request_ids:
+            extra = self._step_states.get(request_id)
             if extra is None:
-                raise ValueError(f"No step state found for request {req_id}")
+                raise ValueError(f"No step state found for request {request_id}")
             per_req_data.append(extra)
 
         is_it2i = ["img_cond" in data["caches"] for data in per_req_data]
@@ -1975,9 +1975,9 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
         **kwargs: Any,
     ) -> None:
         """Apply flow-matching step update and advance step_index."""
-        extra = self._step_states.get(state.req_id)
+        extra = self._step_states.get(state.request_id)
         if extra is None:
-            raise ValueError(f"No step state found for request {state.req_id}")
+            raise ValueError(f"No step state found for request {state.request_id}")
 
         ns = extra["ns"]
         p = extra["p"]
@@ -2019,7 +2019,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExe
         for key in ("cond", "uncond", "img_cond"):
             if key in caches and not isinstance(caches[key], dict):
                 clear_flash_kv_cache(caches[key])
-        self._step_states.pop(state.req_id, None)
+        self._step_states.pop(state.request_id, None)
 
         return DiffusionOutput(output=img, custom_output=custom if custom else None)
 

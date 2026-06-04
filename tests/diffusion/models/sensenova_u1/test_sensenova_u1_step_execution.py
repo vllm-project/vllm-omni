@@ -22,19 +22,17 @@ Or run standalone:
 """
 
 import os
-import sys
 import time
+import uuid
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
-sys.path.insert(
-    0,
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))),
-)
+pytestmark = [pytest.mark.core_model, pytest.mark.gpu, pytest.mark.diffusion]
 
-MODEL_PATH = "/mnt/nas-tbt/tbt/checkpoint/hf_cache/SenseNova-U1-8B-MoT"
+MODEL_PATH = "SenseNova/SenseNova-U1-8B-MoT"
 DEFAULT_PROMPT = (
     "Close portrait of an elderly woman by a farmhouse window, textured skin, "
     "gentle smile, warm natural light, emotional documentary look."
@@ -125,23 +123,25 @@ def _build_request(
     )
     sampling_params.extra_args = {"cfg_scale": cfg_scale, **extra_args}
 
+    if request_id is None:
+        request_id = str(uuid.uuid4())
+
     req = OmniDiffusionRequest(
         prompts=[prompt],
         sampling_params=sampling_params,
+        request_id=request_id,
     )
-    if request_id:
-        req.request_ids = [request_id]
     return req
 
 
-def _make_state(req, req_id):
+def _make_state(req, request_id):
     """Create a DiffusionRequestState from a request (mimics runner logic)."""
     import copy
 
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
     return DiffusionRequestState(
-        req_id=req_id,
+        request_id=request_id,
         sampling=copy.deepcopy(req.sampling_params),
         prompts=req.prompts,
     )
@@ -500,7 +500,7 @@ def test_dynamic_step_counts():
             for state, pred in zip(active, all_preds):
                 pipeline.step_scheduler(state, pred)
                 if state.denoise_completed:
-                    completion_order.append(state.req_id)
+                    completion_order.append(state.request_id)
 
         outputs = [pipeline.post_decode(state) for state in states]
 
@@ -684,11 +684,11 @@ def test_varlen_heterogeneous_resolution():
                     offset = 0
                     for s in group:
                         rows = s.latents.shape[0]
-                        all_preds_map[s.req_id] = pred[offset:offset + rows]
+                        all_preds_map[s.request_id] = pred[offset:offset + rows]
                         offset += rows
 
                 for s in active:
-                    pipeline.step_scheduler(s, all_preds_map[s.req_id])
+                    pipeline.step_scheduler(s, all_preds_map[s.request_id])
             else:
                 ib = InputBatch.make_batch(active)
                 pred = pipeline.denoise_step(ib)
@@ -1091,7 +1091,11 @@ def test_e2e_scheduler_heterogeneous_batch():
             seed=seed,
             extra_args={"cfg_scale": cfg_scale},
         )
-        return OmniDiffusionRequest(prompts=[prompt], sampling_params=sp)
+        return OmniDiffusionRequest(
+            prompts=[prompt],
+            sampling_params=sp,
+            request_id=str(uuid.uuid4()),
+        )
 
     # ── Phase A: reference outputs (single-request forward) ──
     refs = []
@@ -1130,7 +1134,7 @@ def test_e2e_scheduler_heterogeneous_batch():
         sched_req_ids.append(scheduler.add_request(req))
 
     sched_output = scheduler.schedule()
-    scheduled_count = len(sched_output.scheduled_new_reqs) + len(sched_output.scheduled_cached_reqs.sched_req_ids)
+    scheduled_count = len(sched_output.scheduled_new_reqs) + len(sched_output.scheduled_cached_reqs.request_ids)
     print(f"\n  Scheduler batched {scheduled_count}/{num_reqs} requests together")
     assert scheduled_count == num_reqs, (
         f"Scheduler only batched {scheduled_count}/{num_reqs} — "
@@ -1142,7 +1146,7 @@ def test_e2e_scheduler_heterogeneous_batch():
     for new_req_data in sched_output.scheduled_new_reqs:
         req = new_req_data.req
         state = DiffusionRequestState(
-            req_id=new_req_data.sched_req_id,
+            request_id=new_req_data.request_id,
             sampling=copy.deepcopy(req.sampling_params),
             prompts=req.prompts,
         )
@@ -1173,11 +1177,11 @@ def test_e2e_scheduler_heterogeneous_batch():
                 offset = 0
                 for s in group:
                     rows = s.latents.shape[0]
-                    all_preds_map[s.req_id] = pred[offset:offset + rows]
+                    all_preds_map[s.request_id] = pred[offset:offset + rows]
                     offset += rows
 
             for s in active:
-                pipeline.step_scheduler(s, all_preds_map[s.req_id])
+                pipeline.step_scheduler(s, all_preds_map[s.request_id])
 
         outputs = [pipeline.post_decode(state) for state in states]
     torch.accelerator.synchronize()
