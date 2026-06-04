@@ -105,6 +105,7 @@ NPU_DIT_QUANT_MODEL_ENV = "HUNYUAN_IMAGE3_NPU_DIT_QUANT_MODEL"
 NPU_DIT_DEVICES_ENV = "HUNYUAN_IMAGE3_NPU_DIT_DEVICES"
 NPU_DIT_TP_ENV = "HUNYUAN_IMAGE3_NPU_DIT_TP"
 NPU_DIT_EP_ENV = "HUNYUAN_IMAGE3_NPU_DIT_ENABLE_EP"
+NPU_DIT_GPU_MEMORY_UTILIZATION_ENV = "HUNYUAN_IMAGE3_NPU_DIT_GPU_MEMORY_UTILIZATION"
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 # fmt: off
 _DEPLOY_CONFIG = {
@@ -257,13 +258,12 @@ _QUANT_DIT_CONFIG = {
 }
 
 _NPU_DIT_CONFIG = {
-    "pipeline": "hunyuan_image_3_moe",
+    "pipeline": "hunyuan_image3_dit",
     "async_chunk": False,
     "trust_remote_code": True,
     "stages": [
         {
             "stage_id": 0,
-            "model_stage": "dit",
             "gpu_memory_utilization": 0.65,
             "enforce_eager": True,
             "trust_remote_code": True,
@@ -276,10 +276,6 @@ _NPU_DIT_CONFIG = {
                 "sequence_parallel_size": 1,
                 "ulysses_degree": 1,
             },
-            "omni_kv_config": {"need_recv_cache": True},
-            "final_output": True,
-            "final_output_type": "image",
-            "is_comprehension": False,
             "default_sampling_params": {"seed": SEED},
         }
     ],
@@ -363,8 +359,13 @@ def _npu_dit_enable_expert_parallel() -> bool:
     return os.environ.get(NPU_DIT_EP_ENV, "1").lower() in _TRUE_ENV_VALUES
 
 
+def _npu_dit_gpu_memory_utilization() -> float:
+    return float(os.environ.get(NPU_DIT_GPU_MEMORY_UTILIZATION_ENV, "0.65"))
+
+
 def _make_npu_dit_config(path: Path) -> None:
     config = copy.deepcopy(_NPU_DIT_CONFIG)
+    config["stages"][0]["gpu_memory_utilization"] = _npu_dit_gpu_memory_utilization()
     config["stages"][0]["devices"] = _npu_dit_devices()
     config["stages"][0]["parallel_config"]["tensor_parallel_size"] = _npu_dit_tensor_parallel_size()
     config["stages"][0]["parallel_config"]["enable_expert_parallel"] = _npu_dit_enable_expert_parallel()
@@ -712,13 +713,15 @@ def test_npu_dit_config_defaults_to_four_card_expert_parallel(
     monkeypatch.delenv("HUNYUAN_IMAGE3_NPU_DIT_DEVICES", raising=False)
     monkeypatch.delenv("HUNYUAN_IMAGE3_NPU_DIT_TP", raising=False)
     monkeypatch.delenv("HUNYUAN_IMAGE3_NPU_DIT_ENABLE_EP", raising=False)
+    monkeypatch.delenv("HUNYUAN_IMAGE3_NPU_DIT_GPU_MEMORY_UTILIZATION", raising=False)
 
     config_path = tmp_path / "npu_dit.yaml"
     _make_npu_dit_config(config_path)
     config = yaml.safe_load(config_path.read_text())
     stage = config["stages"][0]
 
-    assert stage["model_stage"] == "dit"
+    assert config["pipeline"] == "hunyuan_image3_dit"
+    assert stage["gpu_memory_utilization"] == 0.65
     assert stage["devices"] == "0,1,2,3"
     assert stage["parallel_config"]["tensor_parallel_size"] == 4
     assert stage["parallel_config"]["enable_expert_parallel"] is True
@@ -730,11 +733,13 @@ def test_npu_dit_config_accepts_env_parallelism(tmp_path: Path, monkeypatch: pyt
     monkeypatch.setenv("HUNYUAN_IMAGE3_NPU_DIT_DEVICES", "2,3")
     monkeypatch.setenv("HUNYUAN_IMAGE3_NPU_DIT_TP", "2")
     monkeypatch.setenv("HUNYUAN_IMAGE3_NPU_DIT_ENABLE_EP", "0")
+    monkeypatch.setenv("HUNYUAN_IMAGE3_NPU_DIT_GPU_MEMORY_UTILIZATION", "0.8")
 
     config_path = tmp_path / "npu_dit.yaml"
     _make_npu_dit_config(config_path)
     stage = yaml.safe_load(config_path.read_text())["stages"][0]
 
+    assert stage["gpu_memory_utilization"] == 0.8
     assert stage["devices"] == "2,3"
     assert stage["parallel_config"]["tensor_parallel_size"] == 2
     assert stage["parallel_config"]["enable_expert_parallel"] is False
@@ -907,6 +912,7 @@ def test_npu_dit_distil_smoke_accuracy(accuracy_artifact_root: Path) -> None:
         "devices": _npu_dit_devices(),
         "tensor_parallel_size": _npu_dit_tensor_parallel_size(),
         "enable_expert_parallel": _npu_dit_enable_expert_parallel(),
+        "gpu_memory_utilization": _npu_dit_gpu_memory_utilization(),
     }
     metrics_path = output_dir / "npu_dit_distil_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
@@ -983,6 +989,7 @@ def test_npu_quantized_dit_matches_bf16_accuracy(
         "devices": _npu_dit_devices(),
         "tensor_parallel_size": _npu_dit_tensor_parallel_size(),
         "enable_expert_parallel": _npu_dit_enable_expert_parallel(),
+        "gpu_memory_utilization": _npu_dit_gpu_memory_utilization(),
     }
     metrics_path = output_dir / "npu_quant_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
