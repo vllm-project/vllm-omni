@@ -311,6 +311,18 @@ def test_end2end_routes_through_shared_prompt_utils():
     assert expected_imports <= imported_from_prompt_utils
 
 
+def test_end2end_img2img_explicit_size_overrides_diffusion_params():
+    end2end_path = _repo_root() / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
+    source = end2end_path.read_text(encoding="utf-8")
+
+    assert 'raise ValueError("--height and --width must be provided together.")' in source
+    assert 'prompt_dict["height"] = args.height if explicit_output_size else input_images[0].height' in source
+    assert 'prompt_dict["width"] = args.width if explicit_output_size else input_images[0].width' in source
+    assert 'elif args.modality == "img2img" and explicit_output_size:' in source
+    assert "sp.height = args.height" in source
+    assert "sp.width = args.width" in source
+
+
 _HUNYUAN_MODEL_ID = "tencent/HunyuanImage-3.0-Instruct"
 
 

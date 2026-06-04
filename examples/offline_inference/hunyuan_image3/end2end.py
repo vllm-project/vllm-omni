@@ -131,6 +131,11 @@ def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
     additional_config = parse_additional_config(args.additional_config)
+    explicit_output_size = args.height is not None or args.width is not None
+    if explicit_output_size and (args.height is None or args.width is None):
+        raise ValueError("--height and --width must be provided together.")
+    text2img_height = args.height if args.height is not None else 1024
+    text2img_width = args.width if args.width is not None else 1024
 
     task, default_bot_task = _MODALITY_TASK_MAP[args.modality]
     if args.bot_task is None:
@@ -213,8 +218,8 @@ def main():
         elif args.modality == "img2img":
             prompt_dict["modalities"] = ["image"]
             prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
-            prompt_dict["height"] = input_images[0].height
-            prompt_dict["width"] = input_images[0].width
+            prompt_dict["height"] = args.height if explicit_output_size else input_images[0].height
+            prompt_dict["width"] = args.width if explicit_output_size else input_images[0].width
         elif args.modality == "img2text":
             prompt_dict["modalities"] = ["text"]
             prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
@@ -249,6 +254,9 @@ def main():
             if args.seed is not None:
                 sp.seed = args.seed
             if args.modality == "text2img":
+                sp.height = text2img_height
+                sp.width = text2img_width
+            elif args.modality == "img2img" and explicit_output_size:
                 sp.height = args.height
                 sp.width = args.width
         elif hasattr(sp, "stop_token_ids"):
@@ -273,7 +281,9 @@ def main():
         print(f"  diffusion_kv_cache_skip_steps: {args.diffusion_kv_cache_skip_steps}")
         print(f"  diffusion_kv_cache_skip_layers: {args.diffusion_kv_cache_skip_layers}")
     if args.modality == "text2img":
-        print(f"  Output size: {args.width}x{args.height}")
+        print(f"  Output size: {text2img_width}x{text2img_height}")
+    elif args.modality == "img2img" and explicit_output_size:
+        print(f"  Output size override: {args.width}x{args.height}")
     if args.image_path:
         print(f"  Input image: {args.image_path}")
     if additional_config is not None:
