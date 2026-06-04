@@ -31,11 +31,6 @@
                 ],
                 "random_input_len": 2500,
                 "random_output_len": 900,
-                "temperature": 0.4,
-                "top_p": 0.9,
-                "top_k": 1,
-                "seed": 42,
-                "repetition_penalty": 1.05,
                 "ignore_eos": true,
                 "extra_body": {
                     "modalities": [
@@ -74,11 +69,6 @@
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
-                "temperature": 0.4,
-                "top_p": 0.9,
-                "top_k": 1,
-                "seed": 42,
-                "repetition_penalty": 1.05,
                 "ignore_eos": true,
                 "extra_body": {
                     "modalities": [
@@ -117,11 +107,6 @@
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
-                "temperature": 0.4,
-                "top_p": 0.9,
-                "top_k": 1,
-                "seed": 42,
-                "repetition_penalty": 1.05,
                 "ignore_eos": true,
                 "extra_body": {
                     "modalities": [
@@ -162,11 +147,6 @@
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
-                "temperature": 0.4,
-                "top_p": 0.9,
-                "top_k": 1,
-                "seed": 42,
-                "repetition_penalty": 1.05,
                 "ignore_eos": true,
                 "extra_body": {
                     "modalities": [
