@@ -964,6 +964,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
 
     pool = RecordingPool()
     orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = False
     orchestrator.request_states = {
         "req-stream": OrchestratorRequestState(
             request_id="req-stream",
@@ -1156,3 +1157,37 @@ async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator
         assert stage0_r1.add_request_calls[1][0].request_id == "parent-neg"
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+def test_orchestrator_does_not_re_introduce_global_stats_throttle() -> None:
+    """Regression: each (stage, replica) must independently publish its wrapped
+    vllm:* stats when its scheduler emits non-None scheduler_stats.
+
+    A previous version of Orchestrator carried a global self._last_stats_ts /
+    _stats_interval_s gate around _stat_logger.record(). Because
+    OmniSchedulerMixin.make_stats() already throttles at 1 Hz per scheduler
+    (one per (stage, replica)), the extra global gate starved every replica
+    other than the first to emit within each second — their {stage, replica}
+    gauges/counters went stale.
+
+    The fix removed the global gate entirely; the only signal needed is
+    'this replica's scheduler emitted non-None scheduler_stats'. This test
+    fails loudly if someone reintroduces the global throttle.
+    """
+    import inspect
+
+    from vllm_omni.engine.orchestrator import Orchestrator
+
+    source = inspect.getsource(Orchestrator)
+    assert "_last_stats_ts" not in source, (
+        "Orchestrator must not gate stat recording on a global timestamp. "
+        "OmniSchedulerMixin.make_stats() already throttles per scheduler "
+        "(per (stage, replica)); an outer global gate starves all but the "
+        "first replica to emit within each 1s window."
+    )
+    assert "_stats_interval_s" not in source
+    assert "raw_outputs.scheduler_stats is not None" in source, (
+        "Orchestrator must gate stat recording solely on "
+        "raw_outputs.scheduler_stats being non-None — the per-scheduler 1Hz "
+        "throttle in OmniSchedulerMixin.make_stats() is the only gate needed."
+    )

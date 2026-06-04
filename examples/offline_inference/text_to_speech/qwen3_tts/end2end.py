@@ -15,10 +15,8 @@ import torch
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-from vllm.utils.argparse_utils import FlexibleArgumentParser
-
 from vllm_omni import AsyncOmni, Omni
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 logger = logging.getLogger(__name__)
 
@@ -435,7 +433,7 @@ async def main_streaming(args):
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = TrackingArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
     parser.add_argument(
         "--query-type",
         "-q",
@@ -548,7 +546,6 @@ def parse_args():
         help="Number of prompts per batch (default: 1, sequential).",
     )
 
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

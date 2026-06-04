@@ -16,7 +16,6 @@ from vllm.v1.worker.gpu_model_runner import PerLayerAttnMetadata
 from vllm_ascend.ascend_forward_context import get_forward_context, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import using_paged_attention
-from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE, NPUModelRunner
@@ -34,30 +33,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         # in _pad_for_sequence_parallelism during execute_model.
         # This is a workaround for vllm-ascend not passing vllm_config to enable_sp().
         enable_sp(self.vllm_config)
-        # TODO move this model specific logic to a separate class
-        # TTS model IS the talker (no .talker sub-attr); use getattr to support both Omni and TTS.
-        self.has_talker_mtp = False
-        talker_mtp = getattr(self.model, "talker_mtp", None)
-        if talker_mtp is not None:
-            self.talker_mtp = talker_mtp  # type: ignore[assignment]
-            self.has_talker_mtp = True
-            cudagraph_mode = self.compilation_config.cudagraph_mode
-            assert cudagraph_mode is not None
-            has_separate_talker = getattr(self.model, "talker", None) is not None
-            talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
-            if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
-                self.talker_mtp = ACLGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
-            # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
-            hidden_size = int(
-                getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
-            )
-            max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
-            self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
-            self.talker_mtp_inputs_embeds = self._make_buffer(
-                max_batch_size, hidden_size, dtype=self.dtype, numpy=False
-            )
-            self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
-            self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+        self._init_talker_mtp()
 
     @torch.inference_mode()
     def _dummy_run(
@@ -397,75 +373,3 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             model_output = self._all_gather_hidden_states_and_aux(model_output)
 
         return model_output
-
-    def _talker_mtp_forward(self, decode_req_ids: list[str], inputs_embeds: torch.Tensor) -> None:
-        decode_batch_size = len(decode_req_ids)
-        if decode_batch_size == 0:
-            return
-        _cudagraph_mode, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
-            num_tokens=decode_batch_size,
-            num_reqs=decode_batch_size,
-            num_scheduled_tokens_np=np.ones(decode_batch_size, dtype=np.int32),
-            max_num_scheduled_tokens=1,
-            use_cascade_attn=False,
-        )
-        # Force eager for unwrapped code predictors (AR loops / multinomial).
-        if not isinstance(self.talker_mtp, ACLGraphWrapper):
-            _cudagraph_mode = CUDAGraphMode.NONE
-        num_tokens_padded = batch_desc.num_tokens
-        req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
-        req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
-        last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
-        text_step = self.text_step.gpu[:num_tokens_padded]
-        subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
-        if not isinstance(subtalker_params, dict):
-            subtalker_params = {}
-        # Extract seed from the first request's sampling params for Fast AR
-        # determinism.  NOTE: when batch_size > 1, all requests share the first
-        # request's seed.  Per-request Fast AR seeding requires row-by-row
-        # torch.multinomial calls and is left as a follow-up optimisation.
-        _seed = None
-        if decode_req_ids:
-            _first_sp = getattr(self.requests[decode_req_ids[0]], "sampling_params", None)
-            if _first_sp is not None and getattr(_first_sp, "seed", None) is not None:
-                _seed = _first_sp.seed
-            # Warn when batched requests have different seeds.
-            if len(decode_req_ids) > 1 and _seed is not None:
-                _other_seeds = {
-                    getattr(getattr(self.requests[rid], "sampling_params", None), "seed", None)
-                    for rid in decode_req_ids[1:]
-                }
-                if _other_seeds != {_seed}:
-                    logger.warning(
-                        "Fast AR seed: batch has mixed seeds; using first request's seed=%d for all %d requests.",
-                        _seed,
-                        len(decode_req_ids),
-                    )
-        talker_kwargs = {
-            "do_sample": subtalker_params.get("do_sample"),
-            "temperature": subtalker_params.get("temperature"),
-            "top_k": subtalker_params.get("top_k"),
-            "top_p": subtalker_params.get("top_p"),
-        }
-        if _seed is not None:
-            talker_kwargs["seed"] = _seed
-        with set_ascend_forward_context(
-            None, self.vllm_config, aclgraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
-        ):
-            req_embeds, code_predictor_codes = self.talker_mtp(
-                req_input_ids,
-                req_embeds,
-                last_talker_hidden,
-                text_step,
-                **talker_kwargs,
-            )
-        # update the inputs_embeds and code_predictor_codes
-        out_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))
-        if not isinstance(out_key, tuple) or len(out_key) != 2:
-            raise TypeError(f"talker_mtp_output_key must be a 2-tuple, got {type(out_key).__name__}: {out_key!r}")
-        for idx, req_id in enumerate(decode_req_ids):
-            req_index = self.input_batch.req_ids.index(req_id)
-            start_offset = int(self.query_start_loc.cpu[req_index])
-            inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
-            update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
-            self._merge_additional_information_update(req_id, update_dict)

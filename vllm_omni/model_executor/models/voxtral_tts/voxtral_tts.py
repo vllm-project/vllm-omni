@@ -159,6 +159,13 @@ class VoxtralTTSForConditionalGeneration(
             raise ValueError("Invalid model stage")
 
     # -------------------- CUDA Graph for acoustic transformer --------------------
+
+    def get_language_model(self) -> "nn.Module":
+        """Return the language model for upstream MoE detection."""
+        if hasattr(self.model, "get_language_model"):
+            return self.model.get_language_model()
+        return self.model
+
     def _enable_acoustic_transformer_cudagraph(self):
         """Initialize and capture CUDA graphs for compute_mm_logits."""
         if self.model_stage != "audio_generation" or not hasattr(self, "_vllm_config"):

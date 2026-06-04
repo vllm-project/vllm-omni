@@ -23,7 +23,11 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.utils.speaker_cache import get_speaker_cache
+from vllm_omni.utils.speaker_cache import (
+    get_speaker_cache,
+    iter_custom_voice_profiles,
+    load_validated_profile_tensors,
+)
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
 from .prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder
@@ -441,6 +445,46 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             encode_ref_audio_batch=self._encode_ref_audio_batch,
             speaker_cache=self._speaker_cache,
         )
+        self._load_custom_voice_profiles()
+
+    # -------------------- custom voice profiles --------------------
+
+    def _load_custom_voice_profiles(self) -> None:
+        """Preload offline Qwen3-TTS custom voice profiles into speaker cache."""
+        custom_voice_dir = getattr(self.config, "custom_voice_dir", None)
+        if not custom_voice_dir:
+            return
+
+        expected_dim = int(getattr(self.config.speaker_encoder_config, "enc_dim", 0) or 0)
+        loaded = 0
+        for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type="qwen3_tts"):
+            tensors = load_validated_profile_tensors(
+                profile,
+                expected_model_type="qwen3_tts",
+                qwen3_embedding_dim=expected_dim,
+            )
+            if tensors is None:
+                continue
+
+            speaker_embedding = tensors["speaker_embedding"].reshape(-1).contiguous().cpu()
+            mode = str(profile.get("mode") or "xvec").lower()
+            ref_code = tensors.get("ref_code")
+            artifacts: dict[str, Any] = {
+                "ref_spk_embedding": speaker_embedding,
+                "ref_code": ref_code.contiguous().cpu() if isinstance(ref_code, torch.Tensor) else None,
+                "icl_mode": mode == "icl",
+                "ref_text": profile.get("ref_text"),
+            }
+            key = self._speaker_cache.make_cache_key(
+                profile["voice_name_lower"],
+                model_type=f"qwen3_tts_{mode}",
+                created_at=0,
+            )
+            self._speaker_cache.put(key, artifacts)
+            loaded += 1
+
+        if loaded:
+            logger.info("Loaded %d precomputed Qwen3-TTS custom voice profile(s) from %s", loaded, custom_voice_dir)
 
     # -------------------- vLLM required hooks --------------------
 
