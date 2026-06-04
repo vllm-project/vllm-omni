@@ -64,6 +64,7 @@ AR_DEVICES, DIT_DEVICES = _default_ar_dit_devices()
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
 NUM_INFERENCE_STEPS = 50
 GUIDANCE_SCALE = 2.5
+NPU_GUIDANCE_SCALE = 1.0
 
 # ============================================================================
 # Constants
@@ -224,7 +225,7 @@ _NPU_DEPLOY_CONFIG = {
             "input_connectors": {"from_stage_0": "shared_memory_connector"},
             "default_sampling_params": {
                 "num_inference_steps": NPU_NUM_INFERENCE_STEPS,
-                "guidance_scale": GUIDANCE_SCALE,
+                "guidance_scale": NPU_GUIDANCE_SCALE,
             },
         },
     ],
@@ -419,7 +420,7 @@ def _run_offline(
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
                 sp.num_inference_steps = num_inference_steps
-                sp.guidance_scale = GUIDANCE_SCALE
+                sp.guidance_scale = NPU_GUIDANCE_SCALE
                 sp.seed = SEED
                 sp.generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
             elif hasattr(sp, "stop_token_ids"):
@@ -499,7 +500,7 @@ def _run_online(
                     "n": 1,
                     "response_format": "b64_json",
                     "num_inference_steps": num_inference_steps,
-                    "guidance_scale": GUIDANCE_SCALE,
+                    "guidance_scale": NPU_GUIDANCE_SCALE,
                     "seed": SEED,
                     "sys_type": "en_unified",
                     "bot_task": "think_recaption",
