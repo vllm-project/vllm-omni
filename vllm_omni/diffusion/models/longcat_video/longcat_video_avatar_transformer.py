@@ -212,7 +212,7 @@ class CaptionEmbedder(nn.Module):
         return caption
 
 
-def broadcat(tensors, dim=-1):
+def broadcast_concat(tensors, dim=-1):
     num_tensors = len(tensors)
     shape_lens = set(map(lambda t: len(t.shape), tensors))
     assert len(shape_lens) == 1, "tensors must all have the same number of dimensions"
@@ -266,7 +266,9 @@ class RotaryPositionalEmbedding(nn.Module):
         freqs_t = repeat(freqs_t, "... n -> ... (n r)", r=2)
         freqs_h = repeat(freqs_h, "... n -> ... (n r)", r=2)
         freqs_w = repeat(freqs_w, "... n -> ... (n r)", r=2)
-        freqs = broadcat((freqs_t[:, None, None, :], freqs_h[None, :, None, :], freqs_w[None, None, :, :]), dim=-1)
+        freqs = broadcast_concat(
+            (freqs_t[:, None, None, :], freqs_h[None, :, None, :], freqs_w[None, None, :, :]), dim=-1
+        )
         freqs = rearrange(freqs, "T H W D -> (T H W) D")
         if self.cp_split_hw[0] * self.cp_split_hw[1] > 1:
             raise NotImplementedError("LongCat-Video-Avatar context parallel RoPE is not supported in native MVP.")
@@ -811,11 +813,7 @@ class LoRANetwork(nn.Module):
         self.alpha = alpha
         self.loras: list[LoRAModule] = []
 
-        lora_names = {
-            key.split(".lora_down.weight")[0]
-            for key in lora_state_dict
-            if key.endswith("lora_down.weight")
-        }
+        lora_names = {key.split(".lora_down.weight")[0] for key in lora_state_dict if key.endswith("lora_down.weight")}
         for lora_name in sorted(lora_names):
             module_name = lora_name.replace("lora___lorahyphen___", "").replace("___lorahyphen___", ".")
             try:
@@ -995,9 +993,9 @@ class LongCatAvatarSingleStreamBlock(nn.Module):
                 audio_shift_mca,
                 audio_scale_mca,
             ).view(batch, -1, channels)
-            audio_add_x = (
-                audio_gate_mca * audio_output_noise.view(batch, num_frames - num_cond, -1, channels)
-            ).view(batch, -1, channels)
+            audio_add_x = (audio_gate_mca * audio_output_noise.view(batch, num_frames - num_cond, -1, channels)).view(
+                batch, -1, channels
+            )
             if audio_output_cond is not None:
                 audio_add_x = torch.cat([audio_output_cond, audio_add_x], dim=1).contiguous()
             x = (x + audio_add_x).to(x_dtype)
@@ -1264,9 +1262,11 @@ class LongCatVideoAvatarTransformer3DModel(nn.Module):
 
         if encoder_attention_mask is not None:
             encoder_attention_mask = encoder_attention_mask.squeeze(1).squeeze(1)
-            encoder_hidden_states = encoder_hidden_states.squeeze(1).masked_select(
-                encoder_attention_mask.unsqueeze(-1) != 0
-            ).view(1, -1, hidden_states.shape[-1])
+            encoder_hidden_states = (
+                encoder_hidden_states.squeeze(1)
+                .masked_select(encoder_attention_mask.unsqueeze(-1) != 0)
+                .view(1, -1, hidden_states.shape[-1])
+            )
             y_seqlens = encoder_attention_mask.sum(dim=1).tolist()
         else:
             y_seqlens = [encoder_hidden_states.shape[2]] * encoder_hidden_states.shape[0]

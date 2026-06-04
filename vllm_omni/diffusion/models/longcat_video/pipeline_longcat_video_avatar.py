@@ -356,9 +356,9 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         self.text_encoder = UMT5EncoderModel.from_pretrained(
             str(base_dir), subfolder="text_encoder", torch_dtype=dtype
         ).to(self.device)
-        self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            str(base_dir), subfolder="vae", torch_dtype=dtype
-        ).to(self.device)
+        self.vae = DistributedAutoencoderKLWan.from_pretrained(str(base_dir), subfolder="vae", torch_dtype=dtype).to(
+            self.device
+        )
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(str(self.model_dir), subfolder="scheduler")
 
         if self.use_int8:
@@ -599,9 +599,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         audio_path = (
             audio_field
             if isinstance(audio_field, str | os.PathLike)
-            else extra.get("audio_path")
-            or info.get("audio_path")
-            or (sample.get("cond_audio") or {}).get("person1")
+            else extra.get("audio_path") or info.get("audio_path") or (sample.get("cond_audio") or {}).get("person1")
         )
         audio_path = _resolve_path(audio_path, asset_root=self.asset_root)
         if not audio_path:
@@ -837,9 +835,11 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
                         audio_embs=audio_uncond_embs,
                     )
                     noise_pred_uncond_text, noise_pred_cond = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + text_guidance_scale * (
-                        noise_pred_cond - noise_pred_uncond_text
-                    ) + audio_guidance_scale * (noise_pred_uncond_text - noise_pred_uncond)
+                    noise_pred = (
+                        noise_pred_uncond
+                        + text_guidance_scale * (noise_pred_cond - noise_pred_uncond_text)
+                        + audio_guidance_scale * (noise_pred_uncond_text - noise_pred_uncond)
+                    )
                 latents = self.scheduler.step(-noise_pred, t, latents, return_dict=False)[0]
         return self._decode_latents(latents, output_type="np")
 
@@ -935,9 +935,11 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
                         audio_embs=audio_uncond_embs,
                     )
                     noise_pred_uncond_text, noise_pred_cond = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + text_guidance_scale * (
-                        noise_pred_cond - noise_pred_uncond_text
-                    ) + audio_guidance_scale * (noise_pred_uncond_text - noise_pred_uncond)
+                    noise_pred = (
+                        noise_pred_uncond
+                        + text_guidance_scale * (noise_pred_cond - noise_pred_uncond_text)
+                        + audio_guidance_scale * (noise_pred_uncond_text - noise_pred_uncond)
+                    )
                 latents[:, :, 1:] = self.scheduler.step(
                     -noise_pred[:, :, 1:],
                     t,
