@@ -5,12 +5,16 @@ E2E Online tests for Qwen3-Omni model.
 """
 
 import os
-from pathlib import Path
 
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video, load_test_audio_data_url
+from tests.helpers.media import (
+    generate_synthetic_audio,
+    generate_synthetic_image,
+    generate_synthetic_video,
+    load_test_audio_data_url,
+)
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
@@ -483,7 +487,8 @@ def test_text_to_audio_long_output_001(omni_server, online_client) -> None:
     text = responses[0].text_content if responses else ""
     word_count = len(text.split())
     assert word_count >= 200, f"Expected at least 200 words in long output, got {word_count}"
-    
+
+
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_to_audio(omni_server, openai_client) -> None:
