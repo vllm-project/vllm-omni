@@ -1,4 +1,5 @@
 import os
+from collections.abc import Mapping
 from functools import lru_cache
 
 from vllm.logger import init_logger
@@ -23,6 +24,31 @@ def _looks_like_bagel(model_name: str) -> bool:
             return True
         architectures = cfg.get("architectures") or []
         return "BagelForConditionalGeneration" in architectures
+    except Exception:
+        return False
+
+
+def _looks_like_dreamzero(model_name: str) -> bool:
+    """Best-effort detection for DreamZero-style VLA diffusion checkpoints."""
+    try:
+        cfg = get_hf_file_to_dict("config.json", model_name)
+        if cfg.get("model_type") != "vla":
+            return False
+        action_head_cfg = cfg.get("action_head_cfg") or {}
+        if not isinstance(action_head_cfg, Mapping):
+            return False
+        action_head_config = action_head_cfg.get("config") or {}
+        if not isinstance(action_head_config, Mapping):
+            return False
+        diffusion_model_cfg = action_head_config.get("diffusion_model_cfg") or {}
+        if not isinstance(diffusion_model_cfg, Mapping):
+            return False
+        return (
+            action_head_cfg.get("_target_")
+            == "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf.WANPolicyHead"
+            and diffusion_model_cfg.get("_target_")
+            == ("groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk.CausalWanModel")
+        )
     except Exception:
         return False
 
@@ -72,6 +98,7 @@ def is_diffusion_model(model_name: str) -> bool:
     except Exception as e:
         logger.debug("Failed to load diffusers config via DiffusionPipeline: %s", e)
 
-        # Bagel is not a diffusers pipeline (no model_index.json), but is still a
-        # diffusion-style model in vllm-omni. Detect it via config.json.
-    return _looks_like_bagel(model_name)
+        # Bagel and DreamZero are not diffusers pipelines (no model_index.json),
+        # but are still diffusion-style models in vllm-omni. Detect them via
+        # config.json.
+    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name)
