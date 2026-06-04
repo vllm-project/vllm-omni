@@ -32,8 +32,8 @@ BAGEL_MOONCAKE_CI_DEPLOY = get_deploy_config_path("ci/bagel_mooncake.yaml")
 
 # Reference pixel data extracted from the known-good output image
 # Each entry contains (x, y) position and expected (R, G, B) values
-# "Generated with seed=52, num_inference_steps=15,
-# prompt='A futuristic city skyline at twilight, cyberpunk style'"
+# "Generated with seed=52, num_inference_steps=14,
+# prompt='A cute cat'"
 REFERENCE_PIXELS = [
     {"position": (100, 100), "rgb": (115, 113, 94)},
     {"position": (400, 50), "rgb": (159, 160, 144)},
@@ -63,7 +63,7 @@ def _find_free_port() -> int:
     return port
 
 
-def _configure_sampling_params(omni: Omni, num_inference_steps: int = 15) -> list:
+def _configure_sampling_params(omni: Omni, num_inference_steps: int = 14) -> list:
     """Configure sampling parameters for Bagel text2img generation.
 
     Args:
@@ -269,7 +269,6 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@pytest.mark.skip(reason="Skip failed CI issue 3977: https://github.com/vllm-project/vllm-omni/issues/3977")
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_bagel_text2img_mooncake_connector(run_level):
     """Test Bagel text2img with Mooncake connector for inter-stage communication."""

@@ -216,6 +216,27 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self._supported_speakers = set()
         return self._supported_speakers
 
+    @staticmethod
+    def _truthy_extra_body_flag(request: Any, key: str) -> bool:
+        if isinstance(request, dict):
+            extra_body = request
+            model_extra = {}
+        else:
+            extra_body = getattr(request, "extra_body", None) or {}
+            model_extra = getattr(request, "model_extra", None) or {}
+        value = extra_body.get(key, model_extra.get(key))
+        if isinstance(value, str):
+            return value.lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @classmethod
+    def _filter_stage_metrics_detail(cls, metrics: dict[str, Any] | None, request: Any) -> dict[str, Any] | None:
+        if not metrics:
+            return metrics
+        if cls._truthy_extra_body_flag(request, "return_stage_metrics"):
+            return metrics
+        return None
+
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -243,6 +264,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Handle diffusion mode
         if self._diffusion_mode:
             return await self._create_diffusion_chat_completion(request, raw_request)
+
+        request_timestamp = time.time()
+        if raw_request is not None:
+            request_timestamp = float(getattr(raw_request.state, "request_timestamp", request_timestamp))
 
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
@@ -555,6 +580,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     request_id=request_id,
                     sampling_params_list=sampling_params_list,
                     output_modalities=output_modalities,
+                    arrival_time=request_timestamp,
                 )
 
                 generators.append(generator)
@@ -1624,7 +1650,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choices=[choice_data],
                             model=model_name,
                             modality=final_output_type,
-                            metrics=omni_res.metrics,
+                            metrics=self._filter_stage_metrics_detail(omni_res.metrics, request),
                         )
 
                         # handle usage stats if requested & if continuous
@@ -1705,6 +1731,48 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         choices=choices_data,
                         model=model_name,
                         modality=final_output_type,
+                        metrics=self._filter_stage_metrics_detail(omni_res.metrics, request),
+                    )
+                    chunk.usage = UsageInfo(
+                        prompt_tokens=num_prompt_tokens,
+                        completion_tokens=0,
+                        total_tokens=num_prompt_tokens,
+                    )
+                    data = chunk.model_dump_json(exclude_unset=True)
+                    yield f"data: {data}\n\n"
+
+                elif final_output_type == "image":
+                    role = self.get_chat_request_role(request)
+                    choices_data = []
+                    for choice in self._create_image_choice(omni_res, role, request, stream=True):
+                        delta = DeltaMessage.model_construct(role=role)
+                        object.__setattr__(delta, "content", choice.message.content)
+                        if hasattr(delta, "__pydantic_fields_set__"):
+                            delta.__pydantic_fields_set__.add("content")
+                        stream_choice = ChatCompletionResponseStreamChoice(
+                            index=choice.index,
+                            delta=delta,
+                            logprobs=None,
+                            finish_reason=choice.finish_reason,
+                            stop_reason=choice.stop_reason,
+                        )
+                        if stream_choice.finish_reason is not None:
+                            modality_finished[stream_choice.index].add("image")
+                        if modality_seen[stream_choice.index] < set(request.modalities) or not all(
+                            m in modality_finished[stream_choice.index] for m in modality_seen[stream_choice.index]
+                        ):
+                            stream_choice.finish_reason = None
+                        else:
+                            stop_reason_emitted[stream_choice.index] = True
+                        choices_data.append(stream_choice)
+                    chunk = OmniChatCompletionStreamResponse(
+                        id=request_id,
+                        object=chunk_object_type,
+                        created=created_time,
+                        choices=choices_data,
+                        model=model_name,
+                        modality=final_output_type,
+                        metrics=self._filter_stage_metrics_detail(omni_res.metrics, request),
                     )
                     # NOTE: Currently usage is only set the text stages to align with the behavior
                     # of the full generator. TODO (Alex): Add support for usage on all stages for
@@ -1772,7 +1840,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     choices=[],
                     model=model_name,
                     usage=final_usage,
-                    metrics=last_metrics,
+                    metrics=self._filter_stage_metrics_detail(last_metrics, request),
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_unset=True, exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
@@ -1925,6 +1993,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if extra:
                     response_metrics.update(extra)
             choices.extend(choices_data)
+
+        response_metrics = self._filter_stage_metrics_detail(response_metrics, request)
 
         # Compute prompt_text for non-streaming response (upstream #42052)
         prompt_text = (
@@ -2248,6 +2318,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # omits "sr" and runs at 24kHz; Ming-flash-omni surfaces a 44.1kHz
         # AudioVAE rate via multimodal_output["sr"].
         sr_raw = mm_output.get("sr")
+        if isinstance(sr_raw, (list, tuple)):
+            sr_raw = next((item for item in sr_raw if item is not None), None)
         if sr_raw is None:
             sample_rate = 24000
         elif hasattr(sr_raw, "item"):
@@ -2696,6 +2768,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         extra_body: dict[str, Any] | None = None,
         reference_images: list[str] | None = None,
         request_id: str | None = None,
+        arrival_time: float | None = None,
         stream: bool = False,
         model: str | None = None,
         output_format: str = "png",
@@ -2717,6 +2790,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         engine, gen_prompt, gen_params, pil_images = prepared
         if extra_body is None:
             extra_body = {}
+        return_stage_metrics = self._truthy_extra_body_flag(extra_body, "return_stage_metrics")
 
         if isinstance(engine, AsyncOmni):
             diffusion_engine = cast(AsyncOmni, engine)
@@ -2755,6 +2829,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 prompt=engine_prompt,
                 sampling_params_list=sampling_params_list,
                 request_id=request_id,
+                arrival_time=arrival_time,
             )
             if stream:
                 return self._stream_diffusion_image_chunks(
@@ -2763,6 +2838,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     output_format=output_format,
                     output_compression=output_compression,
                     size=size,
+                    return_stage_metrics=return_stage_metrics,
                     raw_request=raw_request,
                 )
 
@@ -2818,6 +2894,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         output_format: str,
         output_compression: int,
         size: str,
+        return_stage_metrics: bool,
         raw_request: Request | None = None,
     ) -> AsyncIterator[str]:
         """Yield image edit SSE chunks from multi-stage diffusion outputs."""
@@ -2827,6 +2904,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             async for output in result_generator:
                 final_output_type = getattr(output, "final_output_type", None)
                 stage_id = getattr(output, "stage_id", None)
+                metrics = getattr(output, "metrics", None) if return_stage_metrics else None
                 if final_output_type == "text" and stage_id == 0:
                     request_output = output.request_output
                     for completion in request_output.outputs:
@@ -2838,6 +2916,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             index=completion.index,
                             created=created,
                             model=model,
+                            metrics=metrics,
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
                 elif final_output_type == "image":
@@ -2861,6 +2940,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         size=size,
                         created=created,
                         model=model,
+                        metrics=metrics,
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
                     emitted_image = True

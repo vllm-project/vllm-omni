@@ -134,9 +134,15 @@ def count_tokens_from_outputs(engine_outputs: list[Any]) -> int:
         try:
             outs = getattr(_ro, "outputs", None)
             if outs and len(outs) > 0:
-                tokens = getattr(outs[0], "token_ids", None)
-                if tokens is not None:
-                    total += len(tokens)
+                for output in outs:
+                    # In DELTA mode token_ids only contains the latest chunk.
+                    # Omni's output processor attaches the cumulative sequence
+                    # for inter-stage routing and accurate metrics.
+                    tokens = getattr(output, "cumulative_token_ids", None)
+                    if tokens is None:
+                        tokens = getattr(output, "token_ids", None)
+                    if tokens is not None:
+                        total += len(tokens)
         except Exception:
             # Ignore any issues with individual outputs to keep token counting best-effort.
             pass
