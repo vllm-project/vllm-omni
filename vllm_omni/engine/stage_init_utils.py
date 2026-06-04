@@ -721,7 +721,10 @@ def build_engine_args_dict(
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Build the normalized engine args dict for one stage."""
-    engine_args = stage_config.engine_args
+    # Copy engine_args before mutating to avoid corrupting stage_config
+    # for callers that invoke build_engine_args_dict more than once
+    # (e.g. multi-replica init, retries, remote/headless paths).
+    engine_args = dict(stage_config.engine_args)
     # HACK (Alex) Tensor parallel size should not be passed as None;
     # remove it if this is the case so that we fall back to default
     # creation from vLLM's engine args.
