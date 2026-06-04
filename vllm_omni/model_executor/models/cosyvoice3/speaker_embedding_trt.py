@@ -136,3 +136,22 @@ class CampplusTRT:
                 raise RuntimeError("campplus TensorRT execute_async_v3 failed")
             stream.synchronize()
         return out
+
+
+# Process-wide cache: the mm processor is re-created per request (the deploy
+# config disables the mm-processor object cache), so building a fresh
+# CampplusTRT each time would re-deserialize the ~33 MB engine and allocate a
+# new execution context on every request — inflating TTFP. Cache by
+# (engine path, device) and reuse; the context serializes concurrent enqueues
+# via its own lock, so a single shared instance is safe across requests.
+_CAMPPLUS_CACHE: dict[tuple[str, str], CampplusTRT] = {}
+
+
+def get_campplus_trt(onnx_path: str, device: str | torch.device) -> CampplusTRT:
+    """Return a process-wide cached :class:`CampplusTRT` (engine + context)."""
+    key = (os.path.abspath(onnx_path), str(device))
+    inst = _CAMPPLUS_CACHE.get(key)
+    if inst is None:
+        inst = CampplusTRT(onnx_path, device)
+        _CAMPPLUS_CACHE[key] = inst
+    return inst

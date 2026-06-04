@@ -122,10 +122,10 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         if self._speaker_embedding_trt_enabled() and torch.cuda.is_available():
             try:
                 from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import (
-                    CampplusTRT,
+                    get_campplus_trt,
                 )
 
-                self.campplus_trt = CampplusTRT(campplus_onnx_path, device="cuda")
+                self.campplus_trt = get_campplus_trt(campplus_onnx_path, device="cuda")
                 logger.info("CosyVoice3: using TensorRT campplus speaker embedding")
             except Exception as exc:  # pragma: no cover - defensive fallback
                 logger.warning(
