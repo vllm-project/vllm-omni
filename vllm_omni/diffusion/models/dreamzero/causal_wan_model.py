@@ -407,6 +407,13 @@ class WanI2VCrossAttention(nn.Module):
             k = self.norm_k(self.k(context)).unflatten(2, (n, d))
             v = self.v(context).unflatten(2, (n, d))
         x = self.attn(q, k, v)
+        # k_img/v_img are recomputed every call, unlike the text k/v ?
+        # above which are cached in crossattn_cache. context_img == img_emb(clip
+        # feature) is session-invariant (state.clip_feas is set once at
+        # current_start_frame==0 and only cleared on reset, which also rebuilds
+        # crossattn_cache), so k_img/v_img are CACHEABLE the same way: compute
+        # once on is_init and reuse. That removes a per-step norm_k_img all-reduce
+        # plus the k_img/v_img projection GEMMs in steady state. See W5/W6.
         k_img = self.norm_k_img(self.k_img(context_img)).unflatten(2, (n, d))
         v_img = self.v_img(context_img).unflatten(2, (n, d))
         img_x = self.attn(q, k_img, v_img)
