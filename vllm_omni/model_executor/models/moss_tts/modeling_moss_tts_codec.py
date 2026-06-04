@@ -31,15 +31,16 @@ logger = init_logger(__name__)
 class MossTTSCodecDecoder(nn.Module):
     """Stage-1 decoder for all MOSS-TTS variants.
 
-    Consumes ``(T, NQ)`` audio VQ codes emitted by Stage 0 and decodes them
+    Consumes ``(NQ, T)`` audio VQ codes emitted by Stage 0 and decodes them
     to a 24 kHz mono waveform using the vendored
     ``MossAudioTokenizerModel``.
 
     All five variants share the same codec checkpoint
     ``OpenMOSS-Team/MOSS-Audio-Tokenizer``.  The number of quantizers
-    (``n_vq``) is passed as a ``num_quantizers`` argument to ``batch_decode``
-    so one codec instance handles both ``n_vq=32`` (MOSS-TTS) and ``n_vq=16``
-    (all other variants) without swapping weights.
+    (``n_vq``) is read from ``hf_config`` at construction time and fixed for
+    the lifetime of the instance; the same checkpoint can be configured as
+    ``n_vq=32`` (MOSS-TTS) or ``n_vq=16`` (all other variants) without
+    swapping weights.
 
     The codec checkpoint path defaults to the value stored in
     ``vllm_config.model_config.hf_config.codec_model_name_or_path`` but can
@@ -104,10 +105,11 @@ class MossTTSCodecDecoder(nn.Module):
 
         Stage 0 emits flat codebook-major ``[NQ * T_chunk]`` audio codes. The
         chunk transfer adapter assigns those to ``request.prompt_token_ids``,
-        which arrives here as ``input_ids``. Per-request offsets are derived
-        from ``runtime_additional_information``-attached request metadata; meta
-        like ``left_context_size`` (overlap context for the causal decoder)
-        also lives there.
+        which arrives here as ``input_ids`` concatenated across all requests.
+        Per-request slice boundaries are computed from
+        ``kwargs["num_scheduled_tokens"]`` (a list of token counts, one per
+        request).  ``runtime_additional_information`` carries per-request
+        metadata such as ``left_context_size``.
 
         Returns
         -------
@@ -167,11 +169,10 @@ class MossTTSCodecDecoder(nn.Module):
                 continue
             t_chunk = int(seg.numel() // self._n_vq)
             codes_nq_t = seg.reshape(self._n_vq, t_chunk).to(device=device)
-            # Clamp out-of-range codes (the talker uses ``audio_pad_code``
-            # =``codebook_size`` for delay-pattern padding; passing it to the
-            # codec embedding lookup would be an OOB index. The downstream
-            # de-delay step is intended to drop those rows, but until that's
-            # wired we clamp so the kernel does not assert.)
+            # Clamp out-of-range codes: the talker uses ``audio_pad_code``
+            # (= ``codebook_size``) for delay-pattern padding.  The stage input
+            # processor de-delays and drops pad rows before forwarding here, but
+            # clamp as a defensive guard against any edge-case leakage.
             codebook_size = self._codec.config.codebook_size
             codes_nq_t = codes_nq_t.clamp_(0, int(codebook_size) - 1)
 
@@ -201,7 +202,13 @@ class MossTTSCodecDecoder(nn.Module):
 
             # Trim left-context samples.
             if left_ctx > 0:
-                trim = left_ctx * self._codec.downsample_rate
+                trim = min(left_ctx * self._codec.downsample_rate, wav.shape[0])
+                if trim < left_ctx * self._codec.downsample_rate:
+                    logger.warning(
+                        "left_ctx trim (%d samples) exceeds wav length (%d); returning empty audio.",
+                        left_ctx * self._codec.downsample_rate,
+                        wav.shape[0],
+                    )
                 wav = wav[trim:]
 
             audios[i] = wav
@@ -295,9 +302,6 @@ class MossTTSCodecDecoder(nn.Module):
             codec_cfg.num_quantizers,
         )
 
-        # Move sr_tensor to the same device
-        self._sr_tensor = self._sr_tensor.to(device=device)
-
         self._maybe_enable_decoder_cudagraph(device)
 
         # vLLM's track_weights_loading() compares the returned set against
@@ -313,10 +317,27 @@ class MossTTSCodecDecoder(nn.Module):
         if self._codec is None:
             return
 
-        cfg = self.vllm_config.model_config.hf_config
-        capture_sizes: list[int] = list(
-            getattr(cfg, "decode_cudagraph_capture_sizes", None) or [4, 8, 16, 25, 32, 50, 64, 100, 128, 200, 256]
-        )
+        # Read capture sizes from the connector's extra config (same convention
+        # as Qwen3-TTS), falling back to a sensible default covering common
+        # codec_chunk_frames values used in moss_tts.yaml.
+        capture_sizes: list[int] = [4, 8, 16, 25, 32, 50, 64, 100, 128, 200, 256]
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        if isinstance(connector_cfg, dict):
+            extra_cfg: dict | None = connector_cfg.get("extra", connector_cfg)
+        else:
+            extra_cfg = getattr(connector_cfg, "extra", None)
+        if isinstance(extra_cfg, dict):
+            raw = extra_cfg.get("decode_cudagraph_capture_sizes")
+            if raw is not None:
+                if isinstance(raw, (list, tuple)):
+                    parsed = sorted({int(v) for v in raw if int(v) > 0})
+                elif isinstance(raw, str):
+                    parsed = sorted({int(v.strip()) for v in raw.split(",") if v.strip()})
+                else:
+                    parsed = [int(raw)]
+                if parsed:
+                    capture_sizes = parsed
 
         self._cuda_graph_wrapper = MossTTSCUDAGraphCodecWrapper(
             model=self._codec,

@@ -1,6 +1,3 @@
-# Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License").
 """CUDA Graph acceleration for the MOSS Audio Tokenizer codec decoder.
 
 Captures MossAudioTokenizerModel._decode for a set of fixed frame-count

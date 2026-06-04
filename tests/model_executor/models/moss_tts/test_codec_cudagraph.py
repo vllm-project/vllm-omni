@@ -1,7 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Tests for MossTTSCUDAGraphCodecWrapper numerical equivalence.
+"""Tests for MossTTSCUDAGraphCodecWrapper numerical equivalence.
 
 Verifies that CUDA Graph-accelerated decoding produces results equivalent
 to eager mode, with special attention to the two-argument _decode interface
@@ -60,7 +57,7 @@ class SyntheticCodecModel(nn.Module):
     def _decode(self, codes: torch.Tensor, lengths: torch.Tensor) -> MossAudioTokenizerDecoderOutput:
         """codes: [NQ, B, T], lengths: [B] → audio [B, 1, T*upsample]."""
         nq, b, t = codes.shape
-        # sum across NQ dim → [B, NQ, T] for Conv1d (expects [B, C, T])
+        # treat NQ as channel dim → [B, NQ, T] for Conv1d (expects [B, C, T])
         x = codes.permute(1, 0, 2).float()  # [B, NQ, T]
         x = torch.relu(self.embed(x))  # [B, hidden, T]
         x = torch.relu(self.conv(x))  # [B, hidden, T]
@@ -282,9 +279,13 @@ def test_noncontiguous_input_matches_contiguous(model, wrapper, t):
 
 
 def test_zero_padding_no_cuda_error(model, wrapper):
-    """Padded inputs fill unused frames with code 0.  Verify that token 0 is a
-    legal codebook index (i.e. no CUDA index-out-of-bounds / illegal memory
-    access) and the output shape is correct."""
+    """Padded inputs fill unused frames with code 0.  Verify that the zero-
+    padded region does not corrupt the output shape.
+
+    Note: SyntheticCodecModel uses Conv1d (not nn.Embedding), so it cannot
+    trigger a real CUDA index-out-of-bounds on large token ids.  This test
+    validates shape correctness only; OOB safety on the real codec requires
+    an integration test with MossAudioTokenizerModel."""
     t = 7  # well below the 25-frame bucket → large zero-padded region
     codes = _random_codes(t)
     with torch.no_grad():
@@ -311,3 +312,50 @@ def test_graph_and_eager_shape_identical(model, wrapper, t):
     assert out.audio.shape[:-1] == ref.audio.shape[:-1], (
         f"batch/channel shape mismatch: graph={out.audio.shape} eager={ref.audio.shape}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 11. Half-precision weights: graph and eager must agree under fp16/bf16
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_half_precision_graph_eager_agree(dtype):
+    """CUDA Graph must produce outputs consistent with eager when model weights
+    are in half precision.  The wrapper itself stores codes as long and lengths
+    as long; only the model's conv weights change dtype."""
+    torch.manual_seed(0)
+    model_hp = SyntheticCodecModel().to(device=DEVICE, dtype=dtype).eval()
+    wrapper_hp = MossTTSCUDAGraphCodecWrapper(
+        model=model_hp,
+        capture_sizes=[25, 50],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    wrapper_hp.warmup(DEVICE)
+
+    codes = _random_codes(25)
+    ref = _eager_decode(model_hp, codes)
+    with torch.no_grad():
+        out = wrapper_hp.decode(codes)
+    # Half-precision accumulation introduces small numerical error; use
+    # tolerances that match typical fp16/bf16 rounding.
+    atol = 1e-2 if dtype == torch.float16 else 5e-2
+    torch.testing.assert_close(out.audio.float(), ref.audio.float(), atol=atol, rtol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# 12. Empty input (T=0): wrapper must not crash and return zero-length audio
+# ---------------------------------------------------------------------------
+
+
+def test_empty_input_t0(model, wrapper):
+    """T=0 input must be handled gracefully: no exception, audio length == 0.
+
+    The outer MossTTSCodecDecoder guards against empty segments, but the
+    wrapper should also handle T=0 without crashing so it is safe to call
+    directly."""
+    codes = _random_codes(0)  # [NQ, 0]
+    with torch.no_grad():
+        out = wrapper.decode(codes)
+    assert out.audio.shape[-1] == 0, f"expected empty audio, got shape {out.audio.shape}"
