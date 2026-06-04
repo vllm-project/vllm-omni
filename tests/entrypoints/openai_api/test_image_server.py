@@ -9,6 +9,7 @@ OpenAI-compatible async text-to-image generation API endpoints in api_server.py.
 
 import base64
 import io
+import json
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -19,6 +20,7 @@ from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import SamplingParams
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
+from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels, router
@@ -116,6 +118,27 @@ class MockGenerationResult:
     def __init__(self, images):
         self.images = images
         self.request_output = SimpleNamespace(images=images)
+        self.stage_durations = {}
+        self.peak_memory_mb = 0.0
+
+
+class MockStageResult:
+    """Mock multi-stage output for streaming image edit tests."""
+
+    def __init__(self, *, stage_id, final_output_type, text="", texts=None, images=None):
+        self.stage_id = stage_id
+        self.final_output_type = final_output_type
+        self.images = images or []
+        if texts is not None:
+            outputs = [SimpleNamespace(text=item, index=index) for index, item in enumerate(texts)]
+        elif text:
+            outputs = [SimpleNamespace(text=text, index=0)]
+        else:
+            outputs = []
+        self.request_output = SimpleNamespace(
+            outputs=outputs,
+            images=self.images,
+        )
         self.stage_durations = {}
         self.peak_memory_mb = 0.0
 
@@ -391,6 +414,72 @@ def async_omni_stage_configs_only_client():
     return TestClient(app)
 
 
+@pytest.fixture
+def streaming_image_edit_client():
+    """Create a multi-stage client whose engine yields AR text before image output."""
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+    from vllm_omni.entrypoints.openai.api_server import router
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            stage_configs = [
+                SimpleNamespace(stage_type="llm", is_comprehension=True),
+                SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+            ]
+            default_sampling_params_list = [
+                SamplingParams(temperature=0.1),
+                OmniDiffusionSamplingParams(),
+            ]
+            self.engine = SimpleNamespace(
+                stage_configs=stage_configs,
+                default_sampling_params_list=default_sampling_params_list,
+            )
+            self.default_sampling_params_list = default_sampling_params_list
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+            self.captured_prompt = prompt
+            self.captured_sampling_params_list = sampling_params_list or [sampling_params]
+            assert self.captured_sampling_params_list[0].output_kind == RequestOutputKind.DELTA
+            yield MockStageResult(stage_id=0, final_output_type="text", text="recap")
+            yield MockStageResult(stage_id=0, final_output_type="text", text=" done")
+            yield MockStageResult(
+                stage_id=1,
+                final_output_type="image",
+                images=[Image.new("RGB", (32, 24), color="purple")],
+            )
+
+        def __class_getitem__(cls, item):
+            return cls
+
+        def get_diffusion_od_config(self):
+            return self.od_config
+
+    app = FastAPI()
+    app.include_router(router)
+
+    engine = FakeAsyncOmniClass()
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = engine
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
+    app.state.engine_client = engine
+    app.state.stage_configs = [
+        SimpleNamespace(stage_type="llm"),
+        SimpleNamespace(stage_type="diffusion"),
+    ]
+    app.state.args = Namespace(
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
+        max_generated_image_size=1024 * 1792,
+    )
+    return TestClient(app)
+
+
 def test_health_endpoint(test_client):
     """Test health check endpoint for diffusion mode"""
     response = test_client.get("/health")
@@ -495,6 +584,7 @@ def test_generate_single_image(test_client):
     img_bytes = base64.b64decode(data["data"][0]["b64_json"])
     img = Image.open(io.BytesIO(img_bytes))
     assert img.size == (64, 64)  # Our mock returns 64x64 images
+    assert test_client.app.state.engine_client.captured_prompt["modalities"] == ["image"]
 
 
 def test_generate_images_async_omni_sampling_params(async_omni_test_client):
@@ -680,6 +770,154 @@ def test_image_edits_async_omni_stage_configs_only(async_omni_stage_configs_only
     assert len(captured) == 2
 
 
+def _parse_sse_payloads(body: str):
+    payloads = []
+    for line in body.splitlines():
+        if not line.startswith("data: "):
+            continue
+        data = line[len("data: ") :]
+        payloads.append(data if data == "[DONE]" else json.loads(data))
+    return payloads
+
+
+def test_image_edits_streaming_returns_ar_delta_then_image(streaming_image_edit_client):
+    img_bytes = make_test_image_bytes((16, 16))
+    response = streaming_image_edit_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit me",
+            "size": "auto",
+            "stream": "true",
+            "output_format": "png",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+
+    payloads = _parse_sse_payloads(response.text)
+    assert [p["type"] if isinstance(p, dict) and "type" in p else p for p in payloads] == [
+        "ar_delta",
+        "ar_delta",
+        "image",
+        "[DONE]",
+    ]
+    assert payloads[0]["delta"] == "recap"
+    assert payloads[0]["index"] == 0
+    assert payloads[1]["delta"] == " done"
+    assert payloads[2]["output_format"] == "png"
+    assert payloads[2]["size"] == "16x16"
+
+    image_payload = payloads[2]["data"][0]
+    img = Image.open(io.BytesIO(base64.b64decode(image_payload["b64_json"])))
+    assert img.size == (32, 24)
+
+
+def test_image_edits_streaming_ar_delta_chunks_include_index(streaming_image_edit_client):
+    async def generate_multi_output_delta(prompt, request_id, sampling_params=None, sampling_params_list=None):
+        yield MockStageResult(stage_id=0, final_output_type="text", texts=["first", "second"])
+        yield MockStageResult(
+            stage_id=1,
+            final_output_type="image",
+            images=[Image.new("RGB", (32, 24), color="purple")],
+        )
+
+    streaming_image_edit_client.app.state.engine_client.generate = generate_multi_output_delta
+    img_bytes = make_test_image_bytes((16, 16))
+    response = streaming_image_edit_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit me",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _parse_sse_payloads(response.text)
+    assert [(payloads[0]["index"], payloads[0]["delta"]), (payloads[1]["index"], payloads[1]["delta"])] == [
+        (0, "first"),
+        (1, "second"),
+    ]
+
+
+def test_image_edits_streaming_errors_without_final_image(streaming_image_edit_client):
+    async def generate_without_image(prompt, request_id, sampling_params=None, sampling_params_list=None):
+        yield MockStageResult(stage_id=0, final_output_type="text", text="recap")
+
+    streaming_image_edit_client.app.state.engine_client.generate = generate_without_image
+    img_bytes = make_test_image_bytes((16, 16))
+    response = streaming_image_edit_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit me",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _parse_sse_payloads(response.text)
+    assert payloads[0]["type"] == "ar_delta"
+    assert payloads[1]["object"] == "error"
+    assert "without a final image" in payloads[1]["error"]["message"]
+    assert payloads[2] == "[DONE]"
+
+
+def test_image_edits_streaming_errors_on_empty_final_image(streaming_image_edit_client):
+    async def generate_empty_image(prompt, request_id, sampling_params=None, sampling_params_list=None):
+        yield MockStageResult(stage_id=0, final_output_type="text", text="recap")
+        yield MockStageResult(stage_id=1, final_output_type="image", images=[])
+
+    streaming_image_edit_client.app.state.engine_client.generate = generate_empty_image
+    img_bytes = make_test_image_bytes((16, 16))
+    response = streaming_image_edit_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit me",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _parse_sse_payloads(response.text)
+    assert payloads[0]["type"] == "ar_delta"
+    assert payloads[1]["object"] == "error"
+    assert "empty final image" in payloads[1]["error"]["message"]
+    assert payloads[2] == "[DONE]"
+
+
+def test_image_edits_streaming_rejects_single_stage(test_client):
+    img_bytes = make_test_image_bytes((16, 16))
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit me",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "multi-stage" in response.json()["detail"]
+
+
+def test_image_edits_streaming_rejects_single_stage_before_loading_url(test_client):
+    response = test_client.post(
+        "/v1/images/edits",
+        data={
+            "prompt": "edit me",
+            "url": "https://example.invalid/not-fetched.png",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "multi-stage" in response.json()["detail"]
+
+
 def test_generate_images_max_size_rejected(async_omni_test_client):
     """Test that a size exceeding max_generated_image_size returns 400."""
     response = async_omni_test_client.post(
@@ -772,6 +1010,42 @@ def test_with_custom_parameters(test_client):
         },
     )
     assert response.status_code == 200
+
+
+def test_flow_shift_forwarded_to_extra_args(test_client):
+    """flow_shift must reach the diffusion sampling params via extra_args.
+
+    Regression: ``ImageGenerationRequest`` had no ``flow_shift`` field and the
+    single-stage handler never forwarded it, so a request like
+    ``{"flow_shift": 10.0}`` was silently dropped and Cosmos3 T2I always ran at
+    its hardcoded per-mode default shift. The pipeline reads
+    ``extra_args["flow_shift"]`` (via ``_get_sp_param``), so it must land there.
+    """
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a robot in a lab",
+            "size": "960x960",
+            "num_inference_steps": 50,
+            "guidance_scale": 4.0,
+            "flow_shift": 10.0,
+        },
+    )
+    assert response.status_code == 200
+    captured = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert captured.extra_args["flow_shift"] == 10.0
+
+
+def test_flow_shift_absent_when_not_requested(test_client):
+    """Omitting flow_shift must not inject an override, so the pipeline keeps
+    its per-mode default (e.g. Cosmos3 T2I shift=3.0)."""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a tree", "size": "1024x1024"},
+    )
+    assert response.status_code == 200
+    captured = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert "flow_shift" not in (captured.extra_args or {})
 
 
 def test_invalid_size(test_client):

@@ -114,6 +114,24 @@ def _map_device_list(stage_id: int, device_list: list[str], visible_device_list:
         return list(device_list)
 
     logical_ids = [int(device) for device in device_list]
+
+    # If ALL logical device IDs are >= num_visible, none can be 0-based indices
+    # into the visible list — they must be physical device IDs.  This happens
+    # during multi-replica stage initialization where split_devices_for_replicas
+    # assigns physical device IDs (e.g. "2") that are not part of the current
+    # process's CUDA_VISIBLE_DEVICES but are valid physical GPUs.  Pass them
+    # through directly so the replica subprocess inherits the correct device.
+    if logical_ids and all(d >= num_visible for d in logical_ids):
+        logger.warning(
+            "Stage %s has device IDs %s, none of which are < the visible device count %d "
+            "(visible=%s). Treating them as physical device IDs and passing through.",
+            stage_id,
+            device_list,
+            num_visible,
+            visible_device_list,
+        )
+        return list(device_list)
+
     mapped_devices = [visible_device_list[idx] for idx in logical_ids if idx < num_visible]
     mapping_pairs = [
         f"{logical_id}->{visible_device_list[logical_id]}" for logical_id in logical_ids if logical_id < num_visible

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import queue
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -16,6 +15,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.outputs import OmniRequestOutput
@@ -165,83 +165,14 @@ class FakeAsyncOmniEngine:
 def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) -> None:
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", lambda *args, **kwargs: engine)
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
-
-
-def test_direct_omni_with_nullified_parser_only_nulls_untyped_override_fields(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-    from vllm_omni.entrypoints.omni import Omni
-
-    captured: dict[str, Any] = {}
-
-    def fake_engine(*args: Any, **kwargs: Any) -> FakeAsyncOmniEngine:
-        captured.update(kwargs)
-        return FakeAsyncOmniEngine()
-
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", fake_engine)
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--hsdp-shard-size", type=int, default=-1)
-    nullify_stage_engine_defaults(parser)
-    args = parser.parse_args([])
-    args.model = "fake-model"
-
-    Omni(**vars(args))
-
-    assert captured["gpu_memory_utilization"] is None
-    assert captured["hsdp_shard_size"] == -1
-    assert "_cli_explicit_keys" not in captured
-
-
-def test_from_cli_args_warns_and_forwards_without_internal_keys(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    captured: dict[str, Any] = {}
-
-    def fake_engine(*args: Any, **kwargs: Any) -> FakeAsyncOmniEngine:
-        captured.update(kwargs)
-        return FakeAsyncOmniEngine()
-
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", fake_engine)
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
-
-    args = argparse.Namespace(model="fake-model", gpu_memory_utilization=0.9, _cli_explicit_keys={"model"})
-    with pytest.deprecated_call(match="from_cli_args"):
-        Omni.from_cli_args(args)
-
-    assert captured["gpu_memory_utilization"] == 0.9
-    assert "_cli_explicit_keys" not in captured
-
-
-def test_deprecated_from_cli_args_preserves_legacy_parser_nulling(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from vllm_omni.entrypoints.omni import Omni
-
-    captured: dict[str, Any] = {}
-
-    def fake_engine(*args: Any, **kwargs: Any) -> FakeAsyncOmniEngine:
-        captured.update(kwargs)
-        return FakeAsyncOmniEngine()
-
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", fake_engine)
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
-    monkeypatch.setattr("sys.argv", ["prog"])
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--hsdp-shard-size", type=int, default=-1)
-    args = parser.parse_args([])
-    args.model = "fake-model"
-
-    with pytest.deprecated_call(match="from_cli_args"):
-        Omni.from_cli_args(args, parser=parser)
-
-    assert captured["gpu_memory_utilization"] is None
-    assert captured["hsdp_shard_size"] == -1
+    # Don't add random UUIDs to requests calling .generate since we usually
+    # just want to check for present requests anyway, and would need to just
+    # strip the UUID. Explicit checks against the mapping are in tests for
+    # AsyncOmni, or explicitly set the client req states.
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.async_omni.AsyncOmni._get_unique_request_id",
+        staticmethod(lambda request_id: request_id),
+    )
 
 
 def _make_base():
@@ -487,6 +418,19 @@ def test_get_diffusion_od_config_returns_diffusion_stage_config():
     omni.engine = SimpleNamespace(
         stage_clients=[
             SimpleNamespace(stage_type="llm"),
+            SimpleNamespace(stage_type="diffusion", od_config=diffusion_od_config),
+        ]
+    )
+
+    assert omni.get_diffusion_od_config() is diffusion_od_config
+
+
+def test_get_diffusion_od_config_falls_back_to_inner_engine():
+    diffusion_od_config = object()
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        stage_clients=[
+            SimpleNamespace(stage_type="llm"),
             SimpleNamespace(stage_type="diffusion", _engine=SimpleNamespace(od_config=diffusion_od_config)),
         ]
     )
@@ -623,16 +567,23 @@ async def test_async_omni_llm_diffusion_yields_text_stream_then_image(monkeypatc
 async def test_async_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
     engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META)
     _patch_engine(monkeypatch, engine)
-
     app = AsyncOmni("dummy-model")
+
+    # Requests internally have a random UUID appended to the
+    # external ID to avoid collisions, so this also tests mapping
+    external_req_id = "req-1"
+    req_id = "req-1-12345678"
     try:
-        app.request_states["req-1"] = object()
-        await app.abort("req-1")
+        app.request_states[req_id] = ClientRequestState(
+            request_id=req_id,
+            external_request_id=external_req_id,
+        )
+        await app.abort(external_req_id)
     finally:
         app.shutdown()
 
-    assert engine.aborted == [["req-1"]]
-    assert "req-1" not in app.request_states
+    assert engine.aborted == [[req_id]]
+    assert external_req_id not in app.request_states
 
 
 @pytest.mark.asyncio

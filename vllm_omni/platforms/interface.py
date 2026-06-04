@@ -7,8 +7,11 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.platforms import Platform
+from vllm.platforms.interface import PlatformEnum
 
 logger = init_logger(__name__)
 
@@ -200,9 +203,44 @@ class OmniPlatform(Platform):
         """
         return "vllm_omni.profiler.omni_torch_profiler.OmniTorchProfilerWrapper"
 
+    @classmethod
+    def get_graph_wrapper_cls(cls) -> type:
+        """Return the platform's full-graph wrapper class.
+
+        Defaults to vLLM's CUDAGraphWrapper; NPU overrides with ACLGraphWrapper.
+        """
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+        return CUDAGraphWrapper
+
+    @classmethod
+    def set_forward_context(
+        cls,
+        attn_metadata: Any,
+        vllm_config: VllmConfig,
+        *,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        batch_descriptor: BatchDescriptor,
+    ):
+        """Platform-neutral wrapper around the device's set_forward_context.
+
+        Defaults to vLLM's ``set_forward_context``; NPU overrides to dispatch
+        to ``set_ascend_forward_context`` (renaming ``cudagraph_runtime_mode``
+        to ``aclgraph_runtime_mode``).
+        """
+        from vllm.forward_context import set_forward_context
+
+        return set_forward_context(
+            attn_metadata,
+            vllm_config,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
+        )
+
 
 class UnspecifiedOmniPlatform(OmniPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED
+    _enum = PlatformEnum.UNSPECIFIED
     device_type = ""
 
     @classmethod

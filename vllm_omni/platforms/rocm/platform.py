@@ -10,6 +10,7 @@ from vllm.platforms.rocm import RocmPlatform
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+from vllm_omni.platforms.rocm.patch import apply_patches
 
 logger = init_logger(__name__)
 
@@ -50,6 +51,10 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     """
 
     _omni_enum = OmniPlatformEnum.ROCM
+
+    def __init__(self):
+        super().__init__()
+        apply_patches()
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
@@ -167,4 +172,4 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         else:
             rms_norm = default
 
-        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)
+        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm, fused_add_rms_norm=rms_norm)

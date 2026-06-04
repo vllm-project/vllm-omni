@@ -10,19 +10,73 @@ different QuantizationConfig subclass in the OMNI context (e.g. GGUF).
 from __future__ import annotations
 
 import inspect
+import sys
 from collections.abc import Callable, Mapping
+from types import ModuleType
 from typing import Any
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization import (
+
+
+# ---------------------------------------------------------------------------
+# Stub the ``humming`` package so that vLLM's lazy import inside
+# ``get_quantization_config()`` (which unconditionally does
+# ``from .humming import HummingConfig``) does not crash when the real
+# ``humming`` wheel is not installed.  Only populate the bare-minimum
+# names that ``humming.py`` accesses at module level.
+# ---------------------------------------------------------------------------
+def _register_humming_stubs() -> None:
+    """Register stub ``humming`` sub-modules so that the optional
+    humming quantization backend can be imported without the real wheel."""
+    if "humming" in sys.modules:
+        return  # already present (real or stub)
+
+    # --- sub-modules ---
+    submodules: dict[str, tuple[str, ...]] = {
+        "humming": (),
+        "humming.config": ("GemmType",),
+        "humming.dtypes": ("DataType",),
+        "humming.layer": ("HummingLayerMeta", "HummingMethod"),
+        "humming.schema": (
+            "BaseInputSchema",
+            "BaseWeightSchema",
+            "HummingInputSchema",
+            "HummingWeightSchema",
+        ),
+        "humming.utils": (),
+        "humming.utils.weight": ("quantize_weight",),
+    }
+
+    registry: dict[str, ModuleType] = {}
+    for name, attrs in submodules.items():
+        mod = ModuleType(name)
+        for attr in attrs:
+            setattr(mod, attr, type(attr, (), {}))
+        registry[name] = mod
+
+    # wire parent references
+    registry["humming"].config = registry["humming.config"]
+    registry["humming"].dtypes = registry["humming.dtypes"]
+    registry["humming"].layer = registry["humming.layer"]
+    registry["humming"].schema = registry["humming.schema"]
+    registry["humming"].utils = registry["humming.utils"]
+    registry["humming.utils"].weight = registry["humming.utils.weight"]
+
+    for name, mod in registry.items():
+        sys.modules[name] = mod
+
+
+_register_humming_stubs()
+
+from vllm.model_executor.layers.quantization import (  # noqa: E402
     QUANTIZATION_METHODS,
     get_quantization_config,
 )
-from vllm.model_executor.layers.quantization.base_config import (
+from vllm.model_executor.layers.quantization.base_config import (  # noqa: E402
     QuantizationConfig,
 )
 
-from .component_config import ComponentQuantizationConfig
+from .component_config import ComponentQuantizationConfig  # noqa: E402
 
 logger = init_logger(__name__)
 
@@ -397,6 +451,12 @@ def resolve_quant_config_from_disk(
             "config.json marks checkpoint as serialized; switching to offline %s mode.",
             qc_method,
         )
+        return build_quant_config(qc_method, **qc_kwargs)
+
+    # AutoRound MXFP8 checkpoints use data_type="mx_fp" instead of
+    # is_checkpoint_*_serialized; rebuild so the offline path is selected.
+    if qc_kwargs.get("data_type") == "mx_fp":
+        logger.info("config.json declares data_type='mx_fp'; rebuilding as offline AutoRound MXFP8.")
         return build_quant_config(qc_method, **qc_kwargs)
 
     if (
