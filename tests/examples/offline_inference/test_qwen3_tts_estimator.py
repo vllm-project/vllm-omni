@@ -57,11 +57,11 @@ def wav_file(tmp_path: Path) -> Path:
 def estimator_cache(monkeypatch):
     """
     Bypass model loading by pre-populating the estimator cache, and shortcut
-    Qwen3TTSTalker.estimate_prompt_len_from_additional_information so that
-    the test directly observes the real _estimate_ref_code_len closure.
+    Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information
+    so that the test directly observes the real _estimate_ref_code_len closure.
     """
-    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
-        Qwen3TTSTalkerForConditionalGeneration,
+    from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+        Qwen3TTSPromptEmbedsBuilder,
     )
 
     def _shortcut(**kwargs):
@@ -69,7 +69,7 @@ def estimator_cache(monkeypatch):
         return kwargs["estimate_ref_code_len"](ref_audio)
 
     monkeypatch.setattr(
-        Qwen3TTSTalkerForConditionalGeneration,
+        Qwen3TTSPromptEmbedsBuilder,
         "estimate_prompt_len_from_additional_information",
         staticmethod(_shortcut),
     )

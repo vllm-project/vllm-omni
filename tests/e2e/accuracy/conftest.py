@@ -62,6 +62,19 @@ def pytest_addoption(parser):
         default=1200,
         help="Online serving timeout in seconds for Wan2.2 I2V accuracy tests.",
     )
+    group.addoption(
+        "--hunyuanvideo15-i2v-image-source",
+        action="store",
+        default=None,
+        help="Image source for HunyuanVideo-1.5 I2V accuracy tests. Can be local path or remote URL",
+    )
+    group.addoption(
+        "--hunyuanvideo15-online-timeout-seconds",
+        action="store",
+        type=int,
+        default=3600,
+        help="Online serving timeout in seconds for HunyuanVideo-1.5 accuracy tests.",
+    )
 
 
 def _hf_cache_root() -> Path:
@@ -166,6 +179,17 @@ def wan22_i2v_image_source(request: pytest.FixtureRequest) -> str | None:
 @pytest.fixture(scope="session")
 def wan22_i2v_online_timeout_seconds(request: pytest.FixtureRequest) -> int:
     return int(request.config.getoption("wan22_i2v_online_timeout_seconds"))
+
+
+@pytest.fixture(scope="session")
+def hunyuanvideo15_i2v_image_source(request: pytest.FixtureRequest) -> str | None:
+    value = request.config.getoption("hunyuanvideo15_i2v_image_source")
+    return str(value) if value else None
+
+
+@pytest.fixture(scope="session")
+def hunyuanvideo15_online_timeout_seconds(request: pytest.FixtureRequest) -> int:
+    return int(request.config.getoption("hunyuanvideo15_online_timeout_seconds"))
 
 
 @pytest.fixture(scope="session")

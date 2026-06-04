@@ -53,6 +53,8 @@ _TASK_TO_DATASET: dict[str, str] = {
     "voice_clone": "seed-tts",
     "default_voice": "seed-tts-text",
     "voice_design": "seed-tts-design",
+    "dialogue": "ttsd",
+    "sound_effect": "sound-effect",
 }
 
 # Default design dataset path (bundled with the repo)
@@ -81,6 +83,7 @@ def build_bench_args(
     output_dir: str | None,
     result_filename: str | None,
     extra_cli_args: list[str],
+    output_len: int | None = None,
 ) -> list[str]:
     """Build the ``vllm bench serve --omni`` command for one (task, concurrency) run."""
     dataset_name = _TASK_TO_DATASET[task]
@@ -130,11 +133,17 @@ def build_bench_args(
     if task_extra_body:
         cmd += ["--extra-body", json.dumps(task_extra_body, separators=(",", ":"))]
 
+    if model_cfg.get("trust_remote_code"):
+        cmd.append("--trust-remote-code")
+
     if concurrency is not None:
         cmd += ["--max-concurrency", str(concurrency), "--request-rate", "inf"]
 
     if wer_eval:
         cmd.append("--seed-tts-wer-eval")
+
+    if output_len is not None:
+        cmd += ["--hf-output-len", str(output_len)]
 
     if output_dir or result_filename:
         out_dir = output_dir or "."
@@ -235,6 +244,15 @@ def main() -> None:
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-configs", default=str(_DEFAULT_MODEL_CONFIGS), help="Path to model_configs.yaml")
+    parser.add_argument(
+        "--output-len",
+        type=int,
+        default=None,
+        help="Override per-request max_new_tokens forwarded to the server "
+        "(seed-tts datasets default to 2048; the MOSS-TTS full talker takes "
+        "this as 'max_new_frames' so smaller values cap audio length per "
+        "request and keep bench runtime tractable).",
+    )
     parser.add_argument("extra", nargs=argparse.REMAINDER, help="Extra args passed directly to vllm bench serve")
     args = parser.parse_args()
 
@@ -289,6 +307,7 @@ def main() -> None:
                 output_dir=args.output_dir,
                 result_filename=result_filename,
                 extra_cli_args=args.extra or [],
+                output_len=args.output_len,
             )
             result = run_one_benchmark(cmd)
             if result is not None:

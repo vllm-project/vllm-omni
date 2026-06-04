@@ -329,6 +329,16 @@ Single-GPU serves now default to the uniproc executor (lower IPC overhead, the B
 
 To opt out of chunked streaming, pass `--no-async-chunk` — the pipeline auto-dispatches to the end-to-end codec processor.
 
+### Tuning stage 1 `max_num_seqs` per task type
+The bundled `qwen3_tts.yaml` ships stage 1 (Code2Wav) at `max_num_seqs: 10`, tuned for Base voice cloning: stage-1 lifetimes are long (~3 s/req), so admitting up to 10 concurrent codec sequences lets requests progress in parallel in the scheduler — ~2× TTFA p95 at c=4 / c=8 (1× H100, 1.7B-Base, seed-tts) at an 8–12 % audio-throughput cost.
+
+CustomVoice / VoiceDesign have much shorter stage-1 lifetimes (~50–200 ms) and are TTFA-optimal at `max_num_seqs: 1`. Override the default when serving those task types:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
+    --stage-overrides '{"1": {"max_num_seqs": 1}}'
+```
+
 ### Sending requests
 ```bash
 # CustomVoice with a predefined speaker
@@ -370,6 +380,31 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 ```
 Uploaded voices are then usable as `voice="custom_voice_1"` on subsequent requests.
 
+### Precomputed custom voices
+For reused Base voice-cloning speakers, precompute the reference artifacts once and load them at server startup:
+```bash
+python qwen3_tts/precompute_custom_voice.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --voice-name alice \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "Original transcript of the reference audio" \
+    --mode icl \
+    --output-dir /path/to/custom_voices
+```
+`--mode icl` stores both `speaker_embedding` and `ref_code`; `--mode xvec` stores only the speaker embedding. Add the output directory to a deploy config:
+```yaml
+custom_voice_dir: /path/to/custom_voices
+```
+Then start the server with that config and call the Speech API with only the voice name:
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --deploy-config /path/to/qwen3_tts_custom_voice.yaml
+
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"input":"Hello from a precomputed voice.","voice":"alice","task_type":"Base"}' \
+    --output alice.wav
+```
+
 ### Streaming PCM
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -409,8 +444,10 @@ python qwen3_tts/gradio_fastrtc_demo.py --api-base http://localhost:8000
 `qwen3_tts/batch_speech_client.py` issues many concurrent requests for throughput measurement.
 
 ### Notes
-- Base voice cloning has per-request reference-audio cost; the uniproc default keeps IPC overhead off the critical path. See the executor-backend section above for background.
+- Base voice cloning has uniproc-vs-mp tradeoffs depending on per-request reference audio cost; see the executor-backend section above.
+- With async chunking, Qwen3-TTS Base voice cloning sends the full reference context in the first Code2Wav packet, then caches that prefix on the Code2Wav stage for follow-up chunks in the same request.
 - `vllm_omni/deploy/qwen3_tts.yaml` is the default deploy config (loaded by HF `model_type`); per-stage runtime overrides are available via `--stage-N-<field> <value>`.
+- Under vocoder-bound overload (single-stream `rtf_p99 ≥ 1` at the target concurrency), set `active_stream_window: 2` at the top of the deploy yaml to cap simultaneously active Stage 1 streams. Off by default; trades TTFP for streaming continuity. See [#3592](https://github.com/vllm-project/vllm-omni/pull/3592) for the mechanism and tradeoff numbers.
 
 ---
 
@@ -437,6 +474,23 @@ python voxcpm2/openai_speech_client.py \
     --ref-audio /path/to/reference.wav
 ```
 The `ref_audio` field accepts local file paths (auto-base64), HTTP URLs, or `data:audio/wav;base64,...` data URIs.
+
+### Precomputed custom voices
+For repeated VoxCPM2 speakers, precompute the prompt cache and load it through `custom_voice_dir`:
+```bash
+python voxcpm2/precompute_custom_voice.py \
+    --model openbmb/VoxCPM2 \
+    --voice-name alice \
+    --ref-audio /path/to/reference.wav \
+    --mode ref_continuation \
+    --prompt-text "Original transcript of the reference audio" \
+    --output-dir /path/to/custom_voices
+```
+Add the output directory to the deploy config:
+```yaml
+custom_voice_dir: /path/to/custom_voices
+```
+After startup, `/v1/audio/voices` lists `alice`, and `/v1/audio/speech` can use `voice="alice"` without sending `ref_audio`.
 
 ### Gradio demo (gapless streaming via AudioWorklet)
 ```bash

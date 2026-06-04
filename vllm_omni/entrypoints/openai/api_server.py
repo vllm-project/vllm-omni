@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from numbers import Integral
+from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
 import httpx
@@ -55,13 +56,8 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
-from vllm.entrypoints.openai.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
-from vllm.entrypoints.openai.speech_to_text.serving import (
-    OpenAIServingTranscription,
-    OpenAIServingTranslation,
-)
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
@@ -74,6 +70,13 @@ from vllm.entrypoints.serve.disagg.serving import ServingTokens
 from vllm.entrypoints.serve.instrumentator.basic import base
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
+from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
+from vllm.entrypoints.speech_to_text.transcription.serving import (
+    OpenAIServingTranscription,
+)
+from vllm.entrypoints.speech_to_text.translation.serving import (
+    OpenAIServingTranslation,
+)
 from vllm.entrypoints.utils import (
     create_error_response,
     load_aware_call,
@@ -92,6 +95,7 @@ from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
     encode_image_base64,
+    encode_image_base64_with_compression,
     parse_size,
     validate_layered_layers,
 )
@@ -130,13 +134,60 @@ from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
+from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 logger = init_logger(__name__)
 router = APIRouter()
 
 MAX_UINT32_SEED = 2**32 - 1
 profiler_router = APIRouter()
+
+
+def _load_model_chat_template_json(model: str) -> str | None:
+    """Load a model-level chat_template.json from a local path or HF cache.
+
+    Some multimodal HF repos, including Qwen3-Omni, ship the chat template as a
+    separate file instead of embedding it in tokenizer_config.json. Transformers
+    4.44+ no longer supplies a default template, so serving must pass that model
+    template explicitly when the user did not provide --chat-template.
+    """
+    candidate = Path(model) / "chat_template.json"
+    template_path: str | None = str(candidate) if candidate.is_file() else None
+
+    if template_path is None:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            template_path = hf_hub_download(
+                repo_id=model,
+                filename="chat_template.json",
+                local_files_only=True,
+            )
+        except Exception:
+            return None
+
+    try:
+        with open(template_path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        logger.warning("Failed to load chat template from %s: %s", template_path, exc)
+        return None
+
+    if isinstance(payload, dict):
+        template = payload.get("chat_template")
+    elif isinstance(payload, str):
+        template = payload
+    else:
+        template = None
+
+    if not isinstance(template, str) or not template.strip():
+        logger.warning("Ignoring malformed chat template payload in %s", template_path)
+        return None
+
+    logger.info("Loaded chat template from %s", template_path)
+    return template
 
 
 def _should_enable_profiler_endpoints(stage_configs: list | None) -> bool:
@@ -354,7 +405,7 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     warnings_module.filterwarnings("ignore", message=".*PydanticSerializationUnexpectedValue.*", category=UserWarning)
 
     # Add process-specific prefix to stdout and stderr.
-    decorate_logs("APIServer")
+    decorate_logs("APIServer", skip_if_decorated=True)
 
     listen_address, sock = setup_openai_server(args)
 
@@ -460,7 +511,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
 @asynccontextmanager
 async def build_async_omni(
-    args: Namespace,
+    args: TrackingNamespace,
     *,
     disable_frontend_multiprocessing: bool | None = None,
     client_config: dict[str, Any] | None = None,
@@ -500,7 +551,7 @@ async def build_async_omni(
 
 @asynccontextmanager
 async def build_async_omni_from_stage_config(
-    args: Namespace,
+    args: TrackingNamespace,
     *,
     disable_frontend_multiprocessing: bool = False,
 ) -> AsyncIterator[EngineClient]:
@@ -528,10 +579,35 @@ async def build_async_omni_from_stage_config(
 
     async_omni: EngineClient | None = None
 
+    # Pre-load the model config so HuggingFace registers `transformers_modules`
+    # in this process — only when the user has explicitly opted in via
+    # `--trust-remote-code`. Stage workers consume the same flag through their
+    # deploy config, but the API server process also needs the dynamic modules
+    # for ZMQ pickle deserialization of stage outputs that reference them
+    # (e.g. trust_remote_code models like MiniCPM-o).
+    if getattr(args, "trust_remote_code", False) and getattr(args, "model", None):
+        try:
+            import os
+
+            from transformers import AutoConfig
+
+            # Hide GPUs so the custom config code doesn't allocate CUDA memory.
+            saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            try:
+                AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+            finally:
+                if saved is not None:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = saved
+                else:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        except Exception as e:
+            logger.debug("Pre-loading transformers_modules failed: %s", e)
+
     try:
-        kwargs = vars(args).copy()
-        kwargs.pop("model", None)
-        async_omni = AsyncOmni(model=args.model, **kwargs)
+        kwargs = args.get_explicit_kwargs_dict()
+        model = kwargs.pop("model", None) or args.model
+        async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
         # await async_llm.reset_mm_cache()
@@ -630,6 +706,10 @@ async def omni_init_app_state(
         )
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
+        state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
+            engine_client=engine_client,
+            model_name=model_name,
+        )
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
@@ -645,6 +725,19 @@ async def omni_init_app_state(
 
     state.vllm_config = vllm_config
 
+    # Propagate enable_in_reasoning to the API-server process. The engine core
+    # runs in a separate process, so the contextvar that backs
+    # `get_current_vllm_config_or_none()` is None on this stack. Tool parsers
+    # call `get_enable_structured_outputs_in_reasoning()` during request
+    # handling and need to see the real flag, otherwise they silently fall
+    # back to False and mismatch the engine-side bitmask gating.
+    if vllm_config is not None:
+        from vllm.tool_parsers.structural_tag_registry import (
+            set_enable_structured_outputs_in_reasoning,
+        )
+
+        set_enable_structured_outputs_in_reasoning(vllm_config.structured_outputs_config.enable_in_reasoning)
+
     # Get supported tasks
     supported_tasks: set[str] = {"generate"}
     if hasattr(engine_client, "get_supported_tasks"):
@@ -652,6 +745,14 @@ async def omni_init_app_state(
     logger.info("Supported tasks: %s", supported_tasks)
 
     resolved_chat_template = load_chat_template(args.chat_template)
+    if resolved_chat_template is None:
+        try:
+            tokenizer = await engine_client.get_tokenizer()
+        except Exception as exc:
+            logger.debug("Could not inspect tokenizer chat_template before serving init: %s", exc)
+            tokenizer = None
+        if tokenizer is None or getattr(tokenizer, "chat_template", None) is None:
+            resolved_chat_template = _load_model_chat_template_json(args.model)
 
     if args.tool_server == "demo":
         tool_server: ToolServer | None = DemoToolServer()
@@ -947,6 +1048,7 @@ async def omni_init_app_state(
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
     )
+    state.openai_serving_realtime_robot = None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
@@ -1380,22 +1482,6 @@ async def streaming_video_chat(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
-    engine_client = getattr(websocket.app.state, "engine_client", None)
-    if engine_client is not None and getattr(engine_client, "async_chunk", False):
-        await websocket.accept()
-        await websocket.send_json(
-            {
-                "type": "error",
-                "error": (
-                    "The /v1/realtime API is not supported when async_chunk is enabled on the server. "
-                    "Use a stage configuration with async_chunk disabled and restart the server before using "
-                    "this endpoint."
-                ),
-                "code": "unsupported",
-            }
-        )
-        await websocket.close()
-        return
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
     if serving is None:
         await websocket.accept()
@@ -1403,6 +1489,23 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.close()
         return
     connection = RealtimeConnection(websocket, serving)
+    await connection.handle_connection()
+
+
+@router.websocket("/v1/realtime/robot/openpi")
+async def realtime_robot_openpi(websocket: WebSocket):
+    """WebSocket endpoint for robot policy inference via OpenPI messages."""
+    from vllm_omni.entrypoints.openpi.connection import (
+        RobotRealtimeConnection,
+    )
+
+    serving = getattr(websocket.app.state, "openai_serving_realtime_robot", None)
+    if serving is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "Robot policy not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    connection = RobotRealtimeConnection(websocket, serving)
     await connection.handle_connection()
 
 
@@ -1529,6 +1632,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 extra_body["guidance_scale"] = request.guidance_scale
             if request.true_cfg_scale is not None:
                 extra_body["true_cfg_scale"] = request.true_cfg_scale
+            if request.flow_shift is not None:
+                extra_body["flow_shift"] = request.flow_shift
+            if request.extra_params is not None:
+                extra_body["extra_params"] = request.extra_params
             if request.generator_device is not None:
                 extra_body["generator_device"] = request.generator_device
             if request.lora is not None:
@@ -1546,6 +1653,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 prompt=request.prompt,
                 extra_body=extra_body,
                 request_id=f"img_gen-{random_uuid()}",
+                raw_request=raw_request,
             )
             if isinstance(generation_result, ErrorResponse):
                 return JSONResponse(
@@ -1558,17 +1666,19 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             return ImageGenerationResponse(created=int(time.time()), data=image_data)
 
         # Build params - pass through user values directly
-        prompt: OmniTextPrompt = {"prompt": request.prompt}
+        prompt: OmniTextPrompt = {"prompt": request.prompt, "modalities": ["image"]}
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
-        extra_args = {}
+        extra_args = dict(request.extra_params or {})
         if request.use_system_prompt is not None:
             extra_args["use_system_prompt"] = request.use_system_prompt
         if request.system_prompt is not None:
             extra_args["system_prompt"] = request.system_prompt
         if request.bot_task is not None:
             extra_args["bot_task"] = request.bot_task
+        if request.flow_shift is not None:
+            extra_args["flow_shift"] = request.flow_shift
         if extra_args:
             gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
@@ -1644,7 +1754,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
         # Encode images to base64 with the specified format
         image_data = [
-            ImageData(b64_json=_encode_image_base64_with_compression(img, format=output_format), revised_prompt=None)
+            ImageData(b64_json=encode_image_base64_with_compression(img, format=output_format), revised_prompt=None)
             for img in images
         ]
 
@@ -1694,6 +1804,7 @@ async def edit_images(
     output_format: str | None = Form("png"),
     background: str | None = Form("auto"),
     output_compression: Annotated[int, Form(ge=0, le=100)] = 100,
+    stream: bool = Form(False),
     user: str | None = Form(None),  # unused now
     # vllm-omni extensions for image editing
     mask_image: str | UploadFile | None = None,
@@ -1734,10 +1845,15 @@ async def edit_images(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Only response_format 'b64_json' is supported now.",
         )
+    if stream and len(stage_configs) <= 1:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="stream=true is only supported for multi-stage image editing pipelines.",
+        )
     try:
         # 2. Build prompt & images params
         cot_output = None
-        prompt: OmniTextPrompt = {"prompt": prompt}
+        prompt: OmniTextPrompt = {"prompt": prompt, "modalities": ["image"]}
         if negative_prompt is not None:
             prompt["negative_prompt"] = negative_prompt
         input_images_list = []
@@ -1941,7 +2057,18 @@ async def edit_images(
                 extra_body=extra_body,
                 reference_images=ref_b64_list,
                 request_id=request_id,
+                stream=stream,
+                model=model_name,
+                output_format=output_format,
+                output_compression=output_compression,
+                size=size_str,
+                raw_request=raw_request,
             )
+            if stream and not isinstance(generation_result, ErrorResponse):
+                return StreamingResponse(
+                    content=generation_result,
+                    media_type="text/event-stream",
+                )
             if isinstance(generation_result, ErrorResponse):
                 raise HTTPException(
                     status_code=generation_result.error.code if generation_result.error else 400,
@@ -1964,7 +2091,7 @@ async def edit_images(
         # Encode images to base64
         image_data = [
             ImageData(
-                b64_json=_encode_image_base64_with_compression(
+                b64_json=encode_image_base64_with_compression(
                     img, format=output_format, output_compression=output_compression
                 ),
                 revised_prompt=None,
@@ -2289,48 +2416,6 @@ def _choose_output_format(output_format: str | None, background: str | None) -> 
     return "jpeg"
 
 
-def _prepare_image_for_output_format(image: Image.Image, format: str) -> Image.Image:
-    fmt = format.lower()
-    if fmt not in {"jpg", "jpeg"}:
-        return image
-
-    if image.mode == "RGB":
-        return image
-
-    if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
-        alpha_image = image.convert("RGBA")
-        flattened = Image.new("RGB", alpha_image.size, (255, 255, 255))
-        flattened.paste(alpha_image, mask=alpha_image.getchannel("A"))
-        return flattened
-
-    return image.convert("RGB")
-
-
-def _encode_image_base64_with_compression(
-    image: Image.Image, format: str = "png", output_compression: int = 100
-) -> str:
-    """Encode PIL Image to a base64 image string.
-
-    Args:
-        image: PIL Image object
-        format: Output image format (e.g., "PNG", "JPEG", "WEBP")
-        output_compression: Compression level (0-100%), 100 for best quality
-    Returns:
-        Base64-encoded image as string
-    """
-    buffer = io.BytesIO()
-    image = _prepare_image_for_output_format(image, format)
-    save_kwargs = {}
-    if format in ("jpg", "jpeg", "webp"):
-        save_kwargs["quality"] = output_compression
-    elif format == "png":
-        save_kwargs["compress_level"] = max(0, min(9, 9 - output_compression // 11))  # Map 0-100 to 9-0
-
-    image.save(buffer, format=format, **save_kwargs)
-    buffer.seek(0)
-    return base64.b64encode(buffer.read()).decode("utf-8")
-
-
 def apply_stage_default_sampling_params(
     default_params_json: str | None,
     sampling_params: Any,
@@ -2460,7 +2545,7 @@ async def _run_video_generation_job(
     started_at = time.perf_counter()
     output_path = None
     try:
-        video_bytes, stage_durations, peak_memory_mb = await handler.generate_video_bytes(
+        video_bytes, stage_durations, peak_memory_mb, action = await handler.generate_video_bytes(
             request, video_id, reference_image=reference_image
         )
 
@@ -2478,6 +2563,7 @@ async def _run_video_generation_job(
                 "inference_time_s": time.perf_counter() - started_at,
                 "stage_durations": stage_durations,
                 "peak_memory_mb": peak_memory_mb,
+                "action": action,
             },
         )
     except (EngineGenerateError, EngineDeadError) as exc:
@@ -2542,6 +2628,8 @@ async def _parse_video_form(
     flow_shift: float | None = Form(default=None),
     true_cfg_scale: float | None = Form(default=None),
     seed: int | None = Form(default=None),
+    generate_sound: bool | None = Form(default=None),
+    sound_duration: float | None = Form(default=None, gt=0.0),
     negative_prompt: str | None = Form(default=None),
     enable_frame_interpolation: bool | None = Form(default=None),
     frame_interpolation_exp: int | None = Form(default=None, ge=1),
@@ -2582,6 +2670,8 @@ async def _parse_video_form(
         "flow_shift": flow_shift,
         "true_cfg_scale": true_cfg_scale,
         "seed": seed,
+        "generate_sound": generate_sound,
+        "sound_duration": sound_duration,
         "negative_prompt": negative_prompt,
         "enable_frame_interpolation": enable_frame_interpolation,
         "frame_interpolation_exp": frame_interpolation_exp,
@@ -2685,7 +2775,7 @@ async def create_video_sync(
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
-        video_bytes, stage_durations, peak_memory_mb = await asyncio.wait_for(
+        video_bytes, stage_durations, peak_memory_mb, _action = await asyncio.wait_for(
             handler.generate_video_bytes(request, request_id, reference_image=reference_image),
             timeout=VIDEO_SYNC_TIMEOUT_S,
         )
@@ -2956,25 +3046,23 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
 
 
 if __name__ == "__main__":
-    import argparse
     import asyncio
 
     from vllm.entrypoints.openai.cli_args import make_arg_parser
 
-    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
-    parser = argparse.ArgumentParser(description="vLLM-Omni OpenAI-Compatible REST API server")
+    parser = TrackingArgumentParser(description="vLLM-Omni OpenAI-Compatible REST API server")
     parser = make_arg_parser(parser)
     registered_flags = set()
     for action in parser._actions:
         registered_flags.update(action.option_strings)
+
+    # FIXME - this is broken on `main`. `make_arg_parser` does not handle omni engine args properly.
     if "--omni" not in registered_flags:
         parser.add_argument("--omni", action="store_true", default=False, help="Enable vLLM-Omni mode.")
     if "--enable-sleep-mode" not in registered_flags:
         parser.add_argument(
             "--enable-sleep-mode", action="store_true", default=False, help="Enable GPU memory pool for sleep mode."
         )
-    nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     if not hasattr(args, "model_tag"):
         setattr(args, "model_tag", args.model)

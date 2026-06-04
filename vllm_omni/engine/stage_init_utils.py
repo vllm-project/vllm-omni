@@ -13,9 +13,10 @@ import importlib
 import multiprocessing as mp
 import os
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
@@ -179,6 +180,19 @@ def terminate_alive_proc(proc, timeout=5):
         proc.join(timeout=timeout)
         if proc.is_alive():
             proc.kill()
+
+
+def set_death_signal(sig: int) -> None:
+    """Best-effort parent-death signal for Linux subprocesses."""
+    try:
+        import ctypes
+        import platform
+
+        if platform.system() != "Linux":
+            return
+        ctypes.CDLL("libc.so.6").prctl(1, sig)
+    except Exception:
+        pass
 
 
 def patch_generation_config_if_needed(model_config: Any) -> None:
@@ -468,6 +482,15 @@ def prepare_engine_environment() -> None:
         pass
 
 
+def _maybe_set_qwen3_omni_moe_env(engine_args_dict: dict[str, Any]) -> None:
+    if (
+        engine_args_dict.get("model_arch") == "Qwen3OmniMoeForConditionalGeneration"
+        and "VLLM_USE_FLASHINFER_MOE_FP16" not in os.environ
+    ):
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
+        logger.info("[stage_init] Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni stage")
+
+
 def split_devices_for_replicas(
     devices_str: str | None,
     num_replicas: int,
@@ -635,6 +658,62 @@ def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
         )
 
 
+@contextmanager
+def stage_runtime_setup(stage_id: int, runtime_cfg: Any) -> Generator[None, None, None]:
+    """Apply per-stage ``runtime.env`` and ``runtime.devices`` for the context.
+
+    Restores ``runtime.env`` on exit. Device visibility restore remains the
+    caller's responsibility (e.g. ``AsyncOmniEngine`` saves/restores the
+    platform device-control env var around this block).
+    """
+    with stage_runtime_env(stage_id, runtime_cfg):
+        setup_stage_devices(stage_id, runtime_cfg)
+        yield
+
+
+@contextmanager
+def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, None]:
+    """Apply per-stage ``runtime.env`` for the duration of the context."""
+    if runtime_cfg is None:
+        runtime_cfg = {}
+    elif not isinstance(runtime_cfg, dict):
+        runtime_cfg = cast(dict[str, Any], _to_dict(runtime_cfg))
+
+    raw_env = runtime_cfg.get("env")
+    if raw_env is None:
+        yield
+        return
+    if isinstance(raw_env, dict):
+        runtime_env = cast(dict[str, Any], raw_env)
+    else:
+        runtime_env = cast(dict[str, Any], _to_dict(raw_env))
+        if not runtime_env:
+            logger.warning(
+                "[stage_init] Stage-%s ignored runtime.env with unsupported type %s",
+                stage_id,
+                type(raw_env).__name__,
+            )
+            yield
+            return
+
+    previous_env: dict[str, str | None] = {}
+    for key, value in runtime_env.items():
+        env_key = str(key)
+        previous_env[env_key] = os.environ.get(env_key)
+        os.environ[env_key] = str(value)
+
+    if previous_env:
+        logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
+    try:
+        yield
+    finally:
+        for key, old_value in previous_env.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
+
+
 def build_engine_args_dict(
     stage_config: Any,
     model: str,
@@ -691,6 +770,10 @@ def build_engine_args_dict(
     # Check whether the stage's default_sampling_params defines extra_args.
     default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
     engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
+
+    # TODO: Remove this after the performance regression is fixed
+    # Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni to avoid performance regression
+    _maybe_set_qwen3_omni_moe_env(engine_args_dict)
 
     return engine_args_dict
 
@@ -754,11 +837,25 @@ def build_vllm_config(
     if upgraded is not vllm_config.quant_config:
         vllm_config = replace(vllm_config, quant_config=upgraded)
 
+    custom_voice_dir = engine_args_dict.get("custom_voice_dir")
+    if custom_voice_dir:
+        setattr(vllm_config.model_config.hf_config, "custom_voice_dir", custom_voice_dir)
+
     return vllm_config, executor_class
 
 
-def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_config: Any) -> Any | None:
-    """Build one output processor per logical LLM stage."""
+def build_llm_stage_output_processor(
+    plan: LogicalStageInitPlan,
+    stage_vllm_config: Any,
+    log_stats: bool = False,
+) -> Any | None:
+    """Build one output processor per logical LLM stage.
+
+    ``log_stats`` controls whether the processor populates per-request
+    IterationStats (consumed by the Prometheus wrap). Default False matches
+    the upstream MultimodalOutputProcessor default and respects the
+    --log-stats CLI flag plumbed through AsyncOmniEngine.
+    """
 
     metadata = plan.replicas[0].metadata
     if stage_vllm_config.model_config.skip_tokenizer_init:
@@ -769,7 +866,7 @@ def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_conf
         )
     return MultimodalOutputProcessor(
         tokenizer=tokenizer,
-        log_stats=False,
+        log_stats=log_stats,
         engine_core_output_type=metadata.engine_output_type,
     )
 
@@ -784,6 +881,45 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
         renderer=input_processor.renderer,
     )
     return input_processor
+
+
+def _cleanup_stale_lock_if_dead(lock_file: str) -> bool:
+    """If *lock_file* exists and its recorded PID is dead, unlink the file.
+
+    Returns ``True`` if the stale lock was cleaned up (caller should retry),
+    ``False`` otherwise (lock holder appears alive, or file could not be read).
+    """
+    try:
+        with open(lock_file) as fh:
+            content = fh.read().strip()
+        if not content:
+            return False
+        pid = int(content)
+    except (OSError, ValueError):
+        return False
+
+    # Check whether the PID is still alive.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        # PID does not exist — stale lock.
+        logger.info(
+            "Removing stale device lock %s (PID %s is dead)",
+            lock_file,
+            pid,
+        )
+        try:
+            os.unlink(lock_file)
+            return True
+        except OSError:
+            logger.debug("Failed to unlink stale lock %s", lock_file)
+            return False
+    except PermissionError:
+        # PID exists but we cannot signal it (different user) — treat as alive.
+        return False
+
+    # PID is alive — legitimate lock holder.
+    return False
 
 
 def acquire_device_locks(
@@ -864,6 +1000,7 @@ def acquire_device_locks(
         for device_id in devices_to_lock:
             lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
             lock_acquired = False
+            already_cleaned_stale = False  # only try stale cleanup once per device
 
             while not lock_acquired:
                 try:
@@ -878,6 +1015,11 @@ def acquire_device_locks(
                         logger.debug("Acquired exclusive lock for device %s", device_id)
                     except BlockingIOError:
                         os.close(lock_fd)
+                        # Detect and clean stale locks from dead processes.
+                        if not already_cleaned_stale:
+                            already_cleaned_stale = True
+                            if _cleanup_stale_lock_if_dead(lock_file):
+                                continue  # retry flock immediately
                         if time.time() - wait_start > stage_init_timeout:
                             logger.warning(
                                 "Timeout waiting for device %s initialization lock, proceeding anyway",

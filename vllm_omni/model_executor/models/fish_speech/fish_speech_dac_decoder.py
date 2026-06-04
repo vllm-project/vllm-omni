@@ -11,6 +11,7 @@ Install with: ``pip install fish-speech``
 
 from __future__ import annotations
 
+import inspect
 import os
 from collections.abc import Iterable
 from typing import Any
@@ -31,6 +32,41 @@ from vllm_omni.model_executor.models.fish_speech.dac_utils import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
+
+
+def _connector_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
+    model_config = getattr(vllm_config, "model_config", None)
+    connector_cfg = getattr(model_config, "stage_connector_config", None)
+    if isinstance(connector_cfg, dict):
+        return connector_cfg.get("extra", connector_cfg)
+    extra = getattr(connector_cfg, "extra", None)
+    return extra if isinstance(extra, dict) else {}
+
+
+def _get_int_config(extra_cfg: dict[str, Any], default: int, *names: str) -> int:
+    value = None
+    for name in names:
+        if name in extra_cfg:
+            value = extra_cfg[name]
+            break
+    if value is None:
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid Fish Speech DAC integer config {names[0]}={value!r}") from exc
+
+
+def _get_dac_dtype(extra_cfg: dict[str, Any]) -> torch.dtype:
+    value = extra_cfg.get("fish_speech_dac_dtype", "float32")
+    value = str(value).strip().lower()
+    if value in {"fp16", "float16", "half"}:
+        return torch.float16
+    if value in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if value in {"fp32", "float32", ""}:
+        return torch.float32
+    raise ValueError(f"Invalid Fish Speech DAC dtype: {value!r}")
 
 
 class FishSpeechDACDecoder(nn.Module):
@@ -58,6 +94,43 @@ class FishSpeechDACDecoder(nn.Module):
         self._output_sample_rate: int = DAC_SAMPLE_RATE
         self._hop_length: int = DAC_HOP_LENGTH
         self._logged_codec_stats = False
+        self._codec_decode_takes_lengths: bool | None = None
+        extra_cfg = _connector_extra_config(vllm_config)
+        self._dac_dtype = _get_dac_dtype(extra_cfg)
+        self._decode_batch_max_padded_frames = _get_int_config(
+            extra_cfg,
+            0,
+            "fish_speech_dac_max_padded_frames",
+            "dac_max_padded_frames",
+        )
+        self._decode_batch_max_batch = _get_int_config(
+            extra_cfg,
+            0,
+            "fish_speech_dac_max_batch",
+            "dac_max_batch",
+        )
+
+    def _decode_codes(
+        self,
+        codes_bqf: torch.Tensor,
+        feature_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self._codec is not None
+        if self._codec_decode_takes_lengths:
+            return self._codec.decode(codes_bqf, feature_lengths)
+
+        if hasattr(self._codec, "from_indices"):
+            wav_batch = self._codec.from_indices(codes_bqf)
+        else:
+            wav_batch = self._codec.decode(codes_bqf)
+        max_frames = max(int(codes_bqf.shape[-1]), 1)
+        scale = wav_batch.shape[-1] / max_frames
+        audio_lengths = torch.clamp(
+            torch.round(feature_lengths.to(torch.float32) * scale).to(torch.long),
+            min=0,
+            max=wav_batch.shape[-1],
+        )
+        return wav_batch, audio_lengths
 
     def _bake_weight_norm(self, codec: nn.Module) -> None:
         baked = 0
@@ -149,14 +222,16 @@ class FishSpeechDACDecoder(nn.Module):
         codec.quantizer.downsample = None
 
         device = self.vllm_config.device_config.device
-        codec = codec.to(device=device, dtype=torch.float32)
+        codec = codec.to(device=device, dtype=self._dac_dtype)
         codec.eval()
         self._codec = codec
+        self._codec_decode_takes_lengths = len(inspect.signature(codec.decode).parameters) >= 2
 
         logger.info(
-            "Fish Speech DAC codec loaded from %s (device=%s, sample_rate=%d)",
+            "Fish Speech DAC codec loaded from %s (device=%s, dtype=%s, sample_rate=%d)",
             codec_path,
             device,
+            self._dac_dtype,
             self._output_sample_rate,
         )
 
@@ -188,6 +263,28 @@ class FishSpeechDACDecoder(nn.Module):
                 return [ids[boundaries[i] : boundaries[i + 1]] for i in range(len(boundaries) - 1)]
         return [ids]
 
+    def _codes_from_runtime_info(
+        self,
+        info: dict[str, Any] | None,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if not isinstance(info, dict):
+            return None
+        codes = info.get("codes", {}).get("audio")
+        if not isinstance(codes, torch.Tensor) or codes.numel() == 0:
+            return None
+
+        q = self._num_codebooks
+        codes = codes.to(device=device, dtype=torch.long, non_blocking=True).contiguous()
+        if codes.ndim != 2 or codes.shape[0] != q:
+            logger.warning(
+                "DAC tensor codes must have shape [num_codebooks, frames], got %s for num_codebooks=%d.",
+                tuple(codes.shape),
+                q,
+            )
+            return None
+        return codes
+
     @torch.no_grad()
     def forward(
         self,
@@ -203,13 +300,13 @@ class FishSpeechDACDecoder(nn.Module):
         input_ids layout per request: flat codes [num_codebooks * num_frames].
         Codes are codebook-major: [cb0_f0, cb0_f1, ..., cb0_fN, cb1_f0, ...].
         """
-        self._ensure_codec_loaded()
-        assert self._codec is not None
-
         q = self._num_codebooks
         sr_val = self._output_sample_rate
         sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32)
+
+        self._ensure_codec_loaded()
+        assert self._codec is not None
 
         if input_ids is None or input_ids.numel() == 0:
             return OmniOutput(
@@ -235,9 +332,22 @@ class FishSpeechDACDecoder(nn.Module):
                     left_context_size[i] = meta["left_context_size"]
 
         for i, req_ids in enumerate(request_ids_list):
+            ctx_frames = left_context_size[i]
+            runtime_codes = (
+                self._codes_from_runtime_info(runtime_additional_information[i], ids.device)
+                if runtime_additional_information is not None and i < len(runtime_additional_information)
+                else None
+            )
+            if runtime_codes is not None:
+                frames = runtime_codes.shape[1]
+                parsed_ctx_frames[i] = ctx_frames
+                parsed_total_frames[i] = frames
+                valid_codes_qf.append(runtime_codes)
+                valid_indices.append(i)
+                continue
+
             if req_ids.numel() < 1:
                 continue
-            ctx_frames = left_context_size[i]
             flat = req_ids
             n = flat.numel()
             if n == 0 or n % q != 0:
@@ -279,25 +389,61 @@ class FishSpeechDACDecoder(nn.Module):
             except Exception:
                 pass
 
-        feature_lengths = torch.tensor(
-            [codes_qf.shape[1] for codes_qf in valid_codes_qf],
-            device=valid_codes_qf[0].device,
-            dtype=torch.long,
-        )
-        max_frames = int(feature_lengths.max().item())
-        batch_size = len(valid_codes_qf)
+        wav_tensors: list[torch.Tensor | None] = [None] * len(valid_codes_qf)
 
-        codes_bqf = torch.zeros(
-            (batch_size, q, max_frames),
-            device=valid_codes_qf[0].device,
-            dtype=torch.long,
-        )
-        for i, codes_qf in enumerate(valid_codes_qf):
-            frame_count = int(feature_lengths[i].item())
-            codes_bqf[i, :, :frame_count] = codes_qf
+        def _iter_bounded_groups(group: list[tuple[int, torch.Tensor]]) -> Iterable[list[tuple[int, torch.Tensor]]]:
+            max_padded_frames = int(getattr(self, "_decode_batch_max_padded_frames", 0))
+            max_batch = int(getattr(self, "_decode_batch_max_batch", 0))
+            if max_padded_frames <= 0 and max_batch <= 0:
+                yield group
+                return
 
-        with torch.amp.autocast("cuda", enabled=False):
-            wav_batch, audio_lengths = self._codec.decode(codes_bqf, feature_lengths)
+            current: list[tuple[int, torch.Tensor]] = []
+            current_max_frames = 0
+            for item in sorted(group, key=lambda pair: int(pair[1].shape[1])):
+                frames = int(item[1].shape[1])
+                next_max_frames = max(current_max_frames, frames)
+                next_batch_size = len(current) + 1
+                exceeds_batch = max_batch > 0 and next_batch_size > max_batch
+                exceeds_work = max_padded_frames > 0 and next_batch_size * next_max_frames > max_padded_frames
+                if current and (exceeds_batch or exceeds_work):
+                    yield current
+                    current = [item]
+                    current_max_frames = frames
+                else:
+                    current.append(item)
+                    current_max_frames = next_max_frames
+            if current:
+                yield current
+
+        def _decode_group(group: list[tuple[int, torch.Tensor]]) -> None:
+            actual_frames = [int(codes_qf.shape[1]) for _, codes_qf in group]
+            target_frames = max(actual_frames)
+            batch_size = len(group)
+            first_codes = group[0][1]
+            feature_lengths = torch.tensor(actual_frames, device=first_codes.device, dtype=torch.long)
+            codes_bqf = torch.zeros(
+                (batch_size, q, target_frames),
+                device=first_codes.device,
+                dtype=torch.long,
+            )
+            for row, (_, codes_qf) in enumerate(group):
+                frame_count = int(codes_qf.shape[1])
+                codes_bqf[row, :, :frame_count] = codes_qf
+
+            with torch.amp.autocast("cuda", enabled=False):
+                wav_batch, audio_lengths = self._decode_codes(codes_bqf, feature_lengths)
+            audio_lengths_list = (
+                audio_lengths.detach().to(device="cpu", dtype=torch.long).reshape(-1).tolist()
+                if audio_lengths.numel() > 0
+                else []
+            )
+            for row, (j, _) in enumerate(group):
+                audio_len = int(audio_lengths_list[row]) if len(audio_lengths_list) > row else int(wav_batch.shape[-1])
+                wav_tensors[j] = wav_batch[row, 0, :audio_len]
+
+        for bounded_group in _iter_bounded_groups(list(enumerate(valid_codes_qf))):
+            _decode_group(bounded_group)
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
@@ -305,8 +451,8 @@ class FishSpeechDACDecoder(nn.Module):
         for j, idx in enumerate(valid_indices):
             ctx_frames = parsed_ctx_frames[idx]
             total_frames = parsed_total_frames[idx]
-            audio_len = int(audio_lengths[j].item()) if audio_lengths.numel() > j else int(wav_batch.shape[-1])
-            wav = wav_batch[j, 0, :audio_len]
+            wav = wav_tensors[j]
+            assert wav is not None
             # Trim context frames (left overlap for streaming).
             if ctx_frames > 0:
                 # Decode length may deviate from (frames * hop_length) due to model

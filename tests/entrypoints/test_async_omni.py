@@ -1,12 +1,19 @@
 import asyncio
+import re
 from types import SimpleNamespace
 
 import pytest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from tests.helpers.mark import hardware_test
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
+
+DIFFUSION_MODEL = "riverclouds/qwen_image_random"
+OMNI_MODEL = "Qwen/Qwen2.5-Omni-7B"
+OMNI_STAGE_CONFIG = get_deploy_config_path("ci/qwen2_5_omni_thinker_only.yaml")
 
 
 async def _noop(**kw):
@@ -59,6 +66,89 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     return omni
 
 
+@pytest.mark.cpu
+def test_generate_submits_randomized_id_to_engine():
+    """Ensure the engine receives a UUID-suffixed ID, not the raw request ID"""
+
+    async def run():
+        submitted_ids = []
+        omni = get_async_omni_instance(fake_add_request=get_fake_add_request(submitted_ids))
+
+        req_id = "my-req-1"
+        async for _ in omni.generate(
+            prompt={"prompt": "test"},
+            request_id=req_id,
+            sampling_params_list=[SimpleNamespace()],
+            output_modalities=["text"],
+        ):
+            pass
+
+        assert len(submitted_ids) == 1
+        assert submitted_ids[0] != req_id
+        assert submitted_ids[0].startswith(f"{req_id}-")
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "req_ids,cancel_prefix,expected_cancel_count",
+    [
+        (["cancel-me"], "cancel-me", 1),
+        (["cancel-me", "cancel-me"], "cancel-me", 2),
+        (["cancel-hello", "cancel-hello-world"], "cancel-hello", 1),
+    ],
+)
+def test_abort_handles_internal_request_mapping(req_ids: list[str], cancel_prefix: str, expected_cancel_count: int):
+    """Ensure that abort() with the user-visible ID resolves correctly.
+
+    NOTE: In the case of concurrent / colliding request(s), all requests matching the
+    user provided request ID will be aborted."""
+
+    async def run():
+        aborted_batches = []
+        omni = get_async_omni_instance(
+            fake_abort_request=get_fake_abort(aborted_batches),
+        )
+
+        async def exhaust(agen):
+            async for _ in agen:
+                pass
+
+        tasks = []
+        for user_request_id in req_ids:
+            t = asyncio.create_task(
+                exhaust(
+                    omni.generate(
+                        prompt={"prompt": "test"},
+                        request_id=user_request_id,
+                        sampling_params_list=[SimpleNamespace()],
+                    )
+                )
+            )
+            await asyncio.sleep(0)
+            tasks.append(t)
+
+        assert len(omni.request_states) == len(req_ids)
+        await omni.abort(cancel_prefix)
+
+        assert len(aborted_batches) == 1
+        aborted_ids = aborted_batches[0]
+        # Aborted requests will have fmt {ext_id}-{UUID} to avoid collisions
+        for rid in aborted_ids:
+            assert re.fullmatch(rf"{re.escape(cancel_prefix)}-[0-9a-f]+", rid)
+        assert len(aborted_ids) == expected_cancel_count
+        assert len(set(aborted_ids)) == expected_cancel_count
+        assert len(omni.request_states) == len(req_ids) - expected_cancel_count
+
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_generate_accepts_request_after_repeated_cancellations():
     async def run_test():
         submitted_request_ids = []
@@ -91,22 +181,23 @@ def test_generate_accepts_request_after_repeated_cancellations():
                 await task
 
         assert len(await collect_outputs("after-cancel")) == 1
-        assert submitted_request_ids == [
-            "baseline",
-            "cancel-0",
-            "cancel-1",
-            "cancel-2",
-            "after-cancel",
-        ]
-        assert aborted_request_batches == [
-            ["cancel-0"],
-            ["cancel-1"],
-            ["cancel-2"],
-        ]
+
+        # Check prefixes instead of equality since generate will add
+        # a random numeric suffix to ensure the request ID is unique
+        expected_prefixes = ["baseline-", "cancel-0-", "cancel-1-", "cancel-2-", "after-cancel-"]
+        assert len(submitted_request_ids) == len(expected_prefixes)
+        for submitted, prefix in zip(submitted_request_ids, expected_prefixes):
+            assert submitted.startswith(prefix)
+
+        assert len(aborted_request_batches) == 3
+        for batch, prefix in zip(aborted_request_batches, ["cancel-0-", "cancel-1-", "cancel-2-"]):
+            assert len(batch) == 1
+            assert batch[0].startswith(prefix)
 
     asyncio.run(run_test())
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "output_kind", [RequestOutputKind.DELTA, RequestOutputKind.FINAL_ONLY, RequestOutputKind.CUMULATIVE]
 )
@@ -132,3 +223,79 @@ def test_output_kind_is_preserved_with_explicit_sampling_params(output_kind):
 
     asyncio.run(run())
     assert captured_params[0].output_kind == output_kind
+
+
+# End to end tests for ensuring internal manipulation of request ID
+# in diffusion / Omni models don't leak back to the user.
+#
+# NOTE: It seems like we currently need the shutdowns here, otherwise
+# running the tests sequentially seems to leave a zombie process in diffusion
+# that can OOM the Omni tests.
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.omni
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "req_id",
+    ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"],
+    ids=["plain", "prefixed-img", "prefixed-chat"],
+)
+async def test_diffusion_generate_preserves_request_id(req_id):
+    """Ensure diffusion model requests don't leak internal UUID-suffixed req id back to user."""
+    engine = AsyncOmni(model=DIFFUSION_MODEL)
+    try:
+        async for output in engine.generate("a white cat", request_id=req_id):
+            assert output.request_id == req_id
+    finally:
+        engine.shutdown()
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.omni
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "req_id",
+    ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"],
+    ids=["plain", "prefixed-img", "prefixed-chat"],
+)
+async def test_omni_generate_preserves_request_id(req_id):
+    """Ensure omni model requests don't leak internal UUID-suffixed req id back to user."""
+    engine = AsyncOmni(model=OMNI_MODEL, stage_configs_path=OMNI_STAGE_CONFIG)
+    try:
+        async for output in engine.generate(
+            "Say hello in one word.",
+            request_id=req_id,
+            output_modalities=["text"],
+        ):
+            assert output.request_id == req_id
+    finally:
+        engine.shutdown()
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.omni
+@pytest.mark.asyncio
+async def test_diffusion_generate_empty_request_id():
+    """Empty request_id should get a generated internal ID, not stay empty (diffusion)"""
+    engine = AsyncOmni(model=DIFFUSION_MODEL)
+    try:
+        async for output in engine.generate("a white cat", request_id=""):
+            assert output.request_id != ""
+    finally:
+        engine.shutdown()
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.omni
+@pytest.mark.asyncio
+async def test_omni_generate_empty_request_id():
+    """Empty request_id should get a generated internal ID, not stay empty (omni)"""
+    engine = AsyncOmni(model=OMNI_MODEL, stage_configs_path=OMNI_STAGE_CONFIG)
+    try:
+        async for output in engine.generate(
+            "Say hello in one word.",
+            request_id="",
+            output_modalities=["text"],
+        ):
+            assert output.request_id != ""
+    finally:
+        engine.shutdown()

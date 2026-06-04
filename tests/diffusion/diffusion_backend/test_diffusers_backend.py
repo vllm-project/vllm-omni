@@ -60,6 +60,7 @@ def _make_request(**overrides) -> OmniDiffusionRequest:
             output_type="pil",
             generator_device="cpu",
         ),
+        "request_id": "diffusers-backend",
     }
     defaults.update(overrides)
     return OmniDiffusionRequest(**defaults)

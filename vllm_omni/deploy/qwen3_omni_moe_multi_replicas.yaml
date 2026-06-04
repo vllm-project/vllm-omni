@@ -18,6 +18,7 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
+      initial_codec_chunk_frames: 4
       codec_chunk_frames: 25
       codec_left_context_frames: 25
 
@@ -55,13 +56,14 @@ stages:
       repetition_penalty: 1.05
 
   - stage_id: 2
-    max_num_batched_tokens: 51200
+    max_num_batched_tokens: 65536
     max_num_seqs: 64
     gpu_memory_utilization: 0.1
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
     async_scheduling: false
+    enable_chunked_prefill: false
     devices: "1,2"
     num_replicas: 2
     input_connectors:

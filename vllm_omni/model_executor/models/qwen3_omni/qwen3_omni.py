@@ -20,7 +20,6 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP, SupportsRealtime
 from vllm.model_executor.models.qwen3_asr_realtime import Qwen3ASRRealtimeBuffer
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
@@ -180,11 +179,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                 ("hidden_states", "last"),
                 ("hidden_states", "trailing_text"),
                 ("embed", "tts_pad_projected"),
-            }
-            # Keys that need to be accumulated across streaming inputs
-            self.streaming_accumulated_keys: set[tuple[str, str]] = {
-                ("embed", "prefill"),
-                ("hidden_states", "output"),
+                # talker MTP codec codes must stay on GPU to avoid a per-step D2H
+                # sync stall; build_mm_cpu handles the eventual D2H at payload time.
+                ("codes", "audio"),
             }
 
         elif self.model_stage == "code2wav":
@@ -281,6 +278,12 @@ class Qwen3OmniMoeForConditionalGeneration(
             return self.model.sampler
         return Sampler()
 
+    def get_language_model(self) -> torch.nn.Module:
+        """Delegate to the active stage's language model for upstream MoE resolution."""
+        if hasattr(self.model, "get_language_model"):
+            return self.model.get_language_model()
+        return self.model
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
@@ -323,7 +326,12 @@ class Qwen3OmniMoeForConditionalGeneration(
                 msg = "Qwen3 Omni thinker get_mrope_input_positions requires mm_features"
                 raise ValueError(msg)
             return self.thinker.get_mrope_input_positions(input_tokens, mm_features)
-        return MRotaryEmbedding.get_input_positions_tensor(input_tokens, **kwargs)
+        # Talker/code2wav stages are text/codec-only and do not need
+        # multimodal M-RoPE position computation. Return a cheap linear
+        # position tensor to avoid unnecessary per-request M-RoPE work.
+        seq_len = len(input_tokens)
+        linear = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(3, seq_len)
+        return linear, 0
 
     def forward(
         self,
@@ -673,8 +681,14 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         span_len = input_ids.shape[0]
         update_dict: OmniPayload = {}
-        if span_len > 1:
-            # prefill
+        # Prefix caching can reduce a new request's remaining prefill span to a
+        # single token. Use the runner-provided phase flag instead of span_len.
+        is_prefill = bool(payload.get("_omni_is_prefill", span_len > 1))
+        if is_prefill:
+            num_computed_tokens = payload.get("_omni_num_computed_tokens")
+            request_resumable = meta.get("resumable", False)
+            if num_computed_tokens is not None and not request_resumable:
+                meta["num_processed_tokens"] = int(num_computed_tokens)
             input_ids, input_embeds, update_dict = self.talker_preprocess_prefill(input_ids, input_embeds, payload)
             code_predictor_codes = torch.zeros(
                 (input_embeds.shape[0], self.talker.num_code_groups),
@@ -1248,7 +1262,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         if (
             getattr(self, "model_stage", None) == "talker"
             and sampling_metadata is not None
-            and (sampling_metadata.temperature is None or (sampling_metadata.temperature <= 0).any())
+            and (sampling_metadata.temperature is None)
         ):
             self._warn_talker_sampling_temperature(sampling_metadata)
 

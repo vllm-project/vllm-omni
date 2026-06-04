@@ -4,21 +4,16 @@
 from __future__ import annotations
 
 import enum
-import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
-
-from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import RunnerOutput
-
-logger = init_logger(__name__)
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -75,10 +70,7 @@ class SamplingParamsKey:
 class DiffusionRequestState:
     """Scheduler-owned state for one queued OmniDiffusionRequest."""
 
-    # Unique scheduler-owned request ID.
-    # NOTE: This identifies one OmniDiffusionRequest, which may contain multiple request_ids.
-    # TODO: Align this with OmniDiffusionRequest.request_ids once scheduler batching is supported.
-    sched_req_id: str
+    request_id: str
     req: OmniDiffusionRequest
     sampling_params_key: SamplingParamsKey | None = None
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
@@ -92,23 +84,23 @@ class DiffusionRequestState:
 class NewRequestData:
     """Full request payload for a newly scheduled diffusion request."""
 
-    sched_req_id: str
+    request_id: str
     req: OmniDiffusionRequest
 
     @classmethod
     def from_state(cls, state: DiffusionRequestState) -> NewRequestData:
-        return cls(sched_req_id=state.sched_req_id, req=state.req)
+        return cls(request_id=state.request_id, req=state.req)
 
 
 @dataclass
 class CachedRequestData:
-    """Cached diffusion requests that only need their scheduler ids resent."""
+    """Cached diffusion requests that only need their request ids resent."""
 
-    sched_req_ids: list[str]
+    request_ids: list[str]
 
     @classmethod
     def make_empty(cls) -> CachedRequestData:
-        return cls(sched_req_ids=[])
+        return cls(request_ids=[])
 
 
 @dataclass
@@ -123,21 +115,18 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int
 
     @cached_property
-    def scheduled_req_ids(self) -> list[str]:
+    def scheduled_request_ids(self) -> list[str]:
         """
         All scheduled request ids in this cycle, including both new and cached ones.
-        NOTE:
-            This id is generated and owned by the scheduler,
-            and may be different from the OmniDiffusionRequest.request_ids.
         """
         return [
-            *(req.sched_req_id for req in self.scheduled_new_reqs),
-            *self.scheduled_cached_reqs.sched_req_ids,
+            *(req.request_id for req in self.scheduled_new_reqs),
+            *self.scheduled_cached_reqs.request_ids,
         ]
 
     @property
     def num_scheduled_reqs(self) -> int:
-        return len(self.scheduled_req_ids)
+        return len(self.scheduled_request_ids)
 
     @property
     def is_empty(self) -> bool:
@@ -146,25 +135,6 @@ class DiffusionSchedulerOutput:
 
 class SchedulerInterface(ABC):
     """Abstract lifecycle contract for diffusion schedulers."""
-
-    def _make_sched_req_id(self, request: OmniDiffusionRequest) -> str:
-        """
-        Generate a unique scheduler request ID for the given request.
-            The default implementation uses the first request_id from the request if available,
-            otherwise generates a random one.
-        """
-        if request.request_ids:
-            base = request.request_ids[0]
-        else:
-            logger.warning("Request has no request_ids, generating a random one. Request: %s", request)
-            base = f"req_{uuid.uuid4().hex[:8]}"
-
-        sched_req_id = base
-        suffix = 1
-        while self.get_request_state(sched_req_id) is not None:
-            sched_req_id = f"{base}#{suffix}"
-            suffix += 1
-        return sched_req_id
 
     @abstractmethod
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
@@ -183,7 +153,7 @@ class SchedulerInterface(ABC):
         """Update scheduler state from executor output."""
 
     @abstractmethod
-    def get_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
+    def get_request_state(self, request_id: str) -> DiffusionRequestState | None:
         """Return request state if present."""
 
     @abstractmethod
@@ -191,19 +161,15 @@ class SchedulerInterface(ABC):
         """Return whether the scheduler still owns runnable requests."""
 
     @abstractmethod
-    def get_sched_req_id(self, request_id: str) -> str | None:
-        """Resolve a public request_id to the active scheduler request id."""
-
-    @abstractmethod
-    def pop_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
+    def pop_request_state(self, request_id: str) -> DiffusionRequestState | None:
         """Remove and return request state if present."""
 
     @abstractmethod
-    def preempt_request(self, sched_req_id: str) -> bool:
+    def preempt_request(self, request_id: str) -> bool:
         """Preempt a running request back to waiting."""
 
     @abstractmethod
-    def finish_requests(self, sched_req_ids: str | list[str], status: DiffusionRequestStatus) -> None:
+    def finish_requests(self, request_ids: str | list[str], status: DiffusionRequestStatus) -> None:
         """Mark one or more requests finished."""
 
     @abstractmethod

@@ -17,7 +17,7 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_DEFAULT_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3.yaml")
+_DEFAULT_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image_3_moe.yaml")
 _DEFAULT_AR_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3_ar.yaml")
 
 _MODALITY_TASK_MAP: dict[str, tuple[str, str | None]] = {
@@ -61,8 +61,8 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
     parser.add_argument("--guidance-scale", type=float, default=5.0, help="Classifier-free guidance scale.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--height", type=int, default=1024, help="Output image height.")
-    parser.add_argument("--width", type=int, default=1024, help="Output image width.")
+    parser.add_argument("--height", type=int, default=None, help="Output image height.")
+    parser.add_argument("--width", type=int, default=None, help="Output image width.")
     parser.add_argument("--vae-use-tiling", action="store_true", help="Enable VAE tiling.")
     parser.add_argument(
         "--bot-task",
@@ -107,9 +107,6 @@ def parse_args():
         ),
     )
 
-    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
@@ -229,7 +226,21 @@ def main():
 
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
+    if (args.height is None) != (args.width is None):
+        raise ValueError("--height and --width must both be specified or both omitted.")
+    user_specified_size = args.height is not None and args.width is not None
+    if args.modality in ("img2text", "text2text"):
+        ar_image_size = "auto"
+    elif user_specified_size:
+        ar_image_size = f"{args.width}x{args.height}"
+    else:
+        ar_image_size = None
+    ar_stop_token_ids = resolve_stop_token_ids(
+        task=task, bot_task=bot_task, tokenizer=tokenizer, image_size=ar_image_size
+    )
+    print(
+        f"[AR Config] task={task}, bot_task={bot_task}, image_size={ar_image_size}, stop_token_ids={ar_stop_token_ids}"
+    )
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps

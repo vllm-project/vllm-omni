@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -402,39 +402,6 @@ class TestSingleStageModeDetection:
         )
         assert engine.single_stage_mode is True
         assert engine._single_stage_id_filter is None
-
-    def test_engine_args_create_only_forwards_explicit_fields(self, mocker: MockerFixture):
-        from vllm_omni.engine.arg_utils import OmniEngineArgs
-
-        captured: dict[str, Any] = {}
-
-        def fake_resolve(self, model: str, kwargs: dict[str, Any]):
-            captured.update(kwargs)
-            return "/fake/path", [_make_stage_cfg(0)]
-
-        mocker.patch.object(AsyncOmniEngine, "_resolve_stage_configs", fake_resolve)
-        mocker.patch.object(AsyncOmniEngine, "_bootstrap_orchestrator")
-        mock_thread_cls = mocker.patch("threading.Thread")
-        mock_future_cls = mocker.patch("concurrent.futures.Future")
-        mock_future = mocker.Mock()
-        mock_future.result.return_value = mocker.Mock()
-        mock_future_cls.return_value = mock_future
-        mock_thread = mocker.Mock()
-        mock_thread.is_alive.return_value = False
-        mock_thread_cls.return_value = mock_thread
-
-        ea = OmniEngineArgs.create(model="ignored", gpu_memory_utilization=0.5)
-        AsyncOmniEngine(model="fake-model", engine_args=ea)
-
-        assert captured["gpu_memory_utilization"] == 0.5
-        assert "model" not in captured
-        assert "max_num_seqs" not in captured
-
-    def test_bare_engine_args_rejected(self, mocker: MockerFixture):
-        from vllm_omni.engine.arg_utils import OmniEngineArgs
-
-        with pytest.raises(TypeError, match="OmniEngineArgs.create"):
-            self._make_engine_no_thread(mocker, engine_args=OmniEngineArgs(model="fake-model"))
 
     def test_master_address_and_port_stored(self, mocker: MockerFixture):
         engine = self._make_engine_no_thread(
@@ -835,7 +802,7 @@ class TestSingleStageReplicaInitialization:
         prev_device_env = os.environ.get(device_env_var)
         os.environ[device_env_var] = "0"
 
-        mocker.patch.object(engine_mod, "setup_stage_devices")
+        mocker.patch.object(engine_mod, "stage_runtime_setup", return_value=nullcontext())
         mocker.patch.object(engine_mod, "build_engine_args_dict", return_value={})
         mocker.patch.object(engine_mod, "acquire_device_locks", return_value=[])
         mocker.patch.object(engine_mod, "release_device_locks")
@@ -909,7 +876,7 @@ class TestSingleStageReplicaInitialization:
         prev_device_env = os.environ.get(device_env_var)
         os.environ[device_env_var] = "0"
 
-        mocker.patch.object(engine_mod, "setup_stage_devices")
+        mocker.patch.object(engine_mod, "stage_runtime_setup", return_value=nullcontext())
         mocker.patch.object(engine_mod, "inject_kv_stage_info")
         mocker.patch.object(engine_mod, "build_diffusion_config", return_value="diffusion-config")
         mock_register = mocker.patch.object(
@@ -988,7 +955,7 @@ class TestSingleStageReplicaInitialization:
         prev_device_env = os.environ.get(device_env_var)
         os.environ[device_env_var] = "0"
 
-        mocker.patch.object(engine_mod, "setup_stage_devices")
+        mocker.patch.object(engine_mod, "stage_runtime_setup", return_value=nullcontext())
         mocker.patch.object(engine_mod, "inject_kv_stage_info")
         mocker.patch.object(engine_mod, "build_diffusion_config", return_value="diffusion-config")
         mocker.patch.object(
