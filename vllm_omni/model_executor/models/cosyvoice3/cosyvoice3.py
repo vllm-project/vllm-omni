@@ -54,6 +54,11 @@ from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
 
+# Process-wide cache of per-model mm-processor runtime components (tokenizer,
+# feat_extractor, campplus session/engine). The mm processor is re-created per
+# request (mm_processor_cache_gb: 0), so this avoids rebuilding them every time.
+_RUNTIME_COMPONENTS_CACHE: dict[str, dict] = {}
+
 
 def _cosyvoice3_trt_enabled() -> bool:
     """COSYVOICE3_TRT env toggle (default on) for the optional TensorRT paths.
@@ -94,47 +99,78 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         if cached_model_dir == model_dir:
             return
 
-        # If model_dir is an HF repo ID (not a local path), resolve to cache
+        # The mm processor is re-created per request (deploy config sets
+        # ``mm_processor_cache_gb: 0``), so the instance-level guard above never
+        # hits across requests. Without a process-wide cache, every request
+        # would re-run ``snapshot_download``, rebuild the Qwen tokenizer and
+        # create a fresh ONNX campplus session — ~hundreds of ms of pure
+        # overhead on the TTFP critical path. Build the heavy components once
+        # per process, keyed by model_dir, and reuse them.
+        comps = _RUNTIME_COMPONENTS_CACHE.get(model_dir)
+        if comps is None:
+            comps = self._build_runtime_components(model_dir, config)
+            _RUNTIME_COMPONENTS_CACHE[model_dir] = comps
+
+        self.tokenizer = comps["tokenizer"]
+        self.feat_extractor = comps["feat_extractor"]
+        self.campplus_session = comps["campplus_session"]
+        self.campplus_trt = comps["campplus_trt"]
+        self._cached_model_dir = model_dir
+        self._speaker_cache = get_speaker_cache()
+
+    def _build_runtime_components(self, model_dir: str, config: CosyVoice3Config) -> dict:
+        """Build the per-model runtime components once (cached process-wide)."""
+        # If model_dir is an HF repo ID (not a local path), resolve to cache.
         if not os.path.isdir(model_dir):
             model_dir = snapshot_download(model_dir)
 
-        option = onnxruntime.SessionOptions()
-        option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        option.intra_op_num_threads = 1
-
-        self.tokenizer = get_qwen_tokenizer(
+        tokenizer = get_qwen_tokenizer(
             token_path=os.path.join(model_dir, config.qwen_pretrain_path),
             skip_special_tokens=config.skip_special_tokens,
             version=config.version,
         )
-        self.feat_extractor = partial(mel_spectrogram, **getattr(config, "feat_extractor", {}))
+        feat_extractor = partial(mel_spectrogram, **getattr(config, "feat_extractor", {}))
+
         campplus_onnx_path = os.path.join(model_dir, config.campplus_onxx_path)
-        self.campplus_session = onnxruntime.InferenceSession(
-            campplus_onnx_path,
-            sess_options=option,
-            providers=["CPUExecutionProvider"],
-        )
-        # Optional TensorRT speaker-embedding path (default on). The CPU ONNX
-        # campplus session above dominates per-request prompt processing; a
-        # prebuilt TRT engine runs it on GPU. Falls back to ONNX if disabled,
-        # CUDA is unavailable, or the engine fails to build.
-        self.campplus_trt = None
+        # TensorRT speaker-embedding path (default on); a prebuilt TRT engine
+        # runs campplus on GPU. The engine itself is cached process-wide by
+        # ``get_campplus_trt``.
+        campplus_trt = None
         if self._speaker_embedding_trt_enabled() and torch.cuda.is_available():
             try:
                 from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import (
                     get_campplus_trt,
                 )
 
-                self.campplus_trt = get_campplus_trt(campplus_onnx_path, device="cuda")
+                campplus_trt = get_campplus_trt(campplus_onnx_path, device="cuda")
                 logger.info("CosyVoice3: using TensorRT campplus speaker embedding")
             except Exception as exc:  # pragma: no cover - defensive fallback
                 logger.warning(
                     "CosyVoice3: TensorRT campplus build failed (%s); falling back to ONNX-Runtime speaker embedding",
                     exc,
                 )
-                self.campplus_trt = None
-        self._cached_model_dir = model_dir
-        self._speaker_cache = get_speaker_cache()
+                campplus_trt = None
+
+        # Only build the CPU ONNX campplus session when TRT is unavailable —
+        # otherwise it is never used and creating it (ORT_ENABLE_ALL graph
+        # optimization) costs ~hundreds of ms.
+        campplus_session = None
+        if campplus_trt is None:
+            option = onnxruntime.SessionOptions()
+            option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+            option.intra_op_num_threads = 1
+            campplus_session = onnxruntime.InferenceSession(
+                campplus_onnx_path,
+                sess_options=option,
+                providers=["CPUExecutionProvider"],
+            )
+
+        return {
+            "tokenizer": tokenizer,
+            "feat_extractor": feat_extractor,
+            "campplus_session": campplus_session,
+            "campplus_trt": campplus_trt,
+        }
 
     @staticmethod
     def _speaker_embedding_trt_enabled() -> bool:
