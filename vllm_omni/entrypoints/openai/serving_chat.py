@@ -2423,8 +2423,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         mm_processor_kwargs: dict[str, Any] = {}
         if height is not None:
             mm_processor_kwargs["target_h"] = height
+            engine_prompt["height"] = height
         if width is not None:
             mm_processor_kwargs["target_w"] = width
+            engine_prompt["width"] = width
         if mm_processor_kwargs:
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
         if engine_prompt_data is not None:

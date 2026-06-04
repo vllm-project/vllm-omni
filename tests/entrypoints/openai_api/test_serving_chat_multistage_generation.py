@@ -61,6 +61,8 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine_prompt["prompt"] == "draw a robot"
     assert engine_prompt["modalities"] == ["img2img"]
     assert engine_prompt["negative_prompt"] == "blurry"
+    assert engine_prompt["height"] == 768
+    assert engine_prompt["width"] == 1024
     assert engine_prompt["mm_processor_kwargs"] == {"target_h": 768, "target_w": 1024}
     assert engine_prompt["multi_modal_data"]["img2img"].size == (24, 24)
 
