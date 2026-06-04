@@ -826,7 +826,7 @@ class MotionerTransformers(nn.Module):
             self.token_freqs = torch.nn.Parameter(token_freqs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x[0].shape[1] contains motion frames count, but not used directly here
+        # x: [B, C, T, H, W] tensor
         device = self.patch_embedding.weight.device
         freqs = self.freqs
         if freqs.device != device:
@@ -840,18 +840,20 @@ class MotionerTransformers(nn.Module):
 
         if self.enable_tsm:
             sample_idx = [
-                _sample_indices(u.shape[1], stride=self.motion_stride, expand_ratio=self.expand_ratio, c=self.sample_c)
-                for u in x
+                _sample_indices(
+                    x[i].shape[1], stride=self.motion_stride, expand_ratio=self.expand_ratio, c=self.sample_c
+                )
+                for i in range(x.shape[0])
             ]
-            x = [torch.flip(torch.flip(u, [1])[:, idx], [1]) for idx, u in zip(sample_idx, x)]
+            x = torch.stack([torch.flip(torch.flip(x[i], [1])[:, idx], [1]) for i, idx in enumerate(sample_idx)])
 
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        x = self.patch_embedding(x)
 
-        seq_f, seq_h, seq_w = x[0].shape[-3:]
-        batch_size = len(x)
+        batch_size = x.shape[0]
+        seq_f, seq_h, seq_w = x.shape[-3:]
         if not self.enable_tsm:
-            grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-            grid_sizes = [[torch.zeros_like(grid_sizes), grid_sizes, grid_sizes]]
+            grid_sizes_t = torch.tensor([list(x.shape[2:])], dtype=torch.long).repeat(batch_size, 1)
+            grid_sizes = [[torch.zeros_like(grid_sizes_t), grid_sizes_t, grid_sizes_t]]
             seq_f = 0
         else:
             grid_sizes = []
@@ -866,10 +868,9 @@ class MotionerTransformers(nn.Module):
                 grid_sizes += tsm_frame_grid_sizes
             seq_f = sample_idx[0][-1] + 1
 
-        x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        x = torch.cat([u for u in x])
-        batch_size = len(x)
+        x = x.flatten(2).transpose(1, 2)
+        seq_lens = torch.full((batch_size,), x.shape[1], dtype=torch.long)
+        batch_size = x.shape[0]
 
         token_grid_sizes = [
             [
@@ -885,8 +886,8 @@ class MotionerTransformers(nn.Module):
 
         grid_sizes = grid_sizes + token_grid_sizes
         token_len = self.token.shape[1]
-        token = self.token.clone().repeat(x.shape[0], 1, 1).contiguous()
-        seq_lens = seq_lens + torch.tensor([t.size(0) for t in token], dtype=torch.long)
+        token = self.token.clone().repeat(batch_size, 1, 1).contiguous()
+        seq_lens = seq_lens + token_len
         x = torch.cat([x, token], dim=1)
 
         kwargs = dict(seq_lens=seq_lens, grid_sizes=grid_sizes, freqs=freqs)
@@ -1296,9 +1297,9 @@ class WanS2VTransformer3DModel(nn.Module):
             return flatten_mot, mot_remb
 
     def process_motion_transformer_motioner(self, motion_latents, drop_motion_frames=False, add_last_motion=True):
-        batch_size = len(motion_latents)
-        height = motion_latents[0].shape[2] // self.patch_size[1]
-        width = motion_latents[0].shape[3] // self.patch_size[2]
+        batch_size = motion_latents.shape[0]
+        height = motion_latents.shape[3] // self.patch_size[1]
+        width = motion_latents.shape[4] // self.patch_size[2]
 
         trainable_f = None
         if self.trainable_token_pos_emb:
@@ -1308,10 +1309,9 @@ class WanS2VTransformer3DModel(nn.Module):
                 trainable_f = torch.view_as_complex(token_freqs)
 
         if not drop_motion_frames and add_last_motion:
-            last_motion_latent = [u[:, -1:] for u in motion_latents]
-            last_mot = [self.patch_embedding(m.unsqueeze(0)) for m in last_motion_latent]
-            last_mot = [m.flatten(2).transpose(1, 2) for m in last_mot]
-            last_mot = torch.cat(last_mot)
+            last_motion_latent = motion_latents[:, :, -1:]
+            last_mot = self.patch_embedding(last_motion_latent)
+            last_mot = last_mot.flatten(2).transpose(1, 2)
             gride_sizes = [
                 [
                     torch.tensor([-1, 0, 0]).unsqueeze(0).repeat(batch_size, 1),
@@ -1320,9 +1320,7 @@ class WanS2VTransformer3DModel(nn.Module):
                 ]
             ]
         else:
-            last_mot = torch.zeros(
-                [batch_size, 0, self.dim], device=motion_latents[0].device, dtype=motion_latents[0].dtype
-            )
+            last_mot = torch.zeros([batch_size, 0, self.dim], device=motion_latents.device, dtype=motion_latents.dtype)
             gride_sizes = []
 
         zip_motion = self.motioner(motion_latents)
