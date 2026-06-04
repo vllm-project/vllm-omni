@@ -542,7 +542,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # Requests that have loaded chunk from last round
                     # of schedule, but have not scheduled
                     continue
-                if request.request_id in self.finished_requests:
+                if self.is_done_receiving_chunks(request.request_id):
+                    request.additional_information = None
                     continue
                 # Requests that waiting for chunk
                 self.load_async(request)
