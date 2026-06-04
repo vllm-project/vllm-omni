@@ -21,7 +21,7 @@ import torch.nn as nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    get_tp_group,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import (
@@ -181,8 +181,11 @@ class DistributedRMSNorm(nn.Module):
         local_count = x.shape[-1]
 
         if tp_size > 1:
-            global_sum_sq = local_sum_sq.clone()
-            torch.distributed.all_reduce(global_sum_sq, group=get_tp_group().device_group)
+            # Use vLLM's collective (custom all-reduce / symmetric-mem fast path
+            # for small tensors) instead of raw torch.distributed.all_reduce, and
+            # take the return value so the custom-AR path (which may return a new
+            # buffer) is handled correctly. No .clone() needed.
+            global_sum_sq = tensor_model_parallel_all_reduce(local_sum_sq)
             global_count = local_count * tp_size
         else:
             global_sum_sq = local_sum_sq
