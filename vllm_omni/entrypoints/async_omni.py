@@ -315,15 +315,6 @@ class AsyncOmni(EngineClient, OmniBase):
                 "Submit multiple independent requests to use scheduler batching."
             )
 
-        # Reject diffusion list-prompt early with a clear API error.
-        if isinstance(prompt, list) and any(
-            getattr(client, "stage_type", "") == "diffusion" for client in getattr(self.engine, "stage_clients", [])
-        ):
-            raise ValueError(
-                "Diffusion stages accept only a single prompt per request. "
-                "Submit multiple independent requests to use scheduler batching."
-            )
-
         input_stream_task: asyncio.Task | None = None
         try:
             # Start final output dispatcher on the first call to generate()

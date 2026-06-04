@@ -177,7 +177,7 @@ class StageDiffusionProc:
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
-        """Batch requests are no longer supported.
+        """List-prompt batch requests are no longer supported.
 
         Submit multiple independent requests to use scheduler batching.
         """

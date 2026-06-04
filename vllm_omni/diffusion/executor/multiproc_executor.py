@@ -308,13 +308,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._failure_callbacks.append(callback)
 
     def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        """Adapt request-mode scheduler output to worker execute_model RPC.
+        """Adapt request-mode scheduler output to worker execute_model RPCs.
 
-        Iterates over all newly scheduled requests, running each through the
-        pipeline and collecting per-request outputs into a BatchRunnerOutput.
-        Uses the already-initialized ``NewRequestData.req`` so request execution
-        does not re-run ``OmniDiffusionRequest.__post_init__`` and mutate
-        sentinel-based fields like ``guidance_scale_provided``.
+        Returns a BatchRunnerOutput with one RunnerOutput per scheduled request.
         """
         from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
@@ -353,11 +349,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         return BatchRunnerOutput.from_list(runner_outputs)
 
     def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        """Single RPC with DiffusionSchedulerOutput for request-mode batch.
+        """Execute request-mode work through a single batched worker RPC.
 
-        Worker builds RequestBatch internally and calls pipeline.forward(batch).
-        Used for request-batch-capable pipelines, including single-request
-        cycles, so request-mode execution consistently uses execute_model_batch.
+        The worker builds RequestBatch from scheduler output and returns
+        BatchRunnerOutput with one RunnerOutput per scheduled request.
         """
         from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 

@@ -352,13 +352,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         scheduler_output: DiffusionSchedulerOutput,
         od_config: OmniDiffusionConfig,
     ) -> BatchRunnerOutput:
-        """Execute a batch of request-mode requests from a scheduler output.
+        """Execute scheduled request-mode requests through the batch forward path.
 
-        Builds a ``RequestBatch`` from the scheduled new requests, runs per-
-        request setup (KV transfer, generator, cache), then calls
-        ``pipeline.forward(batch)``.  Only pipelines that declare
-        ``supports_request_batch = True`` should reach this path; the engine
-        routes non-batch pipelines through per-request execution.
+        Builds a ``RequestBatch`` from scheduled new requests, runs
+        per-request setup, and calls ``pipeline.forward(batch)``. The pipeline
+        must declare ``supports_request_batch = True``.
         """
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]

@@ -896,11 +896,7 @@ class WorkerProc:
                 continue
 
             else:
-                # Handle single generation request (dummy_run, etc.).
-                # Request-mode batches arrive as {"type": "rpc", "method":
-                # "execute_model_batch"} via collective_rpc and are handled by
-                # the rpc branch above, so there is no bare-DiffusionSchedulerOutput
-                # path here.
+                # Handle direct generation requests.
                 try:
                     output = self.worker.execute_model(msg, self.od_config)
                 except Exception as e:

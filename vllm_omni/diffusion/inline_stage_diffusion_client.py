@@ -160,7 +160,7 @@ class InlineStageDiffusionClient(StageClientBase):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
-        """Batch requests are no longer supported.
+        """List-prompt batch requests are no longer supported.
 
         Submit multiple independent requests to use scheduler batching.
         """
