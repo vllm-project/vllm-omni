@@ -447,10 +447,14 @@ class RotaryEmbeddingS2VGrid(torch.nn.Module):
 
     @staticmethod
     @torch.amp.autocast(current_omni_platform.device_type, enabled=False)
-    def forward(x: torch.Tensor, grid_sizes, freqs: torch.Tensor, start=None) -> torch.Tensor:
-        n, c = x.size(2), x.size(3) // 2
-        input_dtype = x.dtype
-        device = x.device
+    def precompute(
+        seq_len: int, num_heads: int, head_dim: int, grid_sizes, freqs: torch.Tensor, device: torch.device, start=None
+    ) -> torch.Tensor:
+        """Precompute position frequency tensor from grid specification.
+
+        Returns a complex tensor that can be reused across layers via apply_precomputed().
+        """
+        c = head_dim // 2
 
         trainable_freqs = None
         if isinstance(freqs, list):
@@ -459,15 +463,18 @@ class RotaryEmbeddingS2VGrid(torch.nn.Module):
         freqs = freqs.to(device)
         freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-        output = x.clone()
-        seq_bucket = [0]
         if not isinstance(grid_sizes, list):
             grid_sizes = [grid_sizes]
+
+        batch_size = grid_sizes[0][0].shape[0] if isinstance(grid_sizes[0], list) else grid_sizes[0].shape[0]
+        precomputed = torch.empty((batch_size, seq_len, 1, c), device=device, dtype=torch.complex64)
+        seq_bucket = [0]
+
         for g in grid_sizes:
             if not isinstance(g, list):
                 g = [torch.zeros_like(g), g]
-            batch_size = g[0].shape[0]
-            for i in range(batch_size):
+            g_batch_size = g[0].shape[0]
+            for i in range(g_batch_size):
                 if start is None:
                     f_o, h_o, w_o = g[0][i]
                 else:
@@ -476,10 +483,9 @@ class RotaryEmbeddingS2VGrid(torch.nn.Module):
                 f, h, w = g[1][i]
                 t_f, t_h, t_w = g[2][i]
                 seq_f, seq_h, seq_w = f - f_o, h - h_o, w - w_o
-                seq_len = int(seq_f * seq_h * seq_w)
-                if seq_len > 0:
+                seg_len = int(seq_f * seq_h * seq_w)
+                if seg_len > 0:
                     if t_f > 0:
-                        assert f_o * f >= 0 and h_o * h >= 0 and w_o * w >= 0
                         seq_f_int = int(seq_f)
                         seq_h_int = int(seq_h)
                         seq_w_int = int(seq_w)
@@ -501,13 +507,28 @@ class RotaryEmbeddingS2VGrid(torch.nn.Module):
                                 freqs[2][w_sam].view(1, 1, seq_w_int, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
                             ],
                             dim=-1,
-                        ).reshape(seq_len, 1, -1)
+                        ).reshape(seg_len, 1, -1)
                     elif t_f < 0:
                         freqs_i = trainable_freqs.unsqueeze(1)
-                    x_i = torch.view_as_complex(
-                        x[i, seq_bucket[-1] : seq_bucket[-1] + seq_len].to(torch.float64).reshape(seq_len, n, -1, 2)
-                    )
-                    x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-                    output[i, seq_bucket[-1] : seq_bucket[-1] + seq_len] = x_i
-            seq_bucket.append(seq_bucket[-1] + seq_len)
-        return output.to(input_dtype)
+                    precomputed[i, seq_bucket[-1] : seq_bucket[-1] + seg_len] = freqs_i
+            seq_bucket.append(seq_bucket[-1] + seg_len)
+        return precomputed
+
+    @staticmethod
+    @torch.amp.autocast(current_omni_platform.device_type, enabled=False)
+    def apply_precomputed(x: torch.Tensor, precomputed_freqs: torch.Tensor) -> torch.Tensor:
+        """Apply precomputed position frequencies to input tensor."""
+        n = x.size(2)
+        input_dtype = x.dtype
+        seq_len = x.size(1)
+        precomputed_freqs = precomputed_freqs[:, :seq_len]
+        x_c = torch.view_as_complex(x.to(torch.float64).reshape(x.size(0), seq_len, n, -1, 2))
+        x_c = torch.view_as_real(x_c * precomputed_freqs).flatten(3)
+        return x_c.reshape(x.size(0), seq_len, n, -1).to(input_dtype)
+
+    @staticmethod
+    @torch.amp.autocast(current_omni_platform.device_type, enabled=False)
+    def forward(x: torch.Tensor, grid_sizes, freqs: torch.Tensor, start=None) -> torch.Tensor:
+        n, d = x.size(2), x.size(3)
+        precomputed = RotaryEmbeddingS2VGrid.precompute(x.size(1), n, d, grid_sizes, freqs, x.device, start=start)
+        return RotaryEmbeddingS2VGrid.apply_precomputed(x, precomputed)

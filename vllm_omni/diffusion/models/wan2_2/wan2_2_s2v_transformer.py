@@ -558,7 +558,12 @@ class SimpleSelfAttention(nn.Module):
         self.rotary_embedding = RotaryEmbeddingS2VGrid()
 
     def forward(
-        self, x: torch.Tensor, seq_lens: list[int], grid_sizes: list[tuple[int, int, int]], freqs: torch.Tensor
+        self,
+        x: torch.Tensor,
+        seq_lens: list[int],
+        grid_sizes: list[tuple[int, int, int]],
+        freqs: torch.Tensor,
+        precomputed_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -566,8 +571,12 @@ class SimpleSelfAttention(nn.Module):
         k = self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x).view(b, s, n, d)
 
-        q = self.rotary_embedding(q, grid_sizes, freqs)
-        k = self.rotary_embedding(k, grid_sizes, freqs)
+        if precomputed_freqs is not None:
+            q = RotaryEmbeddingS2VGrid.apply_precomputed(q, precomputed_freqs)
+            k = RotaryEmbeddingS2VGrid.apply_precomputed(k, precomputed_freqs)
+        else:
+            q = self.rotary_embedding(q, grid_sizes, freqs)
+            k = self.rotary_embedding(k, grid_sizes, freqs)
 
         q = q.view(b, s, n, d)
         k = k.view(b, s, n, d)
@@ -580,7 +589,12 @@ class SimpleSelfAttention(nn.Module):
 
 class SwinSelfAttention(SimpleSelfAttention):
     def forward(
-        self, x: torch.Tensor, seq_lens: list[int], grid_sizes: list[tuple[int, int, int]], freqs: torch.Tensor
+        self,
+        x: torch.Tensor,
+        seq_lens: list[int],
+        grid_sizes: list[tuple[int, int, int]],
+        freqs: torch.Tensor,
+        precomputed_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -588,8 +602,12 @@ class SwinSelfAttention(SimpleSelfAttention):
         k = self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x).view(b, s, n, d)
 
-        q = self.rotary_embedding(q, grid_sizes, freqs)
-        k = self.rotary_embedding(k, grid_sizes, freqs)
+        if precomputed_freqs is not None:
+            q = RotaryEmbeddingS2VGrid.apply_precomputed(q, precomputed_freqs)
+            k = RotaryEmbeddingS2VGrid.apply_precomputed(k, precomputed_freqs)
+        else:
+            q = self.rotary_embedding(q, grid_sizes, freqs)
+            k = self.rotary_embedding(k, grid_sizes, freqs)
         q = q.view(b, s, n, d)
         k = k.view(b, s, n, d)
         T, H, W = grid_sizes[0].tolist()
@@ -726,9 +744,14 @@ class MotionerAttentionBlock(nn.Module):
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
 
     def forward(
-        self, x: torch.Tensor, seq_lens: list[int], grid_sizes: list[tuple[int, int, int]], freqs: torch.Tensor
+        self,
+        x: torch.Tensor,
+        seq_lens: list[int],
+        grid_sizes: list[tuple[int, int, int]],
+        freqs: torch.Tensor,
+        precomputed_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        y = self.self_attn(self.norm1(x).type_as(x), seq_lens, grid_sizes, freqs)
+        y = self.self_attn(self.norm1(x).type_as(x), seq_lens, grid_sizes, freqs, precomputed_freqs=precomputed_freqs)
         x = x + y
         y = self.ffn(self.norm2(x).type_as(x))
         x = x + y
@@ -890,7 +913,11 @@ class MotionerTransformers(nn.Module):
         seq_lens = seq_lens + token_len
         x = torch.cat([x, token], dim=1)
 
-        kwargs = dict(seq_lens=seq_lens, grid_sizes=grid_sizes, freqs=freqs)
+        precomputed_freqs = RotaryEmbeddingS2VGrid.precompute(
+            x.shape[1], self.num_heads, self.dim // self.num_heads, grid_sizes, freqs, x.device
+        )
+
+        kwargs = dict(seq_lens=seq_lens, grid_sizes=grid_sizes, freqs=freqs, precomputed_freqs=precomputed_freqs)
         for block in self.blocks:
             x = block(x, **kwargs)
 
