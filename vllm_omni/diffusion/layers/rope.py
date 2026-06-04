@@ -335,7 +335,12 @@ class WanS2VRotaryPosEmbed(torch.nn.Module):
         )
         return torch.polar(torch.ones_like(freqs), freqs)
 
-    def forward(self, hidden_states, grid_sizes, trainable_freqs=None):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        grid_sizes: list,
+        trainable_freqs: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Precompute RoPE embeddings for the given grid layout.
 
         Args:

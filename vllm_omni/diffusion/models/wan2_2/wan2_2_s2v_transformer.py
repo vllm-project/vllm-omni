@@ -1441,7 +1441,7 @@ class WanS2VTransformer3DModel(nn.Module):
         drop_motion_frames: bool = False,
         return_dict: bool = True,
         **extra_kwargs: object,
-    ):
+    ) -> torch.Tensor:
         """Forward pass for S2V transformer.
 
         Args:
