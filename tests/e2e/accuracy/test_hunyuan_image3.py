@@ -78,6 +78,7 @@ TEST_IMAGE_URLS = [
 SEED = 42
 AR_TP_SIZE = len(AR_DEVICES.split(","))
 DIT_TP_SIZE = len(DIT_DEVICES.split(","))
+NPU_NUM_INFERENCE_STEPS = 8
 
 # Precision thresholds
 THRESHOLDS = {
@@ -106,7 +107,7 @@ NPU_DIT_DEVICES_ENV = "HUNYUAN_IMAGE3_NPU_DIT_DEVICES"
 NPU_DIT_TP_ENV = "HUNYUAN_IMAGE3_NPU_DIT_TP"
 NPU_DIT_EP_ENV = "HUNYUAN_IMAGE3_NPU_DIT_ENABLE_EP"
 NPU_DIT_GPU_MEMORY_UTILIZATION_ENV = "HUNYUAN_IMAGE3_NPU_DIT_GPU_MEMORY_UTILIZATION"
-NPU_DIT_NUM_INFERENCE_STEPS = 8
+NPU_DIT_NUM_INFERENCE_STEPS = NPU_NUM_INFERENCE_STEPS
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 # fmt: off
 _DEPLOY_CONFIG = {
@@ -222,7 +223,7 @@ _NPU_DEPLOY_CONFIG = {
             },
             "input_connectors": {"from_stage_0": "shared_memory_connector"},
             "default_sampling_params": {
-                "num_inference_steps": NUM_INFERENCE_STEPS,
+                "num_inference_steps": NPU_NUM_INFERENCE_STEPS,
                 "guidance_scale": GUIDANCE_SCALE,
             },
         },
@@ -390,7 +391,12 @@ def _apply_offline_it2i_size_overrides(
             sp.width = width
 
 
-def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+def _run_offline(
+    deploy_config_path: str,
+    output_path: Path,
+    *,
+    num_inference_steps: int = NUM_INFERENCE_STEPS,
+) -> tuple[Image.Image, str, float]:
     from transformers import AutoTokenizer
 
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -412,7 +418,7 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         params_list = list(runner.omni.default_sampling_params_list)
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
-                sp.num_inference_steps = NUM_INFERENCE_STEPS
+                sp.num_inference_steps = num_inference_steps
                 sp.guidance_scale = GUIDANCE_SCALE
                 sp.seed = SEED
                 sp.generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
@@ -465,7 +471,12 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     return image, cot_text, elapsed
 
 
-def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+def _run_online(
+    stage_configs_path: str,
+    output_path: Path,
+    *,
+    num_inference_steps: int = NUM_INFERENCE_STEPS,
+) -> tuple[Image.Image, str, float]:
     from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 
     server_args = [
@@ -487,7 +498,7 @@ def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image
                     "prompt": PROMPT,
                     "n": 1,
                     "response_format": "b64_json",
-                    "num_inference_steps": NUM_INFERENCE_STEPS,
+                    "num_inference_steps": num_inference_steps,
                     "guidance_scale": GUIDANCE_SCALE,
                     "seed": SEED,
                     "sys_type": "en_unified",
@@ -591,7 +602,11 @@ def test_image_to_image_alignment_npu(
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         _make_npu_config(tmp / "npu.yaml")
-        npu_image, npu_cot, _ = runner(str(tmp / "npu.yaml"), output_dir)
+        npu_image, npu_cot, _ = runner(
+            str(tmp / "npu.yaml"),
+            output_dir,
+            num_inference_steps=NPU_NUM_INFERENCE_STEPS,
+        )
 
     npu_cot = npu_cot.lstrip("\n")
     scorer = SemanticSimilarityScorer()
@@ -745,6 +760,14 @@ def test_npu_dit_config_accepts_env_parallelism(tmp_path: Path, monkeypatch: pyt
     assert stage["devices"] == "2,3"
     assert stage["parallel_config"]["tensor_parallel_size"] == 2
     assert stage["parallel_config"]["enable_expert_parallel"] is False
+
+
+def test_npu_it2i_config_uses_eight_steps(tmp_path: Path) -> None:
+    config_path = tmp_path / "npu.yaml"
+    _make_npu_config(config_path)
+    config = yaml.safe_load(config_path.read_text())
+
+    assert config["stages"][1]["default_sampling_params"]["num_inference_steps"] == NPU_NUM_INFERENCE_STEPS
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=8)

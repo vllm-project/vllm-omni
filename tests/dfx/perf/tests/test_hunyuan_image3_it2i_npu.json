@@ -77,7 +77,7 @@
                                     "from_stage_0": "shared_memory_connector"
                                 },
                                 "default_sampling_params": {
-                                    "num_inference_steps": 50,
+                                    "num_inference_steps": 8,
                                     "guidance_scale": 0
                                 }
                             }
