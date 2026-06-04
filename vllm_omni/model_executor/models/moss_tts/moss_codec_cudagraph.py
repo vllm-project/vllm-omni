@@ -193,7 +193,7 @@ class MossTTSCUDAGraphCodecWrapper:
             # left-aligned.  static_codes[:, 0, :actual_t] is [NQ, actual_t]
             # and codes_nq_t is [NQ, actual_t].
             static_codes.zero_()
-            static_codes[:, 0, :actual_t] = codes_nq_t
+            static_codes[:, 0, :actual_t].copy_(codes_nq_t)
 
         # Update the lengths tensor so the decoder computes the correct
         # audio_lengths in the captured graph output.

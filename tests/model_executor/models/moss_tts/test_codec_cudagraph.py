@@ -249,3 +249,65 @@ def test_nq_first_layout_matches_eager(model, wrapper):
     with torch.no_grad():
         out = wrapper.decode(codes)
     torch.testing.assert_close(out.audio, ref.audio, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# 8. Non-contiguous input — copy_() must handle strided tensors correctly
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("t", [20, 47])
+def test_noncontiguous_input_matches_contiguous(model, wrapper, t):
+    """Padded path uses copy_() on a slice; must produce the same result
+    whether codes_nq_t is contiguous or a non-contiguous view (e.g. a column
+    slice of a larger buffer, which is the realistic production layout when the
+    caller slices out one request from a batched tensor)."""
+    codes_contiguous = _random_codes(t)
+    # Build a non-contiguous view: embed in a larger [NQ, 2, T] buffer and
+    # take column 0.  The resulting tensor has stride (2*T, 2, 1) → non-contiguous.
+    buf = torch.zeros(NUM_QUANTIZERS, 2, t, dtype=torch.long, device=DEVICE)
+    buf[:, 0, :] = codes_contiguous
+    codes_noncontig = buf[:, 0, :]  # [NQ, T], non-contiguous
+    assert not codes_noncontig.is_contiguous()
+
+    with torch.no_grad():
+        out_c = wrapper.decode(codes_contiguous)
+        out_nc = wrapper.decode(codes_noncontig)
+    torch.testing.assert_close(out_c.audio, out_nc.audio, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# 9. Zero-padding uses token 0 — must be a valid codebook index (no OOB)
+# ---------------------------------------------------------------------------
+
+
+def test_zero_padding_no_cuda_error(model, wrapper):
+    """Padded inputs fill unused frames with code 0.  Verify that token 0 is a
+    legal codebook index (i.e. no CUDA index-out-of-bounds / illegal memory
+    access) and the output shape is correct."""
+    t = 7  # well below the 25-frame bucket → large zero-padded region
+    codes = _random_codes(t)
+    with torch.no_grad():
+        out = wrapper.decode(codes)
+    torch.accelerator.synchronize()  # surface any deferred CUDA errors
+    assert out.audio.shape[-1] == t * DOWNSAMPLE_RATE
+
+
+# ---------------------------------------------------------------------------
+# 10. Shape alignment: graph path and eager fallback return identical shapes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("t", [25, 30, 101])
+def test_graph_and_eager_shape_identical(model, wrapper, t):
+    """Graph replay (t<=100) and eager fallback (t>100) must return tensors
+    with the same number of dimensions and the same batch/channel layout so
+    downstream consumers can treat both paths uniformly."""
+    codes = _random_codes(t)
+    ref = _eager_decode(model, codes)
+    with torch.no_grad():
+        out = wrapper.decode(codes)
+    assert out.audio.ndim == ref.audio.ndim, f"ndim mismatch: graph={out.audio.ndim} eager={ref.audio.ndim}"
+    assert out.audio.shape[:-1] == ref.audio.shape[:-1], (
+        f"batch/channel shape mismatch: graph={out.audio.shape} eager={ref.audio.shape}"
+    )
