@@ -17,6 +17,7 @@ import numpy as np
 import PIL.Image
 import torch
 from vllm.logger import init_logger
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import (
@@ -46,7 +47,7 @@ from vllm_omni.diffusion.registry import (
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus, DiffusionSchedulerOutput
+from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -76,6 +77,35 @@ def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
     return parameter_name in parameters or any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
     )
+
+
+def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) -> type | None:
+    if custom_pipeline_args is None:
+        return None
+
+    try:
+        pipeline_cls = custom_pipeline_args["pipeline_class"]
+    except KeyError as exc:
+        raise ValueError("custom_pipeline_args must include 'pipeline_class'.") from exc
+
+    if isinstance(pipeline_cls, type):
+        return pipeline_cls
+    if isinstance(pipeline_cls, str):
+        try:
+            return resolve_obj_by_qualname(pipeline_cls)
+        except (AttributeError, ImportError, ValueError) as exc:
+            raise ValueError(f"Failed to resolve custom diffusion pipeline class {pipeline_cls!r}.") from exc
+    raise TypeError(
+        f"custom_pipeline_args['pipeline_class'] must be a qualified name string or a class, "
+        f"got {type(pipeline_cls).__name__}"
+    )
+
+
+def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
+    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
+    if model_cls is None:
+        model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
+    return bool(model_cls is not None and getattr(model_cls, "supports_request_batch", False))
 
 
 def _move_tensor_tree_to_cpu(value: object) -> object:
@@ -137,6 +167,7 @@ class DiffusionEngine:
             StepScheduler() if self.step_execution else RequestScheduler()
         )
         self.scheduler.initialize(od_config)
+        self.supports_request_batch = False if self.step_execution else supports_request_batch(od_config)
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
         self.worker_thread: threading.Thread | None = None
@@ -153,7 +184,12 @@ class DiffusionEngine:
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
-        self.execute_fn = self.executor.execute_step if self.step_execution else self._execute_request_mode
+        if self.step_execution:
+            self.execute_fn = self.executor.execute_step
+        elif self.supports_request_batch:
+            self.execute_fn = self.executor.execute_batch
+        else:
+            self.execute_fn = self.executor.execute_request
 
         try:
             self._dummy_run()
@@ -161,18 +197,6 @@ class DiffusionEngine:
             logger.error(f"Dummy run failed: {e}")
             self.close()
             raise e
-
-    def _execute_request_mode(self, sched_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        """Dispatch request-mode execution by the number of scheduled requests.
-
-        When more than one request is scheduled in a cycle, send the whole batch
-        to the workers in a single RPC (``execute_batch``); otherwise fall back to
-        the per-request path (``execute_request``). This keeps single-request and
-        dummy-run traffic on the original path while batching multi-request cycles.
-        """
-        if sched_output.num_scheduled_reqs > 1:
-            return self.executor.execute_batch(sched_output)
-        return self.executor.execute_request(sched_output)
 
     async def _check_and_start_background_loop(self):
         if self._closed:

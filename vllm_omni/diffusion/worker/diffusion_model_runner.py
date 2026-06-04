@@ -356,9 +356,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         Builds a ``RequestBatch`` from the scheduled new requests, runs per-
         request setup (KV transfer, generator, cache), then calls
-        ``pipeline.forward(batch)``.  For pipelines that do not declare
-        ``supports_request_batch = True`` the batch is split into single-
-        request calls automatically.
+        ``pipeline.forward(batch)``.  Only pipelines that declare
+        ``supports_request_batch = True`` should reach this path; the engine
+        routes non-batch pipelines through per-request execution.
         """
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
@@ -407,13 +407,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
                 with record_function("pipeline_forward_batch"):
-                    if getattr(self.pipeline, "supports_request_batch", False):
-                        outputs = self.pipeline.forward(batch)
-                    else:
-                        outputs = []
-                        for req in reqs:
-                            single_batch = RequestBatch(requests=[req])
-                            outputs.extend(self.pipeline.forward(single_batch))
+                    if not getattr(self.pipeline, "supports_request_batch", False):
+                        raise RuntimeError(f"{type(self.pipeline).__name__} does not support request-batch forward.")
+                    outputs = self.pipeline.forward(batch)
 
             if is_primary and outputs:
                 self._record_peak_memory(outputs[0])

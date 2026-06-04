@@ -92,7 +92,7 @@ def _make_engine(num_gpus: int = 1):
     engine._loop_started = False
     engine._rpc_queue = queue.Queue()
     engine.abort_queue = queue.Queue()
-    engine.execute_fn = engine._execute_request_mode
+    engine.execute_fn = executor.execute_request
     return engine, executor, req_q, res_q
 
 
@@ -215,42 +215,35 @@ def _make_sched_output(*request_ids: str) -> DiffusionSchedulerOutput:
 
 
 class TestRequestModeDispatch:
-    """``_execute_request_mode`` routes by the number of scheduled requests."""
+    """Request-batch-capable dispatch uses ``execute_batch`` for request-mode cycles."""
 
-    def test_single_request_uses_execute_request(self):
+    @pytest.mark.parametrize("request_ids", [("solo",), ("A", "B", "C")])
+    def test_request_batch_capable_pipeline_uses_execute_batch(self, request_ids):
         engine, executor, _, _ = _make_engine()
         executor.execute_request = Mock(return_value="per-request")
         executor.execute_batch = Mock(return_value="batch")
+        engine.execute_fn = executor.execute_batch
 
-        out = engine.execute_fn(_make_sched_output("solo"))
+        out = engine.execute_fn(_make_sched_output(*request_ids))
 
-        assert out == "per-request"
-        executor.execute_request.assert_called_once()
-        executor.execute_batch.assert_not_called()
-
-    def test_multi_request_uses_execute_batch(self):
-        engine, executor, _, _ = _make_engine()
-        executor.execute_request = Mock(return_value="per-request")
-        executor.execute_batch = Mock(return_value="batch")
-
-        out = engine.execute_fn(_make_sched_output("A", "B", "C"))
-
-        assert out == "batch"
         executor.execute_batch.assert_called_once()
+        assert out == "batch"
         executor.execute_request.assert_not_called()
 
-    def test_batch_path_routes_results_through_worker(self):
-        """End-to-end: a >1 request cycle goes out as one ``execute_model_batch``
+    @pytest.mark.parametrize("request_ids", [("solo",), ("A", "B")])
+    def test_batch_path_routes_results_through_worker(self, request_ids):
+        """End-to-end: a request-batch cycle goes out as one ``execute_model_batch``
         RPC and comes back as a per-request-routed ``BatchRunnerOutput``."""
         engine, executor, req_q, res_q = _make_engine()
+        engine.execute_fn = executor.execute_batch
         wt = _start_worker(req_q, res_q, count=1)
 
-        out = engine.execute_fn(_make_sched_output("A", "B"))
+        out = engine.execute_fn(_make_sched_output(*request_ids))
         wt.join(5)
 
         assert isinstance(out, BatchRunnerOutput)
         results = {ro.request_id: ro.result.error for ro in out.runner_outputs}
-        assert results == {"A": "result_for_A", "B": "result_for_B"}
+        assert results == {request_id: f"result_for_{request_id}" for request_id in request_ids}
 
 
 # ───────────────── concurrent collective RPC ─────────────────

@@ -356,8 +356,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         """Single RPC with DiffusionSchedulerOutput for request-mode batch.
 
         Worker builds RequestBatch internally and calls pipeline.forward(batch).
-        Used when more than one request is scheduled in a cycle so the whole
-        batch crosses the process boundary in one RPC instead of one-per-request.
+        Used for request-batch-capable pipelines, including single-request
+        cycles, so request-mode execution consistently uses execute_model_batch.
         """
         from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 

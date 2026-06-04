@@ -126,6 +126,12 @@ class _BatchPipeline:
         return list(self._outputs)
 
 
+class _SingleRequestPipeline:
+    def forward(self, batch):
+        del batch
+        return [SimpleNamespace(output="single")]
+
+
 def _make_batch_runner(pipeline):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
@@ -187,6 +193,20 @@ def test_execute_model_batch_routes_one_output_per_request(monkeypatch):
     assert result.runner_outputs[0].result.output == "a"
     assert result.runner_outputs[1].request_id == "req-1"
     assert result.runner_outputs[1].result.output == "b"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_batch_rejects_pipeline_without_request_batch_support(monkeypatch):
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(
+        model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
+    )
+    runner = _make_batch_runner(_SingleRequestPipeline())
+    sched = _make_scheduler_output(num_reqs=2)
+
+    with pytest.raises(RuntimeError, match="does not support request-batch forward"):
+        DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
 
 
 @pytest.mark.core_model
