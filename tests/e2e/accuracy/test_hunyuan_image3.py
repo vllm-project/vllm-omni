@@ -266,11 +266,11 @@ _NPU_DIT_CONFIG = {
             "gpu_memory_utilization": 0.65,
             "enforce_eager": True,
             "trust_remote_code": True,
-            "devices": "0,1,2,3",
+            "devices": "0,1,2,3,4,5,6,7",
             "distributed_executor_backend": "mp",
             "max_num_batched_tokens": 8192,
             "parallel_config": {
-                "tensor_parallel_size": 4,
+                "tensor_parallel_size": 8,
                 "enable_expert_parallel": False,
                 "sequence_parallel_size": 1,
                 "ulysses_degree": 1,
@@ -351,7 +351,7 @@ def _make_quant_dit_config(path: Path) -> None:
 
 
 def _npu_dit_devices() -> str:
-    return os.environ.get(NPU_DIT_DEVICES_ENV, "0,1,2,3")
+    return os.environ.get(NPU_DIT_DEVICES_ENV, "0,1,2,3,4,5,6,7")
 
 
 def _npu_dit_tensor_parallel_size() -> int:
@@ -700,7 +700,7 @@ def test_offline_it2i_size_overrides_align_with_online() -> None:
     assert unrelated_params.extra_args == {}
 
 
-def test_npu_dit_config_defaults_to_four_cards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_npu_dit_config_defaults_to_eight_cards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HUNYUAN_IMAGE3_NPU_DIT_DEVICES", raising=False)
     monkeypatch.delenv("HUNYUAN_IMAGE3_NPU_DIT_TP", raising=False)
 
@@ -710,8 +710,8 @@ def test_npu_dit_config_defaults_to_four_cards(tmp_path: Path, monkeypatch: pyte
     stage = config["stages"][0]
 
     assert stage["model_stage"] == "dit"
-    assert stage["devices"] == "0,1,2,3"
-    assert stage["parallel_config"]["tensor_parallel_size"] == 4
+    assert stage["devices"] == "0,1,2,3,4,5,6,7"
+    assert stage["parallel_config"]["tensor_parallel_size"] == 8
     assert stage["parallel_config"]["enable_expert_parallel"] is False
     assert "force_cutlass_fp8" not in stage
     assert "moe_backend" not in stage
@@ -864,7 +864,7 @@ def test_quantized_dit_matches_bf16_accuracy(
 
 @pytest.mark.npu
 @pytest.mark.A2
-@pytest.mark.distributed_npu(num_cards=4)
+@pytest.mark.distributed_npu(num_cards=8)
 @pytest.mark.skipif(
     torch.accelerator.device_count() < _npu_dit_tensor_parallel_size(),
     reason="Needs enough NPUs for HunyuanImage3 NPU DiT tensor parallelism",
@@ -903,7 +903,7 @@ def test_npu_dit_distil_smoke_accuracy(accuracy_artifact_root: Path) -> None:
 
 @pytest.mark.npu
 @pytest.mark.A2
-@pytest.mark.distributed_npu(num_cards=4)
+@pytest.mark.distributed_npu(num_cards=8)
 @pytest.mark.skipif(
     torch.accelerator.device_count() < _npu_dit_tensor_parallel_size(),
     reason="Needs enough NPUs for HunyuanImage3 NPU DiT tensor parallelism",
