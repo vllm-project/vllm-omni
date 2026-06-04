@@ -6,7 +6,7 @@
 
 - Vendor: NVIDIA
 - Model: `nvidia/Cosmos3-Nano`
-- Task: Text-to-image (T2I), text-to-video (T2V), and image-to-video (I2V) generation, with optional synchronized audio (video + sound)
+- Task: Text-to-image (T2I), text-to-video (T2V), and image-to-video (I2V) generation, with optional synchronized audio (video + sound), action policy
 - Mode: Online serving with the OpenAI-compatible image/video APIs, plus offline generation via the `Omni` API
 - Maintainer: Community
 
@@ -23,6 +23,23 @@ the mode is selected per request:
 - **T2VS / I2VS** — add `generate_sound=true` (and optional `sound_duration`) to a
   T2V/I2V `/v1/videos/sync` request to also generate synchronized audio, muxed into
   the mp4 as AAC 48 kHz stereo. See the official model card's "Video + Audio" examples.
+- **Action** — pass `extra_params={"action_mode": ...}` to drive Physical-AI tasks:
+  - `forward_dynamics` — given a first frame **and** an action trajectory, roll out
+    the resulting video. Synchronous: `POST /v1/videos/sync`.
+  - `policy` — given a first frame and a language instruction, **predict** the action
+    trajectory (and a rollout video). Use the async `POST /v1/videos` endpoint and
+    read the predicted action from the top-level `action` field
+    (`{data, shape, dtype, raw_action_dim, domain_id}`).
+
+  Action requests also take `domain_name` (e.g. `av`, `bridge_orig_lerobot`,
+  `droid_lerobot`, `agibotworld`, …; or a numeric `domain_id`), `raw_action_dim`,
+  and `action_chunk_size` (must equal `num_frames` or `num_frames - 1`). For
+  `forward_dynamics` also pass the `action` array. The dedicated policy checkpoint
+  **`nvidia/Cosmos3-Nano-Policy-DROID`** is served the same way
+  (`domain_name=droid_lerobot`).
+
+  `inverse_dynamics` (recover the action from a given video) is supported by the
+  pipeline; **online inference of inverse dynamics will be added in a follow-up MR.**
 
 ## References
 
@@ -144,6 +161,35 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -F "sound_duration=7.875" \
   -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":true}' \
   -o cosmos3_t2v_with_sound.mp4
+
+# Action — forward dynamics (first frame + action trajectory -> rollout video).
+# Synchronous; `action` is a JSON array shaped [action_chunk_size, raw_action_dim].
+curl -sS -X POST http://localhost:8000/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  --form-string "model=nvidia/Cosmos3-Nano" \
+  --form-string "prompt=You are an autonomous vehicle. This video is captured from a first-person perspective." \
+  -F "input_reference=@first_frame.jpg;type=image/jpeg" \
+  -F "size=640x480" -F "num_frames=61" -F "fps=10" \
+  -F "num_inference_steps=30" -F "guidance_scale=1.0" -F "flow_shift=5.0" \
+  --form-string "extra_params={\"action_mode\":\"forward_dynamics\",\"domain_name\":\"av\",\"raw_action_dim\":9,\"action_chunk_size\":60,\"action\":$(cat action.json)}" \
+  -F "seed=0" \
+  -o cosmos3_forward_dynamics.mp4
+
+# Action — policy (first frame + instruction -> predicted action trajectory + video).
+# Asynchronous: POST returns a job id; poll, then read the predicted action from
+# the top-level `action` field ({data, shape, dtype, raw_action_dim, domain_id}).
+VIDEO_ID=$(curl -sS -X POST http://localhost:8000/v1/videos \
+  -H "Accept: application/json" \
+  --form-string "model=nvidia/Cosmos3-Nano" \
+  --form-string "prompt=Pick up the banana and place it in the bowl." \
+  -F "input_reference=@first_frame.jpg;type=image/jpeg" \
+  -F "size=640x480" -F "num_frames=17" -F "fps=5" \
+  -F "num_inference_steps=30" -F "guidance_scale=1.0" -F "flow_shift=5.0" \
+  --form-string 'extra_params={"action_mode":"policy","domain_name":"bridge_orig_lerobot","raw_action_dim":10,"action_chunk_size":16}' \
+  -F "seed=0" | jq -r '.id')
+# poll until status == completed, then:
+curl -sS "http://localhost:8000/v1/videos/$VIDEO_ID" | jq '.action | {shape, dtype, raw_action_dim, domain_id}'
+curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_policy.mp4
 ```
 
 #### Notes
@@ -152,6 +198,7 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   - T2I 1024² — 10 / 25 / 50 steps → ~0.4 / 0.7 / **1.3 s**
   - T2V 1280×720 @ 35 steps — 25 / 49 / 93 / **189** frames → ~7 / 15 / 33 / **~93 s**
   - I2V 1280×720, 189 frames @ 35 steps → ~**99 s**
+  - Action 640×480 @ 30 steps — forward-dynamics 61f ~**4 s**, policy 17f ~**1–3 s**.
   - Guardrails-on overhead: ~8% on T2I, negligible on video.
 - **Memory:** transformer ~17 GiB (bf16); peak ~46 GiB for 720p video on 1 GPU;
   full repo (transformer + Wan VAE + Qwen3-VL vision encoder + audio tokenizer)
@@ -173,8 +220,10 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
     the server fails at pipeline build with a gated-repo / safety-checker error.
   - A guardrail-blocked prompt currently returns HTTP 500
     (`"Guardrail blocked prompt"`).
-  - Action (policy / forward- / inverse-dynamics) modalities are not part of
-    this integration yet.
+  - Action `forward_dynamics` (sync `/v1/videos/sync`) and `policy` (async
+    `/v1/videos`, returns the predicted action under the top-level `action`
+    field) are supported online. **Online inference of inverse dynamics will be
+    added in a follow-up MR.**
 
 ### 1x GPU (Offline generation)
 
