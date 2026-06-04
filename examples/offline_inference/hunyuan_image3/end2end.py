@@ -234,7 +234,15 @@ def main():
 
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
+    need_ratio = None
+    if task in ("it2i", "t2i") and explicit_output_size:
+        need_ratio = False
+    ar_stop_token_ids = resolve_stop_token_ids(
+        task=task,
+        bot_task=bot_task,
+        tokenizer=tokenizer,
+        need_ratio=need_ratio,
+    )
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps

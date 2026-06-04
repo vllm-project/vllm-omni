@@ -146,19 +146,21 @@ def resolve_stop_token_ids(
     task: str = "it2i",
     bot_task: str | None | _DefaultBotTask = _DEFAULT_BOT_TASK,
     tokenizer: Any | None = None,
+    need_ratio: bool | None = None,
 ) -> list[int]:
     """AR stop-token ids for a given (task, bot_task) generation request.
 
-    Image-output tasks (``it2i`` / ``t2i``) stop on any ``<img_ratio_*>``
-    token. Upstream ``modeling_hunyuan_image_3.py::generate_image``
-    (line 3289-3303) sets ``final_stop_tokens`` to the full ratio token
-    range when ``need_ratio`` is true, then strips the trailing ratio
-    token before passing the cot to the image stage. AR's natural
-    trajectory under ``_stage_transitions`` is
-    ``</recaption><answer><boi><img_size_base><img_ratio_X>``; stopping
-    AT the ratio token means KV ends exactly at the prefix DiT reuses,
-    and ``ar2diffusion`` can read the ratio off the last sampled token
-    without AR wasting decode steps on ``<|endoftext|>``.
+    Image-output tasks (``it2i`` / ``t2i``) have two valid upstream stop
+    modes:
+
+    * ``need_ratio=True``: stop on any ``<img_ratio_*>`` token. This
+      matches the official auto-size path, where AR emits the final
+      ratio token and ``ar2diffusion`` derives the target size from it.
+    * ``need_ratio=False``: stop at ``</recaption>`` for recaption-style
+      tasks, or at either ``</think>`` / ``</recaption>`` for think-only
+      tasks. This matches the official fixed-size path, where DiT reads
+      the explicit ``height`` / ``width`` from the prompt instead of
+      requiring AR to emit an image-ratio token.
 
     Text-output tasks (``i2t`` / ``t2t``) stop on ``<answer>`` -- the AR
     is the final stage, and the comprehension response sits inside the
@@ -171,6 +173,13 @@ def resolve_stop_token_ids(
     if bot_task not in _BOT_TASK_PRESETS:
         raise ValueError(f"Unknown bot_task {bot_task!r}. Choose from: {available_bot_tasks()}")
     if task in ("it2i", "t2i"):
+        if need_ratio is False:
+            if bot_task is not None and "recaption" in bot_task:
+                return [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"]]
+            return [
+                HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
+                HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
+            ]
         # Main ratio range: <img_ratio_0> .. <img_ratio_32>.
         start = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_0>"]
         end = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_32>"]

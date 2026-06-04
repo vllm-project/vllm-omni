@@ -414,7 +414,12 @@ def _run_offline(
     token_ids = result.token_ids
     system_prompt_type = result.system_prompt_type
 
-    ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
+    ar_stop_token_ids = resolve_stop_token_ids(
+        task="it2i",
+        bot_task="think_recaption",
+        tokenizer=tokenizer,
+        need_ratio=False,
+    )
     with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path) as runner:
         params_list = list(runner.omni.default_sampling_params_list)
         for sp in params_list:

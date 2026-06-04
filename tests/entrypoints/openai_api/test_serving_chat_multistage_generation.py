@@ -220,11 +220,12 @@ def test_build_multistage_generation_inputs_tokenizer_path_emits_prompt_token_id
         assert img_count == n, f"N={n}: expected {n} <img> token ids in prompt_token_ids, got {img_count}"
 
 
-def test_build_multistage_generation_inputs_sets_hunyuan_image_ratio_stops(serving_chat):
-    """Online HunyuanImage3 image-output requests must stop AR on ratio
-    tokens, matching offline accuracy/end2end paths. Stopping on <answer>
-    ends AR before `<boi><img_size_*><img_ratio_*>`, so ar2diffusion cannot
-    recover `ratio_idx` and online diverges from offline.
+def test_build_multistage_generation_inputs_sets_hunyuan_image_fixed_size_stops(serving_chat):
+    """Fixed-size HunyuanImage3 requests must stop on recaption end.
+
+    This matches the official fixed-size think_recaption path: AR stops at
+    ``</recaption>`` and DiT reads the explicit height/width from the prompt
+    instead of requiring a trailing ``<img_ratio_*>`` token.
     """
     from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_stop_token_ids
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
@@ -264,10 +265,58 @@ def test_build_multistage_generation_inputs_sets_hunyuan_image_ratio_stops(servi
         tokenizer=FakeTokenizer(),
     )
 
-    expected = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=FakeTokenizer())
+    expected = resolve_stop_token_ids(
+        task="it2i",
+        bot_task="think_recaption",
+        tokenizer=FakeTokenizer(),
+        need_ratio=False,
+    )
     assert sampling_params_list[0].stop_token_ids == expected
     assert 128025 not in sampling_params_list[0].stop_token_ids
     assert getattr(sampling_params_list[0], "extra_args", None) in (None, {})
+
+
+def test_build_multistage_generation_inputs_uses_ratio_stops_when_size_is_implicit(serving_chat):
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_stop_token_ids
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeTokenizer:
+        SPECIAL = {
+            "<|startoftext|>": 1,
+            "<img>": 2,
+            "<think>": 3,
+        }
+
+        def convert_tokens_to_ids(self, tok: str) -> int:
+            return self.SPECIAL.get(tok, 0)
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            return list(range(100, 100 + len(text)))
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            {"stage_type": "llm"},
+            {"stage_type": "diffusion", "is_comprehension": False},
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0, stop_token_ids=[128025]),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    images = [Image.new("RGB", (32, 32), color="red") for _ in range(2)]
+
+    _, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="edit me",
+        extra_body={"bot_task": "think_recaption", "sys_type": "en_unified"},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(),
+        tokenizer=FakeTokenizer(),
+    )
+
+    expected = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=FakeTokenizer())
+    assert sampling_params_list[0].stop_token_ids == expected
 
 
 def test_build_multistage_generation_inputs_bot_task_semantic_changes_trigger_and_sys(serving_chat):
