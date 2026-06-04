@@ -18,6 +18,7 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
+      initial_codec_chunk_frames: 4
       codec_chunk_frames: 25
       codec_left_context_frames: 25
 
