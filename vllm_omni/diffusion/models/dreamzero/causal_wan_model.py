@@ -174,11 +174,26 @@ class DistributedRMSNorm(nn.Module):
             raise ValueError(f"RMSNorm shard shape mismatch: param={tuple(param.shape)}, shard={tuple(shard.shape)}.")
         param.data.copy_(shard)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        tp_size = get_tensor_model_parallel_world_size()
+    def _local_sum_sq(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Per-rank float32 activation, local sum-of-squares, and local width."""
         x_float = x.float()
         local_sum_sq = x_float.pow(2).sum(dim=-1, keepdim=True)
-        local_count = x.shape[-1]
+        return x_float, local_sum_sq, x.shape[-1]
+
+    def _scale(
+        self,
+        x_float: torch.Tensor,
+        global_sum_sq: torch.Tensor,
+        global_count: int,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the (already reduced) RMS and the per-rank weight shard."""
+        mean_sq = global_sum_sq / global_count
+        return (x_float * torch.rsqrt(mean_sq + self.eps)).type_as(x) * self.weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tp_size = get_tensor_model_parallel_world_size()
+        x_float, local_sum_sq, local_count = self._local_sum_sq(x)
 
         if tp_size > 1:
             # Use vLLM's collective (custom all-reduce / symmetric-mem fast path
@@ -191,8 +206,45 @@ class DistributedRMSNorm(nn.Module):
             global_sum_sq = local_sum_sq
             global_count = local_count
 
-        mean_sq = global_sum_sq / global_count
-        return (x_float * torch.rsqrt(mean_sq + self.eps)).type_as(x) * self.weight
+        return self._scale(x_float, global_sum_sq, global_count, x)
+
+
+def fused_qk_rms_norm(
+    norm_q: nn.Module,
+    norm_k: nn.Module,
+    q: torch.Tensor,
+    k: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply q/k :class:`DistributedRMSNorm` with a SINGLE fused TP all-reduce.
+
+    WHY: self-attention norms q and k every step; on TP each norm issues its own
+    tiny all-reduce of the per-token sum-of-squares. For DreamZero's decode-like
+    per-step forward these latency-bound micro-collectives dominate, so we pack
+    both sum-of-squares into one tensor and reduce once (2 collectives → 1).
+
+    NUMERICALLY IDENTICAL to ``norm_q(q), norm_k(k)``: all-reduce is elementwise,
+    so packing along the last dim reduces each slice independently with the same
+    fp32 accumulation. Requires q and k to share the same shape (true for
+    self-attention — both come from the same hidden states). Falls back to
+    independent application when either norm is not a DistributedRMSNorm
+    (e.g. nn.Identity when qk_norm=False).
+    """
+    if not (isinstance(norm_q, DistributedRMSNorm) and isinstance(norm_k, DistributedRMSNorm)):
+        return norm_q(q), norm_k(k)
+
+    tp_size = get_tensor_model_parallel_world_size()
+    q_float, q_sum_sq, count = norm_q._local_sum_sq(q)
+    k_float, k_sum_sq, _ = norm_k._local_sum_sq(k)
+
+    if tp_size > 1:
+        packed = torch.cat([q_sum_sq, k_sum_sq], dim=-1)
+        packed = tensor_model_parallel_all_reduce(packed)
+        q_sum_sq, k_sum_sq = packed[..., 0:1], packed[..., 1:2]
+        count = count * tp_size
+
+    q_out = norm_q._scale(q_float, q_sum_sq, count, q)
+    k_out = norm_k._scale(k_float, k_sum_sq, count, k)
+    return q_out, k_out
 
 
 # ── Projections ─────────────────────────────────────────────────────
@@ -434,8 +486,10 @@ class CausalWanSelfAttention(nn.Module):
         """Inference-only forward (KV cache path)."""
         n, d = self.tp_num_heads, self.head_dim
 
-        q = self.norm_q(self.q(x)).unflatten(2, (n, d))
-        k = self.norm_k(self.k(x)).unflatten(2, (n, d))
+        # Fuse q/k qk-norm into a single TP all-reduce (both come from x, same shape).
+        q, k = fused_qk_rms_norm(self.norm_q, self.norm_k, self.q(x), self.k(x))
+        q = q.unflatten(2, (n, d))
+        k = k.unflatten(2, (n, d))
         v = self.v(x).unflatten(2, (n, d))
 
         updated_kv_cache: torch.Tensor | None = None
