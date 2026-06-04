@@ -573,7 +573,9 @@ class HunyuanImage3Pipeline(
         cond_vit_image_embeds = []
         for batch_idx, image in enumerate(cond_vit_images):
             cur_kwargs = {k: v[batch_idx] for k, v in vit_kwargs.items()}
-            image_embed = self.vision_model(image, **cur_kwargs).last_hidden_state
+            # Siglip2VisionTransformer now returns a plain tensor (B, max_patches,
+            # hidden_size) after the vLLM-layers refactor, not an HF-style output.
+            image_embed = self.vision_model(image, **cur_kwargs)
             image_embed = self.vision_aligner(image_embed)
             n, seq_len, dim = image_embed.shape
             image_embed = image_embed.reshape(n * seq_len, dim)

@@ -53,6 +53,9 @@
 {% endif %}
             {{ indented_cmd | safe }}
         priority: 100
+        {% if step.timeout_in_minutes %}
+        timeout_in_minutes: {{ step.timeout_in_minutes }}
+        {% endif %}
         {% if step.grade and step.grade == "Blocking" %}
         soft_fail: false
         {% else %}

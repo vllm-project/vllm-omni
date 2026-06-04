@@ -102,7 +102,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self,
         memory_pool_context_fn: callable | None = None,
         load_format: str | None = None,
-        custom_pipeline_name: str | None = None,
+        custom_pipeline_name: str | type | None = None,
     ) -> None:
         """
         Load the diffusion model, apply compilation and offloading.

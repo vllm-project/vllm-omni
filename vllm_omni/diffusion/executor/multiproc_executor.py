@@ -60,11 +60,11 @@ class BackgroundResources:
             for proc in self.processes:
                 if not proc.is_alive():
                     continue
-                proc.join(30)
+                proc.join(5)
                 if proc.is_alive():
                     logger.warning("Terminating diffusion worker %s after timeout", proc.name)
                     proc.terminate()
-                    proc.join(30)
+                    proc.join(5)
 
 
 class MultiprocDiffusionExecutor(DiffusionExecutor):
