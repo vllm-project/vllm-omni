@@ -748,6 +748,25 @@ def _apply_platform_overrides(
     platform_stages = platform_section.get("stages", [])
     base_by_id = {s.stage_id: s for s in deploy.stages}
 
+    # Apply top-level platform overrides (e.g. async_chunk, connectors)
+    if "async_chunk" in platform_section:
+        deploy.async_chunk = platform_section["async_chunk"]
+    if "connectors" in platform_section:
+        platform_connectors = platform_section["connectors"]
+        if deploy.connectors is None:
+            deploy.connectors = platform_connectors
+        else:
+            for conn_name, conn_val in platform_connectors.items():
+                if conn_name in deploy.connectors and isinstance(deploy.connectors[conn_name], dict) and isinstance(conn_val, dict):
+                    base_extra = deploy.connectors[conn_name].get("extra", {})
+                    override_extra = conn_val.get("extra", {})
+                    merged = {**deploy.connectors[conn_name], **conn_val}
+                    if base_extra and override_extra:
+                        merged["extra"] = {**base_extra, **override_extra}
+                    deploy.connectors[conn_name] = merged
+                else:
+                    deploy.connectors[conn_name] = conn_val
+
     for ps in platform_stages:
         base = base_by_id.get(ps["stage_id"])
         if base is None:

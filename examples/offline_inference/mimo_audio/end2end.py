@@ -200,10 +200,12 @@ def main(args):
         temperature=0.0,
         top_p=1.0,
         top_k=-1,
-        max_tokens=2048,
+        max_tokens=8192,
         seed=SEED,
         logit_bias={},
         repetition_penalty=1.1,
+        stop=["<|eostm|>", "<|im_end|>"],
+        stop_token_ids=[151671, 151645],  # <|eostm|>=151671, <|im_end|>=151645
     )
 
     code2wav_sampling_params = SamplingParams(

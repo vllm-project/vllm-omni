@@ -63,14 +63,18 @@ stages:
 platforms:
   xpu:
     async_chunk: false
+    connectors:
+      connector_of_shared_memory:
+        extra:
+          codec_streaming: false
     stages:
       - stage_id: 0
-        gpu_memory_utilization: 0.95
+        gpu_memory_utilization: 0.9
         enforce_eager: true
         disable_hybrid_kv_cache_manager: true
         enable_prefix_caching: false
         skip_mm_profiling: true
-        max_num_batched_tokens: 8192
+        max_num_batched_tokens: 2048
         max_model_len: 8192
         devices: "0"
         default_sampling_params:
@@ -79,20 +83,20 @@ platforms:
           top_k: 50
           max_tokens: 8192
           seed: 42
-          repetition_penalty: 1.0
+          repetition_penalty: 1.1
       - stage_id: 1
-        gpu_memory_utilization: 0.9
+        gpu_memory_utilization: 0.35
         enforce_eager: true
         disable_hybrid_kv_cache_manager: true
         enable_prefix_caching: false
         skip_mm_profiling: true
         async_scheduling: false
-        max_num_batched_tokens: 2048
-        max_model_len: 2048
+        max_num_batched_tokens: 8192
+        max_model_len: 8192
         devices: "1"
         default_sampling_params:
           temperature: 0.0
           top_p: 1.0
           top_k: -1
-          max_tokens: 2048
+          max_tokens: 1
           seed: 42
