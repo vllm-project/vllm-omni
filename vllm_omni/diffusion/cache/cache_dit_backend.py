@@ -8,7 +8,6 @@ pipelines in vllm-omni, supporting both single and dual-transformer architecture
 """
 
 import functools
-import unittest
 from collections.abc import Callable
 from contextlib import ExitStack
 from typing import Any, Optional
@@ -29,13 +28,6 @@ from vllm_omni.diffusion.data import DiffusionCacheConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
 
 logger = init_logger(__name__)
-
-try:
-    from accelerate import hooks
-
-    _accelerate_is_available = True
-except ImportError:
-    _accelerate_is_available = False
 
 
 # Small helper to centralize cache-dit summaries.
@@ -258,6 +250,12 @@ def enable_cache_for_wan22_s2v(pipeline: Any, cache_config: Any) -> Callable[[in
     the timestep modulation state in ``e`` rather than a second positional
     tensor. CacheDiT Pattern_3 matches that contract: cache hidden states only
     and pass the remaining conditioning through kwargs unchanged.
+
+    The S2V transformer has an ``after_transformer_block`` method that injects
+    audio embeddings after specific layers. The cached blocks wrapper
+    (Wan22S2VCachedBlocks._run_block) calls the original internally, so we
+    permanently replace it with a no-op on the transformer to prevent double
+    injection from the main forward loop.
     """
     db_cache_config = _build_db_cache_config(cache_config)
     calibrator_config = None
@@ -266,10 +264,15 @@ def enable_cache_for_wan22_s2v(pipeline: Any, cache_config: Any) -> Callable[[in
         calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
         logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
 
+    # Save the original after_transformer_block before cache-dit wrapping
+    transformer = pipeline.transformer
+    if hasattr(transformer, "after_transformer_block"):
+        transformer._cache_dit_original_after_transformer_block = transformer.after_transformer_block
+
     Wan22S2VCachedAdapter.apply(
         BlockAdapter(
-            transformer=pipeline.transformer,
-            blocks=[pipeline.transformer.blocks],
+            transformer=transformer,
+            blocks=[transformer.blocks],
             forward_pattern=[ForwardPattern.Pattern_3],
             params_modifiers=[
                 ParamsModifier(cache_config=db_cache_config, calibrator_config=calibrator_config),
@@ -279,6 +282,14 @@ def enable_cache_for_wan22_s2v(pipeline: Any, cache_config: Any) -> Callable[[in
         cache_config=db_cache_config,
         calibrator_config=calibrator_config,
     )
+
+    # Permanently replace after_transformer_block with a no-op.
+    # The cached blocks wrapper (Wan22S2VCachedBlocks._run_block) already calls
+    # the original via _cache_dit_original_after_transformer_block.
+    def _noop_after_transformer_block(block_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+    transformer.after_transformer_block = _noop_after_transformer_block
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context for the S2V transformer."""
@@ -1149,7 +1160,14 @@ class Wan22S2VCachedBlocks(CachedBlocks_Pattern_3_4_5):
 
 
 class Wan22S2VCachedAdapter(CachedAdapter):
-    """CacheDiT adapter that preserves S2V audio injection semantics."""
+    """CacheDiT adapter that uses Wan22S2VCachedBlocks for S2V audio injection.
+
+    Only overrides collect_unified_blocks to use Wan22S2VCachedBlocks (which
+    calls after_transformer_block per-layer internally). The base class
+    mock_transformer handles the forward wrapping — after_transformer_block is
+    permanently replaced with a no-op in enable_cache_for_wan22_s2v() to prevent
+    double injection.
+    """
 
     @classmethod
     def collect_unified_blocks(
@@ -1185,80 +1203,6 @@ class Wan22S2VCachedAdapter(CachedAdapter):
             total_cached_blocks.append(unified_blocks_bind_context)
 
         return total_cached_blocks
-
-    @classmethod
-    def mock_transformer(
-        cls,
-        unified_blocks: dict[str, torch.nn.ModuleList],
-        transformer: torch.nn.Module,
-        blocks_name: list[str],
-        unique_blocks_name: list[str],
-        dummy_blocks_names: list[str],
-        block_adapter: BlockAdapter,
-    ) -> torch.nn.Module:
-        dummy_blocks = torch.nn.ModuleList()
-        original_forward = transformer.forward
-        context_manager = block_adapter.pipe._context_manager
-        transformer._context_manager = context_manager
-        transformer._context_names = unique_blocks_name
-
-        if _accelerate_is_available:
-            _hf_hook: hooks.ModelHook | None = None
-            if getattr(transformer, "_hf_hook", None) is not None:
-                _hf_hook = transformer._hf_hook
-                if hasattr(transformer, "_old_forward"):
-                    logger.warning(
-                        "_hf_hook is not None, so, we have to re-direct transformer's "
-                        f"original_forward({id(original_forward)}) to transformer's "
-                        f"_old_forward({id(transformer._old_forward)})"
-                    )
-                    original_forward = transformer._old_forward
-        else:
-            _hf_hook = None
-
-        if hasattr(transformer, "after_transformer_block"):
-            transformer._cache_dit_original_after_transformer_block = transformer.after_transformer_block
-
-        def _skip_after_transformer_block(block_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
-            return hidden_states
-
-        def new_forward(self, *args, **kwargs):
-            with ExitStack() as stack:
-                for name, context_name in zip(blocks_name, unique_blocks_name):
-                    stack.enter_context(unittest.mock.patch.object(self, name, unified_blocks[context_name]))
-                for dummy_name in dummy_blocks_names:
-                    stack.enter_context(unittest.mock.patch.object(self, dummy_name, dummy_blocks))
-                if hasattr(self, "after_transformer_block"):
-                    stack.enter_context(
-                        unittest.mock.patch.object(self, "after_transformer_block", _skip_after_transformer_block)
-                    )
-                outputs = original_forward(*args, **kwargs)
-
-                if context_manager.persistent_context and context_manager.is_pre_refreshed():
-                    cls.apply_stats_hooks(block_adapter)
-
-            return outputs
-
-        def new_forward_with_hf_hook(self, *args, **kwargs):
-            if _hf_hook is not None and hasattr(_hf_hook, "pre_forward"):
-                args, kwargs = _hf_hook.pre_forward(self, *args, **kwargs)
-
-            outputs = new_forward(self, *args, **kwargs)
-
-            if _hf_hook is not None and hasattr(_hf_hook, "post_forward"):
-                outputs = _hf_hook.post_forward(self, outputs)
-
-            return outputs
-
-        transformer.forward = functools.update_wrapper(
-            functools.partial(new_forward_with_hf_hook, transformer),
-            new_forward_with_hf_hook,
-        )
-
-        transformer._original_forward = original_forward
-        transformer._is_cached = True
-
-        return transformer
 
 
 class BagelCachedAdapter(CachedAdapter):
