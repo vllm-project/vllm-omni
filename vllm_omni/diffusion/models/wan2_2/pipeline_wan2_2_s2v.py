@@ -482,7 +482,9 @@ class Wan22S2VPipeline(
     _DEFAULT_MOTION_FRAMES = 73
     _DEFAULT_INFER_FRAMES = 80
     _DEFAULT_FPS = 16
-    dummy_num_frames: ClassVar[int] = 4
+    dummy_num_frames: ClassVar[int] = 81
+    dummy_run_height: ClassVar[int] = 480
+    dummy_run_width: ClassVar[int] = 832
 
     def __init__(
         self,
@@ -930,21 +932,19 @@ class Wan22S2VPipeline(
     def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
         """Forward pass through the S2V transformer to predict noise.
 
-        The S2V model returns a list of tensors (one per batch element).
-        We take the first element since S2V processes one sample at a time.
+        With return_dict=False, the model returns (output,) where output is [B, C, T, H, W].
+        We squeeze batch dim since S2V processes one sample at a time.
         """
         if current_model is None:
             current_model = self.transformer
-        # WanModel_S2V's norm layers compute in float32; autocast ensures
-        # the float32→bfloat16 casts happen automatically (matching the
-        # original Wan2.2 inference path).
         param_dtype = next(current_model.parameters()).dtype
         with torch.amp.autocast(self.device.type, dtype=param_dtype):
             result = current_model(**kwargs)
-        # WanModel_S2V.forward returns a list of tensors
         if isinstance(result, list):
             return result[0]
-        return result[0] if isinstance(result, tuple) else result
+        if isinstance(result, tuple):
+            return result[0].squeeze(0)
+        return result.sample.squeeze(0)
 
     def diffuse(
         self,
@@ -997,32 +997,29 @@ class Wan22S2VPipeline(
                 latent_model_input = [latents.to(device)]
                 timestep = t.unsqueeze(0).to(device) if t.dim() == 0 else t.to(device)
 
-                # -- Positive (conditional) prediction kwargs --
                 positive_kwargs = {
-                    "x": latent_model_input,
-                    "t": timestep,
-                    "context": prompt_embeds[0:1],
-                    "seq_len": max_seq_len,
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": prompt_embeds[0:1],
                     "cond_states": cond_latents,
                     "motion_latents": input_motion_latents,
                     "ref_latents": ref_latents,
-                    "motion_frames": motion_frames,
                     "drop_motion_frames": drop_first_motion,
-                    "audio_emb": positive_audio_emb,
+                    "encoder_hidden_states_audio": positive_audio_emb,
+                    "return_dict": False,
                 }
 
                 if do_true_cfg:
                     negative_kwargs = {
-                        "x": latent_model_input,
-                        "t": timestep,
-                        "context": negative_prompt_embeds[0:1],
-                        "seq_len": max_seq_len,
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep,
+                        "encoder_hidden_states": negative_prompt_embeds[0:1],
                         "cond_states": cond_latents,
                         "motion_latents": input_motion_latents,
                         "ref_latents": ref_latents,
-                        "motion_frames": motion_frames,
                         "drop_motion_frames": drop_first_motion,
-                        "audio_emb": negative_audio_emb,
+                        "encoder_hidden_states_audio": negative_audio_emb,
+                        "return_dict": False,
                     }
                 else:
                     negative_kwargs = None
@@ -1175,7 +1172,7 @@ class Wan22S2VPipeline(
         ref_latents = self.encode_ref_image(image, height, width, device=device).to(dtype=dtype)
 
         # ---- 4. Initial motion latents (zeros) ----
-        motion_frames = self.motion_frames
+        motion_frames = min(self.motion_frames, infer_frames - 1)
         motion_pixels = torch.zeros(
             [1, 3, motion_frames, height, width],
             dtype=dtype,
@@ -1289,6 +1286,10 @@ class Wan22S2VPipeline(
             )
 
             # ---- Decode this clip ----
+            if self.od_config.enable_cpu_offload:
+                self.transformer.to("cpu")
+                current_omni_platform.empty_cache()
+
             latents_for_decode = latents.unsqueeze(0)  # [1, C, T, H, W]
             if not (drop_first_motion and r == 0):
                 decode_latents = torch.cat([motion_latents, latents_for_decode], dim=2)
