@@ -7,9 +7,10 @@
 # references stay in the yaml unconditionally; the runtime only activates
 # them when ``async_chunk: true``.
 #
-# enforce_eager=true everywhere:
-#   * Stage 0 (talker) — cudagraph not verified on this checkpoint.
-#   * Stage 1 (code2wav) — CUDA graphs don't work with dynamic conv shapes.
+# enforce_eager:
+#   * Stage 0 (talker) — enforce_eager: false (CUDA graphs enabled).
+#   * Stage 1 (code2wav) — enforce_eager: true (CUDA graphs don't work with
+#     dynamic conv shapes).
 async_chunk: true
 dtype: float32
 
