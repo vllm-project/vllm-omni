@@ -137,6 +137,11 @@ class OmniPlatform(Platform):
         return "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
 
     @classmethod
+    def diffusion_worker_vllm_config_context(cls):
+        """Context for constructing worker-local diffusion VllmConfig objects."""
+        return nullcontext()
+
+    @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
         raise NotImplementedError
 

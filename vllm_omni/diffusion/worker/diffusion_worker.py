@@ -144,14 +144,16 @@ def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDi
         config_kwargs["additional_config"] = od_config.additional_config
 
     try:
-        return VllmConfig(**config_kwargs)
+        with current_omni_platform.diffusion_worker_vllm_config_context():
+            return VllmConfig(**config_kwargs)
     except TypeError as exc:
         if not _is_unexpected_additional_config_type_error(exc):
             raise
 
         logger.debug("Worker-local VllmConfig does not accept additional_config in constructor: %s", exc)
         config_kwargs.pop("additional_config", None)
-        vllm_config = VllmConfig(**config_kwargs)
+        with current_omni_platform.diffusion_worker_vllm_config_context():
+            vllm_config = VllmConfig(**config_kwargs)
         try:
             setattr(vllm_config, "additional_config", dict(od_config.additional_config))
         except Exception as set_exc:  # pragma: no cover - defensive for older vLLM builds

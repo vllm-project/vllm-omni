@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -167,6 +167,18 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 
         return ACLGraphWrapper
+
+    @classmethod
+    @contextmanager
+    def diffusion_worker_vllm_config_context(cls):
+        import vllm_ascend.platform as ascend_platform
+
+        original_refresh_block_size = ascend_platform.refresh_block_size
+        ascend_platform.refresh_block_size = lambda vllm_config: None
+        try:
+            yield
+        finally:
+            ascend_platform.refresh_block_size = original_refresh_block_size
 
     @classmethod
     def set_forward_context(
