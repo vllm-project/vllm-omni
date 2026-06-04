@@ -23,8 +23,8 @@ from vllm_omni.entrypoints.openai.realtime.world.camera_serving import ServingRe
 from vllm_omni.entrypoints.openai.video_api_utils import _normalize_frames
 
 logger = init_logger(__name__)
-_DEFAULT_IDLE_TIMEOUT = 30.0
-CHUNK_FRAMES = 4
+_DEFAULT_IDLE_TIMEOUT = 300.0
+DEFAULT_FRAMES_PER_CHUNK = 4
 
 
 def _get_msgpack_numpy() -> Any:
@@ -118,6 +118,10 @@ class WorldCameraRealtimeConnection:
                     else:
                         result = await self.serving.infer(req)
 
+                        extra_body: dict = req.get("extra_body", {})
+
+                        frames_per_chunk = extra_body.get("frames_per_chunk", DEFAULT_FRAMES_PER_CHUNK)
+
                         if (
                             len(result.images) == 1
                             and isinstance(result.images[0], tuple)
@@ -137,9 +141,9 @@ class WorldCameraRealtimeConnection:
 
                         frames = _normalize_frames(frames)
 
-                        total = (len(frames) + CHUNK_FRAMES - 1) // CHUNK_FRAMES
+                        total = (len(frames) + frames_per_chunk - 1) // frames_per_chunk
                         for i in range(total):
-                            chunk = frames[i * CHUNK_FRAMES : (i + 1) * CHUNK_FRAMES]
+                            chunk = frames[i * frames_per_chunk : (i + 1) * frames_per_chunk]
                             await self.websocket.send_bytes(
                                 _pack(
                                     {

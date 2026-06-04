@@ -154,8 +154,6 @@ def find_lingbot_world_fast_assets() -> LingbotWorldFastAssets | None:
     weights = find_lingbot_world_fast_weights()
     camera = find_lingbot_world_fast_camera_dir()
     image = find_lingbot_world_fast_image()
-    with open("output.txt", "w+") as f:
-        f.write(f"{weights is None} {camera is None} {image is None}")
     if not (weights and camera and image):
         return None
     return LingbotWorldFastAssets(weights_path=weights, camera_dir=camera, image_path=image)

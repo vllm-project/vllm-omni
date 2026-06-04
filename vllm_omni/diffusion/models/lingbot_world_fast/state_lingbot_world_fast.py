@@ -162,23 +162,17 @@ class LingbotWorldFastState:
                     dim=2,
                 )
 
-    def update_kv_cache(
-        self,
-        layer_index: int,
-        updated_kv: torch.Tensor,
-        is_negative: bool = False,
-    ) -> None:
+    def update_kv_cache(self, layer_index: int, updated_kv: torch.Tensor) -> None:
         """Update a single layer's KV cache after prefill."""
-        cache = self.kv_cache_neg if is_negative else self.kv_cache
-        assert cache is not None, "KV caches not initialized, call create_kv_caches first"
-        cache[layer_index] = updated_kv.clone()
+        assert self.kv_cache is not None, "KV caches not initialized, call create_kv_caches first"
+        self.kv_cache[layer_index] = updated_kv.clone()
 
-    def get_kv_caches(self) -> list[torch.Tensor]:
+    def get_kv_cache(self) -> list[torch.Tensor]:
         """Get KV caches for the specified branch."""
         assert self.kv_cache is not None, "KV caches not initialized"
         return self.kv_cache
 
-    def get_crossattn_caches(self, is_negative: bool = False) -> list[dict[str, bool | torch.Tensor | None]]:
+    def get_crossattn_caches(self) -> list[dict[str, bool | torch.Tensor | None]]:
         """Get cross-attention caches for the specified branch."""
         assert self.crossattn_cache is not None, "Cross-attn caches not initialized"
         return self.crossattn_cache

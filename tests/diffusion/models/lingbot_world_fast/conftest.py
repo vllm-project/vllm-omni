@@ -143,10 +143,17 @@ def make_stubbed_pipeline(
         device = torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu", 0)
 
     parallel_config = SimpleNamespace(world_size=1)
+    patch_size = [1, 2, 2]
+    vae_stride = [4, 8, 8]
+
     od_config = SimpleNamespace(
         model="stub/Lingbot-World-Fast",
         parallel_config=parallel_config,
         dtype=target_dtype,
+        model_config={
+            "latent_frames_per_chunk": 3,
+            "max_area": 64 * 64,
+        },
     )
 
     pipeline = object.__new__(LingbotWorldFastPipeline)
@@ -161,13 +168,12 @@ def make_stubbed_pipeline(
     pipeline.state = LingbotWorldFastState()
     pipeline.text_encoder = StubT5Encoder(dim=dim, dtype=target_dtype)
     pipeline.vae = StubVAE()
-    pipeline.vae_stride = CONFIG["vae_stride"]
-    pipeline.patch_size = CONFIG["patch_size"]
+    pipeline.vae_stride = vae_stride
+    pipeline.patch_size = patch_size
     pipeline.model = StubWanModelFast(dim=dim, num_heads=num_heads, num_layers=num_layers).to(device)
     pipeline.scheduler = FlowUniPCMultistepScheduler(
         num_train_timesteps=CONFIG["num_train_timesteps"],
         shift=1,
         use_dynamic_shifting=False,
     )
-    pipeline.sample_neg_prompt = CONFIG["negative_prompt_sample"]
     return pipeline

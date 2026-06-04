@@ -14,7 +14,10 @@ import numpy as np
 import pytest
 
 from tests.diffusion.models.lingbot_world_fast.conftest import make_dummy_camera_inputs
-from vllm_omni.entrypoints.openai.realtime.world.camera_connection import CHUNK_FRAMES, WorldCameraRealtimeConnection
+from vllm_omni.entrypoints.openai.realtime.world.camera_connection import (
+    DEFAULT_FRAMES_PER_CHUNK,
+    WorldCameraRealtimeConnection,
+)
 from vllm_omni.entrypoints.openai.realtime.world.camera_serving import (
     CameraServerConfig,
     ServingRealtimeWorldCamera,
@@ -96,7 +99,7 @@ class FakeEngineClient:
     def __init__(self, frames: np.ndarray | None = None) -> None:
         if frames is None:
             # Default: CHUNK_FRAMES*(1+1/2) RGB frames so we exercise the chunk split.
-            frames = np.zeros((CHUNK_FRAMES * 3 // 2, 16, 16, 3), dtype=np.uint8)
+            frames = np.zeros((DEFAULT_FRAMES_PER_CHUNK * 3 // 2, 16, 16, 3), dtype=np.uint8)
         self._frames = frames
         self.calls: list[dict[str, Any]] = []
         self.fail_with: Exception | None = None
@@ -231,7 +234,7 @@ def test_reset_endpoint_clears_session_and_returns_text_ack() -> None:
 
 
 def test_infer_frames_are_chunked() -> None:
-    num_frames = CHUNK_FRAMES * 3 // 2
+    num_frames = DEFAULT_FRAMES_PER_CHUNK * 3 // 2
 
     frames = np.arange(num_frames * 4 * 4 * 3, dtype=np.uint8).reshape(num_frames, 4, 4, 3)
     engine_client = FakeEngineClient(frames=frames)
@@ -254,8 +257,8 @@ def test_infer_frames_are_chunked() -> None:
     assert [c["index"] for c in chunks] == [0, 1]
     assert {c["total"] for c in chunks} == {2}
 
-    assert len(chunks[0]["video"]) == CHUNK_FRAMES
-    assert len(chunks[1]["video"]) == num_frames - CHUNK_FRAMES
+    assert len(chunks[0]["video"]) == DEFAULT_FRAMES_PER_CHUNK
+    assert len(chunks[1]["video"]) == num_frames - DEFAULT_FRAMES_PER_CHUNK
 
     for chunk in chunks:
         assert chunk["video"][0].shape == (4, 4, 3)

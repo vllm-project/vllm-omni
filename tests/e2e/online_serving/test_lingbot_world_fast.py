@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from vllm_omni.entrypoints.openai.realtime.world.camera_connection import (
-    CHUNK_FRAMES,
+    DEFAULT_FRAMES_PER_CHUNK,
     WorldCameraRealtimeConnection,
 )
 from vllm_omni.entrypoints.openai.realtime.world.camera_serving import ServingRealtimeWorldCamera
@@ -151,8 +151,8 @@ def test_camera_session_lifecycle_handshake_infer_reset_infer() -> None:
     # Distinct, non-divisible-by-CHUNK_FRAMES buffer sizes so both calls
     # exercise the boundary case (final chunk shorter than CHUNK_FRAMES) and
     # the fill-value lets us prove chunks aren't swapped between requests.
-    first_frames = np.full((CHUNK_FRAMES * 2 + 1, 8, 8, 3), 3, dtype=np.uint8)
-    second_frames = np.full((CHUNK_FRAMES + 1, 8, 8, 3), 7, dtype=np.uint8)
+    first_frames = np.full((DEFAULT_FRAMES_PER_CHUNK * 2 + 1, 8, 8, 3), 3, dtype=np.uint8)
+    second_frames = np.full((DEFAULT_FRAMES_PER_CHUNK + 1, 8, 8, 3), 7, dtype=np.uint8)
 
     engine_client = _FakeEngineClient(queued_frames=[first_frames, second_frames])
     serving = ServingRealtimeWorldCamera(engine_client=engine_client, model_name="lingbot")
@@ -184,8 +184,8 @@ def test_camera_session_lifecycle_handshake_infer_reset_infer() -> None:
     decoded = [msgpack_numpy.unpackb(b) for b in ws.sent_bytes[1:]]
     frame_chunks = [d for d in decoded if isinstance(d, dict) and d.get("type") == "frame"]
 
-    first_total = (len(first_frames) + CHUNK_FRAMES - 1) // CHUNK_FRAMES
-    second_total = (len(second_frames) + CHUNK_FRAMES - 1) // CHUNK_FRAMES
+    first_total = (len(first_frames) + DEFAULT_FRAMES_PER_CHUNK - 1) // DEFAULT_FRAMES_PER_CHUNK
+    second_total = (len(second_frames) + DEFAULT_FRAMES_PER_CHUNK - 1) // DEFAULT_FRAMES_PER_CHUNK
 
     assert len(frame_chunks) == first_total + second_total, (
         f"Expected {first_total} + {second_total} frame chunks, got {len(frame_chunks)}."
@@ -227,8 +227,8 @@ def test_camera_session_handshake_does_not_repeat_within_connection() -> None:
     """The handshake is sent **once** at connect, even if many infer/reset
     operations follow. Other diffusion clients depend on this invariant to
     avoid double-initialising their config."""
-    first_frames = np.full((CHUNK_FRAMES + 1, 4, 4, 3), 1, dtype=np.uint8)
-    second_frames = np.full((CHUNK_FRAMES + 2, 4, 4, 3), 2, dtype=np.uint8)
+    first_frames = np.full((DEFAULT_FRAMES_PER_CHUNK + 1, 4, 4, 3), 1, dtype=np.uint8)
+    second_frames = np.full((DEFAULT_FRAMES_PER_CHUNK + 2, 4, 4, 3), 2, dtype=np.uint8)
     engine_client = _FakeEngineClient(queued_frames=[first_frames, second_frames])
     serving = ServingRealtimeWorldCamera(engine_client=engine_client, model_name="lingbot")
 

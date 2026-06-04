@@ -16,7 +16,6 @@ from tests.diffusion.models.lingbot_world_fast.conftest import (
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.lingbot_world_fast.pipeline_lingbot_world_fast import (
-    CONFIG,
     get_lingbot_world_fast_post_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -32,12 +31,6 @@ if not torch.cuda.is_available():
         'Lingbot World Fast pipeline requires CUDA (torch.amp.autocast("cuda", …))',
         allow_module_level=True,
     )
-
-
-# Keep the spatial resolution tiny so the KV-cache stays small (frame_seqlen
-# is derived from ``lat_h * lat_w``); the stub pipeline still exercises every
-# size-related code path with full fidelity.
-_TINY_MAX_AREA = 64 * 64
 
 # Default ``num_frames`` argument; the pipeline floors to ``25`` internally on
 # a fresh call (smallest length that maps to a non-empty latent).
@@ -77,7 +70,6 @@ def _build_request(
 @pytest.fixture
 def stubbed_pipeline(monkeypatch):
     """Build a stub-backed pipeline and shrink CONFIG['max_area'] for speed."""
-    monkeypatch.setitem(CONFIG, "max_area", _TINY_MAX_AREA)
     pipeline = make_stubbed_pipeline(
         dim=_DIM,
         num_heads=_NUM_HEADS,
