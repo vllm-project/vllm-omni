@@ -65,6 +65,11 @@ MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
 NUM_INFERENCE_STEPS = 50
 GUIDANCE_SCALE = 2.5
 NPU_GUIDANCE_SCALE = 1.0
+NPU_AR_TEMPERATURE = 0.6
+NPU_AR_TOP_P = 0.95
+NPU_AR_TOP_K = 1024
+NPU_AR_MAX_TOKENS = 2048
+NPU_AR_REPETITION_PENALTY = 1.0
 
 # ============================================================================
 # Constants
@@ -197,10 +202,11 @@ _NPU_DEPLOY_CONFIG = {
             "omni_kv_config": {"need_send_cache": True},
             "output_connectors": {"to_stage_1": "shared_memory_connector"},
             "default_sampling_params": {
-                "temperature": 0.0,
-                "top_p": 1,
-                "top_k": -1,
-                "max_tokens": 8192,
+                "temperature": NPU_AR_TEMPERATURE,
+                "top_p": NPU_AR_TOP_P,
+                "top_k": NPU_AR_TOP_K,
+                "max_tokens": NPU_AR_MAX_TOKENS,
+                "repetition_penalty": NPU_AR_REPETITION_PENALTY,
                 "stop_token_ids": [128025],
                 "detokenize": True,
                 "skip_special_tokens": False,
@@ -431,6 +437,16 @@ def _run_offline(
                 sp.generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
             elif hasattr(sp, "stop_token_ids"):
                 sp.stop_token_ids = ar_stop_token_ids
+                if hasattr(sp, "temperature"):
+                    sp.temperature = NPU_AR_TEMPERATURE
+                if hasattr(sp, "top_p"):
+                    sp.top_p = NPU_AR_TOP_P
+                if hasattr(sp, "top_k"):
+                    sp.top_k = NPU_AR_TOP_K
+                if hasattr(sp, "max_tokens"):
+                    sp.max_tokens = NPU_AR_MAX_TOKENS
+                if hasattr(sp, "repetition_penalty"):
+                    sp.repetition_penalty = NPU_AR_REPETITION_PENALTY
 
         images = download_images(TEST_IMAGE_URLS)
         prompts: list[OmniPromptType] = [
@@ -511,6 +527,11 @@ def _run_online(
                     "sys_type": "en_unified",
                     "bot_task": "think_recaption",
                     "size": "1280x720",
+                    "temperature": NPU_AR_TEMPERATURE,
+                    "top_p": NPU_AR_TOP_P,
+                    "top_k": NPU_AR_TOP_K,
+                    "max_tokens": NPU_AR_MAX_TOKENS,
+                    "repetition_penalty": NPU_AR_REPETITION_PENALTY,
                 },
                 files=[
                     ("image", (f"image_{i}.png", pil_to_png_bytes(img), "image/png")) for i, img in enumerate(images)
@@ -773,6 +794,19 @@ def test_npu_it2i_config_uses_eight_steps(tmp_path: Path) -> None:
     config = yaml.safe_load(config_path.read_text())
 
     assert config["stages"][1]["default_sampling_params"]["num_inference_steps"] == NPU_NUM_INFERENCE_STEPS
+
+
+def test_npu_it2i_config_uses_official_ar_sampling(tmp_path: Path) -> None:
+    config_path = tmp_path / "npu.yaml"
+    _make_npu_config(config_path)
+    config = yaml.safe_load(config_path.read_text())
+    stage0_params = config["stages"][0]["default_sampling_params"]
+
+    assert stage0_params["temperature"] == NPU_AR_TEMPERATURE
+    assert stage0_params["top_p"] == NPU_AR_TOP_P
+    assert stage0_params["top_k"] == NPU_AR_TOP_K
+    assert stage0_params["max_tokens"] == NPU_AR_MAX_TOKENS
+    assert stage0_params["repetition_penalty"] == NPU_AR_REPETITION_PENALTY
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=8)
