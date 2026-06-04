@@ -97,17 +97,10 @@ def _move_tensor_tree_to_cpu(value: object) -> object:
 
 def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
     """Get num_frames for the dummy warmup run. Returns 0 to skip warmup."""
-    from vllm_omni.platforms import current_omni_platform
 
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
         return int(getattr(model_cls, "dummy_run_num_frames"))
-    # XPU + S2V: dummy run leaves stale state (audio_emb, seq_len) that
-    # poisons subsequent real inference. Skip until state cleanup is added.
-    if current_omni_platform.is_xpu() and supports_audio_input:
-        return 0
-    if model_cls is not None and hasattr(model_cls, "dummy_num_frames"):
-        return int(getattr(model_cls, "dummy_num_frames"))
     return 2 if supports_audio_input or supports_audio_output(model_class_name) else 1
 
 
@@ -717,12 +710,6 @@ class DiffusionEngine:
         height = 512
         width = 512
         prompt: OmniTextPrompt = {"prompt": "dummy run"}
-
-        # Allow models to override dummy resolution (e.g. S2V needs widescreen)
-        model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
-        if model_cls is not None:
-            height = getattr(model_cls, "dummy_run_height", height)
-            width = getattr(model_cls, "dummy_run_width", width)
 
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
         if supports_image_input:

@@ -482,9 +482,7 @@ class Wan22S2VPipeline(
     _DEFAULT_MOTION_FRAMES = 73
     _DEFAULT_INFER_FRAMES = 80
     _DEFAULT_FPS = 16
-    dummy_num_frames: ClassVar[int] = 81
-    dummy_run_height: ClassVar[int] = 480
-    dummy_run_width: ClassVar[int] = 832
+    dummy_run_num_frames: ClassVar[int] = 0
 
     def __init__(
         self,
