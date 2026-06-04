@@ -26,7 +26,7 @@ HEIGHT = 1024
 WIDTH = 1024
 PROMPT = "A brown and white dog is running on the grass."
 MEAN_THRESHOLD = 3e-2
-P99_THRESHOLD = 4e-1
+P99_THRESHOLD = 3e-1
 SSIM_THRESHOLD = 0.97
 PSNR_THRESHOLD = 30.0
 
