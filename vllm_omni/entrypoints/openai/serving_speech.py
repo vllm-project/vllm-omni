@@ -64,6 +64,48 @@ from vllm_omni.utils.speaker_cache import (
 
 logger = init_logger(__name__)
 
+_MING_TTS_ADMISSION_DEFAULT_MAX_BATCH = 8
+_MING_TTS_ADMISSION_DEFAULT_WAIT_MS = 15.0
+
+
+def _coerce_int_config(name: str, value: Any, default: int, *, min_value: int | None = None) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using default %d", name, value, default)
+        return default
+    if min_value is not None:
+        parsed = max(min_value, parsed)
+    return parsed
+
+
+def _coerce_float_config(name: str, value: Any, default: float, *, min_value: float | None = None) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using default %s", name, value, default)
+        return default
+    if min_value is not None:
+        parsed = max(min_value, parsed)
+    return parsed
+
+
+def _as_plain_dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        return dict(value)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid speech_admission_config=%r", value)
+        return {}
+
+
 # TTS Configuration
 _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
@@ -255,6 +297,74 @@ def _conditioning_cache_salt(request, tts_params: dict | None = None) -> str:
     return h.hexdigest()[:32]
 
 
+class MingTTSAdmissionGate:
+    def __init__(self, *, max_batch_size: int = 8, max_wait_ms: float = 15.0) -> None:
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.max_wait_s = max(0.0, float(max_wait_ms) / 1000.0)
+        self._queues: dict[tuple, list[asyncio.Future]] = {}
+        self._timers: dict[tuple, asyncio.Task] = {}
+        self._lock = asyncio.Lock()
+        self._next_cohort_id = 0
+
+    async def wait(self, key: tuple | str) -> tuple[int, int]:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        key = (key,) if isinstance(key, str) else key
+        async with self._lock:
+            queue = self._queues.setdefault(key, [])
+            queue.append(future)
+            if len(queue) >= self.max_batch_size:
+                self._release_locked(key)
+            elif key not in self._timers:
+                self._timers[key] = asyncio.create_task(self._release_after_wait(key))
+        try:
+            cohort_id, cohort_size = await future
+        except asyncio.CancelledError:
+            async with self._lock:
+                self._remove_waiter_locked(key, future)
+            raise
+        await asyncio.sleep(0)
+        return cohort_id, cohort_size
+
+    async def _release_after_wait(self, key: tuple) -> None:
+        try:
+            await asyncio.sleep(self.max_wait_s)
+            async with self._lock:
+                self._release_locked(key)
+        except asyncio.CancelledError:
+            return
+
+    def _remove_waiter_locked(self, key: tuple, future: asyncio.Future) -> None:
+        queue = self._queues.get(key)
+        if not queue:
+            return
+        try:
+            queue.remove(future)
+        except ValueError:
+            return
+        if not queue:
+            self._queues.pop(key, None)
+            timer = self._timers.pop(key, None)
+            if timer is not None and timer is not asyncio.current_task() and not timer.done():
+                timer.cancel()
+
+    def _release_locked(self, key: tuple) -> None:
+        queue = self._queues.pop(key, [])
+        timer = self._timers.pop(key, None)
+        if timer is not None and timer is not asyncio.current_task() and not timer.done():
+            timer.cancel()
+        queue = [future for future in queue if not future.cancelled()]
+        if not queue:
+            return
+        cohort_id = self._next_cohort_id
+        self._next_cohort_id += 1
+        logger.debug("MingTTSAdmissionGate releasing cohort=%d size=%d", cohort_id, len(queue))
+        result = (cohort_id, len(queue))
+        for future in queue:
+            if not future.done():
+                future.set_result(result)
+
+
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     _diffusion_mode: bool = False
     _tts_executor: ThreadPoolExecutor | None = None
@@ -439,6 +549,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Batch configuration
         self._batch_max_items: int = getattr(self.engine_client, "tts_batch_max_items", 32)
+        ming_admission_config = self._resolve_ming_tts_admission_config()
+        self._ming_tts_admission_gate = MingTTSAdmissionGate(
+            max_batch_size=ming_admission_config["max_batch_size"],
+            max_wait_ms=ming_admission_config["max_wait_ms"],
+        )
 
         # Load speech tokenizer codec parameters for prompt length estimation
         self._codec_frame_rate: float | None = self._load_codec_frame_rate()
@@ -561,6 +676,33 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if stage.engine_args.model_stage in _TTS_MODEL_STAGES:
                 return stage
         return None
+
+    def _resolve_ming_tts_admission_config(self) -> dict[str, int | float]:
+        """Return Ming TTS admission gate settings from stage config."""
+        raw_config = None
+        if self._tts_stage is not None:
+            raw_config = getattr(self._tts_stage, "speech_admission_config", None)
+            if raw_config is None:
+                yaml_extras = getattr(self._tts_stage, "yaml_extras", None)
+                if isinstance(yaml_extras, dict):
+                    raw_config = yaml_extras.get("speech_admission_config")
+            if raw_config is None and hasattr(self._tts_stage, "get"):
+                raw_config = self._tts_stage.get("speech_admission_config", None)
+        config = _as_plain_dict(raw_config)
+        return {
+            "max_batch_size": _coerce_int_config(
+                "speech_admission_config.max_batch_size",
+                config.get("max_batch_size"),
+                _MING_TTS_ADMISSION_DEFAULT_MAX_BATCH,
+                min_value=1,
+            ),
+            "max_wait_ms": _coerce_float_config(
+                "speech_admission_config.max_wait_ms",
+                config.get("max_wait_ms"),
+                _MING_TTS_ADMISSION_DEFAULT_WAIT_MS,
+                min_value=0.0,
+            ),
+        }
 
     def _detect_tts_model_type(self) -> str | None:
         """Detect TTS model type from the stage's model_stage attribute."""
@@ -2701,6 +2843,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "sigma": 0.25,
             "temperature": 0.0,
         }
+        if request.extra_params:
+            cohort_id = request.extra_params.get("ming_tts_admission_cohort")
+            if cohort_id is not None:
+                additional_information["ming_tts_admission_cohort"] = cohort_id
+                additional_information["ming_tts_admission_cohort_size"] = request.extra_params.get(
+                    "ming_tts_admission_cohort_size", 1
+                )
         if has_spk_emb:
             # Passed as plain float list
             additional_information["spk_emb"] = list(request.speaker_embedding)
@@ -3071,12 +3220,35 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         finally:
             self._discard_ref_audio_artifact_warmup(request_id)
 
+    def _ming_tts_admission_key(self, request: OpenAICreateSpeechRequest) -> tuple | None:
+        if self._tts_model_type != "ming_flash_omni_tts":
+            return None
+        if request.stream or request.ref_audio is not None or request.ref_text is not None:
+            return None
+        if request.voice is not None or request.speaker_embedding is not None:
+            return None
+        return (
+            request.model,
+            request.response_format or "wav",
+            request.instructions or "",
+            request.max_new_tokens or _TTS_MAX_NEW_TOKENS_MAX,
+            request.speed or 1.0,
+        )
+
     async def _generate_audio_bytes(
         self,
         request: OpenAICreateSpeechRequest,
         base64_encode: bool = False,
         request_id: str | None = None,
+        skip_admission: bool = False,
     ) -> tuple[bytes | str, str]:
+        key = None if skip_admission else self._ming_tts_admission_key(request)
+        if key is not None:
+            cohort_id, cohort_size = await self._ming_tts_admission_gate.wait(key)
+            extra_params = dict(request.extra_params or {})
+            extra_params["ming_tts_admission_cohort"] = cohort_id
+            extra_params["ming_tts_admission_cohort_size"] = cohort_size
+            request.extra_params = extra_params
         request_id, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
         artifact_ready = False
 
@@ -3493,7 +3665,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if validation_error is not None:
                 return SpeechBatchItemResult(index=idx, status="error", error=validation_error)
             try:
-                audio_data, media_type = await self._generate_audio_bytes(req, base64_encode=True)
+                audio_data, media_type = await self._generate_audio_bytes(req, base64_encode=True, skip_admission=True)
             except Exception as e:
                 logger.exception("Batch item %d failed: %s", idx, e)
                 return SpeechBatchItemResult(index=idx, status="error", error=str(e))

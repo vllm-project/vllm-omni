@@ -34,6 +34,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 
 logger = init_logger(__name__)
@@ -55,6 +56,48 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 async_chunk=False,
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
+        self._ming_tts_cohort_hold_deadlines: dict[int, float] = {}
+        self._ming_tts_cohort_hold_s = 0.05
+
+    @staticmethod
+    def _get_ming_tts_cohort(request: Request) -> tuple[int, int] | None:
+        try:
+            info = deserialize_additional_information(getattr(request, "additional_information", None))
+        except Exception:
+            return None
+        cohort_id = info.get("ming_tts_admission_cohort")
+        cohort_size = info.get("ming_tts_admission_cohort_size", 1)
+        if cohort_id is None:
+            return None
+        try:
+            cohort_id = int(cohort_id)
+            cohort_size = int(cohort_size)
+        except (TypeError, ValueError):
+            return None
+        if cohort_size <= 1:
+            return None
+        return cohort_id, cohort_size
+
+    def _should_hold_ming_tts_batch(self, request: Request, now: float) -> bool:
+        cohort = self._get_ming_tts_cohort(request)
+        if cohort is None:
+            return False
+        cohort_id, cohort_size = cohort
+        available_slots = max(1, self.max_num_running_reqs - len(self.running))
+        target_size = min(cohort_size, available_slots)
+        waiting_in_cohort = 0
+        for waiting_request in self.waiting:
+            waiting_cohort = self._get_ming_tts_cohort(waiting_request)
+            if waiting_cohort is not None and waiting_cohort[0] == cohort_id:
+                waiting_in_cohort += 1
+        if waiting_in_cohort >= target_size:
+            self._ming_tts_cohort_hold_deadlines.pop(cohort_id, None)
+            return False
+        deadline = self._ming_tts_cohort_hold_deadlines.setdefault(cohort_id, now + self._ming_tts_cohort_hold_s)
+        if now < deadline:
+            return True
+        self._ming_tts_cohort_hold_deadlines.pop(cohort_id, None)
+        return False
 
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
@@ -80,6 +123,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         cached_prompt_token_ids: dict[str, list[int]] = {}
         cached_additional_information: dict[str, dict | None] = {}
+        held_waiting_for_ming_tts_cohort = False
 
         # Temporary queue: preserve waiting order, do not disturb non-diffusion requests
         skipped_waiting_requests = create_request_queue(self.policy)
@@ -172,6 +216,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Uniformly treat as diffusion. A feature flag can be added later
             # via config or request tag.
+            if not scheduled_new_reqs and self._should_hold_ming_tts_batch(request, scheduled_timestamp):
+                held_waiting_for_ming_tts_cohort = True
+                break
 
             # Allocate all input tokens for the request in one shot
             # (allocate 1 placeholder if zero)
@@ -205,7 +252,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.waiting.prepend_requests(skipped_waiting_requests)
 
         # If fast path scheduled none, fall back to the original scheduling
-        if not num_scheduled_tokens:
+        if not num_scheduled_tokens and not held_waiting_for_ming_tts_cohort:
             if self.chunk_transfer_adapter:
                 # Don't fall back: base scheduler doesn't handle async_chunk
                 # requests with empty prompt_token_ids.

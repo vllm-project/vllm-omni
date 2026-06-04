@@ -38,6 +38,12 @@ from .voice_presets import VoicePresetRegistry
 logger = init_logger(__name__)
 
 
+def _resolve_inner_cfm_graph_enabled(config: MingFlashOmniTalkerConfig, enforce_eager: bool) -> bool:
+    if config.enable_cfm_graph is not None:
+        return bool(config.enable_cfm_graph)
+    return not enforce_eager
+
+
 @dataclass(slots=True)
 class _GenerationParams:
     """Resolved sampling / decoding parameters for one forward call."""
@@ -126,7 +132,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         # AudioVAE
         self.audio_vae, self._vae_weight_source = self._init_audio_vae(config, self.talker_dir, model_path)
 
-        self._use_cuda_graphs = not vllm_config.model_config.enforce_eager
+        self._use_cuda_graphs = _resolve_inner_cfm_graph_enabled(config, vllm_config.model_config.enforce_eager)
 
         self.audio_generator = MingAudioGenerator(
             config=self.config,
@@ -309,6 +315,20 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
 
         The full autoregressive generation loop is executed inside this method.
         """
+        graph_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        if not graph_capturing and self._can_use_batched_forward(inputs_embeds, runtime_additional_information):
+            return self._forward_batched_embeddings(inputs_embeds, runtime_additional_information)
+        if (
+            kwargs.get("ming_tts_enable_runner_coalescing")
+            and not graph_capturing
+            and inputs_embeds is None
+            and runtime_additional_information
+            and self._can_batch_additional_info(runtime_additional_information)
+        ):
+            batched = self._build_batched_tts_inputs(runtime_additional_information)
+            if batched is not None:
+                return self._forward_batched_embeddings(batched, runtime_additional_information)
+
         additional_info = self._extract_additional_info(runtime_additional_information)
         params = self._resolve_generation_params(additional_info)
         voice = self._resolve_voice(additional_info)
@@ -321,6 +341,96 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             voice=voice,
         )
         return self._decode_to_output(latents, stream_decode=params.stream_decode)
+
+    def _can_batch_additional_info(self, infos: list[dict]) -> bool:
+        if len(infos) <= 1:
+            return False
+        first_params = self._resolve_generation_params(infos[0] or {})
+        for info in infos:
+            info = info or {}
+            if info.get("prompt_wav_lat") is not None or info.get("prompt_wav_emb") is not None:
+                return False
+            if self._resolve_generation_params(info) != first_params:
+                return False
+        return True
+
+    def _can_use_batched_forward(
+        self,
+        inputs_embeds: torch.Tensor | None,
+        runtime_additional_information: list[dict] | None,
+    ) -> bool:
+        if inputs_embeds is None or inputs_embeds.ndim != 3 or inputs_embeds.shape[0] <= 1:
+            return False
+        infos = runtime_additional_information or []
+        if len(infos) != inputs_embeds.shape[0]:
+            return False
+        first = self._resolve_generation_params(infos[0] or {})
+        first_voice = self._resolve_voice(infos[0] or {})
+        if first_voice.prompt_wav_lat is not None or first_voice.prompt_wav_emb is not None:
+            return False
+        for info in infos[1:]:
+            params = self._resolve_generation_params(info or {})
+            voice = self._resolve_voice(info or {})
+            if params != first:
+                return False
+            if voice.prompt_wav_lat is not None or voice.prompt_wav_emb is not None:
+                return False
+        return True
+
+    def _build_batched_tts_inputs(self, infos: list[dict]) -> torch.Tensor | None:
+        params = self._resolve_generation_params(infos[0] or {})
+        embeds = []
+        lengths = []
+        for info in infos:
+            voice = self._resolve_voice(info or {})
+            if voice.prompt_wav_lat is not None or voice.prompt_wav_emb is not None:
+                return None
+            spk_emb = self._project_spk_emb(voice.spk_emb, voice.already_projected, params.use_zero_spk_emb)
+            text = (info or {}).get("text", "")
+            segments = segment_and_normalize(text, max_length=params.max_text_length) if text else []
+            segment = segments[0] if segments else text
+            emb, _ = build_tts_input(
+                tokenizer=self.tokenizer,
+                embed_tokens=self.model.get_input_embeddings(),
+                device=self.device,
+                dtype=torch.bfloat16,
+                text=segment,
+                prompt=params.prompt,
+                spk_emb=spk_emb,
+                instruction=params.instruction,
+                prompt_text=voice.prompt_text,
+                prompt_wav_emb=voice.prompt_wav_emb,
+            )
+            embeds.append(emb[0])
+            lengths.append(emb.shape[1])
+        max_len = max(lengths)
+        padded = []
+        for emb in embeds:
+            if emb.shape[0] < max_len:
+                pad = torch.zeros(max_len - emb.shape[0], emb.shape[1], device=emb.device, dtype=emb.dtype)
+                emb = torch.cat([pad, emb], dim=0)
+            padded.append(emb)
+        return torch.stack(padded, dim=0)
+
+    def _forward_batched_embeddings(
+        self,
+        inputs_embeds: torch.Tensor,
+        runtime_additional_information: list[dict] | None,
+    ) -> OmniOutput:
+        infos = runtime_additional_information or []
+        params = self._resolve_generation_params(infos[0] or {})
+        logger.debug(
+            "Ming batched forward activated: batch_size=%d seq_len=%d", inputs_embeds.shape[0], inputs_embeds.shape[1]
+        )
+        latents_by_request = self.audio_generator.generate_latents_batch(
+            inputs_embeds=inputs_embeds,
+            max_steps=params.max_steps,
+            cfg=params.cfg,
+            sigma=params.sigma,
+            temperature=params.temperature,
+            use_static_cache=params.use_static_cache,
+        )
+        return self._decode_batch_to_output(latents_by_request, stream_decode=params.stream_decode)
 
     @staticmethod
     def _extract_additional_info(
@@ -352,6 +462,8 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             temperature = additional_info.get("temperature", 0.0)
             max_steps = int(additional_info.get("max_steps", additional_info.get("max_decode_steps", 200)))
 
+        default_stream_decode = not bool(self.config.enable_full_vae_decode)
+
         return _GenerationParams(
             prompt=prompt,
             instruction=instruction,
@@ -362,7 +474,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             use_zero_spk_emb=use_zero_spk_emb,
             max_text_length=int(additional_info.get("max_text_length", 50)),
             use_static_cache=bool(additional_info.get("use_static_cache", True)),
-            stream_decode=bool(additional_info.get("stream_decode", True)),
+            stream_decode=bool(additional_info.get("stream_decode", default_stream_decode)),
         )
 
     def _resolve_voice(self, additional_info: dict[str, Any]) -> _VoiceContext:
@@ -477,6 +589,53 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 )
             )
         return all_latents
+
+    def decode_batch_latents_for_runner(
+        self, latents_by_request: list[list[torch.Tensor]], *, stream_decode: bool
+    ) -> tuple[list[Any], int]:
+        sample_rate = int(self.audio_vae.config.sample_rate) if self.audio_vae is not None else 24000
+        batch_vae_min_batch = max(1, int(self.config.batch_vae_min_batch))
+        if self.audio_vae is not None and not stream_decode and len(latents_by_request) >= batch_vae_min_batch:
+            joined = [torch.cat(latents, dim=1) for latents in latents_by_request]
+            if joined and all(x.shape == joined[0].shape for x in joined):
+                batch_latents = torch.cat(joined, dim=0)
+                waveform, _, _ = self.audio_vae.decode(
+                    batch_latents,
+                    use_cache=False,
+                    stream_state=(None, None, None),
+                    last_chunk=True,
+                )
+                waveform_cpu = waveform.detach().float().cpu()
+                return [
+                    self.audio_generator.trim_trailing_silence(waveform_cpu[i : i + 1])
+                    for i in range(waveform_cpu.shape[0])
+                ], sample_rate
+
+        outputs = []
+        for latents in latents_by_request:
+            out = self._decode_to_output(latents, stream_decode=stream_decode).multimodal_outputs
+            outputs.append(out.get("audio", out.get("audio_latents")))
+            sr = out.get("sr")
+            if sr is not None:
+                sample_rate = int(sr.item()) if hasattr(sr, "item") else int(sr)
+        return outputs, sample_rate
+
+    def _decode_batch_to_output(
+        self, latents_by_request: list[list[torch.Tensor]], *, stream_decode: bool
+    ) -> OmniOutput:
+        outputs = []
+        sample_rate = None
+        for latents in latents_by_request:
+            out = self._decode_to_output(latents, stream_decode=stream_decode).multimodal_outputs
+            if "audio" in out:
+                outputs.append(out["audio"])
+                sample_rate = out.get("sr")
+            elif "audio_latents" in out:
+                outputs.append(out["audio_latents"])
+        multimodal_outputs: dict[str, Any] = {"audio": outputs}
+        if sample_rate is not None:
+            multimodal_outputs["sr"] = sample_rate
+        return OmniOutput(text_hidden_states=None, multimodal_outputs=multimodal_outputs)
 
     def _decode_to_output(self, latents: list[torch.Tensor], *, stream_decode: bool) -> OmniOutput:
         multimodal_outputs: dict[str, Any] = {}

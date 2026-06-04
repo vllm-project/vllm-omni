@@ -451,6 +451,7 @@ class StageDeployConfig:
     input_connectors: dict[str, str] | None = None
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
+    speech_admission_config: dict[str, Any] | None = None
 
     # === vLLM EngineArgs fields ===
     # Parallelism and scheduler/memory capacity.
@@ -534,6 +535,7 @@ _STAGE_RESERVED_KEYS = frozenset(
         "output_connectors",
         "input_connectors",
         "default_sampling_params",
+        "speech_admission_config",
         "engine_extras",
         "engine_args",
         "runtime",
@@ -575,11 +577,14 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
+    kwargs["speech_admission_config"] = stage_data.get("speech_admission_config")
     kwargs["engine_extras"] = flat_args
     return StageDeployConfig(**kwargs)
 
 
-_DEEP_MERGE_KEYS = frozenset({"default_sampling_params", "subtalker_sampling_params", "engine_extras", "engine_args"})
+_DEEP_MERGE_KEYS = frozenset(
+    {"default_sampling_params", "subtalker_sampling_params", "speech_admission_config", "engine_extras", "engine_args"}
+)
 
 
 def _deep_merge_stage(base: dict, overlay: dict) -> dict:
@@ -891,6 +896,8 @@ def _build_extras(
         extras["output_connectors"] = dict(ds.output_connectors)
     if ds is not None and ds.input_connectors:
         extras["input_connectors"] = dict(ds.input_connectors)
+    if ds is not None and ds.speech_admission_config:
+        extras["speech_admission_config"] = dict(ds.speech_admission_config)
     if ps.prompt_expand_func:
         extras["prompt_expand_func"] = ps.prompt_expand_func
     if ps.cfg_kv_collect_func:

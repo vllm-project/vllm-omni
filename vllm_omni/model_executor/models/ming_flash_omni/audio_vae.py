@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from threading import Lock
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +17,10 @@ from transformers.utils import is_flash_attn_2_available
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _record_function(name: str):
+    return nullcontext()
 
 
 class AudioVAEConfig(PretrainedConfig):
@@ -73,38 +80,44 @@ class ISTFT(nn.Module):
             raise ValueError("Padding must be 'center' or 'same'.")
 
         B, N, T = spec.shape
-        ifft = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
-        ifft = ifft * self.window[None, :, None]
+        with _record_function("ming.vae.istft.irfft"):
+            ifft = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
+        with _record_function("ming.vae.istft.window_mul"):
+            ifft = ifft * self.window[None, :, None]
 
         output_size = (T - 1) * self.hop_length + self.win_length
-        y = torch.nn.functional.fold(
-            ifft,
-            output_size=(1, output_size),
-            kernel_size=(1, self.win_length),
-            stride=(1, self.hop_length),
-        )[:, 0, 0, :]
-
-        y, audio_buffer = self._buffer_process(y, audio_buffer, pad, last_chunk=last_chunk, streaming=streaming)
-
-        window_sq = self.window.square().expand(1, T, -1).transpose(1, 2)
-        window_envelope = (
-            torch.nn.functional.fold(
-                window_sq,
+        with _record_function("ming.vae.istft.fold_audio"):
+            y = torch.nn.functional.fold(
+                ifft,
                 output_size=(1, output_size),
                 kernel_size=(1, self.win_length),
                 stride=(1, self.hop_length),
+            )[:, 0, 0, :]
+
+        y, audio_buffer = self._buffer_process(y, audio_buffer, pad, last_chunk=last_chunk, streaming=streaming)
+
+        with _record_function("ming.vae.istft.window_envelope"):
+            window_sq = self.window.square().expand(1, T, -1).transpose(1, 2)
+            window_envelope = (
+                torch.nn.functional.fold(
+                    window_sq,
+                    output_size=(1, output_size),
+                    kernel_size=(1, self.win_length),
+                    stride=(1, self.hop_length),
+                )
+                .squeeze(0)
+                .squeeze(0)
             )
-            .squeeze(0)
-            .squeeze(0)
-        )
 
         window_envelope, window_buffer = self._buffer_process(
             window_envelope, window_buffer, pad, last_chunk=last_chunk, streaming=streaming
         )
         window_envelope = window_envelope.squeeze()
 
-        assert (window_envelope > 1e-11).all()
-        y = y / window_envelope
+        if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+            assert (window_envelope > 1e-11).all()
+        with _record_function("ming.vae.istft.normalize"):
+            y = y / window_envelope
 
         return y, audio_buffer, window_buffer
 
@@ -117,17 +130,20 @@ class ISTFTHead(nn.Module):
         self.istft = ISTFT(n_fft=n_fft, hop_length=hop_length, win_length=n_fft, padding=padding)
 
     def forward(self, x, audio_buffer=None, window_buffer=None, streaming=False, last_chunk=False):
-        x_pred = self.out(x)
-        x_pred = x_pred.transpose(1, 2)
-        mag, p = x_pred.chunk(2, dim=1)
-        mag = torch.exp(mag)
-        mag = torch.clip(mag, max=1e2)
-        x = torch.cos(p)
-        y = torch.sin(p)
-        S = mag * (x + 1j * y)
-        audio, audio_buffer, window_buffer = self.istft(
-            S, audio_buffer=audio_buffer, window_buffer=window_buffer, streaming=streaming, last_chunk=last_chunk
-        )
+        with _record_function("ming.vae.head.linear"):
+            x_pred = self.out(x)
+        with _record_function("ming.vae.head.polar"):
+            x_pred = x_pred.transpose(1, 2)
+            mag, p = x_pred.chunk(2, dim=1)
+            mag = torch.exp(mag)
+            mag = torch.clip(mag, max=1e2)
+            x = torch.cos(p)
+            y = torch.sin(p)
+            S = mag * (x + 1j * y)
+        with _record_function("ming.vae.head.istft"):
+            audio, audio_buffer, window_buffer = self.istft(
+                S, audio_buffer=audio_buffer, window_buffer=window_buffer, streaming=streaming, last_chunk=last_chunk
+            )
         return audio.unsqueeze(1), x_pred, audio_buffer, window_buffer
 
 
@@ -188,6 +204,52 @@ class StreamingLinearUpsample(nn.Module):
         return final_out, state
 
 
+class QwenDecoderGraphExecutor:
+    """CUDA graph executor for one stateless AudioVAE Qwen decoder shape."""
+
+    def __init__(self, decoder: Qwen2Model) -> None:
+        self.decoder = decoder
+        self.initialized = False
+        self.input_placeholder: torch.Tensor | None = None
+        self.hidden_placeholder: torch.Tensor | None = None
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.lock = Lock()
+
+    def execute(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        with self.lock:
+            if not self.initialized:
+                self._initialize_graph(inputs_embeds)
+
+            assert self.input_placeholder is not None
+            assert self.hidden_placeholder is not None
+            assert self.graph is not None
+            self.input_placeholder.copy_(inputs_embeds)
+            self.graph.replay()
+            hidden_states = torch.empty_like(self.hidden_placeholder)
+            hidden_states.copy_(self.hidden_placeholder)
+            return hidden_states
+
+    def _initialize_graph(self, inputs_embeds: torch.Tensor) -> None:
+        device = inputs_embeds.device
+        self.input_placeholder = torch.empty_like(inputs_embeds)
+        self.input_placeholder.copy_(inputs_embeds)
+        self.graph = torch.cuda.CUDAGraph()
+
+        graph_stream = torch.cuda.Stream(device=device)
+        graph_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.no_grad(), torch.cuda.stream(graph_stream):
+            for _ in range(3):
+                self.decoder(inputs_embeds=self.input_placeholder, use_cache=False)
+        torch.cuda.current_stream(device).wait_stream(graph_stream)
+        torch.accelerator.synchronize(device)
+
+        with torch.no_grad(), torch.cuda.graph(self.graph):
+            outputs = self.decoder(inputs_embeds=self.input_placeholder, use_cache=False)
+            self.hidden_placeholder = outputs.last_hidden_state
+        torch.accelerator.synchronize(device)
+        self.initialized = True
+
+
 class Decoder(nn.Module):
     def __init__(self, decoder_args, output_dim=320, latent_dim=64, patch_size=-1):
         super().__init__()
@@ -210,19 +272,49 @@ class Decoder(nn.Module):
         self.patch_size = patch_size
         if self.patch_size != -1:
             self.upsampling = StreamingLinearUpsample(scale_factor=patch_size)
+        self._qwen_decode_graph_enabled = True
+        self._qwen_decode_graphs: dict[tuple[tuple[int, ...], torch.device, torch.dtype], QwenDecoderGraphExecutor] = {}
+        self._qwen_decode_graphs_lock = Lock()
+
+    def _can_use_qwen_decode_graph(
+        self,
+        x: torch.Tensor,
+        past_key_values,
+        use_cache: bool,
+    ) -> bool:
+        return (
+            self._qwen_decode_graph_enabled
+            and not self.training
+            and not use_cache
+            and past_key_values is None
+            and x.device.type == "cuda"
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _execute_qwen_decode_graph(self, x: torch.Tensor) -> torch.Tensor:
+        key = (tuple(x.shape), x.device, x.dtype)
+        with self._qwen_decode_graphs_lock:
+            executor = self._qwen_decode_graphs.get(key)
+            if executor is None:
+                executor = QwenDecoderGraphExecutor(self.decoder)
+                self._qwen_decode_graphs[key] = executor
+        return executor.execute(x)
 
     def low_level_reconstruct(self, x, past_key_values=None, use_cache=False, stream_state=None, last_chunk=False):
         upsample_state, audio_buffer, window_buffer = stream_state
         bsz, device, dtype = x.size(0), x.device, x.dtype
-        x = self.fc1(x)
+        with _record_function("ming.vae.decoder.fc1"):
+            x = self.fc1(x)
         if self.patch_size != -1:
             if use_cache:
-                x, upsample_state = self.upsampling(x, state=upsample_state, is_last=last_chunk)
+                with _record_function("ming.vae.decoder.streaming_upsample"):
+                    x, upsample_state = self.upsampling(x, state=upsample_state, is_last=last_chunk)
                 if x is None:
                     stream_state = (upsample_state, audio_buffer, window_buffer)
                     return torch.empty(bsz, 1, 0, device=device, dtype=dtype), stream_state, past_key_values
             else:
-                x = self.upsampling.upsampler(x.transpose(1, 2)).transpose(1, 2)
+                with _record_function("ming.vae.decoder.full_upsample"):
+                    x = self.upsampling.upsampler(x.transpose(1, 2)).transpose(1, 2)
 
         hidden_states_list = []
 
@@ -248,22 +340,28 @@ class Decoder(nn.Module):
                 past_key_values = outputs.past_key_values
                 x = x[:, fill_len:, :]
 
-        outputs = self.decoder(inputs_embeds=x, past_key_values=past_key_values, use_cache=use_cache)
-        hidden_states_list.append(outputs.last_hidden_state)
-        past_key_values = outputs.past_key_values
+        with _record_function("ming.vae.decoder.qwen"):
+            if self._can_use_qwen_decode_graph(x, past_key_values, use_cache):
+                hidden_states_list.append(self._execute_qwen_decode_graph(x))
+                past_key_values = None
+            else:
+                outputs = self.decoder(inputs_embeds=x, past_key_values=past_key_values, use_cache=use_cache)
+                hidden_states_list.append(outputs.last_hidden_state)
+                past_key_values = outputs.past_key_values
 
         if len(hidden_states_list) > 1:
             full_hidden_state = torch.cat(hidden_states_list, dim=1)
         else:
             full_hidden_state = hidden_states_list[0]
 
-        x_out, _, audio_buffer, window_buffer = self.head(
-            full_hidden_state,
-            streaming=use_cache,
-            audio_buffer=audio_buffer,
-            window_buffer=window_buffer,
-            last_chunk=last_chunk,
-        )
+        with _record_function("ming.vae.decoder.head"):
+            x_out, _, audio_buffer, window_buffer = self.head(
+                full_hidden_state,
+                streaming=use_cache,
+                audio_buffer=audio_buffer,
+                window_buffer=window_buffer,
+                last_chunk=last_chunk,
+            )
 
         stream_state = (upsample_state, audio_buffer, window_buffer)
         return x_out, stream_state, past_key_values

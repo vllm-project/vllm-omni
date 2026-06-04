@@ -33,6 +33,7 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.ming_tts_stage_step_runner import MingTTSStageStepRunner
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1804,6 +1805,45 @@ class OmniGPUModelRunner(GPUModelRunner):
     ):
         """Inject omni-specific kwargs into forward and cache model output"""
         model_kwargs_extra = self._build_model_kwargs_extra()
+        runtime_infos = model_kwargs_extra.get("runtime_additional_information")
+        if isinstance(runtime_infos, list):
+            step_runner = getattr(self, "_ming_tts_step_runner", None)
+            if step_runner is None:
+                step_runner = MingTTSStageStepRunner(max_batch_size=8)
+                self._ming_tts_step_runner = step_runner
+            is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            if step_runner.supports_batch(runner=self, runtime_infos=runtime_infos, is_graph_capturing=is_capturing):
+                cohorts = [info.get("ming_tts_admission_cohort") for info in runtime_infos if isinstance(info, dict)]
+                logger.debug(
+                    "MingTTSStageStepRunner accepted batch_size=%d cohorts=%s",
+                    len(runtime_infos),
+                    cohorts,
+                )
+                build_inputs = getattr(self.model, "_build_batched_tts_inputs", None)
+                if build_inputs is not None:
+                    batched_inputs = build_inputs(runtime_infos)
+                    if batched_inputs is not None:
+                        prepared = step_runner.prepare_step(
+                            request_ids=list(self.input_batch.req_ids[: len(runtime_infos)]),
+                            runtime_infos=runtime_infos,
+                            inputs_embeds=batched_inputs,
+                        )
+                        step_runner.run_step(prepared=prepared, runner=self)
+                        step_runner.commit_step(prepared=prepared, runner=self)
+                        self._omni_last_model_output = OmniOutput(
+                            text_hidden_states=None,
+                            multimodal_outputs={
+                                "audio": prepared.audios,
+                                "sr": torch.tensor(prepared.sample_rate or 24000),
+                            },
+                        )
+                        return self._omni_last_model_output
+            elif len(runtime_infos) > 1:
+                logger.debug(
+                    "MingTTSStageStepRunner rejected batch_size=%d reason=%s",
+                    len(runtime_infos),
+                    getattr(step_runner, "last_reject_reason", None),
+                )
 
         model_output = super()._model_forward(
             input_ids=input_ids,

@@ -337,10 +337,13 @@ class MingFlashOmniTalkerConfig(PretrainedConfig):
         cfg_strength: float = 2.0,
         audio_vae_path: str | None = None,
         campplus_model: str | None = None,
+        enable_cfm_graph: bool | None = None,
+        enable_full_vae_decode: bool = False,
+        batch_vae_min_batch: int = 4,
         **kwargs,
     ):
-        super().__init__(**kwargs)
         self.llm_config = llm_config
+        super().__init__(**kwargs)
         self.flowmodel = flowmodel or {}
         self.aggregator = aggregator or {}
         self.steps = steps
@@ -350,6 +353,9 @@ class MingFlashOmniTalkerConfig(PretrainedConfig):
         self.cfg_strength = cfg_strength
         self.audio_vae_path = audio_vae_path
         self.campplus_model = campplus_model
+        self.enable_cfm_graph = enable_cfm_graph
+        self.enable_full_vae_decode = enable_full_vae_decode
+        self.batch_vae_min_batch = batch_vae_min_batch
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
         if isinstance(self.llm_config, dict):

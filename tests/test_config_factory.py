@@ -1049,6 +1049,24 @@ stages:
         assert deploy.stages[0].compilation_config == {"pass_config": {"fuse_allreduce_rms": False}}
         assert "compilation_config" not in deploy.stages[0].engine_extras
 
+    def test_ming_flash_omni_tts_speech_admission_config_is_stage_extra(self):
+        pipeline = _PIPELINE_REGISTRY["ming_flash_omni_tts"]
+        deploy_path = (
+            Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni_tts_high_concurrency.yaml"
+        )
+        deploy = load_deploy_config(deploy_path)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert deploy.stages[0].speech_admission_config == {
+            "max_batch_size": 8,
+            "max_wait_ms": 15.0,
+        }
+        assert stages[0].yaml_extras["speech_admission_config"] == {
+            "max_batch_size": 8,
+            "max_wait_ms": 15.0,
+        }
+        assert "speech_admission_config" not in stages[0].yaml_engine_args
+
     def test_merge_pipeline_deploy(self):
         pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
