@@ -54,6 +54,21 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Transcript of reference audio for voice cloning (Base task)",
     )
+    ref_audio_2: str | None = Field(
+        default=None,
+        description="Second reference audio for two-speaker dialogue (MOSS-TTSD). "
+        "URL, base64, or file URI. Ignored by single-speaker models.",
+    )
+    ambient_sound: str | None = Field(
+        default=None,
+        description="Sound description for ambient/effect synthesis (MOSS-SoundEffect). "
+        "Natural language, e.g. 'ocean waves crashing on a rocky beach'.",
+    )
+    duration_seconds: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Target audio duration in seconds (MOSS-SoundEffect). Converted to ~12.5 frames/s internally.",
+    )
     x_vector_only_mode: bool | None = Field(
         default=None,
         description="Use speaker embedding only without in-context learning (Base task)",

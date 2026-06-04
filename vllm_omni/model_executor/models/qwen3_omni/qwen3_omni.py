@@ -36,6 +36,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload, OmniPayloadMeta
+from vllm_omni.metrics import definitions as defs
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
@@ -183,11 +184,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 # sync stall; build_mm_cpu handles the eventual D2H at payload time.
                 ("codes", "audio"),
             }
-            # Keys that need to be accumulated across streaming inputs
-            self.streaming_accumulated_keys: set[tuple[str, str]] = {
-                ("embed", "prefill"),
-                ("hidden_states", "output"),
-            }
 
         elif self.model_stage == "code2wav":
             multimodal_config.skip_mm_profiling = True
@@ -282,6 +278,12 @@ class Qwen3OmniMoeForConditionalGeneration(
         if hasattr(self.model, "sampler"):
             return self.model.sampler
         return Sampler()
+
+    def get_language_model(self) -> torch.nn.Module:
+        """Delegate to the active stage's language model for upstream MoE resolution."""
+        if hasattr(self.model, "get_language_model"):
+            return self.model.get_language_model()
+        return self.model
 
     def embed_input_ids(
         self,
@@ -526,9 +528,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             return OmniOutput(text_hidden_states=talker_hidden, multimodal_outputs=multimodal_outputs)
         elif self.model_stage == "code2wav":
             audio_tensors = model_outputs
+            sample_rate = defs.resolve_audio_sample_rate(self.code2wav_config)
+            # `sr` is the audio sample rate metadata consumed by downstream
+            # audio serving and stage-local audio metrics.
+            sr_tensors = [torch.tensor(sample_rate, dtype=torch.int32) for _ in audio_tensors]
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [audio_tensor.reshape(1, -1) for audio_tensor in audio_tensors]},
+                multimodal_outputs={
+                    "model_outputs": [audio_tensor.reshape(1, -1) for audio_tensor in audio_tensors],
+                    "sr": sr_tensors,
+                },
             )
 
         return model_outputs
@@ -685,7 +694,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         is_prefill = bool(payload.get("_omni_is_prefill", span_len > 1))
         if is_prefill:
             num_computed_tokens = payload.get("_omni_num_computed_tokens")
-            if num_computed_tokens is not None:
+            request_resumable = meta.get("resumable", False)
+            if num_computed_tokens is not None and not request_resumable:
                 meta["num_processed_tokens"] = int(num_computed_tokens)
             input_ids, input_embeds, update_dict = self.talker_preprocess_prefill(input_ids, input_embeds, payload)
             code_predictor_codes = torch.zeros(

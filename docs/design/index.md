@@ -13,6 +13,10 @@ This section contains design documents and architecture specifications for vLLM-
 - [Adding Step Execution Support for Diffusion Pipelines](feature/diffusion_step_execution.md)
 - [Continuous Batching for Step-Wise Diffusion](feature/diffusion_continuous_batching.md)
 
+## Infrastructure Design Documents
+
+- [Prometheus Metrics](metrics.md)
+
 ## Module Design Documents
 
 - [AR Module](module/ar_module.md)

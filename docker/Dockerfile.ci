@@ -1,5 +1,8 @@
+# Target vllm version: v0.21.0 (releases/v0.21.0 branch).
+# The pinned VLLM_PRECOMPILED_WHEEL_COMMIT and VLLM_BASE_TAG below must
+# be updated on every rebase to match the new upstream vllm commit/tag.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.21.0
+ARG VLLM_BASE_TAG=v0.22.0
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}
 ARG APP_DIR=/workspace/vllm-omni
 WORKDIR ${APP_DIR}

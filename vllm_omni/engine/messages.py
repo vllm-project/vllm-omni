@@ -24,7 +24,9 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     sampling_params_list: list[OmniSamplingParams]
     final_stage_id: int
     preprocess_ms: float
+    request_timestamp: float
     enqueue_ts: float
+    final_output_stage_ids: list[int] | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -80,6 +82,7 @@ class OutputMessage(EngineQueueMessage, kw_only=True):
     type: Literal["output"] = "output"
     request_id: str
     stage_id: int
+    replica_id: int | None = None
     engine_outputs: OmniRequestOutput
     metrics: StageRequestMetrics | None = None
     finished: bool
@@ -90,6 +93,7 @@ class StageMetricsMessage(EngineQueueMessage, kw_only=True):
     type: Literal["stage_metrics"] = "stage_metrics"
     request_id: str
     stage_id: int
+    replica_id: int | None = None
     metrics: StageRequestMetrics
     stage_submit_ts: float | None = None
 

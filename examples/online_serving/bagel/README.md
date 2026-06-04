@@ -68,6 +68,67 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --tensor-parallel-size
 
 Or set `tensor_parallel_size` per stage in a custom deploy YAML.
 
+### VAE Patch Parallelism
+
+[VAE Patch Parallelism](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/parallelism/vae_patch_parallel.html) distributes Bagel VAE **decode/encode** across multiple GPUs by splitting latent tiles. It lowers **per-GPU peak memory during VAE decode**, which helps high-resolution `text2img` / `img2img` when VAE becomes a bottleneck.
+
+**Scope for Bagel:**
+
+| Topology | VAE patch parallel |
+| :------- | :----------------- |
+| **Single-stage** (DiT only) | Supported on stage 0 (`BagelPipeline` + `DistributedAutoEncoder`) |
+| **Two-stage** | Supported on **stage 1 (DiT)** only; stage 0 (Thinker) uses encoder-only VAE and is unrelated |
+
+**Requirements:**
+
+- `vae_patch_parallel_size > 1` and a distributed VAE (`DistributedAutoEncoder` on the DiT pipeline).
+- The DiT process group must have at least `vae_patch_parallel_size` ranks. In practice this means the diffusion stage `world_size` must be ≥ 2 (commonly `tensor_parallel_size=2` on that stage).
+- `vae_use_tiling` must be enabled. If you set `vae_patch_parallel_size > 1` and omit tiling, the registry auto-enables `vae_use_tiling` at startup.
+
+VAE patch parallel **reuses the DiT process group** (`dit_group`); it does not create a separate VAE-only worker pool. It is not a substitute for single-GPU VAE tiling (`vae_pp=1`).
+
+**Online serving (single-stage, 2 GPUs):**
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/bagel_single_stage.yaml \
+    --tensor-parallel-size 2 \
+    --vae-patch-parallel-size 2 \
+    --vae-use-tiling
+```
+
+**Online serving (two-stage, VAE PP on DiT stage 1):** use a custom deploy YAML, for example:
+
+```yaml
+stages:
+  - stage_id: 0
+    devices: "0"
+    # Thinker (AR) — no VAE patch parallel here
+
+  - stage_id: 1
+    devices: "0,1"
+    vae_use_tiling: true
+    parallel_config:
+      tensor_parallel_size: 2
+      vae_patch_parallel_size: 2
+```
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config /path/to/bagel_vae_pp.yaml
+```
+
+**Verify it is active** (check server logs at startup):
+
+```text
+INFO ... vae_patch_parallel_size=2 requires vae_use_tiling; automatically enabling it.
+```
+
+| CLI flag | Default | Description |
+| :------- | :------ | :---------- |
+| `--vae-patch-parallel-size` | `1` | Number of DiT ranks used for VAE tile parallelism. Set to `2` or higher to enable. Should be ≤ DiT process group size (typically match `--tensor-parallel-size` on the diffusion stage). |
+| `--vae-use-tiling` | off | Enable VAE spatial tiling. Required for VAE patch parallel (auto-enabled when `vae_patch_parallel_size > 1`). |
+
 #### Hybrid Sharded Data Parallel (HSDP)
 
 For larger Bagel deployments on multiple GPUs, you can enable HSDP (Hybrid Sharded Data Parallel) by modifying the stage configuration (for example, [`bagel.yaml`](../../../vllm_omni/deploy/bagel.yaml)). HSDP shards transformer weights across GPUs to reduce per-GPU memory usage.
@@ -323,6 +384,8 @@ python openai_chat_client.py \
 | `stages[].gpu_memory_utilization` | per-stage | Fraction of GPU memory to use |
 | `stages[].enforce_eager` | per-stage | Disable CUDA graphs |
 | `stages[].tensor_parallel_size` | per-stage | TP degree for this stage |
+| `stages[].parallel_config.vae_patch_parallel_size` | per-stage (DiT) | VAE tile parallelism degree (DiT stage only) |
+| `stages[].vae_use_tiling` | per-stage (DiT) | Enable VAE tiling (required for VAE patch parallel) |
 | `connectors` | top-level | Define available connector instances (SHM, Mooncake) |
 | `platforms` | top-level | Platform-specific overrides (e.g. `xpu`) |
 

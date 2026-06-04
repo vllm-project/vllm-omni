@@ -7,12 +7,7 @@ import types
 
 import pytest
 import torch
-from vllm.platforms.interface import DeviceCapability
-
-from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
-from vllm_omni.diffusion.envs import PACKAGES_CHECKER
-from vllm_omni.platforms.cuda import platform as cuda_platform_module
-from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+from vllm.platforms import current_platform
 
 SAGE_ATTN3_MODULE = "vllm_omni.diffusion.attention.backends.sage_attn3"
 
@@ -88,7 +83,15 @@ def test_sage_attn3_falls_back_to_sdpa_for_gqa(monkeypatch: pytest.MonkeyPatch):
     assert torch.allclose(output, expected)
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="sage_attn3 tests require CUDA platform")
 def test_cuda_platform_selects_sage_attn3_alias(monkeypatch: pytest.MonkeyPatch):
+    from vllm.platforms.interface import DeviceCapability
+
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.diffusion.envs import PACKAGES_CHECKER
+    from vllm_omni.platforms.cuda import platform as cuda_platform_module
+    from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
     original_import_module = importlib.import_module
 
     monkeypatch.setattr(
@@ -108,7 +111,14 @@ def test_cuda_platform_selects_sage_attn3_alias(monkeypatch: pytest.MonkeyPatch)
     assert backend_path == DiffusionAttentionBackendEnum.SAGE_ATTN_3.get_path()
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="sage_attn3 tests require CUDA platform")
 def test_cuda_platform_falls_back_when_sage_attn3_gpu_is_unsupported(monkeypatch: pytest.MonkeyPatch):
+    from vllm.platforms.interface import DeviceCapability
+
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.diffusion.envs import PACKAGES_CHECKER
+    from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
     monkeypatch.setattr(
         CudaOmniPlatform,
         "get_device_capability",

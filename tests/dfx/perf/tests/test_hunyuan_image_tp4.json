@@ -1,0 +1,34 @@
+[
+    {
+        "test_name": "test_hunyuan_image_tp4",
+        "description": "TP=4 baseline",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "tencent/HunyuanImage-3.0-Instruct",
+            "serve_args": {
+                "deploy-config": "../vllm_omni/deploy/hunyuan_image3_dit.yaml",
+                "tensor-parallel-size": 4,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "1024x1024_steps8",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 1024,
+                "height": 1024,
+                "num-inference-steps": 8,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "skip-performance-assertion": true,
+                "baseline": {
+                    "throughput_qps": 0.21,
+                    "latency_p99": 4.9235,
+                    "peak_memory_mb_max": 57576,
+                    "peak_memory_mb_mean": 57576
+                }
+            }
+        ]
+    }
+]

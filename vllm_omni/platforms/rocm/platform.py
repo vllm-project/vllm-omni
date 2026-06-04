@@ -172,4 +172,4 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         else:
             rms_norm = default
 
-        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)
+        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm, fused_add_rms_norm=rms_norm)

@@ -363,3 +363,104 @@ def test_build_multistage_generation_inputs_custom_system_prompt(serving_chat):
         f"custom system_prompt content must reach the rendered prompt; "
         f"marker {marker!r} not found in prompt of length {len(out['prompt'])}"
     )
+
+
+def test_build_multistage_generation_inputs_sets_ar_stop_token_ids_with_explicit_size(serving_chat):
+    """When height+width are provided with bot_task, the AR (llm) stage
+    must receive stop_token_ids from resolve_stop_token_ids so AR stops
+    at the correct terminator instead of generating until max_tokens.
+
+    Without this, AR would generate past the cot boundary and produce
+    garbage that the DiT bridge cannot parse.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeTokenizer:
+        SPECIAL = {
+            "<|startoftext|>": 1,
+            "<img>": 2,
+            "<recaption>": 4,
+        }
+
+        def convert_tokens_to_ids(self, tok: str) -> int:
+            return self.SPECIAL.get(tok, 0)
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            return list(range(100, 100 + len(text)))
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    images = [Image.new("RGB", (32, 32), color="red")]
+
+    # With height+width and bot_task=think, ar_image_size="1024x768" ->
+    # need_ratio=False -> stop_token_ids=[end_of_think, end_of_recaption]
+    _, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="draw a cat",
+        extra_body={"bot_task": "think"},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(height=768, width=1024),
+        tokenizer=FakeTokenizer(),
+    )
+
+    # AR stage (index 0) must have stop_token_ids set.
+    ar_params = sampling_params_list[0]
+    assert ar_params.stop_token_ids is not None, (
+        "AR stage must have stop_token_ids set when height+width and bot_task are provided"
+    )
+    assert len(ar_params.stop_token_ids) > 0, "stop_token_ids must be non-empty"
+
+    # Diffusion stage (index 1) must NOT have stop_token_ids set.
+    diff_params = sampling_params_list[1]
+    assert getattr(diff_params, "stop_token_ids", None) is None, "Diffusion stage must not have stop_token_ids set"
+
+
+def test_build_multistage_generation_inputs_no_stop_token_ids_without_size(serving_chat):
+    """Without height+width, ar_image_size=None -> need_ratio=True ->
+    stop_token_ids is set to the ratio range (AR predicts ratio).
+    This still assigns stop_token_ids, but the set is the ratio range,
+    not the terminator.
+
+    Without bot_task at all, ar_stop_token_ids stays None and
+    stop_token_ids is not set on any stage.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    images = [Image.new("RGB", (32, 32), color="red")]
+
+    # No height/width, no bot_task -> ar_stop_token_ids=None ->
+    # stop_token_ids not set on any stage.
+    _, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="draw a cat",
+        extra_body={},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+
+    # SamplingParams defaults stop_token_ids=[], not None.
+    # The key contract: it was NOT set by resolve_stop_token_ids,
+    # so it stays as the SamplingParams default (empty list).
+    assert sampling_params_list[0].stop_token_ids == [], (
+        "Without bot_task, AR stage stop_token_ids must be the default empty list"
+    )
