@@ -104,6 +104,7 @@ NPU_DIT_BF16_MODEL = os.environ.get("HUNYUAN_IMAGE3_NPU_DIT_BF16_MODEL", "tencen
 NPU_DIT_QUANT_MODEL_ENV = "HUNYUAN_IMAGE3_NPU_DIT_QUANT_MODEL"
 NPU_DIT_DEVICES_ENV = "HUNYUAN_IMAGE3_NPU_DIT_DEVICES"
 NPU_DIT_TP_ENV = "HUNYUAN_IMAGE3_NPU_DIT_TP"
+NPU_DIT_EP_ENV = "HUNYUAN_IMAGE3_NPU_DIT_ENABLE_EP"
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 # fmt: off
 _DEPLOY_CONFIG = {
@@ -266,12 +267,12 @@ _NPU_DIT_CONFIG = {
             "gpu_memory_utilization": 0.65,
             "enforce_eager": True,
             "trust_remote_code": True,
-            "devices": "0,1,2,3,4,5,6,7",
+            "devices": "0,1,2,3",
             "distributed_executor_backend": "mp",
-            "max_num_batched_tokens": 8192,
+            "max_num_batched_tokens": 32768,
             "parallel_config": {
-                "tensor_parallel_size": 8,
-                "enable_expert_parallel": False,
+                "tensor_parallel_size": 4,
+                "enable_expert_parallel": True,
                 "sequence_parallel_size": 1,
                 "ulysses_degree": 1,
             },
@@ -351,17 +352,22 @@ def _make_quant_dit_config(path: Path) -> None:
 
 
 def _npu_dit_devices() -> str:
-    return os.environ.get(NPU_DIT_DEVICES_ENV, "0,1,2,3,4,5,6,7")
+    return os.environ.get(NPU_DIT_DEVICES_ENV, "0,1,2,3")
 
 
 def _npu_dit_tensor_parallel_size() -> int:
     return int(os.environ.get(NPU_DIT_TP_ENV, str(len(_npu_dit_devices().split(",")))))
 
 
+def _npu_dit_enable_expert_parallel() -> bool:
+    return os.environ.get(NPU_DIT_EP_ENV, "1").lower() in _TRUE_ENV_VALUES
+
+
 def _make_npu_dit_config(path: Path) -> None:
     config = copy.deepcopy(_NPU_DIT_CONFIG)
     config["stages"][0]["devices"] = _npu_dit_devices()
     config["stages"][0]["parallel_config"]["tensor_parallel_size"] = _npu_dit_tensor_parallel_size()
+    config["stages"][0]["parallel_config"]["enable_expert_parallel"] = _npu_dit_enable_expert_parallel()
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
@@ -700,9 +706,12 @@ def test_offline_it2i_size_overrides_align_with_online() -> None:
     assert unrelated_params.extra_args == {}
 
 
-def test_npu_dit_config_defaults_to_eight_cards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_npu_dit_config_defaults_to_four_card_expert_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.delenv("HUNYUAN_IMAGE3_NPU_DIT_DEVICES", raising=False)
     monkeypatch.delenv("HUNYUAN_IMAGE3_NPU_DIT_TP", raising=False)
+    monkeypatch.delenv("HUNYUAN_IMAGE3_NPU_DIT_ENABLE_EP", raising=False)
 
     config_path = tmp_path / "npu_dit.yaml"
     _make_npu_dit_config(config_path)
@@ -710,9 +719,9 @@ def test_npu_dit_config_defaults_to_eight_cards(tmp_path: Path, monkeypatch: pyt
     stage = config["stages"][0]
 
     assert stage["model_stage"] == "dit"
-    assert stage["devices"] == "0,1,2,3,4,5,6,7"
-    assert stage["parallel_config"]["tensor_parallel_size"] == 8
-    assert stage["parallel_config"]["enable_expert_parallel"] is False
+    assert stage["devices"] == "0,1,2,3"
+    assert stage["parallel_config"]["tensor_parallel_size"] == 4
+    assert stage["parallel_config"]["enable_expert_parallel"] is True
     assert "force_cutlass_fp8" not in stage
     assert "moe_backend" not in stage
 
@@ -720,6 +729,7 @@ def test_npu_dit_config_defaults_to_eight_cards(tmp_path: Path, monkeypatch: pyt
 def test_npu_dit_config_accepts_env_parallelism(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HUNYUAN_IMAGE3_NPU_DIT_DEVICES", "2,3")
     monkeypatch.setenv("HUNYUAN_IMAGE3_NPU_DIT_TP", "2")
+    monkeypatch.setenv("HUNYUAN_IMAGE3_NPU_DIT_ENABLE_EP", "0")
 
     config_path = tmp_path / "npu_dit.yaml"
     _make_npu_dit_config(config_path)
@@ -727,6 +737,7 @@ def test_npu_dit_config_accepts_env_parallelism(tmp_path: Path, monkeypatch: pyt
 
     assert stage["devices"] == "2,3"
     assert stage["parallel_config"]["tensor_parallel_size"] == 2
+    assert stage["parallel_config"]["enable_expert_parallel"] is False
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=8)
@@ -864,7 +875,7 @@ def test_quantized_dit_matches_bf16_accuracy(
 
 @pytest.mark.npu
 @pytest.mark.A2
-@pytest.mark.distributed_npu(num_cards=8)
+@pytest.mark.distributed_npu(num_cards=4)
 @pytest.mark.skipif(
     torch.accelerator.device_count() < _npu_dit_tensor_parallel_size(),
     reason="Needs enough NPUs for HunyuanImage3 NPU DiT tensor parallelism",
@@ -895,6 +906,7 @@ def test_npu_dit_distil_smoke_accuracy(accuracy_artifact_root: Path) -> None:
         "elapsed_s": elapsed,
         "devices": _npu_dit_devices(),
         "tensor_parallel_size": _npu_dit_tensor_parallel_size(),
+        "enable_expert_parallel": _npu_dit_enable_expert_parallel(),
     }
     metrics_path = output_dir / "npu_dit_distil_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
@@ -903,7 +915,7 @@ def test_npu_dit_distil_smoke_accuracy(accuracy_artifact_root: Path) -> None:
 
 @pytest.mark.npu
 @pytest.mark.A2
-@pytest.mark.distributed_npu(num_cards=8)
+@pytest.mark.distributed_npu(num_cards=4)
 @pytest.mark.skipif(
     torch.accelerator.device_count() < _npu_dit_tensor_parallel_size(),
     reason="Needs enough NPUs for HunyuanImage3 NPU DiT tensor parallelism",
@@ -970,6 +982,7 @@ def test_npu_quantized_dit_matches_bf16_accuracy(
         "clip_score_drop": clip_score_drop,
         "devices": _npu_dit_devices(),
         "tensor_parallel_size": _npu_dit_tensor_parallel_size(),
+        "enable_expert_parallel": _npu_dit_enable_expert_parallel(),
     }
     metrics_path = output_dir / "npu_quant_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
