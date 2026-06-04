@@ -52,18 +52,12 @@ from typing import Any
 import numpy as np
 import yaml
 
+from vllm_omni.utils import qwen3_force_align_processor as _processor
+
 logger = logging.getLogger(__name__)
 
 
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "deploy" / "qwen3_tts_forced_aligner.yaml"
-
-# Prompt tokens for the Qwen3 forced aligner. These are baked in rather than
-# configurable because the surrounding prompt template (``<|im_start|>`` chat
-# wrapping in ``_build_prompt``) and the ``_tokenize_text`` word splitter are
-# already Qwen-specific: a different aligner family would need code changes
-# here regardless, so exposing just these two strings as config is misleading.
-_AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
-_TIMESTAMP_TOKEN = "<timestamp>"
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +150,7 @@ async def align(
     text: str,
     sample_rate: int,
     config: ForcedAlignerConfig,
+    language: str | None = None,
 ) -> list[WordTimestamp] | None:
     """Run one forced-alignment pass.
 
@@ -165,13 +160,17 @@ async def align(
         sample_rate: Sample rate of ``audio`` in Hz.
         config: Aligner config (same instance for every call across the
             server's lifetime; reload requires a server restart).
+        language: Optional language hint for word segmentation. ``None`` /
+            ``"auto"`` use the space + Chinese-mixed path; ``"japanese"`` /
+            ``"korean"`` (or their codes) need ``qwen_asr`` installed for
+            faithful tokenisation, else they degrade to whitespace splitting.
 
     Returns:
         List of :class:`WordTimestamp` on success (possibly empty for
         silence / no aligned tokens), ``None`` if alignment failed.
     """
     try:
-        return await asyncio.to_thread(_align_sync, audio, text, sample_rate, config)
+        return await asyncio.to_thread(_align_sync, audio, text, sample_rate, config, language)
     except Exception:  # noqa: BLE001
         logger.exception("Forced aligner failed for text=%r", text)
         return None
@@ -182,6 +181,7 @@ def _align_sync(
     text: str,
     sample_rate: int,
     config: ForcedAlignerConfig,
+    language: str | None = None,
 ) -> list[WordTimestamp]:
     _ensure_loaded(config)
     audio_arr = _pcm_bytes_to_float32(audio)
@@ -189,7 +189,10 @@ def _align_sync(
         return []
     audio_duration_ms = (audio_arr.size / sample_rate) * 1000.0
 
-    prompt = _build_prompt(text)
+    # Segment once and reuse for both the prompt and the decode: the word
+    # units MUST match between the two or the markers drift out of sync.
+    words = _processor.segment_words(text, language)
+    prompt = _processor.build_prompt(words)
     request = {
         "prompt": prompt,
         "multi_modal_data": {"audio": (audio_arr, sample_rate)},
@@ -222,7 +225,7 @@ def _align_sync(
 
     return _decode_timestamps(
         logits=logits,
-        text=text,
+        words=words,
         timestamp_positions=timestamp_positions,
         classify_num=_classify_num,
         timestamp_segment_time_ms=_timestamp_segment_time_ms,
@@ -319,7 +322,7 @@ def _ensure_loaded(config: ForcedAlignerConfig) -> None:
             )
 
         tokenizer = llm.get_tokenizer()
-        timestamp_token_id = _resolve_timestamp_token_id(tokenizer)
+        timestamp_token_id = _processor.resolve_timestamp_token_id(tokenizer)
 
         # Publish in this order so a concurrent reader either sees
         # _llm == None (will block on the lock) or sees a fully
@@ -339,72 +342,11 @@ def _ensure_loaded(config: ForcedAlignerConfig) -> None:
 
 
 # --- pure helpers (testable without a GPU / vllm) ---
-
-
-def _build_prompt(
-    text: str,
-    *,
-    audio_placeholder: str = _AUDIO_PLACEHOLDER,
-    timestamp_token: str = _TIMESTAMP_TOKEN,
-) -> str:
-    """Construct the prompt with start/end timestamp slots per word."""
-    words = _tokenize_text(text)
-    if not words:
-        # Pad with one timestamp so the decoder always has something to
-        # read; an empty result still surfaces as "[]" upstream.
-        body = timestamp_token
-    else:
-        body = f"{timestamp_token}{timestamp_token}".join(words) + f"{timestamp_token}{timestamp_token}"
-    return f"<|im_start|>user\n{audio_placeholder}{body}<|im_end|>\n<|im_start|>assistant\n"
-
-
-def _tokenize_text(text: str) -> list[str]:
-    """Approximate Qwen3ForceAlignProcessor tokenization for common languages."""
-    words: list[str] = []
-    current: list[str] = []
-
-    def flush_current() -> None:
-        if current:
-            words.append("".join(current))
-            current.clear()
-
-    for ch in text:
-        code = ord(ch)
-        is_cjk = (
-            0x4E00 <= code <= 0x9FFF
-            or 0x3400 <= code <= 0x4DBF
-            or 0x20000 <= code <= 0x2A6DF
-            or 0x2A700 <= code <= 0x2B73F
-            or 0x2B740 <= code <= 0x2B81F
-            or 0x2B820 <= code <= 0x2CEAF
-            or 0xF900 <= code <= 0xFAFF
-        )
-        if is_cjk:
-            flush_current()
-            words.append(ch)
-        elif ch == "'" or ch.isalnum():
-            current.append(ch)
-        else:
-            flush_current()
-
-    flush_current()
-    return words
-
-
-def _resolve_timestamp_token_id(tokenizer: Any, timestamp_token: str = _TIMESTAMP_TOKEN) -> int:
-    """Look up the integer id of the timestamp special token."""
-    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
-    if not callable(convert):
-        raise RuntimeError("Aligner tokenizer has no convert_tokens_to_ids method.")
-    tid = convert(timestamp_token)
-    if isinstance(tid, list):
-        tid = tid[0] if tid else None
-    if tid is None or (isinstance(tid, int) and tid < 0):
-        raise RuntimeError(
-            f"Aligner tokenizer does not recognise {timestamp_token!r} (got id={tid}). "
-            "Check the model card; the marker token may use a different name."
-        )
-    return int(tid)
+#
+# Word segmentation, prompt building, timestamp repair and marker-token
+# lookup are Qwen-specific and live in
+# :mod:`vllm_omni.utils.qwen3_force_align_processor` (the model-agnostic seam
+# the issue asks for). This module owns only the generic vLLM orchestration.
 
 
 def _pcm_bytes_to_float32(audio: bytes) -> np.ndarray:
@@ -422,13 +364,18 @@ def _pcm_bytes_to_float32(audio: bytes) -> np.ndarray:
 def _decode_timestamps(
     *,
     logits: Any,
-    text: str,
+    words: list[str],
     timestamp_positions: list[int],
     classify_num: int,
     audio_duration_ms: float,
     timestamp_segment_time_ms: float | None = None,
 ) -> list[WordTimestamp]:
-    """Translate ``[n_token, classify_num]`` logits into word timestamps."""
+    """Translate ``[n_token, classify_num]`` logits into word timestamps.
+
+    ``words`` must be the exact segmentation used to build the prompt (see
+    :func:`qwen3_force_align_processor.segment_words`); each word owns two
+    consecutive markers.
+    """
     arr = logits.detach().cpu().numpy() if hasattr(logits, "detach") else np.asarray(logits)
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D logits [n_token, classify_num]; got shape {arr.shape}")
@@ -438,7 +385,6 @@ def _decode_timestamps(
             "model config and prompt template may be out of sync."
         )
 
-    words = _tokenize_text(text)
     expected = len(words) * 2
     if len(timestamp_positions) != expected:
         logger.warning(
@@ -457,20 +403,16 @@ def _decode_timestamps(
         else (audio_duration_ms / classify_num if classify_num > 0 else 0.0)
     )
 
+    # Repair non-monotonic bins across the whole start/end sequence before
+    # pairing, mirroring the official decoder. This keeps each (start, end)
+    # pair ordered and stops one bad bin from corrupting neighbours.
+    marker_ms = _processor.fix_timestamp([int(round(int(b) * bin_size_ms)) for b in bin_idx])
+
     out: list[WordTimestamp] = []
     for i, word in enumerate(words):
-        start_bin = int(bin_idx[i * 2])
-        end_bin = int(bin_idx[i * 2 + 1])
-        if end_bin < start_bin:
-            # Pathological output; skip this word rather than crash.
-            continue
-        out.append(
-            WordTimestamp(
-                word=word,
-                start_ms=int(round(start_bin * bin_size_ms)),
-                end_ms=int(round(end_bin * bin_size_ms)),
-            )
-        )
+        start_ms = marker_ms[i * 2]
+        end_ms = max(marker_ms[i * 2 + 1], start_ms)
+        out.append(WordTimestamp(word=word, start_ms=start_ms, end_ms=end_ms))
     return out
 
 
@@ -488,3 +430,4 @@ def _reset_for_tests() -> None:
         _timestamp_token_id = None
         _timestamp_segment_time_ms = None
         _loaded_config = None
+    _processor._reset_for_tests()

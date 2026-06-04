@@ -25,8 +25,14 @@ forced_aligner:
   architecture: Qwen3ASRForcedAlignerForTokenClassification
   pooling_task: token_classify
   # Note: the prompt tokens (audio placeholder, <timestamp> marker) are not
-  # configurable here — they are baked into forced_aligner._build_prompt
-  # alongside the Qwen-specific chat template and word splitter.
+  # configurable here — they are baked into qwen3_force_align_processor
+  # alongside the Qwen-specific chat template and word segmentation.
+  #
+  # Word segmentation: the built-in port handles space-delimited and
+  # Chinese-mixed text exactly; install `vllm-omni[forced-aligner]`
+  # (pulls qwen-asr) for faithful Japanese/Korean tokenisation. The language
+  # is taken per-request from the streaming session config ("language" field;
+  # default auto -> space path).
 
   # GPU memory cap for the aligner LLM. The aligner runs in the API
   # server process, so by default it carves into the same GPU (cuda:0)

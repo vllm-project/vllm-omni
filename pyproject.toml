@@ -74,6 +74,13 @@ demo = [
     "gradio>=6.7.0",
 ]
 
+# Optional: full multilingual word segmentation for the streaming TTS forced
+# aligner (issue #3631). Without it the built-in port handles space-delimited
+# and Chinese-mixed text; qwen-asr adds faithful Japanese/Korean tokenisation.
+forced-aligner = [
+    "qwen-asr>=0.0.6",
+]
+
 # Local-test-only extras
 local = [
     "FlagEmbedding",

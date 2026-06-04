@@ -7,14 +7,6 @@ from vllm_omni.utils import forced_aligner
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_build_prompt_has_boundary_timestamp_markers():
-    prompt = forced_aligner._build_prompt("hello world.")
-
-    assert prompt.count("<timestamp>") == 4
-    assert "hello<timestamp><timestamp>world" in prompt
-    assert prompt.endswith("<|im_start|>assistant\n")
-
-
 def test_decode_timestamps_maps_boundary_bins_to_words():
     logits = np.zeros((4, 5), dtype=np.float32)
     logits[0, 0] = 1.0
@@ -24,7 +16,7 @@ def test_decode_timestamps_maps_boundary_bins_to_words():
 
     timestamps = forced_aligner._decode_timestamps(
         logits=logits,
-        text="hello world",
+        words=["hello", "world"],
         timestamp_positions=[0, 1, 2, 3],
         classify_num=5,
         audio_duration_ms=1000,
@@ -36,35 +28,45 @@ def test_decode_timestamps_maps_boundary_bins_to_words():
     ]
 
 
+def test_decode_timestamps_repairs_non_monotonic_bins():
+    # Word 1's end bin (1) dips below its start bin (2); fix_timestamp should
+    # snap it back so the frame never carries end_ms < start_ms.
+    logits = np.zeros((4, 5), dtype=np.float32)
+    logits[0, 0] = 1.0  # word0 start -> bin 0
+    logits[1, 2] = 1.0  # word0 end   -> bin 2
+    logits[2, 1] = 1.0  # word1 start -> bin 1 (out of order)
+    logits[3, 3] = 1.0  # word1 end   -> bin 3
+
+    timestamps = forced_aligner._decode_timestamps(
+        logits=logits,
+        words=["hello", "world"],
+        timestamp_positions=[0, 1, 2, 3],
+        classify_num=5,
+        timestamp_segment_time_ms=200,
+        audio_duration_ms=1000,
+    )
+
+    for ts in timestamps:
+        assert ts.end_ms >= ts.start_ms
+    # bins [0, 2, 1, 3] -> repaired [0, 2, 2, 3] -> ms x200
+    assert timestamps == [
+        forced_aligner.WordTimestamp("hello", 0, 400),
+        forced_aligner.WordTimestamp("world", 400, 600),
+    ]
+
+
 def test_decode_timestamps_rejects_marker_count_mismatch():
     logits = np.zeros((2, 5), dtype=np.float32)
 
     timestamps = forced_aligner._decode_timestamps(
         logits=logits,
-        text="hello world",
+        words=["hello", "world"],
         timestamp_positions=[0, 1],
         classify_num=5,
         audio_duration_ms=1000,
     )
 
     assert timestamps == []
-
-
-def test_resolve_timestamp_token_id_defaults_to_marker_token():
-    # Regression: the default must resolve the same <timestamp> marker that
-    # _build_prompt inserts, not None (which would degrade every request).
-    seen = {}
-
-    class FakeTokenizer:
-        def convert_tokens_to_ids(self, token):
-            seen["token"] = token
-            return 151705
-
-    tid = forced_aligner._resolve_timestamp_token_id(FakeTokenizer())
-
-    assert tid == 151705
-    assert seen["token"] == forced_aligner._TIMESTAMP_TOKEN
-    assert forced_aligner._TIMESTAMP_TOKEN in forced_aligner._build_prompt("hello world")
 
 
 def test_build_config_from_yaml(tmp_path):
