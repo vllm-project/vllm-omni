@@ -612,7 +612,7 @@ def test_image_to_image_alignment_npu(
     scorer = SemanticSimilarityScorer()
     clip_scorer = CLIPScorer()
     cot_results = scorer.text_similarity(npu_cot, COT_REF)
-    image_ref = Image.open(str(accuracy_assets_root / "hunyuan_image_ref.png")).convert("RGB")
+    image_ref = Image.open(str(accuracy_assets_root / "hunyuan_image_distil_ref.png")).convert("RGB")
     image_clip_score = clip_scorer.image_image_score(npu_image, image_ref)
     ssim_value, psnr_value = compute_image_ssim_psnr(prediction=npu_image, reference=image_ref, compare_mode="RGB")
 
@@ -657,8 +657,6 @@ def _extract_image(outputs) -> Image.Image:
             image.load()
             return image
     raise AssertionError("Pipeline output had no images")
-
-
 def _run_dit_model(
     model: str,
     deploy_config_path: str,
