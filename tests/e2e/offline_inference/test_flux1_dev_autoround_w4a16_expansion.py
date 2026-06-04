@@ -26,10 +26,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = pytest.mark.skip(
-    reason="Current Hugging Face account is not yet authorized to access this model.",
-)
-
 QUANTIZED_MODEL = "vllm-project-org/FLUX.1-dev-AutoRound-w4a16"
 BASELINE_MODEL = "black-forest-labs/FLUX.1-dev"
 
@@ -63,6 +59,27 @@ def _first_request_images(outputs) -> list:
     return req_out.images
 
 
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4"})
+def test_flux_autoround_w4a16_load():
+    """Load the W4A16 quantized FLUX model and run a minimal generation.
+
+    Verifies that the quantized checkpoint loads end-to-end (quant_config
+    propagated to all transformer blocks) and produces a valid image.
+    """
+    with OmniRunner(QUANTIZED_MODEL, enforce_eager=True) as runner:
+        outputs = runner.omni.generate(
+            "a cup of coffee on a table",
+            _sampling_params(),
+        )
+        images = _first_request_images(outputs)
+        assert len(images) >= 1, "Expected at least one generated image"
+        img = images[0]
+        assert img.width == WIDTH and img.height == HEIGHT
+        arr = np.array(img)
+        assert arr.std() > 1.0, "Generated image appears blank (std ≈ 0)"
+
+
 def _generate_image(model_name: str, **extra_kwargs) -> tuple[list, float]:
     """Load a FLUX model, generate one image, return (images, peak_memory_mb)."""
     gc.collect()
@@ -87,6 +104,7 @@ def _generate_image(model_name: str, **extra_kwargs) -> tuple[list, float]:
     return images, peak
 
 
+@pytest.mark.skip(reason="BF16 baseline model cannot be loaded correctly yet.")
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"})
@@ -105,6 +123,7 @@ def test_flux_autoround_w4a16_generates_image(omni_runner: OmniRunner):
     assert arr.std() > 1.0, "Generated image appears blank (std ≈ 0)"
 
 
+@pytest.mark.skip(reason="BF16 baseline model cannot be loaded correctly yet.")
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"})

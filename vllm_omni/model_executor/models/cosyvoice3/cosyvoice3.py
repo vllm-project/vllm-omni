@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import replace
 from functools import partial
 from threading import Lock
 
@@ -365,6 +364,12 @@ class CosyVoice3Model(
         else:
             raise ValueError(f"Model stage not supported {self.model_stage}")
 
+    def get_language_model(self) -> "nn.Module":
+        """Return the language model for upstream MoE detection."""
+        if hasattr(self.model, "get_language_model"):
+            return self.model.get_language_model()
+        return self.model
+
     def _create_llm_vllm_config(self, parent_config: VllmConfig) -> VllmConfig:
         """Create VllmConfig for the inner Qwen2 LLM.
 
@@ -542,17 +547,21 @@ class CosyVoice3Model(
         if self.model_stage != "cosyvoice3_talker":
             return None
 
-        sampler = getattr(self, "_talker_sampler", None)
-        if sampler is None:
-            sampler = Sampler()
-            self._talker_sampler = sampler
-
         if not self._cosyvoice3_ras_enabled(sampling_metadata):
+            sampler = getattr(self, "_talker_sampler", None)
+            if sampler is None:
+                sampler = Sampler()
+                self._talker_sampler = sampler
             return sampler(logits=logits, sampling_metadata=sampling_metadata)
 
         logits = logits.to(torch.float32)
-        sampling_for_processors = replace(sampling_metadata, no_penalties=True)
-        logits = sampler.apply_logits_processors(logits, sampling_for_processors, predict_bonus_token=False)
+        # Apply logits processors directly — RAS handles its own repetition
+        # logic.  We avoid instantiating Sampler() here because its import
+        # chain pulls in flashinfer / GPU deps that fail in CPU-only tests.
+        if sampling_metadata.allowed_token_ids_mask is not None:
+            logits.masked_fill_(sampling_metadata.allowed_token_ids_mask, float("-inf"))
+        for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+            logits = processor.apply(logits)
 
         sampling_cfg = dict(self.config.llm.get("sampling", {}))
         default_top_p = float(sampling_cfg.get("top_p", 0.8))
@@ -634,14 +643,70 @@ class CosyVoice3Model(
     ) -> torch.Tensor:
         if self.model_stage == "cosyvoice3_talker":
             if is_multimodal is not None and any(is_multimodal):
+                # Per-request rearrange for the talker prompt layout
+                # [SOS_ph, TASK_ID_ph, AUDIO_ph * pstoken_len, ...text_tokens...]
+                # → [SOS_emb, ...text_embs..., TASK_ID_emb, AUDIO_embs].
+                #
+                # In batched prefill ``input_ids`` is the flat concatenation of
+                # N sequences and ``multimodal_embeddings`` is a list with one
+                # tensor per multimodal request. Each request's audio
+                # placeholders form one contiguous ``True`` group in
+                # ``is_multimodal``; the 2 positions immediately before each
+                # group are the SOS / TASK_ID placeholders. Walking the groups
+                # lets us locate every request's segment without needing a
+                # ``seq_token_counts`` kwarg (which only the generation runner
+                # injects, not the AR runner used here).
                 embed_tokens = self.model.llm.model.embed_tokens(input_ids)
                 sos = self.model.speech_embedding.weight[self.model.sos].reshape(1, -1)
                 task_id = self.model.speech_embedding.weight[self.model.task_id].reshape(1, -1)
-                prompt_speech_token_emb = multimodal_embeddings[0]
-                pstoken_len = prompt_speech_token_emb.shape[0]  # Get length from tensor shape
-                embed_tokens = torch.cat(
-                    [sos, embed_tokens[2 + pstoken_len :], task_id, prompt_speech_token_emb], dim=0
-                )
+
+                is_mm = is_multimodal.to(torch.bool).reshape(-1)
+                # vLLM v1's multimodal placeholder range covers the FULL
+                # ``[SOS_ph, TASK_ID_ph, AUDIO_ph * pstoken_len]`` block
+                # (length ``2 + pstoken_len``, see ``_get_prompt_updates``'s
+                # ``insertion_end`` which inserts ``[1] * (1 + 1 + token_len)``
+                # and ``mm_position.length`` matches that). So each contiguous
+                # ``True`` group in ``is_mm`` starts at a request's SOS
+                # placeholder, NOT at its first audio placeholder.
+                prev_false = torch.cat([torch.ones(1, dtype=torch.bool, device=is_mm.device), ~is_mm[:-1]])
+                group_starts = (is_mm & prev_false).nonzero(as_tuple=True)[0].tolist()
+                if len(group_starts) != len(multimodal_embeddings):
+                    raise RuntimeError(
+                        f"cosyvoice3 talker: found {len(group_starts)} placeholder "
+                        f"blocks in is_multimodal but {len(multimodal_embeddings)} "
+                        f"multimodal_embeddings tensors — these must match 1:1."
+                    )
+
+                total_tokens = int(embed_tokens.shape[0])
+                # vLLM v1 packs cached (decode) requests first, then new
+                # (prefill) requests. The decode tokens at positions
+                # ``[0:group_starts[0]]`` get a speech_embedding lookup (the
+                # talker is generating codec tokens here, so input ids are
+                # codec ids, not text ids). Positions starting at
+                # ``group_starts[0]`` are the first new prefill request's
+                # SOS placeholder.
+                segments: list[torch.Tensor] = []
+                first_prefill = group_starts[0]
+                if first_prefill > 0:
+                    decode_ids = input_ids[:first_prefill].to(dtype=torch.long)
+                    segments.append(self.model.speech_embedding.weight[decode_ids])
+
+                for i, req_start in enumerate(group_starts):
+                    pstoken_len_i = int(multimodal_embeddings[i].shape[0])
+                    # Real text starts after the 2 + pstoken_len_i leading
+                    # placeholders of this request's prompt.
+                    text_start = req_start + 2 + pstoken_len_i
+                    # Next request's segment starts at its own SOS placeholder,
+                    # which is exactly the next True group's first index.
+                    if i + 1 < len(group_starts):
+                        req_end = group_starts[i + 1]
+                    else:
+                        req_end = total_tokens
+                    segments.append(sos)
+                    segments.append(embed_tokens[text_start:req_end])
+                    segments.append(task_id)
+                    segments.append(multimodal_embeddings[i])
+                embed_tokens = torch.cat(segments, dim=0)
             else:
                 embed_tokens = self.model.speech_embedding.weight[input_ids]
             return embed_tokens

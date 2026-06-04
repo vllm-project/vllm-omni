@@ -7,8 +7,9 @@
 #   * Stages 0/1 (thinker, talker) do not set max_num_batched_tokens —
 #     chat-sized prefill fits in the 32768 default.
 #   * Stages 0/1 do not set enforce_eager — cudagraph runs by default
-#     (false). Stage 2 (code2wav) sets true because its generation loop
-#     is cudagraph-incompatible.
+#     (false). Stage 2 (code2wav) keeps enforce_eager=false so Code2Wav can
+#     use its inner cudagraph on CUDA. ROCm flips stage 2 to eager because
+#     MIOpen conv_transpose1d is not capture-safe in the Code2Wav graph path.
 #   * Platform sections flip enforce_eager per-stage where platform
 #     cudagraph support differs.
 async_chunk: true
@@ -17,6 +18,7 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
+      initial_codec_chunk_frames: 4
       codec_chunk_frames: 25
       codec_left_context_frames: 25
 
@@ -29,12 +31,8 @@ stages:
     enable_prefix_caching: false
     devices: "0"
     default_sampling_params:
-      temperature: 0.4
-      top_p: 0.9
-      top_k: 1
+      temperature: 0.0
       max_tokens: 2048
-      seed: 42
-      repetition_penalty: 1.05
 
   - stage_id: 1
     max_num_batched_tokens: 32768
@@ -87,6 +85,15 @@ platforms:
       - stage_id: 2
         gpu_memory_utilization: 0.3
         devices: "2"
+
+  # Code2Wav decode uses UpSample1d, which calls F.conv_transpose1d.
+  # On ROCm this routes through MIOpen and is not capture-safe during
+  # vLLM's outer graph capture, so stage 2 runs eager to avoid MIOpen/HIP
+  # graph-capture failures.
+  rocm:
+    stages:
+      - stage_id: 2
+        enforce_eager: true
 
   xpu:
     stages:

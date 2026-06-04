@@ -1,7 +1,7 @@
 [
     {
-        "test_name": "test_hunyuan_image3_ti2i_tp4_tp4_inline",
-        "description": "AR (TP=4) + DiT (TP=4) - using inline dataset and deploy-config",
+        "test_name": "test_hunyuan_image3_ti2i_inline",
+        "description": "AR (TP=2) + 2 * DiT (TP=2) - using inline dataset and deploy-config",
         "server_type": "vllm-omni",
         "benchmark_endpoint": "/v1/images/edits",
         "server_params": {
@@ -21,7 +21,7 @@
                                     "zmq_port": 50051,
                                     "protocol": "rdma",
                                     "device_name": "",
-                                    "memory_pool_size": 4294967296,
+                                    "memory_pool_size": 17179869184,
                                     "memory_pool_device": "cpu"
                                 }
                             }
@@ -32,13 +32,13 @@
                                 "is_comprehension": true,
                                 "final_output": true,
                                 "final_output_type": "text",
-                                "max_num_seqs": 4,
+                                "max_num_seqs": 16,
                                 "gpu_memory_utilization": 0.95,
                                 "enforce_eager": false,
                                 "enable_prefix_caching": false,
                                 "max_num_batched_tokens": 32768,
-                                "devices": "0,1,2,3",
-                                "tensor_parallel_size": 4,
+                                "devices": "0,1",
+                                "tensor_parallel_size": 2,
                                 "hf_overrides": {
                                     "rope_parameters": {
                                         "mrope_section": [0, 32, 32],
@@ -65,13 +65,14 @@
                                 "stage_id": 1,
                                 "max_num_seqs": 1,
                                 "enforce_eager": true,
-                                "devices": "4,5,6,7",
+                                "devices": "2,3",
                                 "distributed_executor_backend": "mp",
                                 "omni_kv_config": {
                                     "need_recv_cache": true
                                 },
                                 "parallel_config": {
-                                    "tensor_parallel_size": 4,
+                                    "tensor_parallel_size": 2,
+                                    "vae_patch_parallel_size": 2,
                                     "enable_expert_parallel": true
                                 },
                                 "input_connectors": {
@@ -114,8 +115,8 @@
                 },
                 "task": "ti2i",
                 "bot-task": "think_recaption",
-                "max-concurrency": 4,
-                "num-prompts": 16,
+                "max-concurrency": 16,
+                "num-prompts": 96,
                 "skip-performance-assertion": true,
                 "baseline": {
                     "throughput_qps": 0.1,

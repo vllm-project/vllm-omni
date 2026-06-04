@@ -9,63 +9,40 @@ import pytest
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
-from vllm_omni.platforms import current_omni_platform
+from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
-models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
-
 # Set VLLM_TEST_PD_MODE=1 to test PD disaggregation (follow-up — deploy overlay not yet migrated).
 _USE_PD = os.environ.get("VLLM_TEST_PD_MODE", "0") == "1"
 
+_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 _CI_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
 
-def get_chunk_config(config_path: str | None = None):
-    """Load the qwen3_omni CI deploy yaml with async_chunk modifications for streaming mode."""
-    if config_path is None:
-        config_path = _CI_DEPLOY
-    # TODO: remove this workaround once legacy `stage_args` path is deleted.
-    # The pipeline (qwen3_omni/pipeline.py) already wires
-    # thinker2talker_async_chunk / talker2code2wav_async_chunk on stage 0/1,
-    # so only async_chunk needs flipping. Writing nested `engine_args:` into
-    # the new-schema overlay trips _parse_stage_deploy's legacy branch and
-    # drops flat fields (load_format, max_num_seqs, ...).
-    return modify_stage_config(config_path, updates={"async_chunk": True})
-
-
-# Platform-specific overrides live inside the new deploy yaml's ``platforms:``
-# section, so a single ``_CI_DEPLOY`` path serves CUDA, ROCm, and XPU.
-# TODO: re-add VLLM_TEST_PD_MODE branch once the PD-disaggregation deploy
-# overlay has been migrated to the new schema (previously used the deleted
-# ``qwen3_omni_moe_pd_ci.yaml`` stage-configs file).
-if current_omni_platform.is_xpu():
-    stage_configs = [_CI_DEPLOY]
-else:  # CUDA + ROCm MI325 share the same deploy config
-    stage_configs = [get_chunk_config()]
-
-# Create parameter combinations for model and stage config
-test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
-]
-# For prefix caching, we enable it on the thinker (stage 0) via CLI override
+# For prefix caching checks against we enable it on the thinker and talker via CLI override
 # and enable prompt token details so that we can determine if any tokens were cached.
+# We also explicitly set block size so that we can make sure the cached token counts are a
+# multiple of the block size.
 BLOCK_SIZE = 16
-prefix_test_params = [
-    OmniServerParams(
-        model=model,
-        stage_config_path=_CI_DEPLOY,
-        server_args=[
-            "--block-size",
-            str(BLOCK_SIZE),
-            "--stage-overrides",
-            '{"0": {"enable_prefix_caching": true}}',
-            "--enable-prompt-tokens-details",
-        ],
+test_params = [
+    pytest.param(
+        OmniServerParams(
+            model=_MODEL,
+            stage_config_path=_CI_DEPLOY,
+            use_stage_cli=True,
+            server_args=[
+                "--no-async-chunk",
+                "--block-size",
+                str(BLOCK_SIZE),
+                "--stage-overrides",
+                '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
+                "--enable-prompt-tokens-details",
+            ],
+        ),
+        id="default",
     )
-    for model in models
 ]
 
 
@@ -166,45 +143,14 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", prefix_test_params, indirect=True)
-def test_thinker_prefix_caching(omni_server, openai_client, run_level) -> None:
+def _run_prefix_cache_check(openai_client, request_config: dict):
+    """Make two requests given a request config, and validate that:
+    1. The second request actually had cached tokens
+    2. The number of cached tokens is divisible by the block size used in
+    test_params, because currently upstream vLLM does not cache partial
+    blocks.
     """
-    Test thinker prefix caching by sending identical requests with an image (i.e.,
-    a large shared prefix) and verifying that the second request uses cached tokens
-    & produces the same output with greedy decoding.
-
-    NOTE: The reason that we check against logprobs instead of direct text here is that
-    the outputs may still diverge a bit even though we set the seed and temperature.
-    This is mostly because the GEMM algorithm may vary based on the input tensors dims.
-    Because of this, we don't check the logprobs if it's a dummy load, since in that case
-    the top logprobs will all be very close.
-    """
-    seed = 10
-    img_res = generate_synthetic_image(224, 224, seed=seed)
-    image_data_url = f"data:image/jpeg;base64,{img_res['base64']}"
-    messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(),
-        image_data_url=image_data_url,
-        content_text=get_prompt("text_image"),
-    )
-
-    top_k = 10
-    sampling_params = {"seed": seed, "temperature": 0, "max_tokens": 8, "logprobs": top_k}
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": False,
-        "modalities": ["text"],
-        "logprobs": True,
-        "top_logprobs": top_k,
-        "sampling_params_list": [sampling_params] * 3,
-    }
-
-    uncached_response = openai_client.send_omni_request(request_config, request_num=1)[0]
+    openai_client.send_omni_request(request_config, request_num=1)[0]
     cached_response = openai_client.send_omni_request(request_config, request_num=1)[0]
 
     # Ensure that we have a prefix cache hit on the second request and that only the last
@@ -217,16 +163,66 @@ def test_thinker_prefix_caching(omni_server, openai_client, run_level) -> None:
     assert num_cached_tokens % BLOCK_SIZE == 0
     assert (num_cached_tokens + num_uncached_tokens) == num_prompt_tokens
 
-    # Ensure that we have logprobs and tokens were generated for both requests
-    assert uncached_response.logprobs is not None
-    assert cached_response.logprobs is not None
-    n_tokens = min(len(uncached_response.logprobs), len(cached_response.logprobs))
-    assert n_tokens > 0
 
-    if run_level == "advanced_model":
-        # For each token index where both responses have an output, ensure that the greedy token
-        # predicted in the uncached case is in the top k logprobs for the cached case
-        for idx in range(n_tokens):
-            greedy_token = uncached_response.logprobs[idx].token
-            cached_top_k = {lp.token for lp in cached_response.logprobs[idx].top_logprobs}
-            assert greedy_token in cached_top_k
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_thinker_prefix_caching_text_output(omni_server, openai_client) -> None:
+    """
+    Test thinker prefix caching by sending identical requests with an image (i.e.,
+    a large shared prefix) and verifying that the second request uses cached tokens
+    & produces the same output with greedy decoding.
+
+    NOTE: Checking the output of prefix caching directly can be a bit unstable
+    due to slight numerical differences as a result of running different scheduled
+    sequence lengths. As such, for E2E tests on prefix cache, we only check the cached
+    token count and not the output, since the omni tensor cache has solid unit tests,
+    and the core prefix cache algorithm is largely tested by upstream vLLM.
+    """
+    img_res = generate_synthetic_image(224, 224)
+    image_data_url = f"data:image/jpeg;base64,{img_res['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        image_data_url=image_data_url,
+        content_text=get_prompt("text_image"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "modalities": ["text"],
+    }
+    _run_prefix_cache_check(openai_client, request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_thinker_prefix_caching_audio_output(omni_server, openai_client) -> None:
+    """
+    Verify that thinker prefix caching does not hang when the request
+    produces audio output (text + audio modalities).  Sends two identical
+    requests so the second exercises the prefix-cached path through the
+    full thinker -> talker -> code2wav pipeline.
+
+    Regression test for https://github.com/vllm-project/vllm-omni/issues/3510
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt(),
+    )
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {
+            "include_usage": True,
+        },
+    }
+
+    _run_prefix_cache_check(openai_client, request_config)

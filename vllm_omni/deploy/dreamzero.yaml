@@ -1,0 +1,25 @@
+# DreamZero-DROID deploy: single diffusion stage.
+#
+# Topology is declared in vllm_omni/model_executor/models/dreamzero/pipeline.py.
+# This default uses one GPU with TP=1 and CFG parallel disabled.
+
+pipeline: dreamzero
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: DreamZeroPipeline
+    model_config:
+      default_robot_embodiment: roboarena
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position
