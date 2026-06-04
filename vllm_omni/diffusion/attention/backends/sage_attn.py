@@ -22,7 +22,7 @@ if current_omni_platform.is_xpu():
     except ImportError:
         logger.warning(
             "XPU SageAttention (auto_round_kernel.ARK.sagev1) is not available. "
-            "Install auto-round-lib==0.13.0 for XPU sage attention support."
+            "Install auto-round-lib for XPU sage attention support."
         )
         xpu_sageattn = None
 else:
@@ -96,9 +96,7 @@ class SageAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         if xpu_sageattn is None:
-            raise ImportError(
-                "XPU SageAttention requires auto-round-lib==0.13.0. Install with: pip install auto-round-lib==0.13.0"
-            )
+            raise ImportError("XPU SageAttention requires auto-round-lib. Install with: pip install auto-round-lib")
         orig_dtype = query.dtype
         # ARK.sagev1 requires float16 inputs
         q = query.to(torch.float16) if orig_dtype != torch.float16 else query
