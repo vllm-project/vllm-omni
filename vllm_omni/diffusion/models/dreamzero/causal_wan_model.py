@@ -26,6 +26,7 @@ from vllm.distributed import (
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.utils import set_weight_attrs
@@ -458,9 +459,15 @@ class CausalWanSelfAttention(nn.Module):
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
         self.max_attention_size = 21 * frame_seqlen if local_attn_size == -1 else local_attn_size * frame_seqlen
-        self.q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
-        self.k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
-        self.v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
+        # Fused QKV projection: q/k/v all come from x, so a single column-parallel
+        # GEMM replaces three (fewer launches / better GEMM util in the decode-like
+        # per-step forward). No GQA here: total_num_kv_heads defaults to num_heads.
+        self.qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=num_heads,
+            bias=True,
+        )
         self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
         self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
@@ -486,11 +493,15 @@ class CausalWanSelfAttention(nn.Module):
         """Inference-only forward (KV cache path)."""
         n, d = self.tp_num_heads, self.head_dim
 
+        # Single fused QKV GEMM, then split into the per-rank q/k/v shards.
+        qkv, _ = self.qkv(x)
+        qk_size = self.tp_num_heads * self.head_dim
+        q, k, v = qkv.split([qk_size, qk_size, qk_size], dim=-1)
         # Fuse q/k qk-norm into a single TP all-reduce (both come from x, same shape).
-        q, k = fused_qk_rms_norm(self.norm_q, self.norm_k, self.q(x), self.k(x))
+        q, k = fused_qk_rms_norm(self.norm_q, self.norm_k, q, k)
         q = q.unflatten(2, (n, d))
         k = k.unflatten(2, (n, d))
-        v = self.v(x).unflatten(2, (n, d))
+        v = v.unflatten(2, (n, d))
 
         updated_kv_cache: torch.Tensor | None = None
 
