@@ -38,10 +38,11 @@ class BackgroundResources:
     result_mq: MessageQueue | None = None
     num_workers: int = 0
     processes: list[mp.Process] | None = None
+    wake_events: list[Any] | None = None
 
     def __call__(self):
         """Clean up background resources."""
-        if hasattr(self, "wake_events") and self.wake_events:
+        if self.wake_events:
             for ev in self.wake_events:
                 ev.set()
 
@@ -74,9 +75,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._closed = False
         self.is_failed = False
         self._failure_callbacks: list[Callable[[], None]] = []
+        self._mp_context = mp.get_context("spawn")
 
         num_workers = self.od_config.num_gpus
-        self.wake_events = [mp.Event() for _ in range(num_workers)]
+        self.wake_events = [self._mp_context.Event() for _ in range(num_workers)]
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
@@ -91,6 +93,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             result_mq=self._result_mq,
             num_workers=num_workers,
             processes=self._processes,
+            wake_events=self.wake_events,
         )
         self._finalizer = weakref.finalize(self, self.resources)
 
@@ -188,7 +191,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         logger.info("Starting server...")
 
         num_gpus = od_config.num_gpus
-        mp.set_start_method("spawn", force=True)
+        mp_context = getattr(self, "_mp_context", mp.get_context("spawn"))
         processes = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
@@ -200,9 +203,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         scheduler_pipe_writers = []
 
         for i in range(num_gpus):
-            reader, writer = mp.Pipe(duplex=False)
+            reader, writer = mp_context.Pipe(duplex=False)
             scheduler_pipe_writers.append(writer)
-            process = mp.Process(
+            process = mp_context.Process(
                 target=WorkerProc.worker_main,
                 args=(
                     i,  # rank
