@@ -294,7 +294,8 @@ def llm2code2wav(
         if len(code_final) > MAX_CODE2WAV_TOKENS:
             logger.warning(
                 "Truncating code2wav input from %d to %d tokens",
-                len(code_final), MAX_CODE2WAV_TOKENS,
+                len(code_final),
+                MAX_CODE2WAV_TOKENS,
             )
             code_final = code_final[:MAX_CODE2WAV_TOKENS]
 

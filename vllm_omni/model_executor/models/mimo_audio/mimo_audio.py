@@ -348,8 +348,11 @@ class MiMoAudioDataParser(MultiModalDataParser):
                     wav_mono = wav_tensor[0]
             audio_codes = self.mimo_tokenizer.encode(audio=(wav_mono, self.target_sr))
             new_audio = audio_codes.detach().cpu().numpy().astype(np.int64).tolist()
-            logger.info("[MiMo _parse_audio_data] Encoded audio codes shape: channels=%d, T=%d",
-                        len(new_audio), len(new_audio[0]) if new_audio else 0)
+            logger.info(
+                "[MiMo _parse_audio_data] Encoded audio codes shape: channels=%d, T=%d",
+                len(new_audio),
+                len(new_audio[0]) if new_audio else 0,
+            )
             new_audios.append(new_audio)
 
         logger.info("[MiMo _parse_audio_data] Total parsed audios: %d", len(new_audios))
@@ -380,9 +383,11 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
         mm_data = dict(mm_data)
         logger.info("[MiMo _call_hf_processor] mm_data keys: %s", list(mm_data.keys()))
         audios = mm_data.pop("audios", []) or mm_data.pop("audio", [])
-        logger.info("[MiMo _call_hf_processor] audios count: %d, types: %s",
-                    len(audios) if audios else 0,
-                    [type(a).__name__ for a in audios] if audios else [])
+        logger.info(
+            "[MiMo _call_hf_processor] audios count: %d, types: %s",
+            len(audios) if audios else 0,
+            [type(a).__name__ for a in audios] if audios else [],
+        )
         tokenizer = self.info.get_tokenizer()
         if audios:
             mm_data["audio"] = audios
@@ -476,7 +481,9 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
                     if audios is not None:
                         num_audios = audios.get_count()
                         audio_output_lengths = [audios.get_audio_length(i) for i in range(num_audios)]
-                        logger.info("[MiMo _get_prompt_updates] audio_output_lengths from mm_items: %s", audio_output_lengths)
+                        logger.info(
+                            "[MiMo _get_prompt_updates] audio_output_lengths from mm_items: %s", audio_output_lengths
+                        )
                 except Exception as e:
                     logger.error(f"_get_prompt_updates failed: {e}")
 
