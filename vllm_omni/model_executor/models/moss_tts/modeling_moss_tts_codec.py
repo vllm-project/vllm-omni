@@ -20,6 +20,9 @@ from vllm_omni.model_executor.models.moss_tts.audio_tokenizer import (
     MossAudioTokenizerConfig,
     MossAudioTokenizerModel,
 )
+from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
+    MossTTSCUDAGraphCodecWrapper,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -64,6 +67,7 @@ class MossTTSCodecDecoder(nn.Module):
 
         # Resolved at load_weights() time
         self._codec: MossAudioTokenizerModel | None = None
+        self._cuda_graph_wrapper: MossTTSCUDAGraphCodecWrapper | None = None
         self._sr_tensor = torch.tensor(self._OUTPUT_SAMPLE_RATE, dtype=torch.int32)
 
     # ------------------------------------------------------------------
@@ -183,7 +187,10 @@ class MossTTSCodecDecoder(nn.Module):
                 left_ctx = int(left_ctx.reshape(-1)[0].item()) if left_ctx.numel() else 0
             left_ctx = int(left_ctx)
 
-            out = self._codec.batch_decode(codes_list=[codes_nq_t], num_quantizers=self._n_vq)
+            if self._cuda_graph_wrapper is not None:
+                out = self._cuda_graph_wrapper.decode(codes_nq_t)
+            else:
+                out = self._codec.batch_decode(codes_list=[codes_nq_t], num_quantizers=self._n_vq)
 
             if out.audio is None:
                 continue
@@ -291,11 +298,33 @@ class MossTTSCodecDecoder(nn.Module):
         # Move sr_tensor to the same device
         self._sr_tensor = self._sr_tensor.to(device=device)
 
+        self._maybe_enable_decoder_cudagraph(device)
+
         # vLLM's track_weights_loading() compares the returned set against
         # ``self.named_parameters()``. After ``self._codec = codec`` above,
         # those parameters are registered with the ``_codec.`` prefix, so
         # mirror that here.
         return {f"_codec.{name}" for name, _ in codec.named_parameters()}
+
+    def _maybe_enable_decoder_cudagraph(self, device: torch.device) -> None:
+        """Capture CUDA Graphs for the codec decoder if enforce_eager is False."""
+        if getattr(self.vllm_config.model_config, "enforce_eager", True):
+            return
+        if self._codec is None:
+            return
+
+        cfg = self.vllm_config.model_config.hf_config
+        capture_sizes: list[int] = list(
+            getattr(cfg, "decode_cudagraph_capture_sizes", None) or [4, 8, 16, 25, 32, 50, 64, 100, 128, 200, 256]
+        )
+
+        self._cuda_graph_wrapper = MossTTSCUDAGraphCodecWrapper(
+            model=self._codec,
+            capture_sizes=capture_sizes,
+            num_quantizers=self._n_vq,
+            enabled=True,
+        )
+        self._cuda_graph_wrapper.warmup(device)
 
 
 __all__ = ["MossTTSCodecDecoder"]
