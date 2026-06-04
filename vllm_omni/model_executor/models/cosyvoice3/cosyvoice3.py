@@ -3,10 +3,16 @@
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
+from math import gcd
 from threading import Lock
 
+import numpy as np
+import onnxruntime
 import torch
 import torch.nn as nn
+from huggingface_hub import snapshot_download
+from scipy.signal import resample_poly
+from transformers import Qwen2Config
 from transformers.feature_extraction_utils import BatchFeature
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
@@ -32,13 +38,14 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
+from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import (
     concat_text_with_prompt_ids,
     extract_speech_feat,
-    extract_speech_token,
     extract_spk_embedding,
     extract_spk_embedding_trt,
     extract_text_token,
+    mel_spectrogram,
     unpad_prompt_conditioning,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -89,14 +96,7 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
 
         # If model_dir is an HF repo ID (not a local path), resolve to cache
         if not os.path.isdir(model_dir):
-            from huggingface_hub import snapshot_download
-
             model_dir = snapshot_download(model_dir)
-
-        import onnxruntime
-
-        from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
-        from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -106,11 +106,6 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             token_path=os.path.join(model_dir, config.qwen_pretrain_path),
             skip_special_tokens=config.skip_special_tokens,
             version=config.version,
-        )
-        self.speech_tokenizer = onnxruntime.InferenceSession(
-            os.path.join(model_dir, config.speech_tokenizer_path),
-            sess_options=option,
-            providers=["CUDAExecutionProvider" if torch.cuda.is_available() else "CPUExecutionProvider"],
         )
         self.feat_extractor = partial(mel_spectrogram, **getattr(config, "feat_extractor", {}))
         campplus_onnx_path = os.path.join(model_dir, config.campplus_onxx_path)
@@ -148,7 +143,7 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
 
     # Class-level cached s3tokenizer model — loaded once per process on first
     # call to ``_extract_speech_token_via_s3`` and shared across all
-    # processor instances. Guarded by ``COSYVOICE3_USE_S3TOKENIZER=1``.
+    # processor instances.
     _s3_model = None
 
     @classmethod
@@ -156,18 +151,17 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         if cls._s3_model is not None:
             return cls._s3_model
 
-        # ``s3tokenizer`` is a regular dependency now; import it directly. No
-        # hard-coded source checkout path. ``S3TOKENIZER_CACHE`` optionally
-        # overrides the download cache; otherwise s3tokenizer's own default is
-        # used.
-        import s3tokenizer as _s3
+        # s3tokenizer is imported lazily (kept off the module top level) so
+        # callers that don't use the CosyVoice3 talker need not install it.
+        try:
+            import s3tokenizer as _s3
+        except ImportError as e:
+            raise ImportError(
+                "CosyVoice3 speech-token extraction requires the 's3tokenizer' "
+                "package; install it with `pip install s3tokenizer`."
+            ) from e
 
-        cache_dir = os.environ.get("S3TOKENIZER_CACHE")
-        load_kwargs = {}
-        if cache_dir:
-            os.makedirs(cache_dir, exist_ok=True)
-            load_kwargs["download_root"] = cache_dir
-        model = _s3.load_model("speech_tokenizer_v3_25hz", **load_kwargs)
+        model = _s3.load_model("speech_tokenizer_v3_25hz")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = model.to(device).eval()
         cls._s3_model = (model, _s3, device)
@@ -179,8 +173,6 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         ``(speech_token[1, T], speech_token_len[1])`` int32 tensors as the
         ONNX path so the rest of ``_call_hf_processor`` is unchanged.
         """
-        import numpy as np
-
         model, _s3, dev = self._ensure_s3_model()
 
         # audio is a (waveform_ndarray, sr) tuple; resample to 16 kHz mono float32.
@@ -189,10 +181,6 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         if wav.ndim == 2:
             wav = wav.mean(axis=1)
         if int(sr) != 16000:
-            from math import gcd
-
-            from scipy.signal import resample_poly
-
             g = gcd(int(sr), 16000)
             wav = resample_poly(wav, 16000 // g, int(sr) // g).astype(np.float32)
         audio_t = torch.from_numpy(wav)
@@ -284,27 +272,12 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
                 )
                 return ft
 
-        # Per-call timing of the three feature-extraction ONNX/mel pipelines.
-        # Aggregated stats are printed at process exit; enable with
-        # ``COSYVOICE3_TIME_PROCESSOR=1``.
-        import os as _os
-        import time as _time
-
-        _timing_on = _os.environ.get("COSYVOICE3_TIME_PROCESSOR") == "1"
-        _t_token0 = _time.perf_counter() if _timing_on else None
-        # Faster path: when ``COSYVOICE3_USE_S3TOKENIZER=1`` and the
-        # S3Tokenizer PyTorch package is importable, use it for speech-token
-        # extraction. It runs on GPU via PyTorch instead of the bundled
-        # ``speech_tokenizer_v3.onnx`` which falls back to CPU ONNX runtime in
-        # this venv (no onnxruntime-gpu installed), and is ~30× faster.
-        if _os.environ.get("COSYVOICE3_USE_S3TOKENIZER") == "1":
-            speech_token, speech_token_len = self._extract_speech_token_via_s3(audio, device)
-        else:
-            speech_token, speech_token_len = extract_speech_token(audio, self.speech_tokenizer, device)
-        _t_token1 = _time.perf_counter() if _timing_on else None
+        # Speech-token extraction via the S3Tokenizer PyTorch model on GPU
+        # (~30x faster than the bundled ``speech_tokenizer_v3.onnx`` CPU ONNX
+        # path in this venv).
+        speech_token, speech_token_len = self._extract_speech_token_via_s3(audio, device)
 
         speech_feat, speech_feat_len = extract_speech_feat(audio, self.feat_extractor, device)
-        _t_feat1 = _time.perf_counter() if _timing_on else None
 
         if config.sample_rate == 24000:
             token_len = min(int(speech_feat.shape[1] / 2), speech_token.shape[1])
@@ -315,44 +288,6 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             embedding = extract_spk_embedding_trt(audio, self.campplus_trt, device)
         else:
             embedding = extract_spk_embedding(audio, self.campplus_session, device)
-        _t_emb1 = _time.perf_counter() if _timing_on else None
-
-        if _timing_on:
-            _cls = type(self)
-            _bucket = getattr(_cls, "_cosyvoice3_timing_buckets", None)
-            if _bucket is None:
-                _bucket = {
-                    "speech_token_ms": [],
-                    "speech_feat_ms": [],
-                    "spk_embedding_ms": [],
-                }
-                _cls._cosyvoice3_timing_buckets = _bucket
-            _bucket["speech_token_ms"].append((_t_token1 - _t_token0) * 1000)
-            _bucket["speech_feat_ms"].append((_t_feat1 - _t_token1) * 1000)
-            _bucket["spk_embedding_ms"].append((_t_emb1 - _t_feat1) * 1000)
-            # Register atexit reporter once per process.
-            if not getattr(_cls, "_cosyvoice3_timing_registered", False):
-                _cls._cosyvoice3_timing_registered = True
-                import atexit as _atexit
-
-                def _report():
-                    import statistics as _st
-
-                    b = type(self)._cosyvoice3_timing_buckets
-                    if not any(b.values()):
-                        return
-                    print("\n=== CosyVoice3 _call_hf_processor feature-extraction timing ===")
-                    for name, xs in b.items():
-                        if not xs:
-                            continue
-                        print(
-                            f"  {name:<22} n={len(xs):>4} sum={sum(xs):>8.1f}ms "
-                            f"mean={_st.mean(xs):>7.2f}ms median={_st.median(xs):>7.2f}ms "
-                            f"min={min(xs):>6.2f}ms max={max(xs):>6.2f}ms"
-                        )
-                    print("=" * 64)
-
-                _atexit.register(_report)
 
         # Cache the extracted artifacts for named speakers
         if cache_key is not None:
@@ -477,8 +412,6 @@ class CosyVoice3Model(
         self.model_stage = vllm_config.model_config.model_stage
         model_dir = vllm_config.model_config.model
         if not os.path.isdir(model_dir):
-            from huggingface_hub import snapshot_download
-
             model_dir = snapshot_download(model_dir)
         self.model_dir = model_dir
         self.model = None
@@ -536,8 +469,6 @@ class CosyVoice3Model(
         the pretrained model directory. The cache config is inherited from the parent
         to enable PagedAttention with the same memory configuration.
         """
-        from transformers import Qwen2Config
-
         qwen_config_path = os.path.join(self.model_dir, self.config.llm["llm"]["pretrain_path"])
         qwen_hf_config = Qwen2Config.from_pretrained(qwen_config_path)
 
@@ -952,8 +883,6 @@ class CosyVoice3Model(
         repo = getattr(self.config, "flow_estimator_onnx_repo", None)
         if repo:
             try:
-                from huggingface_hub import snapshot_download
-
                 fetched_dir = snapshot_download(repo, allow_patterns=[fp16_name])
                 fetched = os.path.join(fetched_dir, fp16_name)
                 if os.path.exists(fetched):
