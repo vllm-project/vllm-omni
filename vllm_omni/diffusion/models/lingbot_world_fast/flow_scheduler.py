@@ -9,11 +9,10 @@ class LingbotFlowScheduler:
     def __init__(
         self,
         inner: FlowUniPCMultistepScheduler,
-        timesteps5: torch.Tensor,
+        timesteps: torch.Tensor,
     ) -> None:
         self._inner = inner
-        # Length-5 schedule: [t0, t1, t2, t3, 0].
-        self.timesteps = timesteps5
+        self.timesteps = timesteps
         # Used by `_convert_flow_pred_to_x0` to look up sigma_t.
         self.sigmas = inner.sigmas
         self._full_timesteps = inner.timesteps
@@ -26,16 +25,12 @@ class LingbotFlowScheduler:
         return_dict: bool = False,
         generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor]:
-        # `t` is a per-row scalar (`_scheduler_step_local` loops per row).
-        if float(t.item()) == 0.0:
-            return (latents,)
-
         x0 = self._convert_flow_pred_to_x0(noise_pred, latents, t)
 
         ts_eq = (self.timesteps == t).nonzero(as_tuple=False)
         chunk_step = int(ts_eq[0].item()) if ts_eq.numel() > 0 else 0
 
-        if chunk_step + 1 < self.timesteps.shape[0] - 1:
+        if chunk_step + 1 < self.timesteps.shape[0]:
             next_t = self.timesteps[chunk_step + 1]
             noise = torch.randn(x0.shape, generator=generator, device=x0.device, dtype=x0.dtype)
             return (self._inner.add_noise(x0, noise, next_t),)

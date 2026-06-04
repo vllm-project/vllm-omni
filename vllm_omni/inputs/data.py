@@ -220,7 +220,7 @@ class OmniDiffusionSamplingParams:
     width_latents: list[int] | int | None = None
     num_frames: int = 1  # Default for image models
     num_frames_round_down: bool = False  # Whether to round down num_frames if it's not divisible by num_gpus
-    chunk_frames: int = 5  # Used when stream_batch=True
+    chunk_frames: int = 4  # Used when stream_batch=True
     num_chunks: int = 1
 
     # SLO-adaptive stream batching. ``slo_fps=None`` keeps B_target fixed at 1.

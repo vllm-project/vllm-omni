@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from enum import IntEnum
 
 import torch
@@ -51,6 +52,7 @@ class LingbotWorldFastState:
         self.current_start_frame: int = 0
         self.local_end_index: list[torch.Tensor] | None = None
         self.global_end_index: list[torch.Tensor] | None = None
+        self.evict_queues: list[list[deque[int]]] | None = None
 
         self.is_initialized: bool = False
         self.current_lat_f: int = 0
@@ -76,6 +78,13 @@ class LingbotWorldFastState:
         # ~2 latents, so we cache the last 2.
         self.last_decoded_latent: torch.Tensor | None = None
 
+        # Session-level rolling-cache config captured on the first call of a
+        # session. Extension calls must match these (the cache is sized once
+        # and reused; changing these mid-session would corrupt cache layout).
+        self.session_chunk_latent_frames: int | None = None
+        self.session_sink_size: int | None = None
+        self.session_local_attn_size: int | None = None
+
     # ------------------------------------------------------------------
     # KV cache management
     # ------------------------------------------------------------------
@@ -89,43 +98,69 @@ class LingbotWorldFastState:
         num_layers: int,
         num_heads: int,
         head_dim: int,
+        num_slots: int = 1,
     ) -> None:
+        """Initialize empty self-attn and cross-attn caches.
+
+        - ``num_slots=1`` (default): all forward calls read/write the same per-layer cache regardless of noise level.
+        - ``num_slots > 1``: each step has its own isolated history.
+
+        Cross-attn is single-slot per layer since text context is independent
+        of denoising step.
+        """
         self.batch_size = batch_size
         self.num_layers = num_layers
+        self.num_slots = num_slots
         self.num_heads = num_heads
         self.head_dim = head_dim
 
-        """Initialize empty KV caches and cross-attention caches."""
+        # kv_cache[layer_idx][slot_idx] -> tensor [2, B, kv_size, H, D]
         self.kv_cache = [
-            torch.zeros(2, batch_size, kv_size, num_heads, head_dim, dtype=dtype, device=device)
+            [
+                torch.zeros(2, batch_size, kv_size, num_heads, head_dim, dtype=dtype, device=device)
+                for _ in range(num_slots)
+            ]
+            for _ in range(num_layers)
+        ]
+        # Per-(layer, slot) scalar tensors tracking fill length.
+        self.local_end_index = [
+            [torch.tensor([0], dtype=torch.long, device=device) for _ in range(num_slots)]
+            for _ in range(num_layers)
+        ]
+        self.global_end_index = [
+            [torch.tensor([0], dtype=torch.long, device=device) for _ in range(num_slots)]
             for _ in range(num_layers)
         ]
 
-        self.local_end_index = [torch.tensor([0], dtype=torch.long, device=device) for _ in range(num_layers)]
-        self.global_end_index = [torch.tensor([0], dtype=torch.long, device=device) for _ in range(num_layers)]
+        # Ring-buffer eviction queue per (layer, slot).
+        self.evict_queues = [
+            [deque() for _ in range(num_slots)]
+            for _ in range(num_layers)
+        ]
 
         self.crossattn_cache = [{"is_init": False, "k": None, "v": None} for _ in range(num_layers)]
 
         self.is_initialized = True
 
     def extend_kv_caches(self, extra_kv_size: int):
+        """Grow each (layer, slot) cache by ``extra_kv_size`` tokens."""
         assert self.is_initialized, "Cannot extend uninitialized kv cache"
 
-        dtype = self.kv_cache[0].dtype
-        device = self.kv_cache[0].device
+        dtype = self.kv_cache[0][0].dtype
+        device = self.kv_cache[0][0].device
 
-        self.kv_cache = [
-            torch.cat(
-                [
-                    self.kv_cache[i],
-                    torch.zeros(
-                        2, self.batch_size, extra_kv_size, self.num_heads, self.head_dim, dtype=dtype, device=device
-                    ),
-                ],
-                dim=2,
-            )
-            for i in range(self.num_layers)
-        ]
+        for li in range(self.num_layers):
+            for si in range(self.num_slots):
+                self.kv_cache[li][si] = torch.cat(
+                    [
+                        self.kv_cache[li][si],
+                        torch.zeros(
+                            2, self.batch_size, extra_kv_size, self.num_heads, self.head_dim,
+                            dtype=dtype, device=device,
+                        ),
+                    ],
+                    dim=2,
+                )
 
     def update_kv_cache(
         self,

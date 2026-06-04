@@ -486,7 +486,7 @@ class WanVAE_(nn.Module):
         return mu
 
     def decode(self, z, scale):
-        self.clear_cache()
+        self.clear_decoder_cache()
         if isinstance(scale[0], torch.Tensor):
             z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(1, self.z_dim, 1, 1, 1)
         else:
@@ -500,7 +500,7 @@ class WanVAE_(nn.Module):
             else:
                 out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
                 out = torch.cat([out, out_], 2)
-        self.clear_cache()
+        self.clear_decoder_cache()
         return out
 
     def reparameterize(self, mu, log_var):
@@ -516,10 +516,15 @@ class WanVAE_(nn.Module):
         return mu + std * torch.randn_like(std)
 
     def clear_cache(self):
+        self.clear_decoder_cache()
+        self.clear_encoder_cache()
+
+    def clear_decoder_cache(self):
         self._conv_num = count_conv3d(self.decoder)
         self._conv_idx = [0]
         self._feat_map = [None] * self._conv_num
-        # cache encode
+
+    def clear_encoder_cache(self):
         self._enc_conv_num = count_conv3d(self.encoder)
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num

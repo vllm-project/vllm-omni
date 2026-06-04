@@ -73,6 +73,7 @@ class CausalWanSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
+        self.sink_threshold = 0.0 # for adaptive sink tokens
         self.qk_norm = qk_norm
         self.eps = eps
 
@@ -102,6 +103,8 @@ class CausalWanSelfAttention(nn.Module):
         local_end_index=None,
         global_end_index=None,
         current_starts=0,
+        slot_idxs=0,
+        evict_queues=None,
         max_attention_size=1_000_000,
     ):
         r"""
@@ -109,14 +112,25 @@ class CausalWanSelfAttention(nn.Module):
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-            current_starts(int | list[int]): per-row absolute token offset; an int
-                broadcasts to all rows.
+            kv_cache: List of per-slot [2, B_cache, kv_size, H, D] tensors for
+                this layer. Slot ``slot_idxs[i]`` is used for batch row i.
+            local_end_index / global_end_index: List of per-slot scalar tensors
+                tracking each slot's fill length.
+            current_starts(int | list[int]): per-row absolute token offset; an
+                int broadcasts to all rows.
+            slot_idxs(int | list[int]): per-row slot index (denoising step)
+                into ``kv_cache``; an int broadcasts to all rows.
+            evict_queues: optional list of per-slot lists holding sink indices
+                marked for adaptive eviction. Used in the rolling branch only.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
         if isinstance(current_starts, int):
             current_starts = [current_starts] * b
         assert len(current_starts) == b
+        if isinstance(slot_idxs, int):
+            slot_idxs = [slot_idxs] * b
+        assert len(slot_idxs) == b
 
         # query, key, value function
         def qkv_fn(x):
@@ -134,61 +148,118 @@ class CausalWanSelfAttention(nn.Module):
         num_new_tokens = roped_query.shape[1]
 
         if self.local_attn_size != -1:
-            # Cache-rolling path only supports single-row processing.
-            assert b == 1, "local_attn_size != -1 requires batch_size=1"
-            current_start = current_starts[0]
-            current_end = current_start + num_new_tokens
-            sink_tokens = self.sink_size * frame_seqlen
-            kv_cache_size = kv_cache[CacheIndex.K].shape[1]
-
-            if (current_end > global_end_index.item()) and (num_new_tokens + local_end_index.item() > kv_cache_size):
-                num_evicted_tokens = num_new_tokens + local_end_index.item() - kv_cache_size
-                num_rolled_tokens = local_end_index.item() - num_evicted_tokens - sink_tokens
-                kv_cache[CacheIndex.K][:, sink_tokens : sink_tokens + num_rolled_tokens] = kv_cache[CacheIndex.K][
-                    :, sink_tokens + num_evicted_tokens : sink_tokens + num_evicted_tokens + num_rolled_tokens
-                ].clone()
-                kv_cache[CacheIndex.V][:, sink_tokens : sink_tokens + num_rolled_tokens] = kv_cache[CacheIndex.V][
-                    :, sink_tokens + num_evicted_tokens : sink_tokens + num_evicted_tokens + num_rolled_tokens
-                ].clone()
-                new_local_end_index = (
-                    local_end_index.item() + current_end - global_end_index.item() - num_evicted_tokens
-                )
-            else:
-                new_local_end_index = local_end_index.item() + current_end - global_end_index.item()
-
-            local_start_index = new_local_end_index - num_new_tokens
-            kv_cache[CacheIndex.K][:, local_start_index:new_local_end_index] = roped_key
-            kv_cache[CacheIndex.V][:, local_start_index:new_local_end_index] = v
-
-            k_cache = kv_cache[CacheIndex.K][:, max(0, new_local_end_index - max_attention_size) : new_local_end_index]
-            v_cache = kv_cache[CacheIndex.V][:, max(0, new_local_end_index - max_attention_size) : new_local_end_index]
-            out = self.attn(roped_query, k_cache, v_cache)
-
-            global_end_index.fill_(current_end)
-            local_end_index.fill_(new_local_end_index)
-        else:
-            # local_attn_size == -1: per-row writes to non-overlapping cache slots,
-            # per-row attention reads sized by max_attention_size. Loops once per
-            # batch row inside attention to avoid needing a key-padding mask.
+            assert evict_queues is not None, "local_attn_size != -1 requires evict_queues"
             outs = []
-            max_end = 0
+            chunk_tokens = num_new_tokens
+            sink_tokens = self.sink_size * chunk_tokens
+            kv_cache_size = kv_cache[slot_idxs[0]][CacheIndex.K].shape[1]
+
             for i in range(b):
+                slot_i = slot_idxs[i]
+                slot_kv = kv_cache[slot_i]
+                slot_local_end = local_end_index[slot_i]
+                slot_global_end = global_end_index[slot_i]
+                slot_evict_queue = evict_queues[slot_i]
+
                 cs_i = current_starts[i]
                 ce_i = cs_i + num_new_tokens
-                kv_cache[CacheIndex.K][:, cs_i:ce_i] = roped_key[i : i + 1]
-                kv_cache[CacheIndex.V][:, cs_i:ce_i] = v[i : i + 1]
 
-                kv_start_i = max(0, ce_i - max_attention_size)
-                k_cache_i = kv_cache[CacheIndex.K][:, kv_start_i:ce_i]
-                v_cache_i = kv_cache[CacheIndex.V][:, kv_start_i:ce_i]
+                # 1. Adaptive sink check: pool the new chunk's K/V, compare to
+                # each sink's pooled K/V (avg of K and V cosine sim). If the
+                # least-similar sink drops below the threshold, prepend its END
+                # position to the queue so the next wrap evicts it.
+                if (
+                    self.sink_size > 0
+                    and self.sink_threshold > 0.0
+                    and slot_local_end.item() >= sink_tokens
+                ):
+                    new_pool_k = roped_key[i : i + 1].mean(dim=1).flatten(1)  # [1, n*d]
+                    new_pool_v = v[i : i + 1].mean(dim=1).flatten(1)
+                    sink_k_pool = (
+                        slot_kv[CacheIndex.K][0, :sink_tokens]
+                        .reshape(self.sink_size, chunk_tokens, n * d)
+                        .mean(dim=1)
+                    )
+                    sink_v_pool = (
+                        slot_kv[CacheIndex.V][0, :sink_tokens]
+                        .reshape(self.sink_size, chunk_tokens, n * d)
+                        .mean(dim=1)
+                    )
+                    k_cos = torch_F.cosine_similarity(sink_k_pool, new_pool_k, dim=-1)
+                    v_cos = torch_F.cosine_similarity(sink_v_pool, new_pool_v, dim=-1)
+                    avg_cos = (k_cos + v_cos) / 2  # [sink_size]
+                    if avg_cos.min().item() < self.sink_threshold:
+                        min_idx = int(avg_cos.argmin().item())
+                        sink_end = (min_idx + 1) * chunk_tokens
+                        if sink_end not in slot_evict_queue:
+                            slot_evict_queue.appendleft(sink_end)
 
+                # 2. Wrap if cache is full or the chunk's global end overruns it.
+                needs_wrap = (ce_i > kv_cache_size) or (slot_local_end.item() >= kv_cache_size)
+
+                if needs_wrap and slot_evict_queue:
+                    target_end = slot_evict_queue.popleft()
+                    if target_end > sink_tokens:
+                        # Rolling position: re-queue at back to keep cycling.
+                        slot_evict_queue.append(target_end)
+                    # Sink positions (target_end <= sink_tokens) are one-shot.
+                    slot_kv[CacheIndex.K][:, target_end - num_new_tokens : target_end] = roped_key[i : i + 1]
+                    slot_kv[CacheIndex.V][:, target_end - num_new_tokens : target_end] = v[i : i + 1]
+                    new_local_end_i = kv_cache_size
+                else:
+                    # Initial fill: append at the current fill position.
+                    new_local_end_i = slot_local_end.item() + ce_i - slot_global_end.item()
+                    local_start_i = new_local_end_i - num_new_tokens
+                    slot_kv[CacheIndex.K][:, local_start_i:new_local_end_i] = roped_key[i : i + 1]
+                    slot_kv[CacheIndex.V][:, local_start_i:new_local_end_i] = v[i : i + 1]
+                    # Queue the NEXT slot's END position so it gets evicted in
+                    # rolling order once the cache is full. Sinks (<=sink_tokens)
+                    # never enter the default queue.
+                    rolling_end = new_local_end_i + num_new_tokens
+                    if (
+                        rolling_end > sink_tokens
+                        and rolling_end <= kv_cache_size
+                        and (not slot_evict_queue or slot_evict_queue[-1] != rolling_end)
+                    ):
+                        slot_evict_queue.append(rolling_end)
+
+                # 3. Per-row attention over the active window.
+                kv_start_i = max(0, new_local_end_i - max_attention_size)
+                k_cache_i = slot_kv[CacheIndex.K][:, kv_start_i:new_local_end_i]
+                v_cache_i = slot_kv[CacheIndex.V][:, kv_start_i:new_local_end_i]
                 outs.append(self.attn(roped_query[i : i + 1], k_cache_i, v_cache_i))
-                if ce_i > max_end:
-                    max_end = ce_i
+
+                slot_global_end.fill_(ce_i)
+                slot_local_end.fill_(new_local_end_i)
 
             out = torch.cat(outs, dim=0)
-            global_end_index.fill_(max_end)
-            local_end_index.fill_(max_end)
+        else:
+            # local_attn_size == -1: per-row writes to non-overlapping cache
+            # positions, per-row attention reads sized by max_attention_size.
+            # Each row's writes and reads target its own slot (denoising step).
+            outs = []
+            max_end_per_slot: dict[int, int] = {}
+            for i in range(b):
+                slot_i = slot_idxs[i]
+                slot_kv = kv_cache[slot_i]
+
+                cs_i = current_starts[i]
+                ce_i = cs_i + num_new_tokens
+                slot_kv[CacheIndex.K][:, cs_i:ce_i] = roped_key[i : i + 1]
+                slot_kv[CacheIndex.V][:, cs_i:ce_i] = v[i : i + 1]
+
+                kv_start_i = max(0, ce_i - max_attention_size)
+                k_cache_i = slot_kv[CacheIndex.K][:, kv_start_i:ce_i]
+                v_cache_i = slot_kv[CacheIndex.V][:, kv_start_i:ce_i]
+
+                outs.append(self.attn(roped_query[i : i + 1], k_cache_i, v_cache_i))
+                if ce_i > max_end_per_slot.get(slot_i, 0):
+                    max_end_per_slot[slot_i] = ce_i
+
+            out = torch.cat(outs, dim=0)
+            for slot_i, end_i in max_end_per_slot.items():
+                global_end_index[slot_i].fill_(end_i)
+                local_end_index[slot_i].fill_(end_i)
 
         # output
         out = out.flatten(2)
@@ -294,6 +365,8 @@ class CausalWanAttentionBlock(nn.Module):
         global_end_index=None,
         crossattn_cache=None,
         current_starts=0,
+        slot_idxs=0,
+        evict_queues=None,
         max_attention_size=1_000_000,
     ):
         r"""
@@ -303,6 +376,10 @@ class CausalWanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             current_starts(int | list[int]): per-row absolute token offset; int broadcasts.
+            slot_idxs(int | list[int]): per-row self-attn cache slot (denoising
+                step); int broadcasts.
+            evict_queues: optional per-slot adaptive-sink eviction queues for
+                this layer; forwarded to ``self_attn``.
         """
         assert e.dtype == torch.float32
         with torch.amp.autocast("cuda", dtype=torch.float32):
@@ -318,6 +395,8 @@ class CausalWanAttentionBlock(nn.Module):
             local_end_index,
             global_end_index,
             current_starts,
+            slot_idxs,
+            evict_queues,
             max_attention_size,
         )
         with torch.amp.autocast("cuda", dtype=torch.float32):
@@ -557,6 +636,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
         global_end_index=None,
         crossattn_cache=None,
         current_starts=0,
+        slot_idxs=0,
+        evict_queues=None,
         max_attention_size=1_000_000,
         intermediate_tensors: IntermediateTensors | None = None,
     ):
@@ -572,6 +653,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
         Args:
             current_starts (int | list[int]): per-row absolute token offset.
                 int broadcasts to all rows.
+            slot_idxs (int | list[int]): per-row self-attn cache slot
+                (denoising step). int broadcasts.
             intermediate_tensors: per-stage hidden state from the previous PP rank.
 
         Returns:
@@ -677,6 +760,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
                     "local_end_index": local_end_index[local_idx],
                     "global_end_index": global_end_index[local_idx],
                     "current_starts": current_starts,
+                    "slot_idxs": slot_idxs,
+                    "evict_queues": evict_queues[local_idx] if evict_queues is not None else None,
                 }
             )
             x = block(x, **kwargs)

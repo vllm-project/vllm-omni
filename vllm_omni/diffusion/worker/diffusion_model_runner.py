@@ -591,8 +591,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                     chunks: list[ChunkState] = [self._get_or_create_chunk(state, idx)[0] for idx in chunk_idxs]
 
-                    # Per-row timesteps
+                    # Per-row timesteps + per-row denoising-step indexes
                     state.batched_timesteps = torch.stack([state.timesteps[c.step_index] for c in chunks])
+                    state.extra["chunk_step_idxs"] = [c.step_index for c in chunks]
 
                     batch_size = len(chunks)
                     noise_pred = self.pipeline.denoise_step(state, batch_size=batch_size)

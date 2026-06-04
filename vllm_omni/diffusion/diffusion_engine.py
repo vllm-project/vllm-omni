@@ -27,7 +27,6 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
-    apply_required_sampling_overrides,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
 )
@@ -606,11 +605,6 @@ class DiffusionEngine:
         return DiffusionEngine(config, scheduler=scheduler)
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
-        apply_required_sampling_overrides(
-            request.sampling_params,
-            self.od_config.model_class_name,
-        )
-
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -639,10 +633,6 @@ class DiffusionEngine:
         return await self.get_result(request_id)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        apply_required_sampling_overrides(
-            request.sampling_params,
-            self.od_config.model_class_name,
-        )
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -761,6 +751,7 @@ class DiffusionEngine:
                 width=width,
                 num_inference_steps=num_inference_steps,
                 num_frames=num_frames,
+                num_chunks=2,
                 # Keep warmup path minimal and robust across text encoders.
                 # Some models may fail when warmup implicitly triggers
                 # classifier-free guidance with an empty negative prompt.

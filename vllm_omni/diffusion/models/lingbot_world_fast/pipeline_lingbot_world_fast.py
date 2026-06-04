@@ -95,9 +95,6 @@ class LingbotWorldFastPipeline(
     supports_step_execution: ClassVar[bool] = True
     supports_micro_step_execution: ClassVar[bool] = True
 
-    STREAM_BATCH_CHUNK_FRAMES: ClassVar[int] = 12
-    STREAM_BATCH_NUM_INFERENCE_STEPS: ClassVar[int] = 5
-
     def __init__(self, *, od_config: OmniDiffusionConfig):
         super().__init__()
         self.od_config = od_config
@@ -421,7 +418,7 @@ class LingbotWorldFastPipeline(
                     "local_end_index": self.state.local_end_index,
                     "global_end_index": self.state.global_end_index,
                     "crossattn_cache": self.state.get_crossattn_caches(),
-                    "current_start": start_token_offset + chunk_id * chunk_size * frame_seqlen,
+                    "current_starts": start_token_offset + chunk_id * chunk_size * frame_seqlen,
                     "max_attention_size": total_kv_size,
                 }
 
@@ -526,18 +523,6 @@ class LingbotWorldFastPipeline(
             raise ValueError("LingbotWorldFastPipeline only supports a single prompt.")
 
         sampling = state.sampling
-        if sampling.chunk_frames != 3 * 4:
-            logger.warning(
-                "LingbotWorldFastPipeline requires chunk_frames=3*4=12, got %s. Overriding.",
-                sampling.chunk_frames,
-            )
-            sampling.chunk_frames = 12
-        if sampling.num_inference_steps != 5:
-            logger.warning(
-                "LingbotWorldFastPipeline requires num_inference_steps=4+1=5, got %s. Overriding.",
-                sampling.num_inference_steps,
-            )
-            sampling.num_inference_steps = 5
 
         prompt = state.prompts[0].get("prompt")
         multi_modal_data = state.prompts[0].get("multi_modal_data", {}) or {}
@@ -557,20 +542,39 @@ class LingbotWorldFastPipeline(
         if camera is None:
             raise ValueError("LingbotWorldFastPipeline requires camera poses in multi_modal_data['camera'].")
 
+        # chunk_latent_frames: VAE temporal stride is 4, so sampling.chunk_frames
+        # (pixel frames per chunk) must be a positive multiple of 4.
+        if sampling.chunk_frames is None or sampling.chunk_frames <= 0:
+            raise ValueError(
+                f"sampling.chunk_frames must be a positive int; got {sampling.chunk_frames}."
+            )
+        if sampling.chunk_frames % 4 != 0:
+            raise ValueError(
+                f"sampling.chunk_frames={sampling.chunk_frames} must be divisible by "
+                f"the VAE temporal stride 4."
+            )
+        chunk_latent_frames = sampling.chunk_frames // 4
+
+        # Lingbot ships a 4-step distilled timestep schedule.
+        max_steps = len(CONFIG["timesteps_index"])
+        if sampling.num_inference_steps is None:
+            sampling.num_inference_steps = max_steps
+        elif sampling.num_inference_steps <= 0 or sampling.num_inference_steps > max_steps:
+            raise ValueError(
+                f"sampling.num_inference_steps must be in [1, {max_steps}]; "
+                f"got {sampling.num_inference_steps}."
+            )
+
         if extension:
             assert multi_modal_data.get("image") is None, (
                 "image must not be provided on extension calls; it is only used on the first call of a session"
             )
-            assert self.model.config.local_attn_size == -1, (
-                "video extension requires the model to be configured with local_attn_size == -1"
-            )
 
         batch_size = 1
         c2ws = camera.get("poses")
-        chunk_size = CONFIG["chunk_size"]
         max_area = CONFIG["max_area"]
 
-        new_lat_f = max(sampling.num_chunks * chunk_size, 1)
+        new_lat_f = max(sampling.num_chunks * chunk_latent_frames, 1)
         if extension:
             num_frames = new_lat_f * 4
         else:
@@ -578,7 +582,7 @@ class LingbotWorldFastPipeline(
         if len(c2ws) < num_frames:
             raise ValueError(
                 f"camera trajectory has {len(c2ws)} poses; need >= {num_frames} "
-                f"for {sampling.num_chunks} chunks (chunk_size={chunk_size})."
+                f"for {sampling.num_chunks} chunks (chunk_latent_frames={chunk_latent_frames})."
             )
         c2ws = c2ws[:num_frames]
 
@@ -599,7 +603,7 @@ class LingbotWorldFastPipeline(
             img = None
             h, w, lat_h, lat_w = self.state.h, self.state.w, self.state.lat_h, self.state.lat_w
 
-        max_seq_len = chunk_size * lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
+        max_seq_len = chunk_latent_frames * lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
 
         seed = state.sampling.seed
@@ -611,13 +615,14 @@ class LingbotWorldFastPipeline(
         seed_g = torch.Generator(device=self.device).manual_seed(seed)
         seed_g_addnoise = torch.Generator(device=self.device).manual_seed(seed + 1)
 
-        # Sampler timesteps (4 denoise + 1 t=0 KV-update)
+        # Sampler timesteps
         self.scheduler.set_timesteps(self.num_train_timesteps, shift=CONFIG["sample_shift"])
-        denoise_timesteps = self.scheduler.timesteps[CONFIG["timesteps_index"]].to(self.device)
-        timesteps5 = torch.cat([denoise_timesteps, denoise_timesteps.new_zeros(1)], dim=0)
+        ts_idx = CONFIG["timesteps_index"][: sampling.num_inference_steps]
+        denoise_timesteps = self.scheduler.timesteps[ts_idx].to(self.device)
 
         # Text + camera Plucker
-        context_list = self.text_encoder([prompt], self.device)
+        context_list = self.text_encoder([prompt], self.text_encoder_device)
+        context_list = [c.to(self.device) for c in context_list]
 
         Ks_raw = torch.from_numpy(camera.get("intrinsics"))
         Ks_t = get_Ks_transformed(
@@ -649,11 +654,50 @@ class LingbotWorldFastPipeline(
                 zero_frame = torch.zeros(3, 1, h, w, device=self.device)
                 self.vae.init(zero_frame)
 
-        # KV cache sizing — per this rank's owned layer slice.
+        # Per-block self-attn config from sampling.extra_args. sink_size and
+        # local_attn_size are in chunks (each chunk has chunk_latent_frames).
+        # Defaults match the unbounded behaviour: no sinks, no rolling, no
+        # adaptive refresh.
+        sink_size = int(extra_args.get("sink_size", 3))
+        local_attn_size = int(extra_args.get("local_attn_size", 3))
+        sink_threshold = float(extra_args.get("sink_threshold", 0.2))
+
+        if extension:
+            prev = (
+                self.state.session_chunk_latent_frames,
+                self.state.session_sink_size,
+                self.state.session_local_attn_size,
+            )
+            curr = (chunk_latent_frames, sink_size, local_attn_size)
+            if prev != curr:
+                raise ValueError(
+                    f"Extension call config mismatch: "
+                    f"chunk_latent_frames/sink_size/local_attn_size went from {prev} to {curr}. "
+                    f"These must stay constant within a session."
+                )
+        else:
+            self.state.session_chunk_latent_frames = chunk_latent_frames
+            self.state.session_sink_size = sink_size
+            self.state.session_local_attn_size = local_attn_size
+
+        for block in self.model.blocks:
+            sa = getattr(block, "self_attn", None)
+            if sa is None:
+                continue  # PPMissingLayer on non-owning ranks
+            sa.sink_size = sink_size
+            sa.local_attn_size = local_attn_size
+            sa.sink_threshold = sink_threshold
+
+        # KV cache sizing — per this rank's owned layer slice and per slot.
+        # Rolling cache holds (sink_size + local_attn_size) chunks worth of K/V,
+        # each chunk occupying ``chunk_latent_frames * frame_seqlen`` tokens.
         model_args = self.model.config
         transformer_dtype = self.target_dtype
         frame_seqlen = int(lat_h * lat_w // 4)
-        extra_kv_size = frame_seqlen * new_lat_f
+        if local_attn_size > 0:
+            extra_kv_size = (sink_size + local_attn_size) * chunk_latent_frames * frame_seqlen
+        else:
+            extra_kv_size = frame_seqlen * new_lat_f
         head_dim = model_args.dim // model_args.num_heads
         local_num_heads = model_args.num_heads // self.sp_size
         owned_num_layers = self.model.end_layer - self.model.start_layer
@@ -667,9 +711,13 @@ class LingbotWorldFastPipeline(
                 owned_num_layers,
                 local_num_heads,
                 head_dim,
+                num_slots=sampling.num_inference_steps,
             )
-        else:
+        elif local_attn_size <= 0:
+            # Unbounded slots: grow on extension to fit the new frames.
             self.state.extend_kv_caches(extra_kv_size)
+        # If local_attn_size > 0, slot capacity is fixed; rolling region absorbs
+        # new chunks without needing to grow the buffer.
 
         prev_lat_f = self.state.current_lat_f
         total_kv_size = frame_seqlen * (prev_lat_f + new_lat_f)
@@ -678,9 +726,9 @@ class LingbotWorldFastPipeline(
         # State population.
         state.prompt_embeds = None  # unused; lingbot keeps text as raw list[Tensor]
         state.latents = None  # per-chunk latents are stacked by encode_chunk_inputs
-        state.timesteps = timesteps5
+        state.timesteps = denoise_timesteps
         state.step_index = 0
-        state.scheduler = LingbotFlowScheduler(self.scheduler, timesteps5)
+        state.scheduler = LingbotFlowScheduler(self.scheduler, denoise_timesteps)
         state.do_true_cfg = False
 
         state.extra["context"] = context_list
@@ -689,13 +737,14 @@ class LingbotWorldFastPipeline(
         state.extra["max_attention_size"] = total_kv_size
         state.extra["frame_seqlen"] = frame_seqlen
         state.extra["max_seq_len"] = max_seq_len
-        state.extra["chunk_size"] = chunk_size
+        state.extra["chunk_latent_frames"] = chunk_latent_frames
         state.extra["lat_h"] = lat_h
         state.extra["lat_w"] = lat_w
         state.extra["h"] = h
         state.extra["w"] = w
         state.extra["new_lat_f"] = new_lat_f
         state.extra["extension"] = extension
+        state.extra["rolling_enabled"] = local_attn_size > 0
         state.extra["seed_g"] = seed_g
         state.extra["seed_g_addnoise"] = seed_g_addnoise
 
@@ -711,7 +760,7 @@ class LingbotWorldFastPipeline(
     ) -> torch.Tensor:
         """Build per-chunk noise, plus VAE-encoded y and Plucker on first stage."""
         seed_g = state.extra["seed_g"]
-        chunk_size = state.extra["chunk_size"]
+        chunk_latent_frames = state.extra["chunk_latent_frames"]
         lat_h = state.extra["lat_h"]
         lat_w = state.extra["lat_w"]
         h = state.extra["h"]
@@ -723,7 +772,7 @@ class LingbotWorldFastPipeline(
         noise = torch.randn(
             B,
             16,
-            chunk_size,
+            chunk_latent_frames,
             lat_h,
             lat_w,
             dtype=torch.float32,
@@ -743,7 +792,7 @@ class LingbotWorldFastPipeline(
         for idx in new_idxs:
             is_anchor_chunk = (not extension) and idx == 0
             if is_anchor_chunk:
-                tail_frames = 4 * (chunk_size - 1)
+                tail_frames = 4 * (chunk_latent_frames - 1)
                 if tail_frames > 0:
                     zeros = torch.zeros(3, tail_frames, h, w, device=self.device)
                     tail_lat = self.vae.encode(zeros)
@@ -753,22 +802,22 @@ class LingbotWorldFastPipeline(
                     assert anchor_latent is not None
                     vae_lat = anchor_latent
             else:
-                zeros = torch.zeros(3, 4 * chunk_size, h, w, device=self.device)
+                zeros = torch.zeros(3, 4 * chunk_latent_frames, h, w, device=self.device)
                 vae_lat = self.vae.encode(zeros)
 
-            msk_chunk = torch.zeros(4, chunk_size, lat_h, lat_w, device=self.device)
+            msk_chunk = torch.zeros(4, chunk_latent_frames, lat_h, lat_w, device=self.device)
             if is_anchor_chunk:
                 msk_chunk[:, 0] = 1
             chunks[idx].extra["y"] = torch.cat([msk_chunk, vae_lat], dim=0)
 
         # plucker
         frame_indices = torch.tensor(
-            [ci * chunk_size + f for ci in new_idxs for f in range(chunk_size)],
+            [ci * chunk_latent_frames + f for ci in new_idxs for f in range(chunk_latent_frames)],
             device=c2ws_infer_full.device,
             dtype=torch.long,
         )
-        batched_c2ws = c2ws_infer_full[frame_indices]  # [B*chunk_size, 3, 4]
-        batched_Ks = Ks_t.repeat(B * chunk_size, 1)  # [B*chunk_size, 4]
+        batched_c2ws = c2ws_infer_full[frame_indices]  # [B*chunk_latent_frames, 3, 4]
+        batched_Ks = Ks_t.repeat(B * chunk_latent_frames, 1)  # [B*chunk_latent_frames, 4]
         batched_plucker = get_plucker_embeddings(batched_c2ws, batched_Ks, h, w, only_rays_d=False)
         batched_plucker = rearrange(
             batched_plucker,
@@ -776,7 +825,7 @@ class LingbotWorldFastPipeline(
             c1=int(h // lat_h),
             c2=int(w // lat_w),
         )
-        batched_plucker = batched_plucker.view(B, chunk_size, lat_h, lat_w, -1)
+        batched_plucker = batched_plucker.view(B, chunk_latent_frames, lat_h, lat_w, -1)
         batched_plucker = batched_plucker.permute(0, 4, 1, 2, 3).contiguous().to(self.target_dtype)
 
         for i, idx in enumerate(new_idxs):
@@ -793,7 +842,7 @@ class LingbotWorldFastPipeline(
         slo_max_batch = getattr(state.sampling, "slo_max_batch", 1)
         slo_max_batch = max(1, slo_max_batch if slo_fps else 1)
 
-        chunk_size = state.extra["chunk_size"]
+        chunk_latent_frames = state.extra["chunk_latent_frames"]
         lat_h = state.extra["lat_h"]
         lat_w = state.extra["lat_w"]
         max_seq_len = state.extra["max_seq_len"]
@@ -804,7 +853,9 @@ class LingbotWorldFastPipeline(
 
         for batch_size in range(1, slo_max_batch * n_steps + 1):
             latents_template = {
-                "latents": torch.empty(batch_size, 16, chunk_size, lat_h, lat_w, dtype=latents_dtype, device="meta")
+                "latents": torch.empty(
+                    batch_size, 16, chunk_latent_frames, lat_h, lat_w, dtype=latents_dtype, device="meta"
+                )
             }
             it_template = {
                 "hidden_states": torch.empty(batch_size, max_seq_len, self.model.dim, dtype=it_dtype, device="meta"),
@@ -831,7 +882,7 @@ class LingbotWorldFastPipeline(
         chunk_idxs: list[int] = state.extra["current_chunk_idxs"]
         assert len(chunk_idxs) == batch_size
 
-        chunk_size = state.extra["chunk_size"]
+        chunk_latent_frames = state.extra["chunk_latent_frames"]
         frame_seqlen = state.extra["frame_seqlen"]
         start_token_offset = state.extra["start_token_offset"]
         chunks = state.extra["chunks"]
@@ -843,7 +894,8 @@ class LingbotWorldFastPipeline(
             y_list = [chunks[ci].extra["y"] for ci in chunk_idxs]
             plucker_list = [chunks[ci].extra["plucker"] for ci in chunk_idxs]
 
-        current_starts = [start_token_offset + ci * chunk_size * frame_seqlen for ci in chunk_idxs]
+        current_starts = [start_token_offset + ci * chunk_latent_frames * frame_seqlen for ci in chunk_idxs]
+        slot_idxs = state.extra["chunk_step_idxs"]
 
         positive_kwargs = {
             "x": x_list,
@@ -857,6 +909,8 @@ class LingbotWorldFastPipeline(
             "global_end_index": self.state.global_end_index,
             "crossattn_cache": self.state.get_crossattn_caches(),
             "current_starts": current_starts,
+            "slot_idxs": slot_idxs,
+            "evict_queues": self.state.evict_queues,
             "max_attention_size": state.extra["max_attention_size"],
         }
 
@@ -933,7 +987,7 @@ class LingbotWorldFastPipeline(
             state.latents.shape[3],
             state.latents.shape[4],
         )
-        # pred_latent_chunks: [16, B*chunk_size, lat_h, lat_w]
+        # pred_latent_chunks: [16, B*chunk_latent_frames, lat_h, lat_w]
 
         extension = state.extra["extension"]
         if self.state.last_decoded_latent is not None:
