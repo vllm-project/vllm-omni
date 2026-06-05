@@ -18,6 +18,9 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.model_executor.stage_input_processors.payload_builder import (
+    to_cpu_tensor,
+)
 
 logger = init_logger(__name__)
 
@@ -37,7 +40,7 @@ def _copy_voice_clone_payload(
             prompt = src.get("prompt_token")
         if prompt is not None:
             if to_cpu:
-                prompt = _to_cpu_tensor(prompt)
+                prompt = to_cpu_tensor(prompt)
             if prompt is not None:
                 dst["prompt_speech_token"] = prompt
 
@@ -47,7 +50,7 @@ def _copy_voice_clone_payload(
         val = src.get(key)
         if val is not None:
             if to_cpu:
-                val = _to_cpu_tensor(val)
+                val = to_cpu_tensor(val)
             if val is not None:
                 dst[key] = val
 
@@ -169,16 +172,7 @@ def _extract_last_speech_token(pooling_output: dict[str, Any]) -> int | None:
     return token_val
 
 
-def _to_cpu_tensor(value: Any) -> torch.Tensor | None:
-    """Convert value to CPU tensor if possible."""
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    if isinstance(value, list):
-        if not value:
-            return None
-        if isinstance(value[0], torch.Tensor):
-            return value[0].detach().cpu()
-    return None
+# _to_cpu_tensor now imported from payload_builder.py
 
 
 # ---------------------------------------------------------------------------
