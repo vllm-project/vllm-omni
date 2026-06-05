@@ -46,6 +46,7 @@ th {
 | `LingBotVideoPipeline` | LingBot-Video dense and MoE T2I, T2V, TI2V | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | ✅︎ | | | | — |
 | `MiniMaxH3Pipeline` | MiniMax H3 T2VA, first/last-keyframe FL2VA, and mixed-reference Ref2VA | `MiniMaxAI/MiniMax-H3` | ✅︎ | ✅︎ | | | [Published](https://recipes.vllm.ai/MiniMaxAI/MiniMax-H3) |
 | `DreamZeroPipeline` | DreamZero-DROID | `GEAR-Dreams/DreamZero-DROID` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `Pi0Pipeline` | π0 (Pi-Zero) VLA | `lerobot/pi0_base` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi0.md) |
 | `HeliosPipeline`, `HeliosPyramidPipeline` | Helios | `BestWishYsh/Helios-Base`, `BestWishYsh/Helios-Mid`, `BestWishYsh/Helios-Distilled` | ✅︎ | ✅︎ | ✅︎ | | — |
 | `MagiHumanPipeline` | MagiHuman | `SII-GAIR/daVinci-MagiHuman-Base-1080p` | ✅︎ | ✅︎ | | | — |
 | `OvisImagePipeline` | Ovis-Image | `OvisAI/Ovis-Image` | ✅︎ | ✅︎ | | ✅︎ | — |
