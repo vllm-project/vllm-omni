@@ -113,14 +113,8 @@ def talker2code2wav(
         codes_qt = _revert_delay_pattern(codes_qt)
 
         # Step 2: Clamp to real code range [0, 1023]
+        # (replaces BOC/EOC with 0, matching sglang's torch.where approach)
         codes_qt = codes_qt.clamp_(min=0, max=_NUM_REAL_CODES - 1)
-
-        # Step 3: Trim first and last frame. The first frame is the all-BOC
-        # seed emitted at the audio_bos transition, and the last frame is
-        # the all-EOC ramp-down. This matches upstream's
-        # revert_delay_pattern(out).clip(0, real-1)[:, 1:-1].
-        if codes_qt.shape[-1] >= 3:
-            codes_qt = codes_qt[:, 1:-1]
 
         if codes_qt.numel() == 0:
             code2wav_inputs.append(

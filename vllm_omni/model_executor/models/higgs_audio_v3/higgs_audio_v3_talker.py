@@ -222,12 +222,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            # Mask -100 placeholders to 0 before embedding (they'll be replaced
-            # by _apply_ref_audio_substitution below). embed_tokens cannot
-            # handle negative indices.
-            safe_ids = input_ids
-            if input_ids is not None and (input_ids < 0).any():
-                safe_ids = torch.where(input_ids < 0, torch.zeros_like(input_ids), input_ids)
+            # Mask -100 placeholders to 0 before embedding. Use torch.where
+            # (no Python data-dependent branch) so this is CUDA-graph safe.
+            safe_ids = torch.where(input_ids < 0, torch.zeros_like(input_ids), input_ids)
             hidden_states = self.model.embed_tokens(safe_ids)
         else:
             hidden_states = inputs_embeds
@@ -252,8 +249,12 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         except Exception:
             self._last_step_query_start_loc = None
 
-        # Voice clone: replace -100 placeholder positions with ref audio embeddings
-        if input_ids is not None and inputs_embeds is None:
+        # Prefill-only operations: ref audio substitution and audio feedback
+        # require Python dict/list ops that break CUDA graph capture.
+        # Detect prefill (sequence length > batch size heuristic) vs decode.
+        is_prefill = input_ids is not None and inputs_embeds is None and int(input_ids.numel()) > 1
+        if is_prefill:
+            # Voice clone: replace -100 placeholder positions with ref audio embeddings
             info_dicts = kwargs.get("model_intermediate_buffer")
             if info_dicts is None:
                 info_dicts = kwargs.get("runtime_additional_information")
@@ -491,31 +492,31 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
         is_audio = sampled_flat == audio_id
 
-        # Handle first-after-<|audio|> transition (seed all-BOC state)
+        # Handle first-after-<|audio|> transition: initialize state but do NOT
+        # skip sampling. Unlike v2 (which seeds an all-BOC frame and skips the
+        # first audio step), v3/sglang samples codebook 0 on the very first
+        # step with delay_count=0 (codebooks 1-7 masked to BOC).
         first_after_start = self._last_first_audio_after_start
         self._last_first_audio_after_start = None
 
-        seeded_rows: list[int] = []
-        seeded_frame: torch.Tensor | None = None
         if isinstance(first_after_start, torch.Tensor) and first_after_start.numel() == is_audio.shape[0]:
             first_after_start = first_after_start.to(is_audio.device)
-            skip_rows = first_after_start & is_audio
-            if bool(skip_rows.any()):
-                seeded_frame = torch.full((num_codebooks,), BOC_ID, dtype=torch.long, device=hidden.device)
-                for bi in torch.nonzero(skip_rows, as_tuple=False).reshape(-1).tolist():
+            init_rows = first_after_start & is_audio
+            if bool(init_rows.any()):
+                boc_frame = torch.full((num_codebooks,), BOC_ID, dtype=torch.long, device=hidden.device)
+                for bi in torch.nonzero(init_rows, as_tuple=False).reshape(-1).tolist():
                     bi = int(bi)
                     self._slot_output_len[bi] = 0
                     self._audio_state[bi] = {
                         "num_delay": 0,
                         "num_remaining_delays": None,
-                        "audio_out_ids": seeded_frame.unsqueeze(-1).clone(),
-                        "last_codes": seeded_frame.clone(),
+                        "audio_out_ids": None,
+                        "last_codes": boc_frame.clone(),
                         "should_terminate": False,
                     }
-                    seeded_rows.append(bi)
-                is_audio = is_audio & ~first_after_start
+                # Do NOT remove init_rows from is_audio — let them be sampled
 
-        if not bool(is_audio.any()) and not seeded_rows:
+        if not bool(is_audio.any()):
             self._last_audio_codes = None
             return sampler_output
 
@@ -595,14 +596,6 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if new_codes_flat:
             stacked = torch.stack(new_codes_flat, dim=0).to(hidden.device)
             codes_full[is_audio] = stacked
-        # Emit seeded all-BOC frames
-        if seeded_rows and seeded_frame is not None:
-            seeded_idx = torch.tensor(seeded_rows, dtype=torch.long, device=hidden.device)
-            codes_full.index_copy_(
-                0,
-                seeded_idx,
-                seeded_frame.unsqueeze(0).expand(len(seeded_rows), -1).to(hidden.device),
-            )
 
         self._last_audio_codes = codes_full
         self._postprocess_cursor = 0
@@ -783,8 +776,10 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             # Check if this is the FIRST step after <|audio|> appears
             # (i.e., transitioning from prompt to audio generation)
             audio_state = self._audio_state.get(i)
-            if audio_state is None:
-                # No state yet — this is the first audio step
+            if audio_state is None or audio_state.get("should_terminate"):
+                # No state yet, or stale state from a finished prior request
+                # reusing this slot — treat as first audio step
+                self._audio_state.pop(i, None)
                 first_after_start[i] = True
 
             # Check for ramp-down termination
