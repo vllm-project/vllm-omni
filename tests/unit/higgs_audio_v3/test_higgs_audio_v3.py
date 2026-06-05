@@ -507,13 +507,13 @@ class TestCodecStrictness:
             HiggsAudioV3Code2Wav,
         )
 
-        # Monkeypatch DAC builder to return a trivial module that accepts any state
         class FakeDAC(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.dummy = torch.nn.Parameter(torch.zeros(1))
 
         monkeypatch.setattr(c2w_mod, "build_boson_dac_decoder", lambda device: FakeDAC().to(device))
+        monkeypatch.setattr(c2w_mod, "build_higgs_audio_acoustic_decoder", lambda cfg, device: FakeDAC().to(device))
 
         config = HiggsAudioV3Config()
         c2w = HiggsAudioV3Code2Wav(config=config)
@@ -540,6 +540,7 @@ class TestCodecStrictness:
                 self.dummy = torch.nn.Parameter(torch.zeros(1))
 
         monkeypatch.setattr(c2w_mod, "build_boson_dac_decoder", lambda device: FakeDAC().to(device))
+        monkeypatch.setattr(c2w_mod, "build_higgs_audio_acoustic_decoder", lambda cfg, device: FakeDAC().to(device))
 
         config = HiggsAudioV3Config()
         c2w = HiggsAudioV3Code2Wav(config=config)
@@ -812,19 +813,16 @@ class TestRegistry:
         assert "HiggsAudioV3Code2WavForConditionalGeneration" in _OMNI_MODELS
 
     def test_pipeline_registered(self):
-        from vllm_omni.config.pipeline_registry import _PIPELINE_REGISTRY
+        from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
 
-        assert "higgs_multimodal_qwen3" in _PIPELINE_REGISTRY
+        assert "higgs_multimodal_qwen3" in _OMNI_PIPELINES
 
     def test_deploy_yaml_exists(self):
         import os
 
-        yaml_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))),
-            "vllm_omni",
-            "deploy",
-            "higgs_multimodal_qwen3.yaml",
-        )
+        # __file__ = tests/unit/higgs_audio_v3/test_*.py → 4 dirnames to repo root
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        yaml_path = os.path.join(repo_root, "vllm_omni", "deploy", "higgs_multimodal_qwen3.yaml")
         assert os.path.isfile(yaml_path), f"Deploy YAML not found at {yaml_path}"
 
 
