@@ -165,6 +165,12 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._last_audio_codes: torch.Tensor | None = None
         self._postprocess_cursor: int = 0
 
+        # Pre-allocated decode-step audio feedback buffers (CUDA-graph safe).
+        # Populated by sample(), read by forward() via torch.where (no dict).
+        max_bs = 64  # safe upper bound; will grow if needed
+        self._decode_last_codes = torch.zeros(max_bs, self.num_codebooks, dtype=torch.long)
+        self._decode_has_codes = torch.zeros(max_bs, dtype=torch.bool)
+
     def _resolve_token_ids(self) -> None:
         """Resolve <|audio|> and eos token IDs.
 
@@ -376,66 +382,37 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
     # ------------------------------------------------------------------ audio feedback
     def _apply_audio_feedback(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-        """Replace continuation-token positions with fused codebook embedding of last codes.
+        """Replace decode-step embeddings with audio feedback from pre-allocated buffers.
 
-        Uses query_start_loc to map flat token positions to request rows,
-        so mixed prefill+decode batches route correctly.
+        CUDA-graph safe: reads from pre-allocated _decode_last_codes and
+        _decode_has_codes tensors using torch.where (no Python dict lookup).
+        The buffers are populated by sample() after each step.
+
+        For decode steps (1 token per request): position i maps to row i.
+        For prefill: audio feedback is not needed (ref audio substitution
+        handles the prefill path separately).
         """
-        if not self._audio_state:
-            return hidden_states
+        bs = hidden_states.shape[0]
 
-        audio_id = self._audio_continuation_id
-        if audio_id is None:
-            return hidden_states
+        # Ensure buffers are on the right device and large enough
+        if self._decode_last_codes.device != hidden_states.device:
+            self._decode_last_codes = self._decode_last_codes.to(hidden_states.device)
+            self._decode_has_codes = self._decode_has_codes.to(hidden_states.device)
+        if bs > self._decode_last_codes.shape[0]:
+            new_size = max(bs, self._decode_last_codes.shape[0] * 2)
+            self._decode_last_codes = torch.zeros(
+                new_size, self.num_codebooks, dtype=torch.long, device=hidden_states.device
+            )
+            self._decode_has_codes = torch.zeros(new_size, dtype=torch.bool, device=hidden_states.device)
 
-        flat_ids = input_ids.reshape(-1)
-        audio_positions = (flat_ids == audio_id).nonzero(as_tuple=False).reshape(-1)
-        if audio_positions.numel() == 0:
-            return hidden_states
+        # Compute audio embeddings from last_codes for ALL rows (graph-safe)
+        codes_slice = self._decode_last_codes[:bs]  # [bs, N]
+        has_codes = self._decode_has_codes[:bs].unsqueeze(-1)  # [bs, 1]
+        audio_embeds = self.multimodal_embedding(codes_slice)  # [bs, D]
+        audio_embeds = audio_embeds.to(dtype=hidden_states.dtype)
 
-        # Build position-to-request-row mapping using query_start_loc
-        q_start = self._last_step_query_start_loc
-        pos_to_row: dict[int, int] | None = None
-        if isinstance(q_start, torch.Tensor) and q_start.numel() > 1:
-            q_start_list = q_start.detach().to("cpu").tolist()
-            num_rows = len(q_start_list) - 1
-            pos_to_row = {}
-            for row in range(num_rows):
-                start = int(q_start_list[row])
-                end = int(q_start_list[row + 1])
-                for p in range(start, end):
-                    pos_to_row[p] = row
-
-        rep_positions: list[int] = []
-        rep_embeds: list[torch.Tensor] = []
-        for pos in audio_positions.tolist():
-            # Map flat position to request row
-            if pos_to_row is not None:
-                row = pos_to_row.get(int(pos))
-            else:
-                row = int(pos)  # decode-only: 1:1 mapping
-            if row is None:
-                continue
-            req_state = self._audio_state.get(row)
-            if req_state is None:
-                continue
-            last_codes = req_state.get("last_codes")
-            if not isinstance(last_codes, torch.Tensor) or last_codes.numel() == 0:
-                continue
-            codes_1n = last_codes.unsqueeze(0).to(hidden_states.device)
-            audio_emb = self.multimodal_embedding(codes_1n)
-            rep_positions.append(int(pos))
-            rep_embeds.append(audio_emb[0].to(dtype=hidden_states.dtype))
-
-        if not rep_positions:
-            return hidden_states
-
-        new_hidden = hidden_states.clone()
-        flat_hidden = new_hidden.reshape(-1, new_hidden.shape[-1])
-        idx = torch.tensor(rep_positions, dtype=torch.long, device=new_hidden.device)
-        rep = torch.stack(rep_embeds, dim=0)
-        flat_hidden.index_copy_(0, idx, rep)
-        return new_hidden
+        # Select: where has_codes, use audio embed; else keep text embed
+        return torch.where(has_codes, audio_embeds, hidden_states)
 
     # ------------------------------------------------------------------ sampling
     def sample(self, logits: torch.Tensor, sampling_metadata: Any) -> Any:
@@ -514,6 +491,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                         "last_codes": boc_frame.clone(),
                         "should_terminate": False,
                     }
+                    # Update CUDA-graph-safe feedback buffers
+                    self._decode_last_codes[bi] = boc_frame.to(self._decode_last_codes.device)
+                    self._decode_has_codes[bi] = True
                 # Do NOT remove init_rows from is_audio — let them be sampled
 
         if not bool(is_audio.any()):
@@ -579,6 +559,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             state["num_delay"] = num_delay
             state["num_remaining_delays"] = num_remaining_delays
             state["last_codes"] = this_codes.clone()
+            # Update CUDA-graph-safe feedback buffers
+            self._decode_last_codes[int(batch_i)] = this_codes.to(self._decode_last_codes.device)
+            self._decode_has_codes[int(batch_i)] = True
             if state["audio_out_ids"] is None:
                 state["audio_out_ids"] = this_codes.unsqueeze(-1).clone()
             else:
@@ -780,6 +763,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 # No state yet, or stale state from a finished prior request
                 # reusing this slot — treat as first audio step
                 self._audio_state.pop(i, None)
+                # Clear CUDA-graph feedback buffers for this slot
+                self._decode_has_codes[i] = False
                 first_after_start[i] = True
 
             # Check for ramp-down termination
