@@ -111,6 +111,107 @@ class TestHiggsAudioV3OnlineHappyPath:
 
 
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+class TestHiggsAudioV3OnlineInlineControlTokens:
+    """Inline control-token surface from the bosonai cookbook.
+
+    The model exposes four categories of ``<|category:value|>`` tokens
+    (emotion, style, prosody, sfx). Delivery tokens (emotion / style /
+    prosody speed-pitch-expressive) go at the START of input; positional
+    tokens (pause, sfx) go inline. SFX tokens must pair with their written
+    onomatopoeia.
+
+    These tests check the *serving surface* - the validator accepts the
+    payload, the engine produces audio, and the WAV has non-trivial size.
+    They do not assert audio quality (out of scope for CI).
+    """
+
+    @pytest.mark.core_model
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_inline_emotion_and_expressive(self, omni_server, openai_client) -> None:
+        """Delivery tokens (emotion + expressive_high) at the start of input."""
+        openai_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": ("<|emotion:amusement|><|prosody:expressive_high|>Wait, that was actually hilarious."),
+                "stream": False,
+                "response_format": "wav",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
+            }
+        )
+
+    @pytest.mark.core_model
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_inline_style_whispering(self, omni_server, openai_client) -> None:
+        """Style token at the start - ``whispering``."""
+        openai_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "<|style:whispering|>It is just between you and me, alright?",
+                "stream": False,
+                "response_format": "wav",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
+            }
+        )
+
+    @pytest.mark.core_model
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_inline_prosody_speed_and_pitch(self, omni_server, openai_client) -> None:
+        """Two prosody tokens at the start - slow speed plus low pitch."""
+        openai_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": (
+                    "<|prosody:speed_slow|><|prosody:pitch_low|>The radar shows a storm approaching from the east."
+                ),
+                "stream": False,
+                "response_format": "wav",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
+            }
+        )
+
+    @pytest.mark.core_model
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_inline_pause_mid_text(self, omni_server, openai_client) -> None:
+        """Positional pause token placed inline between two clauses."""
+        openai_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "Hold on a moment <|prosody:pause|> let me think about it.",
+                "stream": False,
+                "response_format": "wav",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
+            }
+        )
+
+    @pytest.mark.core_model
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_inline_sfx_with_onomatopoeia(self, omni_server, openai_client) -> None:
+        """SFX token paired with its written onomatopoeia (``<|sfx:laughter|>Hehe``)."""
+        openai_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": (
+                    "<|emotion:amusement|>I cannot believe that just happened. "
+                    "<|sfx:laughter|>Hehe, I am still recovering from it."
+                ),
+                "stream": False,
+                "response_format": "wav",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
+            }
+        )
+
+
+@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 class TestHiggsAudioV3OnlineVoiceClone:
     """Voice clone via the two payload shapes the model serves."""
 
