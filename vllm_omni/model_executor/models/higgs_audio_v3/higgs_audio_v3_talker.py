@@ -166,14 +166,34 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._postprocess_cursor: int = 0
 
     def _resolve_token_ids(self) -> None:
-        """Resolve <|audio|> and eos token IDs from the HF tokenizer."""
+        """Resolve <|audio|> and eos token IDs.
+
+        Prefers config's pre-resolved IDs (from ``resolve_special_tokens()``),
+        falls back to loading the HF tokenizer directly.
+        """
         if self._resolved_tokens:
             return
         self._resolved_tokens = True
 
+        # Try config first (populated by resolve_special_tokens or from_pretrained)
+        cfg_audio = getattr(self.config, "audio_continuation_id", None)
+        cfg_eos = getattr(self.config, "eos_token_id", None)
+        if cfg_audio is not None:
+            self._audio_continuation_id = int(cfg_audio)
+        if cfg_eos is not None:
+            self._eos_token_id = int(cfg_eos)
+
+        if self._audio_continuation_id is not None:
+            logger.info(
+                "Resolved v3 token IDs from config: audio_continuation=%s, eos=%s",
+                self._audio_continuation_id,
+                self._eos_token_id,
+            )
+            return
+
+        # Fallback: load tokenizer directly
         model_path = getattr(self.vllm_config.model_config, "model", None)
         if model_path is None:
-            logger.warning("Cannot resolve token IDs: no model path in vllm_config")
             return
         try:
             from transformers import AutoTokenizer
@@ -185,7 +205,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
                 self._eos_token_id = int(tokenizer.eos_token_id)
             logger.info(
-                "Resolved v3 token IDs: audio_continuation=%s, eos=%s",
+                "Resolved v3 token IDs from tokenizer: audio_continuation=%s, eos=%s",
                 self._audio_continuation_id,
                 self._eos_token_id,
             )
@@ -249,7 +269,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
     # ------------------------------------------------------------------ audio feedback
     def _apply_audio_feedback(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-        """Replace continuation-token positions with fused codebook embedding of last codes."""
+        """Replace continuation-token positions with fused codebook embedding of last codes.
+
+        Uses query_start_loc to map flat token positions to request rows,
+        so mixed prefill+decode batches route correctly.
+        """
         if not self._audio_state:
             return hidden_states
 
@@ -262,10 +286,30 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if audio_positions.numel() == 0:
             return hidden_states
 
+        # Build position-to-request-row mapping using query_start_loc
+        q_start = self._last_step_query_start_loc
+        pos_to_row: dict[int, int] | None = None
+        if isinstance(q_start, torch.Tensor) and q_start.numel() > 1:
+            q_start_list = q_start.detach().to("cpu").tolist()
+            num_rows = len(q_start_list) - 1
+            pos_to_row = {}
+            for row in range(num_rows):
+                start = int(q_start_list[row])
+                end = int(q_start_list[row + 1])
+                for p in range(start, end):
+                    pos_to_row[p] = row
+
         rep_positions: list[int] = []
         rep_embeds: list[torch.Tensor] = []
         for pos in audio_positions.tolist():
-            req_state = self._audio_state.get(int(pos))
+            # Map flat position to request row
+            if pos_to_row is not None:
+                row = pos_to_row.get(int(pos))
+            else:
+                row = int(pos)  # decode-only: 1:1 mapping
+            if row is None:
+                continue
+            req_state = self._audio_state.get(row)
             if req_state is None:
                 continue
             last_codes = req_state.get("last_codes")
@@ -305,6 +349,20 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
         audio_id = self._audio_continuation_id
         num_codebooks = self.num_codebooks
+
+        # Slot reuse detection: check output_token_ids length for each row.
+        # If a slot's output length decreased (fresh request reusing a finished
+        # slot), drop stale _audio_state for that row.
+        output_ids = getattr(sampling_metadata, "output_token_ids", None)
+        if output_ids is not None:
+            for i in range(len(output_ids)):
+                cur_len = len(output_ids[i]) if output_ids[i] else 0
+                prev_len = self._slot_output_len.get(i, 0)
+                if cur_len < prev_len:
+                    # Fresh request reusing this slot — clear stale state
+                    self._audio_state.pop(i, None)
+                    self._slot_output_len[i] = 0
+                self._slot_output_len[i] = cur_len
 
         # Bias LM logits for audio continuation
         self._apply_audio_mode_bias(logits, sampling_metadata)
@@ -683,7 +741,10 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             loaded = backbone_module.load_weights(iter(backbone_weights))
             loaded_params.update(loaded)
 
-        # Resolve token IDs after weights are loaded (model path is now accessible)
+        # Resolve special token IDs from the tokenizer
+        model_path = getattr(self.vllm_config.model_config, "model", None)
+        if model_path:
+            self.config.resolve_special_tokens(model_path)
         self._resolve_token_ids()
 
         logger.info(

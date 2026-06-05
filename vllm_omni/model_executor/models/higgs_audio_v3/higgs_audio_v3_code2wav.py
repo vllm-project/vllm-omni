@@ -94,16 +94,8 @@ class HiggsAudioV3Code2Wav(nn.Module):
         self.fc2: nn.Linear | None = None
         self.acoustic_decoder: nn.Module | None = None
         self._loaded: bool = False
-
-        # Try to load from the standalone v2 tokenizer repo (same codec)
-        if self._model_path is not None:
-            try:
-                self._load_from_tokenizer_repo()
-            except (FileNotFoundError, OSError) as exc:
-                logger.info(
-                    "HiggsAudioV3Code2Wav: standalone tokenizer not found (%s); will load from checkpoint weights.",
-                    exc,
-                )
+        # Do NOT eagerly load from standalone tokenizer here.
+        # load_weights() will try bundled V3 codec first, then fall back.
 
     def _load_from_tokenizer_repo(self) -> None:
         """Load codec from the standalone higgs-audio-v2-tokenizer repo."""
@@ -265,26 +257,30 @@ class HiggsAudioV3Code2Wav(nn.Module):
         # Build fc2
         fc2_w = codec_state.get("fc2.weight")
         fc2_b = codec_state.get("fc2.bias")
-        if fc2_w is not None and fc2_b is not None:
-            fc2 = nn.Linear(fc2_w.shape[1], fc2_w.shape[0]).to(device)
-            fc2.weight.data.copy_(fc2_w.to(device))
-            fc2.bias.data.copy_(fc2_b.to(device))
-        else:
-            fc2 = nn.Linear(hidden_size, 256).to(device)
-            logger.warning("fc2 weights not found in bundled codec; using random init")
+        if fc2_w is None or fc2_b is None:
+            raise KeyError(
+                "Bundled codec state dict missing fc2.weight and/or fc2.bias. "
+                f"Available keys (first 10): {list(codec_state.keys())[:10]}"
+            )
+        fc2 = nn.Linear(fc2_w.shape[1], fc2_w.shape[0]).to(device)
+        fc2.weight.data.copy_(fc2_w.to(device))
+        fc2.bias.data.copy_(fc2_b.to(device))
 
-        # Build acoustic decoder
+        # Build acoustic decoder — require decoder keys
         acoustic_decoder = build_boson_dac_decoder(device)
         ad_keys = {
             k[len("acoustic_decoder.") :]: v for k, v in codec_state.items() if k.startswith("acoustic_decoder.")
         }
-        if ad_keys:
-            load_report = acoustic_decoder.load_state_dict(ad_keys, strict=False)
-            if load_report.missing_keys:
-                raise RuntimeError(
-                    f"Bundled DAC decoder missing {len(load_report.missing_keys)} keys: "
-                    f"{load_report.missing_keys[:5]}..."
-                )
+        if not ad_keys:
+            raise KeyError(
+                "Bundled codec state dict has no acoustic_decoder.* keys. "
+                f"Available keys (first 10): {list(codec_state.keys())[:10]}"
+            )
+        load_report = acoustic_decoder.load_state_dict(ad_keys, strict=False)
+        if load_report.missing_keys:
+            raise RuntimeError(
+                f"Bundled DAC decoder missing {len(load_report.missing_keys)} keys: {load_report.missing_keys[:5]}..."
+            )
         acoustic_decoder.eval()
 
         self.quantizer = quantizer

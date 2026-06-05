@@ -35,6 +35,8 @@ def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:
     if audio_codes_qt.ndim != 2:
         raise ValueError(f"_revert_delay_pattern expects [Q, T] input; got {tuple(audio_codes_qt.shape)}")
     q, t = audio_codes_qt.shape
+    if q != _NUM_CODEBOOKS:
+        raise ValueError(f"Expected exactly {_NUM_CODEBOOKS} codebook rows, got {q}. Input shape: [{q}, {t}]")
     if t < q:
         raise ValueError(f"Not enough frames to revert delay pattern: T={t} < Q={q}")
     seq_len = t - q + 1
@@ -96,6 +98,13 @@ def talker2code2wav(
 
         if audio_codes.ndim != 2:
             raise ValueError(f"audio_codes must be 1D or 2D; got shape {tuple(audio_codes.shape)}")
+
+        # Validate codebook count
+        if audio_codes.shape[1] != _NUM_CODEBOOKS:
+            raise ValueError(
+                f"Expected {_NUM_CODEBOOKS} codebooks per frame, "
+                f"got {audio_codes.shape[1]}. Audio codes shape: {tuple(audio_codes.shape)}"
+            )
 
         # Transpose to [Q, T] for delay pattern reversal
         codes_qt = audio_codes.transpose(0, 1).contiguous().cpu()
