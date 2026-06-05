@@ -112,9 +112,21 @@ def talker2code2wav(
         # Step 1: Revert delay pattern
         codes_qt = _revert_delay_pattern(codes_qt)
 
-        # Step 2: Clamp to real code range [0, 1023]
-        # (replaces BOC/EOC with 0, matching sglang's torch.where approach)
-        codes_qt = codes_qt.clamp_(min=0, max=_NUM_REAL_CODES - 1)
+        # Step 2: Replace out-of-range codes (BOC=1024, EOC=1025, -1) with 0.
+        # Must use torch.where, NOT clamp: clamp(max=1023) turns 1025→1023
+        # which is a valid codec code and decodes to audio artifacts.
+        # Matches sglang's: torch.where(codes >= codec_vocab, 0, codes)
+        codes_qt = torch.where(
+            (codes_qt >= _NUM_REAL_CODES) | (codes_qt < 0),
+            torch.zeros_like(codes_qt),
+            codes_qt,
+        )
+
+        # Step 3: Trim the last frame. After de-delay, the final frame
+        # contains residual ramp-down codes (EOC→0 substituted) that
+        # decode to a brief noise artifact at the end of the audio.
+        if codes_qt.shape[-1] >= 2:
+            codes_qt = codes_qt[:, :-1]
 
         if codes_qt.numel() == 0:
             code2wav_inputs.append(
