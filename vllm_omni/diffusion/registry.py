@@ -156,6 +156,11 @@ _DIFFUSION_MODELS = {
         "pipeline_gr00t",
         "Gr00tN1d7Pipeline",
     ),
+    "Pi0Pipeline": (
+        "pi0",
+        "pipeline_pi0",
+        "Pi0Pipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
@@ -529,6 +534,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LancePipeline": "get_lance_post_process_func",
     "MingImagePipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
+    "Pi0Pipeline": "get_pi0_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",
