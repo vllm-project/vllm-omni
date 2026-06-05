@@ -29,6 +29,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 from starlette.datastructures import State
 from starlette.routing import Route
+from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import load_chat_template
@@ -445,6 +446,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
+
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
         _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
@@ -477,8 +479,29 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                 vllm_config.parallel_config._api_process_rank,
                 listen_address,
             )
+
+        class _TimestampMiddleware:
+            """Pure-ASGI outermost wrapper that stamps HTTP request arrival time.
+
+            Wraps the fully-built Starlette app as an outer ASGI layer so no
+            Starlette internals (user_middleware, middleware_stack, etc.) are
+            touched. Websocket and lifespan scopes pass through unchanged.
+            """
+
+            def __init__(self, inner: ASGIApp) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+                if scope["type"] == "http":
+                    scope.setdefault("state", {})
+                    scope["state"]["request_timestamp"] = time.time()
+                await self._inner(scope, receive, send)
+
         shutdown_task = await serve_http(
-            app,
+            _TimestampMiddleware(app),
             sock=sock,
             enable_ssl_refresh=args.enable_ssl_refresh,
             host=args.host,
@@ -1592,6 +1615,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
     Raises:
         HTTPException: For validation errors, missing engine, or generation failures
     """
+    request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
     # Get engine client (AsyncOmni) from app state
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
 
@@ -1654,6 +1678,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 extra_body=extra_body,
                 request_id=f"img_gen-{random_uuid()}",
                 raw_request=raw_request,
+                arrival_time=request_timestamp,
             )
             if isinstance(generation_result, ErrorResponse):
                 return JSONResponse(
@@ -1736,6 +1761,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             stage_configs=stage_configs,
             prompt=prompt,
             request_id=request_id,
+            arrival_time=request_timestamp,
         )
 
         if result is None:
@@ -1826,12 +1852,14 @@ async def edit_images(
     bot_task: str | None = Form(None),
     sys_type: str | None = Form(None),
     system_prompt: str | None = Form(None),
+    return_stage_metrics: bool | None = Form(None),
 ) -> ImageGenerationResponse:
     """
     OpenAI-compatible image edit endpoint.
     """
 
     # 1. get engine and model
+    request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
     if model is not None and model != model_name:
         raise HTTPException(
@@ -2050,6 +2078,8 @@ async def edit_images(
                 extra_body["sys_type"] = sys_type
             if system_prompt is not None:
                 extra_body["system_prompt"] = system_prompt
+            if return_stage_metrics is not None:
+                extra_body["return_stage_metrics"] = return_stage_metrics
 
             prompt_text = prompt.get("prompt", "")
             generation_result = await chat_handler.generate_diffusion_images(
@@ -2057,6 +2087,7 @@ async def edit_images(
                 extra_body=extra_body,
                 reference_images=ref_b64_list,
                 request_id=request_id,
+                arrival_time=request_timestamp,
                 stream=stream,
                 model=model_name,
                 output_format=output_format,

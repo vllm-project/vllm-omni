@@ -22,7 +22,7 @@ from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
 from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
-from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
+from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
@@ -189,6 +189,7 @@ class OmniBase(PDDisaggregationMixin):
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
+        self._consumed_metric_messages: dict[str, set[int]] = {}
         self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
 
@@ -308,6 +309,7 @@ class OmniBase(PDDisaggregationMixin):
             )
         finally:
             self.request_states.pop(request_id, None)
+            self._consumed_metric_messages.pop(request_id, None)
             # Republish gauges so any stale value left by the per-stage
             # publish in _process_single_result (which runs while the request
             # is still in self.request_states) is corrected after the pop.
@@ -326,6 +328,17 @@ class OmniBase(PDDisaggregationMixin):
             self._stage_meta_list,
         )
 
+    def _compute_final_output_stage_ids(self, output_modalities: list[str] | None) -> list[int]:
+        requested_modalities = output_modalities or self.output_modalities
+        requested_modalities = [m for m in requested_modalities if m in self.output_modalities]
+        if not requested_modalities:
+            requested_modalities = self.output_modalities
+        return [
+            sid
+            for sid, stage in enumerate(self._stage_meta_list)
+            if getattr(stage, "final_output", False) and stage.final_output_type in requested_modalities
+        ]
+
     def _process_stage_metrics_message(self, msg: StageMetricsMessage) -> None:
         req_id = msg.request_id
         req_state = self.request_states.get(req_id)
@@ -333,7 +346,8 @@ class OmniBase(PDDisaggregationMixin):
             return
         _m = msg.metrics
         stage_id = msg.stage_id
-        req_state.metrics.on_stage_metrics(stage_id, req_id, _m)
+        stage_meta = self.engine.get_stage_metadata(stage_id)
+        req_state.metrics.on_stage_metrics(stage_id, req_id, _m, stage_meta.final_output_type)
         submit_ts = msg.stage_submit_ts
         now = time.time()
         if req_state.metrics.stage_first_ts[stage_id] is None:
@@ -378,6 +392,20 @@ class OmniBase(PDDisaggregationMixin):
 
         req_state.stage_id = stage_id
 
+        if msg.metrics is not None and not msg.finished and req_state.metrics is not None:
+            stage_meta = self.engine.get_stage_metadata(stage_id)
+            output_type = getattr(msg.engine_outputs, "final_output_type", stage_meta.final_output_type)
+            msg_id = id(msg)
+            consumed = self._consumed_metric_messages.setdefault(req_id, set())
+            if msg_id not in consumed:
+                req_state.metrics.on_stage_metrics(stage_id, req_id, msg.metrics, output_type)
+                submit_ts = msg.stage_submit_ts
+                now = time.time()
+                if req_state.metrics.stage_first_ts[stage_id] is None:
+                    req_state.metrics.stage_first_ts[stage_id] = submit_ts if submit_ts is not None else now
+                req_state.metrics.stage_last_ts[stage_id] = max(req_state.metrics.stage_last_ts[stage_id] or 0.0, now)
+                consumed.add(msg_id)
+
         return False, req_id, stage_id, req_state
 
     def _check_engine_output_error(
@@ -415,7 +443,7 @@ class OmniBase(PDDisaggregationMixin):
         self,
         result: OutputMessage,
         stage_id: int,
-        metrics: OrchestratorMetrics,
+        metrics: OrchestratorAggregator,
         req_start_ts: dict[str, float],
         wall_start_ts: float,
         final_stage_id_for_e2e: int,
@@ -457,10 +485,11 @@ class OmniBase(PDDisaggregationMixin):
         metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, now)
 
         _m = result.metrics
-        if finished and _m is not None:
-            metrics.on_stage_metrics(stage_id, req_id, _m)
-
         stage_meta = self.engine.get_stage_metadata(stage_id)
+        output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
+        if finished and _m is not None:
+            metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
+
         if not stage_meta.final_output:
             return None
 
@@ -510,6 +539,31 @@ class OmniBase(PDDisaggregationMixin):
         self.prom_metrics.set_waiting(max(0, total - running))
 
         images = getattr(engine_outputs, "images", []) if output_type == "image" else []
+        response_metrics: dict[str, Any] = {}
+        stage_metrics: dict[str, dict[str, Any]] = {}
+        rid_key = str(req_id)
+        for evt in metrics.stage_events.get(rid_key, []):
+            if evt.stage_id is None:
+                continue
+            sid = int(evt.stage_id)
+            evt_stage_meta = self.engine.get_stage_metadata(sid)
+            evt_output_type = evt.final_output_type
+            if not evt_output_type:
+                evt_output_type = evt_stage_meta.final_output_type
+            stage_name = evt_stage_meta.model_stage
+            sid_key = str(sid)
+            stage_metrics[sid_key] = OrchestratorAggregator._merge_stage_metric_event(stage_metrics.get(sid_key), evt)
+            stage_metrics[sid_key]["stage_name"] = stage_name or f"stage_{sid}"
+            stage_metrics[sid_key]["final_output_type"] = evt_output_type
+        if stage_metrics:
+            response_metrics["stage_metrics"] = stage_metrics
+            current_stage_metrics = stage_metrics.get(str(stage_id))
+            if current_stage_metrics is not None:
+                response_metrics["stage_id"] = current_stage_metrics["stage_id"]
+                response_metrics["final_output_type"] = current_stage_metrics["final_output_type"]
+                if current_stage_metrics["final_output_type"] == "text":
+                    response_metrics["num_tokens_in"] = current_stage_metrics["num_tokens_in"]
+                    response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
         return OmniRequestOutput(
             request_id=req_id or "",
             stage_id=stage_id,
@@ -521,6 +575,7 @@ class OmniBase(PDDisaggregationMixin):
             trajectory_log_probs=getattr(engine_outputs, "trajectory_log_probs", None),
             trajectory_decoded=getattr(engine_outputs, "trajectory_decoded", None),
             _custom_output=getattr(engine_outputs, "_custom_output", {}),
+            metrics=response_metrics,
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,
         )
