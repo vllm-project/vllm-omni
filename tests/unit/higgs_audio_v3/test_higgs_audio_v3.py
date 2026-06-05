@@ -228,6 +228,166 @@ class TestDelayPatternBehavior:
         assert all(seeded[i] == BOC_ID for i in range(8))
 
 
+# ---- AC-5: Real Sampler Method Tests ----
+
+
+class TestSamplerMethods:
+    """Test the actual _sample_audio_codes and _apply_delay_pattern_masking methods."""
+
+    def _make_minimal_talker(self):
+        """Create a minimal talker-like object with sampler/masking methods."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        class FakeTalker:
+            num_codebooks = 8
+            codebook_size = 1026
+            _audio_state = {}
+
+        t = FakeTalker()
+        t._sample_audio_codes = mod.HiggsAudioV3TalkerForConditionalGeneration._sample_audio_codes.__get__(t)
+        t._apply_delay_pattern_masking = (
+            mod.HiggsAudioV3TalkerForConditionalGeneration._apply_delay_pattern_masking.__get__(t)
+        )
+        return t
+
+    def test_sample_respects_mask(self):
+        """Tokens masked to -inf must never be sampled."""
+        t = self._make_minimal_talker()
+        logits = torch.full((10, 1026), float("-inf"))
+        # Only token 500 is allowed for each row
+        logits[:, 500] = 0.0
+        result = t._sample_audio_codes(logits)
+        assert result.shape == (10,)
+        assert (result == 500).all(), f"Expected all 500, got {result.tolist()}"
+
+    def test_sample_all_masked_falls_back_to_argmax(self):
+        """All-masked row should fall back to argmax (least-negative logit)."""
+        t = self._make_minimal_talker()
+        logits = torch.full((2, 1026), float("-inf"))
+        # Row 0: all masked
+        # Row 1: only token 42 allowed
+        logits[1, 42] = 0.0
+        result = t._sample_audio_codes(logits)
+        assert result.shape == (2,)
+        assert result[1].item() == 42
+
+    def test_delay_masking_forces_boc_during_delay(self):
+        """During delay phase, codebooks beyond delay_count must have only BOC allowed."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import BOC_ID
+
+        t = self._make_minimal_talker()
+        # Simulate delay_count=2 for batch row 0
+        t._audio_state[0] = {"num_delay": 2, "num_remaining_delays": None}
+        cb_logits = torch.zeros(1, 8, 1026)  # [1 audio row, 8 codebooks, 1026 vocab]
+        t._apply_delay_pattern_masking(cb_logits, [0])
+        # CBs 3-7 should have only BOC allowed (everything else -inf)
+        for q in range(3, 8):
+            row = cb_logits[0, q]
+            assert row[BOC_ID].item() == 0.0  # BOC kept
+            # All non-BOC should be -inf
+            non_boc = torch.cat([row[:BOC_ID], row[BOC_ID + 1 :]])
+            assert (non_boc == float("-inf")).all(), f"CB{q} has non-inf non-BOC values"
+
+    def test_delay_masking_disallows_boc_for_active_codebooks(self):
+        """Active codebooks during delay should have BOC disallowed."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import BOC_ID
+
+        t = self._make_minimal_talker()
+        t._audio_state[0] = {"num_delay": 3, "num_remaining_delays": None}
+        cb_logits = torch.zeros(1, 8, 1026)
+        t._apply_delay_pattern_masking(cb_logits, [0])
+        # CBs 0-3 are active: BOC should be -inf
+        for q in range(4):
+            assert cb_logits[0, q, BOC_ID].item() == float("-inf")
+
+    def test_delay_masking_only_cb0_allows_eoc(self):
+        """Only codebook 0 should allow EOC during normal generation."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
+
+        t = self._make_minimal_talker()
+        t._audio_state[0] = {"num_delay": 8, "num_remaining_delays": None}
+        cb_logits = torch.zeros(1, 8, 1026)
+        t._apply_delay_pattern_masking(cb_logits, [0])
+        # CB0 should keep EOC
+        assert cb_logits[0, 0, EOC_ID].item() != float("-inf")
+        # CB1-7 should have EOC masked
+        for q in range(1, 8):
+            assert cb_logits[0, q, EOC_ID].item() == float("-inf"), f"CB{q} EOC not masked"
+
+    def test_rampdown_masking_locks_to_eoc(self):
+        """During ramp-down, locked codebooks should only allow EOC."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            BOC_ID,
+            EOC_ID,
+        )
+
+        t = self._make_minimal_talker()
+        # Ramp-down with 4 remaining delays: lock CBs 0-3 to EOC
+        t._audio_state[0] = {"num_delay": 8, "num_remaining_delays": 4}
+        cb_logits = torch.zeros(1, 8, 1026)
+        t._apply_delay_pattern_masking(cb_logits, [0])
+        # CBs 0-3 locked: only EOC allowed
+        for q in range(4):
+            row = cb_logits[0, q]
+            assert row[EOC_ID].item() == 0.0
+            non_eoc = torch.cat([row[:EOC_ID], row[EOC_ID + 1 :]])
+            assert (non_eoc == float("-inf")).all(), f"Locked CB{q} has non-inf non-EOC"
+        # CBs 4-7 active: BOC and EOC disallowed
+        for q in range(4, 8):
+            assert cb_logits[0, q, BOC_ID].item() == float("-inf")
+            assert cb_logits[0, q, EOC_ID].item() == float("-inf")
+
+
+# ---- AC-6: Feedback Method Tests ----
+
+
+class TestFeedbackMethods:
+    def test_postprocess_emits_audio_codes(self):
+        """postprocess() should return codes from _last_audio_codes."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        class FakeTalker:
+            _last_audio_codes = torch.tensor([[100, 200, 300, 400, 500, 600, 700, 800]])
+            _postprocess_cursor = 0
+
+        t = FakeTalker()
+        t.postprocess = mod.HiggsAudioV3TalkerForConditionalGeneration.postprocess.__get__(t)
+        result = t.postprocess(torch.zeros(1, 64))
+        assert "codes" in result
+        assert "audio" in result["codes"]
+        assert result["codes"]["audio"].shape == (1, 8)
+
+    def test_postprocess_skips_negative_rows(self):
+        """postprocess() should skip rows with -1 (no audio)."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        class FakeTalker:
+            _last_audio_codes = torch.tensor([[-1, -1, -1, -1, -1, -1, -1, -1]])
+            _postprocess_cursor = 0
+
+        t = FakeTalker()
+        t.postprocess = mod.HiggsAudioV3TalkerForConditionalGeneration.postprocess.__get__(t)
+        result = t.postprocess(torch.zeros(1, 64))
+        assert result == {}
+
+    def test_postprocess_advances_cursor(self):
+        """postprocess() should advance cursor by 1 per call."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        class FakeTalker:
+            _last_audio_codes = torch.tensor(
+                [[100, 200, 300, 400, 500, 600, 700, 800], [-1, -1, -1, -1, -1, -1, -1, -1]]
+            )
+            _postprocess_cursor = 0
+
+        t = FakeTalker()
+        t.postprocess = mod.HiggsAudioV3TalkerForConditionalGeneration.postprocess.__get__(t)
+        r1 = t.postprocess(torch.zeros(1, 64))
+        assert "codes" in r1
+        r2 = t.postprocess(torch.zeros(1, 64))
+        assert r2 == {}  # Second row is all -1
+
+
 # ---- AC-8: Codec Strictness ----
 
 
