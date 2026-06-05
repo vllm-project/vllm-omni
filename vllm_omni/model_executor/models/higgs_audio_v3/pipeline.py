@@ -25,9 +25,13 @@ HIGGS_AUDIO_V3_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            # No async_chunk in this phase (sync-only)
+            # No async_chunk in this phase (sync-only).
+            # stop_token_ids: the model-owned sampler forces eos at ramp-down
+            # completion. The Qwen3 eos_token_id (151645) is also listed as a
+            # safety stop so the engine terminates even if the sampler misses.
             sampling_constraints={
                 "detokenize": False,
+                "stop_token_ids": [151645],
             },
         ),
         StagePipelineConfig(

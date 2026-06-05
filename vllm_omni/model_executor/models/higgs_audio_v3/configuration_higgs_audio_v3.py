@@ -79,6 +79,8 @@ class HiggsAudioV3Config(PretrainedConfig):
 
         # Extract audio constants from encoder config or use defaults
         self.num_codebooks = int(audio_encoder_config.get("num_codebooks", num_codebooks))
+        if self.num_codebooks <= 0:
+            raise ValueError(f"num_codebooks must be > 0, got {self.num_codebooks}")
         self.codebook_size = int(audio_encoder_config.get("vocab_size", codebook_size))
         self.tie_modality_embeddings = bool(audio_encoder_config.get("tie_word_embeddings", True))
 

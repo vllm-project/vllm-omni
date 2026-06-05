@@ -151,30 +151,146 @@ class HiggsAudioV3Code2Wav(nn.Module):
     # ------------------------------------------------------------------ load
     def load_weights(self, weights_or_model_dir, device: torch.device | None = None):
         if self._loaded:
-            # Already loaded from standalone tokenizer
             if not isinstance(weights_or_model_dir, (str, bytes, os.PathLike)):
                 for _ in weights_or_model_dir:
                     pass
             return {name for name, _ in self.named_parameters()}
 
         if not isinstance(weights_or_model_dir, (str, bytes, os.PathLike)):
-            # Engine path: consume iterator, try standalone tokenizer
-            for _ in weights_or_model_dir:
-                pass
+            # Engine path: try to extract V3 bundled codec weights first
+            codec_state: dict[str, torch.Tensor] = {}
+            for name, tensor in weights_or_model_dir:
+                if name.startswith(_CODEC_PREFIX):
+                    stripped = name[len(_CODEC_PREFIX) :]
+                    codec_state[stripped] = tensor
+
+            if codec_state:
+                try:
+                    self._load_from_bundled_state(codec_state, device)
+                    logger.info(
+                        "Loaded HiggsAudioV3Code2Wav from bundled V3 checkpoint (%d codec keys consumed).",
+                        len(codec_state),
+                    )
+                    return {name for name, _ in self.named_parameters()}
+                except Exception as exc:
+                    logger.warning(
+                        "Bundled V3 codec loading failed (%s); falling back to standalone tokenizer repo.",
+                        exc,
+                    )
+
+            # Fallback: standalone tokenizer repo
             if not self._loaded:
                 try:
                     self._load_from_tokenizer_repo()
-                except (FileNotFoundError, OSError):
+                except (FileNotFoundError, OSError) as exc2:
                     raise RuntimeError(
                         "HiggsAudioV3Code2Wav: could not load codec weights. "
-                        "Ensure bosonai/higgs-audio-v2-tokenizer is cached in HF_HOME."
-                    )
+                        "Neither V3 bundled codec keys (tied.embedding."
+                        "modality_embeddings.0.model.*) were found in the "
+                        "checkpoint, nor is bosonai/higgs-audio-v2-tokenizer "
+                        f"cached in HF_HOME. Last error: {exc2}"
+                    ) from exc2
             return {name for name, _ in self.named_parameters()}
 
         # File-based path
         if not self._loaded:
             self._load_from_tokenizer_repo()
         return None
+
+    def _load_from_bundled_state(
+        self,
+        codec_state: dict[str, torch.Tensor],
+        device: torch.device | None = None,
+    ) -> None:
+        """Load codec from V3 checkpoint's bundled weights.
+
+        Keys arrive with the ``tied.embedding.modality_embeddings.0.model.``
+        prefix already stripped. We remap to the same layout that
+        ``load_higgs_audio_codec`` expects and build the modules.
+        """
+        from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_decoder import (
+            HiggsAudioRVQ,
+            _remap_boson_model_pth_state_dict,
+            build_boson_dac_decoder,
+        )
+
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # The bundled codec may use boson-ai key naming. Try remapping.
+        needs_remap = any(k.startswith("quantizer.vq.layers.") for k in codec_state)
+        if needs_remap:
+            codec_state = _remap_boson_model_pth_state_dict(codec_state)
+
+        # Discover parameters from the state dict
+        proj_key = "quantizer.quantizers.0.project_out.weight"
+        if proj_key not in codec_state:
+            raise KeyError(
+                f"Bundled codec state dict missing '{proj_key}'. "
+                f"Available keys (first 10): {list(codec_state.keys())[:10]}"
+            )
+        hidden_size = codec_state[proj_key].shape[0]
+        num_quantizers = sum(
+            1 for k in codec_state if k.startswith("quantizer.quantizers.") and k.endswith(".codebook.embed")
+        )
+        if num_quantizers == 0:
+            # Try .codebook.weight naming
+            num_quantizers = sum(
+                1 for k in codec_state if k.startswith("quantizer.quantizers.") and k.endswith(".codebook.weight")
+            )
+        codebook_dim = 64
+        codebook_size = 1024
+
+        # Build RVQ
+        quantizer = HiggsAudioRVQ(
+            num_quantizers=num_quantizers,
+            codebook_size=codebook_size,
+            codebook_dim=codebook_dim,
+            hidden_size=hidden_size,
+        ).to(device)
+        for i in range(num_quantizers):
+            prefix = f"quantizer.quantizers.{i}"
+            for key_suffix in [".codebook.embed", ".codebook.weight"]:
+                embed_key = f"{prefix}{key_suffix}"
+                if embed_key in codec_state:
+                    quantizer.quantizers[i].codebook.weight.data.copy_(codec_state[embed_key].to(device))
+                    break
+            proj_w = f"{prefix}.project_out.weight"
+            proj_b = f"{prefix}.project_out.bias"
+            if proj_w in codec_state:
+                quantizer.quantizers[i].project_out.weight.data.copy_(codec_state[proj_w].to(device))
+            if proj_b in codec_state:
+                quantizer.quantizers[i].project_out.bias.data.copy_(codec_state[proj_b].to(device))
+
+        # Build fc2
+        fc2_w = codec_state.get("fc2.weight")
+        fc2_b = codec_state.get("fc2.bias")
+        if fc2_w is not None and fc2_b is not None:
+            fc2 = nn.Linear(fc2_w.shape[1], fc2_w.shape[0]).to(device)
+            fc2.weight.data.copy_(fc2_w.to(device))
+            fc2.bias.data.copy_(fc2_b.to(device))
+        else:
+            fc2 = nn.Linear(hidden_size, 256).to(device)
+            logger.warning("fc2 weights not found in bundled codec; using random init")
+
+        # Build acoustic decoder
+        acoustic_decoder = build_boson_dac_decoder(device)
+        ad_keys = {
+            k[len("acoustic_decoder.") :]: v for k, v in codec_state.items() if k.startswith("acoustic_decoder.")
+        }
+        if ad_keys:
+            load_report = acoustic_decoder.load_state_dict(ad_keys, strict=False)
+            if load_report.missing_keys:
+                raise RuntimeError(
+                    f"Bundled DAC decoder missing {len(load_report.missing_keys)} keys: "
+                    f"{load_report.missing_keys[:5]}..."
+                )
+        acoustic_decoder.eval()
+
+        self.quantizer = quantizer
+        self.fc2 = fc2
+        self.acoustic_decoder = acoustic_decoder
+        self._loaded = True
 
     # ------------------------------------------------------------------ decode
     @torch.inference_mode()
