@@ -58,6 +58,13 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _is_dummy_request(req: object) -> bool:
+    is_dummy_run = getattr(req, "is_dummy_run", None)
+    if callable(is_dummy_run):
+        return bool(is_dummy_run())
+    return OmniDiffusionRequest.is_dummy_run_request_id(getattr(req, "request_id", None))
+
+
 def get_glm_image_pre_process_func(od_config: OmniDiffusionConfig):
     """Get pre-processing function for GLM-Image pipeline.
 
@@ -694,7 +701,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         # Stage-0 (AR) outputs via req.extra. For GLM-Image, we allow that
         # specific warmup request to proceed by synthesizing minimal prior
         # tokens, while still raising a clear error for real requests.
-        is_dummy_warmup = req.is_dummy_run()
+        is_dummy_warmup = _is_dummy_request(req)
 
         # Get pre-computed prompt embeddings if provided
         if isinstance(first_prompt, str):

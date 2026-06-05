@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import torch
 import torch.nn as nn
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
@@ -15,7 +17,6 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionModel,
     Unpack,
     apply_rotary_pos_emb,
-    check_model_inputs,
     create_causal_mask,
     deprecate_kwarg,
     eager_attention_forward,
@@ -38,6 +39,47 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLTextRMSNorm as HFQwen3VLTextRMSNorm,
 )
+
+try:
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import check_model_inputs
+except ImportError:
+
+    def check_model_inputs(func):
+        return func
+
+
+_CREATE_CAUSAL_MASK_PARAMS = inspect.signature(create_causal_mask).parameters
+_CREATE_CAUSAL_MASK_ACCEPTS_KWARGS = any(
+    param.kind == inspect.Parameter.VAR_KEYWORD for param in _CREATE_CAUSAL_MASK_PARAMS.values()
+)
+
+
+def _create_causal_mask(
+    *,
+    config: Qwen3VLTextConfig,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    cache_position: torch.LongTensor,
+    past_key_values: Cache | None,
+    position_ids: torch.LongTensor,
+) -> torch.Tensor | None:
+    mask_kwargs = {
+        "config": config,
+        "attention_mask": attention_mask,
+        "cache_position": cache_position,
+        "past_key_values": past_key_values,
+        "position_ids": position_ids,
+    }
+    if "input_embeds" in _CREATE_CAUSAL_MASK_PARAMS:
+        mask_kwargs["input_embeds"] = inputs_embeds
+    else:
+        mask_kwargs["inputs_embeds"] = inputs_embeds
+
+    if _CREATE_CAUSAL_MASK_ACCEPTS_KWARGS:
+        return create_causal_mask(**mask_kwargs)
+    return create_causal_mask(
+        **{name: value for name, value in mask_kwargs.items() if name in _CREATE_CAUSAL_MASK_PARAMS}
+    )
 
 
 class Qwen3VLTextRMSNorm(HFQwen3VLTextRMSNorm):
@@ -69,18 +111,12 @@ class Qwen3VLTextAttention(HFQwen3VLTextAttention):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(
-            self.q_proj(hidden_states).view(hidden_shape)
-        ).transpose(1, 2)
-        key_states = self.k_norm(
-            self.k_proj(hidden_states).view(hidden_shape)
-        ).transpose(1, 2)
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin
-        )
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             if use_cache:
@@ -93,18 +129,12 @@ class Qwen3VLTextAttention(HFQwen3VLTextAttention):
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
             else:
-                key_states = torch.cat(
-                    [past_key_values[self.layer_idx][0], key_states], dim=2
-                )
-                value_states = torch.cat(
-                    [past_key_values[self.layer_idx][1], value_states], dim=2
-                )
+                key_states = torch.cat([past_key_values[self.layer_idx][0], key_states], dim=2)
+                value_states = torch.cat([past_key_values[self.layer_idx][1], value_states], dim=2)
 
         attention_interface = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation
-            ]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -126,15 +156,12 @@ class Qwen3VLTextDecoderLayer(HFQwen3VLTextDecoderLayer):
     def __init__(self, config: Qwen3VLTextConfig, layer_idx: int):
         super().__init__(config, layer_idx)
         self.self_attn = Qwen3VLTextAttention(config=config, layer_idx=layer_idx)
-        self.input_layernorm = Qwen3VLTextRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = Qwen3VLTextRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
 class Qwen3VLTextModel(HFQwen3VLTextModel):
+    config_class = Qwen3VLTextConfig
     config: Qwen3VLTextConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer"]
     _repeated_blocks = ["Qwen3VLTextDecoderLayer"]
@@ -144,14 +171,9 @@ class Qwen3VLTextModel(HFQwen3VLTextModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [
-                Qwen3VLTextDecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+            [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
@@ -174,9 +196,7 @@ class Qwen3VLTextModel(HFQwen3VLTextModel):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple | BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds"
-            )
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if use_cache and past_key_values is None and not torch.jit.is_tracing():
             past_key_values = DynamicCache(config=self.config)
@@ -185,9 +205,7 @@ class Qwen3VLTextModel(HFQwen3VLTextModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if cache_position is None:
-            past_seen_tokens = (
-                past_key_values.get_seq_length() if past_key_values is not None else 0
-            )
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],
@@ -195,9 +213,7 @@ class Qwen3VLTextModel(HFQwen3VLTextModel):
             )
 
         if position_ids is None:
-            position_ids = cache_position.view(1, 1, -1).expand(
-                3, inputs_embeds.shape[0], -1
-            )
+            position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
@@ -207,9 +223,9 @@ class Qwen3VLTextModel(HFQwen3VLTextModel):
         else:
             text_position_ids = position_ids[0]
 
-        attention_mask = create_causal_mask(
+        attention_mask = _create_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             cache_position=cache_position,
             past_key_values=past_key_values,
@@ -231,9 +247,7 @@ class Qwen3VLTextModel(HFQwen3VLTextModel):
                 **kwargs,
             )
 
-            if deepstack_visual_embeds is not None and layer_idx in range(
-                len(deepstack_visual_embeds)
-            ):
+            if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
                 hidden_states = self._deepstack_process(
                     hidden_states,
                     visual_pos_masks,
@@ -252,6 +266,7 @@ class Qwen3VLModel(HFQwen3VLModel):
     base_model_prefix = ""
     _checkpoint_conversion_mapping = {}
     accepts_loss_kwargs = False
+    config_class = Qwen3VLConfig
     config: Qwen3VLConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
 
@@ -267,14 +282,13 @@ class Qwen3VLForConditionalGeneration(HFQwen3VLForConditionalGeneration):
     _checkpoint_conversion_mapping = {}
     _tied_weights_keys = ["lm_head.weight"]
     accepts_loss_kwargs = False
+    config_class = Qwen3VLConfig
     config: Qwen3VLConfig
 
     def __init__(self, config):
         Qwen3VLPreTrainedModel.__init__(self, config)
         self.model = Qwen3VLModel(config)
-        self.lm_head = nn.Linear(
-            config.text_config.hidden_size, config.text_config.vocab_size, bias=False
-        )
+        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
 
 

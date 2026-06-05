@@ -2,25 +2,41 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for GLM-Image Sequence Parallelism support."""
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import pytest
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.models.glm_image.pipeline_glm_image import _is_dummy_request
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture(scope="function", autouse=True)
-def setup_sp_groups(mocker):
+def setup_sp_groups(monkeypatch):
     """Set up SP and TP groups for each test function."""
-    mock_get_sp_group = mocker.patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group")
-    mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=1)
-    mock_get_tp_group = mocker.patch("vllm.distributed.parallel_state.get_tp_group")
+    mock_get_sp_group = MagicMock()
+    mock_get_tp_group = MagicMock()
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_sp_group",
+        mock_get_sp_group,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tp_group",
+        mock_get_tp_group,
+    )
 
-    mock_sp_group = mocker.MagicMock()
+    mock_sp_group = MagicMock()
     mock_sp_group.world_size = 4
     mock_get_sp_group.return_value = mock_sp_group
 
-    mock_tp_group = mocker.MagicMock()
+    mock_tp_group = MagicMock()
     mock_tp_group.world_size = 1
     mock_get_tp_group.return_value = mock_tp_group
     yield
@@ -123,6 +139,12 @@ def test_glm_image_has_sp_support():
 
     # This test just verifies the structure exists
     # Actual SP testing requires multi-GPU setup
+
+
+def test_glm_image_dummy_request_helper_accepts_lightweight_requests():
+    assert _is_dummy_request(SimpleNamespace(request_id=DUMMY_DIFFUSION_REQUEST_ID))
+    assert not _is_dummy_request(SimpleNamespace(request_id="real-request"))
+    assert _is_dummy_request(SimpleNamespace(is_dummy_run=lambda: True, request_id="real-request"))
 
 
 @pytest.mark.cuda

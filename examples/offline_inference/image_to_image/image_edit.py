@@ -283,8 +283,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resolution",
         type=int,
-        default=None,
-        help="Bucket in (640, 1024) to determine the condition and output resolution. If width and height are not provided, this will be set to default 640.",
+        default=640,
+        help="Bucket in (640, 1024) to determine the condition and output resolution",
     )
 
     parser.add_argument(
@@ -390,6 +390,11 @@ def parse_args() -> argparse.Namespace:
         "--enable-cpu-offload",
         action="store_true",
         help="Enable CPU offloading for diffusion models.",
+    )
+    parser.add_argument(
+        "--disable-pin-cpu-memory",
+        action="store_true",
+        help="Disable pinned CPU memory when CPU or layerwise offloading is enabled.",
     )
     parser.add_argument(
         "--enable-layerwise-offload",
@@ -498,8 +503,11 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
         enable_cpu_offload=args.enable_cpu_offload,
+        pin_cpu_memory=not args.disable_pin_cpu_memory,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
+        init_timeout=args.init_timeout,
+        stage_init_timeout=args.stage_init_timeout,
     )
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager

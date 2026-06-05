@@ -37,9 +37,7 @@ class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
 
                 latents[:, : image_latents.shape[1]] = image_latents
                 latent_model_input = latents
-                timestep_expand = timestep.expand(latents.shape[0]).to(
-                    device=latents.device, dtype=latents.dtype
-                )
+                timestep_expand = timestep.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
                 positive_kwargs = {
                     "hidden_states": latent_model_input,
@@ -66,9 +64,7 @@ class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                     cfg_normalize=cfg_normalize,
                     output_slice=None,
                 )
-                latents = self.scheduler_step_maybe_with_cfg(
-                    noise_pred, timestep, latents, do_true_cfg
-                )
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, timestep, latents, do_true_cfg)
                 latents[:, : image_latents.shape[1]] = image_latents
                 pbar.update()
         return latents
@@ -77,8 +73,6 @@ class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         if get_classifier_free_guidance_world_size() == 1:
             return True
         if true_cfg_scale <= 1:
-            logger.warning(
-                "CFG parallel is enabled but Joy true_cfg_scale <= 1, so only the positive branch is used."
-            )
+            logger.warning("CFG parallel is enabled but Joy true_cfg_scale <= 1, so only the positive branch is used.")
             return False
         return True

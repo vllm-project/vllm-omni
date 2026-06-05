@@ -18,9 +18,13 @@ from vllm_omni.diffusion.models.joy_image.joy_image_edit_transformer import (
 from vllm_omni.diffusion.models.joy_image.pipeline_joy_image_edit import (
     JOY_MAX_IMAGE_SEQ_LEN,
     JoyImageEditPipeline,
+    _cast_floating_model_inputs,
     _get_transformer_config_kwargs_from_od_config,
+    _should_defer_component_device_placement,
     get_joy_image_edit_pre_process_func,
 )
+from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
 
 
 def _write_model_configs(tmp_path):
@@ -79,9 +83,7 @@ def _make_request(*, prompt=None, params=None):
         "multi_modal_data": {"image": Image.new("RGB", (2048, 1024), color="white")},
     }
     params = params or _make_params()
-    return SimpleNamespace(
-        prompts=[prompt], sampling_params=params, request_id="joy-test"
-    )
+    return SimpleNamespace(prompts=[prompt], sampling_params=params, request_id="joy-test")
 
 
 def test_joy_registry_and_metadata_entries(tmp_path):
@@ -153,6 +155,39 @@ def test_transformer_config_kwargs_from_od_config_filters_metadata():
     }
 
 
+def test_defer_component_device_placement_for_offload_and_hsdp():
+    assert (
+        _should_defer_component_device_placement(
+            SimpleNamespace(
+                enable_cpu_offload=False,
+                enable_layerwise_offload=False,
+                parallel_config=SimpleNamespace(use_hsdp=False),
+            )
+        )
+        is False
+    )
+    assert _should_defer_component_device_placement(SimpleNamespace(enable_cpu_offload=True)) is True
+    assert _should_defer_component_device_placement(SimpleNamespace(enable_layerwise_offload=True)) is True
+    assert (
+        _should_defer_component_device_placement(SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=True)))
+        is True
+    )
+
+
+def test_component_discovery_treats_vae_as_offload_peer():
+    pipeline = object.__new__(JoyImageEditPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = torch.nn.Linear(1, 1)
+    pipeline.text_encoder = torch.nn.Linear(1, 1)
+    pipeline.vae = torch.nn.Linear(1, 1)
+
+    modules = ModuleDiscovery.discover(pipeline)
+
+    assert modules.dit_names == ["transformer"]
+    assert modules.encoder_names == ["text_encoder", "vae"]
+    assert modules.vaes == []
+
+
 def test_preprocess_requires_exactly_one_image(tmp_path):
     od_config = _write_model_configs(tmp_path)
     preprocess = get_joy_image_edit_pre_process_func(od_config)
@@ -163,9 +198,7 @@ def test_preprocess_requires_exactly_one_image(tmp_path):
     multi_image = _make_request(
         prompt={
             "prompt": "x",
-            "multi_modal_data": {
-                "image": [Image.new("RGB", (32, 32)), Image.new("RGB", (32, 32))]
-            },
+            "multi_modal_data": {"image": [Image.new("RGB", (32, 32)), Image.new("RGB", (32, 32))]},
         }
     )
     with pytest.raises(ValueError, match="exactly one image"):
@@ -221,21 +254,13 @@ def test_guidance_scale_alias_only_when_true_cfg_absent():
     canonical = _make_request(params=_make_params(true_cfg_scale=4.0))
     assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(canonical) == 4.0
 
-    default_guidance = _make_request(
-        params=_make_params(guidance_scale=1.0, true_cfg_scale=4.0)
-    )
-    assert (
-        JoyImageEditPipeline.resolve_effective_true_cfg_scale(default_guidance) == 4.0
-    )
+    default_guidance = _make_request(params=_make_params(guidance_scale=1.0, true_cfg_scale=4.0))
+    assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(default_guidance) == 4.0
 
-    matching = _make_request(
-        params=_make_params(guidance_scale=4.0, true_cfg_scale=4.0)
-    )
+    matching = _make_request(params=_make_params(guidance_scale=4.0, true_cfg_scale=4.0))
     assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(matching) == 4.0
 
-    conflict = _make_request(
-        params=_make_params(guidance_scale=3.0, true_cfg_scale=4.0)
-    )
+    conflict = _make_request(params=_make_params(guidance_scale=3.0, true_cfg_scale=4.0))
     with pytest.raises(ValueError, match="compatibility alias"):
         JoyImageEditPipeline.resolve_effective_true_cfg_scale(conflict)
 
@@ -260,6 +285,156 @@ def test_pad_prompt_embeds_keeps_last_tokens_and_builds_mask():
 
     with pytest.raises(ValueError, match="greater than 0"):
         JoyImageEditPipeline._pad_prompt_embeds([first], max_sequence_length=0)
+
+
+def test_last_layer_capture_passes_mm_token_type_ids():
+    class FakeLanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([torch.nn.Identity()])
+
+    class FakeTextEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = SimpleNamespace(language_model=FakeLanguageModel())
+            self.calls = []
+
+        def forward(self, **kwargs):
+            self.calls.append(kwargs)
+            hidden_states = torch.zeros(1, 2, 4)
+            self.model.language_model.layers[-1](hidden_states)
+
+    pipeline = object.__new__(JoyImageEditPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.text_encoder = FakeTextEncoder()
+    mm_token_type_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    model_inputs = SimpleNamespace(
+        input_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        attention_mask=torch.tensor([[1, 1]], dtype=torch.long),
+        pixel_values=torch.zeros(1, 3, 16, 16),
+        image_grid_thw=torch.tensor([[1, 1, 1]], dtype=torch.long),
+        mm_token_type_ids=mm_token_type_ids,
+    )
+
+    hidden_states = JoyImageEditPipeline._get_last_layer_pre_norm_hidden(
+        pipeline,
+        model_inputs,
+    )
+
+    assert hidden_states.shape == (1, 2, 4)
+    assert pipeline.text_encoder.calls[0]["mm_token_type_ids"] is mm_token_type_ids
+
+
+def test_cast_floating_model_inputs_only_casts_pixel_tensors():
+    class FakeModelInputs(dict):
+        def __getattr__(self, name):
+            return self[name]
+
+    model_inputs = FakeModelInputs(
+        input_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        attention_mask=torch.tensor([[1, 1]], dtype=torch.long),
+        pixel_values=torch.zeros(1, 3, dtype=torch.float32),
+        image_grid_thw=torch.tensor([[1, 1, 1]], dtype=torch.long),
+    )
+
+    _cast_floating_model_inputs(model_inputs, torch.bfloat16)
+
+    assert model_inputs.input_ids.dtype == torch.long
+    assert model_inputs.attention_mask.dtype == torch.long
+    assert model_inputs.pixel_values.dtype == torch.bfloat16
+    assert model_inputs.image_grid_thw.dtype == torch.long
+
+
+def test_qwen_prompt_embeds_casts_processor_pixel_values_to_encoder_dtype():
+    class FakeModelInputs(dict):
+        def __init__(self):
+            super().__init__(
+                input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
+                attention_mask=torch.tensor([[1, 1, 1]], dtype=torch.long),
+                pixel_values=torch.zeros(1, 3, dtype=torch.float32),
+                image_grid_thw=torch.tensor([[1, 1, 1]], dtype=torch.long),
+            )
+
+        def __getattr__(self, name):
+            return self[name]
+
+        def __setattr__(self, name, value):
+            self[name] = value
+
+        def to(self, device):
+            for key, value in list(self.items()):
+                if isinstance(value, torch.Tensor):
+                    self[key] = value.to(device)
+            return self
+
+    class FakeProcessor:
+        def __init__(self):
+            self.model_inputs = FakeModelInputs()
+
+        def __call__(self, **kwargs):
+            self.kwargs = kwargs
+            return self.model_inputs
+
+    class FakeTextEncoder:
+        dtype = torch.bfloat16
+
+    pipeline = object.__new__(JoyImageEditPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.processor = FakeProcessor()
+    pipeline.text_encoder = FakeTextEncoder()
+    pipeline.prompt_template_encode = "{}"
+    pipeline.prompt_template_encode_start_idx = 0
+    pipeline.tokenizer_max_length = 8
+    captured = {}
+
+    def fake_get_hidden(model_inputs):
+        captured["pixel_dtype"] = model_inputs.pixel_values.dtype
+        captured["attention_mask_dtype"] = model_inputs.attention_mask.dtype
+        return torch.ones(1, 3, 4, dtype=torch.float32)
+
+    pipeline._get_last_layer_pre_norm_hidden = fake_get_hidden
+
+    prompt_embeds, prompt_mask = JoyImageEditPipeline._get_qwen_prompt_embeds(
+        pipeline,
+        "make it brighter",
+        Image.new("RGB", (16, 16)),
+    )
+
+    assert captured == {
+        "pixel_dtype": torch.bfloat16,
+        "attention_mask_dtype": torch.long,
+    }
+    assert prompt_embeds.dtype == torch.bfloat16
+    assert prompt_mask.dtype == torch.long
+
+
+def test_prepare_latents_casts_encoded_image_latents_to_requested_dtype():
+    pipeline = object.__new__(JoyImageEditPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.latent_channels = 4
+    pipeline.vae_scale_factor = 8
+
+    def fake_encode(image, generator):
+        assert image.dtype == torch.bfloat16
+        return torch.ones(1, 4, 1, 8, 8, dtype=torch.float32)
+
+    pipeline._encode_vae_image = fake_encode
+
+    latents, image_latents = JoyImageEditPipeline.prepare_latents(
+        pipeline,
+        image=torch.zeros(1, 3, 1, 64, 64, dtype=torch.float32),
+        batch_size=1,
+        num_channels_latents=4,
+        height=64,
+        width=64,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        generator=None,
+    )
+
+    assert latents.dtype == torch.bfloat16
+    assert image_latents.dtype == torch.bfloat16
 
 
 def test_transformer_shape_and_masked_forward():
@@ -290,9 +465,7 @@ def test_transformer_shape_and_masked_forward():
 def test_transformer_from_config_file_loads_checkpoint_config(tmp_path):
     _write_model_configs(tmp_path)
 
-    transformer = JoyImageEditTransformer3DModel.from_config_file(
-        tmp_path / "transformer" / "config.json"
-    )
+    transformer = JoyImageEditTransformer3DModel.from_config_file(tmp_path / "transformer" / "config.json")
 
     assert transformer.patch_size == (1, 2, 2)
     assert transformer.hidden_size == 32
@@ -320,9 +493,7 @@ def test_transformer_load_weights_maps_diffusers_prefix():
     assert torch.equal(transformer.img_in.weight, weight)
 
     text_weight = torch.randn_like(transformer.condition_embedder.text_embedder.linear_1.weight)
-    loaded = transformer.load_weights(
-        [("transformer.condition_embedder.text_embedder.linear_1.weight", text_weight)]
-    )
+    loaded = transformer.load_weights([("transformer.condition_embedder.text_embedder.linear_1.weight", text_weight)])
 
     assert loaded == {"condition_embedder.text_embedder.linear_1.weight"}
     assert torch.equal(transformer.condition_embedder.text_embedder.linear_1.weight, text_weight)
@@ -546,3 +717,73 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
     assert encode_calls == [("prompt", "make it brighter"), ("negative_prompt", "")]
     assert diffuse_calls[0]["do_true_cfg"] is True
     assert diffuse_calls[0]["true_cfg_scale"] == 2.0
+
+
+def test_forward_skips_decode_for_dummy_warmup_request(monkeypatch):
+    class FakeScheduler:
+        def set_timesteps(self, num_inference_steps, device):
+            self.timesteps = torch.tensor([1.0], device=device)
+
+    pipeline = object.__new__(JoyImageEditPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=True,
+        enable_layerwise_offload=False,
+        pin_cpu_memory=False,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+    )
+    pipeline.transformer = torch.nn.Linear(1, 1)
+    pipeline.latent_channels = 4
+    pipeline.scheduler = FakeScheduler()
+    pipeline.encode_prompt = lambda *args, **kwargs: (
+        torch.zeros(1, 3, 4),
+        torch.ones(1, 3, dtype=torch.long),
+    )
+    pipeline.prepare_latents = lambda **kwargs: (
+        torch.zeros(1, 2, 4, 1, 2, 2),
+        torch.ones(1, 1, 4, 1, 2, 2),
+    )
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"] + 1.0
+    pipeline.check_cfg_parallel_validity = lambda scale: True
+
+    def decode_should_not_run(latents):
+        raise AssertionError("dummy warmup should not decode latents")
+
+    pipeline._decode_latents = decode_should_not_run
+    move_calls = []
+
+    def fake_move_params(module, target_device, **kwargs):
+        move_calls.append((module, target_device, kwargs))
+
+    monkeypatch.setattr(
+        joy_pipeline_module.SequentialOffloadHook,
+        "_move_params",
+        fake_move_params,
+    )
+    monkeypatch.setattr(joy_pipeline_module.current_omni_platform, "empty_cache", lambda: None)
+
+    request = _make_request(
+        prompt={
+            "prompt": "dummy run",
+            "additional_information": {
+                "image_tensor": torch.zeros(1, 3, 1, 16, 16),
+                "prompt_image": Image.new("RGB", (16, 16)),
+                "height": 16,
+                "width": 16,
+            },
+        },
+        params=_make_params(true_cfg_scale=1.0),
+    )
+    request.request_id = DUMMY_DIFFUSION_REQUEST_ID
+
+    output = JoyImageEditPipeline.forward(pipeline, request)
+
+    assert output.output.shape == (1, 4, 1, 2, 2)
+    assert move_calls == [
+        (
+            pipeline.transformer,
+            torch.device("cpu"),
+            {"non_blocking": False, "pin_memory": False},
+        )
+    ]
