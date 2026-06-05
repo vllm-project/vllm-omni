@@ -16,9 +16,10 @@ Usage:
 """
 
 import argparse
-import os
+import json
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -27,6 +28,16 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
+
+
+def parse_profiler_config(value: str) -> dict[str, Any]:
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+    return config
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,6 +97,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=3.0,
         help="Scheduler flow shift (default: 3.0).",
+    )
+    parser.add_argument(
+        "--boundary-ratio",
+        type=float,
+        default=None,
+        help="Boundary split ratio for low/high DiT stages (S2V). Default varies by model.",
     )
     parser.add_argument(
         "--output",
@@ -178,30 +195,10 @@ def parse_args() -> argparse.Namespace:
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
     parser.add_argument(
-        "--profile-dir",
-        type=str,
+        "--profiler-config",
+        type=parse_profiler_config,
         default=None,
-        help="Enable torch profiler and save traces to this directory.",
-    )
-    parser.add_argument(
-        "--profile-record-shapes",
-        action="store_true",
-        help="Record tensor shapes in profiler (increases trace size).",
-    )
-    parser.add_argument(
-        "--profile-with-stack",
-        action="store_true",
-        help="Record stack traces in profiler (increases overhead).",
-    )
-    parser.add_argument(
-        "--profile-with-memory",
-        action="store_true",
-        help="Profile memory usage.",
-    )
-    parser.add_argument(
-        "--profile-with-flops",
-        action="store_true",
-        help="Estimate FLOPs for operations.",
+        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
     return parser.parse_args()
 
@@ -239,23 +236,9 @@ def main():
         ulysses_degree=args.ulysses_degree,
     )
 
-    # Check if profiling is requested via CLI args or environment variable
-    profile_dir = args.profile_dir or os.getenv("VLLM_TORCH_PROFILER_DIR")
-    profiler_enabled = bool(profile_dir)
-    profiler_config = None
-    if profiler_enabled:
-        from vllm.config import ProfilerConfig
+    profiler_enabled = args.profiler_config is not None
 
-        profiler_config = ProfilerConfig(
-            profiler="torch",
-            torch_profiler_dir=profile_dir,
-            torch_profiler_record_shapes=args.profile_record_shapes,
-            torch_profiler_with_stack=args.profile_with_stack,
-            torch_profiler_with_memory=args.profile_with_memory,
-            torch_profiler_with_flops=args.profile_with_flops,
-        )
-
-    omni = Omni(
+    omni_kwargs = dict(
         model=args.model,
         model_class_name="WanS2VPipeline",
         flow_shift=args.flow_shift,
@@ -269,8 +252,12 @@ def main():
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         enable_cache_dit_summary=args.enable_cache_dit_summary,
-        profiler_config=profiler_config,
+        profiler_config=args.profiler_config,
     )
+    if args.boundary_ratio is not None:
+        omni_kwargs["boundary_ratio"] = args.boundary_ratio
+
+    omni = Omni(**omni_kwargs)
 
     # Print generation configuration
     print(f"\n{'=' * 60}")
@@ -325,13 +312,16 @@ def main():
     if profiler_enabled:
         print("\n[Profiler] Stopping profiler and collecting results...")
         profile_results = omni.stop_profile()
-        if profile_results and isinstance(profile_results, list):
+        if profile_results and isinstance(profile_results, dict):
+            traces = profile_results.get("traces", [])
             print("\n" + "=" * 60)
             print("PROFILING RESULTS:")
-            for i, result in enumerate(profile_results):
-                print(f"\nStage {i}:")
-                if result:
-                    print(f"  {result}")
+            for rank, trace in enumerate(traces):
+                print(f"\nRank {rank}:")
+                if trace:
+                    print(f"  • Trace: {trace}")
+            if not traces:
+                print("  No traces collected.")
             print("=" * 60)
         else:
             print("[Profiler] No valid profiling data returned.")

@@ -156,3 +156,17 @@ def test_sensenova_u1_text2img(run_level):
         generated_image = _generate_sensenova_u1_image(runner.omni)
         if run_level == "advanced_model":
             _validate_pixels(generated_image)
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cache
+@hardware_test(res={"cuda": "H100"})
+def test_sensenova_u1_text2img_cache_dit():
+    """Test SenseNova-U1 text2img with Cache-DiT enabled."""
+    with OmniRunner(
+        "SenseNova/SenseNova-U1-8B-MoT",
+        stage_configs_path=None,
+        cache_backend="cache_dit",
+    ) as runner:
+        _generate_sensenova_u1_image(runner.omni)

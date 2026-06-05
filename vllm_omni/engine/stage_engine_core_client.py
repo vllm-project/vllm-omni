@@ -6,10 +6,13 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import multiprocessing.connection
+import os
 import socket
 import threading
+import time
 import weakref
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -20,9 +23,14 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    TRANSFER_ENGINE_CONNECTOR_NAMES,
+)
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     KV_TRANSFER_PORT_OFFSET,
 )
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
+from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
 if TYPE_CHECKING:
@@ -56,7 +64,7 @@ def _default_process_engine_inputs(
     ]
 
 
-class StageEngineCoreClientBase:
+class StageEngineCoreClientBase(StageClientBase):
     """Shared stage-aware behavior for async EngineCore clients.
 
     The concrete transport/load-balancing behavior is supplied by the
@@ -79,7 +87,8 @@ class StageEngineCoreClientBase:
     def make_async_mp_client(
         vllm_config: Any,
         executor_class: type,
-        metadata: StageMetadata,
+        log_stats: bool = False,
+        metadata: StageMetadata | None = None,
         client_addresses: dict[str, str] | None = None,
         proc: Any = None,
         engine_manager: Any = None,
@@ -92,6 +101,7 @@ class StageEngineCoreClientBase:
         client_args = dict(
             vllm_config=vllm_config,
             executor_class=executor_class,
+            log_stats=log_stats,
             metadata=metadata,
             client_addresses=client_addresses,
             proc=proc,
@@ -150,6 +160,7 @@ class StageEngineCoreClientBase:
 
         self.engine_outputs: Any = None
         self._proc = proc
+        self._shutting_down = False
         self.client_addresses = dict(client_addresses or {})
         self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
         self._kv_sender_host = self._resolve_contact_host()
@@ -225,15 +236,37 @@ class StageEngineCoreClientBase:
                 multiprocessing.connection.wait([proc.sentinel])
             except Exception:
                 return
+
+            # Give multiprocessing a brief chance to publish a stable exitcode
+            # before emitting the monitor log. Without this, the sentinel can
+            # fire first and the log may misleadingly print ``None``.
+            with contextlib.suppress(Exception):
+                proc.join(timeout=0)
+            exitcode = proc.exitcode
+            if exitcode is None:
+                deadline = time.monotonic() + 0.2
+                while exitcode is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    with contextlib.suppress(Exception):
+                        proc.join(timeout=0)
+                    exitcode = proc.exitcode
+
             resources = resources_ref()
-            if resources is None or resources.engine_dead:
+            if resources is None or resources.engine_dead or self._shutting_down:
+                return
+            if exitcode == 0:
+                logger.info(
+                    "[StageEngineCoreClient] stage-%s [rep-%s] subprocess exited cleanly.",
+                    stage_id,
+                    replica_id,
+                )
                 return
             resources.engine_dead = True
             logger.error(
                 "[StageEngineCoreClient] stage-%s [rep-%s] subprocess died unexpectedly (exit code %s).",
                 stage_id,
                 replica_id,
-                proc.exitcode,
+                exitcode,
             )
 
         t = threading.Thread(
@@ -327,11 +360,13 @@ class StageEngineCoreClientBase:
         if sender_host is not None:
             self._kv_sender_host = sender_host
 
+        connector_type = connector_config.get("type")
         sender_port = connector_config.get("sender_zmq_port")
-        if sender_port is None:
+        if connector_type in TRANSFER_ENGINE_CONNECTOR_NAMES or sender_port is None:
             base_port = connector_config.get("zmq_port")
             if base_port is None:
                 return
+            base_port = os.path.expandvars(str(base_port))
 
             omni_kv_config = getattr(self, "_omni_kv_config", None)
             from_stage = self.stage_id
@@ -341,7 +376,12 @@ class StageEngineCoreClientBase:
             try:
                 # Orchestrator always reports rank-0's port; receiver
                 # workers add their own local_rank * KV_RANK_PORT_STRIDE.
-                sender_port = int(base_port) + KV_TRANSFER_PORT_OFFSET + int(from_stage)
+                sender_port = kv_zmq_port(
+                    int(base_port),
+                    int(from_stage),
+                    local_rank=0,
+                    replica_id=self.replica_id,
+                )
             except (TypeError, ValueError):
                 logger.warning(
                     "[StageEngineCoreClient] stage-%s [rep-%s] could not resolve sender_zmq_port "
@@ -383,7 +423,12 @@ class StageEngineCoreClientBase:
         # rank-0 base port; receiver workers adjust per KV_RANK_PORT_STRIDE.
         return {
             "host": self._kv_sender_host,
-            "zmq_port": base_port + kv_transfer_port_offset + int(self.stage_id),
+            "zmq_port": kv_zmq_port(
+                base_port - KV_TRANSFER_PORT_OFFSET + kv_transfer_port_offset,
+                int(self.stage_id),
+                local_rank=0,
+                replica_id=self.replica_id,
+            ),
         }
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None:
@@ -440,8 +485,9 @@ class StageEngineCoreClientBase:
             kwargs=kwargs,
         )
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown managed resources and any externally spawned subprocess."""
+        self._shutting_down = True
         child_procs: list[psutil.Process] = []
         if self._proc is not None and self._proc.pid is not None:
             try:
@@ -450,7 +496,7 @@ class StageEngineCoreClientBase:
                 child_procs = []
 
         try:
-            super().shutdown()
+            super().shutdown(timeout=timeout)
         finally:
             if self._proc is not None and self._proc.is_alive():
                 self._proc.terminate()

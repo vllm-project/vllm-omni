@@ -17,6 +17,9 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 
 The default deployment configuration situated at `vllm_omni/deploy/qwen3_omni_moe.yaml` is resolved and loaded
 automatically via the model registry, obviating the necessity for the `--deploy-config` flag in standard deployment topologies.
+The bundled Qwen3-Omni setup defaults `VLLM_USE_FLASHINFER_MOE_FP16=0`. This keeps the Thinker & Talker on vLLM's
+Triton unquantized MoE path and avoids the performance regression observed with the FlashInfer CUTLASS unquantized MoE
+backend.
 Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
 
 To explicitly utilize a custom deployment YAML, specify the configuration path:
@@ -70,6 +73,12 @@ with `--stage-overrides`, for example:
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --stage-overrides '{"1": {"gpu_memory_utilization": 0.5}}'
+```
+
+To experiment with the FlashInfer FP16 MoE path, set `VLLM_USE_FLASHINFER_MOE_FP16=1` before launching the server:
+```bash
+VLLM_USE_FLASHINFER_MOE_FP16=1 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
 For the stage-based CLI, you usually do **not** need `--stage-overrides` for

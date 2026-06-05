@@ -115,39 +115,43 @@ class TestConnectorKeyFormat:
 class TestRankMapping:
     """Verify get_kv_target_ranks and get_kv_source_ranks for various TP configs."""
 
-    def test_homogeneous_tp2_rank0(self):
-        topo = KVTPTopology(source_tp_size=2, target_tp_size=2, local_rank=0)
-        assert get_kv_target_ranks(topo) == [0]
-        assert get_kv_source_ranks(topo) == [0]
+    @pytest.mark.parametrize(
+        "tp_size,local_rank",
+        [
+            (2, 0),
+            (2, 1),
+            (4, 3),
+        ],
+    )
+    def test_homogeneous_tp(self, tp_size, local_rank):
+        """Homogeneous TP: each rank sends/receives to/from itself."""
+        topo = KVTPTopology(source_tp_size=tp_size, target_tp_size=tp_size, local_rank=local_rank)
+        assert get_kv_target_ranks(topo) == [local_rank]
+        assert get_kv_source_ranks(topo) == [local_rank]
 
-    def test_homogeneous_tp2_rank1(self):
-        topo = KVTPTopology(source_tp_size=2, target_tp_size=2, local_rank=1)
-        assert get_kv_target_ranks(topo) == [1]
-        assert get_kv_source_ranks(topo) == [1]
+    @pytest.mark.parametrize(
+        "local_rank,expected_source_ranks",
+        [
+            (0, [0, 1]),  # rank 0 receives from sender ranks 0 and 1
+            (1, [2, 3]),  # rank 1 receives from sender ranks 2 and 3
+        ],
+    )
+    def test_sender_gt_receiver_tp4_to_tp2(self, local_rank, expected_source_ranks):
+        """Receiver with source_tp=4, target_tp=2."""
+        topo = KVTPTopology(source_tp_size=4, target_tp_size=2, local_rank=local_rank)
+        assert get_kv_source_ranks(topo) == expected_source_ranks
 
-    def test_homogeneous_tp4_rank3(self):
-        topo = KVTPTopology(source_tp_size=4, target_tp_size=4, local_rank=3)
-        assert get_kv_target_ranks(topo) == [3]
-        assert get_kv_source_ranks(topo) == [3]
-
-    def test_sender_gt_receiver_tp4_to_tp2_rank0(self):
-        """Receiver rank 0 should receive from sender rank 0 and 1."""
-        topo = KVTPTopology(source_tp_size=4, target_tp_size=2, local_rank=0)
-        assert get_kv_source_ranks(topo) == [0, 1]
-
-    def test_sender_gt_receiver_tp4_to_tp2_rank1(self):
-        """Receiver rank 1 should receive from sender rank 2 and 3."""
-        topo = KVTPTopology(source_tp_size=4, target_tp_size=2, local_rank=1)
-        assert get_kv_source_ranks(topo) == [2, 3]
-
-    def test_sender_lt_receiver_tp2_to_tp4_rank0(self):
-        """Sender rank 0 should send to receiver ranks 0 and 1."""
-        topo = KVTPTopology(source_tp_size=2, target_tp_size=4, local_rank=0)
-        assert get_kv_target_ranks(topo) == [0, 1]
-
-    def test_sender_lt_receiver_tp2_to_tp4_rank1(self):
-        topo = KVTPTopology(source_tp_size=2, target_tp_size=4, local_rank=1)
-        assert get_kv_target_ranks(topo) == [2, 3]
+    @pytest.mark.parametrize(
+        "local_rank,expected_target_ranks",
+        [
+            (0, [0, 1]),  # sender rank 0 sends to receiver ranks 0 and 1
+            (1, [2, 3]),  # sender rank 1 sends to receiver ranks 2 and 3
+        ],
+    )
+    def test_sender_lt_receiver_tp2_to_tp4(self, local_rank, expected_target_ranks):
+        """Sender with source_tp=2, target_tp=4."""
+        topo = KVTPTopology(source_tp_size=2, target_tp_size=4, local_rank=local_rank)
+        assert get_kv_target_ranks(topo) == expected_target_ranks
 
     def test_receiver_lt_sender_source_ranks(self):
         """Receiver rank 0 with tp2_to_tp4 should source from rank 0 only."""
@@ -174,21 +178,21 @@ class TestBuildRankAwareRecvKeys:
         assert key == "omni_stage0_to_stage1_kv_cache_req-1"
         assert rank is None
 
-    def test_homogeneous_tp2_rank0(self):
-        topo = KVTPTopology(source_tp_size=2, target_tp_size=2, local_rank=0)
+    @pytest.mark.parametrize(
+        "local_rank,expected_key,expected_rank",
+        [
+            (0, "req-1_stage0_0_0_0", 0),
+            (1, "req-1_stage0_0_1_1", 1),
+        ],
+    )
+    def test_homogeneous_tp2(self, local_rank, expected_key, expected_rank):
+        """Homogeneous TP=2: each rank gets one key."""
+        topo = KVTPTopology(source_tp_size=2, target_tp_size=2, local_rank=local_rank)
         pairs = build_rank_aware_recv_keys("req-1", "stage0", "stage1", topo)
         assert len(pairs) == 1
         key, rank = pairs[0]
-        assert key == "req-1_stage0_0_0_0"
-        assert rank == 0
-
-    def test_homogeneous_tp2_rank1(self):
-        topo = KVTPTopology(source_tp_size=2, target_tp_size=2, local_rank=1)
-        pairs = build_rank_aware_recv_keys("req-1", "stage0", "stage1", topo)
-        assert len(pairs) == 1
-        key, rank = pairs[0]
-        assert key == "req-1_stage0_0_1_1"
-        assert rank == 1
+        assert key == expected_key
+        assert rank == expected_rank
 
     def test_heterogeneous_tp4_to_tp2_rank0_gets_two_keys(self):
         """Receiver rank 0 with source_tp=4, target_tp=2 should get 2 keys."""
@@ -311,9 +315,16 @@ class TestReceiveConstructsMetadata:
         assert len(calls) > 0
         assert calls[0]["metadata"] is None
 
-    def test_homogeneous_tp2_rank0_passes_metadata(self):
-        """TP=2 rank 0: metadata should point to sender rank 0's port."""
-        mgr = _make_manager(from_tp=2, to_tp=2, local_rank=0, recv_timeout=0.05)
+    @pytest.mark.parametrize(
+        "local_rank,expected_port_offset",
+        [
+            (0, 0),
+            (1, 1),
+        ],
+    )
+    def test_homogeneous_tp2_passes_metadata(self, local_rank, expected_port_offset):
+        """TP=2: metadata should point to sender rank's port with correct offset."""
+        mgr = _make_manager(from_tp=2, to_tp=2, local_rank=local_rank, recv_timeout=0.05)
         mgr.update_sender_info({"host": "10.0.0.1", "zmq_port": 50151})
 
         calls = []
@@ -330,24 +341,7 @@ class TestReceiveConstructsMetadata:
         meta = calls[0]["metadata"]
         assert meta is not None
         assert meta["source_host"] == "10.0.0.1"
-        assert meta["source_port"] == 50151 + 0 * KV_RANK_PORT_STRIDE
-
-    def test_homogeneous_tp2_rank1_passes_metadata_with_offset(self):
-        mgr = _make_manager(from_tp=2, to_tp=2, local_rank=1, recv_timeout=0.05)
-        mgr.update_sender_info({"host": "10.0.0.1", "zmq_port": 50151})
-
-        calls = []
-
-        class _Connector:
-            def get(self, from_stage, to_stage, get_key, metadata=None):
-                calls.append({"key": get_key, "metadata": metadata})
-                return None
-
-        mgr._connector = _Connector()
-        mgr.receive_kv_cache_for_request("req-1")
-
-        meta = calls[0]["metadata"]
-        assert meta["source_port"] == 50151 + 1 * KV_RANK_PORT_STRIDE
+        assert meta["source_port"] == 50151 + expected_port_offset * KV_RANK_PORT_STRIDE
 
     def test_heterogeneous_tp4_to_tp2_rank0_multiple_metadata(self):
         """Receiver rank 0 with source_tp=4, target_tp=2 should call get() with
@@ -676,6 +670,230 @@ class TestDistributedReceive:
             assert mgr.receive_multi_kv_cache_distributed(req, target_device=torch.device("cpu")) is True
 
         mgr.receive_multi_kv_cache.assert_called_once_with(req, None, torch.device("cpu"))
+
+    # ── SP-only scenarios ────────────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        "sp_rank,world_rank_in_group,is_owner",
+        [
+            (0, 0, True),  # owner receives and broadcasts
+            (1, 1, False),  # follower receives via broadcast
+        ],
+    )
+    def test_sp_only_scenarios(self, sp_rank, world_rank_in_group, is_owner):
+        """SP-only (sp_size=2, cfg_size=1): Test owner and follower behavior."""
+        mgr = _make_manager(from_tp=2, to_tp=4, local_rank=0)
+        req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
+        world_group = _MockBroadcastGroup(world_size=4, rank_in_group=world_rank_in_group)
+        sp_payload = {
+            "past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+            "kv_metadata": {"source": "owner"},
+            "sp.past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+            "sp.kv_metadata": {"source": "owner"},
+        }
+        sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=sp_rank, broadcast_value=sp_payload)
+
+        def _receive(req_obj, cfg_func, target_device):
+            req_obj.past_key_values = SimpleNamespace(key_cache=[torch.tensor([1.0])])
+            req_obj.kv_metadata = {"source": "owner"}
+            req_obj.sampling_params.past_key_values = req_obj.past_key_values
+            req_obj.sampling_params.kv_metadata = req_obj.kv_metadata
+            return True
+
+        mgr.receive_multi_kv_cache = MagicMock(side_effect=_receive)
+        with (
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=None),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
+                return_value=sp_rank,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
+        ):
+            assert mgr.receive_multi_kv_cache_distributed(req) is True
+
+        # Verify behavior based on role
+        if is_owner:
+            mgr.receive_multi_kv_cache.assert_called_once()
+            assert mgr.receive_multi_kv_cache.call_args.args[2] == torch.device("cpu")
+            assert sp_group.broadcast_calls[0][1] == 0
+        else:
+            mgr.receive_multi_kv_cache.assert_not_called()
+
+        assert len(sp_group.broadcast_calls) == 1
+        assert torch.equal(req.past_key_values.key_cache[0], torch.tensor([1.0]))
+        assert req.sampling_params.kv_metadata == {"source": "owner"}
+
+    # ── CFG + SP mixed scenarios ─────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        "cfg_rank,sp_rank,world_rank_in_group,role",
+        [
+            (0, 0, 0, "owner"),  # owner: receives, cfg scatter, sp broadcast
+            (1, 0, 2, "cfg_follower_sp_leader"),  # cfg follower + sp leader: cfg recv, sp broadcast
+            (0, 1, 1, "sp_follower"),  # sp follower: only sp broadcast
+        ],
+    )
+    def test_cfg_sp_mixed_scenarios(self, cfg_rank, sp_rank, world_rank_in_group, role):
+        """CFG+SP (cfg_size=2, sp_size=2): Test various rank combinations."""
+        mgr = _make_manager(from_tp=2, to_tp=4, local_rank=0)
+        req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
+        world_group = _MockBroadcastGroup(world_size=8, rank_in_group=world_rank_in_group)
+
+        # Setup payloads based on role
+        if role == "owner":
+            owner_sp_payload = {
+                "past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+                "kv_metadata": {"source": "owner"},
+                "sp.past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+                "sp.kv_metadata": {"source": "owner"},
+                "sp.cfg_branch_roles": ["cfg_text"],
+                "sp.cfg_active_branch": None,
+            }
+            cfg_group = _MockBroadcastGroup(world_size=2, rank_in_group=cfg_rank)
+            sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=sp_rank, broadcast_value=owner_sp_payload)
+
+            def _receive(req_obj, cfg_func, target_device):
+                req_obj.past_key_values = SimpleNamespace(key_cache=[torch.tensor([1.0])])
+                req_obj.kv_metadata = {"source": "owner"}
+                req_obj.sampling_params.past_key_values = req_obj.past_key_values
+                req_obj.sampling_params.kv_metadata = req_obj.kv_metadata
+                req_obj.sampling_params.cfg_text_past_key_values = SimpleNamespace(key_cache=[torch.tensor([2.0])])
+                req_obj.sampling_params.cfg_text_kv_metadata = {"source": "cfg_text"}
+                return True
+
+            mgr.receive_multi_kv_cache = MagicMock(side_effect=_receive)
+        else:
+            cfg_payload = {
+                "past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+                "kv_metadata": {"source": "main"},
+                "sp.past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+                "sp.kv_metadata": {"source": "main"},
+                "sp.cfg_active_branch": "cfg_text" if role == "cfg_follower_sp_leader" else None,
+                "sp.cfg_branch_roles": ["cfg_text"],
+                "sp.cfg_branch_past_key_values": {
+                    "cfg_text": SimpleNamespace(key_cache=[torch.tensor([2.0])]),
+                }
+                if role == "cfg_follower_sp_leader"
+                else {},
+            }
+            if role == "cfg_follower_sp_leader":
+                cfg_payload["sp.cfg_text_past_key_values"] = SimpleNamespace(key_cache=[torch.tensor([2.0])])
+
+            cfg_group = _MockBroadcastGroup(world_size=2, rank_in_group=cfg_rank, recv_value=cfg_payload)
+            sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=sp_rank, broadcast_value=cfg_payload)
+            mgr.receive_multi_kv_cache = MagicMock(return_value=True)
+
+        with (
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
+                return_value=cfg_rank,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=cfg_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
+                return_value=sp_rank,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
+        ):
+            assert mgr.receive_multi_kv_cache_distributed(req) is True
+
+        # Verify behavior based on role
+        if role == "owner":
+            mgr.receive_multi_kv_cache.assert_called_once()
+            assert mgr.receive_multi_kv_cache.call_args.args[2] == torch.device("cpu")
+            assert [dst for dst, _ in cfg_group.send_calls] == [1]
+            assert cfg_group.send_calls[0][1]["sp.cfg_active_branch"] == "cfg_text"
+            assert len(sp_group.broadcast_calls) == 1
+            assert sp_group.broadcast_calls[0][1] == 0
+        elif role == "cfg_follower_sp_leader":
+            mgr.receive_multi_kv_cache.assert_not_called()
+            assert cfg_group.recv_calls == [0]
+            assert len(sp_group.broadcast_calls) == 1
+            assert sp_group.broadcast_calls[0][1] == 0
+            assert req.sampling_params.cfg_active_branch == "cfg_text"
+            assert torch.equal(
+                req.sampling_params.cfg_branch_past_key_values["cfg_text"].key_cache[0],
+                torch.tensor([2.0]),
+            )
+        else:  # sp_follower
+            mgr.receive_multi_kv_cache.assert_not_called()
+            assert cfg_group.recv_calls == []
+            assert cfg_group.send_calls == []
+            assert len(sp_group.broadcast_calls) == 1
+            assert torch.equal(req.past_key_values.key_cache[0], torch.tensor([1.0]))
+            assert req.kv_metadata == {"source": "main"}
+
+    @pytest.mark.parametrize(
+        "has_cfg,cfg_size",
+        [
+            (False, 1),  # SP-only: owner receive failure
+            (True, 2),  # CFG+SP: owner receive failure with deadlock prevention
+        ],
+    )
+    def test_owner_receive_failure_scenarios(self, has_cfg, cfg_size):
+        """Test receive failure handling in SP-only and CFG+SP scenarios."""
+        mgr = _make_manager(from_tp=2, to_tp=4, local_rank=0)
+        req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
+        world_group = _MockBroadcastGroup(world_size=4 if not has_cfg else 8, rank_in_group=0)
+        cfg_group = _MockBroadcastGroup(world_size=2, rank_in_group=0) if has_cfg else None
+        sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=0, broadcast_value=None)
+
+        mgr.receive_multi_kv_cache = MagicMock(return_value=False)
+        with (
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_world_size",
+                return_value=cfg_size,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=cfg_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
+        ):
+            assert mgr.receive_multi_kv_cache_distributed(req) is False
+
+        # Owner attempted to receive but failed
+        mgr.receive_multi_kv_cache.assert_called_once()
+        # SP broadcast still called but with None
+        assert len(sp_group.broadcast_calls) == 1
+        assert sp_group.broadcast_calls[0][0] is None
+
+        # CFG+SP: owner must send None to cfg followers to prevent deadlock
+        if has_cfg:
+            assert len(cfg_group.send_calls) == 1
+            assert cfg_group.send_calls[0] == (1, None)
 
 
 # ── TP auto-detect ───────────────────────────────────────────────────

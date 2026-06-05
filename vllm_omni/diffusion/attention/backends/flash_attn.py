@@ -11,6 +11,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
+from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
 )
@@ -136,7 +137,9 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         batch_size, q_len = query.size()[:2]
-        cu_seqlens = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
+        k_len = key.size(1)
+        cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
+        cu_seqlens_k = torch.arange(0, (batch_size + 1) * k_len, step=k_len, dtype=torch.int32, device=query.device)
         # b s ... -> (b s) ...
         query = query.flatten(0, 1)
         key = key.flatten(0, 1)
@@ -146,10 +149,10 @@ class FlashAttentionImpl(AttentionImpl):
             q=query,
             k=key,
             v=value,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=q_len,
-            max_seqlen_k=q_len,
+            max_seqlen_k=k_len,
             causal=self.causal,
             softmax_scale=self.softmax_scale,
         )
@@ -307,6 +310,13 @@ class FlashAttentionImpl(AttentionImpl):
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
+
+        # NPU aclnnFlashAttentionScore requires mask shape to be one of:
+        # [B, N, Sq, Skv], [B, 1, Sq, Skv], [1, 1, Sq, Skv], or [Sq, Skv]
+        # But the incoming mask is 2D [B, S] — reshape to [B, 1, 1, S]
+        # So reuse SDPA's mask reshape logic: [B, S] -> [B, 1, Sq, Skv]
+        attention_mask = _maybe_reshape_attn_mask(query, key, attention_mask, mask_mode="full_qk")
+
         layout = self.qkv_layout or "BNSD"
         return attention_forward(
             query,

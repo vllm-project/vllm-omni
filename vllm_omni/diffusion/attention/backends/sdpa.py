@@ -30,10 +30,6 @@ def _maybe_reshape_attn_mask(
       - broadcast_k: [batch_size, 1, 1, seq_len_k]
       - full_qk: [batch_size, 1, seq_len_q, seq_len_k]
     """
-    # Skip Attention Mask if all values are 1, `None` mask can speedup the computation
-    if attn_mask is not None and torch.all(attn_mask != 0):
-        attn_mask = None
-
     # Reshape Attention Mask
     # 2D [batch_size, seq_len_k] mask only.
     if (
@@ -89,6 +85,7 @@ class SDPAImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.requires_gqa = num_heads != num_kv_heads
         if backend_kwargs:
             logger.warning("SDPAImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
@@ -115,6 +112,7 @@ class SDPAImpl(AttentionImpl):
             dropout_p=0.0,
             is_causal=self.causal,
             scale=self.softmax_scale,
+            enable_gqa=self.requires_gqa,
         )
         out = output.permute(0, 2, 1, 3)
         return out

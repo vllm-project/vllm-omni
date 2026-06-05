@@ -239,6 +239,7 @@ data/
 datasets/
 *.csv
 *.json
+!tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 *.jsonl
 *.parquet
@@ -269,3 +270,6 @@ vllm_omni/_version.py
 .worktrees/
 # CI overlay yamls materialized from tests/utils.py:_CI_OVERLAYS at test time
 tests/.ci_generated/
+
+# Local Lance precision-matching dump scripts (not part of the repo)
+lance_compare/

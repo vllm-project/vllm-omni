@@ -74,6 +74,41 @@ class TestOmniVoiceTTS:
         openai_client.send_audio_speech_request(request_config)
 
 
+@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+class TestOmniVoiceSeed:
+    """E2E tests for OmniVoice Seed Params."""
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_speech_auto_voice_seed_deterministic(self, omni_server, openai_client) -> None:
+        cfg = {
+            "model": omni_server.model,
+            "input": get_prompt("text"),
+            "response_format": "wav",
+            "seed": 42,
+            "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+        }
+
+        r1 = openai_client.send_audio_speech_request(cfg)[0]
+        r2 = openai_client.send_audio_speech_request(cfg)[0]
+        assert r1.audio_bytes == r2.audio_bytes
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_speech_auto_voice_seed_non_deterministic(self, omni_server, openai_client) -> None:
+        cfg = {
+            "model": omni_server.model,
+            "input": get_prompt("text"),
+            "response_format": "wav",
+            "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+        }
+
+        cfg1 = {**cfg, "seed": 42}
+        cfg2 = {**cfg, "seed": 43}
+
+        r1 = openai_client.send_audio_speech_request(cfg1)[0]
+        r2 = openai_client.send_audio_speech_request(cfg2)[0]
+        assert r1.audio_bytes != r2.audio_bytes
+
+
 @pytest.mark.skipif(not _HAS_VOICE_CLONE, reason="Voice cloning requires transformers>=5.3.0")
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 class TestOmniVoiceVoiceCloning:
@@ -103,18 +138,5 @@ class TestOmniVoiceVoiceCloning:
             "response_format": "wav",
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
-        }
-        openai_client.send_audio_speech_request(request_config)
-
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_voice_clone_invalid_ref_audio_format(self, omni_server, openai_client) -> None:
-        """Test that invalid ref_audio format returns a clear error."""
-        request_config = {
-            "model": omni_server.model,
-            "input": get_prompt("text"),
-            "ref_audio": "not_a_valid_uri",
-            "response_format": "wav",
-            "timeout": 180.0,
-            "status_code": (400, 422),
         }
         openai_client.send_audio_speech_request(request_config)

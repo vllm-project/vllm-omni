@@ -141,6 +141,16 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
+    "LancePipeline": (
+        "lance",
+        "pipeline_lance",
+        "LancePipeline",
+    ),
+    "MingImagePipeline": (
+        "ming_flash_omni",
+        "pipeline_ming_imagegen",
+        "MingImagePipeline",
+    ),
     "InternVLAA1Pipeline": (
         "internvla_a1",
         "pipeline_internvla_a1",
@@ -266,10 +276,25 @@ _DIFFUSION_MODELS = {
         "pipeline_omnivoice",
         "OmniVoicePipeline",
     ),
+    "Cosmos3OmniDiffusersPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3",
+        "Cosmos3OmniDiffusersPipeline",
+    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
         "DiffusersAdapterPipeline",
+    ),
+    "HiDreamImagePipeline": (
+        "hidream_image",
+        "pipeline_hidream_image",
+        "HiDreamImagePipeline",
+    ),
+    "DreamZeroPipeline": (
+        "dreamzero",
+        "pipeline_dreamzero",
+        "DreamZeroPipeline",
     ),
 }
 
@@ -287,7 +312,6 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
-    "SenseNovaU1Pipeline",
     "AudioXPipeline",
 }
 
@@ -472,6 +496,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
+    "LancePipeline": "get_lance_post_process_func",
+    "MingImagePipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
@@ -494,6 +520,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
+    "HiDreamImagePipeline": "get_hidream_image_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -519,6 +547,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "MicroWorldT2WPipeline": "get_micro_world_t2w_pre_process_func",
     "MicroWorldI2WPipeline": "get_micro_world_i2w_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
 }
 
 

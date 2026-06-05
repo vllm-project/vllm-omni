@@ -47,6 +47,7 @@ class OmniTensorPrefixCache:
         self.mm_outputs_cache = {}
         self.mm_cache_keys = set()
         self._new_req_cache_hit_ids: set[str] = set()
+        self._deferred_mm_outputs: dict[str, dict[str, list[tuple[int, torch.Tensor]]]] = {}
 
     def maybe_init_missing_mm_cache_keys(self, multimodal_outputs: dict, seq_len: int):
         """Given multimodal outputs from executing the model, dynamically
@@ -62,7 +63,17 @@ class OmniTensorPrefixCache:
         determined by the warmup.
         """
         for key, val in multimodal_outputs.items():
-            if isinstance(val, torch.Tensor) and val.shape[0] == seq_len and key not in self.mm_cache_keys:
+            # Only cache per-token feature tensors: 2D+ with first dim == seq_len.
+            # A 1D tensor of shape (seq_len,) is a broadcast scalar (per-request
+            # metadata such as ref_code_len / codec_streaming), not per-token data;
+            # caching it by slot causes a shape mismatch when a later request has a
+            # different scheduled seq length.
+            if (
+                isinstance(val, torch.Tensor)
+                and val.ndim >= 2
+                and val.shape[0] == seq_len
+                and key not in self.mm_cache_keys
+            ):
                 feat_dim = val.shape[-1]
                 self.mm_outputs_cache[key] = self._get_cache_tensor(
                     dtype=val.dtype,
@@ -89,10 +100,43 @@ class OmniTensorPrefixCache:
         """Clears the cache hit IDs to prepare for a new engine step."""
         self._new_req_cache_hit_ids.clear()
 
+    def has_prefix_cached_new_req_ids(self) -> bool:
+        """Return True when this step contains a newly scheduled prefix hit."""
+        return bool(self._new_req_cache_hit_ids)
+
     @staticmethod
     def _coerce_to_cpu_tensor(maybe_gpu_tensor: torch.Tensor) -> torch.Tensor:
         """Convert GPU tensors -> contiguous CPU tensors if needed."""
         return maybe_gpu_tensor.detach().cpu().contiguous()
+
+    @staticmethod
+    def _resolve_hidden_states_cpu(
+        hidden_states: torch.Tensor,
+        num_tokens: int,
+        hidden_states_cpu: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if hidden_states_cpu is None:
+            return OmniTensorPrefixCache._coerce_to_cpu_tensor(hidden_states[:num_tokens])
+        if hidden_states_cpu.device.type != "cpu":
+            raise RuntimeError("hidden_states_cpu must be a CPU tensor.")
+        if not hidden_states_cpu.is_contiguous():
+            raise RuntimeError("hidden_states_cpu must be contiguous.")
+        if hidden_states_cpu.dtype != hidden_states.dtype:
+            raise RuntimeError(
+                "hidden_states_cpu has an incompatible dtype: "
+                f"got {hidden_states_cpu.dtype}, expected {hidden_states.dtype}."
+            )
+        if hidden_states_cpu.shape[1:] != hidden_states.shape[1:]:
+            raise RuntimeError(
+                "hidden_states_cpu has an incompatible feature shape: "
+                f"got {tuple(hidden_states_cpu.shape[1:])}, expected {tuple(hidden_states.shape[1:])}."
+            )
+        if hidden_states_cpu.shape[0] < num_tokens:
+            raise RuntimeError(
+                "hidden_states_cpu does not cover the requested hidden states "
+                f"slice: got {hidden_states_cpu.shape[0]} tokens, need {num_tokens}."
+            )
+        return hidden_states_cpu[:num_tokens]
 
     def update_omni_tensor_prefix_cache(
         self,
@@ -101,6 +145,8 @@ class OmniTensorPrefixCache:
         num_tokens_unpadded: int,
         slot_mapping: torch.Tensor,
         num_tokens_padded: int | None = None,
+        skip_mm_cache_keys: set[str] | None = None,
+        hidden_states_cpu: torch.Tensor | None = None,
     ):
         """Updates the hidden cache state for the provided hidden states and multimodal outputs.
 
@@ -110,16 +156,23 @@ class OmniTensorPrefixCache:
             num_tokens_unpadded: Number of tokens without padding
             slot_mapping: Slot mapping for the input sequence
             num_tokens_padded: Total number of tokens including padding
+            skip_mm_cache_keys: Multimodal keys whose CPU cache writes are deferred
+            hidden_states_cpu: Optional pre-staged CPU view of hidden_states.
+                When provided, it must be contiguous, live on CPU, match the
+                feature shape of hidden_states, and cover num_tokens_unpadded.
         """
         unpadded_slot_mapping = slot_mapping[:num_tokens_unpadded]
         if num_tokens_padded is None:
             num_tokens_padded = num_tokens_unpadded
+        skip_mm_cache_keys = skip_mm_cache_keys or set()
 
         if hidden_states is not None:
             # Slice to unpadded portion before caching
-            hidden_states = hidden_states[:num_tokens_unpadded]
-            # Ensure that hidden states are on the CPU
-            hidden_states = OmniTensorPrefixCache._coerce_to_cpu_tensor(hidden_states)
+            hidden_states = OmniTensorPrefixCache._resolve_hidden_states_cpu(
+                hidden_states,
+                num_tokens_unpadded,
+                hidden_states_cpu,
+            )
             # View the cache as 2D so that we can treat our slots as row indices
             flat_cache = self.hidden_states_cache.view(-1, self.hidden_states_cache.shape[-1])
             flat_cache[unpadded_slot_mapping] = hidden_states
@@ -136,12 +189,173 @@ class OmniTensorPrefixCache:
 
             for mm_out_key, mm_cache in self.mm_outputs_cache.items():
                 if mm_out_key in multimodal_outputs:
+                    if mm_out_key in skip_mm_cache_keys:
+                        continue
                     # Slice to unpadded portion before caching
                     mm_state = multimodal_outputs[mm_out_key][:num_tokens_unpadded]
                     mm_state = OmniTensorPrefixCache._coerce_to_cpu_tensor(mm_state)
                     flat_cache = mm_cache.view(-1, mm_cache.shape[-1])
                     flat_cache[unpadded_slot_mapping] = mm_state
             logger.debug("Writing to mm output cache for %s tokens", num_tokens_unpadded)
+
+    def stage_deferred_mm_outputs(
+        self,
+        query_start_loc: torch.Tensor,
+        input_batch: InputBatch,
+        multimodal_outputs: dict[str, torch.Tensor] | None,
+        num_scheduled_tokens: dict[str, int],
+        deferred_mm_cache_keys: set[str],
+    ) -> None:
+        """Keep GPU multimodal chunks until a request finishes.
+
+        The normal prefix-cache write path copies every cached multimodal tensor
+        to CPU on every step.  For model outputs that are only needed by future
+        full-block prefix hits, we can keep detached GPU chunks and materialize
+        the CPU cache once when the request completes.
+        """
+        if not multimodal_outputs or not deferred_mm_cache_keys:
+            return
+
+        for mm_key in deferred_mm_cache_keys:
+            mm_state = multimodal_outputs.get(mm_key)
+            if not isinstance(mm_state, torch.Tensor) or mm_state.ndim < 2:
+                continue
+            for req_id in input_batch.req_ids:
+                req_idx = input_batch.req_id_to_index[req_id]
+                sched = int(num_scheduled_tokens.get(req_id, 0))
+                if sched <= 0:
+                    continue
+                start = int(query_start_loc[req_idx])
+                end = start + sched
+                if start >= int(mm_state.shape[0]):
+                    continue
+                end = min(end, int(mm_state.shape[0]))
+                if end <= start:
+                    continue
+
+                computed_end = int(input_batch.num_computed_tokens_cpu[req_idx])
+                token_start = max(0, computed_end - sched)
+                chunk = mm_state[start:end].detach()
+                self._deferred_mm_outputs.setdefault(req_id, {}).setdefault(mm_key, []).append((token_start, chunk))
+
+    def commit_deferred_mm_outputs(
+        self,
+        finished_req_ids: set[str] | list[str],
+        input_batch: InputBatch,
+    ) -> None:
+        """Write deferred multimodal chunks into the CPU prefix cache.
+
+        This must run before finished requests are removed from ``input_batch``,
+        because the block table is needed to map logical token positions to KV
+        cache slots.
+        """
+        if not finished_req_ids or not self._deferred_mm_outputs:
+            return
+
+        for req_id in tuple(finished_req_ids):
+            per_key = self._deferred_mm_outputs.pop(req_id, None)
+            if not per_key:
+                continue
+            req_idx = input_batch.req_id_to_index.get(req_id)
+            if req_idx is None:
+                continue
+            for mm_key, chunks in per_key.items():
+                self._commit_deferred_mm_key(req_idx, input_batch, mm_key, chunks)
+
+    def discard_deferred_mm_outputs(self, req_id: str) -> None:
+        """Drop deferred chunks for requests that leave without a cache commit."""
+        self._deferred_mm_outputs.pop(req_id, None)
+
+    def _commit_deferred_mm_key(
+        self,
+        req_idx: int,
+        input_batch: InputBatch,
+        mm_key: str,
+        chunks: list[tuple[int, torch.Tensor]],
+    ) -> None:
+        if not chunks:
+            return
+
+        chunks = sorted(chunks, key=lambda item: item[0])
+        first_start = chunks[0][0]
+        expected_start = first_start
+        tensors: list[torch.Tensor] = []
+        for token_start, tensor in chunks:
+            if tensor.numel() == 0:
+                continue
+            if token_start != expected_start:
+                if tensors:
+                    self._write_deferred_mm_tensor(req_idx, input_batch, mm_key, tensors, first_start)
+                first_start = token_start
+                expected_start = token_start
+                tensors = []
+            tensors.append(tensor)
+            expected_start += int(tensor.shape[0])
+
+        if tensors:
+            self._write_deferred_mm_tensor(req_idx, input_batch, mm_key, tensors, first_start)
+
+    def _write_deferred_mm_tensor(
+        self,
+        req_idx: int,
+        input_batch: InputBatch,
+        mm_key: str,
+        tensors: list[torch.Tensor],
+        token_start: int,
+    ) -> None:
+        mm_state = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+        if mm_state.ndim < 2 or mm_state.shape[0] == 0:
+            return
+
+        if mm_key not in self.mm_cache_keys:
+            self.mm_outputs_cache[mm_key] = self._get_cache_tensor(
+                dtype=mm_state.dtype,
+                hidden_size=int(mm_state.shape[-1]),
+            )
+            self.mm_cache_keys.add(mm_key)
+            logger.info(
+                "Initializing deferred multimodal output cache of size %s for key: %s",
+                list(self.mm_outputs_cache[mm_key].shape),
+                mm_key,
+            )
+
+        slots = self._get_slot_ids_for_token_range(
+            req_idx=req_idx,
+            input_batch=input_batch,
+            token_start=token_start,
+            num_tokens=int(mm_state.shape[0]),
+        )
+        if slots.numel() == 0:
+            return
+
+        mm_state_cpu = OmniTensorPrefixCache._coerce_to_cpu_tensor(mm_state[: slots.numel()])
+        mm_cache = self.mm_outputs_cache[mm_key]
+        flat_cache = mm_cache.view(-1, mm_cache.shape[-1])
+        flat_cache[slots] = mm_state_cpu
+
+    def _get_slot_ids_for_token_range(
+        self,
+        req_idx: int,
+        input_batch: InputBatch,
+        token_start: int,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        if num_tokens <= 0:
+            return torch.empty((0,), dtype=torch.long)
+
+        block_table = input_batch.block_table[0].block_table.cpu
+        token_positions = torch.arange(token_start, token_start + num_tokens, dtype=torch.long)
+        block_offsets = token_positions // self.block_size
+        max_blocks = int(block_table.shape[1])
+        valid = block_offsets < max_blocks
+        if not bool(valid.all()):
+            token_positions = token_positions[valid]
+            block_offsets = block_offsets[valid]
+        if token_positions.numel() == 0:
+            return torch.empty((0,), dtype=torch.long)
+
+        block_ids = block_table[req_idx, block_offsets].to(torch.long)
+        return block_ids * self.block_size + (token_positions % self.block_size)
 
     def _coerce_to_payload_dict(
         self,
@@ -151,17 +365,25 @@ class OmniTensorPrefixCache:
         num_scheduled_tokens: dict[str, int],
     ) -> dict[str, object]:
         """Build the multimodal passthrough data per request for
-        the object under consideration. This is identical to the case
-        for no prefix cache when we tensor does have a first dimension
-        matching the seq len.
+        the object under consideration. This mirrors the no-prefix-cache
+        path: a tensor whose first dimension matches the total scheduled
+        token count is sliced per request, so 1D (seq_len,) metadata that
+        is intentionally not cached (e.g. ref_code_len, codec_streaming)
+        is still split per request instead of leaking the whole batch.
         """
+        total_scheduled_tokens = sum(int(num_scheduled_tokens[r]) for r in input_batch.req_ids)
         elem_dict = {}
         for req_id in input_batch.req_ids:
             req_idx = input_batch.req_id_to_index[req_id]
             start = query_start_loc[req_idx]
             end = start + num_scheduled_tokens[req_id]
             elem_dict[req_id] = to_payload_element(
-                element, req_idx, start=start, end=end, pass_lists_through=True, seq_len=None
+                element,
+                req_idx,
+                start=start,
+                end=end,
+                pass_lists_through=True,
+                seq_len=total_scheduled_tokens,
             )
         return elem_dict
 
@@ -201,11 +423,27 @@ class OmniTensorPrefixCache:
             )
         return combined_multimodal_outputs
 
-    def get_merged_hidden_states(self, *args, **kwargs) -> dict[str, torch.Tensor]:
-        """Get the merged hidden states."""
+    def get_merged_hidden_states(
+        self,
+        query_start_loc: torch.Tensor,
+        input_batch: InputBatch,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: dict[str, int],
+        hidden_states_cpu: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Get merged hidden states, optionally reusing pre-staged CPU states.
+
+        When provided, hidden_states_cpu follows the same contract as
+        update_omni_tensor_prefix_cache: CPU, contiguous, same dtype and feature
+        shape as hidden_states, and covering every scheduled-token span derived
+        from query_start_loc and num_scheduled_tokens.
+        """
         return self._get_merged_tensors(
-            *args,
-            **kwargs,
+            query_start_loc=query_start_loc,
+            input_batch=input_batch,
+            hidden_states=hidden_states,
+            num_scheduled_tokens=num_scheduled_tokens,
+            staged_cpu_tensor=hidden_states_cpu,
             cache=self.hidden_states_cache,
         )
 
@@ -216,12 +454,14 @@ class OmniTensorPrefixCache:
         cache: torch.Tensor,
         hidden_states: torch.Tensor,
         num_scheduled_tokens: dict[str, int],
+        staged_cpu_tensor: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """When hidden state caching is enabled, takes the input hidden_states,
         which only correspond to the scheduled tokens, and returns a mapping
         from request IDs to their full hidden states. This is accomplished by
         looking up the block IDs & scheduled token counts to split the
-        hidden_states.
+        hidden_states. staged_cpu_tensor can supply the already materialized CPU
+        scheduled-token view; None preserves the legacy per-call CPU conversion.
         """
         # We do not support hybrid caches at the moment.
         if len(input_batch.block_table.block_tables) > 1:
@@ -231,7 +471,17 @@ class OmniTensorPrefixCache:
             )
 
         combined_hidden_states = {}
-        hidden_states = OmniTensorPrefixCache._coerce_to_cpu_tensor(hidden_states)
+        required_tokens = 0
+        for req_id in input_batch.req_ids:
+            req_idx = input_batch.req_id_to_index[req_id]
+            start = query_start_loc[req_idx]
+            end = start + num_scheduled_tokens[req_id]
+            required_tokens = max(required_tokens, int(end))
+        hidden_states = OmniTensorPrefixCache._resolve_hidden_states_cpu(
+            hidden_states,
+            required_tokens,
+            staged_cpu_tensor,
+        )
         for req_id in input_batch.req_ids:
             req_idx = input_batch.req_id_to_index[req_id]
 

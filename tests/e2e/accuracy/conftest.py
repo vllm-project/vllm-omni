@@ -62,6 +62,19 @@ def pytest_addoption(parser):
         default=1200,
         help="Online serving timeout in seconds for Wan2.2 I2V accuracy tests.",
     )
+    group.addoption(
+        "--hunyuanvideo15-i2v-image-source",
+        action="store",
+        default=None,
+        help="Image source for HunyuanVideo-1.5 I2V accuracy tests. Can be local path or remote URL",
+    )
+    group.addoption(
+        "--hunyuanvideo15-online-timeout-seconds",
+        action="store",
+        type=int,
+        default=3600,
+        help="Online serving timeout in seconds for HunyuanVideo-1.5 accuracy tests.",
+    )
 
 
 def _hf_cache_root() -> Path:
@@ -169,6 +182,17 @@ def wan22_i2v_online_timeout_seconds(request: pytest.FixtureRequest) -> int:
 
 
 @pytest.fixture(scope="session")
+def hunyuanvideo15_i2v_image_source(request: pytest.FixtureRequest) -> str | None:
+    value = request.config.getoption("hunyuanvideo15_i2v_image_source")
+    return str(value) if value else None
+
+
+@pytest.fixture(scope="session")
+def hunyuanvideo15_online_timeout_seconds(request: pytest.FixtureRequest) -> int:
+    return int(request.config.getoption("hunyuanvideo15_online_timeout_seconds"))
+
+
+@pytest.fixture(scope="session")
 def gebench_samples_per_type(request: pytest.FixtureRequest) -> int:
     return int(request.config.getoption("gebench_samples_per_type"))
 
@@ -182,6 +206,12 @@ def gedit_samples_per_group(request: pytest.FixtureRequest) -> int:
 def accuracy_artifact_root() -> Path:
     root = Path(__file__).resolve().parent / "artifacts"
     root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+@pytest.fixture(scope="session")
+def accuracy_assets_root() -> Path:
+    root = Path(__file__).resolve().parent / "assets"
     return root
 
 

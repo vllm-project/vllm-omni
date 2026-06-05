@@ -31,11 +31,12 @@ import torchvision.transforms as T
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -484,11 +485,44 @@ def _optimized_scale(positive_flat, negative_flat):
 
 
 # ---------------------------------------------------------------------------
+# Gen-only FP8 wrapper
+# ---------------------------------------------------------------------------
+
+
+class _GenOnlyQuantConfig:
+    """Wraps an inner QuantizationConfig so only ``*_mot_gen`` layers are quantized.
+
+    SenseNova-U1 uses Mixture-of-Tokenizers with duplicate weights per layer:
+    understanding path (``qkv_proj``, ``mlp``) and generation path
+    (``qkv_proj_mot_gen``, ``mlp_mot_gen``).  The RFC requires FP8 only on the
+    gen-path GEMMs during denoising; und-path layers stay in BF16.
+
+    This is *not* a full ``QuantizationConfig`` subclass — it only needs to
+    satisfy the duck-typed interface that ``LinearBase.__init__`` uses:
+    ``get_quant_method(layer, prefix)``.  The outer registry and weight-loader
+    still operate on the original config stored in ``od_config.quantization_config``.
+    """
+
+    def __init__(self, inner: QuantizationConfig):
+        self._inner = inner
+
+    def get_quant_method(self, layer, prefix: str = ""):
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+        if "mot_gen" in prefix:
+            return self._inner.get_quant_method(layer, prefix)
+        return UnquantizedLinearMethod()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
 
-class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelineProfilerMixin):
+class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
     """SenseNova-U1 text-to-image and image-to-image pipeline for vllm-omni.
 
     Builds the full model graph internally:
@@ -549,9 +583,15 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
         self.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.img_start_token_id = self.tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
 
-        # Language model (TP-aware)
+        # Language model (TP-aware).
+        # Wrap quant_config so only gen-path (mot_gen) layers are quantized;
+        # understanding-path layers stay in BF16.
+        quant_config = od_config.quantization_config
+        if quant_config is not None:
+            quant_config = _GenOnlyQuantConfig(quant_config)
         self.language_model = SenseNovaU1ForCausalLM(
             self.llm_cfg,
+            quant_config=quant_config,
             prefix="language_model",
         )
 
@@ -707,7 +747,17 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
         return out.past_key_values, out.hidden_states
 
     def _t2i_predict_v(
-        self, input_embeds, indexes_image, attn_mask, past_key_values, t, z, image_token_num, image_size=None, **_kw
+        self,
+        input_embeds,
+        indexes_image,
+        attn_mask,
+        past_key_values,
+        t,
+        z,
+        image_token_num,
+        image_size=None,
+        cache_dit_skip=False,
+        **_kw,
     ):
         B, L = z.shape[0], z.shape[1]
         outputs = self.language_model(
@@ -719,6 +769,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
             attention_mask=attn_mask,
             past_key_values=past_key_values,
             update_cache=False,
+            cache_dit_skip=cache_dit_skip,
             use_cache=True,
             compute_logits=False,
         )
@@ -1066,6 +1117,13 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
         kv_cond = caches["cond"]
         idx_cond = caches["idx_cond"]
         mask_cond = caches["mask_cond"]
+        is_it2i = "img_cond" in caches
+        if is_it2i:
+            use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
+            needs_cfg = not (p.cfg_scale == 1 and p.img_cfg_scale == 1)
+            has_cached_partner = use_cfg and needs_cfg
+        else:
+            has_cached_partner = t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1
 
         out_cond = self._t2i_predict_v(
             image_embeds,
@@ -1076,9 +1134,9 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
             z,
             image_token_num=ns.token_h * ns.token_w,
             image_size=p.image_size,
+            cache_dit_skip=not has_cached_partner,
         )
 
-        is_it2i = "img_cond" in caches
         if is_it2i:
             return self._denoise_step_it2i(out_cond, image_embeds, ns, t, z, caches, p, step_i)
         return self._denoise_step_t2i(out_cond, image_embeds, ns, t, z, caches, p, step_i)
@@ -1153,6 +1211,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
                 caches["img_cond"],
                 t,
                 z,
+                cache_dit_skip=True,
                 **predict_kw,
             )
             out_uncond = self._t2i_predict_v(

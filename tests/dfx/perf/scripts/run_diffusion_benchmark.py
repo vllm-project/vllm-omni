@@ -5,16 +5,17 @@ This runner separates two concepts:
 
 1. ``server_type``: how the serving process is started.
    Currently only ``vllm-omni`` is supported here.
-2. ``benchmark_backend``: which serving API the benchmark client calls.
-   Examples: ``vllm-omni`` for ``/v1/chat/completions`` and ``v1/videos``
-   for async video jobs.
+2. ``benchmark_endpoint``: which serving API the benchmark client calls.
+   Examples: ``/v1/chat/completions`` and ``/v1/videos``.
 
 A config JSON file is REQUIRED via --test-config-file:
   pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
+Optional: ``--assert-baseline`` compares metrics to the ``baseline`` block in each benchmark entry (default: off).
+
 All benchmark results for a session are consolidated into a single JSON file under
 BENCHMARK_RESULT_DIR (override via the DIFFUSION_BENCHMARK_DIR environment variable).
-Each entry in the file contains the test metadata (test_name, backend, benchmark_params,
+Each entry in the file contains the test metadata (test_name, endpoint, benchmark_params,
 timestamp) together with the raw metrics returned by the benchmark script.
 """
 
@@ -33,10 +34,78 @@ from typing import Any, cast
 import psutil
 import pytest
 
+from benchmarks.diffusion.backends import endpoint_filename_token, normalize_endpoint
+
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ.setdefault("DIFFUSION_ATTENTION_BACKEND", "FLASH_ATTN")
+
+
+# ---------------------------------------------------------------------------
+# Inline field processing
+# ---------------------------------------------------------------------------
+def _process_inline_fields(obj: Any, parent_key: str = "") -> None:
+    """Recursively process '*-inline' fields into temp files."""
+
+    if isinstance(obj, list):
+        for item in obj:
+            _process_inline_fields(item, parent_key)
+        return
+
+    if not isinstance(obj, dict):
+        return
+
+    import atexit
+
+    import yaml
+
+    for key in list(obj.keys()):
+        value = obj[key]
+
+        if not key.endswith("-inline"):
+            _process_inline_fields(value, key)
+            continue
+
+        base_key = key[:-7]
+        full_key = f"{parent_key}.{key}" if parent_key else key
+
+        try:
+            if not isinstance(value, dict):
+                raise ValueError("must be a dict")
+
+            file_type = value.get("type")
+            content = value.get("content")
+
+            if file_type not in {"yaml", "jsonl"}:
+                raise ValueError(f"invalid type: {file_type}")
+
+            fd, path = tempfile.mkstemp(
+                suffix=f".{file_type}",
+                prefix=f"{base_key}_",
+            )
+
+            atexit.register(Path(path).unlink, missing_ok=True)
+
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                if file_type == "jsonl":
+                    items = content if isinstance(content, list) else [content]
+                    f.writelines(json.dumps(x, ensure_ascii=False) + "\n" for x in items)
+                else:
+                    yaml.dump(
+                        content,
+                        f,
+                        allow_unicode=True,
+                        sort_keys=False,
+                        indent=2,
+                    )
+
+            obj[base_key] = path
+            del obj[key]
+
+        except Exception as e:
+            print(f"Warning: failed processing '{full_key}': {e}")
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -99,11 +168,14 @@ def _resolve_refs(configs: list[dict[str, Any]], config_dir: Path) -> list[dict[
 
 
 def load_configs(config_path: str) -> list[dict[str, Any]]:
+    """Load benchmark configs from JSON file and process inline fields."""
     try:
         abs_path = Path(config_path).resolve()
         with open(abs_path, encoding="utf-8") as f:
             configs = json.load(f)
-        return _resolve_refs(configs, abs_path.parent)
+        configs = _resolve_refs(configs, abs_path.parent)
+        _process_inline_fields(configs)
+        return configs
     except json.JSONDecodeError as e:
         raise ValueError(f"JSON parsing error: {str(e)}")
     except FileNotFoundError:
@@ -151,8 +223,12 @@ def _get_open_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_for_port(host: str, port: int, timeout: int = 1200) -> None:
-    """Block until the given host:port accepts connections or timeout expires."""
+def _wait_for_port(host: str, port: int, timeout: int = 1200, proc: subprocess.Popen | None = None) -> None:
+    """Block until the given host:port accepts connections or timeout expires.
+
+    If *proc* is provided, also monitors the process; raises RuntimeError
+    immediately if the server process exits before the port becomes available.
+    """
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -162,6 +238,10 @@ def _wait_for_port(host: str, port: int, timeout: int = 1200) -> None:
                     return
         except Exception:
             pass
+        if proc is not None:
+            ret = proc.poll()
+            if ret is not None:
+                raise RuntimeError(f"Server process exited with code {ret} before port {host}:{port} became ready")
         time.sleep(2)
     raise RuntimeError(f"Server did not start on {host}:{port} within {timeout}s")
 
@@ -259,7 +339,7 @@ class DiffusionServer:
             env=env,
             cwd=str(Path(__file__).parent.parent.parent.parent),
         )
-        _wait_for_port(self.host, self.port)
+        _wait_for_port(self.host, self.port, proc=self.proc)
         print(f"DiffusionServer ready on {self.host}:{self.port}")
 
     def __enter__(self):
@@ -400,7 +480,7 @@ def _unique_server_params(configs: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "model": cfg["server_params"]["model"],
                 "serve_args_dict": serve_args_dict,
                 "serve_args": _build_serve_args(serve_args_dict),
-                "benchmark_backend": cfg.get("benchmark_backend"),
+                "benchmark_endpoint": cfg.get("benchmark_endpoint", cfg.get("benchmark_backend")),
                 "server_params": cfg["server_params"],
             }
         )
@@ -482,7 +562,7 @@ def run_benchmark(
     model: str,
     params: dict[str, Any],
     test_name: str,
-    backend: str = "vllm-omni",
+    endpoint: str = "/v1/chat/completions",
     server_cfg: dict[str, Any] | None = None,
     source_file: str = "",
 ) -> dict[str, Any]:
@@ -490,18 +570,19 @@ def run_benchmark(
 
     The raw metrics are written to a temporary file by the subprocess.  After
     the run completes the metrics are merged with full metadata (test_name,
-    backend, benchmark_params, timestamp, flat reporting fields) and appended
+    endpoint, benchmark_params, timestamp, flat reporting fields) and appended
     to the session-wide aggregated JSON file (AGGREGATED_RESULT_FILE).  The
     temporary file is removed afterwards.  Subprocess stdout/stderr are tee'd
     to a .log file under BENCHMARK_RESULT_DIR/logs/; its path is stored in
     the record.
     """
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    endpoint = normalize_endpoint(endpoint)
 
     log_dir = BENCHMARK_RESULT_DIR / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    backend_label = backend.replace("/", "_")
-    log_file = log_dir / f"{test_name}_{backend_label}_{timestamp}.log"
+    endpoint_label = endpoint_filename_token(endpoint)
+    log_file = log_dir / f"{test_name}_{endpoint_label}_{timestamp}.log"
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="diffusion_bench_tmp_", delete=False) as tmp:
         tmp_result_file = Path(tmp.name)
@@ -517,8 +598,8 @@ def run_benchmark(
         str(port),
         "--model",
         model,
-        "--backend",
-        backend,
+        "--endpoint",
+        endpoint,
         "--dataset",
         params.get("dataset", "random"),
         "--task",
@@ -545,7 +626,7 @@ def run_benchmark(
     # cause truncated or out-of-order log output when stdout is piped).
     cmd = [cmd[0], "-u"] + cmd[1:]
 
-    print(f"\nRunning benchmark (backend={backend}): {' '.join(cmd)}")
+    print(f"\nRunning benchmark (endpoint={endpoint}): {' '.join(cmd)}")
     print(f"  Log file: {log_file}")
 
     # Redirect stdout + stderr directly to the log file at the OS level
@@ -597,7 +678,7 @@ def run_benchmark(
 
     record: dict[str, Any] = {
         "test_name": test_name,
-        "backend": backend,
+        "endpoint": endpoint,
         "timestamp": timestamp,
         "server_params": server_cfg.get("server_params"),
         "benchmark_params": params,
@@ -605,7 +686,7 @@ def run_benchmark(
         "log_file": str(log_file),
         "Model": model,
         "Framework": server_type,
-        "API Backend": backend,
+        "API Endpoint": endpoint,
         "Hardware": "",
         "Deployment": "",
         "Task": params.get("task", "t2i"),
@@ -650,40 +731,191 @@ def run_benchmark(
 # ---------------------------------------------------------------------------
 
 
-def assert_result(result: dict[str, Any], params: dict[str, Any]) -> None:
+def _resolve_baseline_value(
+    baseline_raw: Any,
+    *,
+    sweep_index: int | None,
+    max_concurrency: Any = None,
+    request_rate: Any = None,
+) -> Any:
+    """Pick the baseline threshold for this sweep step."""
+    if baseline_raw is None:
+        return 100000
+    if isinstance(baseline_raw, dict):
+        if max_concurrency is not None:
+            for key in (max_concurrency, str(max_concurrency)):
+                if key in baseline_raw:
+                    return baseline_raw[key]
+        if request_rate is not None:
+            for key in (request_rate, str(request_rate)):
+                if key in baseline_raw:
+                    return baseline_raw[key]
+        raise KeyError(
+            f"baseline dict has no key for max_concurrency={max_concurrency!r} "
+            f"or request_rate={request_rate!r}; keys={list(baseline_raw.keys())!r}"
+        )
+    if isinstance(baseline_raw, (list, tuple)):
+        if sweep_index is None:
+            raise ValueError("sweep_index is required when baseline is a list or tuple")
+        return baseline_raw[sweep_index]
+    return baseline_raw
+
+
+def assert_result(
+    result: dict[str, Any],
+    params: dict[str, Any],
+    num_prompts: int,
+    *,
+    sweep_index: int | None = None,
+    max_concurrency: Any = None,
+    request_rate: Any = None,
+    assert_baseline: bool = True,
+) -> None:
     """Assert that benchmark metrics satisfy the configured baselines."""
-    num_prompts = params.get("num-prompts", 10)
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
 
+    if not assert_baseline:
+        return
     if params.get("skip-performance-assertion", False):
         print("Skipping performance assertions.")
         return
 
-    for metric, threshold in params.get("baseline", {}).items():
+    for metric, baseline_raw in params.get("baseline", {}).items():
         current = result.get(metric)
         assert current is not None, f"Metric '{metric}' not found in result: {list(result.keys())}"
+        threshold = _resolve_baseline_value(
+            baseline_raw,
+            sweep_index=sweep_index,
+            max_concurrency=max_concurrency,
+            request_rate=request_rate,
+        )
         if "throughput" in metric:
             assert current >= threshold, f"{metric}: {current:.4f} < baseline {threshold}"
         else:
             assert current <= threshold, f"{metric}: {current:.4f} > baseline {threshold}"
 
 
-def _default_benchmark_backend_for_task(task: str) -> str:
-    """Return the default client-side benchmark backend for a diffusion task."""
+def _default_benchmark_endpoint_for_task(task: str) -> str:
+    """Return the default client-side benchmark endpoint for a diffusion task."""
     if task in {"t2v", "i2v", "ti2v"}:
-        return "v1/videos"
+        return "/v1/videos"
     if task in {"t2i", "i2i", "ti2i"}:
-        return "vllm-omni"
-    raise ValueError(f"Unsupported task for benchmark backend resolution: {task}")
+        return "/v1/chat/completions"
+    raise ValueError(f"Unsupported task for benchmark endpoint resolution: {task}")
 
 
-def _resolve_benchmark_backend(server_cfg: dict[str, Any], params: dict[str, Any]) -> str:
+def _resolve_benchmark_endpoint(server_cfg: dict[str, Any], params: dict[str, Any]) -> str:
     """Resolve which serving API the benchmark client should call."""
-    configured = server_cfg.get("benchmark_backend")
+    configured = server_cfg.get("benchmark_endpoint")
     if configured:
-        return cast(str, configured)
-    return _default_benchmark_backend_for_task(cast(str, params.get("task", "t2i")))
+        return normalize_endpoint(cast(str, configured))
+    return _default_benchmark_endpoint_for_task(cast(str, params.get("task", "t2i")))
+
+
+def _to_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    return [value] if not isinstance(value, (list, tuple)) else list(value)
+
+
+def _build_run_params(
+    params: dict[str, Any],
+    *,
+    num_prompts: int,
+    sweep_index: int | None = None,
+    request_rate: Any | None = None,
+    max_concurrency: Any | None = None,
+) -> dict[str, Any]:
+    run_params = {
+        key: value for key, value in params.items() if key not in {"request-rate", "max-concurrency", "num-prompts"}
+    }
+    run_params["num-prompts"] = num_prompts
+    if request_rate is not None:
+        run_params["request-rate"] = request_rate
+    if max_concurrency is not None:
+        run_params["max-concurrency"] = max_concurrency
+    if "baseline" in params:
+        run_params["baseline"] = {
+            metric: _resolve_baseline_value(
+                baseline_raw,
+                sweep_index=sweep_index,
+                max_concurrency=max_concurrency,
+                request_rate=request_rate,
+            )
+            for metric, baseline_raw in params["baseline"].items()
+        }
+    return run_params
+
+
+def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
+    request_rate_list = _to_list(params.get("request-rate"))
+    num_prompt_list = _to_list(params.get("num-prompts", 10))
+    max_concurrency_list = _to_list(params.get("max-concurrency"))
+
+    max_len = max(len(request_rate_list), len(max_concurrency_list))
+    if len(num_prompt_list) == 1 and max_len > 1:
+        num_prompt_list = num_prompt_list * max_len
+    elif max_len == 1 and len(num_prompt_list) > 1:
+        if len(request_rate_list) == 1:
+            request_rate_list = request_rate_list * len(num_prompt_list)
+        if len(max_concurrency_list) == 1:
+            max_concurrency_list = max_concurrency_list * len(num_prompt_list)
+        max_len = max(len(request_rate_list), len(max_concurrency_list))
+    elif len(num_prompt_list) != max_len and max_len > 0:
+        raise ValueError("The number of prompts does not match the request-rate or max-concurrency")
+
+    sweep_runs: list[dict[str, Any]] = []
+
+    for i, (request_rate, num_prompts) in enumerate(zip(request_rate_list, num_prompt_list)):
+        sweep_runs.append(
+            {
+                "params": _build_run_params(
+                    params,
+                    request_rate=request_rate,
+                    num_prompts=num_prompts,
+                    sweep_index=i,
+                ),
+                "num_prompts": num_prompts,
+                "sweep_index": i,
+                "request_rate": request_rate,
+                "max_concurrency": None,
+            }
+        )
+
+    for i, (max_concurrency, num_prompts) in enumerate(zip(max_concurrency_list, num_prompt_list)):
+        sweep_runs.append(
+            {
+                "params": _build_run_params(
+                    params,
+                    max_concurrency=max_concurrency,
+                    num_prompts=num_prompts,
+                    sweep_index=i,
+                    request_rate="inf",
+                ),
+                "num_prompts": num_prompts,
+                "sweep_index": i,
+                "request_rate": None,
+                "max_concurrency": max_concurrency,
+            }
+        )
+
+    if not sweep_runs:
+        default_num_prompts = num_prompt_list[0]
+        sweep_runs.append(
+            {
+                "params": _build_run_params(
+                    params,
+                    num_prompts=default_num_prompts,
+                ),
+                "num_prompts": default_num_prompts,
+                "sweep_index": None,
+                "request_rate": None,
+                "max_concurrency": None,
+            }
+        )
+
+    return sweep_runs
 
 
 # ---------------------------------------------------------------------------
@@ -697,49 +929,59 @@ def _resolve_benchmark_backend(server_cfg: dict[str, Any], params: dict[str, Any
     indirect=True,
 )
 @pytest.mark.parametrize("benchmark_params", benchmark_indices, indirect=True)
-def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
-    """Run the diffusion performance benchmark and assert against baselines.
+def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, request):
+    """Run the diffusion performance benchmark and verify request completion.
 
     One server is started per unique parallel configuration (module scope).
     For each server, all benchmark parameter sets defined in the config JSON
-    are executed sequentially; results are asserted against the baselines.
+    are executed sequentially; metrics are recorded to the aggregated result file.
 
-    Tracked metrics:
-        - throughput_qps          (higher is better)
-        - latency_p50, latency_p99 (lower is better)
+    Pass ``--assert-baseline`` to compare ``throughput_qps``, ``latency_mean``, etc. to the JSON ``baseline`` block.
     """
     test_name = benchmark_params["test_name"]
     params = benchmark_params["params"]
     server_cfg = getattr(diffusion_server, "server_cfg", {})
-    backend = _resolve_benchmark_backend(server_cfg, params)
+    sweep_runs = _iter_sweep_runs(params)
 
-    result = run_benchmark(
-        host=diffusion_server.host,
-        port=diffusion_server.port,
-        model=diffusion_server.model,
-        params=params,
-        test_name=test_name,
-        backend=backend,
-        server_cfg=server_cfg,
-        source_file=cast(str, CONFIG_FILE_PATH),
-    )
+    for sweep_run in sweep_runs:
+        endpoint = _resolve_benchmark_endpoint(server_cfg, sweep_run["params"])
+        result = run_benchmark(
+            host=diffusion_server.host,
+            port=diffusion_server.port,
+            model=diffusion_server.model,
+            params=sweep_run["params"],
+            test_name=test_name,
+            endpoint=endpoint,
+            server_cfg=server_cfg,
+            source_file=cast(str, CONFIG_FILE_PATH),
+        )
 
-    print(f"\n{'=' * 60}")
-    print(f"Results for {test_name} (server={diffusion_server.server_type}, backend={backend}):")
-    for key in (
-        "throughput_qps",
-        "latency_mean",
-        "latency_median",
-        "latency_p50",
-        "latency_p99",
-        "peak_memory_mb_max",
-        "peak_memory_mb_mean",
-        "peak_memory_mb_median",
-    ):
-        if key in result:
-            print(f"  {key}: {result[key]:.4f}")
+        print(f"\n{'=' * 60}")
+        print(f"Results for {test_name} (server={diffusion_server.server_type}, endpoint={endpoint}):")
+        for key in (
+            "throughput_qps",
+            "latency_mean",
+            "latency_median",
+            "latency_p50",
+            "latency_p99",
+            "peak_memory_mb_max",
+            "peak_memory_mb_mean",
+            "peak_memory_mb_median",
+        ):
+            if key in result:
+                print(f"  {key}: {result[key]:.4f}")
 
-    print(f"\n  Aggregated results: {AGGREGATED_RESULT_FILE}")
-    print("=" * 60)
+        print(f"\n  Aggregated results: {AGGREGATED_RESULT_FILE}")
+        print("=" * 60)
 
-    assert_result(result, params)
+        assert_baseline = request.config.getoption("--assert-baseline", default=False)
+
+        assert_result(
+            result,
+            params,
+            sweep_run["num_prompts"],
+            sweep_index=sweep_run["sweep_index"],
+            max_concurrency=sweep_run["max_concurrency"],
+            request_rate=sweep_run["request_rate"],
+            assert_baseline=assert_baseline,
+        )

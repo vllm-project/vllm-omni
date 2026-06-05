@@ -6,11 +6,13 @@ End-to-end tests for the unified quantization framework (PR #1764).
 Validates FP8 quantization works correctly for all supported model types:
   - Single-stage diffusion models (FLUX.1-dev, Qwen-Image, Z-Image-Turbo)
   - Multi-stage models (BAGEL: LLM + Diffusion)
+  - MoT gen-only models (SenseNova-U1: gen-path FP8, und-path BF16)
 
 Tests verify:
   1. FP8 quantization produces valid images
   2. Memory usage is lower than BF16 baseline
   3. Multi-stage models only quantize the diffusion stage (not the LLM stage)
+  4. MoT models only quantize gen-path layers (mot_gen)
 
 Usage:
     # Run all FP8 quantization tests
@@ -107,6 +109,85 @@ def _generate_single_stage_image(
             peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
         return images, peak_mem
+
+
+def _generate_single_stage_video(
+    model: str,
+    quantization: str | None = None,
+    height: int = 256,
+    width: int = 256,
+    num_frames: int = 25,
+    num_inference_steps: int = 8,
+    guidance_scale: float = 4.0,
+    seed: int = 42,
+    prompt: str = "A serene lakeside sunrise with mist over the water",
+    **extra_omni_kwargs: Any,
+) -> tuple[int, float]:
+    """Generate a t2v output with a single-stage diffusion model.
+
+    Returns (num_frames_produced, peak_memory_gib)
+    """
+    omni_kwargs: dict[str, Any] = dict(extra_omni_kwargs)
+    if quantization:
+        omni_kwargs["quantization"] = quantization
+
+    with OmniRunner(model, **omni_kwargs) as runner:
+        torch.accelerator.reset_peak_memory_stats()
+
+        generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
+        outputs = runner.omni.generate(
+            {"prompt": prompt, "negative_prompt": ""},
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+            ),
+        )
+
+        first = outputs[0]
+
+        # Unwrap pipeline-style outputs (multi-stage / OmniRequestOutput.request_output).
+        frames: Any = None
+        if hasattr(first, "request_output") and isinstance(first.request_output, list):
+            inner = first.request_output[0]
+            if isinstance(inner, OmniRequestOutput) and inner.images:
+                frames = inner.images[0]
+        if frames is None and hasattr(first, "images") and first.images:
+            frames = first.images[0]
+        assert frames is not None, "No video frames returned from generate()"
+
+        # LTX-2 (audio+video) may surface (video, audio) tuples or {"video": ...} dicts.
+        if isinstance(frames, dict):
+            frames = frames.get("video") or frames.get("frames")
+        elif isinstance(frames, tuple) and len(frames) == 2:
+            frames = frames[0]
+        assert frames is not None, "Could not extract video frames from output"
+
+        if isinstance(frames, torch.Tensor):
+            video = frames.detach().cpu()
+            if video.dim() == 5:
+                video = video[0]
+            if video.dim() == 4 and video.shape[0] in (3, 4):
+                video = video.permute(1, 2, 3, 0)
+            num_frames_produced = int(video.shape[0])
+        else:
+            import numpy as np
+
+            arr = np.asarray(frames)
+            if arr.ndim == 5:
+                arr = arr[0]
+            num_frames_produced = int(arr.shape[0])
+
+        peak_mem_mb = getattr(first, "peak_memory_mb", None)
+        if peak_mem_mb:
+            peak_mem = float(peak_mem_mb) / 1024.0
+        else:
+            peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
+
+        return num_frames_produced, peak_mem
 
 
 def _generate_bagel_image(
@@ -277,6 +358,25 @@ def test_single_stage_flux_fp8_uses_less_memory():
     assert mem_fp8 < mem_bf16, f"FP8 ({mem_fp8:.2f} GiB) should use less memory than BF16 ({mem_bf16:.2f} GiB)"
 
 
+@hardware_test(res={"cuda": "H100"})
+def test_single_stage_ltx2_fp8_uses_less_memory():
+    """FP8 should use less peak memory than BF16 for LTX-2."""
+    _, mem_bf16 = _generate_single_stage_video(
+        model="Lightricks/LTX-2",
+        quantization=None,
+    )
+    torch.accelerator.empty_cache()
+
+    _, mem_fp8 = _generate_single_stage_video(
+        model="Lightricks/LTX-2",
+        quantization="fp8",
+    )
+
+    print(f"LTX-2 BF16 peak memory: {mem_bf16:.2f} GiB")
+    print(f"LTX-2 FP8 peak memory:  {mem_fp8:.2f} GiB")
+    assert mem_fp8 < mem_bf16, f"FP8 ({mem_fp8:.2f} GiB) should use less memory than BF16 ({mem_bf16:.2f} GiB)"
+
+
 # ─── Multi-stage model tests (BAGEL) ─────────────────────────────────────────
 
 
@@ -338,3 +438,92 @@ def test_single_stage_quantization_config_key():
         quantization_config="fp8",
     )
     assert len(images) >= 1
+
+
+# ─── SenseNova-U1 gen-only FP8 tests ─────────────────────────────────────────
+
+_SENSENOVA_MODEL = "SenseNova/SenseNova-U1-8B-MoT"
+
+
+def _generate_sensenova_u1_image(
+    quantization_config: str | None = None,
+    num_inference_steps: int = 20,
+) -> tuple[Any, float]:
+    """Generate an image with SenseNova-U1 (single-stage MoT, gen-only FP8).
+
+    Returns (generated_image, peak_memory_gib).
+    """
+    omni_kwargs: dict[str, Any] = {}
+    if quantization_config:
+        omni_kwargs["quantization_config"] = quantization_config
+
+    with OmniRunner(_SENSENOVA_MODEL, **omni_kwargs) as runner:
+        torch.accelerator.reset_peak_memory_stats()
+
+        sampling_params = OmniDiffusionSamplingParams(
+            height=1024,
+            width=1024,
+            seed=42,
+            num_inference_steps=num_inference_steps,
+            extra_args={
+                "cfg_scale": 4.0,
+                "cfg_norm": "none",
+                "timestep_shift": 3.0,
+            },
+        )
+        omni_outputs = list(
+            runner.omni.generate(
+                prompts={"prompt": "A cat sitting on a windowsill", "modalities": ["image"]},
+                sampling_params_list=sampling_params,
+            )
+        )
+
+        peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
+
+        generated_image = None
+        for req_output in omni_outputs:
+            if images := getattr(req_output, "images", None):
+                generated_image = images[0]
+                break
+
+        assert generated_image is not None, "No images generated from SenseNova-U1"
+        assert generated_image.size == (1024, 1024), f"Expected 1024x1024, got {generated_image.size}"
+
+        return generated_image, peak_mem
+
+
+@hardware_test(res={"cuda": "H100"})
+def test_sensenova_u1_fp8_generates_image():
+    """SenseNova-U1 with gen-only FP8 generates a valid image.
+
+    FP8 is applied only to gen-path (mot_gen) layers; understanding-path
+    layers stay in BF16.
+    """
+    image, _ = _generate_sensenova_u1_image(quantization_config="fp8")
+    image.save("test_sensenova_u1_fp8.png")
+
+
+@hardware_test(res={"cuda": "H100"})
+def test_sensenova_u1_bf16_generates_image():
+    """SenseNova-U1 without quantization generates a valid image (baseline)."""
+    image, _ = _generate_sensenova_u1_image(quantization_config=None)
+    image.save("test_sensenova_u1_bf16.png")
+
+
+@hardware_test(res={"cuda": "H100"})
+def test_sensenova_u1_fp8_uses_less_memory():
+    """Gen-only FP8 should use less peak memory than BF16 for SenseNova-U1."""
+    _, mem_bf16 = _generate_sensenova_u1_image(
+        quantization_config=None,
+        num_inference_steps=10,
+    )
+    torch.accelerator.empty_cache()
+
+    _, mem_fp8 = _generate_sensenova_u1_image(
+        quantization_config="fp8",
+        num_inference_steps=10,
+    )
+
+    print(f"SenseNova-U1 BF16 peak memory: {mem_bf16:.2f} GiB")
+    print(f"SenseNova-U1 FP8  peak memory: {mem_fp8:.2f} GiB")
+    assert mem_fp8 < mem_bf16, f"FP8 ({mem_fp8:.2f} GiB) should use less memory than BF16 ({mem_bf16:.2f} GiB)"

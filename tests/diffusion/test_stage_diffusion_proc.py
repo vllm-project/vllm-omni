@@ -68,7 +68,7 @@ def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info():
 
         request = captured["request"]
         assert request.request_id == "req-parent"
-        assert request.request_ids == ["req-parent-0", "req-parent-1"]
+        assert not hasattr(request, "request_ids")
         assert request.kv_sender_info == {0: {"host": "10.0.0.2", "zmq_port": 50151}}
         assert result.request_id == "req-parent"
         assert result.images == ["img-1", "img-2"]
@@ -85,7 +85,7 @@ class MockOmniRequestOutput:
 BASE_HEIGHT = 512
 BASE_WIDTH = 512
 BASE_INFER_STEPS = 10
-DELAY_BASE = 2
+DELAY_BASE = 0.01
 
 
 class MockDiffusionEngine:
@@ -93,7 +93,7 @@ class MockDiffusionEngine:
         def simulate_step_delay(height, width, num_inference_steps) -> float:
             return (height / BASE_HEIGHT) * (width / BASE_WIDTH) * (num_inference_steps / BASE_INFER_STEPS)
 
-        DELAY_BASE = 2
+        DELAY_BASE = 0.01
         delay_scale = simulate_step_delay(
             request.sampling_params.height, request.sampling_params.width, request.sampling_params.num_inference_steps
         )
@@ -139,7 +139,7 @@ async def test_proc_process_request_with_batching_async_output():
     assert len(results) == len(test_requests)
     base_time = DELAY_BASE
     time_gap_std = DELAY_BASE * 2 * 2 * 1  # height/width/steps infer time scale
-    eps = 0.5
+    eps = 0.1
     for i, (res, elapsed_time) in enumerate(results):
         assert res.request_id == test_requests[i]["request_id"]
         assert isinstance(res, MockOmniRequestOutput)
