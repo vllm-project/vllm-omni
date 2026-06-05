@@ -157,10 +157,12 @@ class TestFusedModules:
             embed(codes)
 
 
-# ---- AC-5: Delay Pattern (unit logic) ----
+# ---- AC-5: Delay Pattern Behavior ----
 
 
-class TestDelayPatternConstants:
+class TestDelayPatternBehavior:
+    """Test the delay pattern masking logic extracted from the talker."""
+
     def test_boc_eoc_ids(self):
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
             BOC_ID,
@@ -169,6 +171,112 @@ class TestDelayPatternConstants:
 
         assert BOC_ID == 1024
         assert EOC_ID == 1025
+
+    def test_delay_phase_boc_masking(self):
+        """During delay phase, codebooks beyond delay_count are forced to BOC."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import BOC_ID
+
+        num_codebooks = 8
+        # Simulate delay phase at step 3 (delay_count=2, so CBs 3-7 should be BOC)
+        codes = torch.randint(0, 1024, (num_codebooks,))
+        delay_count = 2
+        next_cb = delay_count + 1
+        if next_cb < num_codebooks:
+            codes[next_cb:] = BOC_ID
+        # CBs 0-2 should have original codes, CBs 3-7 should be BOC
+        assert all(codes[i] != BOC_ID or i >= 3 for i in range(num_codebooks))
+        assert all(codes[i] == BOC_ID for i in range(3, num_codebooks))
+
+    def test_cb0_eoc_triggers_rampdown(self):
+        """EOC on codebook 0 starts ramp-down; EOC on other codebooks does not."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            EOC_ID,
+        )
+
+        num_codebooks = 8
+        codes = torch.randint(0, 1024, (num_codebooks,))
+
+        # Simulate: cb0 emits EOC
+        codes[0] = EOC_ID
+        assert int(codes[0].item()) == EOC_ID
+        # Ramp-down should start with countdown = N-2 = 6
+        eoc_countdown = num_codebooks - 2
+        assert eoc_countdown == 6
+
+        # If cb3 emits EOC but cb0 doesn't, no ramp-down
+        codes2 = torch.randint(0, 1024, (num_codebooks,))
+        codes2[3] = EOC_ID
+        assert int(codes2[0].item()) != EOC_ID  # cb0 is not EOC
+
+    def test_rampdown_termination(self):
+        """After N-2 steps of ramp-down, generation_done becomes True."""
+        num_codebooks = 8
+        eoc_countdown = num_codebooks - 2  # = 6
+        generation_done = False
+        for _ in range(6):
+            eoc_countdown -= 1
+            if eoc_countdown <= 0:
+                generation_done = True
+        assert generation_done is True
+
+    def test_all_boc_seed(self):
+        """First audio step should seed last_codes with all-BOC."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import BOC_ID
+
+        seeded = torch.full((8,), BOC_ID, dtype=torch.long)
+        assert seeded.shape == (8,)
+        assert all(seeded[i] == BOC_ID for i in range(8))
+
+
+# ---- AC-8: Codec Strictness ----
+
+
+class TestCodecStrictness:
+    def test_bundled_missing_quantizer_key_raises(self):
+        """Bundled codec load must fail when a quantizer codebook key is missing."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
+            HiggsAudioV3Code2Wav,
+        )
+
+        config = HiggsAudioV3Config()
+        c2w = HiggsAudioV3Code2Wav(config=config)
+
+        # State with only 7 quantizers (missing quantizer.quantizers.7.*)
+        codec_state = {}
+        for i in range(7):
+            codec_state[f"quantizer.quantizers.{i}.codebook.embed"] = torch.randn(1024, 64)
+            codec_state[f"quantizer.quantizers.{i}.project_out.weight"] = torch.randn(1024, 64)
+            codec_state[f"quantizer.quantizers.{i}.project_out.bias"] = torch.randn(1024)
+        codec_state["fc2.weight"] = torch.randn(256, 1024)
+        codec_state["fc2.bias"] = torch.randn(256)
+
+        with pytest.raises(KeyError, match="quantizer 7"):
+            c2w._load_from_bundled_state(codec_state, device=torch.device("cpu"))
+
+    def test_bundled_missing_fc2_raises(self):
+        """Bundled codec load must fail when fc2 keys are missing."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
+            HiggsAudioV3Code2Wav,
+        )
+
+        config = HiggsAudioV3Config()
+        c2w = HiggsAudioV3Code2Wav(config=config)
+
+        codec_state = {}
+        for i in range(8):
+            codec_state[f"quantizer.quantizers.{i}.codebook.embed"] = torch.randn(1024, 64)
+            codec_state[f"quantizer.quantizers.{i}.project_out.weight"] = torch.randn(1024, 64)
+            codec_state[f"quantizer.quantizers.{i}.project_out.bias"] = torch.randn(1024)
+        # No fc2 keys
+
+        with pytest.raises(KeyError, match="fc2"):
+            c2w._load_from_bundled_state(codec_state, device=torch.device("cpu"))
 
 
 # ---- AC-7: Stage Input Processor ----

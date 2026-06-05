@@ -2,18 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration class for higgs-audio v3 (HiggsMultimodalQwen3) in vllm-omni.
 
-V3 uses a Qwen3 backbone (~4B, 36 layers, 2560 hidden, GQA 32/8) with
-fused multi-codebook embedding/head. No DualFFN. The audio codec is the
-same higgs-audio-v2-tokenizer (8 codebooks, 25fps, 24kHz DAC decoder).
-
-Special token resolution: ``resolve_special_tokens()`` reads the HF tokenizer
-from a model directory and populates ``tts_token_id``, ``text_token_id``,
-``audio_token_id`` (the continuation/output token), and ``eos_token_id`` so
-the talker's LM bias and prompt builder have concrete IDs.
+``HiggsAudioV3Config.from_pretrained(model_path)`` returns a config with
+``tts_token_id``, ``text_token_id``, ``audio_continuation_id``, and
+``eos_token_id`` already resolved from the checkpoint tokenizer. If the
+tokenizer is unavailable or missing required specials, the load raises.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -22,7 +19,11 @@ from transformers import PretrainedConfig
 
 __all__ = ["HiggsAudioV3Config"]
 
+logger = logging.getLogger(__name__)
+
 _QWEN3_ROPE_THETA = 1_000_000
+
+_REQUIRED_SPECIALS = ("<|tts|>", "<|text|>", "<|audio|>")
 
 
 def _build_text_config(raw: Any) -> PretrainedConfig:
@@ -39,8 +40,40 @@ def _build_text_config(raw: Any) -> PretrainedConfig:
     return cfg_cls(**cfg)
 
 
+def _resolve_model_dir(pretrained_model_name_or_path: str) -> str | None:
+    """Resolve a model name/path to a local directory containing tokenizer files."""
+    if os.path.isdir(pretrained_model_name_or_path):
+        return pretrained_model_name_or_path
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(repo_id=pretrained_model_name_or_path, filename="tokenizer_config.json")
+        if isinstance(cached, str) and os.path.isfile(cached):
+            return os.path.dirname(cached)
+    except Exception:
+        pass
+
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        safe = pretrained_model_name_or_path.replace("/", "--")
+        snapshots = os.path.join(HF_HUB_CACHE, f"models--{safe}", "snapshots")
+        if os.path.isdir(snapshots):
+            for rev in os.listdir(snapshots):
+                candidate = os.path.join(snapshots, rev)
+                if os.path.isfile(os.path.join(candidate, "tokenizer_config.json")):
+                    return candidate
+    except Exception:
+        pass
+    return None
+
+
 class HiggsAudioV3Config(PretrainedConfig):
-    """Typed config for higgs-audio v3 (HiggsMultimodalQwen3)."""
+    """Typed config for higgs-audio v3 (HiggsMultimodalQwen3).
+
+    ``from_pretrained()`` automatically resolves ``<|tts|>``, ``<|text|>``,
+    ``<|audio|>`` and ``eos_token_id`` from the checkpoint tokenizer.
+    """
 
     model_type: str = "higgs_multimodal_qwen3"
     is_composition = True
@@ -57,7 +90,6 @@ class HiggsAudioV3Config(PretrainedConfig):
         audio_stream_eos_id: int = 1025,
         sample_rate: int = 24000,
         frame_rate: int = 25,
-        # Resolved special token IDs (populated by resolve_special_tokens)
         tts_token_id: int | None = None,
         text_token_id: int | None = None,
         audio_continuation_id: int | None = None,
@@ -89,12 +121,30 @@ class HiggsAudioV3Config(PretrainedConfig):
         self.text_config = _build_text_config(text_config)
         self.audio_hidden_size = int(audio_encoder_config.get("out_dim", self.text_config.hidden_size))
 
-        # Resolved special token IDs — None until resolve_special_tokens() is called
         self.tts_token_id = tts_token_id
         self.text_token_id = text_token_id
         self.audio_continuation_id = audio_continuation_id
 
         super().__init__(**kwargs)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs: Any) -> HiggsAudioV3Config:
+        """Load config and resolve special token IDs from the checkpoint tokenizer.
+
+        Raises ``ValueError`` if the tokenizer is missing required specials
+        (``<|tts|>``, ``<|text|>``, ``<|audio|>``).
+        """
+        config = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+        model_dir = _resolve_model_dir(pretrained_model_name_or_path)
+        if model_dir is not None:
+            config.resolve_special_tokens(model_dir)
+        else:
+            logger.warning(
+                "HiggsAudioV3Config: could not resolve model directory for %s; special token IDs left unresolved.",
+                pretrained_model_name_or_path,
+            )
+        return config
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:
         del decoder
@@ -109,38 +159,27 @@ class HiggsAudioV3Config(PretrainedConfig):
         return self.text_config.hidden_size
 
     def resolve_special_tokens(self, model_path: str) -> None:
-        """Resolve <|tts|>, <|text|>, <|audio|> and eos token IDs from the HF tokenizer.
+        """Resolve <|tts|>, <|text|>, <|audio|> and eos from the HF tokenizer.
 
-        Call after ``from_pretrained()`` with the model directory or HF repo id.
-        Populates ``tts_token_id``, ``text_token_id``, ``audio_continuation_id``,
-        and ``eos_token_id`` on the config object.
+        Raises ``ValueError`` if any of the 3 required specials is missing
+        from the tokenizer's added vocabulary.
         """
-        if not model_path or not os.path.isdir(model_path):
-            # Try HF cache resolution
-            try:
-                from huggingface_hub import try_to_load_from_cache
+        from transformers import AutoTokenizer
 
-                cached = try_to_load_from_cache(repo_id=model_path, filename="tokenizer_config.json")
-                if isinstance(cached, str) and os.path.isfile(cached):
-                    model_path = os.path.dirname(cached)
-                else:
-                    return
-            except Exception:
-                return
-
-        try:
-            from transformers import AutoTokenizer
-
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        except Exception:
-            return
-
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         vocab = dict(tokenizer.get_added_vocab())
-        if "<|tts|>" in vocab:
-            self.tts_token_id = vocab["<|tts|>"]
-        if "<|text|>" in vocab:
-            self.text_token_id = vocab["<|text|>"]
-        if "<|audio|>" in vocab:
-            self.audio_continuation_id = vocab["<|audio|>"]
+
+        missing = [t for t in _REQUIRED_SPECIALS if t not in vocab]
+        if missing:
+            raise ValueError(
+                f"Tokenizer at {model_path} is missing required Higgs TTS v3 "
+                f"special tokens: {missing}. Available added tokens: "
+                f"{sorted(vocab.keys())[:20]}"
+            )
+
+        self.tts_token_id = vocab["<|tts|>"]
+        self.text_token_id = vocab["<|text|>"]
+        self.audio_continuation_id = vocab["<|audio|>"]
+
         if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
             self.eos_token_id = int(tokenizer.eos_token_id)

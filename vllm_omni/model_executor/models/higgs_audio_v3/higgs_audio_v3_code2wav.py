@@ -157,20 +157,15 @@ class HiggsAudioV3Code2Wav(nn.Module):
                     codec_state[stripped] = tensor
 
             if codec_state:
-                try:
-                    self._load_from_bundled_state(codec_state, device)
-                    logger.info(
-                        "Loaded HiggsAudioV3Code2Wav from bundled V3 checkpoint (%d codec keys consumed).",
-                        len(codec_state),
-                    )
-                    return {name for name, _ in self.named_parameters()}
-                except Exception as exc:
-                    logger.warning(
-                        "Bundled V3 codec loading failed (%s); falling back to standalone tokenizer repo.",
-                        exc,
-                    )
+                # Bundled keys found — load strictly, no fallback on error.
+                self._load_from_bundled_state(codec_state, device)
+                logger.info(
+                    "Loaded HiggsAudioV3Code2Wav from bundled V3 checkpoint (%d codec keys consumed).",
+                    len(codec_state),
+                )
+                return {name for name, _ in self.named_parameters()}
 
-            # Fallback: standalone tokenizer repo
+            # No bundled keys — fallback to standalone tokenizer repo
             if not self._loaded:
                 try:
                     self._load_from_tokenizer_repo()
@@ -222,37 +217,41 @@ class HiggsAudioV3Code2Wav(nn.Module):
                 f"Available keys (first 10): {list(codec_state.keys())[:10]}"
             )
         hidden_size = codec_state[proj_key].shape[0]
-        num_quantizers = sum(
-            1 for k in codec_state if k.startswith("quantizer.quantizers.") and k.endswith(".codebook.embed")
-        )
-        if num_quantizers == 0:
-            # Try .codebook.weight naming
-            num_quantizers = sum(
-                1 for k in codec_state if k.startswith("quantizer.quantizers.") and k.endswith(".codebook.weight")
-            )
         codebook_dim = 64
         codebook_size = 1024
+        required_quantizers = self.num_codebooks
 
-        # Build RVQ
+        # Build RVQ — require exactly num_codebooks quantizers
         quantizer = HiggsAudioRVQ(
-            num_quantizers=num_quantizers,
+            num_quantizers=required_quantizers,
             codebook_size=codebook_size,
             codebook_dim=codebook_dim,
             hidden_size=hidden_size,
         ).to(device)
-        for i in range(num_quantizers):
+        for i in range(required_quantizers):
             prefix = f"quantizer.quantizers.{i}"
+            # Require codebook weight
+            embed_key = None
             for key_suffix in [".codebook.embed", ".codebook.weight"]:
-                embed_key = f"{prefix}{key_suffix}"
-                if embed_key in codec_state:
-                    quantizer.quantizers[i].codebook.weight.data.copy_(codec_state[embed_key].to(device))
+                candidate = f"{prefix}{key_suffix}"
+                if candidate in codec_state:
+                    embed_key = candidate
                     break
+            if embed_key is None:
+                raise KeyError(
+                    f"Bundled codec missing codebook weight for quantizer {i}. "
+                    f"Expected {prefix}.codebook.embed or {prefix}.codebook.weight"
+                )
+            quantizer.quantizers[i].codebook.weight.data.copy_(codec_state[embed_key].to(device))
+            # Require projector weights
             proj_w = f"{prefix}.project_out.weight"
             proj_b = f"{prefix}.project_out.bias"
-            if proj_w in codec_state:
-                quantizer.quantizers[i].project_out.weight.data.copy_(codec_state[proj_w].to(device))
-            if proj_b in codec_state:
-                quantizer.quantizers[i].project_out.bias.data.copy_(codec_state[proj_b].to(device))
+            if proj_w not in codec_state:
+                raise KeyError(f"Bundled codec missing {proj_w}")
+            if proj_b not in codec_state:
+                raise KeyError(f"Bundled codec missing {proj_b}")
+            quantizer.quantizers[i].project_out.weight.data.copy_(codec_state[proj_w].to(device))
+            quantizer.quantizers[i].project_out.bias.data.copy_(codec_state[proj_b].to(device))
 
         # Build fc2
         fc2_w = codec_state.get("fc2.weight")
