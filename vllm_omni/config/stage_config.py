@@ -757,7 +757,11 @@ def _apply_platform_overrides(
             deploy.connectors = platform_connectors
         else:
             for conn_name, conn_val in platform_connectors.items():
-                if conn_name in deploy.connectors and isinstance(deploy.connectors[conn_name], dict) and isinstance(conn_val, dict):
+                if (
+                    conn_name in deploy.connectors
+                    and isinstance(deploy.connectors[conn_name], dict)
+                    and isinstance(conn_val, dict)
+                ):
                     base_extra = deploy.connectors[conn_name].get("extra", {})
                     override_extra = conn_val.get("extra", {})
                     merged = {**deploy.connectors[conn_name], **conn_val}
