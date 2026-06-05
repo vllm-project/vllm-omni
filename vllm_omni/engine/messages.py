@@ -24,7 +24,9 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     sampling_params_list: list[OmniSamplingParams]
     final_stage_id: int
     preprocess_ms: float
+    request_timestamp: float
     enqueue_ts: float
+    final_output_stage_ids: list[int] | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):

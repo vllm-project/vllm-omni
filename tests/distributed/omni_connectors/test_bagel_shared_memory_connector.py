@@ -24,14 +24,13 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.usefixtures("clean_gpu_memory_between_tests")]
 
 BAGEL_CI_DEPLOY = get_deploy_config_path("ci/bagel.yaml")
 
 # Reference pixel data extracted from the known-good output image
-# Generated with seed=52, num_inference_steps=15,
+# Generated with seed=52, num_inference_steps=14,
 # prompt='Change the grass color to red',
 # input image: 2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg
 REFERENCE_PIXELS = [
@@ -47,23 +46,10 @@ REFERENCE_PIXELS = [
     {"position": (256, 256), "rgb": (181, 201, 221)},
 ]
 
-if current_omni_platform.is_rocm():
-    REFERENCE_PIXELS = [
-        {"position": (100, 100), "rgb": (156, 172, 217)},
-        {"position": (400, 50), "rgb": (105, 144, 217)},
-        {"position": (700, 100), "rgb": (118, 159, 232)},
-        {"position": (150, 400), "rgb": (180, 22, 52)},
-        {"position": (512, 336), "rgb": (221, 211, 194)},
-        {"position": (700, 400), "rgb": (192, 10, 46)},
-        {"position": (100, 600), "rgb": (102, 12, 22)},
-        {"position": (400, 600), "rgb": (161, 28, 47)},
-        {"position": (700, 600), "rgb": (100, 87, 94)},
-        {"position": (256, 256), "rgb": (181, 201, 221)},
-    ]
 
 # text2img reference pixels (aligned with offline `bagel/end2end.py` text2img, 15 steps)
-# "Generated with seed=52, num_inference_steps=15,
-# prompt='A futuristic city skyline at twilight, cyberpunk style'"
+# "Generated with seed=52, num_inference_steps=14,
+# prompt='A cute cat'"
 TEXT2IMG_REFERENCE_PIXELS = [
     {"position": (100, 100), "rgb": (115, 113, 94)},
     {"position": (400, 50), "rgb": (159, 160, 144)},
@@ -77,19 +63,6 @@ TEXT2IMG_REFERENCE_PIXELS = [
     {"position": (256, 256), "rgb": (167, 156, 150)},
 ]
 
-if current_omni_platform.is_rocm():
-    TEXT2IMG_REFERENCE_PIXELS = [
-        {"position": (100, 100), "rgb": (115, 113, 94)},
-        {"position": (400, 50), "rgb": (159, 160, 144)},
-        {"position": (700, 100), "rgb": (164, 151, 123)},
-        {"position": (150, 400), "rgb": (120, 121, 107)},
-        {"position": (512, 512), "rgb": (165, 133, 127)},
-        {"position": (700, 400), "rgb": (217, 130, 66)},
-        {"position": (100, 700), "rgb": (191, 168, 152)},
-        {"position": (400, 700), "rgb": (130, 96, 77)},
-        {"position": (700, 700), "rgb": (247, 203, 140)},
-        {"position": (256, 256), "rgb": (167, 156, 150)},
-    ]
 
 PIXEL_TOLERANCE = 10
 TEXT2IMG_PIXEL_TOLERANCE = 5
@@ -115,7 +88,7 @@ def _find_free_port() -> int:
     return port
 
 
-def _configure_sampling_params(omni: Omni, num_inference_steps: int = 15) -> list:
+def _configure_sampling_params(omni: Omni, num_inference_steps: int = 14) -> list:
     """Configure sampling parameters for Bagel img2img generation.
 
     Args:
@@ -258,7 +231,6 @@ def _resolve_deploy_config(config_path: str, run_level: str) -> str:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@pytest.mark.skip(reason="Skip failed CI issue 3977: https://github.com/vllm-project/vllm-omni/issues/3977")
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_bagel_img2img_shared_memory_connector(run_level):
     """Test Bagel img2img with shared memory connector."""
@@ -276,7 +248,6 @@ def test_bagel_img2img_shared_memory_connector(run_level):
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@pytest.mark.skip(reason="Skip failed CI issue 3977: https://github.com/vllm-project/vllm-omni/issues/3977")
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_bagel_text2img_shared_memory_connector(run_level):
     """Test Bagel text2img with shared memory connector."""

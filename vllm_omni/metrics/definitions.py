@@ -11,6 +11,8 @@ time-bearing metrics use the ``_s`` suffix (values in seconds), counters use
 ``_total`` (auto-suffixed by the prometheus client), sizes use ``_bytes``.
 """
 
+from typing import Any
+
 # vllm:omni_ avoids upstream's unregister_vllm_metrics() stripping, which
 # removes every collector whose ``_name`` does not start with ``vllm``.
 METRIC_PREFIX = "vllm:omni_"
@@ -26,6 +28,78 @@ AUDIO_FRAMES = "audio_frames"
 AUDIO_UNDERRUN = "audio_underrun"
 AUDIO_CONTINUITY_OK = "audio_continuity_ok"
 AUDIO_SKIPPED_REQUESTS = "audio_skipped_requests"
+
+# Bench-side aggregate field names. Keep these centralized so new benchmark
+# metrics reuse the same vocabulary instead of inventing parallel spellings.
+MEAN_AUDIO_TTFP_MS = f"mean_{AUDIO_TTFP}_ms"
+MEDIAN_AUDIO_TTFP_MS = f"median_{AUDIO_TTFP}_ms"
+STD_AUDIO_TTFP_MS = f"std_{AUDIO_TTFP}_ms"
+PERCENTILES_AUDIO_TTFP_MS = f"percentiles_{AUDIO_TTFP}_ms"
+TOTAL_AUDIO_DURATION_S = f"total_{AUDIO_DURATION}_s"
+TOTAL_AUDIO_FRAMES = f"total_{AUDIO_FRAMES}"
+AUDIO_THROUGHPUT = "audio_throughput"
+MEAN_AUDIO_RTF = f"mean_{AUDIO_RTF}"
+MEDIAN_AUDIO_RTF = f"median_{AUDIO_RTF}"
+STD_AUDIO_RTF = f"std_{AUDIO_RTF}"
+PERCENTILES_AUDIO_RTF = f"percentiles_{AUDIO_RTF}"
+MEAN_AUDIO_DURATION_S = f"mean_{AUDIO_DURATION}_s"
+MEDIAN_AUDIO_DURATION_S = f"median_{AUDIO_DURATION}_s"
+STD_AUDIO_DURATION_S = f"std_{AUDIO_DURATION}_s"
+PERCENTILES_AUDIO_DURATION_S = f"percentiles_{AUDIO_DURATION}_s"
+MEAN_AUDIO_UNDERRUN_S = f"mean_{AUDIO_UNDERRUN}_s"
+MEDIAN_AUDIO_UNDERRUN_S = f"median_{AUDIO_UNDERRUN}_s"
+STD_AUDIO_UNDERRUN_S = f"std_{AUDIO_UNDERRUN}_s"
+PERCENTILES_AUDIO_UNDERRUN_S = f"percentiles_{AUDIO_UNDERRUN}_s"
+AUDIO_CONTINUITY_OK_RATE = f"{AUDIO_CONTINUITY_OK}_rate"
+
+IMAGE_COUNT = "image_count"
+IMAGE_GENERATION = "image_generation"
+IMAGE_GENERATION_TIME_MS = f"{IMAGE_GENERATION}_time_ms"
+IMAGE_PIXELS = "image_pixels"
+TOTAL_IMAGES = "total_images"
+IMAGE_THROUGHPUT = "image_throughput"
+AVERAGE_PIXELS_PER_IMAGE = "average_pixels_per_image"
+DENOISE_STEP_LATENCY = "denoise_step_latency"
+DENOISE_STEP_LATENCY_MS = f"{DENOISE_STEP_LATENCY}_ms"
+MEAN_DENOISE_STEP_LATENCY_MS = f"mean_{DENOISE_STEP_LATENCY}_ms"
+MEAN_IMAGE_GENERATION_MS = f"mean_{IMAGE_GENERATION}_ms"
+MEDIAN_IMAGE_GENERATION_MS = f"median_{IMAGE_GENERATION}_ms"
+STD_IMAGE_GENERATION_MS = f"std_{IMAGE_GENERATION}_ms"
+PERCENTILES_IMAGE_GENERATION_MS = f"percentiles_{IMAGE_GENERATION}_ms"
+
+# Stage snapshot / StageBenchmarkMetrics field names.
+TOTAL_OUTPUT = "total_output"
+TTFTS = "ttfts"
+TPOTS = "tpots"
+ITLS = "itls"
+VLLM_TTFTS = "vllm_ttfts"
+VLLM_TPOTS = "vllm_tpots"
+VLLM_ITLS = "vllm_itls"
+AUDIO_TTFPS = "audio_ttfps"
+AUDIO_RTFS = "audio_rtfs"
+AUDIO_DURATIONS = "audio_durations"
+MISSING_AUDIO_DURATION_COUNT = "missing_audio_duration_count"
+MISSING_AUDIO_RTF_COUNT = "missing_audio_rtf_count"
+STAGE_GEN_TIME = "stage_gen_time"
+STAGE_GEN_TIME_MS = f"{STAGE_GEN_TIME}_ms"
+STAGE_GEN_TIMES_MS = f"{STAGE_GEN_TIME}s_ms"
+POSTPROCESS_TIME = "postprocess_time"
+POSTPROCESS_TIME_MS = f"{POSTPROCESS_TIME}_ms"
+POSTPROCESS_TIMES_MS = f"{POSTPROCESS_TIME}s_ms"
+OUTPUT_UNIT_COUNT = "output_unit_count"
+SERVING_TIME_TO_FIRST_OUTPUT_MS = "serving_time_to_first_output_ms"
+SERVING_TIME_TO_FIRST_OUTPUTS_MS = "serving_time_to_first_outputs_ms"
+TIME_PER_OUTPUT_UNIT_MS = "time_per_output_unit_ms"
+TIME_PER_OUTPUT_UNITS_MS = "time_per_output_units_ms"
+INTER_OUTPUT_LATENCY_MS = "inter_output_latency_ms"
+INTER_OUTPUT_LATENCIES_MS = "inter_output_latencies_ms"
+VLLM_TTFT_MS = "vllm_ttft_ms"
+VLLM_TPOT_MS = "vllm_tpot_ms"
+VLLM_ITL_MS = "vllm_itl_ms"
+VLLM_ITLS_MS = "vllm_itls_ms"
+NUM_TOKENS_IN = "num_tokens_in"
+NUM_TOKENS_OUT = "num_tokens_out"
+AUDIO_SAMPLE_RATE = "audio_sample_rate"
 
 
 # ============================================================================
@@ -186,6 +260,16 @@ def compute_audio_rtf(stage_gen_time_s: float, audio_duration_s: float) -> float
     return stage_gen_time_s / audio_duration_s
 
 
+def compute_denoise_step_latency(stage_gen_time: float, num_inference_steps: int) -> float:
+    """Mean denoise step latency = image stage generation time / step count.
+
+    The returned value uses the same time unit as ``stage_gen_time``.
+    """
+    if num_inference_steps <= 0:
+        return 0.0
+    return stage_gen_time / float(num_inference_steps)
+
+
 # ============================================================================
 # Audio sample-rate resolution
 # ============================================================================
@@ -195,21 +279,22 @@ def compute_audio_rtf(stage_gen_time_s: float, audio_duration_s: float) -> float
 # at runtime so this default only kicks in when the field is missing.
 DEFAULT_AUDIO_SAMPLE_RATE = 24000
 
-_SAMPLE_RATE_KEYS = ("audio_sample_rate", "sample_rate", "sampling_rate", "sr")
+_SAMPLE_RATE_KEYS = ("output_sample_rate", "audio_sample_rate", "sample_rate", "sampling_rate", "sr")
 
 
-def resolve_audio_sample_rate(multimodal_output: dict | None) -> int:
-    """Extract audio sample_rate from a multimodal_output dict, with fallbacks.
+def resolve_audio_sample_rate(source: dict[str, Any] | Any | None) -> int:
+    """Extract audio sample_rate from a dict or config object, with fallbacks.
 
     Tries the same key chain as serving_chat.py's audio response path so
     /metrics audio_duration_s = audio_frames / sample_rate stays consistent
-    with what the OpenAI streaming endpoint reports back to clients.
+    with what the OpenAI streaming endpoint reports back to clients. Also
+    accepts config objects that expose the same values as attributes.
     Returns DEFAULT_AUDIO_SAMPLE_RATE when no usable value is present.
     """
-    if not multimodal_output:
+    if not source:
         return DEFAULT_AUDIO_SAMPLE_RATE
     for key in _SAMPLE_RATE_KEYS:
-        raw = multimodal_output.get(key)
+        raw = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
         if raw is None:
             continue
         try:

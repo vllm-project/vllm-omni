@@ -123,6 +123,7 @@ class StageRuntimeInfo:
     final_output: bool
     final_output_type: FinalOutputModalityType | None
     stage_type: str
+    model_stage: str | None = None
 
 
 # ============================================================================
@@ -1247,6 +1248,7 @@ class AsyncOmniEngine:
                     final_output=first_client.final_output,
                     final_output_type=first_client.final_output_type,
                     stage_type=first_client.stage_type,
+                    model_stage=getattr(first_client, "model_stage", None),
                 )
             )
 
@@ -1616,6 +1618,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         lora_request: Any = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -1628,6 +1631,7 @@ class AsyncOmniEngine:
         message_type: Literal["add_request", "streaming_update"] = "add_request",
     ) -> StageSubmissionMessage:
         """Build an add_request message after stage-0 preprocessing."""
+        request_timestamp = float(arrival_time) if arrival_time is not None else time.time()
         effective_sampling_params_list: list[OmniSamplingParams] = (
             list(cast(Sequence[OmniSamplingParams], sampling_params_list))
             if sampling_params_list is not None
@@ -1713,7 +1717,9 @@ class AsyncOmniEngine:
             output_prompt_text=output_prompt_text,
             sampling_params_list=effective_sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=list(final_output_stage_ids) if final_output_stage_ids is not None else None,
             preprocess_ms=_preprocess_ms,
+            request_timestamp=request_timestamp,
             enqueue_ts=time.perf_counter(),
         )
 
@@ -2186,6 +2192,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         lora_request: Any = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -2209,6 +2216,7 @@ class AsyncOmniEngine:
             prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
@@ -2236,6 +2244,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         lora_request: Any = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -2253,6 +2262,7 @@ class AsyncOmniEngine:
             prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
@@ -2270,6 +2280,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         *,
         resumable: bool = True,
@@ -2281,6 +2292,7 @@ class AsyncOmniEngine:
             prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             resumable=resumable,
             message_type="streaming_update",
@@ -2294,6 +2306,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         *,
         resumable: bool = True,
@@ -2305,6 +2318,7 @@ class AsyncOmniEngine:
             prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             resumable=resumable,
         )
