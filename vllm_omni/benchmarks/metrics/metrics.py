@@ -480,6 +480,23 @@ def _print_image_stage_metrics(
     )
 
 
+def _print_video_stage_metrics(
+    selected_percentiles: list[float],
+    sm: StageBenchmarkMetrics,
+) -> None:
+    video_num = getattr(sm, defs.OUTPUT_UNIT_COUNT) if getattr(sm, "output_unit_type") == "video" else 0
+    print("{s:{c}^{n}}".format(s=" Video Result ", n=50, c="="))
+    print("{:<40} {:<10}".format("Total videos generated:", video_num))
+    _print_percentile_metric(
+        "Video Generation",
+        "VIDEO_GENERATION",
+        getattr(sm, defs.STAGE_GEN_TIMES_MS),
+        selected_percentiles,
+        values_are_ms=True,
+        to_ms=True,
+    )
+
+
 def _print_internal_stream_stage_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
@@ -539,6 +556,7 @@ def print_stage_metrics(
         return
 
     if is_video_stage:
+        _print_video_stage_metrics(selected_percentiles, sm)
         return
 
     _print_stage_timing(sm, selected_percentiles)
