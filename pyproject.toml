@@ -65,7 +65,8 @@ dev = [
     "orjson>=3.11.7", # to make v1/embeddings API fast
     "voxcpm>=2.0.2", # for VoxCPM2 path-locating in tests
     "torchdiffeq>=0.2.5", # for covo_audio Test
-    "FlagEmbedding" # for hunyuan_image3 tests
+    "FlagEmbedding", # for hunyuan_image3 tests
+    "kernels<0.15.0" # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
 ]
 
 demo = [
