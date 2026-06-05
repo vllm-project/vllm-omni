@@ -577,6 +577,55 @@ def _build_full_codec_state() -> dict[str, torch.Tensor]:
     return state
 
 
+# ---- AC-2: Loader Required-Key Validation ----
+
+
+class TestLoaderRequiredKeys:
+    """Test exact required-key validation in load_weights."""
+
+    def test_build_required_keys_count(self):
+        """Required key set should have 1 text_emb + 36*11 layers + 1 norm + 1 modality = 399."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        keys = HiggsAudioV3TalkerForConditionalGeneration._build_required_keys(36)
+        assert len(keys) == 1 + 36 * 11 + 1 + 1  # text + layers + norm + modality = 399
+
+    def test_build_required_keys_contains_norm(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        keys = HiggsAudioV3TalkerForConditionalGeneration._build_required_keys(2)
+        assert "body.norm.weight" in keys
+
+    def test_build_required_keys_contains_layer_subkeys(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        keys = HiggsAudioV3TalkerForConditionalGeneration._build_required_keys(2)
+        assert "body.layers.0.self_attn.k_proj.weight" in keys
+        assert "body.layers.1.mlp.gate_proj.weight" in keys
+
+    def test_build_required_keys_contains_modality_embedding(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        keys = HiggsAudioV3TalkerForConditionalGeneration._build_required_keys(1)
+        assert "tied.embedding.modality_embeddings.0.embedding.weight" in keys
+
+    def test_build_required_keys_contains_text_embedding(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        keys = HiggsAudioV3TalkerForConditionalGeneration._build_required_keys(1)
+        assert "tied.embedding.text_embedding.weight" in keys
+
+
 # ---- AC-7: Stage Input Processor ----
 
 
