@@ -290,7 +290,6 @@ def llm2code2wav(
         code_final = code_final.tolist()
 
         # Truncate to Stage-1 max_model_len
-        MAX_CODE2WAV_TOKENS = 2048
         if len(code_final) > MAX_CODE2WAV_TOKENS:
             logger.warning(
                 "Truncating code2wav input from %d to %d tokens",

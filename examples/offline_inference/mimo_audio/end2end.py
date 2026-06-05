@@ -202,8 +202,6 @@ def main(args):
         top_k=-1,
         max_tokens=8192,
         seed=SEED,
-        logit_bias={},
-        repetition_penalty=1.1,
         stop=["<|eostm|>", "<|im_end|>"],
         stop_token_ids=[151671, 151645],  # <|eostm|>=151671, <|im_end|>=151645
     )
@@ -212,10 +210,8 @@ def main(args):
         temperature=0.0,
         top_p=1.0,
         top_k=-1,
-        max_tokens=4096 * 16,
+        max_tokens=18192,
         seed=SEED,
-        detokenize=True,
-        repetition_penalty=1.1,
     )
 
     sampling_params_list = [
@@ -259,9 +255,11 @@ def main(args):
     elif args.query_type == "audio_understanding_sft":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type audio_understanding_sft --text "Summarize the audio." --audio_path "./spoken_dialogue_assistant_turn_1.wav"
         query_result = query_func(text=text, audio_path=audio_path)
+        query_result["modalities"] = ["text"]
     elif args.query_type == "audio_understanding_sft_with_thinking":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type audio_understanding_sft_with_thinking --text "Summarize the audio." --audio_path "./spoken_dialogue_assistant_turn_1.wav"
         query_result = query_func(text=text, audio_path=audio_path, thinking=True)
+        query_result["modalities"] = ["text"]
     elif args.query_type == "spoken_dialogue_sft_multiturn":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type spoken_dialogue_sft_multiturn  --audio_path "./prompt_speech_zh_m.wav"
         first_turn_text_response = "我没办法获取实时的天气信息。不过呢，你可以试试几个方法来查看今天的天气。首先，你可以用手机自带的天气功能，比如苹果手机的天气应用，或者直接在系统设置里查看。其次，你也可以用一些专业的天气服务，像是国外的AccuWeather、Weather.com，或者国内的中国天气网、墨迹天气等等。再有就是，你还可以在谷歌或者百度里直接搜索你所在的城市加上天气这两个字。如果你能告诉我你所在的城市，我也可以帮你分析一下历史天气趋势，不过最新的数据还是需要你通过官方渠道去获取哦。"
@@ -301,6 +299,7 @@ def main(args):
             {"role": "user", "content": s2_audio_path},
         ]
         query_result = query_func(message_list, thinking=True, audio_list=audio_list)
+        query_result["modalities"] = ["text"]
     elif args.query_type == "text_dialogue_sft_multiturn":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type text_dialogue_sft_multiturn
         message_list = [
@@ -309,6 +308,7 @@ def main(args):
             {"role": "user", "content": "Beijing"},
         ]
         query_result = query_func(message_list=message_list)
+        query_result["modalities"] = ["text"]
     else:
         raise ValueError(f"Invalid query type: {args.query_type}")
 

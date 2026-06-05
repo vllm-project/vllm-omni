@@ -91,12 +91,12 @@ platforms:
         enable_prefix_caching: false
         skip_mm_profiling: true
         async_scheduling: false
-        max_num_batched_tokens: 8192
-        max_model_len: 8192
+        max_num_batched_tokens: 18192
+        max_model_len: 18192
         devices: "1"
         default_sampling_params:
           temperature: 0.0
           top_p: 1.0
           top_k: -1
-          max_tokens: 1
+          max_tokens: 18192
           seed: 42
