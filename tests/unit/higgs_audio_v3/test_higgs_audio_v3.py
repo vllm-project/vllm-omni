@@ -626,6 +626,105 @@ class TestLoaderRequiredKeys:
         assert "tied.embedding.text_embedding.weight" in keys
 
 
+class TestLoadWeightsEnforcement:
+    """Test load_weights() itself with synthetic key sets via a minimal fake talker."""
+
+    def _make_fake_talker_and_keys(self):
+        """Build a minimal talker-like object and the full 1-layer key set."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        # Minimal fake talker with just enough to run load_weights
+        talker = object.__new__(mod.HiggsAudioV3TalkerForConditionalGeneration)
+        torch.nn.Module.__init__(talker)
+
+        # Attach minimal attributes load_weights needs
+        talker.multimodal_embedding = mod.HiggsFusedMultiTextEmbedding(8, 1026, 16)
+        talker.modality_head = mod.HiggsFusedMultiTextHead(8, 1026, 16)
+        talker.tie_modality = True
+        talker.modality_head.weight = talker.multimodal_embedding.weight
+
+        # Fake backbone config with 1 layer
+        class FakeConfig:
+            num_hidden_layers = 1
+            tie_word_embeddings = True
+
+        talker._backbone_config = FakeConfig()
+
+        # Fake vllm_config for resolve_special_tokens (no-op)
+        class FakeModelConfig:
+            model = None
+
+        class FakeVllmConfig:
+            model_config = FakeModelConfig()
+
+        talker.vllm_config = FakeVllmConfig()
+        talker.config = type("C", (), {"resolve_special_tokens": lambda self, p: None})()
+        talker._resolved_tokens = True
+        talker._audio_continuation_id = None
+        talker._eos_token_id = None
+
+        # Build the full required key set for 1 layer
+        required = mod.HiggsAudioV3TalkerForConditionalGeneration._build_required_keys(1)
+
+        # Build synthetic weights: tiny tensors for every required key
+        weights = {}
+        for key in required:
+            if "modality_embeddings.0.embedding" in key:
+                weights[key] = torch.randn(8 * 1026, 16)
+            else:
+                weights[key] = torch.randn(4)  # tiny placeholder
+
+        # Monkeypatch _BackboneWrapper.load_weights to accept and return keys
+        def fake_backbone_load(self_wrapper, ws):
+            consumed = set()
+            for name, _ in ws:
+                consumed.add(name)
+            return consumed
+
+        talker._fake_backbone_load = fake_backbone_load
+        return talker, weights, mod, fake_backbone_load
+
+    def test_load_weights_succeeds_with_all_keys(self, monkeypatch):
+        """load_weights succeeds when all required keys are present."""
+        talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
+        monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
+        result = talker.load_weights(iter(weights.items()))
+        assert isinstance(result, set)
+        assert len(result) > 0
+
+    def test_load_weights_fails_missing_norm(self, monkeypatch):
+        """load_weights raises when body.norm.weight is missing."""
+        talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
+        monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
+        del weights["body.norm.weight"]
+        with pytest.raises(RuntimeError, match="required checkpoint keys missing"):
+            talker.load_weights(iter(weights.items()))
+
+    def test_load_weights_fails_missing_layer_subkey(self, monkeypatch):
+        """load_weights raises when a specific layer subkey is missing."""
+        talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
+        monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
+        del weights["body.layers.0.self_attn.k_proj.weight"]
+        with pytest.raises(RuntimeError, match="required checkpoint keys missing"):
+            talker.load_weights(iter(weights.items()))
+
+    def test_load_weights_fails_missing_modality_embedding(self, monkeypatch):
+        """load_weights raises when modality embedding is missing."""
+        talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
+        monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
+        del weights["tied.embedding.modality_embeddings.0.embedding.weight"]
+        with pytest.raises(RuntimeError, match="required checkpoint keys missing"):
+            talker.load_weights(iter(weights.items()))
+
+    def test_load_weights_fails_unknown_prefix(self, monkeypatch):
+        """load_weights raises on unknown non-codec checkpoint prefix."""
+        talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
+        monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
+        weights["unknown.prefix.weight"] = torch.randn(4)
+        with pytest.raises(ValueError, match="Unexpected checkpoint key"):
+            talker.load_weights(iter(weights.items()))
+
+
 # ---- AC-7: Stage Input Processor ----
 
 
