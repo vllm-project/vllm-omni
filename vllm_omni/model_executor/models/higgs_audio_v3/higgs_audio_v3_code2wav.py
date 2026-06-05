@@ -19,6 +19,8 @@ from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_decoder import (
     HiggsAudioRVQ,
+    build_boson_dac_decoder,
+    build_higgs_audio_acoustic_decoder,
     load_higgs_audio_codec,
 )
 from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
@@ -196,9 +198,7 @@ class HiggsAudioV3Code2Wav(nn.Module):
         ``load_higgs_audio_codec`` expects and build the modules.
         """
         from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_decoder import (
-            HiggsAudioRVQ,
             _remap_boson_model_pth_state_dict,
-            build_boson_dac_decoder,
         )
 
         if device is None:
@@ -265,11 +265,33 @@ class HiggsAudioV3Code2Wav(nn.Module):
         fc2.weight.data.copy_(fc2_w.to(device))
         fc2.bias.data.copy_(fc2_b.to(device))
 
-        # Build acoustic decoder — require decoder keys
-        acoustic_decoder = build_boson_dac_decoder(device)
+        # Build acoustic decoder — detect layout from key names.
+        # V3 checkpoint uses OmniVoice layout (block.N/conv1/conv2/snake1),
+        # not boson-ai standalone layout (model.0/model.1).
         ad_keys = {
             k[len("acoustic_decoder.") :]: v for k, v in codec_state.items() if k.startswith("acoustic_decoder.")
         }
+        is_boson_layout = any(k.startswith("model.") for k in ad_keys)
+        if is_boson_layout:
+            acoustic_decoder = build_boson_dac_decoder(device)
+        else:
+            # OmniVoice layout — need the v2 tokenizer config for DacConfig
+            tokenizer_config = {
+                "acoustic_model_config": {
+                    "codebook_dim": 8,
+                    "codebook_size": 1024,
+                    "decoder_hidden_size": 1024,
+                    "downsampling_ratios": [8, 5, 4, 2, 3],
+                    "encoder_hidden_size": 64,
+                    "hidden_size": 256,
+                    "hop_length": 960,
+                    "model_type": "dac",
+                    "n_codebooks": 9,
+                    "sampling_rate": 16000,
+                    "upsampling_ratios": [8, 5, 4, 2, 3],
+                }
+            }
+            acoustic_decoder = build_higgs_audio_acoustic_decoder(tokenizer_config, device)
         if not ad_keys:
             raise KeyError(
                 "Bundled codec state dict has no acoustic_decoder.* keys. "
@@ -305,7 +327,9 @@ class HiggsAudioV3Code2Wav(nn.Module):
             if k.startswith("acoustic_decoder."):
                 consumed.add(k)
 
-        # Known encoder-side prefixes that are bundled but not needed by the decoder
+        # Known unused prefixes: encoder-side modules and quantizer training
+        # artifacts (cluster_size, embed_avg, inited, project_in) that are
+        # bundled in the checkpoint but not needed for inference decoding.
         _KNOWN_UNUSED_PREFIXES = (
             "acoustic_encoder.",
             "encoder_semantic.",
@@ -314,11 +338,21 @@ class HiggsAudioV3Code2Wav(nn.Module):
             "fc.",
             "fc1.",
         )
+        # Quantizer training-only suffixes (per-codebook)
+        _QUANTIZER_TRAINING_SUFFIXES = (
+            ".codebook.cluster_size",
+            ".codebook.embed_avg",
+            ".codebook.inited",
+            ".project_in.weight",
+            ".project_in.bias",
+        )
         unconsumed = set()
         for k in codec_state:
             if k in consumed:
                 continue
             if any(k.startswith(p) for p in _KNOWN_UNUSED_PREFIXES):
+                continue
+            if any(k.endswith(s) for s in _QUANTIZER_TRAINING_SUFFIXES):
                 continue
             unconsumed.add(k)
         if unconsumed:
