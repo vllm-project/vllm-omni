@@ -131,19 +131,13 @@ class HiggsAudioV3Config(PretrainedConfig):
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs: Any) -> HiggsAudioV3Config:
         """Load config and resolve special token IDs from the checkpoint tokenizer.
 
-        Raises ``ValueError`` if the tokenizer is missing required specials
-        (``<|tts|>``, ``<|text|>``, ``<|audio|>``).
+        Passes the original ``pretrained_model_name_or_path`` (local dir or
+        HF repo ID) directly to ``AutoTokenizer.from_pretrained()`` so it can
+        handle cache hits, downloads, and local paths uniformly. Raises if the
+        tokenizer is missing required specials.
         """
         config = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
-
-        model_dir = _resolve_model_dir(pretrained_model_name_or_path)
-        if model_dir is not None:
-            config.resolve_special_tokens(model_dir)
-        else:
-            logger.warning(
-                "HiggsAudioV3Config: could not resolve model directory for %s; special token IDs left unresolved.",
-                pretrained_model_name_or_path,
-            )
+        config.resolve_special_tokens(pretrained_model_name_or_path)
         return config
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:

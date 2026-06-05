@@ -280,7 +280,31 @@ class HiggsAudioV3Code2Wav(nn.Module):
             raise RuntimeError(
                 f"Bundled DAC decoder missing {len(load_report.missing_keys)} keys: {load_report.missing_keys[:5]}..."
             )
+        if load_report.unexpected_keys:
+            raise RuntimeError(
+                f"Bundled DAC decoder has {len(load_report.unexpected_keys)} unexpected keys: "
+                f"{load_report.unexpected_keys[:5]}..."
+            )
         acoustic_decoder.eval()
+
+        # Verify all codec keys were consumed
+        consumed: set[str] = set()
+        for i in range(required_quantizers):
+            prefix = f"quantizer.quantizers.{i}"
+            for suffix in [".codebook.embed", ".codebook.weight"]:
+                if f"{prefix}{suffix}" in codec_state:
+                    consumed.add(f"{prefix}{suffix}")
+            consumed.add(f"{prefix}.project_out.weight")
+            consumed.add(f"{prefix}.project_out.bias")
+        consumed.add("fc2.weight")
+        consumed.add("fc2.bias")
+        for k in codec_state:
+            if k.startswith("acoustic_decoder."):
+                consumed.add(k)
+
+        unconsumed = set(codec_state.keys()) - consumed
+        if unconsumed:
+            raise RuntimeError(f"Bundled codec has {len(unconsumed)} unconsumed keys: {sorted(unconsumed)[:10]}...")
 
         self.quantizer = quantizer
         self.fc2 = fc2

@@ -591,7 +591,19 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             mask.scatter_(-1, sorted_idx, sorted_mask)
             x = x.masked_fill(mask, float("-inf"))
         probs = x.softmax(dim=-1)
-        probs = probs.clamp(min=1e-8)
+        # Guard: if any row is all-masked (all -inf), softmax yields NaN/uniform.
+        # Fall back to argmax for those rows (picks the least-negative logit).
+        all_masked = probs.sum(dim=-1) == 0
+        if all_masked.any():
+            fallback = x.argmax(dim=-1)
+            sampled = (
+                torch.multinomial(probs[~all_masked], num_samples=1).squeeze(-1)
+                if (~all_masked).any()
+                else torch.empty(0, dtype=torch.long, device=x.device)
+            )
+            result = fallback.clone()
+            result[~all_masked] = sampled
+            return result
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     def _apply_audio_mode_bias(self, logits: torch.Tensor, sampling_metadata: Any) -> None:
