@@ -2015,6 +2015,16 @@ async def edit_images(
         _update_if_not_none(gen_params, "layers", layers)
         _update_if_not_none(gen_params, "resolution", resolution)
 
+        extra_args = dict(getattr(gen_params, "extra_args", {}) or {})
+        if bot_task is not None:
+            extra_args["bot_task"] = bot_task
+        if sys_type is not None:
+            extra_args["use_system_prompt"] = sys_type
+        if system_prompt is not None:
+            extra_args["system_prompt"] = system_prompt
+        if extra_args:
+            gen_params.extra_args = extra_args
+
         # 4. Generate images
         request_id = f"img_edit-{random_uuid()}"
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
