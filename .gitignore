@@ -273,14 +273,3 @@ tests/.ci_generated/
 
 # Local Lance precision-matching dump scripts (not part of the repo)
 lance_compare/
-
-# Temporary local files (yuekaiz branch work)
-.humanize/
-CLAUDE.local.md
-docs/superpowers/
-examples/offline_inference/text_to_speech/cosyvoice3/benchmark_cosyvoice3_llm_stage.py
-examples/offline_inference/text_to_speech/cosyvoice3/benchmark_deploy_offline.yaml
-examples/offline_inference/text_to_speech/cosyvoice3/offline_benchmark.py
-examples/offline_inference/text_to_speech/higgs_audio_v2/offline_benchmark_higgs.py
-examples/offline_inference/text_to_speech/higgs_audio_v2/offline_benchmark_higgs_torch.py
-examples/online_serving/text_to_speech/cosyvoice3/benchmark_client.sh
