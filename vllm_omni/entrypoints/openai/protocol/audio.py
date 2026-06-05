@@ -117,6 +117,54 @@ class OpenAICreateSpeechRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def normalize_references_alias(cls, data):
+        """Map the BosonAI Higgs Audio v3 cookbook ``references`` array onto ``ref_audio`` / ``ref_text``.
+
+        Upstream Higgs Audio v3 examples and the boson.ai cookbook send voice
+        clones as::
+
+            {"references": [{"audio_path": str, "text": str}]}
+
+        vllm-omni's existing convention is ``ref_audio`` + ``ref_text``.
+        Without this alias pydantic silently drops the unknown ``references``
+        field and the request falls through to zero-shot synthesis with no
+        error, which is hard to debug from the client side. The normalizer
+        translates a single reference and rejects multi-reference payloads
+        (vllm-omni does not yet support multi-shot voice clone) or conflicts
+        with the explicit ``ref_audio`` / ``ref_text`` fields.
+        """
+        if not isinstance(data, dict):
+            return data
+        refs = data.get("references")
+        if refs is None:
+            return data
+        if not isinstance(refs, list) or len(refs) == 0:
+            raise ValueError("'references' must be a non-empty array of {audio_path, text} objects")
+        if len(refs) > 1:
+            raise ValueError("'references' only supports a single reference; multi-shot voice clone is not supported")
+        first = refs[0]
+        if not isinstance(first, dict):
+            raise ValueError("'references[0]' must be an object with 'audio_path' and optional 'text'")
+        audio_path = first.get("audio_path")
+        if not isinstance(audio_path, str) or not audio_path:
+            raise ValueError(
+                "'references[0].audio_path' is required and must be a string (URL, data: URI, or file path)"
+            )
+        existing_ref_audio = data.get("ref_audio")
+        if existing_ref_audio and existing_ref_audio != audio_path:
+            raise ValueError("'references' and 'ref_audio' are mutually exclusive")
+        data["ref_audio"] = audio_path
+        text = first.get("text")
+        if isinstance(text, str) and text.strip():
+            existing_ref_text = data.get("ref_text")
+            if existing_ref_text and existing_ref_text != text:
+                raise ValueError("'references[0].text' and 'ref_text' conflict; supply only one")
+            data["ref_text"] = text
+        data.pop("references", None)
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def reject_higgs_audio_v2_unsupported_aliases(cls, data):
         """Reject unsupported rich-input aliases for higgs_audio_v2 BEFORE pydantic strips them.
 

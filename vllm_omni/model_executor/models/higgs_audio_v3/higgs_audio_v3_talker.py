@@ -171,6 +171,18 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._decode_last_codes = torch.zeros(max_bs, self.num_codebooks, dtype=torch.long)
         self._decode_has_codes = torch.zeros(max_bs, dtype=torch.bool)
 
+        # PrefixCache opt-outs (mirror qwen3_tts pattern):
+        # 1. The talker only consumes the last token's hidden state, so the
+        #    runner can skip the per-step full hidden-state GPU->CPU merge
+        #    that PrefixCache otherwise does.
+        # 2. Per-step ``codes.audio`` rows stay GPU-resident; defer the CPU
+        #    write of the prefix-cache mm-output copy to request finish so
+        #    the per-step bookkeeping does not block batching. Stage 0 can
+        #    then set ``enable_prefix_caching: true`` without the regression
+        #    observed in qwen3_tts (#3665).
+        self.requires_full_prefix_cached_hidden_states = False
+        self.deferred_prefix_cache_mm_keys = {"codes.audio"}
+
     def _resolve_token_ids(self) -> None:
         """Resolve <|audio|> and eos token IDs.
 
