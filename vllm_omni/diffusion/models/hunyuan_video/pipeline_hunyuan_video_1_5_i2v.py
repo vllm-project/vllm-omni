@@ -32,6 +32,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_hunyuan_video_1
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15Transformer3DModel
 from vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5 import (
     extract_glyph_texts,
@@ -123,9 +124,29 @@ class HunyuanVideo15I2VPipeline(
         model = od_config.model
         local_files_only = os.path.exists(model)
 
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the whole component set before any from_pretrained so
+        # peer workers load from a warm, complete cache.
+        hv_subfolders = [
+            "tokenizer",
+            "text_encoder",
+            "tokenizer_2",
+            "text_encoder_2",
+            "image_encoder",
+            "feature_extractor",
+            "vae",
+            "scheduler",
+        ]
+        prefetch_subfolders(model, hv_subfolders, local_files_only=local_files_only)
+
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.text_encoder = Qwen2_5_VLTextModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+        self.text_encoder = from_pretrained_with_prefetch(
+            Qwen2_5_VLTextModel.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=hv_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         self.tokenizer_2 = ByT5Tokenizer.from_pretrained(
@@ -134,15 +155,25 @@ class HunyuanVideo15I2VPipeline(
         t5_config = AutoConfig.from_pretrained(model, subfolder="text_encoder_2", local_files_only=local_files_only)
         self.text_encoder_2 = T5EncoderModel(t5_config, prefix="text_encoder_2").to(dtype=dtype, device=self.device)
 
-        self.image_encoder = SiglipVisionModel.from_pretrained(
-            model, subfolder="image_encoder", torch_dtype=dtype, local_files_only=local_files_only
+        self.image_encoder = from_pretrained_with_prefetch(
+            SiglipVisionModel.from_pretrained,
+            model,
+            subfolder="image_encoder",
+            prefetch_list=hv_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
         self.feature_extractor = SiglipImageProcessor.from_pretrained(
             model, subfolder="feature_extractor", local_files_only=local_files_only
         )
 
-        self.vae = DistributedAutoencoderKLHunyuanVideo15.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+        self.vae = from_pretrained_with_prefetch(
+            DistributedAutoencoderKLHunyuanVideo15.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=hv_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=torch.float32,
         ).to(self.device)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(

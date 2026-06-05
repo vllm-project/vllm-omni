@@ -100,6 +100,9 @@ class OmniServeCommand(CLISubcommand):
             model_config = dict(existing) if isinstance(existing, dict) else {}
             model_config["guardrails"] = False
             args.model_config = model_config
+            explicit_keys = getattr(args, "explicit_keys", None)
+            if explicit_keys is not None:
+                args.explicit_keys = explicit_keys | {"model_config"}
 
         if args.headless:
             run_headless(args)

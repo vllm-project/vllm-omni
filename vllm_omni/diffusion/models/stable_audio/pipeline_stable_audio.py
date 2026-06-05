@@ -28,6 +28,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import (
     StableAudioDiTModel,
@@ -109,6 +110,11 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
             ),
         ]
 
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the whole component set before any from_pretrained.
+        sa_subfolders = ["tokenizer", "text_encoder", "vae", "projection_model", "scheduler"]
+        prefetch_subfolders(model, sa_subfolders, local_files_only=local_files_only)
+
         # Load tokenizer
         self.tokenizer = T5TokenizerFast.from_pretrained(
             model,
@@ -117,27 +123,33 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         )
 
         # Load text encoder
-        self.text_encoder = T5EncoderModel.from_pretrained(
+        self.text_encoder = from_pretrained_with_prefetch(
+            T5EncoderModel.from_pretrained,
             model,
             subfolder="text_encoder",
-            torch_dtype=dtype,
+            prefetch_list=sa_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         # Load VAE (AutoencoderOobleck for audio)
-        self.vae = AutoencoderOobleck.from_pretrained(
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderOobleck.from_pretrained,
             model,
             subfolder="vae",
-            torch_dtype=torch.float32,
+            prefetch_list=sa_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=torch.float32,
         ).to(self.device)
 
         # Load projection model (using diffusers implementation)
-        self.projection_model = StableAudioProjectionModel.from_pretrained(
+        self.projection_model = from_pretrained_with_prefetch(
+            StableAudioProjectionModel.from_pretrained,
             model,
             subfolder="projection_model",
-            torch_dtype=dtype,
+            prefetch_list=sa_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         # Initialize transformer from HF config to keep architecture aligned with checkpoint.

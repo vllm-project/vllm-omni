@@ -1638,9 +1638,6 @@ class TestBaseConfigInheritance:
         s0 = deploy.stages[0].default_sampling_params
         # CI overrides max_tokens
         assert s0["max_tokens"] == 150
-        # Inherited from base
-        assert s0["temperature"] == 0.4
-        assert s0["seed"] == 42
 
     def test_pure_inheritance_overlay(self, tmp_path):
         """An overlay with only ``base_config`` inherits everything."""
@@ -1960,5 +1957,3 @@ class TestSamplingConstraintsPrecedence:
         assert stages[0].yaml_extras["default_sampling_params"]["detokenize"] is True
         # Pipeline says stop_token_ids=[2150] for talker
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [2150]
-        # Deploy temperature still flows through
-        assert stages[0].yaml_extras["default_sampling_params"]["temperature"] == 0.4

@@ -188,3 +188,32 @@ def _patch_chat_template_registry():
 
 
 _patch_chat_template_registry()
+
+
+def _patch_scaled_mm_fp8_contiguous_activation():
+    """Support batched diffusion activations on the ModelOpt FP8 (ScaledMM) path.
+
+    The FP8 ScaledMM linear flattens its activation with ``x.view(-1, ...)``, which
+    needs a contiguous tensor. Under step-execution batching (``--max-num-seqs > 1``)
+    the sequence-packed diffusion activations can be non-contiguous, so we make the
+    activation contiguous before the GEMM (no-op when it already is). Mixed FP8/NVFP4
+    routes through the CUTLASS NVFP4 path and is unaffected.
+    """
+    try:
+        from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+            ScaledMMLinearKernel,
+        )
+    except ImportError:
+        return
+
+    _original_apply_weights = ScaledMMLinearKernel.apply_weights
+
+    def _patched_apply_weights(self, layer, x, bias=None):
+        if not x.is_contiguous():
+            x = x.contiguous()
+        return _original_apply_weights(self, layer, x, bias)
+
+    ScaledMMLinearKernel.apply_weights = _patched_apply_weights
+
+
+_patch_scaled_mm_fp8_contiguous_activation()

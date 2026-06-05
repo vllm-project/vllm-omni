@@ -19,7 +19,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import Distribu
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
@@ -156,18 +156,19 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
         # SD3.5 loads six subfolders in a row, each with multi-shard
         # safetensors - it is the worst-case fan-out for the race window.
+        sd3_subfolders = [
+            "scheduler",
+            "tokenizer",
+            "tokenizer_2",
+            "tokenizer_3",
+            "text_encoder",
+            "text_encoder_2",
+            "text_encoder_3",
+            "vae",
+        ]
         prefetch_subfolders(
             model,
-            [
-                "scheduler",
-                "tokenizer",
-                "tokenizer_2",
-                "tokenizer_3",
-                "text_encoder",
-                "text_encoder_2",
-                "text_encoder_3",
-                "vae",
-            ],
+            sd3_subfolders,
             local_files_only=local_files_only,
         )
 
@@ -198,31 +199,43 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         self.tokenizer_3 = T5Tokenizer.from_pretrained(
             model, subfolder="tokenizer_3", local_files_only=local_files_only
         )
-        self.text_encoder = CLIPTextModelWithProjection.from_pretrained(
+        # ``from_pretrained_with_prefetch`` re-prefetches and retries if a
+        # peer worker left the cache half-written (missing-shard ``OSError`` or
+        # the default-config size-mismatch ``RuntimeError``) instead of
+        # crashing the worker - critical here given the six-subfolder fan-out.
+        self.text_encoder = from_pretrained_with_prefetch(
+            CLIPTextModelWithProjection.from_pretrained,
             model,
             subfolder="text_encoder",
-            torch_dtype=dtype,
+            prefetch_list=sd3_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         )
-        self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+        self.text_encoder_2 = from_pretrained_with_prefetch(
+            CLIPTextModelWithProjection.from_pretrained,
             model,
             subfolder="text_encoder_2",
-            torch_dtype=dtype,
+            prefetch_list=sd3_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         )
-        self.text_encoder_3 = T5EncoderModel.from_pretrained(
+        self.text_encoder_3 = from_pretrained_with_prefetch(
+            T5EncoderModel.from_pretrained,
             model,
             subfolder="text_encoder_3",
-            torch_dtype=dtype,
+            prefetch_list=sd3_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         )
         self.transformer = SD3Transformer2DModel(od_config=od_config)
 
-        self.vae = DistributedAutoencoderKL.from_pretrained(
+        self.vae = from_pretrained_with_prefetch(
+            DistributedAutoencoderKL.from_pretrained,
             model,
             subfolder="vae",
-            torch_dtype=dtype,
+            prefetch_list=sd3_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8

@@ -44,6 +44,14 @@ def test_resolve_pooler_payload_req_ids_downstream_stage_uses_filtered_requests(
     assert payload_req_ids == ["r2"]
 
 
+def test_sparse_mm_req_ids_requires_sparse_audio_marker():
+    assert GPUARModelRunner._sparse_mm_req_ids({"meta": {"req_id": ["r1"]}}) is None
+    assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"]}) is None
+
+    assert GPUARModelRunner._sparse_mm_req_ids({"meta": {"req_id": ["r1"], "sparse_audio": ["1"]}}) == ["r1"]
+    assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"], "meta.sparse_audio": ["1"]}) == ["r1"]
+
+
 @pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])
 def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monkeypatch, query_start_loc_attr):
     runner = object.__new__(GPUARModelRunner)

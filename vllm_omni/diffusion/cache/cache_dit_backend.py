@@ -242,6 +242,80 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
     return refresh_cache_context
 
 
+def enable_cache_for_wan22_s2v(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    """Enable cache-dit for Wan2.2 S2V.
+
+    S2V uses a single transformer, but unlike the other Wan2.2 variants its
+    block loop calls each block as ``block(hidden_states, **kwargs)`` and keeps
+    the timestep modulation state in ``e`` rather than a second positional
+    tensor. CacheDiT Pattern_3 matches that contract: cache hidden states only
+    and pass the remaining conditioning through kwargs unchanged.
+
+    The S2V transformer has an ``after_transformer_block`` method that injects
+    audio embeddings after specific layers. The cached blocks wrapper
+    (Wan22S2VCachedBlocks._run_block) calls the original internally, so we
+    permanently replace it with a no-op on the transformer to prevent double
+    injection from the main forward loop.
+    """
+    db_cache_config = _build_db_cache_config(cache_config)
+    calibrator_config = None
+    if cache_config.enable_taylorseer:
+        taylorseer_order = cache_config.taylorseer_order
+        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+
+    # Save the original after_transformer_block before cache-dit wrapping
+    transformer = pipeline.transformer
+    if hasattr(transformer, "after_transformer_block"):
+        transformer._cache_dit_original_after_transformer_block = transformer.after_transformer_block
+
+    Wan22S2VCachedAdapter.apply(
+        BlockAdapter(
+            transformer=transformer,
+            blocks=[transformer.blocks],
+            forward_pattern=[ForwardPattern.Pattern_3],
+            params_modifiers=[
+                ParamsModifier(cache_config=db_cache_config, calibrator_config=calibrator_config),
+            ],
+            has_separate_cfg=True,
+        ),
+        cache_config=db_cache_config,
+        calibrator_config=calibrator_config,
+    )
+
+    # Permanently replace after_transformer_block with a no-op.
+    # The cached blocks wrapper (Wan22S2VCachedBlocks._run_block) already calls
+    # the original via _cache_dit_original_after_transformer_block.
+    def _noop_after_transformer_block(block_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+    transformer.after_transformer_block = _noop_after_transformer_block
+
+    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        """Refresh cache context for the S2V transformer."""
+        if cache_config.scm_steps_mask_policy is None:
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                num_inference_steps=num_inference_steps,
+                verbose=verbose,
+            )
+        else:
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                cache_config=DBCacheConfig().reset(
+                    num_inference_steps=num_inference_steps,
+                    steps_computation_mask=cache_dit.steps_mask(
+                        mask_policy=cache_config.scm_steps_mask_policy,
+                        total_steps=num_inference_steps,
+                    ),
+                    steps_computation_policy=cache_config.scm_steps_policy,
+                ),
+                verbose=verbose,
+            )
+
+    return refresh_cache_context
+
+
 def enable_cache_for_longcat_image(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for LongCatImage pipeline.
 
@@ -984,6 +1058,151 @@ class BagelCachedBlocks(CachedBlocks_Pattern_0_1_2):
             torch._dynamo.graph_break()
 
         return hidden_states, encoder_hidden_states
+
+
+class Wan22S2VCachedBlocks(CachedBlocks_Pattern_3_4_5):
+    """CacheDiT blocks wrapper that preserves S2V per-layer audio injection."""
+
+    def _run_block(self, block_id: int, block: torch.nn.Module, hidden_states: torch.Tensor, *args, **kwargs):
+        hidden_states = block(hidden_states, *args, **kwargs)
+        hidden_states, new_encoder_hidden_states = self._process_block_outputs(hidden_states)
+        original_after_transformer_block = getattr(
+            self.transformer,
+            "_cache_dit_original_after_transformer_block",
+            getattr(self.transformer, "after_transformer_block", None),
+        )
+        if original_after_transformer_block is not None:
+            hidden_states = original_after_transformer_block(block_id, hidden_states)
+        return hidden_states, new_encoder_hidden_states
+
+    def call_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        *args,
+        **kwargs,
+    ):
+        new_encoder_hidden_states = None
+        for block_id, block in enumerate(self.transformer_blocks):
+            hidden_states, new_encoder_hidden_states = self._run_block(
+                block_id,
+                block,
+                hidden_states,
+                *args,
+                **kwargs,
+            )
+        return hidden_states, new_encoder_hidden_states
+
+    def call_Fn_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        *args,
+        **kwargs,
+    ):
+        new_encoder_hidden_states = None
+        for block_id, block in enumerate(self._Fn_blocks()):
+            hidden_states, new_encoder_hidden_states = self._run_block(
+                block_id,
+                block,
+                hidden_states,
+                *args,
+                **kwargs,
+            )
+        return hidden_states, new_encoder_hidden_states
+
+    def call_Mn_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        *args,
+        **kwargs,
+    ):
+        original_hidden_states = hidden_states
+        new_encoder_hidden_states = None
+        start_idx = self.context_manager.Fn_compute_blocks()
+        for block_id, block in enumerate(self._Mn_blocks(), start=start_idx):
+            hidden_states, new_encoder_hidden_states = self._run_block(
+                block_id,
+                block,
+                hidden_states,
+                *args,
+                **kwargs,
+            )
+
+        hidden_states = hidden_states.contiguous()
+        hidden_states_residual = hidden_states - original_hidden_states.to(hidden_states.device)
+
+        return (
+            hidden_states,
+            new_encoder_hidden_states,
+            hidden_states_residual,
+        )
+
+    def call_Bn_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        *args,
+        **kwargs,
+    ):
+        new_encoder_hidden_states = None
+        if self.context_manager.Bn_compute_blocks() == 0:
+            return hidden_states, new_encoder_hidden_states
+
+        start_idx = len(self.transformer_blocks) - self.context_manager.Bn_compute_blocks()
+        for block_id, block in enumerate(self._Bn_blocks(), start=start_idx):
+            hidden_states, new_encoder_hidden_states = self._run_block(
+                block_id,
+                block,
+                hidden_states,
+                *args,
+                **kwargs,
+            )
+
+        return hidden_states, new_encoder_hidden_states
+
+
+class Wan22S2VCachedAdapter(CachedAdapter):
+    """CacheDiT adapter that uses Wan22S2VCachedBlocks for S2V audio injection.
+
+    Only overrides collect_unified_blocks to use Wan22S2VCachedBlocks (which
+    calls after_transformer_block per-layer internally). The base class
+    mock_transformer handles the forward wrapping — after_transformer_block is
+    permanently replaced with a no-op in enable_cache_for_wan22_s2v() to prevent
+    double injection.
+    """
+
+    @classmethod
+    def collect_unified_blocks(
+        cls,
+        block_adapter: BlockAdapter,
+        contexts_kwargs: list[dict],
+    ) -> list[dict[str, torch.nn.ModuleList]]:
+        BlockAdapter.assert_normalized(block_adapter)
+
+        total_cached_blocks: list[dict[str, torch.nn.ModuleList]] = []
+        assert hasattr(block_adapter.pipe, "_context_manager")
+
+        for i in range(len(block_adapter.transformer)):
+            unified_blocks_bind_context = {}
+            for j in range(len(block_adapter.blocks[i])):
+                cache_config: BasicCacheConfig = contexts_kwargs[i * len(block_adapter.blocks[i]) + j]["cache_config"]
+                unified_blocks_bind_context[block_adapter.unique_blocks_name[i][j]] = torch.nn.ModuleList(
+                    [
+                        Wan22S2VCachedBlocks(
+                            block_adapter.blocks[i][j],
+                            transformer=block_adapter.transformer[i],
+                            forward_pattern=block_adapter.forward_pattern[i][j],
+                            check_forward_pattern=block_adapter.check_forward_pattern,
+                            check_num_outputs=block_adapter.check_num_outputs,
+                            cache_prefix=block_adapter.blocks_name[i][j],
+                            cache_context=block_adapter.unique_blocks_name[i][j],
+                            context_manager=block_adapter.pipe._context_manager,
+                            cache_type=cache_config.cache_type,
+                        )
+                    ]
+                )
+
+            total_cached_blocks.append(unified_blocks_bind_context)
+
+        return total_cached_blocks
 
 
 class BagelCachedAdapter(CachedAdapter):
@@ -1808,6 +2027,7 @@ CUSTOM_DIT_ENABLERS.update(
     {
         "Wan22Pipeline": enable_cache_for_wan22,
         "Wan22I2VPipeline": enable_cache_for_wan22,
+        "Wan22S2VPipeline": enable_cache_for_wan22_s2v,
         "HunyuanImage3Pipeline": enable_cache_for_hunyuan_image3,
         "FluxPipeline": enable_cache_for_flux,
         "Flux2KleinPipeline": enable_cache_for_flux2_klein,
