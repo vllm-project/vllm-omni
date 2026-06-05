@@ -525,6 +525,11 @@ class FluxKontextPipeline(
         width = req.sampling_params.width or width
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         guidance_scale = req.sampling_params.guidance_scale or guidance_scale
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
         generator = req.sampling_params.generator or generator
         latents = (
             req.sampling_params.extra_args.get("latents")

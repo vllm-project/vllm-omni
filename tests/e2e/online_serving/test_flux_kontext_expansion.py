@@ -28,6 +28,19 @@ def _get_diffusion_feature_cases(model: str):
             ),
             id="parallel_001",
         ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--tensor-parallel-size",
+                    "2",
+                    "--enable-cpu-offload",
+                    "--cache-backend",
+                    "cache_dit",
+                ],
+            ),
+            id="parallel_002",
+        ),
     ]
 
 
