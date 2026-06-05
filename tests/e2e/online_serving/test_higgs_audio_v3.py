@@ -258,21 +258,33 @@ class TestHiggsAudioV3OnlineVoiceClone:
 
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 class TestHiggsAudioV3OnlineValidatorRejections:
-    """Out-of-scope shapes must come back as 4xx."""
+    """Out-of-scope shapes must come back as 4xx.
+
+    These cases use ``send_audio_speech_http_request`` (raw HTTP POST against
+    ``/v1/audio/speech``) rather than the OpenAI SDK helper because:
+
+    - We need the failure-path matcher; the SDK helper asserts success.
+    - The cookbook ``references`` field is not in the OpenAI SDK schema, so
+      the SDK strips it before the request leaves the client and the server
+      sees a plain TTS request that returns 200. Raw HTTP keeps the JSON body
+      intact so the validator actually fires.
+    """
 
     @pytest.mark.core_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     def test_rejects_empty_input(self, omni_server, openai_client) -> None:
         """Empty text input - validator should reject before reaching the engine."""
-        openai_client.send_audio_speech_request(
+        openai_client.send_audio_speech_http_request(
             {
-                "model": omni_server.model,
-                "input": "",
-                "response_format": "wav",
+                "json": {
+                    "model": omni_server.model,
+                    "input": "",
+                    "response_format": "wav",
+                },
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "status_code": (400, 422),
-                "err_message": "empty",
+                "err_code": (400, 422),
+                "err_message": ("input", "empty"),
             }
         )
 
@@ -281,17 +293,19 @@ class TestHiggsAudioV3OnlineValidatorRejections:
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     def test_rejects_multi_reference_payload(self, omni_server, openai_client) -> None:
         """``references[]`` with more than one entry - multi-shot voice clone is not supported."""
-        openai_client.send_audio_speech_request(
+        openai_client.send_audio_speech_http_request(
             {
-                "model": omni_server.model,
-                "input": "Hello world.",
-                "references": [
-                    {"audio_path": _REF_AUDIO_URL, "text": _REF_TEXT},
-                    {"audio_path": _REF_AUDIO_URL, "text": _REF_TEXT},
-                ],
-                "response_format": "wav",
+                "json": {
+                    "model": omni_server.model,
+                    "input": "Hello world.",
+                    "references": [
+                        {"audio_path": _REF_AUDIO_URL, "text": _REF_TEXT},
+                        {"audio_path": _REF_AUDIO_URL, "text": _REF_TEXT},
+                    ],
+                    "response_format": "wav",
+                },
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "status_code": (400, 422),
+                "err_code": (400, 422),
                 "err_message": "references",
             }
         )
@@ -301,15 +315,17 @@ class TestHiggsAudioV3OnlineValidatorRejections:
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     def test_rejects_conflicting_ref_audio_and_references(self, omni_server, openai_client) -> None:
         """``ref_audio`` and ``references`` cannot both be set to different values."""
-        openai_client.send_audio_speech_request(
+        openai_client.send_audio_speech_http_request(
             {
-                "model": omni_server.model,
-                "input": "Hello world.",
-                "ref_audio": _REF_AUDIO_URL,
-                "references": [{"audio_path": "https://example.com/other.wav"}],
-                "response_format": "wav",
+                "json": {
+                    "model": omni_server.model,
+                    "input": "Hello world.",
+                    "ref_audio": _REF_AUDIO_URL,
+                    "references": [{"audio_path": "https://example.com/other.wav"}],
+                    "response_format": "wav",
+                },
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "status_code": (400, 422),
+                "err_code": (400, 422),
                 "err_message": "mutually exclusive",
             }
         )
