@@ -18,8 +18,13 @@ except ImportError:
 import numpy as np
 import soundfile as sf
 from openai import OpenAI
+from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    DEFAULT_QWEN3_TTS_REF_TEXT,
+    default_qwen3_tts_ref_audio_path,
+)
 
 SEED = 42
+DEFAULT_TTS_REF_AUDIO = default_qwen3_tts_ref_audio_path()
 
 
 def parse_args():
@@ -120,7 +125,6 @@ def build_interface(client: OpenAI, model: str):
         tts_ref_audio: str,
         tts_ref_text: str,
         tts_x_vector_only_mode: bool,
-        tts_use_aura_token_ids: bool,
     ):
         audio_url = _audio_to_data_url(audio_file)
         video_url = _video_to_data_url(video_file)
@@ -137,7 +141,6 @@ def build_interface(client: OpenAI, model: str):
             "aura_system_prompt": aura_system_prompt,
             "tts_task_type": tts_task_type,
             "tts_instruct": tts_instruct,
-            "tts_use_aura_token_ids": bool(tts_use_aura_token_ids),
         }
         if tts_task_type == "CustomVoice":
             additional_information.update(
@@ -215,18 +218,18 @@ def build_interface(client: OpenAI, model: str):
             with gr.Group(visible=True) as base_config_group:
                 tts_ref_audio = gr.Textbox(
                     label="Base reference audio path/URL",
-                    value="/data/yrr/rein_test/shuhan.mp3",
+                    value=DEFAULT_TTS_REF_AUDIO,
                 )
-                tts_ref_text = gr.Textbox(label="Base reference transcript", value="", lines=3)
+                tts_ref_text = gr.Textbox(
+                    label="Base reference transcript",
+                    value=DEFAULT_QWEN3_TTS_REF_TEXT,
+                    lines=3,
+                )
                 tts_x_vector_only_mode = gr.Checkbox(
                     label="Base x-vector only mode (disable ICL)",
                     value=False,
                 )
 
-            tts_use_aura_token_ids = gr.Checkbox(
-                label="Experimental: pass AURA token ids to TTS",
-                value=False,
-            )
             tts_task_type.change(
                 _toggle_tts_advanced,
                 inputs=[tts_task_type],
@@ -250,7 +253,6 @@ def build_interface(client: OpenAI, model: str):
                 tts_ref_audio,
                 tts_ref_text,
                 tts_x_vector_only_mode,
-                tts_use_aura_token_ids,
             ],
             outputs=[text_output, audio_output],
         )

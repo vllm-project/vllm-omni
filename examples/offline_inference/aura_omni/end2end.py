@@ -26,6 +26,10 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    DEFAULT_QWEN3_TTS_REF_TEXT,
+    default_qwen3_tts_ref_audio_path,
+)
 
 SEED = 42
 DEFAULT_MODEL = "aurateam/AURA"
@@ -80,7 +84,6 @@ def build_query(args) -> QueryResult:
                 "tts_ref_audio": args.tts_ref_audio,
                 "tts_ref_text": args.tts_ref_text,
                 "tts_x_vector_only_mode": args.tts_x_vector_only_mode,
-                "tts_use_aura_token_ids": args.tts_use_aura_token_ids,
             },
         },
         limit_mm_per_prompt={"audio": 1, "video": 1},
@@ -201,17 +204,20 @@ def parse_args():
     parser.add_argument("--tts-language", default="Chinese", help="Qwen3-TTS language.")
     parser.add_argument("--tts-speaker", default="Vivian", help="Qwen3-TTS speaker.")
     parser.add_argument("--tts-instruct", default="", help="Optional Qwen3-TTS style instruction.")
-    parser.add_argument("--tts-ref-audio", default=None, help="Base-mode reference audio path/URL.")
-    parser.add_argument("--tts-ref-text", default=None, help="Base-mode reference audio transcript.")
+    parser.add_argument(
+        "--tts-ref-audio",
+        default=default_qwen3_tts_ref_audio_path(),
+        help="Base-mode reference audio path/URL.",
+    )
+    parser.add_argument(
+        "--tts-ref-text",
+        default=DEFAULT_QWEN3_TTS_REF_TEXT,
+        help="Base-mode reference audio transcript.",
+    )
     parser.add_argument(
         "--tts-x-vector-only-mode",
         action="store_true",
         help="Use speaker embedding only for Base mode (disable ICL ref_text conditioning).",
-    )
-    parser.add_argument(
-        "--tts-use-aura-token-ids",
-        action="store_true",
-        help="Experimental: pass AURA generated token ids directly into Qwen3-TTS text ids.",
     )
     parser.add_argument("--init-timeout", type=int, default=2000, help="Overall initialization timeout.")
     parser.add_argument("--stage-init-timeout", type=int, default=2000, help="Per-stage initialization timeout.")

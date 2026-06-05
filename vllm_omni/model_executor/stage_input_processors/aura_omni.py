@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
@@ -32,6 +33,14 @@ QWEN_ASSISTANT_SUFFIX_IDS = [
 ]
 DEFAULT_QWEN3_TTS_REF_AUDIO = "vllm-omni/tests/assets/qwen3_tts/clone_2.wav"
 DEFAULT_QWEN3_TTS_REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+
+
+def default_qwen3_tts_ref_audio_path() -> str:
+    """Return absolute path to the bundled ``clone_2.wav`` reference asset."""
+    bundled = Path(__file__).resolve().parents[3] / "tests" / "assets" / "qwen3_tts" / "clone_2.wav"
+    if bundled.is_file():
+        return str(bundled)
+    return DEFAULT_QWEN3_TTS_REF_AUDIO
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -188,6 +197,12 @@ def _estimate_tts_prompt_len(text: str) -> int:
     return max(32, min(4096, len(text) + 64))
 
 
+def _estimate_tts_prompt_len_from_token_ids(token_ids: list[int]) -> int:
+    # Token-passthrough avoids TTS text tokenization, so size the placeholder
+    # span from the assistant-template token ids that Qwen3-TTS will consume.
+    return max(32, min(4096, len(token_ids) + 64))
+
+
 def aura2tts(
     source_outputs: list[Any],
     prompt: Any = None,
@@ -205,13 +220,23 @@ def aura2tts(
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
         task_type = _first_value(additional_info.get("tts_task_type"), "Base")
+        assistant_token_ids = _qwen3_tts_assistant_token_ids_from_aura(source_output)
         tts_info = {
             "task_type": [task_type],
-            "text": [text],
             "language": [_first_value(additional_info.get("tts_language"), "Chinese")],
             "instruct": [_first_value(additional_info.get("tts_instruct"), "")],
             "max_new_tokens": [int(_first_value(additional_info.get("tts_max_new_tokens"), 2048))],
         }
+        if assistant_token_ids:
+            tts_info[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids]
+            prompt_len = _estimate_tts_prompt_len_from_token_ids(assistant_token_ids)
+            print("Using assistant token ids for TTS prompt length estimation: %r", assistant_token_ids)
+        else:
+            # Defensive fallback for synthetic outputs or legacy callers that do
+            # not populate cumulative_token_ids.
+            tts_info["text"] = [text]
+            prompt_len = _estimate_tts_prompt_len(text)
+            print("Using text fallback for TTS prompt length estimation: %r", text)
         if task_type == "Base":
             ref_audio = _first_value(additional_info.get("tts_ref_audio"), DEFAULT_QWEN3_TTS_REF_AUDIO)
             ref_text = _first_value(additional_info.get("tts_ref_text"), DEFAULT_QWEN3_TTS_REF_TEXT)
@@ -225,13 +250,9 @@ def aura2tts(
             tts_info["speaker"] = [
                 _normalize_qwen3_tts_speaker(_first_value(additional_info.get("tts_speaker"), "Vivian"))
             ]
-        if _first_bool(additional_info.get("tts_use_aura_token_ids"), False):
-            assistant_token_ids = _qwen3_tts_assistant_token_ids_from_aura(source_output)
-            if assistant_token_ids:
-                tts_info[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids]
         next_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=[0] * _estimate_tts_prompt_len(text),
+                prompt_token_ids=[0] * prompt_len,
                 additional_information=tts_info,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,

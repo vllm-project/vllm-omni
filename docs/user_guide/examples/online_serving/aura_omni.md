@@ -41,6 +41,6 @@ turn.
   checkpoint for stages 2 and 3 in `aura_omni.yaml`, then pass
   `tts_task_type=CustomVoice` and `tts_speaker`.
 
-Experimental token passthrough is available with `tts_use_aura_token_ids=true`.
-It trims AURA response boundary tokens and passes the generated token ids into
-Qwen3-TTS directly instead of re-tokenizing the response text.
+AURA responses are passed to Qwen3-TTS as generated token ids. The
+pipeline trims AURA response boundary tokens and passes the resulting assistant
+template ids directly into Qwen3-TTS instead of re-tokenizing response text.

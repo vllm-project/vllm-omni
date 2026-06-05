@@ -4,6 +4,10 @@ set -euo pipefail
 PORT="${PORT:-8091}"
 MODEL="${MODEL:-aura_omni}"
 OUTPUT_DIR="${OUTPUT_DIR:-output_aura_omni_online}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VLLM_OMNI_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+CLONE_REF_AUDIO="${VLLM_OMNI_ROOT}/tests/assets/qwen3_tts/clone_2.wav"
+CLONE_REF_TEXT="Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 mkdir -p "$OUTPUT_DIR"
 
 MARY_HAD_LAMB_AUDIO_URL="https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/mary_had_lamb.ogg"
@@ -21,6 +25,9 @@ request_body=$(cat <<EOF
   ],
   "additional_information": {
     "aura_system_prompt": "You are receiving a live video stream where the final frame is the present moment. Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in Chinese.",
+    "tts_task_type": "Base",
+    "tts_ref_audio": "file://${CLONE_REF_AUDIO}",
+    "tts_ref_text": "${CLONE_REF_TEXT}",
     "tts_language": "Chinese",
     "tts_speaker": "Vivian",
     "tts_instruct": ""

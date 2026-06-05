@@ -87,7 +87,10 @@ def test_aura2tts_builds_qwen3_tts_prompt_information():
     [tts_input] = aura2tts([_source_output("你好。")], prompt=[prompt])
 
     assert len(tts_input["prompt_token_ids"]) >= 32
-    assert tts_input["additional_information"]["text"] == ["你好。"]
+    assert "text" not in tts_input["additional_information"]
+    assert tts_input["additional_information"][PRECOMPUTED_TEXT_IDS_KEY] == [
+        [151644, 77091, 198, 1, 2, 3, 151645, 198, 151644, 77091, 198]
+    ]
     assert tts_input["additional_information"]["task_type"] == ["Base"]
     assert tts_input["additional_information"]["language"] == ["Chinese"]
     assert tts_input["additional_information"]["ref_audio"] == [DEFAULT_QWEN3_TTS_REF_AUDIO]
@@ -140,10 +143,9 @@ def test_aura2tts_supports_custom_voice_mode():
     assert "ref_audio" not in tts_input["additional_information"]
 
 
-def test_aura2tts_can_pass_aura_token_ids_to_qwen3_tts():
+def test_aura2tts_passes_aura_token_ids_to_qwen3_tts_by_default():
     prompt = {
         "additional_information": {
-            "tts_use_aura_token_ids": [True],
             "tts_ref_text": ["测试参考文本。"],
         }
     }
@@ -161,6 +163,7 @@ def test_aura2tts_can_pass_aura_token_ids_to_qwen3_tts():
     assert tts_input["additional_information"][PRECOMPUTED_TEXT_IDS_KEY] == [
         [151644, 77091, 198, 108386, 1773, 151645, 198, 151644, 77091, 198]
     ]
+    assert "text" not in tts_input["additional_information"]
 
 
 def test_aura2tts_drops_silent_response():

@@ -6,9 +6,7 @@ This example runs the native AURA Omni pipeline offline:
 Qwen3-ASR -> AURA/Qwen3-VL -> Qwen3-TTS Talker -> Qwen3-TTS Code2Wav
 ```
 
-The first stage consumes speech and produces a transcript. The AURA stage then
-combines the transcript with the video frames from the original request and
-returns text or `<|silent|>`. Non-silent text is passed to Qwen3-TTS.
+The first stage consumes speech and produces a transcript. The AURA stage then combines the transcript with the video frames from the original request and returns text or `<|silent|>`. Non-silent responses are passed to Qwen3-TTS as AURA-generated token ids.
 
 ## Run
 
@@ -43,12 +41,6 @@ to point at a Qwen3-TTS CustomVoice checkpoint:
 python end2end.py \
   --tts-task-type CustomVoice \
   --tts-speaker Vivian
-```
-
-Experimental AURA-to-TTS token passthrough:
-
-```bash
-python end2end.py --tts-use-aura-token-ids
 ```
 
 For local checkpoints, edit the stage `model` entries in

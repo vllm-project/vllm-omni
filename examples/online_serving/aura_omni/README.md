@@ -49,7 +49,6 @@ Expected request shape:
   - `tts_ref_audio`
   - `tts_ref_text`
   - `tts_x_vector_only_mode`
-  - `tts_use_aura_token_ids`
 
 If AURA emits `<|silent|>`, the `aura2tts` processor returns no TTS request, so
 the TTS stages are skipped for that turn.
@@ -78,8 +77,8 @@ Base voice clone mode (default, recommended as x-vector while debugging ICL):
 ```bash
 python examples/online_serving/aura_omni/openai_chat_completion_client.py \
   --tts-task-type Base \
-  --tts-ref-audio /data/yrr/rein_test/shuhan.mp3 \
-  --tts-x-vector-only-mode
+  --tts-ref-audio vllm-omni/tests/assets/qwen3_tts/clone_2.wav \
+  --tts-ref-text "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 ```
 
 CustomVoice mode requires stages 2 and 3 in `aura_omni.yaml` to point at a
@@ -91,12 +90,8 @@ python examples/online_serving/aura_omni/openai_chat_completion_client.py \
   --tts-speaker Vivian
 ```
 
-To try AURA token passthrough into Qwen3-TTS:
-
-```bash
-python examples/online_serving/aura_omni/openai_chat_completion_client.py \
-  --tts-use-aura-token-ids
-```
+AURA responses are passed to Qwen3-TTS as AURA-generated token ids by default,
+so Qwen3-TTS does not re-tokenize the response text.
 
 ## Curl
 

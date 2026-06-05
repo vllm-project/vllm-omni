@@ -30,7 +30,7 @@ from vllm_omni.utils.speaker_cache import (
 )
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
-from .prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder
+from .prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY, Qwen3TTSPromptEmbedsBuilder
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Encoder
@@ -38,6 +38,19 @@ from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2E
 logger = init_logger(__name__)
 
 _TRAILING_TEXT_COMPACT_MIN_FRAMES = 64
+
+
+def _has_tts_text_conditioning(info_dict: dict[str, Any], hidden_states: Any | None = None) -> bool:
+    text_list = info_dict.get("text")
+    if isinstance(text_list, list) and bool(text_list) and bool(text_list[0]):
+        return True
+    if PRECOMPUTED_TEXT_IDS_KEY in info_dict:
+        return True
+    if isinstance(hidden_states, dict):
+        tail = hidden_states.get("trailing_text")
+        if isinstance(tail, torch.Tensor):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -625,9 +638,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             except Exception:
                 is_prefill = span_len > 1
 
-        text_list = info_dict.get("text")
-        if not isinstance(text_list, list) or not text_list or not text_list[0]:
-            raise ValueError("Missing additional_information.text for Qwen3-TTS AR talker.")
+        if not _has_tts_text_conditioning(info_dict, hs):
+            raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
 
         task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
         codec_streaming_val = meta.get("codec_streaming")
@@ -808,9 +820,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             hs = payload.get("hidden_states", {})
             meta = payload.get("meta", {})
 
-            text_list = info_dict.get("text")
-            if not isinstance(text_list, list) or not text_list or not text_list[0]:
-                raise ValueError("Missing additional_information.text for Qwen3-TTS AR talker.")
+            if not _has_tts_text_conditioning(info_dict, hs):
+                raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
 
             task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
             codec_streaming_val = meta.get("codec_streaming")

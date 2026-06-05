@@ -12,6 +12,10 @@ import soundfile as sf
 from openai import OpenAI
 from vllm.assets.audio import AudioAsset
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    DEFAULT_QWEN3_TTS_REF_TEXT,
+    default_qwen3_tts_ref_audio_path,
+)
 
 SEED = 42
 DEFAULT_MODEL = "aura_omni"
@@ -134,7 +138,6 @@ def main(args) -> None:
                 "tts_ref_audio": args.tts_ref_audio,
                 "tts_ref_text": args.tts_ref_text,
                 "tts_x_vector_only_mode": args.tts_x_vector_only_mode,
-                "tts_use_aura_token_ids": args.tts_use_aura_token_ids,
             },
         },
         timeout=args.timeout,
@@ -166,17 +169,20 @@ def parse_args():
     parser.add_argument("--tts-language", default="Chinese")
     parser.add_argument("--tts-speaker", default="Vivian")
     parser.add_argument("--tts-instruct", default="")
-    parser.add_argument("--tts-ref-audio", default=None, help="Base-mode reference audio path/URL visible to server.")
-    parser.add_argument("--tts-ref-text", default=None, help="Base-mode reference audio transcript.")
+    parser.add_argument(
+        "--tts-ref-audio",
+        default=default_qwen3_tts_ref_audio_path(),
+        help="Base-mode reference audio path/URL visible to server.",
+    )
+    parser.add_argument(
+        "--tts-ref-text",
+        default=DEFAULT_QWEN3_TTS_REF_TEXT,
+        help="Base-mode reference audio transcript.",
+    )
     parser.add_argument(
         "--tts-x-vector-only-mode",
         action="store_true",
         help="Use speaker embedding only for Base mode (disable ICL ref_text conditioning).",
-    )
-    parser.add_argument(
-        "--tts-use-aura-token-ids",
-        action="store_true",
-        help="Experimental: pass AURA generated token ids directly into Qwen3-TTS text ids.",
     )
     parser.add_argument("--timeout", type=float, default=600.0)
     return parser.parse_args()
