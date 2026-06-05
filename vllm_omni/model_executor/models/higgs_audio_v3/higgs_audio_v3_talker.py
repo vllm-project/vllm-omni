@@ -828,7 +828,12 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         for ckpt_prefix, model_prefix in _BACKBONE_PREFIX_MAP.items():
             if name.startswith(ckpt_prefix):
                 return name.replace(ckpt_prefix, model_prefix, 1)
-        return None
+        # Reject unexpected non-codec Higgs checkpoint keys
+        raise ValueError(
+            f"Unexpected checkpoint key with no known mapping: {name!r}. "
+            f"Known prefixes: {list(_BACKBONE_PREFIX_MAP.keys())}, "
+            f"{_MODALITY_EMBEDDING_PREFIX!r}, {_MODALITY_HEAD_PREFIX!r}, {_CODEC_PREFIX!r}"
+        )
 
 
 class _BackboneWrapper(nn.Module):

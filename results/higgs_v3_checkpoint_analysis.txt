@@ -4,7 +4,7 @@ HF_HOME: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yueka
 
 
 Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]
-Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 5355.00it/s]
+Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 5104.11it/s]
 Snapshot path: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/.cache/huggingface/hub/models--bosonai--higgs-audio-v3-tts-4b/snapshots/e47035915457a842f97199cf7dc005abe5ad93da
 Files: ['config.json', 'model.safetensors.index.json', 'tokenizer.json', 'tokenizer_config.json']
 
@@ -167,5 +167,10 @@ Codec key prefixes (528 total):
   codec:quantizer.quantizers.0.project_out.bias: dtype=BF16, shape=[1024]
   codec:fc2.weight: dtype=BF16, shape=[256, 1024]
   codec:fc2.bias: dtype=BF16, shape=[256]
+  codec:acoustic_decoder.conv1.weight: dtype=BF16, shape=[1024, 256, 7]
+  codec:acoustic_decoder.conv1.bias: dtype=BF16, shape=[1024]
+  codec:acoustic_decoder.block.0.conv_t1.weight: dtype=BF16, shape=[1024, 512, 16]
+  codec:acoustic_decoder.block.0.res_unit1.conv1.weight: dtype=BF16, shape=[512, 512, 7]
+  codec:acoustic_decoder.conv2.weight: dtype=BF16, shape=[1, 32, 7]
 
 === Analysis Complete ===

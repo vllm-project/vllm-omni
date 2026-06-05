@@ -175,6 +175,12 @@ def main():
             "tied.embedding.modality_embeddings.0.model.quantizer.quantizers.0.project_out.bias",
             "tied.embedding.modality_embeddings.0.model.fc2.weight",
             "tied.embedding.modality_embeddings.0.model.fc2.bias",
+            # DAC acoustic decoder representative shapes
+            "tied.embedding.modality_embeddings.0.model.acoustic_decoder.conv1.weight",
+            "tied.embedding.modality_embeddings.0.model.acoustic_decoder.conv1.bias",
+            "tied.embedding.modality_embeddings.0.model.acoustic_decoder.block.0.conv_t1.weight",
+            "tied.embedding.modality_embeddings.0.model.acoustic_decoder.block.0.res_unit1.conv1.weight",
+            "tied.embedding.modality_embeddings.0.model.acoustic_decoder.conv2.weight",
         ]
         for k in shape_keys:
             info = sf_header.get(k, {})
