@@ -287,7 +287,10 @@ class HiggsAudioV3Code2Wav(nn.Module):
             )
         acoustic_decoder.eval()
 
-        # Verify all codec keys were consumed
+        # Verify required decoder-side codec keys were consumed. The V3
+        # checkpoint also bundles encoder-side keys (acoustic_encoder.*,
+        # encoder_semantic.*, decoder_semantic.*, semantic_model.*, fc.*, fc1.*)
+        # that the DAC decoder does not need — those are allowed but ignored.
         consumed: set[str] = set()
         for i in range(required_quantizers):
             prefix = f"quantizer.quantizers.{i}"
@@ -302,9 +305,26 @@ class HiggsAudioV3Code2Wav(nn.Module):
             if k.startswith("acoustic_decoder."):
                 consumed.add(k)
 
-        unconsumed = set(codec_state.keys()) - consumed
+        # Known encoder-side prefixes that are bundled but not needed by the decoder
+        _KNOWN_UNUSED_PREFIXES = (
+            "acoustic_encoder.",
+            "encoder_semantic.",
+            "decoder_semantic.",
+            "semantic_model.",
+            "fc.",
+            "fc1.",
+        )
+        unconsumed = set()
+        for k in codec_state:
+            if k in consumed:
+                continue
+            if any(k.startswith(p) for p in _KNOWN_UNUSED_PREFIXES):
+                continue
+            unconsumed.add(k)
         if unconsumed:
-            raise RuntimeError(f"Bundled codec has {len(unconsumed)} unconsumed keys: {sorted(unconsumed)[:10]}...")
+            raise RuntimeError(
+                f"Bundled codec has {len(unconsumed)} unexpected decoder-side keys: {sorted(unconsumed)[:10]}..."
+            )
 
         self.quantizer = quantizer
         self.fc2 = fc2

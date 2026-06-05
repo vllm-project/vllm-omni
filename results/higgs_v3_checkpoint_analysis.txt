@@ -1,0 +1,150 @@
+=== Higgs-Audio-V3 Checkpoint Analysis ===
+Repo: bosonai/higgs-audio-v3-tts-4b
+HF_HOME: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/.cache/huggingface
+
+
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]
+Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 4781.20it/s]
+Snapshot path: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/.cache/huggingface/hub/models--bosonai--higgs-audio-v3-tts-4b/snapshots/e47035915457a842f97199cf7dc005abe5ad93da
+Files: ['config.json', 'model.safetensors.index.json', 'tokenizer.json', 'tokenizer_config.json']
+
+=== config.json ===
+model_type: higgs_multimodal_qwen3
+architectures: ['HiggsMultimodalQwen3ForConditionalGeneration']
+audio_token_id: -100
+
+audio_encoder_config:
+  encoder_type: discrete
+  num_codebooks: 8
+  vocab_size: 1026
+  out_dim: 2560
+  tie_word_embeddings: True
+  use_delay_pattern: True
+
+text_config:
+  model_type: qwen3
+  hidden_size: 2560
+  num_hidden_layers: 36
+  num_attention_heads: 32
+  num_key_value_heads: 8
+  head_dim: 128
+  intermediate_size: 9728
+  vocab_size: 151936
+  bos_token_id: 151643
+  eos_token_id: 151643
+  tie_word_embeddings: True
+  rms_norm_eps: 1e-06
+  max_position_embeddings: 32768
+
+=== tokenizer.json special tokens ===
+    151643  '<|endoftext|>'  special=True
+    151646  '<|object_ref_start|>'  special=True
+    151647  '<|object_ref_end|>'  special=True
+    151666  '<|streaming_asr|>'  special=True
+    151667  '<|tts|>'  special=True
+    151668  '<|streaming_tts|>'  special=True
+    151669  '<|audio_cont_txt|>'  special=True
+    151670  '<|audio|>'  special=True
+    151671  '<|audio_end|>'  special=True
+    151672  '<|text|>'  special=True
+    151673  '<|text_end|>'  special=True
+    151678  '<|await_audio|>'  special=True
+    151679  '<|ref_audio|>'  special=True
+    151680  '<|ref_text|>'  special=True
+
+EOS-related tokens:
+    151643  '<|endoftext|>'  special=True
+    151645  '<|im_end|>'  special=True
+    151647  '<|object_ref_end|>'  special=True
+    151649  '<|box_end|>'  special=True
+    151651  '<|quad_end|>'  special=True
+    151653  '<|vision_end|>'  special=True
+    151671  '<|audio_end|>'  special=True
+    151673  '<|text_end|>'  special=True
+
+=== model.safetensors.index.json ===
+Total keys: 927
+
+Key groups (39):
+    11  body.layers.0
+    11  body.layers.1
+    11  body.layers.10
+    11  body.layers.11
+    11  body.layers.12
+    11  body.layers.13
+    11  body.layers.14
+    11  body.layers.15
+    11  body.layers.16
+    11  body.layers.17
+    11  body.layers.18
+    11  body.layers.19
+    11  body.layers.2
+    11  body.layers.20
+    11  body.layers.21
+    11  body.layers.22
+    11  body.layers.23
+    11  body.layers.24
+    11  body.layers.25
+    11  body.layers.26
+    11  body.layers.27
+    11  body.layers.28
+    11  body.layers.29
+    11  body.layers.3
+    11  body.layers.30
+    11  body.layers.31
+    11  body.layers.32
+    11  body.layers.33
+    11  body.layers.34
+    11  body.layers.35
+    11  body.layers.4
+    11  body.layers.5
+    11  body.layers.6
+    11  body.layers.7
+    11  body.layers.8
+    11  body.layers.9
+     1  body.norm
+         body.norm.weight
+   529  tied.embedding.modality_embeddings.0
+     1  tied.embedding.text_embedding
+         tied.embedding.text_embedding.weight
+
+body.layers.0 keys (11):
+  body.layers.0.input_layernorm.weight
+  body.layers.0.mlp.down_proj.weight
+  body.layers.0.mlp.gate_proj.weight
+  body.layers.0.mlp.up_proj.weight
+  body.layers.0.post_attention_layernorm.weight
+  body.layers.0.self_attn.k_norm.weight
+  body.layers.0.self_attn.k_proj.weight
+  body.layers.0.self_attn.o_proj.weight
+  body.layers.0.self_attn.q_norm.weight
+  body.layers.0.self_attn.q_proj.weight
+  body.layers.0.self_attn.v_proj.weight
+
+Codec key prefixes (528 total):
+   105  acoustic_decoder.block
+     2  acoustic_decoder.conv1
+     2  acoustic_decoder.conv2
+     1  acoustic_decoder.snake1
+   105  acoustic_encoder.block
+     2  acoustic_encoder.conv1
+     2  acoustic_encoder.conv2
+     1  acoustic_encoder.snake1
+     1  decoder_semantic.conv1
+     1  decoder_semantic.conv2
+    12  decoder_semantic.conv_blocks
+     1  encoder_semantic.conv
+    12  encoder_semantic.conv_blocks
+     1  fc.bias
+     1  fc.weight
+     1  fc1.bias
+     1  fc1.weight
+     1  fc2.bias
+     1  fc2.weight
+    64  quantizer.quantizers
+   197  semantic_model.encoder
+     9  semantic_model.feature_extractor
+     4  semantic_model.feature_projection
+     1  semantic_model.masked_spec_embed
+
+=== Analysis Complete ===
