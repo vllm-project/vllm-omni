@@ -87,6 +87,7 @@ from vllm_omni.model_executor.models.moss_tts.pipeline import (
 from vllm_omni.model_executor.models.moss_tts_nano.pipeline import MOSS_TTS_NANO_PIPELINE
 from vllm_omni.model_executor.models.omnivoice.pipeline import OMNIVOICE_PIPELINE
 from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
+from vllm_omni.model_executor.models.pi0.pipeline import PI0_PIPELINE
 from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
     QWEN2_5_OMNI_PIPELINE,
     QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
@@ -126,6 +127,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lance": LANCE_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
+    "pi0": PI0_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,
     "hunyuan_image3_ar": HUNYUAN_IMAGE3_AR_PIPELINE,

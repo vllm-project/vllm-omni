@@ -1302,6 +1302,17 @@ class OmniDiffusionConfig:
                         self.update_multimodal_support()
                     else:
                         raise
+                elif (
+                    model_type == "pi0"
+                    or cfg.get("type") == "pi0"
+                    or "Pi0ForActionPrediction" in architectures
+                ):
+                    # π0 (Pi-Zero) VLA. The LeRobot checkpoint uses ``type: "pi0"``;
+                    # the SGLang-converted one adds ``model_type``/``architectures``.
+                    if self.model_class_name is None:
+                        self.model_class_name = "Pi0Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     architecture = architectures[0]
                     from vllm_omni.diffusion.registry import DiffusionModelRegistry
