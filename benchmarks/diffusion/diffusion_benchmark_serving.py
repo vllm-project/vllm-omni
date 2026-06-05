@@ -1032,6 +1032,88 @@ def wait_for_service(base_url: str, timeout: int = 120) -> None:
         time.sleep(1)
 
 
+def _parse_profiler_stages(profiler_stages: str | None) -> list[int] | None:
+    if not profiler_stages:
+        return None
+
+    try:
+        stages = [int(stage.strip()) for stage in profiler_stages.split(",") if stage.strip()]
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid --profiler-stages format: {profiler_stages}. Expected comma-separated integers."
+        ) from exc
+
+    return stages or None
+
+
+def _build_profiler_request_body(args) -> dict[str, Any] | None:
+    request_body: dict[str, Any] = {}
+
+    profiler_stages = _parse_profiler_stages(args.profiler_stages)
+    if profiler_stages is not None:
+        request_body["stages"] = profiler_stages
+
+    return request_body or None
+
+
+async def _read_profiler_response(response: aiohttp.ClientResponse) -> Any:
+    response_text = await response.text()
+    if not response_text:
+        return None
+
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        return response_text
+
+
+async def _start_profiler(session: aiohttp.ClientSession, args) -> None:
+    print("[Profiler] Starting profiler...")
+    async with session.post(
+        f"{args.base_url}/start_profile",
+        json=_build_profiler_request_body(args),
+    ) as response:
+        if response.status != 200:
+            error_text = await response.text()
+            raise RuntimeError(f"Failed to start profiler: HTTP {response.status} - {error_text}")
+        result = await _read_profiler_response(response)
+        if result is None:
+            print("[Profiler] Started.")
+        else:
+            print(f"[Profiler] Started: {result}")
+
+
+async def _stop_profiler(session: aiohttp.ClientSession, args) -> None:
+    print("\n[Profiler] Stopping profiler...")
+    async with session.post(
+        f"{args.base_url}/stop_profile",
+        json=_build_profiler_request_body(args),
+    ) as response:
+        if response.status != 200:
+            error_text = await response.text()
+            print(f"[Profiler] Warning: Failed to stop profiler: HTTP {response.status} - {error_text}")
+            return
+
+        profile_results = await _read_profiler_response(response)
+        if profile_results is None:
+            print("[Profiler] Stopped.")
+            return
+
+        if profile_results and isinstance(profile_results, dict):
+            traces = profile_results.get("traces", [])
+            print("\n" + "=" * 60)
+            print("[Profiler] Results:")
+            for rank, trace in enumerate(traces):
+                print(f"\nRank {rank}:")
+                if trace:
+                    print(f"  • Trace: {trace}")
+            if not traces:
+                print("  No traces collected.")
+            print("=" * 60)
+        else:
+            print("[Profiler] No valid profiling data returned.")
+
+
 def _default_endpoint_for_task(task: str) -> str:
     if task in {"t2v", "i2v", "ti2v"}:
         return "/v1/videos"
@@ -1131,6 +1213,10 @@ async def benchmark(args):
                 args=args,
             )
 
+        profiler_enabled = args.enable_profiler
+        if profiler_enabled:
+            await _start_profiler(session, args)
+
         start_time = time.perf_counter()
         tasks = []
         async for req in iter_requests(requests_list=requests_list, request_rate=args.request_rate):
@@ -1140,7 +1226,10 @@ async def benchmark(args):
         outputs = await asyncio.gather(*tasks)
         total_duration = time.perf_counter() - start_time
 
-    pbar.close()
+        pbar.close()
+
+        if profiler_enabled:
+            await _stop_profiler(session, args)
 
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
@@ -1357,6 +1446,18 @@ if __name__ == "__main__":
         type=str,
         default="think",
         help=("bot_task form field for --endpoint /v1/images/edits (think, recaption, think_recaption, vanilla)."),
+    )
+    parser.add_argument(
+        "--enable-profiler",
+        action="store_true",
+        default=False,
+        help="Enable profiler for the benchmark. Sends POST /start_profile before and /stop_profile after benchmark.",
+    )
+    parser.add_argument(
+        "--profiler-stages",
+        type=str,
+        default=None,
+        help=("Comma-separated list of stage IDs to profile (e.g., '0,1'). If not specified, profiles all stages."),
     )
 
     args = parser.parse_args()
