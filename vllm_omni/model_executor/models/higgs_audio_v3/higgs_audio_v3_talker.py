@@ -222,7 +222,13 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            hidden_states = self.model.embed_tokens(input_ids)
+            # Mask -100 placeholders to 0 before embedding (they'll be replaced
+            # by _apply_ref_audio_substitution below). embed_tokens cannot
+            # handle negative indices.
+            safe_ids = input_ids
+            if input_ids is not None and (input_ids < 0).any():
+                safe_ids = torch.where(input_ids < 0, torch.zeros_like(input_ids), input_ids)
+            hidden_states = self.model.embed_tokens(safe_ids)
         else:
             hidden_states = inputs_embeds
 
@@ -246,6 +252,13 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         except Exception:
             self._last_step_query_start_loc = None
 
+        # Voice clone: replace -100 placeholder positions with ref audio embeddings
+        if input_ids is not None and inputs_embeds is None:
+            info_dicts = kwargs.get("model_intermediate_buffer")
+            if info_dicts is None:
+                info_dicts = kwargs.get("runtime_additional_information")
+            hidden_states = self._apply_ref_audio_substitution(hidden_states, input_ids, info_dicts)
+
         # Audio feedback at decode: replace continuation token embeddings
         if input_ids is not None and inputs_embeds is None:
             hidden_states = self._apply_audio_feedback(hidden_states, input_ids)
@@ -264,8 +277,101 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         return self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
-        text_embed = self.model.embed_tokens(input_ids)
+        safe_ids = input_ids
+        if input_ids is not None and (input_ids < 0).any():
+            safe_ids = torch.where(input_ids < 0, torch.zeros_like(input_ids), input_ids)
+        text_embed = self.model.embed_tokens(safe_ids)
         return self._apply_audio_feedback(text_embed, input_ids)
+
+    # ------------------------------------------------------------------ ref audio substitution
+    def _apply_ref_audio_substitution(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        info_dicts: list[dict[str, Any]] | None,
+    ) -> torch.Tensor:
+        """Replace -100 placeholder positions with fused multi-codebook embeddings
+        of the delay-pattern-encoded reference audio codes.
+
+        Called at prefill to inject voice clone reference. ``info_dicts`` is a
+        list of per-request dicts from ``model_intermediate_buffer``, each
+        containing ``audio_input_ids`` ([T, N] delayed codes) and
+        ``audio_input_ids_mask`` ([T] bool mask).
+        """
+        if not info_dicts:
+            return hidden_states
+
+        PLACEHOLDER = -100
+        flat_ids = input_ids.reshape(-1)
+        placeholder_mask = flat_ids == PLACEHOLDER
+        if not placeholder_mask.any():
+            return hidden_states
+
+        # Use query_start_loc to map placeholders to per-request spans
+        q_start = self._last_step_query_start_loc
+        if not isinstance(q_start, torch.Tensor) or q_start.numel() < 2:
+            # Fallback: single-request batch
+            q_start_list = [0, int(flat_ids.numel())]
+        else:
+            q_start_list = q_start.detach().to("cpu").tolist()
+
+        new_hidden: torch.Tensor | None = None
+        num_requests = min(len(info_dicts), len(q_start_list) - 1)
+
+        for i in range(num_requests):
+            info = info_dicts[i]
+            if not isinstance(info, dict):
+                continue
+
+            codes = info.get("audio_input_ids")
+            mask = info.get("audio_input_ids_mask")
+
+            # Handle msgspec serialization (may be list-wrapped)
+            if isinstance(codes, list):
+                codes = codes[0] if codes else None
+            if isinstance(mask, list):
+                mask = mask[0] if mask else None
+            if not isinstance(codes, torch.Tensor):
+                continue
+
+            # codes shape: [T, num_codebooks] delayed reference codes
+            if codes.ndim == 3:
+                codes = codes[0]
+            if codes.ndim != 2:
+                continue
+
+            if isinstance(mask, torch.Tensor):
+                if mask.ndim == 2:
+                    mask = mask[0]
+                codes = codes[mask.to(dtype=torch.bool)]
+
+            if codes.numel() == 0:
+                continue
+
+            # Find placeholder positions in this request's span
+            s = int(q_start_list[i])
+            e = int(q_start_list[i + 1])
+            if e - s <= 1:
+                continue  # Decode step, skip
+
+            span_mask = placeholder_mask[s:e]
+            placeholders = span_mask.nonzero(as_tuple=True)[0]
+            n_codes = int(codes.shape[0])
+
+            if int(placeholders.numel()) < n_codes:
+                continue  # Mismatch
+
+            # Embed delayed codes via fused multi-codebook embedding
+            target = placeholders[:n_codes] + s
+            codes_device = codes.to(device=hidden_states.device, dtype=torch.long)
+            embeds = self.multimodal_embedding(codes_device)  # [n_codes, hidden]
+
+            if new_hidden is None:
+                new_hidden = hidden_states.clone()
+            flat_hidden = new_hidden.reshape(-1, new_hidden.shape[-1])
+            flat_hidden[target] = embeds.to(new_hidden.dtype)
+
+        return new_hidden if new_hidden is not None else hidden_states
 
     # ------------------------------------------------------------------ audio feedback
     def _apply_audio_feedback(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:

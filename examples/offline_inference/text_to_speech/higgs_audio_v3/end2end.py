@@ -6,11 +6,18 @@ Runs Stage 0 (Qwen3 talker) + Stage 1 (HiggsAudio codec) end-to-end
 through the vLLM-Omni engine without going through the HTTP server, and
 saves a 24 kHz mono WAV per prompt.
 
-Example:
+Example (plain TTS):
 
-    python examples/offline_inference/text_to_speech/higgs_audio_v3/end2end.py \
-        --texts "Hello world." \
-                "The quick brown fox jumps over the lazy dog." \
+    python examples/offline_inference/text_to_speech/higgs_audio_v3/end2end.py \\
+        --texts "Hello world." \\
+        --output-dir results/higgs_v3_wavs
+
+Example (voice clone):
+
+    python examples/offline_inference/text_to_speech/higgs_audio_v3/end2end.py \\
+        --texts "Hello world." \\
+        --ref-audio path/to/reference.wav \\
+        --ref-text "Transcript of the reference clip." \\
         --output-dir results/higgs_v3_wavs
 """
 
@@ -74,6 +81,18 @@ def parse_args():
         default=2048,
         help="Cap on Stage-0 codec frames per request.",
     )
+    parser.add_argument(
+        "--ref-audio",
+        type=str,
+        default=None,
+        help="Reference audio for voice clone (WAV/FLAC/MP3 path).",
+    )
+    parser.add_argument(
+        "--ref-text",
+        type=str,
+        default=None,
+        help="Transcript of the reference audio. Optional but improves fidelity.",
+    )
     return parser.parse_args()
 
 
@@ -84,7 +103,6 @@ def _slugify(text: str) -> str:
 
 
 def _extract_pcm(multimodal_output: dict) -> torch.Tensor:
-    """Pull the final concatenated PCM tensor out of a request's multimodal_output."""
     audio = multimodal_output.get("model_outputs")
     if audio is None:
         audio = multimodal_output.get("audio")
@@ -115,25 +133,54 @@ def main():
 
     engine = Omni(model=args.model, deploy_config=args.deploy_config, trust_remote_code=True)
 
-    # Build prompts using the v3 tokenizer adapter
     from transformers import AutoTokenizer
 
     from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import (
         HiggsAudioV3TokenizerAdapter,
+        apply_delay_pattern,
+        encode_reference_audio,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     adapter = HiggsAudioV3TokenizerAdapter(tokenizer)
 
+    # Load and encode reference audio once (if voice cloning)
+    ref_codes_delayed: torch.Tensor | None = None
+    if args.ref_audio is not None:
+        ref_wav, ref_sr = sf.read(args.ref_audio, always_2d=False)
+        if ref_wav.ndim == 2:
+            ref_wav = ref_wav.mean(axis=1)
+        ref_codes_raw = encode_reference_audio(ref_wav, int(ref_sr))
+        ref_codes_delayed = apply_delay_pattern(ref_codes_raw)
+        print(f"Reference   : {args.ref_audio}")
+        print(f"Ref codes   : {ref_codes_raw.shape[0]} frames -> {ref_codes_delayed.shape[0]} delayed")
+        if args.ref_text:
+            print(f"Ref text    : {args.ref_text}")
+
     print(f"Model       : {args.model}")
     print(f"Prompts     : {len(args.texts)}")
     print(f"Output dir  : {output_dir}")
+    print(f"Voice clone : {'yes' if ref_codes_delayed is not None else 'no'}")
 
     total_elapsed = 0.0
     total_dur = 0.0
     for text in args.texts:
-        prompt_ids = adapter.build_prompt(text)
-        prompt = {"prompt_token_ids": prompt_ids}
+        if ref_codes_delayed is not None:
+            prompt_ids = adapter.build_prompt(
+                text,
+                num_ref_tokens=int(ref_codes_delayed.shape[0]),
+                reference_text=args.ref_text,
+            )
+            prompt = {
+                "prompt_token_ids": prompt_ids,
+                "additional_information": {
+                    "audio_input_ids": ref_codes_delayed.to(torch.long),
+                    "audio_input_ids_mask": torch.ones(ref_codes_delayed.shape[0], dtype=torch.bool),
+                },
+            }
+        else:
+            prompt_ids = adapter.build_prompt(text)
+            prompt = {"prompt_token_ids": prompt_ids}
 
         t_start = time.perf_counter()
         outputs = engine.generate([prompt])
