@@ -109,11 +109,18 @@ def talker2code2wav(
         # Transpose to [Q, T] for delay pattern reversal
         codes_qt = audio_codes.transpose(0, 1).contiguous().cpu()
 
-        # Step 1: Revert delay pattern FIRST
+        # Step 1: Revert delay pattern
         codes_qt = _revert_delay_pattern(codes_qt)
 
-        # Step 2: Filter BOC/EOC AFTER de-delay
-        codes_qt = _filter_real_code_frames(codes_qt)
+        # Step 2: Clamp to real code range [0, 1023]
+        codes_qt = codes_qt.clamp_(min=0, max=_NUM_REAL_CODES - 1)
+
+        # Step 3: Trim first and last frame. The first frame is the all-BOC
+        # seed emitted at the audio_bos transition, and the last frame is
+        # the all-EOC ramp-down. This matches upstream's
+        # revert_delay_pattern(out).clip(0, real-1)[:, 1:-1].
+        if codes_qt.shape[-1] >= 3:
+            codes_qt = codes_qt[:, 1:-1]
 
         if codes_qt.numel() == 0:
             code2wav_inputs.append(
