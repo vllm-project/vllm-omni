@@ -419,35 +419,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         cb_logits = self._audio_codebook_logits(hidden, is_audio)
 
         # Apply delay pattern masking BEFORE sampling
-        bos_pre = BOC_ID
-        eos_pre = EOC_ID
-        for local_i, batch_i in enumerate(audio_row_indices):
-            state = self._audio_state.get(int(batch_i))
-            num_delay = int(state["num_delay"]) if state else 0
-            num_rem = state.get("num_remaining_delays") if state else None
-
-            if num_rem is not None:
-                lock_until = num_codebooks - int(num_rem)
-                for q in range(num_codebooks):
-                    row = cb_logits[local_i, q]
-                    if q < lock_until:
-                        mask = torch.full_like(row, float("-inf"))
-                        mask[eos_pre] = row[eos_pre]
-                        cb_logits[local_i, q] = mask
-                    else:
-                        cb_logits[local_i, q, bos_pre] = float("-inf")
-                        cb_logits[local_i, q, eos_pre] = float("-inf")
-            else:
-                for q in range(num_codebooks):
-                    row = cb_logits[local_i, q]
-                    if q > num_delay:
-                        mask = torch.full_like(row, float("-inf"))
-                        mask[bos_pre] = row[bos_pre]
-                        cb_logits[local_i, q] = mask
-                    else:
-                        cb_logits[local_i, q, bos_pre] = float("-inf")
-                        if q != 0:
-                            cb_logits[local_i, q, eos_pre] = float("-inf")
+        self._apply_delay_pattern_masking(cb_logits, audio_row_indices)
 
         # Sample per-codebook
         cb_logits_2d = cb_logits.reshape(-1, cb_logits.shape[-1])
@@ -572,6 +544,44 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 device=hidden_states.device,
             )
         return self.modality_head.generate(hidden_flat[mask])
+
+    def _apply_delay_pattern_masking(self, cb_logits: torch.Tensor, audio_row_indices: list[int]) -> None:
+        """Mask per-codebook logits according to delay pattern state, in-place.
+
+        During delay phase: codebooks beyond delay_count only allow BOC.
+        During ramp-down: locked codebooks only allow EOC.
+        Normal generation: BOC disallowed; only cb0 allows EOC.
+        """
+        bos_pre = BOC_ID
+        eos_pre = EOC_ID
+        num_codebooks = self.num_codebooks
+        for local_i, batch_i in enumerate(audio_row_indices):
+            state = self._audio_state.get(int(batch_i))
+            num_delay = int(state["num_delay"]) if state else 0
+            num_rem = state.get("num_remaining_delays") if state else None
+
+            if num_rem is not None:
+                lock_until = num_codebooks - int(num_rem)
+                for q in range(num_codebooks):
+                    row = cb_logits[local_i, q]
+                    if q < lock_until:
+                        mask = torch.full_like(row, float("-inf"))
+                        mask[eos_pre] = row[eos_pre]
+                        cb_logits[local_i, q] = mask
+                    else:
+                        cb_logits[local_i, q, bos_pre] = float("-inf")
+                        cb_logits[local_i, q, eos_pre] = float("-inf")
+            else:
+                for q in range(num_codebooks):
+                    row = cb_logits[local_i, q]
+                    if q > num_delay:
+                        mask = torch.full_like(row, float("-inf"))
+                        mask[bos_pre] = row[bos_pre]
+                        cb_logits[local_i, q] = mask
+                    else:
+                        cb_logits[local_i, q, bos_pre] = float("-inf")
+                        if q != 0:
+                            cb_logits[local_i, q, eos_pre] = float("-inf")
 
     def _sample_audio_codes(self, logits_2d: torch.Tensor) -> torch.Tensor:
         """Replicate upstream sampling: temperature → top-k → top-p → multinomial."""

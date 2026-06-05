@@ -388,6 +388,65 @@ class TestFeedbackMethods:
         assert r2 == {}  # Second row is all -1
 
 
+# ---- AC-6: Audio Feedback Method Tests ----
+
+
+class TestAudioFeedback:
+    """Test _apply_audio_feedback with minimal fake talker."""
+
+    def _make_feedback_talker(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        embed = mod.HiggsFusedMultiTextEmbedding(num_codebooks=8, vocab_size=1026, hidden_size=16)
+        torch.nn.init.ones_(embed.weight)
+
+        class FakeTalker:
+            num_codebooks = 8
+            codebook_size = 1026
+            _audio_continuation_id = 99999  # fake audio token
+            _last_step_query_start_loc = None
+            _audio_state = {}
+            multimodal_embedding = embed
+            model = type("M", (), {"embed_tokens": lambda self, ids: torch.zeros(ids.shape[0], 16)})()
+
+        t = FakeTalker()
+        t._apply_audio_feedback = mod.HiggsAudioV3TalkerForConditionalGeneration._apply_audio_feedback.__get__(t)
+        return t
+
+    def test_text_positions_unchanged(self):
+        """Non-audio positions should not be modified."""
+        t = self._make_feedback_talker()
+        # No audio state → all positions unchanged
+        input_ids = torch.tensor([1, 2, 3, 4])
+        hidden = torch.randn(4, 16)
+        result = t._apply_audio_feedback(hidden, input_ids)
+        assert torch.equal(result, hidden)
+
+    def test_audio_position_replaced_with_state(self):
+        """Audio position with state should have its embedding replaced."""
+        t = self._make_feedback_talker()
+        audio_id = t._audio_continuation_id
+        t._audio_state[1] = {"last_codes": torch.zeros(8, dtype=torch.long)}
+        input_ids = torch.tensor([1, audio_id, 3])
+        hidden = torch.zeros(3, 16)
+        result = t._apply_audio_feedback(hidden, input_ids)
+        # Position 1 (audio) should be non-zero (embedding of all-0 codes)
+        assert result[1].abs().sum() > 0
+        # Positions 0 and 2 should remain zero
+        assert result[0].abs().sum() == 0
+        assert result[2].abs().sum() == 0
+
+    def test_no_state_no_replacement(self):
+        """Audio position without state should not be replaced."""
+        t = self._make_feedback_talker()
+        audio_id = t._audio_continuation_id
+        # No state for row 0
+        input_ids = torch.tensor([audio_id])
+        hidden = torch.zeros(1, 16)
+        result = t._apply_audio_feedback(hidden, input_ids)
+        assert torch.equal(result, hidden)
+
+
 # ---- AC-8: Codec Strictness ----
 
 
