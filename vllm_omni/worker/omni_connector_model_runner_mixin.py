@@ -59,6 +59,50 @@ class OmniConnectorModelRunnerMixin:
     """
 
     # ------------------------------------------------------------------ #
+    #  Helper instances (lazy-initialized)
+    # ------------------------------------------------------------------ #
+
+    @property
+    def _lifecycle_helper(self) -> OmniConnectorLifecycleHelper:
+        if not hasattr(self, "_lifecycle_helper_instance"):
+            self._lifecycle_helper_instance = OmniConnectorLifecycleHelper(self)
+        return self._lifecycle_helper_instance
+
+    @_lifecycle_helper.setter
+    def _lifecycle_helper(self, value: OmniConnectorLifecycleHelper) -> None:
+        self._lifecycle_helper_instance = value
+
+    @property
+    def _full_payload_helper(self) -> OmniConnectorFullPayloadHelper:
+        if not hasattr(self, "_full_payload_helper_instance"):
+            self._full_payload_helper_instance = OmniConnectorFullPayloadHelper(self)
+        return self._full_payload_helper_instance
+
+    @_full_payload_helper.setter
+    def _full_payload_helper(self, value: OmniConnectorFullPayloadHelper) -> None:
+        self._full_payload_helper_instance = value
+
+    @property
+    def _kv_helper(self) -> OmniConnectorKVHelper:
+        if not hasattr(self, "_kv_helper_instance"):
+            self._kv_helper_instance = OmniConnectorKVHelper(self)
+        return self._kv_helper_instance
+
+    @_kv_helper.setter
+    def _kv_helper(self, value: OmniConnectorKVHelper) -> None:
+        self._kv_helper_instance = value
+
+    @property
+    def _request_state_helper(self) -> OmniConnectorRequestStateHelper:
+        if not hasattr(self, "_request_state_helper_instance"):
+            self._request_state_helper_instance = OmniConnectorRequestStateHelper(self)
+        return self._request_state_helper_instance
+
+    @_request_state_helper.setter
+    def _request_state_helper(self, value: OmniConnectorRequestStateHelper) -> None:
+        self._request_state_helper_instance = value
+
+    # ------------------------------------------------------------------ #
     #  Init / Shutdown
     # ------------------------------------------------------------------ #
 
@@ -75,12 +119,6 @@ class OmniConnectorModelRunnerMixin:
             model_config: Stage-level model config with connector settings.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
-        # Initialize helper instances
-        self._lifecycle_helper = OmniConnectorLifecycleHelper(self)
-        self._full_payload_helper = OmniConnectorFullPayloadHelper(self)
-        self._kv_helper = OmniConnectorKVHelper(self)
-        self._request_state_helper = OmniConnectorRequestStateHelper(self)
-
         # Delegate to lifecycle helper for initialization
         self._lifecycle_helper.init_omni_connectors(
             vllm_config,
