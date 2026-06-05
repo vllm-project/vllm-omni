@@ -1,30 +1,17 @@
 # Higgs-audio v3 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
 #
-# Plain TTS plus voice cloning via ref_audio + ref_text (or references=[{...}]).
-# Streaming is wired through the stage-input processor's
-# ``talker2code2wav_async_chunk`` callback plus the shared-memory
-# connector's ``codec_streaming`` flag. To run a strictly non-streaming
-# smoke test, set ``async_chunk: false`` and ``codec_streaming: false``.
-async_chunk: true
+# Plain TTS only (no voice cloning). Sync-only (no async streaming).
+async_chunk: false
 
 connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
       shm_threshold_bytes: 65536
-      codec_streaming: true
+      codec_streaming: false
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 5000
       connector_get_max_wait: 500
-      # 25 frames at 25 fps is ~1 s of audio per chunk. 25 left-context
-      # frames keep the codec decoder's sliding-window history populated
-      # across chunk boundaries. ``initial_codec_chunk_frames: 1`` emits
-      # the first chunk as soon as Stage 0 has produced enough rows to
-      # de-delay one frame (Q=8 talker steps), so TTFA approaches one
-      # AR-loop's-worth of work rather than the whole utterance.
-      codec_chunk_frames: 25
-      codec_left_context_frames: 25
-      initial_codec_chunk_frames: 1
 
 stages:
   - stage_id: 0

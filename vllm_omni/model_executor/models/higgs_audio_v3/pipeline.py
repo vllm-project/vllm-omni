@@ -2,9 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """higgs-audio v3 pipeline: Talker (text -> 8-codebook codec) -> Code2Wav (codec -> 24 kHz PCM).
 
-Both sync and async-chunk streaming paths are wired. The deploy YAML's
-``async_chunk`` flag selects which adapter the orchestrator dispatches
-to at request time.
+Sync-only in this phase (no async_chunk streaming).
 """
 
 from vllm_omni.config.stage_config import (
@@ -27,13 +25,7 @@ HIGGS_AUDIO_V3_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            # async_chunk streaming: per-step accumulator that de-delays
-            # the codec rows and flushes a chunk to Stage 1 each time
-            # enough rows are available. Selected when the deploy YAML
-            # sets ``async_chunk: true`` + ``codec_streaming: true``;
-            # otherwise the orchestrator falls back to the sync path
-            # below.
-            async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
+            # No async_chunk in this phase (sync-only).
             # stop_token_ids: the model-owned sampler forces eos at ramp-down
             # completion. Safety stops from the actual V3 checkpoint:
             #   151643 = <|endoftext|> (eos_token_id from config.json)

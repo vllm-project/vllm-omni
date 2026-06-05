@@ -109,30 +109,6 @@ class TestHiggsAudioV3OnlineHappyPath:
             request_num=3,
         )
 
-    @pytest.mark.core_model
-    @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_plain_text_pcm_streaming(self, omni_server, openai_client) -> None:
-        """PCM streaming over async_chunk + codec_streaming.
-
-        The shipped YAML pins ``async_chunk: true`` + ``codec_streaming: true``
-        with ``initial_codec_chunk_frames: 1`` for fast TTFA. The talker's
-        per-step rows are de-delayed in chunks of ``codec_chunk_frames`` (25
-        by default) before reaching Stage 1, so the audio bytes the client
-        sees come back as the codec emits them rather than only at end of
-        utterance.
-        """
-        openai_client.send_audio_speech_request(
-            {
-                "model": omni_server.model,
-                "input": "Streaming the quick brown fox over the lazy dog.",
-                "stream": True,
-                "response_format": "pcm",
-                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "min_audio_bytes": _MIN_AUDIO_BYTES,
-            }
-        )
-
 
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 class TestHiggsAudioV3OnlineInlineControlTokens:
