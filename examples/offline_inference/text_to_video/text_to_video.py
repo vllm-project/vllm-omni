@@ -35,11 +35,25 @@ _MODEL_PRESETS = {
         "fps": 24,
         "output": "hunyuan_video_15_output.mp4",
     },
+    # JoyAI-Echo PR1: single-shot text -> video+audio, DMD few-step schedule.
+    # Multi-shot 5-minute generation lands in PR2 (PairedAudioVideoMemoryBank).
+    "joyai": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 121,
+        "num_inference_steps": 8,
+        "guidance_scale": 1.0,
+        "fps": 25,
+        "frame_rate": 25,
+        "output": "joyai_echo_output.mp4",
+    },
 }
 
 
 def _detect_preset(model: str) -> dict:
     model_lower = model.lower()
+    if "joyai" in model_lower or "joyai-echo" in model_lower:
+        return _MODEL_PRESETS["joyai"]
     if "hunyuan" in model_lower:
         return _MODEL_PRESETS["hunyuan"]
     return _MODEL_PRESETS["wan"]
@@ -357,6 +371,8 @@ def main():
     )
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
+    if args.frame_rate is not None:
+        sampling_kwargs["frame_rate"] = float(args.frame_rate)
 
     generation_start = time.perf_counter()
     frames = omni.generate(
