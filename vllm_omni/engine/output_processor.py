@@ -331,7 +331,6 @@ class OmniRequestState(RequestState):
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
-        routed_experts: np.ndarray | None = None,
     ) -> MultimodalCompletionOutput | CompletionOutput:
         """Create a completion output with multimodal data attached.
 
@@ -348,14 +347,13 @@ class OmniRequestState(RequestState):
                 index=self.request_index,
                 text="",
                 token_ids=token_ids,
-                routed_experts=routed_experts,
                 logprobs=None,
                 cumulative_logprob=None,
                 finish_reason=str(finish_reason) if finished else None,
                 stop_reason=stop_reason if finished else None,
             )
         else:
-            base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason, routed_experts)
+            base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
 
         # Always provide cumulative token IDs for inter-stage processors.
         if self.detokenizer is not None:

@@ -92,6 +92,9 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     runner.supports_mm_inputs = False
     runner.use_async_scheduling = False
     runner._omni_num_scheduled_tokens_np = None
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type="audio"),
+    )
 
     monkeypatch.setattr(
         GPUARModelRunner, "_sample", lambda self, logits, spec_decode_metadata: SimpleNamespace(sampled_token_ids=[])
