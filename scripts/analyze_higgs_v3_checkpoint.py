@@ -139,6 +139,52 @@ def main():
     else:
         print("model.safetensors.index.json not found")
 
+    # === Tensor Shapes (via safetensors header range request) ===
+    print("\n=== Tensor Shapes ===")
+    try:
+        import struct
+
+        import requests
+        from huggingface_hub import hf_hub_url
+        from huggingface_hub.utils import build_hf_headers
+
+        url = hf_hub_url(repo_id, "model.safetensors")
+        headers = build_hf_headers()
+        resp = requests.get(url, headers={**headers, "Range": "bytes=0-7"}, timeout=30)
+        header_len = struct.unpack("<Q", resp.content)[0]
+        resp2 = requests.get(url, headers={**headers, "Range": f"bytes=8-{8 + header_len - 1}"}, timeout=60)
+        sf_header = json.loads(resp2.content)
+
+        shape_keys = [
+            "tied.embedding.text_embedding.weight",
+            "tied.embedding.modality_embeddings.0.embedding.weight",
+            "body.norm.weight",
+            "body.layers.0.self_attn.q_proj.weight",
+            "body.layers.0.self_attn.k_proj.weight",
+            "body.layers.0.self_attn.v_proj.weight",
+            "body.layers.0.self_attn.o_proj.weight",
+            "body.layers.0.self_attn.q_norm.weight",
+            "body.layers.0.self_attn.k_norm.weight",
+            "body.layers.0.mlp.gate_proj.weight",
+            "body.layers.0.mlp.up_proj.weight",
+            "body.layers.0.mlp.down_proj.weight",
+            "body.layers.0.input_layernorm.weight",
+            "body.layers.0.post_attention_layernorm.weight",
+            "tied.embedding.modality_embeddings.0.model.quantizer.quantizers.0.codebook.embed",
+            "tied.embedding.modality_embeddings.0.model.quantizer.quantizers.0.project_out.weight",
+            "tied.embedding.modality_embeddings.0.model.quantizer.quantizers.0.project_out.bias",
+            "tied.embedding.modality_embeddings.0.model.fc2.weight",
+            "tied.embedding.modality_embeddings.0.model.fc2.bias",
+        ]
+        for k in shape_keys:
+            info = sf_header.get(k, {})
+            short = k.replace("tied.embedding.modality_embeddings.0.model.", "codec:")
+            short = short.replace("tied.embedding.", "")
+            short = short.replace("body.", "")
+            print(f"  {short}: dtype={info.get('dtype')}, shape={info.get('shape')}")
+    except Exception as exc:
+        print(f"  (shape extraction failed: {exc})")
+
     print("\n=== Analysis Complete ===")
 
 

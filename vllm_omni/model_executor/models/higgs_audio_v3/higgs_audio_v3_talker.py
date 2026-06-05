@@ -740,8 +740,23 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         backbone_weights: list[tuple[str, torch.Tensor]] = []
         loaded_params: set[str] = set()
         own_params = dict(self.named_parameters())
+        seen_checkpoint_groups: set[str] = set()
 
         for name, tensor in weights:
+            # Track which checkpoint key groups we see (for required-group check)
+            for prefix in _BACKBONE_PREFIX_MAP:
+                if name.startswith(prefix):
+                    if prefix == "body.layers.":
+                        # Track per-layer group
+                        parts = name.split(".")
+                        if len(parts) >= 3:
+                            seen_checkpoint_groups.add(f"body.layers.{parts[2]}")
+                    else:
+                        seen_checkpoint_groups.add(prefix.rstrip("."))
+                    break
+            if name.startswith(_MODALITY_EMBEDDING_PREFIX):
+                seen_checkpoint_groups.add("modality_embedding")
+
             mapped = self._map_weight_name(name)
             if mapped is None:
                 continue
@@ -769,24 +784,28 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self.config.resolve_special_tokens(model_path)
         self._resolve_token_ids()
 
-        # Verify required weight groups were loaded.
-        # Based on actual bosonai/higgs-audio-v3-tts-4b checkpoint analysis:
-        # - tied.embedding.text_embedding.weight → model.embed_tokens.weight
-        # - body.layers.{0-35}.* → model.layers.{0-35}.*
-        # - body.norm.weight → model.norm.weight
-        # - tied.embedding.modality_embeddings.0.embedding.weight → multimodal_embedding.weight
-        # - No tied.head.text_head (text tie=true)
-        # - No tied.head.modality_heads (modality tie=true)
+        # Verify required checkpoint groups were seen.
+        # Based on actual bosonai/higgs-audio-v3-tts-4b checkpoint analysis
+        # (results/higgs_v3_checkpoint_analysis.txt):
+        #   text_embedding.weight [151936, 2560]
+        #   body.layers.{0-35}.* (11 keys each)
+        #   body.norm.weight [2560]
+        #   modality_embeddings.0.embedding.weight [8208, 2560]
+        #   No tied.head.text_head or tied.head.modality_heads (both tied)
+        num_layers = int(self._backbone_config.num_hidden_layers)
         required_groups = {
-            "multimodal_embedding": any(k.startswith("multimodal_embedding.") for k in loaded_params),
+            "tied.embedding.text_embedding",
+            "body.norm",
+            "modality_embedding",
         }
-        # Backbone weights are loaded by AutoWeightsLoader which handles its own
-        # verification. We check the modality embedding since it's loaded directly.
-        missing_groups = [g for g, present in required_groups.items() if not present]
-        if missing_groups:
+        for i in range(num_layers):
+            required_groups.add(f"body.layers.{i}")
+
+        missing = required_groups - seen_checkpoint_groups
+        if missing:
             raise RuntimeError(
-                f"HiggsAudioV3Talker: required weight groups not loaded: {missing_groups}. "
-                f"Loaded {len(loaded_params)} params total."
+                f"HiggsAudioV3Talker: required checkpoint groups not found: "
+                f"{sorted(missing)[:10]}. Seen groups: {sorted(seen_checkpoint_groups)[:10]}."
             )
 
         logger.info(

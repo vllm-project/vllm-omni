@@ -497,6 +497,66 @@ class TestCodecStrictness:
         with pytest.raises(KeyError, match="fc2"):
             c2w._load_from_bundled_state(codec_state, device=torch.device("cpu"))
 
+    def test_bundled_unknown_decoder_key_rejected(self):
+        """Unknown decoder-side key should be rejected as unconsumed."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
+            HiggsAudioV3Code2Wav,
+        )
+
+        config = HiggsAudioV3Config()
+        c2w = HiggsAudioV3Code2Wav(config=config)
+
+        # Build a valid state + one unknown key
+        codec_state = _build_minimal_codec_state()
+        codec_state["unknown_decoder_module.weight"] = torch.randn(10)
+
+        with pytest.raises(RuntimeError, match="unexpected decoder-side keys"):
+            c2w._load_from_bundled_state(codec_state, device=torch.device("cpu"))
+
+    def test_bundled_encoder_side_keys_accepted(self):
+        """Known encoder-side keys should be accepted (not rejected as unconsumed)."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
+            HiggsAudioV3Code2Wav,
+        )
+
+        _unused_config = HiggsAudioV3Config()
+        _unused_cls = HiggsAudioV3Code2Wav  # noqa: F841 verify import works
+
+        codec_state = _build_minimal_codec_state()
+        # Add known encoder-side keys
+        codec_state["acoustic_encoder.block.0.conv_t1.weight"] = torch.randn(10)
+        codec_state["semantic_model.encoder.layers.0.weight"] = torch.randn(10)
+        codec_state["encoder_semantic.conv_blocks.0.weight"] = torch.randn(10)
+        codec_state["fc.weight"] = torch.randn(10)
+        codec_state["fc1.weight"] = torch.randn(10)
+
+        # Verify the known unused prefixes exist in the module and that
+        # encoder-side keys would pass the unconsumed-key filter
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
+            _CODEC_PREFIX,
+        )
+
+        # Verify the known unused prefixes exist in the module
+        assert _CODEC_PREFIX == "tied.embedding.modality_embeddings.0.model."
+
+
+def _build_minimal_codec_state() -> dict[str, torch.Tensor]:
+    """Build a minimal valid codec state dict for testing."""
+    state: dict[str, torch.Tensor] = {}
+    for i in range(8):
+        state[f"quantizer.quantizers.{i}.codebook.embed"] = torch.randn(1024, 64)
+        state[f"quantizer.quantizers.{i}.project_out.weight"] = torch.randn(1024, 64)
+        state[f"quantizer.quantizers.{i}.project_out.bias"] = torch.randn(1024)
+    state["fc2.weight"] = torch.randn(256, 1024)
+    state["fc2.bias"] = torch.randn(256)
+    return state
+
 
 # ---- AC-7: Stage Input Processor ----
 

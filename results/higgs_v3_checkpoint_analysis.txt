@@ -4,7 +4,7 @@ HF_HOME: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yueka
 
 
 Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]
-Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 4781.20it/s]
+Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 5355.00it/s]
 Snapshot path: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/.cache/huggingface/hub/models--bosonai--higgs-audio-v3-tts-4b/snapshots/e47035915457a842f97199cf7dc005abe5ad93da
 Files: ['config.json', 'model.safetensors.index.json', 'tokenizer.json', 'tokenizer_config.json']
 
@@ -146,5 +146,26 @@ Codec key prefixes (528 total):
      9  semantic_model.feature_extractor
      4  semantic_model.feature_projection
      1  semantic_model.masked_spec_embed
+
+=== Tensor Shapes ===
+  text_embedding.weight: dtype=BF16, shape=[151936, 2560]
+  modality_embeddings.0.embedding.weight: dtype=BF16, shape=[8208, 2560]
+  norm.weight: dtype=BF16, shape=[2560]
+  layers.0.self_attn.q_proj.weight: dtype=BF16, shape=[4096, 2560]
+  layers.0.self_attn.k_proj.weight: dtype=BF16, shape=[1024, 2560]
+  layers.0.self_attn.v_proj.weight: dtype=BF16, shape=[1024, 2560]
+  layers.0.self_attn.o_proj.weight: dtype=BF16, shape=[2560, 4096]
+  layers.0.self_attn.q_norm.weight: dtype=BF16, shape=[128]
+  layers.0.self_attn.k_norm.weight: dtype=BF16, shape=[128]
+  layers.0.mlp.gate_proj.weight: dtype=BF16, shape=[9728, 2560]
+  layers.0.mlp.up_proj.weight: dtype=BF16, shape=[9728, 2560]
+  layers.0.mlp.down_proj.weight: dtype=BF16, shape=[2560, 9728]
+  layers.0.input_layernorm.weight: dtype=BF16, shape=[2560]
+  layers.0.post_attention_layernorm.weight: dtype=BF16, shape=[2560]
+  codec:quantizer.quantizers.0.codebook.embed: dtype=BF16, shape=[1024, 64]
+  codec:quantizer.quantizers.0.project_out.weight: dtype=BF16, shape=[1024, 64]
+  codec:quantizer.quantizers.0.project_out.bias: dtype=BF16, shape=[1024]
+  codec:fc2.weight: dtype=BF16, shape=[256, 1024]
+  codec:fc2.bias: dtype=BF16, shape=[256]
 
 === Analysis Complete ===
