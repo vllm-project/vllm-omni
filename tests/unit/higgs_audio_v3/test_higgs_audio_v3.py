@@ -650,6 +650,10 @@ class TestLoadWeightsEnforcement:
 
         talker._backbone_config = FakeConfig()
 
+        # Minimal model and lm_head so _BackboneWrapper can be constructed
+        talker.model = torch.nn.Module()
+        talker.lm_head = torch.nn.Module()
+
         # Fake vllm_config for resolve_special_tokens (no-op)
         class FakeModelConfig:
             model = None
@@ -690,14 +694,14 @@ class TestLoadWeightsEnforcement:
         monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
         result = talker.load_weights(iter(weights.items()))
         assert isinstance(result, set)
-        assert len(result) > 0
+        assert "multimodal_embedding.weight" in result
 
     def test_load_weights_fails_missing_norm(self, monkeypatch):
         """load_weights raises when body.norm.weight is missing."""
         talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
         monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
         del weights["body.norm.weight"]
-        with pytest.raises(RuntimeError, match="required checkpoint keys missing"):
+        with pytest.raises(RuntimeError, match="body.norm.weight"):
             talker.load_weights(iter(weights.items()))
 
     def test_load_weights_fails_missing_layer_subkey(self, monkeypatch):
@@ -705,7 +709,7 @@ class TestLoadWeightsEnforcement:
         talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
         monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
         del weights["body.layers.0.self_attn.k_proj.weight"]
-        with pytest.raises(RuntimeError, match="required checkpoint keys missing"):
+        with pytest.raises(RuntimeError, match="body.layers.0.self_attn.k_proj.weight"):
             talker.load_weights(iter(weights.items()))
 
     def test_load_weights_fails_missing_modality_embedding(self, monkeypatch):
@@ -713,7 +717,7 @@ class TestLoadWeightsEnforcement:
         talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
         monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
         del weights["tied.embedding.modality_embeddings.0.embedding.weight"]
-        with pytest.raises(RuntimeError, match="required checkpoint keys missing"):
+        with pytest.raises(RuntimeError, match="modality_embeddings"):
             talker.load_weights(iter(weights.items()))
 
     def test_load_weights_fails_unknown_prefix(self, monkeypatch):
