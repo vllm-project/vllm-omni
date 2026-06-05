@@ -2016,12 +2016,12 @@ async def edit_images(
         _update_if_not_none(gen_params, "resolution", resolution)
 
         extra_args = dict(getattr(gen_params, "extra_args", {}) or {})
-        if bot_task is not None:
-            extra_args["bot_task"] = bot_task
-        if sys_type is not None:
-            extra_args["use_system_prompt"] = sys_type
-        if system_prompt is not None:
-            extra_args["system_prompt"] = system_prompt
+        edit_extra_args = _build_hunyuan_edit_extra_args(
+            bot_task=bot_task,
+            sys_type=sys_type,
+            system_prompt=system_prompt,
+        )
+        extra_args.update(edit_extra_args)
         if extra_args:
             gen_params.extra_args = extra_args
 
@@ -2321,6 +2321,28 @@ def _check_max_generated_image_size(
                 detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
                 f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
             )
+
+
+def _build_hunyuan_edit_extra_args(
+    *,
+    bot_task: str | None,
+    sys_type: str | None,
+    system_prompt: str | None,
+) -> dict[str, Any]:
+    """Map Hunyuan /v1/images/edits form fields to DiT ``extra_args``."""
+    extra_args: dict[str, Any] = {}
+    effective_use_system_prompt = sys_type
+    if effective_use_system_prompt is None and bot_task is not None:
+        from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_sys_type
+
+        effective_use_system_prompt = resolve_sys_type(bot_task)
+    if effective_use_system_prompt is not None:
+        extra_args["use_system_prompt"] = effective_use_system_prompt
+    if system_prompt is not None:
+        extra_args["system_prompt"] = system_prompt
+    if bot_task is not None:
+        extra_args["bot_task"] = bot_task
+    return extra_args
 
 
 def _update_if_not_none(object: Any, key: str, val: Any) -> None:
