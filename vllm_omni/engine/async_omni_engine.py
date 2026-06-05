@@ -416,7 +416,7 @@ class AsyncOmniEngine:
 
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,
-                output_async_queue=self.output_queue.async_q,
+                output_sync_queue=self.output_queue.sync_q,
                 rpc_async_queue=self.rpc_output_queue.async_q,
                 stage_pools=self.stage_pools,
                 async_chunk=self.async_chunk,
@@ -439,14 +439,17 @@ class AsyncOmniEngine:
                 startup_future.set_exception(wrapped)
             logger.exception("[AsyncOmniEngine] Orchestrator thread crashed")
             error_text = str(e) or "Orchestrator thread crashed"
-            try:
-                error_msg = ErrorMessage(error=error_text, fatal=True)
-                if self.output_queue is not None:
-                    self.output_queue.sync_q.put_nowait(error_msg)
-                if self.rpc_output_queue is not None:
-                    self.rpc_output_queue.sync_q.put_nowait(error_msg)
-            except Exception:
-                pass
+            # On crash, wake any parked reader on each queue: enqueue the fatal
+            # message, then shutdown() (see try_get_output_async). Isolated per
+            # queue so a failure on one does not skip the other.
+            for q in (self.output_queue, self.rpc_output_queue):
+                if q is None:
+                    continue
+                try:
+                    q.sync_q.put_nowait(ErrorMessage(error=error_text, fatal=True))
+                    q.shutdown()
+                except Exception:
+                    pass
             raise
         finally:
             try:
@@ -1376,19 +1379,29 @@ class AsyncOmniEngine:
         """Read one output message from the Orchestrator output queue."""
         try:
             return self.output_queue.sync_q.get(timeout=timeout)
+        except janus.QueueShutDown:
+            # Queue shut down by a crashing orchestrator (see
+            # ``_bootstrap_orchestrator``); the engine is gone.
+            raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
         except queue.Empty:
             if not self.is_alive():
                 raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
             return None
 
-    async def try_get_output_async(self) -> EngineQueueMessage | None:
-        """Async read from the Orchestrator output queue."""
+    async def try_get_output_async(self) -> EngineQueueMessage:
+        """Async read from the Orchestrator output queue.
+
+        Parks on ``async_q.get()`` and wakes the instant a message arrives
+        (event-driven, no polling). When the orchestrator dies it enqueues a
+        fatal ``ErrorMessage`` and then shuts the queue down (see
+        ``_bootstrap_orchestrator``); ``shutdown()`` drains the fatal message
+        first and then wakes any still-parked getter with ``QueueShutDown``, so
+        this never hangs on a dead engine regardless of timing.
+        """
         try:
-            return self.output_queue.sync_q.get_nowait()
-        except queue.Empty:
-            if not self.is_alive():
-                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
-            return None
+            return await self.output_queue.async_q.get()
+        except janus.QueueShutDown:
+            raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         """Get cached metadata for a stage."""
@@ -1435,6 +1448,8 @@ class AsyncOmniEngine:
                 remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
                 try:
                     result_msg = self.rpc_output_queue.sync_q.get(timeout=remaining)
+                except janus.QueueShutDown as exc:
+                    raise RuntimeError("Orchestrator died unexpectedly. See logs above.") from exc
                 except queue.Empty as exc:
                     raise TimeoutError(f"collective_rpc timed out after {timeout} seconds") from exc
 

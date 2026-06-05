@@ -90,8 +90,11 @@ class MembershipController:
         if affected and effective_cleanup_callback is not None:
             await effective_cleanup_callback(affected)
         if affected and effective_output_queue is not None:
+            # Orchestrator now produces output via the queue's sync side, so push
+            # non-blocking with put_nowait (the queue is unbounded). See
+            # Orchestrator.output_sync_queue / try_get_output_async.
             for req_id in affected:
-                await effective_output_queue.put(
+                effective_output_queue.put_nowait(
                     ErrorMessage(error="stage replica disappeared", request_id=req_id, stage_id=stage_id)
                 )
 
