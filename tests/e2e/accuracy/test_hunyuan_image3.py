@@ -70,6 +70,13 @@ NPU_AR_TOP_P = 0.95
 NPU_AR_TOP_K = 1024
 NPU_AR_MAX_TOKENS = 2048
 NPU_AR_REPETITION_PENALTY = 1.0
+NPU_AR_SAMPLING_PARAMS = {
+    "temperature": NPU_AR_TEMPERATURE,
+    "top_p": NPU_AR_TOP_P,
+    "top_k": NPU_AR_TOP_K,
+    "max_tokens": NPU_AR_MAX_TOKENS,
+    "repetition_penalty": NPU_AR_REPETITION_PENALTY,
+}
 
 # ============================================================================
 # Constants
@@ -403,6 +410,8 @@ def _run_offline(
     output_path: Path,
     *,
     num_inference_steps: int = NUM_INFERENCE_STEPS,
+    guidance_scale: float = GUIDANCE_SCALE,
+    ar_sampling_params: dict[str, float | int] | None = None,
 ) -> tuple[Image.Image, str, float]:
     from transformers import AutoTokenizer
 
@@ -432,21 +441,15 @@ def _run_offline(
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
                 sp.num_inference_steps = num_inference_steps
-                sp.guidance_scale = NPU_GUIDANCE_SCALE
+                sp.guidance_scale = guidance_scale
                 sp.seed = SEED
                 sp.generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
             elif hasattr(sp, "stop_token_ids"):
                 sp.stop_token_ids = ar_stop_token_ids
-                if hasattr(sp, "temperature"):
-                    sp.temperature = NPU_AR_TEMPERATURE
-                if hasattr(sp, "top_p"):
-                    sp.top_p = NPU_AR_TOP_P
-                if hasattr(sp, "top_k"):
-                    sp.top_k = NPU_AR_TOP_K
-                if hasattr(sp, "max_tokens"):
-                    sp.max_tokens = NPU_AR_MAX_TOKENS
-                if hasattr(sp, "repetition_penalty"):
-                    sp.repetition_penalty = NPU_AR_REPETITION_PENALTY
+                if ar_sampling_params is not None:
+                    for key, value in ar_sampling_params.items():
+                        if hasattr(sp, key):
+                            setattr(sp, key, value)
 
         images = download_images(TEST_IMAGE_URLS)
         prompts: list[OmniPromptType] = [
@@ -499,6 +502,8 @@ def _run_online(
     output_path: Path,
     *,
     num_inference_steps: int = NUM_INFERENCE_STEPS,
+    guidance_scale: float = GUIDANCE_SCALE,
+    ar_sampling_params: dict[str, float | int] | None = None,
 ) -> tuple[Image.Image, str, float]:
     from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 
@@ -514,25 +519,23 @@ def _run_online(
         with OmniServer(MODEL_PATH, server_args, use_omni=True) as omni_server:
             images = download_images(TEST_IMAGE_URLS)
             t0 = time.perf_counter()
+            request_data = {
+                "model": omni_server.model,
+                "prompt": PROMPT,
+                "n": 1,
+                "response_format": "b64_json",
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+                "seed": SEED,
+                "sys_type": "en_unified",
+                "bot_task": "think_recaption",
+                "size": "1280x720",
+            }
+            if ar_sampling_params is not None:
+                request_data.update(ar_sampling_params)
             response = requests.post(
                 f"http://{omni_server.host}:{omni_server.port}/v1/images/edits",
-                data={
-                    "model": omni_server.model,
-                    "prompt": PROMPT,
-                    "n": 1,
-                    "response_format": "b64_json",
-                    "num_inference_steps": num_inference_steps,
-                    "guidance_scale": NPU_GUIDANCE_SCALE,
-                    "seed": SEED,
-                    "sys_type": "en_unified",
-                    "bot_task": "think_recaption",
-                    "size": "1280x720",
-                    "temperature": NPU_AR_TEMPERATURE,
-                    "top_p": NPU_AR_TOP_P,
-                    "top_k": NPU_AR_TOP_K,
-                    "max_tokens": NPU_AR_MAX_TOKENS,
-                    "repetition_penalty": NPU_AR_REPETITION_PENALTY,
-                },
+                data=request_data,
                 files=[
                     ("image", (f"image_{i}.png", pil_to_png_bytes(img), "image/png")) for i, img in enumerate(images)
                 ],
@@ -634,6 +637,8 @@ def test_image_to_image_alignment_npu(
             str(tmp / "npu.yaml"),
             output_dir,
             num_inference_steps=NPU_NUM_INFERENCE_STEPS,
+            guidance_scale=NPU_GUIDANCE_SCALE,
+            ar_sampling_params=NPU_AR_SAMPLING_PARAMS,
         )
 
     npu_cot = npu_cot.lstrip("\n")
