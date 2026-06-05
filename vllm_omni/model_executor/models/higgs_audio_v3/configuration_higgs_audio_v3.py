@@ -15,7 +15,7 @@ import os
 from typing import Any
 
 import transformers
-from transformers import PretrainedConfig
+from transformers import AutoConfig, PretrainedConfig
 
 __all__ = ["HiggsAudioV3Config"]
 
@@ -177,3 +177,6 @@ class HiggsAudioV3Config(PretrainedConfig):
 
         if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
             self.eos_token_id = int(tokenizer.eos_token_id)
+
+
+AutoConfig.register("higgs_multimodal_qwen3", HiggsAudioV3Config)

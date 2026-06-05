@@ -113,7 +113,7 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    engine = Omni(model=args.model, deploy_config=args.deploy_config)
+    engine = Omni(model=args.model, deploy_config=args.deploy_config, trust_remote_code=True)
 
     # Build prompts using the v3 tokenizer adapter
     from transformers import AutoTokenizer
