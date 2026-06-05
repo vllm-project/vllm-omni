@@ -10,7 +10,6 @@ import soundfile as sf
 from vllm import SamplingParams
 from vllm.multimodal.media.audio import load_audio
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
@@ -65,7 +64,6 @@ def run_e2e():
         required=True,
         help="Path to tokenizer directory (e.g., <model_path>/CosyVoice-BlankEN).",
     )
-    nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     # Ensure tokenizer directory exists
     if not os.path.exists(args.tokenizer):

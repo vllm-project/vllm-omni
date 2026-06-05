@@ -121,6 +121,7 @@ class Omni(OmniBase):
             for req_id, prompt in zip(request_ids, request_prompts):
                 prompt_modalities = prompt.get("modalities", None) if isinstance(prompt, dict) else None
                 final_stage_id = self._compute_final_stage_id(prompt_modalities)
+                final_output_stage_ids = self._compute_final_output_stage_ids(prompt_modalities) or [final_stage_id]
                 req_final_stage_ids[req_id] = final_stage_id
 
                 metrics = OrchestratorMetrics(
@@ -145,6 +146,7 @@ class Omni(OmniBase):
                     prompt=prompt,
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id,
+                    final_output_stage_ids=final_output_stage_ids,
                 )
                 submit_ts = time.time()
                 req_state.metrics.stage_first_ts[0] = submit_ts

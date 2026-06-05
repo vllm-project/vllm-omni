@@ -972,8 +972,24 @@ class OmniDiffusionConfig:
                         self.model_class_name = "WanS2VPipeline"
                     self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
+                elif model_type == "vla":
+                    from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
+
+                    if _looks_like_dreamzero(self.model):
+                        self.model_class_name = "DreamZeroPipeline"
+                        self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                    else:
+                        raise
                 elif architectures and len(architectures) == 1:
-                    self.model_class_name = architectures[0]
+                    architecture = architectures[0]
+                    from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+                    if (
+                        self.model_class_name is None
+                        or DiffusionModelRegistry._try_load_model_cls(architecture) is not None
+                    ):
+                        self.model_class_name = architecture
                 else:
                     raise
 
@@ -1043,10 +1059,10 @@ class DiffusionOutput:
     """
 
     # Fields may be replaced with SHM handle dicts by ipc.pack_diffusion_output_shm
-    output: torch.Tensor | dict | None = None
-    trajectory_timesteps: torch.Tensor | dict | None = None
-    trajectory_latents: torch.Tensor | dict | None = None
-    trajectory_log_probs: torch.Tensor | dict | None = None
+    output: torch.Tensor | tuple[Any, ...] | dict[str, Any] | None = None
+    trajectory_timesteps: torch.Tensor | dict[str, Any] | None = None
+    trajectory_latents: torch.Tensor | dict[str, Any] | None = None
+    trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
     error: str | None = None
     aborted: bool = False

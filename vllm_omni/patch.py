@@ -1,3 +1,4 @@
+import logging
 import sys
 from functools import cached_property
 
@@ -129,6 +130,43 @@ for module_name, module in list(sys.modules.items()):
     if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
         module.EngineCoreRequest = OmniEngineCoreRequest
 
+# =============================================================================
+# Patch unregister_vllm_metrics to skip vllm:omni_* collectors
+# =============================================================================
+# WHY: Upstream unregister_vllm_metrics() uses `"vllm" in collector._name` to
+# strip collectors before each new PrometheusStatLogger registers, which is
+# how it avoids "Duplicated timeseries" when the same process spawns multiple
+# engines / orchestrators.  But its substring match also wipes our vllm:omni_*
+# families, so we must replace it with a scoped version that keeps ours.
+#
+# REMOVAL: Remove this patch once upstream vLLM adds
+# _STAT_LOGGER_METRIC_NAMES to vllm.v1.metrics.prometheus and scopes
+# unregister_vllm_metrics() to that set.  Track:
+# https://github.com/vllm-project/vllm/pull/42331
+import vllm.v1.metrics.prometheus as _vllm_prometheus  # noqa: E402
+
+_logger = logging.getLogger(__name__)
+
+
+def _scoped_unregister_vllm_metrics():
+    """Drop upstream vllm:* collectors but preserve vllm:omni_* (ours)."""
+    from prometheus_client import REGISTRY
+
+    for collector in list(REGISTRY._collector_to_names):
+        name = getattr(collector, "_name", "")
+        if "vllm" not in name:
+            continue
+        if name.startswith("vllm:omni_") or name.startswith("vllm_omni"):
+            continue
+        REGISTRY.unregister(collector)
+
+
+_vllm_prometheus.unregister_vllm_metrics = _scoped_unregister_vllm_metrics
+_logger.warning(
+    "Monkey-patched unregister_vllm_metrics() to scope drops to non-omni vllm:* collectors. "
+    "Remove this patch once vLLM adds _STAT_LOGGER_METRIC_NAMES."
+)
+
 
 # Patch: add qwen3_omni_moe to vllm's chat template fallback registry.
 # Qwen/Qwen3-Omni-30B-A3B-Instruct stores its chat_template in a standalone
@@ -150,3 +188,32 @@ def _patch_chat_template_registry():
 
 
 _patch_chat_template_registry()
+
+
+def _patch_scaled_mm_fp8_contiguous_activation():
+    """Support batched diffusion activations on the ModelOpt FP8 (ScaledMM) path.
+
+    The FP8 ScaledMM linear flattens its activation with ``x.view(-1, ...)``, which
+    needs a contiguous tensor. Under step-execution batching (``--max-num-seqs > 1``)
+    the sequence-packed diffusion activations can be non-contiguous, so we make the
+    activation contiguous before the GEMM (no-op when it already is). Mixed FP8/NVFP4
+    routes through the CUTLASS NVFP4 path and is unaffected.
+    """
+    try:
+        from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+            ScaledMMLinearKernel,
+        )
+    except ImportError:
+        return
+
+    _original_apply_weights = ScaledMMLinearKernel.apply_weights
+
+    def _patched_apply_weights(self, layer, x, bias=None):
+        if not x.is_contiguous():
+            x = x.contiguous()
+        return _original_apply_weights(self, layer, x, bias)
+
+    ScaledMMLinearKernel.apply_weights = _patched_apply_weights
+
+
+_patch_scaled_mm_fp8_contiguous_activation()
