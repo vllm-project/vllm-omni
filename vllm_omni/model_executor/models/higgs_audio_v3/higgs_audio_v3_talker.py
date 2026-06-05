@@ -769,6 +769,26 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self.config.resolve_special_tokens(model_path)
         self._resolve_token_ids()
 
+        # Verify required weight groups were loaded.
+        # Based on actual bosonai/higgs-audio-v3-tts-4b checkpoint analysis:
+        # - tied.embedding.text_embedding.weight → model.embed_tokens.weight
+        # - body.layers.{0-35}.* → model.layers.{0-35}.*
+        # - body.norm.weight → model.norm.weight
+        # - tied.embedding.modality_embeddings.0.embedding.weight → multimodal_embedding.weight
+        # - No tied.head.text_head (text tie=true)
+        # - No tied.head.modality_heads (modality tie=true)
+        required_groups = {
+            "multimodal_embedding": any(k.startswith("multimodal_embedding.") for k in loaded_params),
+        }
+        # Backbone weights are loaded by AutoWeightsLoader which handles its own
+        # verification. We check the modality embedding since it's loaded directly.
+        missing_groups = [g for g, present in required_groups.items() if not present]
+        if missing_groups:
+            raise RuntimeError(
+                f"HiggsAudioV3Talker: required weight groups not loaded: {missing_groups}. "
+                f"Loaded {len(loaded_params)} params total."
+            )
+
         logger.info(
             "HiggsAudioV3Talker: loaded %d params, modality_embedding=%s, tied=%s",
             len(loaded_params),
