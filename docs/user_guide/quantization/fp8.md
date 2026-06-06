@@ -52,17 +52,6 @@ guide. FP8 on Ampere may use a weight-only path where available.
 Audio encoder, vision encoder, talker, and code2wav stay in BF16 unless a
 model-specific guide says otherwise.
 
-### MoT Diffusion Model (SenseNova-U1)
-
-| Model | HF models | Scope | Status | Notes |
-|-------|-----------|-------|--------|-------|
-| SenseNova-U1 | `SenseNova/SenseNova-U1-8B-MoT` | Gen-path only (`*_mot_gen` layers) | Validated | Understanding-path layers stay in BF16; no `ignored_layers` needed |
-
-SenseNova-U1 uses Mixture-of-Tokenizers (MoT) with duplicate weights per
-layer: understanding path (`qkv_proj`, `mlp`) and generation path
-(`qkv_proj_mot_gen`, `mlp_mot_gen`).  When `quantization="fp8"` is set,
-the pipeline automatically applies FP8 only to gen-path GEMMs.
-
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
 | Model | Scope | Status | Notes |

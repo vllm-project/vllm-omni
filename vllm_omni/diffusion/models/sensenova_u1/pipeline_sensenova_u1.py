@@ -31,7 +31,6 @@ import torchvision.transforms as T
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -485,39 +484,6 @@ def _optimized_scale(positive_flat, negative_flat):
 
 
 # ---------------------------------------------------------------------------
-# Gen-only FP8 wrapper
-# ---------------------------------------------------------------------------
-
-
-class _GenOnlyQuantConfig:
-    """Wraps an inner QuantizationConfig so only ``*_mot_gen`` layers are quantized.
-
-    SenseNova-U1 uses Mixture-of-Tokenizers with duplicate weights per layer:
-    understanding path (``qkv_proj``, ``mlp``) and generation path
-    (``qkv_proj_mot_gen``, ``mlp_mot_gen``).  The RFC requires FP8 only on the
-    gen-path GEMMs during denoising; und-path layers stay in BF16.
-
-    This is *not* a full ``QuantizationConfig`` subclass — it only needs to
-    satisfy the duck-typed interface that ``LinearBase.__init__`` uses:
-    ``get_quant_method(layer, prefix)``.  The outer registry and weight-loader
-    still operate on the original config stored in ``od_config.quantization_config``.
-    """
-
-    def __init__(self, inner: QuantizationConfig):
-        self._inner = inner
-
-    def get_quant_method(self, layer, prefix: str = ""):
-        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-
-        if "mot_gen" in prefix:
-            return self._inner.get_quant_method(layer, prefix)
-        return UnquantizedLinearMethod()
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-
-# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -583,15 +549,9 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         self.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.img_start_token_id = self.tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
 
-        # Language model (TP-aware).
-        # Wrap quant_config so only gen-path (mot_gen) layers are quantized;
-        # understanding-path layers stay in BF16.
-        quant_config = od_config.quantization_config
-        if quant_config is not None:
-            quant_config = _GenOnlyQuantConfig(quant_config)
+        # Language model (TP-aware)
         self.language_model = SenseNovaU1ForCausalLM(
             self.llm_cfg,
-            quant_config=quant_config,
             prefix="language_model",
         )
 
