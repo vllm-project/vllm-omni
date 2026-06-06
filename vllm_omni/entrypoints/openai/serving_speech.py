@@ -434,6 +434,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Merge built-in speakers into the set initialized by _init_speaker_storage.
         self.supported_speakers |= self._load_supported_speakers()
         self.supported_speakers |= set(self.precomputed_speakers)
+
+        self.supported_languages: set[str] = self._load_supported_languages()
+
         self._tts_tokenizer = None
         self._voxcpm2_tokenizer = None
         self._voxcpm2_split_map: dict[int, list[int]] = {}
@@ -693,6 +696,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.warning("Could not load speakers from model config: %s", e)
 
         return set()
+
+    def _load_supported_languages(self) -> set[str]:
+        """Load supported languages (title-cased) from the model configuration"""
+        if self._tts_model_type != "qwen3_tts":
+            return set()
+        try:
+            config = self.engine_client.model_config.hf_config.talker_config
+
+            if isinstance(config, dict):
+                codec_language_id = config.get("codec_language_id")
+            else:
+                codec_language_id = getattr(config, "codec_language_id", None)
+
+            if codec_language_id and isinstance(codec_language_id, dict):
+                return {str(language).title() for language in codec_language_id} | {"Auto"}
+
+            logger.warning("No codec_language_id found in talker_config; falling back to default languages")
+        except Exception as e:
+            logger.warning("Could not load languages from model config: %s", e)
+        return _TTS_LANGUAGES
 
     def _estimate_ref_code_len(self, ref_audio: object) -> int | None:
         """Estimate ref_code length from ref_audio waveform without running the codec.
@@ -1420,9 +1443,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
-        # Validate language
-        if request.language is not None and request.language not in _TTS_LANGUAGES:
-            return f"Invalid language '{request.language}'. Supported: {', '.join(sorted(_TTS_LANGUAGES))}"
+        # Validate language (case-insensitive; normalized to the title-cased config form)
+        if request.language is not None:
+            request.language = request.language.title()
+            if request.language not in self.supported_languages:
+                return f"Invalid language '{request.language}'. Supported: {', '.join(sorted(self.supported_languages))}"
 
         # Validate speaker for CustomVoice task
         if task_type == "CustomVoice":
