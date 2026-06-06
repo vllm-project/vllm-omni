@@ -20,6 +20,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.diffusion.data import DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -31,11 +32,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class InlineStageDiffusionClient:
+class InlineStageDiffusionClient(StageClientBase):
     """Runs DiffusionEngine in a thread executor inside the Orchestrator."""
 
     stage_type: str = "diffusion"
     replica_id: int = 0
+    is_comprehension: bool = False
 
     def __init__(
         self,
@@ -50,6 +52,7 @@ class InlineStageDiffusionClient:
         self.replica_id = metadata.replica_id
         self.final_output = metadata.final_output
         self.final_output_type = metadata.final_output_type
+        self.model_stage = getattr(metadata, "model_stage", None)
         self.default_sampling_params = metadata.default_sampling_params
         self.requires_multimodal_data = metadata.requires_multimodal_data
         self.custom_process_input_func = metadata.custom_process_input_func
@@ -62,7 +65,10 @@ class InlineStageDiffusionClient:
 
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
         self._tasks: dict[str, asyncio.Task] = {}
+        self._engine_dead = False
         self._shutting_down = False
+
+        self._engine.executor.register_failure_callback(self._mark_engine_dead)
 
         logger.info(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] initialized inline (batch_size=%d)",
@@ -74,6 +80,16 @@ class InlineStageDiffusionClient:
     def _enrich_config(self) -> None:
         """Load model metadata from HuggingFace and populate od_config fields."""
         self.od_config.enrich_config()
+
+    def _mark_engine_dead(self) -> None:
+        if self._engine_dead:
+            return
+        self._engine_dead = True
+        logger.error(
+            "[InlineStageDiffusionClient] stage-%s [rep-%s] diffusion executor died unexpectedly.",
+            self.stage_id,
+            self.replica_id,
+        )
 
     # ------------------------------------------------------------------
     # Request processing
@@ -113,7 +129,6 @@ class InlineStageDiffusionClient:
             request = OmniDiffusionRequest(
                 prompts=[prompt],
                 sampling_params=sampling_params,
-                request_ids=[request_id],
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
             )
@@ -172,7 +187,6 @@ class InlineStageDiffusionClient:
             request = OmniDiffusionRequest(
                 prompts=prompts,
                 sampling_params=sampling_params,
-                request_ids=[f"{request_id}-{i}" for i in range(len(prompts))],
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
             )
@@ -247,6 +261,8 @@ class InlineStageDiffusionClient:
         try:
             return self._output_queue.get_nowait()
         except asyncio.QueueEmpty:
+            if self._engine_dead:
+                raise EngineDeadError(f"Stage-{self.stage_id} inline diffusion engine is dead")
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
@@ -349,7 +365,11 @@ class InlineStageDiffusionClient:
         """Check if the inline diffusion engine and its workers are healthy."""
         if self._shutting_down:
             raise EngineDeadError("InlineStageDiffusionClient is shutting down")
-        self._engine.executor.check_health()
+        try:
+            self._engine.executor.check_health()
+        except EngineDeadError:
+            self._mark_engine_dead()
+            raise
 
     def shutdown(self) -> None:
         self._shutting_down = True

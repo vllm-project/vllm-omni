@@ -30,6 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase, Qwen2Config, Qwen2Model, StaticCache
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb
 
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
@@ -479,7 +480,7 @@ class CFMGraphExecutor:
         self.sde_rnd_placeholder = torch.empty_like(sde_rnd)
 
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
+        with torch.cuda.graph(self.graph, pool=current_platform.get_global_graph_pool()):
             self.gen_lat_placeholder = self.cfm.sample(
                 self.last_hidden_state_placeholder,
                 self.his_lat_placeholder,
@@ -901,6 +902,7 @@ class MingAudioGenerator:
         if self._audio_vae is None:
             return requested_max_steps
 
+        # Transformers >=5.x may expose these config values as 0-d tensors.
         sample_rate = float(self._audio_vae.config.sample_rate)
         vae_patch_size = float(getattr(self._audio_vae.config, "patch_size", 4))
         hop_size = float(getattr(self._audio_vae.decoder, "hop_length", 320))
@@ -1040,7 +1042,7 @@ class MingAudioGenerator:
                 use_cache=True,
             )
         else:
-            past_seen_tokens = past_key_values.get_seq_length()
+            past_seen_tokens = int(past_key_values.get_seq_length())
             cache_position = torch.arange(
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],

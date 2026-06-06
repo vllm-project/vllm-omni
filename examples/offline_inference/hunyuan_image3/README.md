@@ -112,6 +112,7 @@ python end2end.py --modality text2img \
                   --additional-config '{"torchair_graph_config":{"enabled":true}}'
 ```
 
+
 ## Key Arguments
 
 | Argument | Description |
@@ -123,16 +124,15 @@ python end2end.py --modality text2img \
 | `--steps` | Number of diffusion inference steps for image generation. |
 | `--guidance-scale` | Classifier-free guidance scale for image generation. |
 | `--height`, `--width` | Output image size for `text2img`. |
-| `--bot-task` | Prompt behavior. `auto` selects the default from `--modality`; `think` adds `<think>`; `recaption` adds `<recaption>`; `vanilla` uses the text-to-image pretrain template. |
+| `--bot-task` | Override prompt mode. `none`, `think`, `recaption`, `think_recaption`, or `vanilla`. |
 | `--sys-type` | Override the system prompt type, for example `en_unified` or `en_vanilla`. |
 | `--vae-use-tiling` | Enable VAE tiling for memory reduction. |
 
 ## Notes
 
-- `hunyuan_image3_ar.yaml` is a 4-card AR-only text/comprehension deploy. It sets `engine_output_type: text`, `final_output_type: text`, and text sampling defaults.
-- `hunyuan_image3_dit.yaml` is a single-stage DiT deploy with `stage_id: 0`; it does not require stage 1 or a running AR stage.
+- `hunyuan_image3_ar.yaml` is a 4-card AR-only text/comprehension deploy.
+- `hunyuan_image3_dit.yaml` is a single-stage DiT deploy with `stage_id: 0`.
 - The old HunyuanImage3 YAMLs under `model_executor/stage_configs/` and `platforms/*/stage_configs/` have been folded into the deploy YAMLs.
-- This PR does not keep the HunyuanImage3 AR-to-DiT KV reuse wiring. The deploy YAMLs describe the topology and platform settings only.
 
 ## Prompt Format
 
@@ -148,22 +148,8 @@ Assistant: {trigger_tag?}
 
 - `<img>`: Placeholder for each input image (single token; expanded by the multimodal pipeline).
 - Trigger tags: `<think>` for CoT and `<recaption>` for recaptioning, placed after `Assistant: `.
-- System prompt: Auto-selected based on task.
-- `t2i_vanilla` is the only task that uses the bare pretrain template without chat structure.
-- The example composes the internal prompt task from `--modality` and `--bot-task`
-  before calling `prompt_utils`; for example, `img2text + think` becomes
-  `i2t_think` for prompt and stop-token lookup.
+- System prompt: Auto-selected from `task` and `bot_task`.
+- `bot_task='vanilla'` with `task='t2i'` uses the bare pretrain template.
 
 The shared `vllm_omni.diffusion.models.hunyuan_image3.prompt_utils.build_prompt_tokens()`
 helper handles segment-by-segment tokenization and matches HF `apply_chat_template`.
-
-## FAQ
-
-- **OOM errors**: Decrease `gpu_memory_utilization` in the deploy YAML, use a smaller `max_num_batched_tokens`, or enable VAE tiling with `--vae-use-tiling`.
-- **Custom image sizes**: Use `--height` and `--width` flags (multiples of 16 recommended).
-
-| Stage | VRAM (approx) |
-| :--- | :--- |
-| Stage 0 (AR) | ~15 GiB + KV Cache |
-| Stage 1 (DiT) | ~30 GiB |
-| Total (8-GPU) | ~45 GiB + KV Cache |

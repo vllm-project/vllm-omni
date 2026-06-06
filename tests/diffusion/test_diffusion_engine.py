@@ -10,6 +10,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import torch
+
+from vllm_omni.diffusion.diffusion_engine import _move_tensor_tree_to_cpu
 
 
 @dataclass
@@ -22,15 +25,15 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int = 0
 
     @property
-    def scheduled_req_ids(self):
+    def scheduled_request_ids(self):
         ids = [req.request_id for req in self.scheduled_new_reqs]
         if self.scheduled_cached_reqs:
-            ids.extend(self.scheduled_cached_reqs.sched_req_ids)
+            ids.extend(self.scheduled_cached_reqs.request_ids)
         return ids
 
     @property
     def is_empty(self):
-        return len(self.scheduled_req_ids) == 0
+        return len(self.scheduled_request_ids) == 0
 
 
 class MockScheduler:
@@ -63,6 +66,80 @@ class MockScheduler:
         return [req.request_id for req in sched_output.scheduled_new_reqs]
 
 
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_move_tensor_tree_keeps_cpu_tensor_identity() -> None:
+    tensor = torch.arange(8, dtype=torch.float32)
+
+    moved = _move_tensor_tree_to_cpu(tensor)
+
+    assert moved is tensor
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_move_tensor_tree_preserves_nested_structure_without_mutating_input() -> None:
+    tensor = torch.arange(4, dtype=torch.float32)
+    nested_tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    sentinel = object()
+    payload = {
+        "tensor": tensor,
+        "list": [nested_tensor, sentinel],
+        "tuple": ({"inner": tensor}, "metadata"),
+        "scalar": 3,
+    }
+
+    moved = _move_tensor_tree_to_cpu(payload)
+
+    assert moved is not payload
+    assert set(moved) == {"tensor", "list", "tuple", "scalar"}
+    assert moved["list"] is not payload["list"]
+    assert moved["tuple"] is not payload["tuple"]
+    assert moved["tuple"][0] is not payload["tuple"][0]
+    assert moved["tensor"] is tensor
+    assert moved["list"][0] is nested_tensor
+    assert moved["list"][1] is sentinel
+    assert moved["tuple"][0]["inner"] is tensor
+    assert moved["tuple"][1] == "metadata"
+    assert moved["scalar"] == 3
+    assert payload["list"][0] is nested_tensor
+    assert payload["list"][1] is sentinel
+    assert payload["tuple"][0]["inner"] is tensor
+    assert payload["tuple"][1] == "metadata"
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_move_tensor_tree_returns_non_tensor_values_unchanged() -> None:
+    value = object()
+
+    moved = _move_tensor_tree_to_cpu(value)
+
+    assert moved is value
+
+
+@pytest.mark.diffusion
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_move_tensor_tree_moves_nested_cuda_tensors_to_cpu() -> None:
+    tensor = torch.arange(8, dtype=torch.float32, device="cuda")
+    other = torch.arange(4, dtype=torch.int64, device="cuda")
+    payload = {"tensor": tensor, "items": [other, ("keep", tensor)]}
+
+    moved = _move_tensor_tree_to_cpu(payload)
+
+    assert moved["tensor"].device.type == "cpu"
+    assert moved["items"][0].device.type == "cpu"
+    assert moved["items"][1][1].device.type == "cpu"
+    torch.testing.assert_close(moved["tensor"], tensor.cpu())
+    torch.testing.assert_close(moved["items"][0], other.cpu())
+    torch.testing.assert_close(moved["items"][1][1], tensor.cpu())
+    assert moved["items"][1][0] == "keep"
+
+
 @pytest.mark.asyncio
 async def test_async_add_req_and_wait_for_response():
     from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -71,31 +148,36 @@ async def test_async_add_req_and_wait_for_response():
     engine.scheduler = MockScheduler()
     engine._out_queue = {}
     engine.abort_queue: queue.Queue[str] = queue.Queue()
-    engine._rpc_lock = threading.Lock()
+    engine._rpc_queue = queue.Queue()
+    engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
+    engine._init_lock = asyncio.Lock()
+    engine._closed = False
+    engine._loop_started = False
+    engine.main_loop = None
 
     engine._finalize_finished_request = lambda rid, out, err: out.result
 
     def mock_execute_batch(sched_output):
-        req_ids = sched_output.scheduled_req_ids
+        request_ids = sched_output.scheduled_request_ids
 
         time.sleep(1)
 
         class MockRunnerOutput:
             def __init__(self, ids):
-                self.req_id = ids
+                self.request_id = ids
                 self.step_index = 0
                 self.finished = True
                 self._results = {rid: SimpleNamespace(result_data=f"data_{rid}") for rid in ids}
 
-            def get_req_output(self, rid):
+            def get_request_output(self, rid):
                 return SimpleNamespace(result=self._results[rid], step_index=0, finished=True)
 
-        return MockRunnerOutput(req_ids)
+        return MockRunnerOutput(request_ids)
 
     engine.execute_fn = mock_execute_batch
 
-    engine.stop_event = threading.Event()
-    engine.start_background_loop()
+    await engine._check_and_start_background_loop()
 
     async def run_task(rid):
         req = SimpleNamespace(request_id=rid)
@@ -105,10 +187,13 @@ async def test_async_add_req_and_wait_for_response():
 
     task_ids = [f"req_{i}" for i in range(5)]
     tasks = [run_task(rid) for rid in task_ids]
-    results = await asyncio.gather(*tasks)
-
-    engine.stop_event.set()
-    engine.worker_thread.join(timeout=5)
+    try:
+        results = await asyncio.gather(*tasks)
+    finally:
+        with engine._cv:
+            engine.stop_event.set()
+            engine._cv.notify_all()
+        engine.worker_thread.join(timeout=5)
     assert len(results) == 5
     for rid, res, elapsed in results:
         assert rid in res.result_data

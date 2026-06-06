@@ -17,7 +17,7 @@ _HUNYUAN_IMAGE3_INPUT_PROCESSOR = "vllm_omni.model_executor.stage_input_processo
 
 
 HUNYUAN_IMAGE3_PIPELINE = PipelineConfig(
-    model_type="hunyuan_image3",
+    model_type="hunyuan_image_3_moe",
     model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
     hf_architectures=_HUNYUAN_IMAGE3_HF_ARCHS,
     stages=(
@@ -26,7 +26,8 @@ HUNYUAN_IMAGE3_PIPELINE = PipelineConfig(
             model_stage="AR",
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
-            final_output=False,
+            final_output=True,
+            final_output_type="text",
             owns_tokenizer=False,
             requires_multimodal_data=True,
             model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,

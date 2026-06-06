@@ -13,8 +13,6 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from vllm import SamplingParams
 
-    from vllm_omni.entrypoints.omni_stage import OmniStage
-
 _DEFAULT_MOONCAKE_BOOTSTRAP_PORT = 25201
 
 logger = logging.getLogger(__name__)
@@ -131,7 +129,7 @@ class PDDisaggregationMixin:
         p_stage = self.stage_configs[p_id]
         d_stage = self.stage_configs[d_id]
 
-        def _get_kv_cfg(stage: "OmniStage") -> dict[str, Any]:
+        def _get_kv_cfg(stage: Any) -> dict[str, Any]:
             ea = stage.engine_args
             cfg = getattr(ea, "kv_transfer_config", None)
             if cfg is None:

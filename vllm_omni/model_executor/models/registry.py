@@ -2,6 +2,7 @@ from vllm.model_executor.models.registry import (
     _VLLM_MODELS,
     _LazyRegisteredModel,
     _ModelRegistry,
+    _resolve_module_name,
 )
 
 _OMNI_MODELS = {
@@ -102,6 +103,22 @@ _OMNI_MODELS = {
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
     ),
+    ## higgs-audio v2
+    "HiggsAudioV2ForConditionalGeneration": (
+        "higgs_audio_v2",
+        "higgs_audio_v2_talker",
+        "HiggsAudioV2TalkerForConditionalGeneration",
+    ),
+    "HiggsAudioV2TalkerForConditionalGeneration": (
+        "higgs_audio_v2",
+        "higgs_audio_v2_talker",
+        "HiggsAudioV2TalkerForConditionalGeneration",
+    ),
+    "HiggsAudioV2Code2WavForConditionalGeneration": (
+        "higgs_audio_v2",
+        "higgs_audio_v2_code2wav",
+        "HiggsAudioV2Code2WavForConditionalGeneration",
+    ),
     ## mimo_audio
     "MiMoAudioModel": (
         "mimo_audio",
@@ -129,6 +146,12 @@ _OMNI_MODELS = {
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
     ),
+    ## glm_tts
+    "GLMTTSForConditionalGeneration": (
+        "glm_tts",
+        "glm_tts",
+        "GLMTTSForConditionalGeneration",
+    ),
     "OmniBagelForConditionalGeneration": (
         "bagel",
         "bagel",
@@ -149,12 +172,6 @@ _OMNI_MODELS = {
         "fish_speech",
         "fish_speech_dac_decoder",
         "FishSpeechDACDecoder",
-    ),
-    ## VoxCPM
-    "VoxCPMForConditionalGeneration": (
-        "voxcpm",
-        "voxcpm",
-        "VoxCPMForConditionalGeneration",
     ),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
@@ -206,6 +223,25 @@ _OMNI_MODELS = {
         "modeling_moss_tts_nano",
         "MossTTSNanoForGeneration",
     ),
+    ## MOSS-TTS (full variants: Delay + Realtime)
+    # MossTTSDelayModel: MOSS-TTS (8B), MOSS-TTSD (8B), MOSS-SoundEffect (8B), MOSS-VoiceGenerator (1.7B)
+    "MossTTSDelayModel": (
+        "moss_tts",
+        "modeling_moss_tts_talker",
+        "MossTTSDelayTalkerForGeneration",
+    ),
+    # MossTTSRealtime: MOSS-TTS-Realtime (1.7B)
+    "MossTTSRealtime": (
+        "moss_tts",
+        "modeling_moss_tts_talker",
+        "MossTTSRealtimeTalkerForGeneration",
+    ),
+    # Stage-1 codec decoder (shared by all 5 variants)
+    "MossTTSCodecDecoder": (
+        "moss_tts",
+        "modeling_moss_tts_codec",
+        "MossTTSCodecDecoder",
+    ),
     "DyninOmniForConditionalGeneration": (
         "dynin_omni",
         "dynin_omni",
@@ -233,6 +269,22 @@ _OMNI_MODELS = {
         "ming_flash_omni",
         "MingFlashOmniForConditionalGeneration",
     ),
+    # MiniCPM-o 4.5 Omni models
+    "MiniCPMO45OmniForConditionalGeneration": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni",
+        "MiniCPMO45OmniForConditionalGeneration",
+    ),
+    "MiniCPMO45OmniLLMForConditionalGeneration": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni_llm",
+        "MiniCPMO45OmniLLMForConditionalGeneration",
+    ),
+    "MiniCPMO45OmniTTSForConditionalGeneration": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni_tts",
+        "MiniCPMO45OmniTTSForConditionalGeneration",
+    ),
 }
 
 
@@ -245,7 +297,7 @@ OmniModelRegistry = _ModelRegistry(
     {
         **{
             model_arch: _LazyRegisteredModel(
-                module_name=f"vllm.model_executor.models.{mod_relname}",
+                module_name=_resolve_module_name(mod_relname),
                 class_name=cls_name,
             )
             for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()

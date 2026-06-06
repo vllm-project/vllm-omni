@@ -78,15 +78,19 @@ steps:
       echo "--- Image pushed successfully"
       echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
 
-  # - label: "Upload Ready Pipeline"
-  #   depends_on: image-build
-  #   key: upload-ready-pipeline
-  #   if: build.branch != "main" && build.pull_request.labels includes "npu-test"
-  #   agents:
-  #     queue: "ascend-a2b3"
-  #     resource_class: "npu-1"
-  #   command: |
-  #     buildkite-agent pipeline upload .buildkite/test-npu-ready.yaml
+  - label: "Upload Ready Pipeline"
+    depends_on: image-build
+    key: upload-ready-pipeline
+    if: >-
+      build.branch != "main" && (
+        build.pull_request.labels includes "npu-test" ||
+        build.pull_request.labels includes "ready"
+      )
+    agents:
+      queue: "ascend-a2b3"
+      resource_class: "npu-1"
+    command: |
+      buildkite-agent pipeline upload .buildkite/test-npu-ready.yaml
 
   # L4 Test — main+NIGHTLY=1 (scheduled), or PR with specific label (e.g. add label then Rebuild)
   - label: "Upload Nightly Pipeline"

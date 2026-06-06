@@ -94,6 +94,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         return cls(
             request_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
+            prompt_is_token_ids=request.prompt_is_token_ids,
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
@@ -109,6 +110,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             resumable=request.resumable,
             external_req_id=request.external_req_id,
             reasoning_ended=request.reasoning_ended,
+            reasoning_parser_kwargs=request.reasoning_parser_kwargs,
+            abort_immediately=request.abort_immediately,
             additional_information=additional_information,
         )
 

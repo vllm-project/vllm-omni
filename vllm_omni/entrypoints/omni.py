@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
 
+from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import OmniBase
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
@@ -33,7 +34,7 @@ class Omni(OmniBase):
         for stage_id, params in enumerate(sampling_params_list):
             sp = copy.deepcopy(params)
             stage_meta = self.engine.get_stage_metadata(stage_id)
-            if stage_meta.get("stage_type") != "diffusion" and hasattr(sp, "output_kind"):
+            if stage_meta.stage_type != "diffusion" and hasattr(sp, "output_kind"):
                 sp.output_kind = RequestOutputKind.FINAL_ONLY
             effective_params.append(sp)
         return effective_params
@@ -120,6 +121,7 @@ class Omni(OmniBase):
             for req_id, prompt in zip(request_ids, request_prompts):
                 prompt_modalities = prompt.get("modalities", None) if isinstance(prompt, dict) else None
                 final_stage_id = self._compute_final_stage_id(prompt_modalities)
+                final_output_stage_ids = self._compute_final_output_stage_ids(prompt_modalities) or [final_stage_id]
                 req_final_stage_ids[req_id] = final_stage_id
 
                 metrics = OrchestratorMetrics(
@@ -144,6 +146,7 @@ class Omni(OmniBase):
                     prompt=prompt,
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id,
+                    final_output_stage_ids=final_output_stage_ids,
                 )
                 submit_ts = time.time()
                 req_state.metrics.stage_first_ts[0] = submit_ts
@@ -181,7 +184,7 @@ class Omni(OmniBase):
                 if output_to_yield is not None:
                     yield output_to_yield
 
-                if msg.get("finished"):
+                if isinstance(msg, OutputMessage) and msg.finished:
                     active_reqs.discard(req_id)
                     if pbar is not None:
                         pbar.update(1)

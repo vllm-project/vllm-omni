@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -100,6 +101,14 @@ class DiffusionExecutor(ABC):
     def check_health(self) -> None:
         """Check if the executor and workers are healthy."""
         pass
+
+    def register_failure_callback(self, callback: Callable[[], None]) -> None:
+        """Register a callback invoked when the executor fatally fails.
+
+        Executors without a background failure monitor can keep the default
+        no-op implementation.
+        """
+        return None
 
     @abstractmethod
     def shutdown(self) -> None:

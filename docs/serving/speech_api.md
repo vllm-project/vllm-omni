@@ -5,6 +5,9 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
+- **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
+
+See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, and MOSS-TTS-Nano.
 
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
@@ -26,6 +29,10 @@ vllm serve fishaudio/s2-pro --omni --port 8091
 
 # Voxtral TTS
 vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
+
+# CosyVoice3 (voice cloning only — supply ref_audio + ref_text per request)
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+    --omni --port 8091 --trust-remote-code
 ```
 
 ### Generate Speech
@@ -373,6 +380,44 @@ are cached in-process with a shared LRU so repeated requests with the same
 `voice=...` skip the extraction pipeline. The cache is a true singleton across
 all TTS model types; deleting a voice invalidates every model-type slot at
 once.
+
+### Precomputed Custom Voices
+
+Qwen3-TTS Base and VoxCPM2 can load offline-precomputed voices at startup.
+Generate a directory containing `custom_voice_manifest.json` plus one
+`.safetensors` file per voice, then set the pipeline-wide deploy config field:
+
+```yaml
+custom_voice_dir: /path/to/custom_voices
+```
+
+Qwen3-TTS profiles are created with:
+
+```bash
+python examples/online_serving/text_to_speech/qwen3_tts/precompute_custom_voice.py \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --voice-name alice \
+  --ref-audio /path/to/reference.wav \
+  --ref-text "Original transcript of the reference audio" \
+  --mode icl \
+  --output-dir /path/to/custom_voices
+```
+
+VoxCPM2 profiles are created with:
+
+```bash
+python examples/online_serving/text_to_speech/voxcpm2/precompute_custom_voice.py \
+  --model openbmb/VoxCPM2 \
+  --voice-name alice \
+  --ref-audio /path/to/reference.wav \
+  --mode ref_continuation \
+  --prompt-text "Original transcript of the reference audio" \
+  --output-dir /path/to/custom_voices
+```
+
+Only profiles whose safetensors payload can be loaded and validated are exposed
+by `GET /v1/audio/voices`. Valid precomputed voices can be used in
+`POST /v1/audio/speech` by passing `voice="alice"` without `ref_audio`.
 
 **Configuration (environment variables):**
 

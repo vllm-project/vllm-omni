@@ -94,7 +94,9 @@ def _normalize_video_tensor(video_tensor: torch.Tensor) -> np.ndarray:
         video_tensor = video_tensor.permute(1, 2, 3, 0)
 
     if video_tensor.is_floating_point():
-        video_tensor = video_tensor.clamp(-1, 1) * 0.5 + 0.5
+        # Cast to float32 first: bf16 (e.g. SANA-WM's refiner output) has no
+        # numpy dtype, so ``.numpy()`` below raises on it.
+        video_tensor = video_tensor.float().clamp(-1, 1) * 0.5 + 0.5
     else:
         video_tensor = video_tensor.to(torch.float32) / 255.0
     video_array = video_tensor.numpy()
