@@ -235,11 +235,11 @@ def main():
         ar_image_size = f"{args.width}x{args.height}"
     else:
         ar_image_size = None
-    ar_stop_token_ids = resolve_stop_token_ids(
+    autoregressive_stop_token_ids = resolve_stop_token_ids(
         task=task, bot_task=bot_task, tokenizer=tokenizer, image_size=ar_image_size
     )
     print(
-        f"[AR Config] task={task}, bot_task={bot_task}, image_size={ar_image_size}, stop_token_ids={ar_stop_token_ids}"
+        f"[AR Config] task={task}, bot_task={bot_task}, image_size={ar_image_size}, stop_token_ids={autoregressive_stop_token_ids}"
     )
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
@@ -252,7 +252,7 @@ def main():
                 sp.height = args.height
                 sp.width = args.width
         elif hasattr(sp, "stop_token_ids"):
-            sp.stop_token_ids = ar_stop_token_ids
+            sp.stop_token_ids = autoregressive_stop_token_ids
 
     print(f"\n{'=' * 60}")
     print("HunyuanImage-3.0 Generation Configuration:")
