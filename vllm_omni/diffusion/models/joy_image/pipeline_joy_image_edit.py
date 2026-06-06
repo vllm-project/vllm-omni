@@ -125,7 +125,9 @@ def _is_dummy_request(req: Any) -> bool:
     return getattr(req, "request_id", None) == DUMMY_DIFFUSION_REQUEST_ID
 
 
-def _calculate_dimensions(target_area: int, ratio: float, alignment: int) -> tuple[int, int]:
+def _calculate_dimensions(
+    target_area: int, ratio: float, alignment: int
+) -> tuple[int, int]:
     width = math.sqrt(target_area * ratio)
     height = width / ratio
     width = max(alignment, int(round(width / alignment) * alignment))
@@ -150,7 +152,9 @@ def _fit_to_token_budget(height: int, width: int, alignment: int) -> tuple[int, 
     return height, width
 
 
-def _normalize_explicit_size(height: int, width: int, alignment: int) -> tuple[int, int]:
+def _normalize_explicit_size(
+    height: int, width: int, alignment: int
+) -> tuple[int, int]:
     height = max(alignment, int(round(height / alignment) * alignment))
     width = max(alignment, int(round(width / alignment) * alignment))
     token_count = (height // alignment) * (width // alignment)
@@ -174,7 +178,9 @@ def _tensor_to_pil(images: torch.Tensor) -> list[PIL.Image.Image]:
     if images.ndim == 3:
         images = images.unsqueeze(0)
     if images.ndim != 4:
-        raise ValueError(f"Expected image tensor (B, C, H, W), got {tuple(images.shape)}.")
+        raise ValueError(
+            f"Expected image tensor (B, C, H, W), got {tuple(images.shape)}."
+        )
     images = images.detach().cpu().float().clamp(-1.0, 1.0)
     images = (images + 1.0) / 2.0
     images = (images * 255.0).round().to(torch.uint8)
@@ -187,13 +193,19 @@ def _tensor_to_pil(images: torch.Tensor) -> list[PIL.Image.Image]:
 def _extract_single_image(
     prompt: dict[str, Any] | str,
 ) -> PIL.Image.Image | torch.Tensor | np.ndarray:
-    multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else {}
+    multi_modal_data = (
+        prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else {}
+    )
     raw_image = multi_modal_data.get("image")
     if raw_image is None or (isinstance(raw_image, list) and len(raw_image) == 0):
-        raise ValueError("Received no input image. JoyAI-Image-Edit requires exactly one input image.")
+        raise ValueError(
+            "Received no input image. JoyAI-Image-Edit requires exactly one input image."
+        )
     if isinstance(raw_image, list):
         if len(raw_image) != 1:
-            raise ValueError("Received multiple input images. JoyAI-Image-Edit v1 supports exactly one image.")
+            raise ValueError(
+                "Received multiple input images. JoyAI-Image-Edit v1 supports exactly one image."
+            )
         raw_image = raw_image[0]
     if isinstance(raw_image, str):
         return PIL.Image.open(raw_image)
@@ -227,7 +239,9 @@ def _to_pil_image(
     if array.dtype != np.uint8:
         if array.min() < 0:
             array = (array + 1.0) / 2.0
-        array = np.clip(array * 255.0 if array.max() <= 1.0 else array, 0, 255).astype(np.uint8)
+        array = np.clip(array * 255.0 if array.max() <= 1.0 else array, 0, 255).astype(
+            np.uint8
+        )
     return PIL.Image.fromarray(array).convert("RGB")
 
 
@@ -252,7 +266,9 @@ def get_joy_image_edit_pre_process_func(
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         if len(request.prompts) != 1:
-            raise ValueError("JoyAI-Image-Edit v1 supports exactly one prompt per request.")
+            raise ValueError(
+                "JoyAI-Image-Edit v1 supports exactly one prompt per request."
+            )
         for prompt_index, prompt in enumerate(request.prompts):
             if isinstance(prompt, str):
                 prompt = {"prompt": prompt}
@@ -262,10 +278,14 @@ def get_joy_image_edit_pre_process_func(
             height_is_set = request.sampling_params.height is not None
             width_is_set = request.sampling_params.width is not None
             if height_is_set != width_is_set:
-                raise ValueError("JoyAI-Image-Edit requires both `height` and `width`, or neither.")
+                raise ValueError(
+                    "JoyAI-Image-Edit requires both `height` and `width`, or neither."
+                )
             if not height_is_set and not width_is_set:
                 ratio = original_width / original_height
-                width, height = _calculate_dimensions(JOY_DEFAULT_TARGET_AREA, ratio, alignment)
+                width, height = _calculate_dimensions(
+                    JOY_DEFAULT_TARGET_AREA, ratio, alignment
+                )
                 height, width = _fit_to_token_budget(height, width, alignment)
             else:
                 height, width = _normalize_explicit_size(
@@ -274,7 +294,9 @@ def get_joy_image_edit_pre_process_func(
                     alignment,
                 )
 
-            prompt_image = _to_pil_image(image).resize((width, height), PIL.Image.Resampling.LANCZOS)
+            prompt_image = _to_pil_image(image).resize(
+                (width, height), PIL.Image.Resampling.LANCZOS
+            )
             image_tensor = _pil_to_tensor(prompt_image, height, width)
             prompt["additional_information"].update(
                 {
@@ -303,7 +325,9 @@ def get_joy_image_edit_post_process_func(
     return post_process_func
 
 
-def retrieve_latents(encoder_output: Any, generator: torch.Generator | None = None) -> torch.Tensor:
+def retrieve_latents(
+    encoder_output: Any, generator: torch.Generator | None = None
+) -> torch.Tensor:
     if hasattr(encoder_output, "latent_dist"):
         return encoder_output.latent_dist.sample(generator=generator)
     if hasattr(encoder_output, "latents"):
@@ -395,7 +419,9 @@ class JoyImageEditPipeline(
         )
         if not defer_component_device_placement:
             self.vae = self.vae.to(self.device)
-        transformer_config_kwargs = _get_transformer_config_kwargs_from_od_config(od_config)
+        transformer_config_kwargs = _get_transformer_config_kwargs_from_od_config(
+            od_config
+        )
         if transformer_config_kwargs:
             self.transformer = JoyImageEditTransformer3DModel(
                 od_config=od_config,
@@ -433,7 +459,9 @@ class JoyImageEditPipeline(
         guidance_provided = sampling_params.guidance_scale_provided
         guidance_scale = sampling_params.guidance_scale
         if true_cfg_scale is None:
-            return float(guidance_scale if guidance_provided else default_true_cfg_scale)
+            return float(
+                guidance_scale if guidance_provided else default_true_cfg_scale
+            )
         guidance_is_disabled_default = math.isclose(float(guidance_scale), 1.0)
         if (
             guidance_provided
@@ -447,7 +475,9 @@ class JoyImageEditPipeline(
         return float(true_cfg_scale)
 
     @staticmethod
-    def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor) -> list[torch.Tensor]:
+    def _extract_masked_hidden(
+        hidden_states: torch.Tensor, mask: torch.Tensor
+    ) -> list[torch.Tensor]:
         bool_mask = mask.bool()
         valid_lengths = bool_mask.sum(dim=1)
         selected = hidden_states[bool_mask]
@@ -460,7 +490,9 @@ class JoyImageEditPipeline(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if max_sequence_length <= 0:
             raise ValueError("max_sequence_length must be greater than 0.")
-        split_hidden_states = [item[-max_sequence_length:] for item in split_hidden_states]
+        split_hidden_states = [
+            item[-max_sequence_length:] for item in split_hidden_states
+        ]
         max_seq_len = max(item.shape[0] for item in split_hidden_states)
         prompt_embeds = torch.stack(
             [
@@ -499,7 +531,9 @@ class JoyImageEditPipeline(
         def hook(_module: nn.Module, args: tuple[Any, ...], _output: Any) -> None:
             captured["hidden_states"] = args[0]
 
-        handle = self.text_encoder.model.language_model.layers[-1].register_forward_hook(hook)
+        handle = self.text_encoder.model.language_model.layers[
+            -1
+        ].register_forward_hook(hook)
         try:
             if _joy_trace_enabled():
                 logger.info(
@@ -526,7 +560,9 @@ class JoyImageEditPipeline(
         finally:
             handle.remove()
         if "hidden_states" not in captured:
-            raise RuntimeError("Failed to capture Qwen3VL last-layer pre-norm hidden states.")
+            raise RuntimeError(
+                "Failed to capture Qwen3VL last-layer pre-norm hidden states."
+            )
         return captured["hidden_states"]
 
     def _get_qwen_prompt_embeds(
@@ -563,13 +599,20 @@ class JoyImageEditPipeline(
                 time.perf_counter() - start,
             )
         hidden_states = self._get_last_layer_pre_norm_hidden(model_inputs)
-        split_hidden_states = self._extract_masked_hidden(hidden_states, model_inputs.attention_mask)
-        split_hidden_states = [item[self.prompt_template_encode_start_idx :] for item in split_hidden_states]
+        split_hidden_states = self._extract_masked_hidden(
+            hidden_states, model_inputs.attention_mask
+        )
+        split_hidden_states = [
+            item[self.prompt_template_encode_start_idx :]
+            for item in split_hidden_states
+        ]
         prompt_embeds, prompt_mask = self._pad_prompt_embeds(
             split_hidden_states,
             self.tokenizer_max_length,
         )
-        return prompt_embeds.to(dtype=dtype, device=self.device), prompt_mask.to(device=self.device)
+        return prompt_embeds.to(dtype=dtype, device=self.device), prompt_mask.to(
+            device=self.device
+        )
 
     def encode_prompt(
         self,
@@ -590,10 +633,14 @@ class JoyImageEditPipeline(
         if prompt_embeds_mask is None:
             raise ValueError("prompt_embeds_mask must be provided with prompt_embeds.")
         prompt_embeds = prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
-        prompt_embeds_mask = prompt_embeds_mask.repeat_interleave(num_images_per_prompt, dim=0)
+        prompt_embeds_mask = prompt_embeds_mask.repeat_interleave(
+            num_images_per_prompt, dim=0
+        )
         return prompt_embeds, prompt_embeds_mask
 
-    def _latent_stats(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    def _latent_stats(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.latent_channels, 1, 1, 1)
@@ -635,7 +682,9 @@ class JoyImageEditPipeline(
             ]
             image_latents = torch.cat(image_latents, dim=0)
         else:
-            image_latents = retrieve_latents(self.vae.encode(image), generator=generator)
+            image_latents = retrieve_latents(
+                self.vae.encode(image), generator=generator
+            )
         if _joy_trace_enabled():
             logger.info(
                 "[joy-trace] vae encode done vae_device=%s latent_device=%s latent_shape=%s elapsed=%.2fs",
@@ -644,7 +693,9 @@ class JoyImageEditPipeline(
                 tuple(image_latents.shape),
                 time.perf_counter() - start,
             )
-        latents_mean, latents_std = self._latent_stats(image_latents.device, image_latents.dtype)
+        latents_mean, latents_std = self._latent_stats(
+            image_latents.device, image_latents.dtype
+        )
         return (image_latents - latents_mean) / latents_std
 
     def prepare_latents(
@@ -670,7 +721,9 @@ class JoyImageEditPipeline(
             latent_width,
         )
         if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(f"Generator list length {len(generator)} must match effective batch size {batch_size}.")
+            raise ValueError(
+                f"Generator list length {len(generator)} must match effective batch size {batch_size}."
+            )
 
         image = image.to(device=device, dtype=dtype)
         if _joy_trace_enabled():
@@ -680,7 +733,11 @@ class JoyImageEditPipeline(
                 tuple(image.shape),
                 dtype,
             )
-        image_latents = image if image.shape[1] == self.latent_channels else self._encode_vae_image(image, generator)
+        image_latents = (
+            image
+            if image.shape[1] == self.latent_channels
+            else self._encode_vae_image(image, generator)
+        )
         image_latents = image_latents.to(device=device, dtype=dtype)
         expected_image_tail = (
             num_channels_latents,
@@ -688,7 +745,10 @@ class JoyImageEditPipeline(
             latent_height,
             latent_width,
         )
-        if image_latents.ndim != 5 or tuple(image_latents.shape[1:]) != expected_image_tail:
+        if (
+            image_latents.ndim != 5
+            or tuple(image_latents.shape[1:]) != expected_image_tail
+        ):
             raise ValueError(
                 "Joy image latents must have shape "
                 f"(B, {expected_image_tail[0]}, {expected_image_tail[1]}, "
@@ -704,7 +764,9 @@ class JoyImageEditPipeline(
             repeats = batch_size // image_latents.shape[0]
             image_latents = image_latents.repeat_interleave(repeats, dim=0)
         elif batch_size < image_latents.shape[0]:
-            raise ValueError(f"Image batch size {image_latents.shape[0]} exceeds effective batch size {batch_size}.")
+            raise ValueError(
+                f"Image batch size {image_latents.shape[0]} exceeds effective batch size {batch_size}."
+            )
 
         if latents is None:
             noise_latents = randn_tensor(
@@ -719,7 +781,8 @@ class JoyImageEditPipeline(
                 noise_latents = noise_latents.unsqueeze(1)
             if tuple(noise_latents.shape) != expected_noise_shape:
                 raise ValueError(
-                    f"Joy noise latents must have shape {expected_noise_shape}, got {tuple(noise_latents.shape)}."
+                    "Joy noise latents must have shape "
+                    f"{expected_noise_shape}, got {tuple(noise_latents.shape)}."
                 )
         return torch.cat([image_latents, noise_latents], dim=1), image_latents
 
@@ -778,9 +841,13 @@ class JoyImageEditPipeline(
             )
         start = time.perf_counter()
         batch_size, num_items, channels, frames, height, width = latents.shape
-        flat_latents = latents.reshape(batch_size * num_items, channels, frames, height, width)
+        flat_latents = latents.reshape(
+            batch_size * num_items, channels, frames, height, width
+        )
         flat_latents = flat_latents.to(device=self._vae_device(flat_latents.device))
-        latents_mean, latents_std = self._latent_stats(flat_latents.device, flat_latents.dtype)
+        latents_mean, latents_std = self._latent_stats(
+            flat_latents.device, flat_latents.dtype
+        )
         flat_latents = flat_latents * latents_std + latents_mean
         decoded = self.vae.decode(flat_latents, return_dict=False)[0]
         if _joy_trace_enabled():
@@ -817,7 +884,9 @@ class JoyImageEditPipeline(
         output_type: str | None = "pil",
     ) -> DiffusionOutput:
         if len(req.prompts) != 1:
-            raise ValueError("JoyImageEditPipeline supports exactly one prompt per request.")
+            raise ValueError(
+                "JoyImageEditPipeline supports exactly one prompt per request."
+            )
         if _joy_trace_enabled():
             logger.info(
                 "[joy-trace] forward start request_id=%s output_type=%s "
@@ -829,14 +898,24 @@ class JoyImageEditPipeline(
                 _trace_module_device(self.vae),
             )
         first_prompt = req.prompts[0]
-        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-        additional_information = {} if isinstance(first_prompt, str) else first_prompt.get("additional_information", {})
+        prompt = (
+            first_prompt
+            if isinstance(first_prompt, str)
+            else (first_prompt.get("prompt") or "")
+        )
+        additional_information = (
+            {}
+            if isinstance(first_prompt, str)
+            else first_prompt.get("additional_information", {})
+        )
         image = additional_information.get("image_tensor")
         prompt_image = additional_information.get("prompt_image")
         height = additional_information.get("height") or req.sampling_params.height
         width = additional_information.get("width") or req.sampling_params.width
         if image is None or prompt_image is None or height is None or width is None:
-            raise ValueError("JoyImageEditPipeline requires preprocessed image information in the request.")
+            raise ValueError(
+                "JoyImageEditPipeline requires preprocessed image information in the request."
+            )
 
         num_inference_steps = req.sampling_params.num_inference_steps or 50
         generator = req.sampling_params.generator or generator
@@ -844,7 +923,11 @@ class JoyImageEditPipeline(
         true_cfg_scale = self.resolve_effective_true_cfg_scale(req)
         do_true_cfg = true_cfg_scale > 1.0
         self.check_cfg_parallel_validity(true_cfg_scale)
-        negative_prompt = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt")
+        negative_prompt = (
+            None
+            if isinstance(first_prompt, str)
+            else first_prompt.get("negative_prompt")
+        )
         if do_true_cfg and negative_prompt is None:
             negative_prompt = ""
 
@@ -886,7 +969,9 @@ class JoyImageEditPipeline(
 
         batch_size = prompt_embeds.shape[0]
         if req.sampling_params.seed is not None and generator is None:
-            generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
+            generator = torch.Generator(device=self.device).manual_seed(
+                req.sampling_params.seed
+            )
 
         latents, image_latents = self.prepare_latents(
             image=image,

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import inspect
-
 import torch
 import torch.nn as nn
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
@@ -17,6 +15,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionModel,
     Unpack,
     apply_rotary_pos_emb,
+    check_model_inputs,
     create_causal_mask,
     deprecate_kwarg,
     eager_attention_forward,
@@ -39,47 +38,6 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLTextRMSNorm as HFQwen3VLTextRMSNorm,
 )
-
-try:
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import check_model_inputs
-except ImportError:
-
-    def check_model_inputs(func):
-        return func
-
-
-_CREATE_CAUSAL_MASK_PARAMS = inspect.signature(create_causal_mask).parameters
-_CREATE_CAUSAL_MASK_ACCEPTS_KWARGS = any(
-    param.kind == inspect.Parameter.VAR_KEYWORD for param in _CREATE_CAUSAL_MASK_PARAMS.values()
-)
-
-
-def _create_causal_mask(
-    *,
-    config: Qwen3VLTextConfig,
-    inputs_embeds: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    cache_position: torch.LongTensor,
-    past_key_values: Cache | None,
-    position_ids: torch.LongTensor,
-) -> torch.Tensor | None:
-    mask_kwargs = {
-        "config": config,
-        "attention_mask": attention_mask,
-        "cache_position": cache_position,
-        "past_key_values": past_key_values,
-        "position_ids": position_ids,
-    }
-    if "input_embeds" in _CREATE_CAUSAL_MASK_PARAMS:
-        mask_kwargs["input_embeds"] = inputs_embeds
-    else:
-        mask_kwargs["inputs_embeds"] = inputs_embeds
-
-    if _CREATE_CAUSAL_MASK_ACCEPTS_KWARGS:
-        return create_causal_mask(**mask_kwargs)
-    return create_causal_mask(
-        **{name: value for name, value in mask_kwargs.items() if name in _CREATE_CAUSAL_MASK_PARAMS}
-    )
 
 
 class Qwen3VLTextRMSNorm(HFQwen3VLTextRMSNorm):
@@ -217,9 +175,9 @@ class Qwen3VLTextModel(HFQwen3VLTextModel):
         else:
             text_position_ids = position_ids[0]
 
-        attention_mask = _create_causal_mask(
+        attention_mask = create_causal_mask(
             config=self.config,
-            inputs_embeds=inputs_embeds,
+            input_embeds=inputs_embeds,
             attention_mask=attention_mask,
             cache_position=cache_position,
             past_key_values=past_key_values,

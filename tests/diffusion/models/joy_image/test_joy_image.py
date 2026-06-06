@@ -83,7 +83,9 @@ def _make_request(*, prompt=None, params=None):
         "multi_modal_data": {"image": Image.new("RGB", (2048, 1024), color="white")},
     }
     params = params or _make_params()
-    return SimpleNamespace(prompts=[prompt], sampling_params=params, request_id="joy-test")
+    return SimpleNamespace(
+        prompts=[prompt], sampling_params=params, request_id="joy-test"
+    )
 
 
 def test_joy_registry_and_metadata_entries(tmp_path):
@@ -198,7 +200,9 @@ def test_preprocess_requires_exactly_one_image(tmp_path):
     multi_image = _make_request(
         prompt={
             "prompt": "x",
-            "multi_modal_data": {"image": [Image.new("RGB", (32, 32)), Image.new("RGB", (32, 32))]},
+            "multi_modal_data": {
+                "image": [Image.new("RGB", (32, 32)), Image.new("RGB", (32, 32))]
+            },
         }
     )
     with pytest.raises(ValueError, match="exactly one image"):
@@ -254,13 +258,21 @@ def test_guidance_scale_alias_only_when_true_cfg_absent():
     canonical = _make_request(params=_make_params(true_cfg_scale=4.0))
     assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(canonical) == 4.0
 
-    default_guidance = _make_request(params=_make_params(guidance_scale=1.0, true_cfg_scale=4.0))
-    assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(default_guidance) == 4.0
+    default_guidance = _make_request(
+        params=_make_params(guidance_scale=1.0, true_cfg_scale=4.0)
+    )
+    assert (
+        JoyImageEditPipeline.resolve_effective_true_cfg_scale(default_guidance) == 4.0
+    )
 
-    matching = _make_request(params=_make_params(guidance_scale=4.0, true_cfg_scale=4.0))
+    matching = _make_request(
+        params=_make_params(guidance_scale=4.0, true_cfg_scale=4.0)
+    )
     assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(matching) == 4.0
 
-    conflict = _make_request(params=_make_params(guidance_scale=3.0, true_cfg_scale=4.0))
+    conflict = _make_request(
+        params=_make_params(guidance_scale=3.0, true_cfg_scale=4.0)
+    )
     with pytest.raises(ValueError, match="compatibility alias"):
         JoyImageEditPipeline.resolve_effective_true_cfg_scale(conflict)
 
@@ -465,7 +477,9 @@ def test_transformer_shape_and_masked_forward():
 def test_transformer_from_config_file_loads_checkpoint_config(tmp_path):
     _write_model_configs(tmp_path)
 
-    transformer = JoyImageEditTransformer3DModel.from_config_file(tmp_path / "transformer" / "config.json")
+    transformer = JoyImageEditTransformer3DModel.from_config_file(
+        tmp_path / "transformer" / "config.json"
+    )
 
     assert transformer.patch_size == (1, 2, 2)
     assert transformer.hidden_size == 32
@@ -493,7 +507,9 @@ def test_transformer_load_weights_maps_diffusers_prefix():
     assert torch.equal(transformer.img_in.weight, weight)
 
     text_weight = torch.randn_like(transformer.condition_embedder.text_embedder.linear_1.weight)
-    loaded = transformer.load_weights([("transformer.condition_embedder.text_embedder.linear_1.weight", text_weight)])
+    loaded = transformer.load_weights(
+        [("transformer.condition_embedder.text_embedder.linear_1.weight", text_weight)]
+    )
 
     assert loaded == {"condition_embedder.text_embedder.linear_1.weight"}
     assert torch.equal(transformer.condition_embedder.text_embedder.linear_1.weight, text_weight)
