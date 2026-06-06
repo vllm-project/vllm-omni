@@ -9,6 +9,7 @@ import re
 import struct
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
@@ -102,19 +103,21 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "higgs_audio_v2",
     "higgs_audio_v3",
 }
-_TTS_LANGUAGES: set[str] = {
-    "Auto",
-    "Chinese",
-    "English",
-    "Japanese",
-    "Korean",
-    "German",
-    "French",
-    "Russian",
-    "Portuguese",
-    "Spanish",
-    "Italian",
-}
+_TTS_LANGUAGES: frozenset[str] = frozenset(
+    {
+        "Auto",
+        "Chinese",
+        "English",
+        "Japanese",
+        "Korean",
+        "German",
+        "French",
+        "Russian",
+        "Portuguese",
+        "Spanish",
+        "Italian",
+    }
+)
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
@@ -435,7 +438,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self.supported_speakers |= self._load_supported_speakers()
         self.supported_speakers |= set(self.precomputed_speakers)
 
-        self.supported_languages: set[str] = self._load_supported_languages()
+        self.supported_languages: frozenset[str] = self._load_supported_languages()
 
         self._tts_tokenizer = None
         self._voxcpm2_tokenizer = None
@@ -697,7 +700,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return set()
 
-    def _load_supported_languages(self) -> set[str]:
+    def _load_supported_languages(self) -> frozenset[str]:
         """Load supported languages (title-cased) from the model configuration"""
         if self._tts_model_type != "qwen3_tts":
             return _TTS_LANGUAGES
@@ -709,8 +712,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             else:
                 codec_language_id = getattr(config, "codec_language_id", None)
 
-            if codec_language_id and isinstance(codec_language_id, dict):
-                return {str(language).title() for language in codec_language_id} | {"Auto"}
+            if codec_language_id and isinstance(codec_language_id, Mapping):
+                return frozenset(str(language).title() for language in codec_language_id) | {"Auto"}
 
             logger.warning("No codec_language_id found in talker_config; falling back to default languages")
         except Exception as e:
