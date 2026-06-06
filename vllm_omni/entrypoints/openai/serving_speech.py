@@ -103,7 +103,7 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "higgs_audio_v2",
     "higgs_audio_v3",
 }
-_TTS_LANGUAGES: frozenset[str] = frozenset(
+_TTS_LANGUAGES = frozenset(
     {
         "Auto",
         "Chinese",
@@ -438,7 +438,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self.supported_speakers |= self._load_supported_speakers()
         self.supported_speakers |= set(self.precomputed_speakers)
 
-        self.supported_languages: frozenset[str] = self._load_supported_languages()
+        self.supported_languages = self._load_supported_languages()
 
         self._tts_tokenizer = None
         self._voxcpm2_tokenizer = None
