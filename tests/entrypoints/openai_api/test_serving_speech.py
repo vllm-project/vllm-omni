@@ -1314,10 +1314,10 @@ class TestTTSMethods:
         speech_server.engine_client = SimpleNamespace()  # no model_config -> AttributeError
         assert speech_server._load_supported_languages() == _TTS_LANGUAGES
 
-    def test_load_supported_languages_empty_for_non_qwen(self, speech_server):
-        """Non-qwen3_tts model types get an empty language set."""
+    def test_load_supported_languages_default_for_non_qwen(self, speech_server):
+        """Non-qwen3_tts model types get the default language set."""
         speech_server._tts_model_type = None
-        assert speech_server._load_supported_languages() == set()
+        assert speech_server._load_supported_languages() == _TTS_LANGUAGES
 
     def test_build_tts_params_with_uploaded_voice(self, speech_server, mocker: MockerFixture):
         """Test _build_tts_params auto-sets ref_audio for uploaded voices (x_vector only)."""

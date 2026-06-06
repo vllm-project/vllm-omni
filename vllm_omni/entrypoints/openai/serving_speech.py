@@ -700,7 +700,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _load_supported_languages(self) -> set[str]:
         """Load supported languages (title-cased) from the model configuration"""
         if self._tts_model_type != "qwen3_tts":
-            return set()
+            return _TTS_LANGUAGES
         try:
             config = self.engine_client.model_config.hf_config.talker_config
 
@@ -1447,7 +1447,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if request.language is not None:
             request.language = request.language.title()
             if request.language not in self.supported_languages:
-                return f"Invalid language '{request.language}'. Supported: {', '.join(sorted(self.supported_languages))}"
+                return (
+                    f"Invalid language '{request.language}'. Supported: {', '.join(sorted(self.supported_languages))}"
+                )
 
         # Validate speaker for CustomVoice task
         if task_type == "CustomVoice":
