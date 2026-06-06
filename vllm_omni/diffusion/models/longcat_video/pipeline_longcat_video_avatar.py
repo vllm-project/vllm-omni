@@ -634,12 +634,6 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         )
         self.vocal_separator.load_model(separator_path.name)
 
-    def close(self) -> None:
-        audio_temp_dir = getattr(self, "_audio_temp_dir", None)
-        if audio_temp_dir is not None:
-            audio_temp_dir.cleanup()
-            self._audio_temp_dir = None
-
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
         device = torch.device(args[0]) if args else torch.device(kwargs.get("device", self.device))
