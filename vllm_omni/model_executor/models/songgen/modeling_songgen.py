@@ -201,8 +201,7 @@ class SongGenForGeneration(nn.Module):
                 return_tensors="pt",
             )
             model_inputs = {
-                k: v.to(self._device) if isinstance(v, torch.Tensor) else v
-                for k, v in model_inputs.items()
+                k: v.to(self._device) if isinstance(v, torch.Tensor) else v for k, v in model_inputs.items()
             }
 
             output = self._model.generate(**model_inputs, do_sample=_DEFAULT_DO_SAMPLE)
