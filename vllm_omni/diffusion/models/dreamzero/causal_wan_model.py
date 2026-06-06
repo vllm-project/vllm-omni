@@ -913,6 +913,7 @@ class CausalWanModel(nn.Module):
         timestep_action: torch.Tensor | None,
         state: torch.Tensor | None,
         kv_cache: list[torch.Tensor],
+        crossattn_cache: list[dict] | None,
         current_start_frame: int,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
         x = x.flatten(start_dim=2).transpose(1, 2)
@@ -963,6 +964,7 @@ class CausalWanModel(nn.Module):
                 context=context,
                 action_register_length=action_register_length,
                 kv_cache=kv_cache[block_index] if kv_cache else None,
+                crossattn_cache=crossattn_cache[block_index] if crossattn_cache else None,
                 current_start_frame=current_start_frame,
             )
             updated_kv_caches.append(updated_kv_cache)
@@ -1020,6 +1022,7 @@ class CausalWanModel(nn.Module):
             timestep_action=timestep_action,
             state=state,
             kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
             current_start_frame=current_start_frame,
         )
 
