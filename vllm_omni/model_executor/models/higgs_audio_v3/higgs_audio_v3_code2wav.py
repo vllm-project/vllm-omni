@@ -391,16 +391,26 @@ class HiggsAudioV3Code2Wav(nn.Module):
         audio_codes: torch.Tensor,
         *,
         left_context_size: int = 0,
+        right_holdback_size: int = 0,
         hop_length: int | None = None,
     ) -> torch.Tensor:
+        # ``left_context_size`` frames trimmed off the front (already-emitted
+        # prefix). ``right_holdback_size`` frames trimmed off the end
+        # (deferred to the next chunk so the codec has future context for
+        # the emit region's trailing samples).
         hop = int(hop_length) if hop_length is not None else self.hop_length
         pcm = self.decode_codes(audio_codes)
-        if left_context_size == 0:
+        right_trim = right_holdback_size * hop
+        left_trim = left_context_size * hop
+        if right_trim > 0:
+            if pcm.shape[-1] <= right_trim:
+                return pcm[..., :0]
+            pcm = pcm[..., :-right_trim]
+        if left_trim == 0:
             return pcm
-        trim = left_context_size * hop
-        if pcm.shape[-1] <= trim:
+        if pcm.shape[-1] <= left_trim:
             return pcm[..., :0]
-        return pcm[..., trim:]
+        return pcm[..., left_trim:]
 
     # ------------------------------------------------------------------ runtime forward
     @torch.no_grad()
@@ -430,6 +440,7 @@ class HiggsAudioV3Code2Wav(nn.Module):
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
         left_context_size = [0] * len(request_ids_list)
+        right_holdback_size = [0] * len(request_ids_list)
         if runtime_additional_information is not None:
             for i, info in enumerate(runtime_additional_information):
                 if i >= len(left_context_size):
@@ -437,6 +448,8 @@ class HiggsAudioV3Code2Wav(nn.Module):
                 meta = info.get("meta", {}) if isinstance(info, dict) else {}
                 if "left_context_size" in meta:
                     left_context_size[i] = int(meta["left_context_size"])
+                if "right_holdback_size" in meta:
+                    right_holdback_size[i] = int(meta["right_holdback_size"])
 
         wavs: list[torch.Tensor] = []
         for i, req_ids in enumerate(request_ids_list):
@@ -459,6 +472,7 @@ class HiggsAudioV3Code2Wav(nn.Module):
                 pcm = self.forward_chunk(
                     codes_bqf,
                     left_context_size=left_context_size[i],
+                    right_holdback_size=right_holdback_size[i],
                     hop_length=self.hop_length,
                 )
             except ValueError as exc:

@@ -109,6 +109,47 @@ class TestHiggsAudioV3OnlineHappyPath:
             request_num=3,
         )
 
+    @pytest.mark.core_model
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_plain_text_pcm_streaming(self, omni_server, openai_client) -> None:
+        """Streaming PCM via talker2code2wav_async_chunk + the connector's codec_streaming path.
+
+        The deploy YAML pins ``async_chunk: true`` and ``codec_streaming: true`` so chunks
+        flow Stage 0 -> Stage 1 per AR loop. The Stage-1 codec honors
+        ``meta.left_context_size`` and ``meta.right_holdback_size`` so per-chunk codec
+        windows stitch into a coherent PCM stream. The byte-count gate is the same as
+        the sync paths; per-chunk audio content is verified offline against Whisper.
+        """
+        openai_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "The quick brown fox jumps over the lazy dog.",
+                "stream": True,
+                "response_format": "pcm",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
+            }
+        )
+
+    @pytest.mark.core_model
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_concurrent_pcm_streaming(self, omni_server, openai_client) -> None:
+        """Three concurrent streaming requests - guards per-request frame cursors
+        in ``talker2code2wav_async_chunk`` and per-slot delay-pattern state under batched AR."""
+        openai_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "She sells seashells by the seashore.",
+                "stream": True,
+                "response_format": "pcm",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
+            },
+            request_num=3,
+        )
+
 
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 class TestHiggsAudioV3OnlineInlineControlTokens:
