@@ -697,6 +697,8 @@ class Orchestrator:
                                     "new_prompt_len_snapshot",
                                     None,
                                 )
+                                if req_state.streaming.enabled:
+                                    await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
                             # OmniSchedulerMixin.make_stats() already throttles
                             # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
                             # being non-None means this replica passed its own gate.
@@ -829,6 +831,34 @@ class Orchestrator:
             if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
                 self._running_counter.decrement()
 
+    async def _apply_raw_terminal_stage_finish(
+        self,
+        stage_id: int,
+        eco: Any,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Record session-level finish markers dropped by the streaming output processor.
+
+        Streaming segment stops set ``is_segment_finished=True`` and are handled
+        via processed outputs. Session termination (e.g. ``finish_requests`` after
+        ``resumable=False``) emits a terminal ``finish_reason`` with
+        ``is_segment_finished=False``, but vLLM's output processor may remove the
+        request state before that EngineCoreOutput is processed.
+
+        Only update ``finished_final_output_stage_ids`` here. Request cleanup stays
+        in ``_route_output`` so downstream async-chunk stages can still deliver
+        outputs after stage-0 session end.
+        """
+        if getattr(eco, "finish_reason", None) is None:
+            return
+        if getattr(eco, "is_segment_finished", False):
+            return
+
+        final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+        if stage_id not in final_output_stage_ids:
+            return
+        req_state.finished_final_output_stage_ids.add(stage_id)
+
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""
         companion_request_ids = self._cfg_tracker.get_companion_request_ids(request_id)
@@ -872,7 +902,6 @@ class Orchestrator:
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
-
         if self.stage_pools[stage_id].final_output:
             await self.output_async_queue.put(
                 OutputMessage(
