@@ -120,6 +120,11 @@ class TestHiggsAudioV3OnlineHappyPath:
         ``meta.left_context_size`` and ``meta.right_holdback_size`` so per-chunk codec
         windows stitch into a coherent PCM stream. The byte-count gate is the same as
         the sync paths; per-chunk audio content is verified offline against Whisper.
+
+        NOTE: ``min_hnr_db=-3.0`` matches the pattern moss_tts uses for streaming PCM.
+        The sliding-window codec is slightly noisier per-chunk than the sync one-shot
+        decode (intrinsic to chunked DAC vocoding); ``-3.0`` clears measured streaming
+        output while still catching catastrophic decoder failures (HNR << 0).
         """
         openai_client.send_audio_speech_request(
             {
@@ -129,6 +134,7 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "min_hnr_db": -3.0,
             }
         )
 
@@ -137,7 +143,8 @@ class TestHiggsAudioV3OnlineHappyPath:
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     def test_concurrent_pcm_streaming(self, omni_server, openai_client) -> None:
         """Three concurrent streaming requests - guards per-request frame cursors
-        in ``talker2code2wav_async_chunk`` and per-slot delay-pattern state under batched AR."""
+        in ``talker2code2wav_async_chunk`` and per-slot delay-pattern state under batched AR.
+        ``min_hnr_db`` matches ``test_plain_text_pcm_streaming``."""
         openai_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
@@ -146,6 +153,7 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "min_hnr_db": -3.0,
             },
             request_num=3,
         )
