@@ -96,7 +96,9 @@ def _normalize_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(value, int | float):
                 continue
             key = str(name)
-            normalized[key if key.endswith("_ms") else f"{key}_ms"] = float(value) if key.endswith("_ms") else float(value) * 1000.0
+            normalized[key if key.endswith("_ms") else f"{key}_ms"] = (
+                float(value) if key.endswith("_ms") else float(value) * 1000.0
+            )
         out["stage_durations_ms"] = normalized
     return out
 
