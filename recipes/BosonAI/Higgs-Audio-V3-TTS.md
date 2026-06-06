@@ -38,7 +38,7 @@ MusicGen-style delay pattern).
 - Python: 3.12+
 - CUDA: 12.x
 - vLLM version: 0.22.0
-- vLLM-Omni version or commit: branch `higgs-v3`
+- vLLM-Omni version or commit: `36e048fd` (branch `higgs-v3`)
 
 #### Command
 
