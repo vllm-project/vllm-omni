@@ -136,8 +136,11 @@ def _avatar_model_allow_patterns(use_int8: bool) -> list[str]:
         "scheduler/*",
         f"{weight_subfolder}/*",
         "lora/dmd_lora.safetensors",
-        "whisper-large-v3/*",
-        "vocal_separator/Kim_Vocal_2.onnx",
+        "whisper-large-v3/config.json",
+        "whisper-large-v3/generation_config.json",
+        "whisper-large-v3/model.safetensors",
+        "whisper-large-v3/preprocessor_config.json",
+        "vocal_separator/*",
         "config.json",
         "model_index.json",
     ]
@@ -367,6 +370,35 @@ def _ensure_local_dir(model: str | os.PathLike[str], allow_patterns: list[str] |
     from huggingface_hub import snapshot_download
 
     return Path(snapshot_download(str(model), allow_patterns=allow_patterns))
+
+
+def _ensure_avatar_model_index(model_dir: Path, use_int8: bool) -> None:
+    model_index_path = model_dir / "model_index.json"
+    model_index = {}
+    if model_index_path.exists():
+        with model_index_path.open("r", encoding="utf-8") as f:
+            model_index = json.load(f)
+    model_index.update(
+        {
+            "_class_name": "LongCatVideoAvatarPipeline",
+            "_diffusers_version": "0.38.0",
+            "model_name": "LongCat-Video-Avatar-1.5",
+        }
+    )
+    model_index_path.write_text(json.dumps(model_index, indent=2, sort_keys=True), encoding="utf-8")
+
+    source_subfolder = "base_model_int8" if use_int8 else "base_model"
+    source_config = model_dir / source_subfolder / "config.json"
+    target_config = model_dir / "transformer" / "config.json"
+    if source_config.exists():
+        target_config.parent.mkdir(parents=True, exist_ok=True)
+        target_config.write_text(source_config.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def prepare_longcat_video_avatar_model_for_omni(model: str, use_int8: bool = True) -> str:
+    model_dir = _ensure_local_dir(model, allow_patterns=_avatar_model_allow_patterns(use_int8))
+    _ensure_avatar_model_index(model_dir, use_int8)
+    return str(model_dir)
 
 
 def _load_image(raw_image: Any, *, asset_root: Path | None) -> Image.Image:

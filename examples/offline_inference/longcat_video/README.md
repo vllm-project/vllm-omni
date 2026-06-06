@@ -44,33 +44,33 @@ python end2end.py \
 Download the official Avatar example assets directly:
 
 ```bash
-mkdir -p longcat_avatar_assets/single longcat_avatar_assets/multi
+mkdir -p longcat_avatar_assets/assets/avatar/single longcat_avatar_assets/assets/avatar/multi
 
-curl -L -o longcat_avatar_assets/single/man.mp3 \
+curl -L -o longcat_avatar_assets/assets/avatar/single/man.mp3 \
   https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/main/assets/avatar/single/man.mp3
-curl -L -o longcat_avatar_assets/single/man.png \
+curl -L -o longcat_avatar_assets/assets/avatar/single/man.png \
   https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/main/assets/avatar/single/man.png
-curl -L -o longcat_avatar_assets/single_example_1.json \
+curl -L -o longcat_avatar_assets/assets/avatar/single_example_1.json \
   https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/main/assets/avatar/single_example_1.json
 
-curl -L -o longcat_avatar_assets/multi/sing.png \
+curl -L -o longcat_avatar_assets/assets/avatar/multi/sing.png \
   https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/main/assets/avatar/multi/sing.png
-curl -L -o longcat_avatar_assets/multi/sing_man.WAV \
+curl -L -o longcat_avatar_assets/assets/avatar/multi/sing_man.WAV \
   https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/main/assets/avatar/multi/sing_man.WAV
-curl -L -o longcat_avatar_assets/multi/sing_woman.WAV \
+curl -L -o longcat_avatar_assets/assets/avatar/multi/sing_woman.WAV \
   https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/main/assets/avatar/multi/sing_woman.WAV
-curl -L -o longcat_avatar_assets/multi/introduce.png \
+curl -L -o longcat_avatar_assets/assets/avatar/multi/introduce.png \
   https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/main/assets/avatar/multi/introduce.png
-curl -L -o longcat_avatar_assets/multi/introduce_man.mp3 \
+curl -L -o longcat_avatar_assets/assets/avatar/multi/introduce_man.mp3 \
   https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/main/assets/avatar/multi/introduce_man.mp3
-curl -L -o longcat_avatar_assets/multi/introduce_woman.mp3 \
+curl -L -o longcat_avatar_assets/assets/avatar/multi/introduce_woman.mp3 \
   https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/main/assets/avatar/multi/introduce_woman.mp3
-curl -L -o longcat_avatar_assets/multi_example_1.json \
+curl -L -o longcat_avatar_assets/assets/avatar/multi_example_1.json \
   https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/main/assets/avatar/multi_example_1.json
-curl -L -o longcat_avatar_assets/multi_example_2.json \
+curl -L -o longcat_avatar_assets/assets/avatar/multi_example_2.json \
   https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/main/assets/avatar/multi_example_2.json
 
-export LONGCAT_VIDEO_ASSET_DIR="$PWD/longcat_avatar_assets"
+export LONGCAT_VIDEO_ASSET_DIR="$PWD/longcat_avatar_assets/assets/avatar"
 ```
 
 ## Official Asset Smoke Test

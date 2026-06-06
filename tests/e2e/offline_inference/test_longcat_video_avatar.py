@@ -10,9 +10,15 @@ from PIL import Image
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
+from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar import (
+    prepare_longcat_video_avatar_model_for_omni,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-MODEL = os.environ.get("LONGCAT_AVATAR_TEST_MODEL", "meituan-longcat/LongCat-Video-Avatar-1.5")
+MODEL = prepare_longcat_video_avatar_model_for_omni(
+    os.environ.get("LONGCAT_AVATAR_TEST_MODEL", "meituan-longcat/LongCat-Video-Avatar-1.5"),
+    use_int8=True,
+)
 BASE_MODEL_DIR = os.environ.get("LONGCAT_AVATAR_TEST_BASE_MODEL_DIR")
 PROMPT = "A person speaks calmly while facing the camera."
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"

@@ -14,6 +14,9 @@ import numpy as np
 import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar import (
+    prepare_longcat_video_avatar_model_for_omni,
+)
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -170,55 +173,6 @@ def _load_input_case(input_json: str) -> tuple[dict[str, Any], Path]:
     return case, _infer_asset_root_from_input_json(input_json_path)
 
 
-def _avatar_model_allow_patterns(use_int8: bool) -> list[str]:
-    weight_subfolder = "base_model_int8" if use_int8 else "base_model"
-    return [
-        "scheduler/*",
-        f"{weight_subfolder}/*",
-        "lora/dmd_lora.safetensors",
-        "whisper-large-v3/*",
-        "vocal_separator/Kim_Vocal_2.onnx",
-        "config.json",
-        "model_index.json",
-    ]
-
-
-def _ensure_avatar_model_index(model_dir: Path, use_int8: bool) -> None:
-    model_index_path = model_dir / "model_index.json"
-    model_index = {}
-    if model_index_path.exists():
-        with model_index_path.open("r", encoding="utf-8") as f:
-            model_index = json.load(f)
-    model_index.update(
-        {
-            "_class_name": "LongCatVideoAvatarPipeline",
-            "_diffusers_version": "0.38.0",
-            "model_name": "LongCat-Video-Avatar-1.5",
-        }
-    )
-    model_index_path.write_text(json.dumps(model_index, indent=2, sort_keys=True), encoding="utf-8")
-
-    source_subfolder = "base_model_int8" if use_int8 else "base_model"
-    source_config = model_dir / source_subfolder / "config.json"
-    target_config = model_dir / "transformer" / "config.json"
-    if source_config.exists():
-        target_config.parent.mkdir(parents=True, exist_ok=True)
-        target_config.write_text(source_config.read_text(encoding="utf-8"), encoding="utf-8")
-
-
-def _prepare_avatar_model_for_omni(model: str, use_int8: bool) -> str:
-    model_path = Path(model)
-    if model_path.exists():
-        _ensure_avatar_model_index(model_path, use_int8)
-        return str(model_path)
-
-    from huggingface_hub import snapshot_download
-
-    model_dir = Path(snapshot_download(model, allow_patterns=_avatar_model_allow_patterns(use_int8)))
-    _ensure_avatar_model_index(model_dir, use_int8)
-    return str(model_dir)
-
-
 def _create_merged_audio_for_case(
     audio_paths: dict[str, str],
     audio_type: str,
@@ -261,7 +215,7 @@ def main():
         raise ValueError("--audio is required unless --input-json is provided.")
     if args.stage == "ai2v" and not args.image:
         raise ValueError("--image is required when --stage=ai2v.")
-    model_for_omni = _prepare_avatar_model_for_omni(args.model, args.use_int8)
+    model_for_omni = prepare_longcat_video_avatar_model_for_omni(args.model, args.use_int8)
 
     additional_config = {
         "model_type": "avatar-v1.5",

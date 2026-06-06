@@ -21,6 +21,7 @@ from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar impo
     _default_at2v_shape,
     _prepare_multi_speaker_audio_arrays,
     _resolve_num_segments,
+    prepare_longcat_video_avatar_model_for_omni,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -56,6 +57,28 @@ def test_longcat_video_avatar_allow_patterns_download_one_weight_set(
 
     assert expected_weight_dir in allow_patterns
     assert unexpected_weight_dir not in allow_patterns
+    assert "whisper-large-v3/*" not in allow_patterns
+    assert "whisper-large-v3/model.safetensors" in allow_patterns
+    assert "whisper-large-v3/pytorch_model.bin" not in allow_patterns
+    assert "whisper-large-v3/flax_model.msgpack" not in allow_patterns
+    assert "vocal_separator/*" in allow_patterns
+
+
+def test_longcat_video_avatar_prepare_model_adds_omni_metadata(tmp_path):
+    model_dir = tmp_path / "LongCat-Video-Avatar-1.5"
+    base_model_dir = model_dir / "base_model_int8"
+    base_model_dir.mkdir(parents=True)
+    (base_model_dir / "config.json").write_text('{"model_type": "longcat_avatar"}', encoding="utf-8")
+    (model_dir / "model_index.json").write_text("{}", encoding="utf-8")
+
+    prepared = prepare_longcat_video_avatar_model_for_omni(str(model_dir), use_int8=True)
+
+    assert prepared == str(model_dir)
+    model_index = json.loads((model_dir / "model_index.json").read_text(encoding="utf-8"))
+    assert model_index["_class_name"] == "LongCatVideoAvatarPipeline"
+    assert model_index["_diffusers_version"] == "0.38.0"
+    transformer_config = json.loads((model_dir / "transformer" / "config.json").read_text(encoding="utf-8"))
+    assert transformer_config == {"model_type": "longcat_avatar"}
 
 
 @pytest.mark.parametrize(
