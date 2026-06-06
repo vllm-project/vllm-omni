@@ -121,10 +121,12 @@ class TestHiggsAudioV3OnlineHappyPath:
         windows stitch into a coherent PCM stream. The byte-count gate is the same as
         the sync paths; per-chunk audio content is verified offline against Whisper.
 
-        NOTE: ``min_hnr_db=-3.0`` matches the pattern moss_tts uses for streaming PCM.
-        The sliding-window codec is slightly noisier per-chunk than the sync one-shot
-        decode (intrinsic to chunked DAC vocoding); ``-3.0`` clears measured streaming
-        output while still catching catastrophic decoder failures (HNR << 0).
+        NOTE: ``min_hnr_db=0.0`` sits below the typical speech-noise floor so the
+        check still catches catastrophic codec failure (silence, white noise, sample
+        scramble all give HNR << 0) while allowing for the sliding-window codec's
+        slightly-noisier-than-sync output. The default 1.0 dB threshold has only
+        ~0.16 dB margin over measured single-request output (1.16 dB on L4), so
+        flake risk is too high there.
         """
         openai_client.send_audio_speech_request(
             {
@@ -134,7 +136,7 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
-                "min_hnr_db": -3.0,
+                "min_hnr_db": 0.0,
             }
         )
 
@@ -144,7 +146,13 @@ class TestHiggsAudioV3OnlineHappyPath:
     def test_concurrent_pcm_streaming(self, omni_server, openai_client) -> None:
         """Three concurrent streaming requests - guards per-request frame cursors
         in ``talker2code2wav_async_chunk`` and per-slot delay-pattern state under batched AR.
-        ``min_hnr_db`` matches ``test_plain_text_pcm_streaming``."""
+
+        NOTE: ``min_hnr_db=-2.0`` is looser than the single-request streaming test
+        because batched AR adds per-request codec quality variance (DAC boundary
+        artifacts compounded across the 3-way batch); -2.0 dB gives ~1.6 dB margin
+        over the measured worst-of-3 on L4 (-0.42 dB) while still well above the
+        catastrophic-failure region.
+        """
         openai_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
@@ -153,7 +161,7 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
-                "min_hnr_db": -3.0,
+                "min_hnr_db": -2.0,
             },
             request_num=3,
         )
