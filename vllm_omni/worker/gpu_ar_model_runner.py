@@ -898,10 +898,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self.vllm_config.model_config.engine_output_type == "text":
             return None
 
+        query_start_loc_cpu = self.query_start_loc.cpu
+        if callable(query_start_loc_cpu):
+            query_start_loc_cpu = query_start_loc_cpu()
+
         results: list[dict[str, object]] = []
         for rid in req_ids:
             idx = req_id_to_index[rid]
-            start = int(self.query_start_loc.cpu[idx])
+            start = int(query_start_loc_cpu[idx])
             sched = int(num_scheduled_tokens_np[idx])
             end = start + sched
 

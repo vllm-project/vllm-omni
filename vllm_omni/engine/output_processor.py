@@ -1,7 +1,6 @@
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
-import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, PoolingRequestOutput, RequestOutput
@@ -395,7 +394,6 @@ class OmniRequestState(RequestState):
         outputs: list,
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
-        prompt_routed_experts: "np.ndarray | None" = None,
     ) -> RequestOutput | PoolingRequestOutput:
         """Create request output, handling no-detokenizer generation stages.
 
@@ -410,7 +408,6 @@ class OmniRequestState(RequestState):
                 outputs,
                 finished,
                 kv_transfer_params,
-                prompt_routed_experts,
             )
 
         # No-detokenizer path: build RequestOutput directly.
