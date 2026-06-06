@@ -236,6 +236,93 @@ def rotate_half(x):
     return rearrange(x, "... d r -> ... (d r)")
 
 
+def normalize_and_scale(values, source_range, target_range):
+    source_min, source_max = source_range
+    target_min, target_max = target_range
+    denom = source_max - source_min
+    if torch.is_tensor(denom):
+        denom = torch.clamp(denom, min=torch.finfo(values.dtype).eps)
+    else:
+        denom = max(denom, torch.finfo(values.dtype).eps)
+    normalized = (values - source_min) / denom
+    return normalized * (target_max - target_min) + target_min
+
+
+class RotaryPositionalEmbedding1D(nn.Module):
+    def __init__(self, head_dim):
+        super().__init__()
+        self.head_dim = head_dim
+        self.base = 10000
+
+    def precompute_freqs_cis_1d(self, pos_indices):
+        freqs = 1.0 / (self.base ** (torch.arange(0, self.head_dim, 2)[: (self.head_dim // 2)].float() / self.head_dim))
+        freqs = freqs.to(pos_indices.device)
+        freqs = torch.einsum("..., f -> ... f", pos_indices.float(), freqs)
+        return repeat(freqs, "... n -> ... (n r)", r=2)
+
+    def forward(self, x, pos_indices):
+        freqs_cis = self.precompute_freqs_cis_1d(pos_indices)
+        x_ = x.float()
+        freqs_cis = freqs_cis.float().to(x.device)
+        cos, sin = freqs_cis.cos(), freqs_cis.sin()
+        cos, sin = rearrange(cos, "n d -> 1 1 n d"), rearrange(sin, "n d -> 1 1 n d")
+        x_ = (x_ * cos) + (rotate_half(x_) * sin)
+        return x_.type_as(x)
+
+
+def _calculate_x_ref_attn_map(
+    noise_q: torch.Tensor,
+    ref_k: torch.Tensor,
+    ref_target_masks: torch.Tensor,
+) -> torch.Tensor:
+    ref_k = ref_k.to(noise_q.dtype).to(noise_q.device)
+    noise_q = noise_q * (1.0 / noise_q.shape[-1] ** 0.5)
+    noise_q = noise_q.transpose(1, 2)
+    ref_k = ref_k.transpose(1, 2)
+    attn = noise_q @ ref_k.transpose(-2, -1)
+    attn_source = attn.softmax(-1).to(noise_q.dtype)
+
+    x_ref_attn_maps = []
+    ref_target_masks = ref_target_masks.to(noise_q.dtype)
+    for ref_target_mask in ref_target_masks:
+        ref_target_mask = ref_target_mask[None, None, None, ...]
+        mask_sum = torch.clamp(ref_target_mask.sum(), min=torch.finfo(noise_q.dtype).eps)
+        x_ref_attn_map = (attn_source * ref_target_mask).sum(-1) / mask_sum
+        x_ref_attn_map = x_ref_attn_map.permute(0, 2, 1).mean(-1)
+        x_ref_attn_maps.append(x_ref_attn_map)
+    return torch.cat(x_ref_attn_maps, dim=0)
+
+
+def _get_attn_map_with_target(
+    noise_q: torch.Tensor,
+    key: torch.Tensor,
+    shape: tuple[int, int, int],
+    ref_target_masks: torch.Tensor,
+    split_num: int = 2,
+    cp_split_hw=None,
+) -> torch.Tensor:
+    if cp_split_hw is not None and cp_split_hw[0] * cp_split_hw[1] > 1:
+        raise NotImplementedError("LongCat-Video-Avatar multi-speaker masks do not support context parallel.")
+    _, num_h, num_w = shape
+    ref_seq_len = num_h * num_w
+    ref_k = key[:, :ref_seq_len]
+    if ref_target_masks.shape[-1] != ref_seq_len:
+        raise ValueError(
+            f"Expected ref_target_masks token length {ref_seq_len}, got {ref_target_masks.shape[-1]}."
+        )
+
+    _, seq_len, heads, _ = noise_q.shape
+    class_num = ref_target_masks.shape[0]
+    x_ref_attn_maps = torch.zeros(class_num, seq_len, dtype=noise_q.dtype, device=noise_q.device)
+    split_num = max(1, min(split_num, heads))
+    for noise_q_chunk, ref_k_chunk in zip(
+        torch.chunk(noise_q.contiguous(), split_num, dim=2),
+        torch.chunk(ref_k.contiguous(), split_num, dim=2),
+    ):
+        x_ref_attn_maps += _calculate_x_ref_attn_map(noise_q_chunk, ref_k_chunk, ref_target_masks)
+    return x_ref_attn_maps / split_num
+
+
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, head_dim, cp_split_hw=None):
         super().__init__()
@@ -245,11 +332,11 @@ class RotaryPositionalEmbedding(nn.Module):
         self.base = 10000
         self.freqs_dict = {}
 
-    def register_grid_size(self, grid_size):
-        if grid_size not in self.freqs_dict:
-            self.freqs_dict.update({grid_size: self.precompute_freqs_cis_3d(grid_size)})
+    def register_grid_size(self, grid_size, key_name, frame_index=None, num_ref_latents=None):
+        if key_name not in self.freqs_dict:
+            self.freqs_dict.update({key_name: self.precompute_freqs_cis_3d(grid_size, frame_index, num_ref_latents)})
 
-    def precompute_freqs_cis_3d(self, grid_size):
+    def precompute_freqs_cis_3d(self, grid_size, frame_index=None, num_ref_latents=None):
         num_frames, height, width = grid_size
         dim_t = self.head_dim - 4 * (self.head_dim // 6)
         dim_h = 2 * (self.head_dim // 6)
@@ -257,7 +344,16 @@ class RotaryPositionalEmbedding(nn.Module):
         freqs_t = 1.0 / (self.base ** (torch.arange(0, dim_t, 2)[: (dim_t // 2)].float() / dim_t))
         freqs_h = 1.0 / (self.base ** (torch.arange(0, dim_h, 2)[: (dim_h // 2)].float() / dim_h))
         freqs_w = 1.0 / (self.base ** (torch.arange(0, dim_w, 2)[: (dim_w // 2)].float() / dim_w))
-        grid_t = torch.from_numpy(np.linspace(0, num_frames, num_frames, endpoint=False, dtype=np.float32)).float()
+        if frame_index is not None and num_ref_latents is not None:
+            grid_t = torch.cat(
+                [
+                    torch.tensor([frame_index], dtype=torch.float32),
+                    torch.arange(0, num_frames - num_ref_latents, dtype=torch.float32),
+                ],
+                dim=0,
+            )
+        else:
+            grid_t = torch.from_numpy(np.linspace(0, num_frames, num_frames, endpoint=False, dtype=np.float32)).float()
         grid_h = torch.from_numpy(np.linspace(0, height, height, endpoint=False, dtype=np.float32)).float()
         grid_w = torch.from_numpy(np.linspace(0, width, width, endpoint=False, dtype=np.float32)).float()
         freqs_t = torch.einsum("..., f -> ... f", grid_t, freqs_t)
@@ -274,11 +370,12 @@ class RotaryPositionalEmbedding(nn.Module):
             raise NotImplementedError("LongCat-Video-Avatar context parallel RoPE is not supported in native MVP.")
         return freqs
 
-    def forward(self, q, k, grid_size):
-        if grid_size not in self.freqs_dict:
-            self.register_grid_size(grid_size)
+    def forward(self, q, k, grid_size, frame_index=None, num_ref_latents=None):
+        key_name = ".".join(str(item) for item in grid_size) + f"-{frame_index}-{num_ref_latents}"
+        if key_name not in self.freqs_dict:
+            self.register_grid_size(grid_size, key_name, frame_index, num_ref_latents)
 
-        freqs_cis = self.freqs_dict[grid_size].to(q.device)
+        freqs_cis = self.freqs_dict[key_name].to(q.device)
         q_, k_ = q.float(), k.float()
         freqs_cis = freqs_cis.float().to(q.device)
         cos, sin = freqs_cis.cos(), freqs_cis.sin()
@@ -332,6 +429,8 @@ class Attention(nn.Module):
         )
 
     def _process_attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        if q.shape[2] == 0:
+            return q
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
@@ -344,7 +443,11 @@ class Attention(nn.Module):
         shape: tuple[int, int, int] | None = None,
         num_cond_latents: int | None = None,
         return_kv: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        num_ref_latents=None,
+        ref_img_index=None,
+        mask_frame_range=None,
+        ref_target_masks=None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         bsz, seq_len, channels = x.shape
         qkv = self.qkv(x)
         qkv = qkv.view(bsz, seq_len, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -354,30 +457,157 @@ class Attention(nn.Module):
         if return_kv:
             k_cache, v_cache = k.clone(), v.clone()
 
-        q, k = self.rope_3d(q, k, shape)
+        q, k = self.rope_3d(q, k, shape, ref_img_index, num_ref_latents)
 
+        num_cond_latents_thw = None
         if num_cond_latents is not None and num_cond_latents > 0:
             if shape is None:
                 raise ValueError("shape is required when num_cond_latents is set.")
-            num_cond_latents_thw = num_cond_latents * (seq_len // shape[0])
-            q_cond = q[:, :, :num_cond_latents_thw].contiguous()
-            k_cond = k[:, :, :num_cond_latents_thw].contiguous()
-            v_cond = v[:, :, :num_cond_latents_thw].contiguous()
-            x_cond = self._process_attn(q_cond, k_cond, v_cond)
-            q_noise = q[:, :, num_cond_latents_thw:].contiguous()
-            x_noise = self._process_attn(q_noise, k, v)
-            x = torch.cat([x_cond, x_noise], dim=2).contiguous()
+            tokens_per_frame = seq_len // shape[0]
+            num_cond_latents_thw = num_cond_latents * tokens_per_frame
+            if num_cond_latents == 1:
+                q_cond = q[:, :, :num_cond_latents_thw].contiguous()
+                k_cond = k[:, :, :num_cond_latents_thw].contiguous()
+                v_cond = v[:, :, :num_cond_latents_thw].contiguous()
+                x_cond = self._process_attn(q_cond, k_cond, v_cond)
+                q_noise = q[:, :, num_cond_latents_thw:].contiguous()
+                x_noise = self._process_attn(q_noise, k, v)
+                x = torch.cat([x_cond, x_noise], dim=2).contiguous()
+            else:
+                if num_ref_latents is None or ref_img_index is None:
+                    raise ValueError("Video continuation requires num_ref_latents and ref_img_index.")
+                num_ref_latents_thw = num_ref_latents * tokens_per_frame
+                q_ref = q[:, :, :num_ref_latents_thw].contiguous()
+                k_ref = k[:, :, :num_ref_latents_thw].contiguous()
+                v_ref = v[:, :, :num_ref_latents_thw].contiguous()
+                q_cond = q[:, :, num_ref_latents_thw:num_cond_latents_thw].contiguous()
+                k_cond = k[:, :, num_ref_latents_thw:num_cond_latents_thw].contiguous()
+                v_cond = v[:, :, num_ref_latents_thw:num_cond_latents_thw].contiguous()
+                x_ref = self._process_attn(q_ref, k_ref, v_ref)
+                x_cond = self._process_attn(q_cond, k_cond, v_cond)
+                if num_cond_latents == shape[0]:
+                    x = torch.cat([x_ref, x_cond], dim=2).contiguous()
+                else:
+                    q_noise = q[:, :, num_cond_latents_thw:].contiguous()
+                    start_noise, end_noise, num_noisy_frames = 0, 0, shape[0] - num_cond_latents
+                    if mask_frame_range is not None and mask_frame_range > 0:
+                        start_noise = ref_img_index - mask_frame_range - num_cond_latents + num_ref_latents
+                        end_noise = ref_img_index + mask_frame_range - num_cond_latents + num_ref_latents + 1
+
+                    if start_noise >= 0 and end_noise > start_noise and end_noise <= num_noisy_frames:
+                        start_pos = start_noise * tokens_per_frame
+                        end_pos = end_noise * tokens_per_frame
+                        q_noise_front = q_noise[:, :, :start_pos].contiguous()
+                        q_noise_maskref = q_noise[:, :, start_pos:end_pos].contiguous()
+                        q_noise_back = q_noise[:, :, end_pos:].contiguous()
+                        k_non_ref = k[:, :, num_ref_latents_thw:].contiguous()
+                        v_non_ref = v[:, :, num_ref_latents_thw:].contiguous()
+                        x_noise_front = self._process_attn(q_noise_front, k, v)
+                        x_noise_maskref = self._process_attn(q_noise_maskref, k_non_ref, v_non_ref)
+                        x_noise_back = self._process_attn(q_noise_back, k, v)
+                        x_noise = torch.cat([x_noise_front, x_noise_maskref, x_noise_back], dim=2).contiguous()
+                    else:
+                        x_noise = self._process_attn(q_noise, k, v)
+                    x = torch.cat([x_ref, x_cond, x_noise], dim=2).contiguous()
         else:
             x = self._process_attn(q, k, v)
 
         x = x.transpose(1, 2).reshape(bsz, seq_len, channels)
         x = self.proj(x)
+        x_ref_attn_map = None
+        if ref_target_masks is not None:
+            if shape is None or num_cond_latents_thw is None or num_cond_latents_thw <= 0:
+                raise ValueError("Multi-speaker Avatar masks require image/video condition latents.")
+            x_ref_attn_map = _get_attn_map_with_target(
+                q.permute(0, 2, 1, 3)[:, num_cond_latents_thw:].type_as(x),
+                k.permute(0, 2, 1, 3).type_as(x),
+                shape,
+                ref_target_masks,
+                cp_split_hw=self.rope_3d.cp_split_hw,
+            )
         if return_kv:
-            return x, (k_cache, v_cache)
-        return x
+            return x, (k_cache, v_cache), x_ref_attn_map
+        return x, x_ref_attn_map
 
-    def forward_with_kv_cache(self, *args, **kwargs) -> torch.Tensor:
-        raise NotImplementedError("LongCat-Video-Avatar KV-cache/refine path is not supported in native MVP.")
+    def forward_with_kv_cache(
+        self,
+        x: torch.Tensor,
+        shape: tuple[int, int, int] | None = None,
+        num_cond_latents: int | None = None,
+        kv_cache=None,
+        num_ref_latents=None,
+        ref_img_index=None,
+        mask_frame_range=None,
+        ref_target_masks=None,
+    ) -> torch.Tensor:
+        if shape is None:
+            raise ValueError("shape is required for LongCat-Video-Avatar KV-cache attention.")
+        if kv_cache is None:
+            raise ValueError("kv_cache is required for forward_with_kv_cache.")
+
+        bsz, seq_len, channels = x.shape
+        qkv = self.qkv(x)
+        qkv = qkv.view(bsz, seq_len, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        k_cache, v_cache = kv_cache
+        k_cache = k_cache.to(device=x.device, dtype=k.dtype)
+        v_cache = v_cache.to(device=x.device, dtype=v.dtype)
+        if k_cache.shape[0] == 1 and bsz > 1:
+            k_cache = k_cache.repeat(bsz, 1, 1, 1)
+            v_cache = v_cache.repeat(bsz, 1, 1, 1)
+        if k_cache.shape[0] != bsz:
+            raise ValueError(f"KV cache batch {k_cache.shape[0]} must be 1 or match input batch {bsz}.")
+
+        k_full = torch.cat([k_cache, k], dim=2).contiguous()
+        v_full = torch.cat([v_cache, v], dim=2).contiguous()
+        if num_cond_latents is not None and num_cond_latents > 0:
+            q_padding = torch.cat([torch.empty_like(k_cache), q], dim=2).contiguous()
+            q_padding, k_full = self.rope_3d(
+                q_padding,
+                k_full,
+                (shape[0] + num_cond_latents, shape[1], shape[2]),
+                ref_img_index,
+                num_ref_latents,
+            )
+            q = q_padding[:, :, -seq_len:].contiguous()
+
+        tokens_per_frame = seq_len // shape[0]
+        start_noise, end_noise, num_noisy_frames = 0, 0, shape[0]
+        if mask_frame_range is not None and mask_frame_range > 0:
+            start_noise = ref_img_index - mask_frame_range - num_cond_latents + num_ref_latents
+            end_noise = ref_img_index + mask_frame_range - num_cond_latents + num_ref_latents + 1
+
+        if start_noise >= 0 and end_noise > start_noise and end_noise <= num_noisy_frames:
+            num_ref_latents_thw = (num_ref_latents or 0) * tokens_per_frame
+            start_pos = start_noise * tokens_per_frame
+            end_pos = end_noise * tokens_per_frame
+            q_noise_front = q[:, :, :start_pos].contiguous()
+            q_noise_maskref = q[:, :, start_pos:end_pos].contiguous()
+            q_noise_back = q[:, :, end_pos:].contiguous()
+            k_non_ref = k_full[:, :, num_ref_latents_thw:].contiguous()
+            v_non_ref = v_full[:, :, num_ref_latents_thw:].contiguous()
+            x_noise_front = self._process_attn(q_noise_front, k_full, v_full)
+            x_noise_maskref = self._process_attn(q_noise_maskref, k_non_ref, v_non_ref)
+            x_noise_back = self._process_attn(q_noise_back, k_full, v_full)
+            x_attn = torch.cat([x_noise_front, x_noise_maskref, x_noise_back], dim=2).contiguous()
+        else:
+            x_attn = self._process_attn(q, k_full, v_full)
+
+        x_out = x_attn.transpose(1, 2).reshape(bsz, seq_len, channels)
+        x_out = self.proj(x_out)
+
+        x_ref_attn_map = None
+        if ref_target_masks is not None:
+            x_ref_attn_map = _get_attn_map_with_target(
+                q.permute(0, 2, 1, 3).type_as(x_out),
+                k_full.permute(0, 2, 1, 3).type_as(x_out),
+                shape,
+                ref_target_masks,
+                cp_split_hw=self.rope_3d.cp_split_hw,
+            )
+        return x_out, x_ref_attn_map
 
 
 class MultiHeadCrossAttention(nn.Module):
@@ -506,21 +736,20 @@ class AvatarSelfAttention(Attention):
         mask_frame_range=None,
         ref_target_masks=None,
     ):
-        if num_ref_latents is not None or ref_img_index is not None or mask_frame_range is not None:
-            raise NotImplementedError("LongCat-Video-Avatar native MVP does not support reference/KV refine paths.")
-        if ref_target_masks is not None:
-            raise NotImplementedError("LongCat-Video-Avatar native MVP does not support multi-speaker masks.")
-
         out = super().forward(
             x,
             shape=shape,
             num_cond_latents=num_cond_latents,
             return_kv=return_kv,
+            num_ref_latents=num_ref_latents,
+            ref_img_index=ref_img_index,
+            mask_frame_range=mask_frame_range,
+            ref_target_masks=ref_target_masks,
         )
         if return_kv:
-            x_out, kv_cache = out
-            return x_out, kv_cache, None
-        return out, None
+            x_out, kv_cache, x_ref_attn_map = out
+            return x_out, kv_cache, x_ref_attn_map
+        return out
 
 
 class SingleStreamAudioAttention(nn.Module):
@@ -556,6 +785,7 @@ class SingleStreamAudioAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
+        self.cp_split_hw = cp_split_hw
 
         self.q_linear = nn.Linear(dim, dim, bias=qkv_bias)
         self.q_norm = RMSNorm_FP32(self.head_dim, eps=eps) if qk_norm else nn.Identity()
@@ -563,6 +793,12 @@ class SingleStreamAudioAttention(nn.Module):
         self.k_norm = RMSNorm_FP32(self.head_dim, eps=eps) if qk_norm else nn.Identity()
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Identity()
+        self.class_interval = class_interval
+        self.class_range = class_range
+        self.rope_h1 = (0, self.class_interval)
+        self.rope_h2 = (self.class_range - self.class_interval, self.class_range)
+        self.rope_bak = int(self.class_range // 2)
+        self.rope_1d = RotaryPositionalEmbedding1D(self.head_dim)
 
         self.attn = VllmAttention(
             num_heads=num_heads,
@@ -584,18 +820,61 @@ class SingleStreamAudioAttention(nn.Module):
         x_ref_attn_map=None,
         human_num=None,
     ) -> torch.Tensor:
-        if x_ref_attn_map is not None or human_num is not None:
-            raise NotImplementedError("LongCat-Video-Avatar native MVP does not support multi-speaker audio attention.")
-
         out_dtype = x.dtype
         x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=frames_num)
         batch, seq_len, channels = x.shape
         q = self.q_linear(x).view(batch, seq_len, self.num_heads, self.head_dim)
         q = self.q_norm(q)
 
+        if x_ref_attn_map is not None:
+            if x_ref_attn_map.shape[0] < 2:
+                raise ValueError("Multi-speaker Avatar requires at least two speaker attention maps.")
+            human1 = normalize_and_scale(
+                x_ref_attn_map[0],
+                (x_ref_attn_map[0].min(), x_ref_attn_map[0].max()),
+                (self.rope_h1[0], self.rope_h1[1]),
+            )
+            human2 = normalize_and_scale(
+                x_ref_attn_map[1],
+                (x_ref_attn_map[1].min(), x_ref_attn_map[1].max()),
+                (self.rope_h2[0], self.rope_h2[1]),
+            )
+            background_pos = self.rope_bak if x_ref_attn_map.shape[0] <= 3 else 100
+            background = torch.full(
+                (x_ref_attn_map.size(1),),
+                background_pos,
+                dtype=human1.dtype,
+                device=human1.device,
+            )
+            max_indices = x_ref_attn_map.argmax(dim=0).clamp(max=2)
+            normalized_map = torch.stack([human1, human2, background], dim=1)
+            normalized_pos = normalized_map[torch.arange(x_ref_attn_map.size(1), device=q.device), max_indices]
+            q = rearrange(q, "(B N_t) S H D -> B H (N_t S) D", N_t=frames_num)
+            q = self.rope_1d(q, normalized_pos)
+            q = rearrange(q, "B H (N_t S) D -> (B N_t) S H D", N_t=frames_num)
+
         kv = self.kv_linear(cond).view(batch, cond.shape[1], 2, self.num_heads, self.head_dim)
         k, v = kv.unbind(2)
         k = self.k_norm(k)
+
+        if x_ref_attn_map is not None:
+            per_frame = torch.zeros(cond.shape[1], dtype=k.dtype, device=k.device)
+            human1_pos = (self.rope_h1[0] + self.rope_h1[1]) / 2
+            human2_pos = (self.rope_h2[0] + self.rope_h2[1]) / 2
+            if human_num is not None and human_num > 2:
+                background_pos = self.rope_bak if x_ref_attn_map.shape[0] <= 3 else 100
+                tokens_per_human = max(1, per_frame.size(0) // human_num)
+                per_frame[:tokens_per_human] = human1_pos
+                per_frame[tokens_per_human : 2 * tokens_per_human] = human2_pos
+                per_frame[2 * tokens_per_human :] = background_pos
+            else:
+                midpoint = per_frame.size(0) // 2
+                per_frame[:midpoint] = human1_pos
+                per_frame[midpoint:] = human2_pos
+            encoder_pos = torch.cat([per_frame] * frames_num, dim=0)
+            k = rearrange(k, "(B N_t) S H D -> B H (N_t S) D", N_t=frames_num)
+            k = self.rope_1d(k, encoder_pos)
+            k = rearrange(k, "B H (N_t S) D -> (B N_t) S H D", N_t=frames_num)
 
         x = self.attn(q, k, v)
         x = self.proj(x.reshape(batch, seq_len, channels))
@@ -940,11 +1219,6 @@ class LongCatAvatarSingleStreamBlock(nn.Module):
         token_ref_target_masks=None,
         human_num=None,
     ):
-        if kv_cache is not None or return_kv:
-            raise NotImplementedError("LongCat-Video-Avatar native MVP does not support KV-cache/refine.")
-        if token_ref_target_masks is not None or human_num is not None:
-            raise NotImplementedError("LongCat-Video-Avatar native MVP does not support multi-speaker masks.")
-
         x_dtype = x.dtype
         batch, seq_len, channels = x.shape
         num_frames, _, _ = latent_shape
@@ -955,47 +1229,66 @@ class LongCatAvatarSingleStreamBlock(nn.Module):
         )
         x_m = modulate_fp32(self.mod_norm_attn, x.view(batch, num_frames, -1, channels), shift_msa, scale_msa)
         x_m = x_m.view(batch, seq_len, channels)
-        x_s, x_ref_attn_map = self.attn(
-            x_m,
-            shape=latent_shape,
-            num_cond_latents=num_cond_latents,
-            num_ref_latents=num_ref_latents,
-            ref_img_index=ref_img_index,
-            mask_frame_range=mask_frame_range,
-            ref_target_masks=token_ref_target_masks,
-        )
+        if kv_cache is not None:
+            attn_outputs = self.attn.forward_with_kv_cache(
+                x_m,
+                shape=latent_shape,
+                num_cond_latents=num_cond_latents,
+                kv_cache=kv_cache,
+                num_ref_latents=num_ref_latents,
+                ref_img_index=ref_img_index,
+                mask_frame_range=mask_frame_range,
+                ref_target_masks=token_ref_target_masks,
+            )
+        else:
+            attn_outputs = self.attn(
+                x_m,
+                shape=latent_shape,
+                num_cond_latents=num_cond_latents,
+                return_kv=return_kv,
+                num_ref_latents=num_ref_latents,
+                ref_img_index=ref_img_index,
+                mask_frame_range=mask_frame_range,
+                ref_target_masks=token_ref_target_masks,
+            )
+        if return_kv:
+            x_s, new_kv_cache, x_ref_attn_map = attn_outputs
+        else:
+            x_s, x_ref_attn_map = attn_outputs
         x = x + (gate_msa * x_s.view(batch, -1, seq_len // num_frames, channels)).view(batch, -1, channels)
         x = x.to(x_dtype)
 
         if not skip_crs_attn:
+            cross_num_cond_latents = None if kv_cache is not None else num_cond_latents
             x = x + self.cross_attn(
                 self.pre_crs_attn_norm(x),
                 y,
                 y_seqlen,
-                num_cond_latents=num_cond_latents,
+                num_cond_latents=cross_num_cond_latents,
                 shape=latent_shape,
             )
 
+            audio_num_cond = 0 if kv_cache is not None else num_cond
             audio_shift_mca, audio_scale_mca, audio_gate_mca = (
-                silu_linear_fp32(self.audio_adaLN_modulation, t[:, num_cond:]).unsqueeze(2).chunk(3, dim=-1)
+                silu_linear_fp32(self.audio_adaLN_modulation, t[:, audio_num_cond:]).unsqueeze(2).chunk(3, dim=-1)
             )
             audio_output_cond, audio_output_noise = self.audio_cross_attn(
                 self.pre_video_crs_attn_norm(x),
                 self.pre_audio_crs_attn_norm(audio_hidden_states),
                 shape=latent_shape,
-                num_cond_latents=num_cond_latents,
+                num_cond_latents=audio_num_cond,
                 x_ref_attn_map=x_ref_attn_map,
                 human_num=human_num,
             )
             audio_output_noise = modulate_fp32(
                 self.mod_norm_attn,
-                audio_output_noise.view(batch, num_frames - num_cond, -1, channels),
+                audio_output_noise.view(batch, num_frames - audio_num_cond, -1, channels),
                 audio_shift_mca,
                 audio_scale_mca,
             ).view(batch, -1, channels)
-            audio_add_x = (audio_gate_mca * audio_output_noise.view(batch, num_frames - num_cond, -1, channels)).view(
-                batch, -1, channels
-            )
+            audio_add_x = (
+                audio_gate_mca * audio_output_noise.view(batch, num_frames - audio_num_cond, -1, channels)
+            ).view(batch, -1, channels)
             if audio_output_cond is not None:
                 audio_add_x = torch.cat([audio_output_cond, audio_add_x], dim=1).contiguous()
             x = (x + audio_add_x).to(x_dtype)
@@ -1004,6 +1297,8 @@ class LongCatAvatarSingleStreamBlock(nn.Module):
         x_m = x_m.view(batch, -1, channels)
         x_s = self.ffn(x_m)
         x = x + (gate_mlp * x_s.view(batch, -1, seq_len // num_frames, channels)).view(batch, -1, channels)
+        if return_kv:
+            return x.to(x_dtype), new_kv_cache
         return x.to(x_dtype)
 
 
@@ -1212,14 +1507,9 @@ class LongCatVideoAvatarTransformer3DModel(nn.Module):
         mask_frame_range=None,
         ref_target_masks=None,
     ):
-        if return_kv or kv_cache_dict:
-            raise NotImplementedError("LongCat-Video-Avatar native MVP does not support KV-cache/refine.")
-        if offload_kv_cache or num_ref_latents is not None or ref_img_index is not None or mask_frame_range is not None:
-            raise NotImplementedError("LongCat-Video-Avatar native MVP does not support reference/refine paths.")
-        if ref_target_masks is not None:
-            raise NotImplementedError("LongCat-Video-Avatar native MVP does not support multi-speaker masks.")
         if audio_embs is None:
             raise ValueError("LongCat-Video-Avatar requires audio_embs.")
+        kv_cache_dict = kv_cache_dict or {}
 
         batch, _, num_frames, height, width = hidden_states.shape
         n_t = num_frames // self.patch_size[0]
@@ -1253,8 +1543,27 @@ class LongCatVideoAvatarTransformer3DModel(nn.Module):
             dim=2,
         )
         audio_hidden_states = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
+        if num_ref_latents is not None and num_ref_latents > 0:
+            audio_start_ref = audio_hidden_states[:, [0], :, :]
+            audio_hidden_states = torch.cat([audio_start_ref, audio_hidden_states], dim=1).contiguous()
         audio_hidden_states = audio_hidden_states[:, -n_t:]
-        audio_hidden_states = rearrange(audio_hidden_states, "b t n c -> (b t) n c")
+
+        human_num = None
+        if ref_target_masks is not None:
+            if batch != 1:
+                raise NotImplementedError("LongCat-Video-Avatar multi-speaker AI2V supports batch size 1.")
+            human_num = len(audio_hidden_states)
+            audio_hidden_states = torch.concat(audio_hidden_states.split(1), dim=2).squeeze(0)
+        else:
+            audio_hidden_states = rearrange(audio_hidden_states, "b t n c -> (b t) n c")
+
+        token_ref_target_masks = None
+        if ref_target_masks is not None:
+            ref_target_masks = ref_target_masks.unsqueeze(0).to(device=hidden_states.device, dtype=torch.float32)
+            token_ref_target_masks = F.interpolate(ref_target_masks, size=(n_h, n_w), mode="nearest")
+            token_ref_target_masks = token_ref_target_masks.squeeze(0)
+            token_ref_target_masks = (token_ref_target_masks > 0).view(token_ref_target_masks.shape[0], -1)
+            token_ref_target_masks = token_ref_target_masks.to(dtype)
 
         if self.text_tokens_zero_pad and encoder_attention_mask is not None:
             encoder_hidden_states = encoder_hidden_states * encoder_attention_mask[:, None, :, None]
@@ -1272,28 +1581,40 @@ class LongCatVideoAvatarTransformer3DModel(nn.Module):
             y_seqlens = [encoder_hidden_states.shape[2]] * encoder_hidden_states.shape[0]
             encoder_hidden_states = encoder_hidden_states.squeeze(1).view(1, -1, hidden_states.shape[-1])
 
-        for block in self.blocks:
-            hidden_states = block(
+        kv_cache_dict_ret = {}
+        for idx, block in enumerate(self.blocks):
+            block_outputs = block(
                 hidden_states,
                 encoder_hidden_states,
                 t,
                 y_seqlens,
                 (n_t, n_h, n_w),
                 num_cond_latents,
-                False,
-                None,
+                return_kv,
+                kv_cache_dict.get(idx),
                 skip_crs_attn,
-                None,
+                num_ref_latents,
                 audio_hidden_states,
-                None,
-                None,
-                None,
-                None,
+                ref_img_index,
+                mask_frame_range,
+                token_ref_target_masks,
+                human_num,
             )
+            if return_kv:
+                hidden_states, kv_cache = block_outputs
+                if offload_kv_cache:
+                    kv_cache_dict_ret[idx] = (kv_cache[0].cpu(), kv_cache[1].cpu())
+                else:
+                    kv_cache_dict_ret[idx] = (kv_cache[0].contiguous(), kv_cache[1].contiguous())
+            else:
+                hidden_states = block_outputs
 
         hidden_states = self.final_layer(hidden_states, t, (n_t, n_h, n_w))
         hidden_states = self.unpatchify(hidden_states, n_t, n_h, n_w)
-        return hidden_states.to(torch.float32)
+        hidden_states = hidden_states.to(torch.float32)
+        if return_kv:
+            return hidden_states, kv_cache_dict_ret
+        return hidden_states
 
     def unpatchify(self, x, n_t, n_h, n_w):
         t_p, h_p, w_p = self.patch_size

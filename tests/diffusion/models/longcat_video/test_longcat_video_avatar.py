@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_transformer import (
     LongCatVideoAvatarTransformer3DModel,
@@ -15,7 +17,10 @@ from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_transformer i
 )
 from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar import (
     _avatar_model_allow_patterns,
+    _build_multi_speaker_ref_target_masks,
     _default_at2v_shape,
+    _prepare_multi_speaker_audio_arrays,
+    _resolve_num_segments,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -51,6 +56,34 @@ def test_longcat_video_avatar_allow_patterns_download_one_weight_set(
 
     assert expected_weight_dir in allow_patterns
     assert unexpected_weight_dir not in allow_patterns
+
+
+@pytest.mark.parametrize(
+    ("value", "audio_duration", "expected"),
+    [
+        (None, 26.6, 1),
+        ("1", 26.6, 1),
+        (3, 26.6, 3),
+        ("auto", 3.0, 1),
+        ("auto", 23.8, 8),
+        ("auto", 26.6, 9),
+    ],
+)
+def test_longcat_video_avatar_resolve_num_segments(
+    value,
+    audio_duration: float,
+    expected: int,
+):
+    assert (
+        _resolve_num_segments(
+            value,
+            audio_duration=audio_duration,
+            num_frames=93,
+            num_cond_frames=13,
+            save_fps=25,
+        )
+        == expected
+    )
 
 
 def test_longcat_video_avatar_read_config_filters_non_constructor_metadata(tmp_path):
@@ -100,3 +133,95 @@ def test_longcat_video_avatar_load_weights_supports_int8_buffers():
 
     assert buffer_name in loaded_params
     assert torch.equal(dict(model.named_buffers())[buffer_name], loaded_weight)
+
+
+def test_longcat_video_avatar_multi_speaker_para_audio_arrays_are_aligned():
+    left = np.ones(3, dtype=np.float32)
+    right = np.ones(5, dtype=np.float32) * 2
+
+    left_out, right_out = _prepare_multi_speaker_audio_arrays(
+        [left, right],
+        audio_type="para",
+        generate_duration=0.5,
+        sample_rate=10,
+    )
+
+    assert left_out.tolist() == [1, 1, 1, 0, 0]
+    assert right_out.tolist() == [2, 2, 2, 2, 2]
+
+
+def test_longcat_video_avatar_multi_speaker_add_audio_arrays_are_sequential():
+    left = np.ones(3, dtype=np.float32)
+    right = np.ones(2, dtype=np.float32) * 2
+
+    left_out, right_out = _prepare_multi_speaker_audio_arrays(
+        [left, right],
+        audio_type="add",
+        generate_duration=0.1,
+        sample_rate=10,
+    )
+
+    assert left_out.tolist() == [1, 1, 1, 0, 0]
+    assert right_out.tolist() == [0, 0, 0, 2, 2]
+
+
+def test_longcat_video_avatar_multi_speaker_masks_use_explicit_bboxes():
+    image = Image.new("RGB", (8, 6))
+    masks, use_background = _build_multi_speaker_ref_target_masks(
+        image,
+        {
+            "person1": [1, 1, 4, 3],
+            "person2": [2, 4, 5, 7],
+        },
+    )
+
+    assert not use_background
+    assert masks.shape == (3, 6, 8)
+    assert masks[0, 1:4, 1:3].sum() == 6
+    assert masks[1, 2:5, 4:7].sum() == 9
+    assert masks[2, 0, 0] == 1
+    assert masks[2, 2, 2] == 0
+
+
+def test_longcat_video_avatar_multi_speaker_masks_default_to_left_right_split():
+    image = Image.new("RGB", (10, 8))
+    masks, use_background = _build_multi_speaker_ref_target_masks(image, None)
+
+    assert not use_background
+    assert masks.shape == (3, 8, 10)
+    assert masks[0, :, :5].sum() > 0
+    assert masks[0, :, 5:].sum() == 0
+    assert masks[1, :, :5].sum() == 0
+    assert masks[1, :, 5:].sum() > 0
+
+
+def test_longcat_video_avatar_transformer_accepts_multi_speaker_masks():
+    model = LongCatVideoAvatarTransformer3DModel(
+        hidden_size=4,
+        depth=0,
+        num_heads=1,
+        caption_channels=4,
+        intermediate_dim=4,
+        output_dim=4,
+        audio_channel=4,
+        context_tokens=1,
+    )
+    hidden_states = torch.randn(1, 16, 5, 4, 4)
+    timestep = torch.zeros(1, 5)
+    encoder_hidden_states = torch.randn(1, 1, 4, 4)
+    audio_embs = torch.randn(2, 5, 5, 12, 4)
+    ref_target_masks = torch.zeros(3, 4, 4)
+    ref_target_masks[0, :, :2] = 1
+    ref_target_masks[1, :, 2:] = 1
+    ref_target_masks[2] = torch.where(ref_target_masks[0] + ref_target_masks[1] > 0, 0, 1)
+
+    output = model(
+        hidden_states=hidden_states,
+        timestep=timestep,
+        encoder_hidden_states=encoder_hidden_states,
+        num_cond_latents=1,
+        audio_embs=audio_embs,
+        ref_target_masks=ref_target_masks,
+    )
+
+    assert output.shape == hidden_states.shape
