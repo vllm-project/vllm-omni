@@ -44,6 +44,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use-distill", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-int8", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--build-components-on-gpu",
+        action="store_true",
+        default=False,
+        help="Build large Avatar components directly on GPU for faster startup. Requires more peak VRAM.",
+    )
     parser.add_argument("--use-kv-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--offload-kv-cache", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--enforce-eager", action="store_true")
@@ -222,6 +228,7 @@ def main():
         "resolution": args.resolution,
         "use_distill": args.use_distill,
         "use_int8": args.use_int8,
+        "build_components_on_gpu": args.build_components_on_gpu,
     }
     if args.base_model_dir:
         additional_config["base_model_dir"] = args.base_model_dir

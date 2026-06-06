@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Iterable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -522,6 +523,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             raise NotImplementedError("LongCat-Video-Avatar native MVP only supports avatar-v1.5.")
         self.use_distill = _as_bool(additional_config.get("use_distill"), True)
         self.use_int8 = _as_bool(additional_config.get("use_int8"), True)
+        self.build_components_on_gpu = _as_bool(additional_config.get("build_components_on_gpu"), False)
         self.resolution = str(additional_config.get("resolution") or "480p")
         self.model_dir = _ensure_local_dir(
             od_config.model,
@@ -572,44 +574,54 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         dtype = getattr(self.od_config, "dtype", torch.bfloat16)
         base_dir = self._base_model_dir()
         self.tokenizer = AutoTokenizer.from_pretrained(str(base_dir), subfolder="tokenizer")
-        self.text_encoder = UMT5EncoderModel.from_pretrained(
-            str(base_dir), subfolder="text_encoder", torch_dtype=dtype
-        ).to(self.device)
-        self.vae = DistributedAutoencoderKLWan.from_pretrained(str(base_dir), subfolder="vae", torch_dtype=dtype).to(
-            self.device
-        )
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(str(self.model_dir), subfolder="scheduler")
 
-        if self.use_int8:
-            self.transformer = create_quantized_avatar_dit(
-                str(self.model_dir),
-                subfolder="base_model_int8",
-                cp_split_hw=[1, 1],
+        # vLLM initializes native pipelines under the target device context.
+        # Build LongCat's large components on CPU first by default to avoid
+        # transient full-precision CUDA allocations before int8 DiT replacement.
+        build_context = nullcontext() if self.build_components_on_gpu else torch.device("cpu")
+        enable_distill_lora = False
+        with build_context:
+            self.text_encoder = UMT5EncoderModel.from_pretrained(
+                str(base_dir), subfolder="text_encoder", torch_dtype=dtype
             )
-        else:
-            self.transformer = create_full_precision_avatar_dit(
-                str(self.model_dir),
-                subfolder="base_model",
-                cp_split_hw=[1, 1],
-            )
-        self.transformer = self.transformer.to(device=self.device)
-        if not self.use_int8:
-            self.transformer = self.transformer.to(dtype=dtype)
+            self.vae = DistributedAutoencoderKLWan.from_pretrained(str(base_dir), subfolder="vae", torch_dtype=dtype)
 
-        if self.use_distill:
-            lora_path = self.model_dir / "lora" / "dmd_lora.safetensors"
-            if lora_path.exists():
-                self.transformer.load_lora(
-                    str(lora_path),
-                    "dmd",
-                    multiplier=1.0,
-                    lora_network_dim=128,
-                    lora_network_alpha=64,
+            if self.use_int8:
+                self.transformer = create_quantized_avatar_dit(
+                    str(self.model_dir),
+                    subfolder="base_model_int8",
+                    cp_split_hw=[1, 1],
                 )
-                self.transformer.enable_loras(["dmd"])
+            else:
+                self.transformer = create_full_precision_avatar_dit(
+                    str(self.model_dir),
+                    subfolder="base_model",
+                    cp_split_hw=[1, 1],
+                )
+                self.transformer = self.transformer.to(dtype=dtype)
 
-        audio_model_path = self.model_dir / "whisper-large-v3"
-        self.audio_encoder = WhisperModel.from_pretrained(str(audio_model_path)).eval().to(self.device)
+            if self.use_distill:
+                lora_path = self.model_dir / "lora" / "dmd_lora.safetensors"
+                if lora_path.exists():
+                    self.transformer.load_lora(
+                        str(lora_path),
+                        "dmd",
+                        multiplier=1.0,
+                        lora_network_dim=128,
+                        lora_network_alpha=64,
+                    )
+                    enable_distill_lora = True
+
+            audio_model_path = self.model_dir / "whisper-large-v3"
+            self.audio_encoder = WhisperModel.from_pretrained(str(audio_model_path)).eval()
+
+        self.text_encoder = self.text_encoder.to(self.device)
+        self.vae = self.vae.to(self.device)
+        self.transformer = self.transformer.to(device=self.device)
+        if enable_distill_lora:
+            self.transformer.enable_loras(["dmd"])
+        self.audio_encoder = self.audio_encoder.to(self.device)
         self.audio_encoder.requires_grad_(False)
         self.audio_feature_extractor = AutoFeatureExtractor.from_pretrained(str(audio_model_path))
 
