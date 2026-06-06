@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import gc
 import html
 import json
 import math
@@ -626,13 +625,20 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         self.audio_feature_extractor = AutoFeatureExtractor.from_pretrained(str(audio_model_path))
 
         separator_path = self.model_dir / "vocal_separator" / "Kim_Vocal_2.onnx"
-        self.audio_temp_dir = Path(tempfile.mkdtemp(prefix="longcat_avatar_audio_"))
+        self._audio_temp_dir = tempfile.TemporaryDirectory(prefix="longcat_avatar_audio_")
+        self.audio_temp_dir = Path(self._audio_temp_dir.name)
         self.vocal_separator = Separator(
             output_dir=self.audio_temp_dir / "vocals",
             output_single_stem="vocals",
             model_file_dir=str(separator_path.parent),
         )
         self.vocal_separator.load_model(separator_path.name)
+
+    def close(self) -> None:
+        audio_temp_dir = getattr(self, "_audio_temp_dir", None)
+        if audio_temp_dir is not None:
+            audio_temp_dir.cleanup()
+            self._audio_temp_dir = None
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
@@ -781,7 +787,6 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
 
     def _clear_cache(self) -> None:
         self.kv_cache_dict = {}
-        gc.collect()
         if self.device.type == "cuda":
             torch.accelerator.empty_cache()
 
