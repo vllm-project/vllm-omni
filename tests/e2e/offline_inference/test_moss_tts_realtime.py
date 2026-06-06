@@ -94,12 +94,11 @@ def _get_test_config() -> str:
 # pytestmark — one engine for the whole module
 # ---------------------------------------------------------------------------
 
-# pytestmark = [
-#     pytest.mark.full_model,
-#     pytest.mark.tts,
-#     pytest.mark.parametrize("omni_runner", [(MODEL, _get_test_config())], indirect=True),
-# ]
-pytestmark: list = []
+pytestmark = [
+    pytest.mark.full_model,
+    pytest.mark.tts,
+    pytest.mark.parametrize("omni_runner", [(MODEL, _get_test_config())], indirect=True),
+]
 
 # ---------------------------------------------------------------------------
 # Fixtures
