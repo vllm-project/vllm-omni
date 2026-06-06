@@ -135,7 +135,6 @@ class Qwen3VLTextDecoderLayer(HFQwen3VLTextDecoderLayer):
 
 
 class Qwen3VLTextModel(HFQwen3VLTextModel):
-    config_class = Qwen3VLTextConfig
     config: Qwen3VLTextConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer"]
     _repeated_blocks = ["Qwen3VLTextDecoderLayer"]
@@ -253,7 +252,6 @@ class Qwen3VLModel(HFQwen3VLModel):
     base_model_prefix = ""
     _checkpoint_conversion_mapping = {}
     accepts_loss_kwargs = False
-    config_class = Qwen3VLConfig
     config: Qwen3VLConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
 
@@ -269,7 +267,6 @@ class Qwen3VLForConditionalGeneration(HFQwen3VLForConditionalGeneration):
     _checkpoint_conversion_mapping = {}
     _tied_weights_keys = ["lm_head.weight"]
     accepts_loss_kwargs = False
-    config_class = Qwen3VLConfig
     config: Qwen3VLConfig
 
     def __init__(self, config):
