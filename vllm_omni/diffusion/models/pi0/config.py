@@ -15,7 +15,6 @@ used; any other keys in the file are ignored.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
@@ -84,23 +83,13 @@ class Pi0Config:
     def __post_init__(self) -> None:
         # Coerce list → tuple (JSON has no tuples) and validate squareness.
         res = self.image_resolution
-        if (
-            not isinstance(res, (tuple, list))
-            or len(res) != 2
-            or res[0] != res[1]
-        ):
-            raise ValueError(
-                f"π0 expects a square image_resolution (H == W); got {res!r}."
-            )
+        if not isinstance(res, (tuple, list)) or len(res) != 2 or res[0] != res[1]:
+            raise ValueError(f"π0 expects a square image_resolution (H == W); got {res!r}.")
         self.image_resolution = (int(res[0]), int(res[1]))
 
         # Derive the camera order from input_features if not given explicitly.
         if self.image_feature_keys is None and self.input_features:
-            self.image_feature_keys = [
-                key
-                for key in self.input_features
-                if key.startswith(OBS_IMAGES + ".")
-            ]
+            self.image_feature_keys = [key for key in self.input_features if key.startswith(OBS_IMAGES + ".")]
 
     # ------------------------------------------------------------------
     # Constructors

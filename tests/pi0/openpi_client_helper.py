@@ -110,9 +110,7 @@ class OpenPIWebsocketClient:
 
 def make_dummy_obs(*, prompt: str, session_id: str, image_size: int = IMAGE_SIZE) -> dict[str, Any]:
     """A single π0 observation: 3 blank cameras (HWC uint8) + zero state + prompt."""
-    obs: dict[str, Any] = {
-        cam: np.zeros((image_size, image_size, 3), dtype=np.uint8) for cam in CAMERA_KEYS
-    }
+    obs: dict[str, Any] = {cam: np.zeros((image_size, image_size, 3), dtype=np.uint8) for cam in CAMERA_KEYS}
     obs["state"] = np.zeros(STATE_DIM, dtype=np.float32)
     obs["prompt"] = prompt
     obs["session_id"] = session_id
@@ -133,10 +131,7 @@ def run_policy_session(
     client = OpenPIWebsocketClient(host=host, port=port, path=path)
     try:
         metadata = client.get_server_metadata()
-        actions = [
-            client.infer(make_dummy_obs(prompt=prompt, session_id=session_id))
-            for _ in range(num_steps)
-        ]
+        actions = [client.infer(make_dummy_obs(prompt=prompt, session_id=session_id)) for _ in range(num_steps)]
         return {"metadata": metadata, "actions": actions, "session_id": session_id}
     finally:
         client.close()

@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Dict, Iterable, List, Optional, Tuple
+from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -121,9 +121,7 @@ def create_sinusoidal_pos_embedding(
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
 
 
-def make_att_2d_masks(
-    pad_masks: torch.Tensor, att_masks: torch.Tensor
-) -> torch.Tensor:
+def make_att_2d_masks(pad_masks: torch.Tensor, att_masks: torch.Tensor) -> torch.Tensor:
     """Build a 2D attention mask from a padding mask and an autoregressive mask.
 
     Ref: openpi/models_pytorch/pi0_pytorch.py make_att_2d_masks
@@ -139,9 +137,7 @@ def make_att_2d_masks(
     return att_2d_masks & pad_2d_masks
 
 
-def _build_norm_buffers(
-    norm_stats: Optional[Dict], key: str
-) -> Optional[Dict[str, torch.Tensor]]:
+def _build_norm_buffers(norm_stats: dict | None, key: str) -> dict[str, torch.Tensor] | None:
     """Parse a ``norm_stats[key]`` entry into CPU tensors, or ``None``.
 
     Matches LeRobot's ``NormalizationMode``:
@@ -179,7 +175,7 @@ def _build_norm_buffers(
 
 def _apply_norm(
     x: torch.Tensor,
-    stats: Optional[Dict[str, torch.Tensor]],
+    stats: dict[str, torch.Tensor] | None,
     inverse: bool,
     eps: float = 1e-8,
 ) -> torch.Tensor:
@@ -288,7 +284,10 @@ def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, positio
     q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
     att = _attend(
-        q, k, v, attention_mask,
+        q,
+        k,
+        v,
+        attention_mask,
         num_kv_groups=layer.self_attn.num_key_value_groups,
         scaling=1.0 / math.sqrt(layer.self_attn.head_dim),
     )
@@ -301,8 +300,13 @@ def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, positio
 
 
 def _compute_layer_suffix_only(
-    layer_idx, hidden_states, prefix_kv, attention_mask, position_ids,
-    paligemma, gemma_expert,
+    layer_idx,
+    hidden_states,
+    prefix_kv,
+    attention_mask,
+    position_ids,
+    paligemma,
+    gemma_expert,
 ):
     """Run one action-expert layer on the suffix, attending to the cached
     prefix K/V concatenated with freshly computed suffix K/V.
@@ -332,7 +336,10 @@ def _compute_layer_suffix_only(
     v = torch.cat([v_prefix.to(v_suf.dtype), v_suf], dim=2)
 
     att = _attend(
-        q, k, v, attention_mask,
+        q,
+        k,
+        v,
+        attention_mask,
         num_kv_groups=layer.self_attn.num_key_value_groups,
         scaling=1.0 / math.sqrt(layer.self_attn.head_dim),
     )
@@ -444,10 +451,10 @@ class PaliGemmaWithActionExpert(nn.Module):
 
     def forward(
         self,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
         past_key_values=None,
-        inputs_embeds: Optional[List[Optional[torch.Tensor]]] = None,
+        inputs_embeds: list[torch.Tensor | None] | None = None,
         use_cache: bool = False,
     ):
         """Dispatch to prefix_only / suffix_only and return
@@ -462,10 +469,13 @@ class PaliGemmaWithActionExpert(nn.Module):
             # per-layer post-RoPE K/V is collected into a list that the
             # suffix pass will consume directly.
             hidden_states = inputs_embeds[0]
-            kv_list: List[Tuple[torch.Tensor, torch.Tensor]] = []
+            kv_list: list[tuple[torch.Tensor, torch.Tensor]] = []
             for layer_idx in range(num_layers):
                 hidden_states, kv = _compute_layer_prefix_only(
-                    layer_idx, hidden_states, attention_mask, position_ids,
+                    layer_idx,
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
                     paligemma=self.paligemma,
                 )
                 kv_list.append(kv)
@@ -488,9 +498,13 @@ class PaliGemmaWithActionExpert(nn.Module):
         hidden_states = inputs_embeds[1]
         for layer_idx in range(num_layers):
             hidden_states = _compute_layer_suffix_only(
-                layer_idx, hidden_states, past_key_values[layer_idx],
-                attention_mask, position_ids,
-                paligemma=self.paligemma, gemma_expert=self.gemma_expert,
+                layer_idx,
+                hidden_states,
+                past_key_values[layer_idx],
+                attention_mask,
+                position_ids,
+                paligemma=self.paligemma,
+                gemma_expert=self.gemma_expert,
             )
         hidden_states = expert_lm.norm(hidden_states)
         return [None, hidden_states], None
@@ -532,9 +546,7 @@ class Pi0ForActionPrediction(nn.Module):
         # back to action_dim for older configs that only expose a single size.
         self.max_state_dim = getattr(config, "max_state_dim", self.action_dim)
         self.action_horizon = getattr(config, "chunk_size", DEFAULT_ACTION_HORIZON)
-        self.num_inference_steps = getattr(
-            config, "num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS
-        )
+        self.num_inference_steps = getattr(config, "num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS)
 
         paligemma_variant = getattr(config, "paligemma_variant", "gemma_2b")
         action_expert_variant = getattr(config, "action_expert_variant", "gemma_300m")
@@ -573,8 +585,7 @@ class Pi0ForActionPrediction(nn.Module):
         self._action_norm = _build_norm_buffers(getattr(config, "norm_stats", None), "action")
         if self._state_norm is None:
             logger.info(
-                "π0: no state normalization stats on config.norm_stats — "
-                "state values will pass through unchanged."
+                "π0: no state normalization stats on config.norm_stats — state values will pass through unchanged."
             )
         if self._action_norm is None:
             logger.info(
@@ -594,11 +605,11 @@ class Pi0ForActionPrediction(nn.Module):
 
     def embed_prefix(
         self,
-        images: List[torch.Tensor],
-        image_masks: List[torch.Tensor],
+        images: list[torch.Tensor],
+        image_masks: list[torch.Tensor],
         lang_tokens: torch.Tensor,
         lang_masks: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build the prefix embeddings, per-token padding mask, and AR mask.
 
         Prefix tokens form a contiguous sequence
@@ -609,9 +620,9 @@ class Pi0ForActionPrediction(nn.Module):
 
         Ref: openpi PI0Pytorch.embed_prefix
         """
-        embs: List[torch.Tensor] = []
-        pad_masks: List[torch.Tensor] = []
-        att_masks: List[int] = []
+        embs: list[torch.Tensor] = []
+        pad_masks: list[torch.Tensor] = []
+        att_masks: list[int] = []
 
         for img, img_mask in zip(images, image_masks):
             img_emb = self.paligemma_with_expert.embed_image(img)
@@ -644,7 +655,7 @@ class Pi0ForActionPrediction(nn.Module):
         state: torch.Tensor,
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build the suffix embeddings + masks: ``[state_token, action_tokens×H]``.
 
         AR mask layout: ``[1, 1, 0, 0, ..., 0]`` — the state token is a causal
@@ -665,26 +676,26 @@ class Pi0ForActionPrediction(nn.Module):
 
         # Sinusoidal timestep → (B, W) → expand across the horizon.
         time_emb = create_sinusoidal_pos_embedding(
-            timestep, self.action_in_proj.out_features,
-            min_period=4e-3, max_period=4.0, device=device,
+            timestep,
+            self.action_in_proj.out_features,
+            min_period=4e-3,
+            max_period=4.0,
+            device=device,
         ).to(dtype=model_dtype)
 
         # Fuse action and time via (2W → W → W) MLP with SiLU.
         action_emb = self.action_in_proj(noisy_actions)  # (B, H, W)
-        action_time_emb = torch.cat(
-            [action_emb, time_emb[:, None, :].expand_as(action_emb)], dim=2
-        )
+        action_time_emb = torch.cat([action_emb, time_emb[:, None, :].expand_as(action_emb)], dim=2)
         action_time_emb = self.action_time_mlp_in(action_time_emb)
         action_time_emb = F.silu(action_time_emb)
         action_time_emb = self.action_time_mlp_out(action_time_emb)
 
         embs = torch.cat([state_emb, action_time_emb], dim=1)
-        pad_masks = torch.ones(
-            bsize, embs.shape[1], dtype=torch.bool, device=device
-        )
+        pad_masks = torch.ones(bsize, embs.shape[1], dtype=torch.bool, device=device)
         att_masks = torch.tensor(
             [1] + [1] + [0] * (self.action_horizon - 1),
-            dtype=embs.dtype, device=device,
+            dtype=embs.dtype,
+            device=device,
         )[None, :].expand(bsize, -1)
         return embs, pad_masks, att_masks
 
@@ -703,9 +714,7 @@ class Pi0ForActionPrediction(nn.Module):
         Uses the prefix KV cache from ``sample_actions`` and only runs the
         action expert. Ref: openpi PI0Pytorch.denoise_step.
         """
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-            state, x_t, timestep
-        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, timestep)
 
         # Build the full (B, suffix_len, prefix_len + suffix_len) boolean mask:
         #   * suffix queries can see every *valid* prefix key (padded camera
@@ -716,9 +725,7 @@ class Pi0ForActionPrediction(nn.Module):
         suffix_len = suffix_pad_masks.shape[1]
         prefix_len = prefix_pad_masks.shape[1]
 
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
-            batch_size, suffix_len, prefix_len
-        )
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
@@ -746,13 +753,13 @@ class Pi0ForActionPrediction(nn.Module):
     @torch.no_grad()
     def sample_actions(
         self,
-        images: List[torch.Tensor],
-        image_masks: List[torch.Tensor],
+        images: list[torch.Tensor],
+        image_masks: list[torch.Tensor],
         lang_tokens: torch.Tensor,
         lang_masks: torch.Tensor,
         state: torch.Tensor,
-        noise: Optional[torch.Tensor] = None,
-        num_steps: Optional[int] = None,
+        noise: torch.Tensor | None = None,
+        num_steps: int | None = None,
     ) -> torch.Tensor:
         """Generate an action chunk via iterative flow-matching denoising.
 
@@ -767,8 +774,11 @@ class Pi0ForActionPrediction(nn.Module):
         device = state.device
         if noise is None:
             noise = torch.randn(
-                bsize, self.action_horizon, self.action_dim,
-                dtype=torch.float32, device=device,
+                bsize,
+                self.action_horizon,
+                self.action_dim,
+                dtype=torch.float32,
+                device=device,
             )
 
         # 1. Prefix embeddings + mask building.
@@ -793,9 +803,7 @@ class Pi0ForActionPrediction(nn.Module):
         x_t = noise
         for step in range(num_steps):
             t = 1.0 + step * dt
-            time_tensor = torch.full(
-                (bsize,), t, dtype=torch.float32, device=device
-            )
+            time_tensor = torch.full((bsize,), t, dtype=torch.float32, device=device)
             v_t = self.denoise_step(
                 state=state,
                 prefix_pad_masks=prefix_pad_masks,
@@ -808,7 +816,7 @@ class Pi0ForActionPrediction(nn.Module):
 
     # ── Weight loading ───────────────────────────────────────────────
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights from an ``lerobot/pi0_base`` safetensors checkpoint.
 
         Checkpoint keys (after stripping the leading ``model.`` prefix) look
@@ -844,20 +852,20 @@ class Pi0ForActionPrediction(nn.Module):
         def _remap(name: str) -> str:
             # Strip the leading "model." that LeRobot's PI0Policy wrapper adds.
             if name.startswith("model."):
-                name = name[len("model."):]
+                name = name[len("model.") :]
 
             # Historical MLP alias used by some early π0 checkpoints.
             if name.startswith("time_mlp_in."):
-                name = "action_time_mlp_in." + name[len("time_mlp_in."):]
+                name = "action_time_mlp_in." + name[len("time_mlp_in.") :]
             elif name.startswith("time_mlp_out."):
-                name = "action_time_mlp_out." + name[len("time_mlp_out."):]
+                name = "action_time_mlp_out." + name[len("time_mlp_out.") :]
 
             # Nested PaliGemma layout.
             for sub in _PALIGEMMA_SUBMODULES:
                 flat = f"paligemma_with_expert.paligemma.{sub}."
                 nested = f"paligemma_with_expert.paligemma.model.{sub}."
                 if name.startswith(flat) and not name.startswith(nested):
-                    return nested + name[len(flat):]
+                    return nested + name[len(flat) :]
 
             # Tied lm_head → embed_tokens redirect (see docstring).
             if name == "paligemma_with_expert.paligemma.lm_head.weight":
@@ -877,19 +885,19 @@ class Pi0ForActionPrediction(nn.Module):
             vt = "paligemma_with_expert.paligemma.model.vision_tower."
             if not name.startswith(vt):
                 return name
-            rest = name[len(vt):]
+            rest = name[len(vt) :]
             if name in params_dict or name in buffers_dict:
                 return name  # model already expects this exact layout
             if rest.startswith("vision_model."):
                 # Checkpoint has the infix; model (≥5.4) doesn't → strip it.
-                candidate = vt + rest[len("vision_model."):]
+                candidate = vt + rest[len("vision_model.") :]
             else:
                 # Checkpoint lacks the infix; model (≤5.3) has it → insert it.
                 candidate = vt + "vision_model." + rest
             return candidate if (candidate in params_dict or candidate in buffers_dict) else name
 
         loaded = 0
-        skipped: List[str] = []
+        skipped: list[str] = []
         filled_params: set = set()
         for name, loaded_weight in weights:
             mapped = _fix_vision_tower(_remap(name))
@@ -909,7 +917,7 @@ class Pi0ForActionPrediction(nn.Module):
         # Reverse audit: any model param that got no checkpoint tensor at all
         # would be running with random init. ``rotary_emb.inv_freq`` and
         # friends are config-derived buffers, not stored in the checkpoint.
-        missing_params: List[str] = []
+        missing_params: list[str] = []
         for pname in params_dict:
             if pname in filled_params:
                 continue
@@ -918,20 +926,15 @@ class Pi0ForActionPrediction(nn.Module):
             missing_params.append(pname)
 
         if missing_params or skipped:
-            parts: List[str] = []
+            parts: list[str] = []
             if skipped:
-                parts.append(
-                    f"{len(skipped)} checkpoint key(s) had no home in the "
-                    f"model (first 5: {skipped[:5]})"
-                )
+                parts.append(f"{len(skipped)} checkpoint key(s) had no home in the model (first 5: {skipped[:5]})")
             if missing_params:
-                parts.append(
-                    f"{len(missing_params)} model param(s) received NO weight "
-                    f"(first 5: {missing_params[:5]})"
-                )
+                parts.append(f"{len(missing_params)} model param(s) received NO weight (first 5: {missing_params[:5]})")
             logger.warning(
                 "π0 load_weights: %d tensors loaded — %s.",
-                loaded, "; ".join(parts),
+                loaded,
+                "; ".join(parts),
             )
         else:
             logger.info(

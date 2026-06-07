@@ -16,7 +16,6 @@ the OpenPI protocol are accepted but ignored.
 from __future__ import annotations
 
 import os
-from typing import Any
 
 import numpy as np
 import torch
@@ -29,11 +28,10 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.request import OmniDiffusionRequest
-
 from vllm_omni.diffusion.models.pi0.config import Pi0Config
 from vllm_omni.diffusion.models.pi0.modeling_pi0 import Pi0ForActionPrediction
 from vllm_omni.diffusion.models.pi0.processor_pi0 import build_model_inputs
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
 
@@ -106,9 +104,7 @@ class Pi0Pipeline(nn.Module):
         self.config = self._build_config(od_config)
 
         custom_args = od_config.custom_pipeline_args or {}
-        self.tokenizer_source = str(
-            custom_args.get("tokenizer", self._resolve_tokenizer_source())
-        )
+        self.tokenizer_source = str(custom_args.get("tokenizer", self._resolve_tokenizer_source()))
 
         # Torch dtype/device from od_config.
         self._torch_dtype = self._resolve_dtype(od_config)
@@ -188,9 +184,7 @@ class Pi0Pipeline(nn.Module):
         return AutoTokenizer.from_pretrained(self.tokenizer_source)
 
     def has_real_checkpoint(self) -> bool:
-        return bool(self.model_dir) and os.path.exists(
-            os.path.join(self.model_dir, "model.safetensors")
-        )
+        return bool(self.model_dir) and os.path.exists(os.path.join(self.model_dir, "model.safetensors"))
 
     def _initialize_model(self) -> Pi0ForActionPrediction:
         model = Pi0ForActionPrediction(self.config)

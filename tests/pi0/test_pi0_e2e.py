@@ -174,18 +174,14 @@ def _create_dummy_batch(batch_size: int = BATCH_SIZE, device: str = DEVICE) -> d
     g = torch.Generator(device="cpu").manual_seed(0)
     prompt = "Pick up the red block and place it in the bin"
     return {
-        "observation.state": torch.randn(
-            batch_size, STATE_DIM, generator=g, dtype=torch.float32
-        ).to(device),
-        "action": torch.randn(
-            batch_size, ACTION_HORIZON, ACTION_DIM, generator=g, dtype=torch.float32
-        ).to(device),
-        "observation.images.base_0_rgb": torch.rand(
-            batch_size, 3, 224, 224, generator=g, dtype=torch.float32
-        ).to(device),
-        "observation.images.left_wrist_0_rgb": torch.rand(
-            batch_size, 3, 224, 224, generator=g, dtype=torch.float32
-        ).to(device),
+        "observation.state": torch.randn(batch_size, STATE_DIM, generator=g, dtype=torch.float32).to(device),
+        "action": torch.randn(batch_size, ACTION_HORIZON, ACTION_DIM, generator=g, dtype=torch.float32).to(device),
+        "observation.images.base_0_rgb": torch.rand(batch_size, 3, 224, 224, generator=g, dtype=torch.float32).to(
+            device
+        ),
+        "observation.images.left_wrist_0_rgb": torch.rand(batch_size, 3, 224, 224, generator=g, dtype=torch.float32).to(
+            device
+        ),
         "observation.images.right_wrist_0_rgb": torch.rand(
             batch_size, 3, 224, 224, generator=g, dtype=torch.float32
         ).to(device),
@@ -201,18 +197,14 @@ def _instantiate_lerobot():
     if FROM_PRETRAINED:
         policy = PI0Policy.from_pretrained(MODEL_PATH, strict=True)
     else:
-        config = PI0Config(
-            max_action_dim=ACTION_DIM, max_state_dim=STATE_DIM, dtype=DTYPE_STR
-        )
+        config = PI0Config(max_action_dim=ACTION_DIM, max_state_dim=STATE_DIM, dtype=DTYPE_STR)
         policy = PI0Policy(config)
 
     policy.to(DEVICE)
     policy.config.device = DEVICE
     policy.eval()
 
-    pre, post = make_pi0_pre_post_processors(
-        config=policy.config, dataset_stats=_dummy_dataset_stats()
-    )
+    pre, post = make_pi0_pre_post_processors(config=policy.config, dataset_stats=_dummy_dataset_stats())
     return policy, pre, post
 
 
@@ -272,9 +264,7 @@ def _extract_lerobot_model_inputs(lerobot_policy, processed_batch):
 # ─── Shared fixed-noise sampler ───────────────────────────────────────
 def _make_fixed_noise(batch_size: int, device: str) -> torch.Tensor:
     g = torch.Generator(device="cpu").manual_seed(42)
-    return torch.randn(
-        batch_size, ACTION_HORIZON, ACTION_DIM, generator=g, dtype=torch.float32
-    ).to(device)
+    return torch.randn(batch_size, ACTION_HORIZON, ACTION_DIM, generator=g, dtype=torch.float32).to(device)
 
 
 # ─── Main test ────────────────────────────────────────────────────────
@@ -289,9 +279,7 @@ def test_pi0_vllm_omni_vs_lerobot():
     print("[parity] Preparing shared inputs…")
     raw_batch = _create_dummy_batch()
     processed_batch = lerobot_pre(copy.deepcopy(raw_batch))
-    images, img_masks, lang_tokens, lang_masks, state = _extract_lerobot_model_inputs(
-        lerobot_policy, processed_batch
-    )
+    images, img_masks, lang_tokens, lang_masks, state = _extract_lerobot_model_inputs(lerobot_policy, processed_batch)
     noise = _make_fixed_noise(raw_batch["observation.state"].shape[0], DEVICE)
 
     print(f"[parity] state.shape={state.shape}  lang_tokens.shape={lang_tokens.shape}")
@@ -302,8 +290,13 @@ def test_pi0_vllm_omni_vs_lerobot():
     print("[parity] Running LeRobot sample_actions…")
     with torch.no_grad():
         lerobot_actions = lerobot_policy.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state,
-            noise=noise, num_steps=NUM_STEPS,
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noise=noise,
+            num_steps=NUM_STEPS,
         )
     print(
         f"[parity] LeRobot actions: shape={lerobot_actions.shape} "
@@ -338,26 +331,37 @@ def test_pi0_vllm_omni_vs_lerobot():
     if not close:
         print("\n[parity] ⚠️  Outputs diverge — running per-stage diagnostics…")
         _diagnose_divergence(
-            lerobot_policy.model, omni_model,
-            images, img_masks, lang_tokens, lang_masks, state, noise,
+            lerobot_policy.model,
+            omni_model,
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noise,
         )
 
     assert close, (
-        f"vllm-omni vs LeRobot actions differ beyond atol={ATOL}. "
-        f"max_diff={max_diff:.2e}  mean_diff={mean_diff:.2e}"
+        f"vllm-omni vs LeRobot actions differ beyond atol={ATOL}. max_diff={max_diff:.2e}  mean_diff={mean_diff:.2e}"
     )
 
 
 # ─── Per-stage divergence diagnostics ─────────────────────────────────
 @torch.no_grad()
 def _diagnose_divergence(
-    lerobot_flow_model, omni_model,
-    images, img_masks, lang_tokens, lang_masks, state, noise,
+    lerobot_flow_model,
+    omni_model,
+    images,
+    img_masks,
+    lang_tokens,
+    lang_masks,
+    state,
+    noise,
 ):
     """Localize a numerical mismatch to a specific pipeline stage:
-      1. Prefix embeddings (SigLIP / embed_tokens / projector) — image vs lang.
-      2. Prefix KV cache layer 0 — PaliGemma LM attention.
-      3. A single denoise_step velocity at t=1.0 — action expert forward.
+    1. Prefix embeddings (SigLIP / embed_tokens / projector) — image vs lang.
+    2. Prefix KV cache layer 0 — PaliGemma LM attention.
+    3. A single denoise_step velocity at t=1.0 — action expert forward.
     """
     from vllm_omni.diffusion.models.pi0.modeling_pi0 import (
         make_att_2d_masks,
@@ -368,29 +372,17 @@ def _diagnose_divergence(
     lr_prefix_embs, lr_prefix_pad, lr_prefix_att = lerobot_flow_model.embed_prefix(
         images, img_masks, lang_tokens, lang_masks
     )
-    sg_prefix_embs, sg_prefix_pad, sg_prefix_att = omni_model.embed_prefix(
-        images, img_masks, lang_tokens, lang_masks
-    )
+    sg_prefix_embs, sg_prefix_pad, sg_prefix_att = omni_model.embed_prefix(images, img_masks, lang_tokens, lang_masks)
     total_diff = (lr_prefix_embs.float() - sg_prefix_embs.float()).abs().max().item()
-    print(
-        f"[diag] prefix_embs max |Δ| = {total_diff:.2e}   "
-        f"(shape={tuple(sg_prefix_embs.shape)})"
-    )
+    print(f"[diag] prefix_embs max |Δ| = {total_diff:.2e}   (shape={tuple(sg_prefix_embs.shape)})")
     print(f"[diag] prefix_pad_masks equal: {torch.equal(lr_prefix_pad, sg_prefix_pad)}")
-    print(
-        f"[diag] prefix_att_masks equal: "
-        f"{torch.equal(lr_prefix_att.bool(), sg_prefix_att.bool())}"
-    )
+    print(f"[diag] prefix_att_masks equal: {torch.equal(lr_prefix_att.bool(), sg_prefix_att.bool())}")
 
     num_cams = len(images)
     img_len = 256 * num_cams
     lang_len = lr_prefix_embs.shape[1] - img_len
-    img_diff = (
-        lr_prefix_embs[:, :img_len].float() - sg_prefix_embs[:, :img_len].float()
-    ).abs().max().item()
-    lang_diff = (
-        lr_prefix_embs[:, img_len:].float() - sg_prefix_embs[:, img_len:].float()
-    ).abs().max().item()
+    img_diff = (lr_prefix_embs[:, :img_len].float() - sg_prefix_embs[:, :img_len].float()).abs().max().item()
+    lang_diff = (lr_prefix_embs[:, img_len:].float() - sg_prefix_embs[:, img_len:].float()).abs().max().item()
     print(f"[diag]   image slice [:{img_len}] max|Δ| = {img_diff:.2e}   (num_cams={num_cams})")
     print(f"[diag]   lang slice  [{img_len}:] max|Δ| = {lang_diff:.2e}   (len={lang_len})")
 
@@ -412,12 +404,18 @@ def _diagnose_divergence(
 
     lerobot_flow_model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
     _, lr_kv = lerobot_flow_model.paligemma_with_expert.forward(
-        attention_mask=prefix_att_4d, position_ids=prefix_pos,
-        past_key_values=None, inputs_embeds=[lr_prefix_embs, None], use_cache=True,
+        attention_mask=prefix_att_4d,
+        position_ids=prefix_pos,
+        past_key_values=None,
+        inputs_embeds=[lr_prefix_embs, None],
+        use_cache=True,
     )
     _, sg_kv = omni_model.paligemma_with_expert.forward(
-        attention_mask=prefix_att_4d, position_ids=prefix_pos,
-        past_key_values=None, inputs_embeds=[sg_prefix_embs, None], use_cache=True,
+        attention_mask=prefix_att_4d,
+        position_ids=prefix_pos,
+        past_key_values=None,
+        inputs_embeds=[sg_prefix_embs, None],
+        use_cache=True,
     )
 
     def _layer0_kv(cache):
@@ -440,10 +438,7 @@ def _diagnose_divergence(
     t = torch.ones(bsize, dtype=torch.float32, device=state.device)
     lr_vt = lerobot_flow_model.denoise_step(state, sg_prefix_pad, lr_kv, noise, t)
     sg_vt = omni_model.denoise_step(state, sg_prefix_pad, sg_kv, noise, t)
-    print(
-        f"[diag] denoise_step(t=1) v_t max|Δ| = "
-        f"{(lr_vt.float() - sg_vt.float()).abs().max().item():.2e}"
-    )
+    print(f"[diag] denoise_step(t=1) v_t max|Δ| = {(lr_vt.float() - sg_vt.float()).abs().max().item():.2e}")
 
 
 # ─── End-to-end online serving (OpenPI websocket) ─────────────────────

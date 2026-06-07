@@ -63,9 +63,7 @@ def _make_dummy_obs(prompt: str, session_id: str, image_size: int = 224) -> dict
     Replace the zeros with real camera frames (HWC uint8) and proprioceptive
     state to drive an actual robot.
     """
-    obs: dict[str, Any] = {
-        cam: np.zeros((image_size, image_size, 3), dtype=np.uint8) for cam in CAMERA_KEYS
-    }
+    obs: dict[str, Any] = {cam: np.zeros((image_size, image_size, 3), dtype=np.uint8) for cam in CAMERA_KEYS}
     obs["state"] = np.zeros(STATE_DIM, dtype=np.float32)
     obs["prompt"] = prompt
     obs["session_id"] = session_id
@@ -106,7 +104,10 @@ def main() -> int:
         actions = _as_action_array(policy.infer(obs))
         logger.info(
             "[step %d] actions shape=%s mean=%.4f std=%.4f",
-            step, actions.shape, float(actions.mean()), float(actions.std()),
+            step,
+            actions.shape,
+            float(actions.mean()),
+            float(actions.std()),
         )
         if not np.isfinite(actions).all():
             raise RuntimeError("Server returned non-finite actions.")

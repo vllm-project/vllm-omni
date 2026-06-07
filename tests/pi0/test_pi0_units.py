@@ -165,9 +165,7 @@ def test_make_att_2d_masks_causal():
 
 
 def test_make_att_2d_masks_prefix_lm():
-    result = make_att_2d_masks(
-        torch.ones(1, 5, dtype=torch.bool), torch.tensor([[0, 0, 0, 1, 1]], dtype=torch.long)
-    )
+    result = make_att_2d_masks(torch.ones(1, 5, dtype=torch.bool), torch.tensor([[0, 0, 0, 1, 1]], dtype=torch.long))
     assert result[0, 0, 0]
     assert not result[0, 0, 3]
     assert result[0, 3, 0]
@@ -223,9 +221,7 @@ def test_build_norm_buffers_min_max():
 
 
 def test_apply_norm_mean_std_forward_inverse():
-    stats = _build_norm_buffers(
-        {"s": {"mode": "mean_std", "mean": [0.5, -0.2], "std": [2.0, 0.1]}}, "s"
-    )
+    stats = _build_norm_buffers({"s": {"mode": "mean_std", "mean": [0.5, -0.2], "std": [2.0, 0.1]}}, "s")
     x = torch.tensor([[1.0, 0.3]])
     z = _apply_norm(x, stats, inverse=False)
     assert torch.allclose(z, torch.tensor([[0.25, 5.0]]), atol=1e-5)
@@ -234,9 +230,7 @@ def test_apply_norm_mean_std_forward_inverse():
 
 
 def test_apply_norm_min_max_forward_inverse():
-    stats = _build_norm_buffers(
-        {"s": {"mode": "min_max", "min": [0.0, -1.0], "max": [1.0, 1.0]}}, "s"
-    )
+    stats = _build_norm_buffers({"s": {"mode": "min_max", "min": [0.0, -1.0], "max": [1.0, 1.0]}}, "s")
     x = torch.tensor([[0.25, 0.5]])
     z = _apply_norm(x, stats, inverse=False)
     assert torch.allclose(z, torch.tensor([[-0.5, 0.5]]), atol=1e-5)
@@ -245,9 +239,7 @@ def test_apply_norm_min_max_forward_inverse():
 
 
 def test_apply_norm_preserves_padded_tail():
-    stats = _build_norm_buffers(
-        {"s": {"mode": "mean_std", "mean": [0.0, 0.0], "std": [1.0, 1.0]}}, "s"
-    )
+    stats = _build_norm_buffers({"s": {"mode": "mean_std", "mean": [0.0, 0.0], "std": [1.0, 1.0]}}, "s")
     x = torch.tensor([[1.0, 2.0, 99.0, -99.0]])
     z = _apply_norm(x, stats, inverse=False)
     assert torch.allclose(z[:, :2], x[:, :2])
@@ -294,9 +286,7 @@ def _tiny_pi0_model():
 def _silence_pi0_loader(caplog):
     # The remap tests feed a single synthetic weight; the loader's
     # "missing params" warning is expected noise here.
-    logging.getLogger(
-        "vllm_omni.diffusion.models.pi0.modeling_pi0"
-    ).setLevel(logging.ERROR)
+    logging.getLogger("vllm_omni.diffusion.models.pi0.modeling_pi0").setLevel(logging.ERROR)
     yield
 
 
@@ -304,10 +294,7 @@ def _silence_pi0_loader(caplog):
 def test_remap_paligemma_submodules_to_nested_layout():
     model = _tiny_pi0_model()
     params = dict(model.named_parameters())
-    target = next(
-        k for k in params
-        if k.startswith("paligemma_with_expert.paligemma.model.vision_tower.")
-    )
+    target = next(k for k in params if k.startswith("paligemma_with_expert.paligemma.model.vision_tower."))
     flat_key = "model." + target.replace(
         "paligemma_with_expert.paligemma.model.vision_tower.",
         "paligemma_with_expert.paligemma.vision_tower.",
@@ -328,9 +315,7 @@ def test_lm_head_remap_to_embed_tokens():
     assert target in params
     payload = torch.full(params[target].shape, 0.5)
     before = params[target].detach().clone()
-    model.load_weights(
-        [("model.paligemma_with_expert.paligemma.lm_head.weight", payload)]
-    )
+    model.load_weights([("model.paligemma_with_expert.paligemma.lm_head.weight", payload)])
     after = dict(model.named_parameters())[target]
     assert not torch.equal(before, after), "lm_head→embed_tokens remap broken"
     assert torch.allclose(after, payload)
@@ -346,15 +331,15 @@ def test_vision_tower_version_robust_remap():
     params = dict(model.named_parameters())
     # A representative vision-tower param as it exists on the model.
     target = next(
-        k for k in params
-        if k.startswith("paligemma_with_expert.paligemma.model.vision_tower.")
-        and "patch_embedding.weight" in k
+        k
+        for k in params
+        if k.startswith("paligemma_with_expert.paligemma.model.vision_tower.") and "patch_embedding.weight" in k
     )
     vt = "paligemma_with_expert.paligemma.model.vision_tower."
-    rest = target[len(vt):]
+    rest = target[len(vt) :]
     # Build the checkpoint key in whichever layout differs from the model's.
     if rest.startswith("vision_model."):
-        ckpt_key = vt + rest[len("vision_model."):]
+        ckpt_key = vt + rest[len("vision_model.") :]
     else:
         ckpt_key = vt + "vision_model." + rest
     payload = torch.full(params[target].shape, 0.073)
@@ -435,8 +420,9 @@ def test_preprocess_single_resizes_ndarray():
 class _FakeTokenizer:
     """Minimal stand-in for the PaliGemma tokenizer (no download)."""
 
-    def __call__(self, text, padding=None, max_length=None, truncation=None,
-                 add_special_tokens=None, return_tensors=None):
+    def __call__(
+        self, text, padding=None, max_length=None, truncation=None, add_special_tokens=None, return_tensors=None
+    ):
         ids = [2] + [ord(c) % 100 for c in text][: max_length - 1]
         ids = ids[:max_length]
         attn = [1] * len(ids)
@@ -486,9 +472,7 @@ def test_build_model_inputs_state_truncated():
 def test_build_model_inputs_image_key_map():
     import numpy as np
 
-    cfg = Pi0Config.from_model_config(
-        {**_LEROBOT_CFG, "image_key_map": {"cam_high": "observation.images.base_0_rgb"}}
-    )
+    cfg = Pi0Config.from_model_config({**_LEROBOT_CFG, "image_key_map": {"cam_high": "observation.images.base_0_rgb"}})
     robot_obs = {
         "images": {"cam_high": np.full((224, 224, 3), 60, dtype=np.uint8)},
         "prompt": "go",
@@ -504,7 +488,7 @@ def test_build_model_inputs_image_key_map():
 # The LeRobot parity gate (test_pi0_e2e.py) only validates correctness at
 # transformers 5.3.0 (where LeRobot loads pi0_base cleanly). Production vllm-omni
 # ships transformers 5.6.2, and LeRobot is not a usable reference there (it
-# mis-loads the SigLIP vision tower at >=5.4). So we pin the kernel's deterministic
+# incorrectly loads the SigLIP vision tower at >=5.4). So we pin the kernel's deterministic
 # output to golden values established at 5.3.0 and re-check them here: running on
 # the production transformers proves the port is version-stable and guards the
 # vision_tower / embed_scale version-robust paths against regressions.
@@ -549,15 +533,11 @@ def _selfconsist_model(device):
     import safetensors.torch
 
     model = Pi0ForActionPrediction(
-        Pi0Config(max_action_dim=32, max_state_dim=32, chunk_size=50,
-                  num_inference_steps=10, dtype="float32")
+        Pi0Config(max_action_dim=32, max_state_dim=32, chunk_size=50, num_inference_steps=10, dtype="float32")
     )
     state = safetensors.torch.load_file(os.path.join(_SELFCONSIST_CKPT, "model.safetensors"))
     filled = model.load_weights(list(state.items()))
-    expected = {
-        n for n, _ in model.named_parameters()
-        if "rotary_emb" not in n and not n.endswith(".inv_freq")
-    }
+    expected = {n for n, _ in model.named_parameters() if "rotary_emb" not in n and not n.endswith(".inv_freq")}
     missing = expected - (filled or set())
     assert not missing, f"{len(missing)} params received no weight (e.g. {sorted(missing)[:3]})"
     return model.to(device).eval()
@@ -570,10 +550,19 @@ def test_version_stable_actions():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = _selfconsist_model(device)
     images, masks, lang, lmask, state, noise = _selfconsist_inputs(device)
-    actions = model.sample_actions(
-        images=images, image_masks=masks, lang_tokens=lang,
-        lang_masks=lmask, state=state, noise=noise, num_steps=10,
-    ).float().cpu()
+    actions = (
+        model.sample_actions(
+            images=images,
+            image_masks=masks,
+            lang_tokens=lang,
+            lang_masks=lmask,
+            state=state,
+            noise=noise,
+            num_steps=10,
+        )
+        .float()
+        .cpu()
+    )
     s, m, std = actions.sum().item(), actions.mean().item(), actions.std().item()
     assert abs(s - _GOLDEN_SUM) < 0.5, f"action sum drifted: {s} vs {_GOLDEN_SUM}"
     assert abs(std - _GOLDEN_STD) < 0.01, f"action std drifted: {std} vs {_GOLDEN_STD}"

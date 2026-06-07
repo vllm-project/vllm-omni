@@ -150,11 +150,7 @@ def _extract_images(robot_obs: dict, config) -> dict[str, Any]:
     images = robot_obs.get("images")
     if not isinstance(images, dict):
         # Fall back to flat keys (anything that isn't a known scalar field).
-        images = {
-            k: v
-            for k, v in robot_obs.items()
-            if k not in ("state", "prompt", "session_id", "reset", "images")
-        }
+        images = {k: v for k, v in robot_obs.items() if k not in ("state", "prompt", "session_id", "reset", "images")}
     key_map = getattr(config, "image_key_map", None) or {}
     return {key_map.get(k, k): v for k, v in images.items()}
 
