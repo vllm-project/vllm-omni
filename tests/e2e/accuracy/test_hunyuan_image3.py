@@ -52,6 +52,13 @@ def _default_ar_dit_devices() -> tuple[str, str]:
     return ar, dit
 
 
+def _empty_accelerator_cache() -> None:
+    from vllm_omni.platforms import current_omni_platform
+
+    if not current_omni_platform.is_cpu():
+        current_omni_platform.empty_cache()
+
+
 AR_DEVICES, DIT_DEVICES = _default_ar_dit_devices()
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
 NUM_INFERENCE_STEPS = 50
@@ -92,6 +99,13 @@ QUANT_RUN_ENV = "HUNYUAN_IMAGE3_RUN_QUANT_ACCURACY"
 QUANT_BF16_ENV = "HUNYUAN_IMAGE3_BF16_MODEL"
 QUANT_FP8_ENV = "HUNYUAN_IMAGE3_FP8_MODEL"
 QUANT_NVFP4_ENV = "HUNYUAN_IMAGE3_NVFP4_MODEL"
+NPU_DIT_BF16_MODEL = os.environ.get("HUNYUAN_IMAGE3_NPU_DIT_BF16_MODEL", "tencent/HunyuanImage-3.0-Instruct-Distil")
+NPU_DIT_QUANT_MODEL_ENV = "HUNYUAN_IMAGE3_NPU_DIT_QUANT_MODEL"
+NPU_DIT_DEVICES_ENV = "HUNYUAN_IMAGE3_NPU_DIT_DEVICES"
+NPU_DIT_TP_ENV = "HUNYUAN_IMAGE3_NPU_DIT_TP"
+NPU_DIT_EP_ENV = "HUNYUAN_IMAGE3_NPU_DIT_ENABLE_EP"
+NPU_DIT_GPU_MEMORY_UTILIZATION_ENV = "HUNYUAN_IMAGE3_NPU_DIT_GPU_MEMORY_UTILIZATION"
+NPU_DIT_NUM_INFERENCE_STEPS = 8
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 # fmt: off
 _DEPLOY_CONFIG = {
@@ -177,6 +191,30 @@ _QUANT_DIT_CONFIG = {
     ],
 }
 
+_NPU_DIT_CONFIG = {
+    "pipeline": "hunyuan_image3_dit",
+    "async_chunk": False,
+    "trust_remote_code": True,
+    "stages": [
+        {
+            "stage_id": 0,
+            "gpu_memory_utilization": 0.65,
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "devices": "0,1,2,3",
+            "distributed_executor_backend": "mp",
+            "max_num_batched_tokens": 32768,
+            "parallel_config": {
+                "tensor_parallel_size": 4,
+                "enable_expert_parallel": True,
+                "sequence_parallel_size": 1,
+                "ulysses_degree": 1,
+            },
+            "default_sampling_params": {"seed": SEED},
+        }
+    ],
+}
+
 
 @dataclass(frozen=True)
 class _QuantAccuracyCase:
@@ -236,6 +274,31 @@ def _make_quant_dit_config(path: Path) -> None:
     config = copy.deepcopy(_QUANT_DIT_CONFIG)
     config["stages"][0]["devices"] = _quant_devices()
     config["stages"][0]["parallel_config"]["tensor_parallel_size"] = _quant_tensor_parallel_size()
+    path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+
+
+def _npu_dit_devices() -> str:
+    return os.environ.get(NPU_DIT_DEVICES_ENV, "0,1,2,3")
+
+
+def _npu_dit_tensor_parallel_size() -> int:
+    return int(os.environ.get(NPU_DIT_TP_ENV, str(len(_npu_dit_devices().split(",")))))
+
+
+def _npu_dit_enable_expert_parallel() -> bool:
+    return os.environ.get(NPU_DIT_EP_ENV, "1").lower() in _TRUE_ENV_VALUES
+
+
+def _npu_dit_gpu_memory_utilization() -> float:
+    return float(os.environ.get(NPU_DIT_GPU_MEMORY_UTILIZATION_ENV, "0.65"))
+
+
+def _make_npu_dit_config(path: Path) -> None:
+    config = copy.deepcopy(_NPU_DIT_CONFIG)
+    config["stages"][0]["gpu_memory_utilization"] = _npu_dit_gpu_memory_utilization()
+    config["stages"][0]["devices"] = _npu_dit_devices()
+    config["stages"][0]["parallel_config"]["tensor_parallel_size"] = _npu_dit_tensor_parallel_size()
+    config["stages"][0]["parallel_config"]["enable_expert_parallel"] = _npu_dit_enable_expert_parallel()
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
@@ -434,6 +497,7 @@ def _run_dit_model(
     deploy_config_path: str,
     output_path: Path,
     *,
+    num_inference_steps: int = 20,
     nvfp4_backend: str | None = None,
 ) -> tuple[Image.Image, float]:
     from tests.helpers.runtime import OmniRunner
@@ -452,7 +516,7 @@ def _run_dit_model(
                 width=QUANT_WIDTH,
                 seed=SEED,
                 generator=generator,
-                num_inference_steps=20,
+                num_inference_steps=num_inference_steps,
                 guidance_scale=4.0,
                 guidance_scale_provided=True,
             )
@@ -469,8 +533,45 @@ def _run_dit_model(
             else:
                 os.environ["VLLM_NVFP4_GEMM_BACKEND"] = old_backend
         gc.collect()
-        if torch.accelerator.is_available():
-            torch.accelerator.empty_cache()
+        _empty_accelerator_cache()
+
+
+def test_npu_dit_config_defaults_to_four_card_expert_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(NPU_DIT_DEVICES_ENV, raising=False)
+    monkeypatch.delenv(NPU_DIT_TP_ENV, raising=False)
+    monkeypatch.delenv(NPU_DIT_EP_ENV, raising=False)
+    monkeypatch.delenv(NPU_DIT_GPU_MEMORY_UTILIZATION_ENV, raising=False)
+
+    config_path = tmp_path / "npu_dit.yaml"
+    _make_npu_dit_config(config_path)
+    config = yaml.safe_load(config_path.read_text())
+    stage = config["stages"][0]
+
+    assert config["pipeline"] == "hunyuan_image3_dit"
+    assert stage["gpu_memory_utilization"] == 0.65
+    assert stage["devices"] == "0,1,2,3"
+    assert stage["parallel_config"]["tensor_parallel_size"] == 4
+    assert stage["parallel_config"]["enable_expert_parallel"] is True
+    assert "force_cutlass_fp8" not in stage
+    assert "moe_backend" not in stage
+
+
+def test_npu_dit_config_accepts_env_parallelism(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(NPU_DIT_DEVICES_ENV, "2,3")
+    monkeypatch.setenv(NPU_DIT_TP_ENV, "2")
+    monkeypatch.setenv(NPU_DIT_EP_ENV, "0")
+    monkeypatch.setenv(NPU_DIT_GPU_MEMORY_UTILIZATION_ENV, "0.8")
+
+    config_path = tmp_path / "npu_dit.yaml"
+    _make_npu_dit_config(config_path)
+    stage = yaml.safe_load(config_path.read_text())["stages"][0]
+
+    assert stage["gpu_memory_utilization"] == 0.8
+    assert stage["devices"] == "2,3"
+    assert stage["parallel_config"]["tensor_parallel_size"] == 2
+    assert stage["parallel_config"]["enable_expert_parallel"] is False
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=8)
@@ -602,5 +703,142 @@ def test_quantized_dit_matches_bf16_accuracy(
     )
     assert clip_score_drop <= QUANT_CLIP_SCORE_DROP_THRESHOLD, (
         f"{case.name} CLIP score drop too large: got {clip_score_drop:.4f}, "
+        f"expected <= {QUANT_CLIP_SCORE_DROP_THRESHOLD:.4f}"
+    )
+
+
+@pytest.mark.npu
+@pytest.mark.A2
+@pytest.mark.distributed_npu(num_cards=4)
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < _npu_dit_tensor_parallel_size(),
+    reason="Needs enough NPUs for HunyuanImage3 NPU DiT tensor parallelism",
+)
+def test_npu_dit_distil_smoke_accuracy(accuracy_artifact_root: Path) -> None:
+    """NPU DiT-only smoke test using the long-term Distil bf16 reference model."""
+    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-npu-dit")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        deploy_config_path = Path(tmpdir) / "hunyuan_image3_npu_dit.yaml"
+        _make_npu_dit_config(deploy_config_path)
+        image, elapsed = _run_dit_model(
+            NPU_DIT_BF16_MODEL,
+            str(deploy_config_path),
+            output_dir / "npu_dit_distil.png",
+            num_inference_steps=NPU_DIT_NUM_INFERENCE_STEPS,
+        )
+
+    assert image.size == (QUANT_WIDTH, QUANT_HEIGHT)
+    metrics = {
+        "case": "npu_dit_distil",
+        "model": NPU_DIT_BF16_MODEL,
+        "prompt": QUANT_PROMPT,
+        "seed": SEED,
+        "height": QUANT_HEIGHT,
+        "width": QUANT_WIDTH,
+        "num_inference_steps": NPU_DIT_NUM_INFERENCE_STEPS,
+        "guidance_scale": 4.0,
+        "elapsed_s": elapsed,
+        "devices": _npu_dit_devices(),
+        "tensor_parallel_size": _npu_dit_tensor_parallel_size(),
+        "enable_expert_parallel": _npu_dit_enable_expert_parallel(),
+        "gpu_memory_utilization": _npu_dit_gpu_memory_utilization(),
+    }
+    metrics_path = output_dir / "npu_dit_distil_metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+    print(f"\nHunyuanImage3 NPU DiT smoke accuracy metrics: {metrics_path}")
+
+
+@pytest.mark.npu
+@pytest.mark.A2
+@pytest.mark.distributed_npu(num_cards=4)
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < _npu_dit_tensor_parallel_size(),
+    reason="Needs enough NPUs for HunyuanImage3 NPU DiT tensor parallelism",
+)
+def test_npu_quantized_dit_matches_bf16_accuracy(
+    accuracy_artifact_root: Path,
+) -> None:
+    """NPU quantized DiT checkpoints should preserve bf16 DiT image quality."""
+    quant_model = os.environ.get(NPU_DIT_QUANT_MODEL_ENV)
+    if not quant_model:
+        pytest.skip(f"Set {NPU_DIT_QUANT_MODEL_ENV} to run HunyuanImage3 NPU DiT quant accuracy.")
+
+    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-npu-dit-quant")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        deploy_config_path = Path(tmpdir) / "hunyuan_image3_npu_dit.yaml"
+        _make_npu_dit_config(deploy_config_path)
+        bf16_image, bf16_time = _run_dit_model(
+            NPU_DIT_BF16_MODEL,
+            str(deploy_config_path),
+            output_dir / "npu_bf16.png",
+            num_inference_steps=NPU_DIT_NUM_INFERENCE_STEPS,
+        )
+        quant_image, quant_time = _run_dit_model(
+            quant_model,
+            str(deploy_config_path),
+            output_dir / "npu_quant.png",
+            num_inference_steps=NPU_DIT_NUM_INFERENCE_STEPS,
+        )
+
+    ssim_score, psnr_score = compute_image_ssim_psnr(
+        prediction=quant_image,
+        reference=bf16_image,
+    )
+    assert_similarity(
+        model_name=f"{MODEL_NAME} npu quant vs bf16",
+        vllm_image=quant_image,
+        diffusers_image=bf16_image,
+        ssim_threshold=QUANT_SSIM_THRESHOLD,
+        psnr_threshold=QUANT_PSNR_THRESHOLD,
+        width=QUANT_WIDTH,
+        height=QUANT_HEIGHT,
+    )
+
+    clip_scorer = CLIPScorer()
+    bf16_clip_score = clip_scorer.score(bf16_image, QUANT_PROMPT)
+    quant_clip_score = clip_scorer.score(quant_image, QUANT_PROMPT)
+    clip_score_drop = bf16_clip_score - quant_clip_score
+
+    metrics = {
+        "case": "npu_quant",
+        "bf16_model": NPU_DIT_BF16_MODEL,
+        "quant_model": quant_model,
+        "prompt": QUANT_PROMPT,
+        "seed": SEED,
+        "height": QUANT_HEIGHT,
+        "width": QUANT_WIDTH,
+        "num_inference_steps": NPU_DIT_NUM_INFERENCE_STEPS,
+        "guidance_scale": 4.0,
+        "bf16_elapsed_s": bf16_time,
+        "quant_elapsed_s": quant_time,
+        "ssim": ssim_score,
+        "psnr": psnr_score,
+        "bf16_clip_score": bf16_clip_score,
+        "quant_clip_score": quant_clip_score,
+        "clip_score_drop": clip_score_drop,
+        "devices": _npu_dit_devices(),
+        "tensor_parallel_size": _npu_dit_tensor_parallel_size(),
+        "enable_expert_parallel": _npu_dit_enable_expert_parallel(),
+        "gpu_memory_utilization": _npu_dit_gpu_memory_utilization(),
+    }
+    metrics_path = output_dir / "npu_quant_metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+
+    print("\nHunyuanImage3 NPU DiT quant accuracy")
+    print(f"  bf16 model:       {NPU_DIT_BF16_MODEL}")
+    print(f"  quant model:      {quant_model}")
+    print(f"  BF16 CLIP score:  {bf16_clip_score:.4f}")
+    print(f"  quant CLIP score: {quant_clip_score:.4f} threshold>={QUANT_CLIP_SCORE_THRESHOLD:.4f}")
+    print(f"  CLIP score drop:  {clip_score_drop:.4f} threshold<={QUANT_CLIP_SCORE_DROP_THRESHOLD:.4f}")
+    print(f"  metrics:          {metrics_path}")
+
+    assert quant_clip_score >= QUANT_CLIP_SCORE_THRESHOLD, (
+        f"NPU quant CLIP score below threshold: got {quant_clip_score:.4f}, "
+        f"expected >= {QUANT_CLIP_SCORE_THRESHOLD:.4f}"
+    )
+    assert clip_score_drop <= QUANT_CLIP_SCORE_DROP_THRESHOLD, (
+        f"NPU quant CLIP score drop too large: got {clip_score_drop:.4f}, "
         f"expected <= {QUANT_CLIP_SCORE_DROP_THRESHOLD:.4f}"
     )
