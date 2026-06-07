@@ -28,11 +28,11 @@ class MossTTSCUDAGraphCodecWrapper:
 
     Graphs are keyed by padded_T (int).  On each call the actual T is
     bucket-matched to the smallest pre-captured size >= T.  The static code
-    buffer [NQ, 1, padded_T] is filled left-aligned (right-zero-padded), the
-    static lengths tensor is updated with the actual frame count, and then the
-    graph is replayed.  The output audio is sliced to actual_T * downsample_rate
-    and cloned before returning so the static buffer can be reused on the next
-    call.
+    buffer [NQ, 1, padded_T] is filled left-aligned (right-zero-padded) and
+    the graph is replayed.  The output audio is sliced to the correct length
+    by scaling from the captured audio shape (actual_T / padded_T * captured_len),
+    avoiding any assumption about downsample_rate vs effective decoder upsample.
+    The slice is cloned before returning so the static buffer can be reused.
 
     Usage::
 
@@ -54,16 +54,14 @@ class MossTTSCUDAGraphCodecWrapper:
         self.capture_sizes: list[int] = sorted(capture_sizes)
         self.num_quantizers = num_quantizers
         self.enabled = enabled
-        # Wav samples produced per code frame.  The MossAudioTokenizerConfig
-        # attribute is named "downsample_rate" because it measures the encoder
-        # stride; the decoder inverts it, so it is also the decoder upsample.
-        self.total_upsample: int = model.downsample_rate
 
         # All dicts keyed by padded_T.
         self.graphs: dict[int, CUDAGraph] = {}
         self.static_codes: dict[int, torch.Tensor] = {}  # [NQ, 1, padded_T]
+        # static_lengths is kept alive here — the captured graph holds a
+        # reference to the underlying storage and must not be GC'd.
         self.static_lengths: dict[int, torch.Tensor] = {}  # [1]
-        self.static_audio: dict[int, torch.Tensor] = {}  # captured output audio tensor
+        self.static_audio: dict[int, torch.Tensor] = {}  # [1, 1, padded_T * effective_upsample]
 
         self._warmed_up = False
 
@@ -147,7 +145,7 @@ class MossTTSCUDAGraphCodecWrapper:
         self.static_lengths[size] = static_lengths
         # static_out.audio is a static buffer reused every replay; hold a
         # reference so it is not garbage-collected.
-        self.static_audio[size] = static_out.audio  # [1, 1, size * upsample]
+        self.static_audio[size] = static_out.audio  # [1, 1, size * effective_upsample]
 
     # ------------------------------------------------------------------
     # Inference
@@ -179,7 +177,6 @@ class MossTTSCUDAGraphCodecWrapper:
         # --- Fill static buffers then replay ---
 
         static_codes = self.static_codes[padded_size]  # [NQ, 1, padded_size]
-        static_lengths = self.static_lengths[padded_size]  # [1]
 
         if actual_t == padded_size:
             # Exact fit: copy the whole buffer at once.
@@ -192,16 +189,16 @@ class MossTTSCUDAGraphCodecWrapper:
             static_codes.zero_()
             static_codes[:, 0, :actual_t].copy_(codes_nq_t)
 
-        # Update the lengths tensor so the decoder computes the correct
-        # audio_lengths in the captured graph output.
-        static_lengths.fill_(actual_t)
-
         self.graphs[padded_size].replay()
 
         # static_audio[padded_size] is the live output buffer of the graph.
         # Slice to the real audio length and clone before returning; without
         # the clone the next replay would overwrite the caller's tensor.
-        actual_wav_len = actual_t * self.total_upsample
+        # Derive the slice length from the captured audio shape rather than
+        # downsample_rate: the decoder's effective upsample (product of all
+        # PatchedPretransform patch sizes) can differ from the config attribute.
+        captured_len = self.static_audio[padded_size].shape[-1]
+        actual_wav_len = captured_len * actual_t // padded_size
         audio = self.static_audio[padded_size][..., :actual_wav_len].clone()
         audio_lengths = torch.tensor([actual_wav_len], dtype=torch.long, device=audio.device)
         return MossAudioTokenizerDecoderOutput(audio=audio, audio_lengths=audio_lengths)
