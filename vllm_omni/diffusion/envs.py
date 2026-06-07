@@ -25,6 +25,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
+    # Use the fused permute-free all-to-all (NCCL symmetric memory, JIT-built from
+    # pytorch#178230) for Ulysses-SP Q/K/V/output exchange instead of the
+    # permute + NCCL all_to_all_single path. Default 0 (off).
+    "VLLM_OMNI_ULYSSES_A2A_PERMUTE": lambda: bool(int(os.getenv("VLLM_OMNI_ULYSSES_A2A_PERMUTE", "0"))),
 }
 
 
