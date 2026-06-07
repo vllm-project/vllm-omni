@@ -308,7 +308,7 @@ class StageDeployConfig:
     the top level of ``DeployConfig`` and propagated to every stage.
     """
 
-    # === Omni fields ===
+    # === Omni stage wrapper fields ===
     # Stage identity and Omni runtime placement.
     stage_id: int
     devices: str | None = None
@@ -321,22 +321,33 @@ class StageDeployConfig:
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
 
-    # === vLLM EngineArgs fields ===
-    # Parallelism and scheduler/memory capacity.
+    # === Generic stage engine fields ===
+    # Parallelism, scheduler, and memory-capacity controls.
     tensor_parallel_size: int | None = None
+    enable_expert_parallel: bool | None = None
     gpu_memory_utilization: float | None = None
     max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
 
-    # Execution, scheduling, and KV/cache behavior.
+    # Generic execution, scheduling, and KV/cache behavior.
     enforce_eager: bool | None = None
     async_scheduling: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
 
-    # Diffusion parallel_config deploy override fields.
-    enable_expert_parallel: bool | None = None
+    # Generic compilation, profiling, tokenizer/config parsing, and model
+    # loading controls.
+    compilation_config: dict[str, Any] | None = None
+    profiler_config: dict[str, Any] | None = None
+    skip_mm_profiling: bool | None = None
+    enable_flashinfer_autotune: bool | None = None
+    config_format: str | None = None
+    load_format: str | None = None
+    tokenizer_mode: str | None = None
+
+    # === Diffusion stage runtime fields ===
+    # Diffusion parallel_config deploy/runtime override fields.
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
     ring_degree: int | None = None
@@ -357,7 +368,7 @@ class StageDeployConfig:
     diffusion_attention_backend: str | None = None
     diffusion_attention_config: dict[str, Any] | None = None
 
-    # Diffusion stage execution, cache, and VAE behavior.
+    # Diffusion execution, cache, and VAE behavior.
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
@@ -371,7 +382,7 @@ class StageDeployConfig:
     diffusion_kv_cache_skip_layers: str | None = None
     auxiliary_text_encoder: str | None = None
 
-    # Runtime optimizations used by diffusion model loading/execution.
+    # Runtime optimizations used by diffusion loading/execution.
     enable_multithread_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
     enable_cpu_offload: bool | None = None
@@ -380,16 +391,12 @@ class StageDeployConfig:
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 
-    # Compilation, profiling, tokenizer/config parsing, and model loading.
-    compilation_config: dict[str, Any] | None = None
-    profiler_config: dict[str, Any] | None = None
-    skip_mm_profiling: bool | None = None
-    enable_flashinfer_autotune: bool | None = None
-    config_format: str | None = None
-    load_format: str | None = None
-    tokenizer_mode: str | None = None
+    # Modality/service constraints consumed outside the core engine config.
+    max_generated_image_size: int | None = None
+    tts_max_instructions_length: int | None = None
 
-    # Pass-through vLLM EngineArgs fields that are not represented above.
+    # === Pass-through stage engine fields ===
+    # Pass-through stage engine args that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
 
