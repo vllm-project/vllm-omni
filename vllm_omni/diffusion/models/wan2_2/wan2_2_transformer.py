@@ -746,6 +746,45 @@ class WanTransformerBlock(nn.Module):
         return hidden_states
 
 
+def convert_original_to_diffusers_key(name: str) -> str:
+    """Convert an original Wan checkpoint key into the diffusers naming
+    convention.
+
+    The original release (e.g. ``Wan2.2-VACE-Fun-A14B``) names weights
+    differently than the diffusers conversion. To make use of existing code, 
+    we translate original names into diffusers form first.
+
+    This is a no-op on keys already in diffusers form, so it is currently called
+    unconditionally for every Wan checkpoint.
+    """
+    if name == "head.modulation":
+        return "scale_shift_table"
+
+    rewrites = (
+        ("head.head.", "proj_out."),
+        ("text_embedding.0.", "condition_embedder.text_embedder.linear_1."),
+        ("text_embedding.2.", "condition_embedder.text_embedder.linear_2."),
+        ("time_embedding.0.", "condition_embedder.time_embedder.linear_1."),
+        ("time_embedding.2.", "condition_embedder.time_embedder.linear_2."),
+        ("time_projection.1.", "condition_embedder.time_proj."),
+        (".self_attn.", ".attn1."),
+        (".cross_attn.", ".attn2."),
+        (".q.weight", ".to_q.weight"), (".q.bias", ".to_q.bias"),
+        (".k.weight", ".to_k.weight"), (".k.bias", ".to_k.bias"),
+        (".v.weight", ".to_v.weight"), (".v.bias", ".to_v.bias"),
+        (".o.weight", ".to_out.0.weight"), (".o.bias", ".to_out.0.bias"),
+        (".ffn.0.", ".ffn.net.0.proj."),
+        (".ffn.2.", ".ffn.net.2."),
+        (".norm3.", ".norm2."),  # cross-attn pre-norm (only affine norm in block)
+        (".modulation", ".scale_shift_table"),
+        (".before_proj.", ".proj_in."),  # VACE skip-connection in (block 0 only)
+        (".after_proj.", ".proj_out."),  # VACE skip-connection out
+    )
+    for old, new in rewrites:
+        name = name.replace(old, new)
+    return name
+
+
 class WanTransformer3DModel(nn.Module):
     """
     Optimized Wan Transformer model for video generation using vLLM layers.
@@ -1100,6 +1139,10 @@ class WanTransformer3DModel(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            # Original (non-diffusers) checkpoints use a different naming scheme;
+            # convert to diffusers form first so the existing remapping/fusion
+            # logic below handles them. No-op on keys following diffusers naming convention.
+            name = convert_original_to_diffusers_key(name)
             name = weight_name_remapping.get(name, name)
             original_name = name
             lookup_name = name
