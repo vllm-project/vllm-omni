@@ -1935,10 +1935,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             apply_delay_pattern,
             encode_reference_audio,
         )
+        from vllm_omni.model_executor.models.higgs_audio_v3.ref_audio_cache import (
+            cached_encode_reference_audio,
+        )
 
         wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
         wav = np.asarray(wav_list, dtype=np.float32)
-        ref_codes_raw = await asyncio.to_thread(encode_reference_audio, wav, int(sr))
+        # Cache the codec encode by content hash so identical ref_audio
+        # payloads skip the encode and reuse the same [num_frames,
+        # num_codebooks] codes tensor across requests.
+        ref_codes_raw = await asyncio.to_thread(cached_encode_reference_audio, wav, int(sr), encode_reference_audio)
         ref_codes_delayed = apply_delay_pattern(ref_codes_raw)
 
         prompt_ids = adapter.build_prompt(
