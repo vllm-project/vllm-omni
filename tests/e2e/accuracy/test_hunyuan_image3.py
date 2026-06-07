@@ -708,7 +708,6 @@ def test_quantized_dit_matches_bf16_accuracy(
 
 
 @pytest.mark.npu
-@pytest.mark.A2
 @pytest.mark.distributed_npu(num_cards=4)
 @pytest.mark.skipif(
     torch.accelerator.device_count() < _npu_dit_tensor_parallel_size(),
@@ -750,7 +749,6 @@ def test_npu_dit_distil_smoke_accuracy(accuracy_artifact_root: Path) -> None:
 
 
 @pytest.mark.npu
-@pytest.mark.A2
 @pytest.mark.distributed_npu(num_cards=4)
 @pytest.mark.skipif(
     torch.accelerator.device_count() < _npu_dit_tensor_parallel_size(),
