@@ -94,27 +94,15 @@ def _get_test_config() -> str:
 # pytestmark — one engine for the whole module
 # ---------------------------------------------------------------------------
 
-# pytestmark = [
-#     pytest.mark.full_model,
-#     pytest.mark.tts,
-#     pytest.mark.parametrize("omni_runner", [(MODEL, _get_test_config())], indirect=True),
-# ]
-pytestmark: list = []
+pytestmark = [
+    pytest.mark.full_model,
+    pytest.mark.tts,
+    pytest.mark.parametrize("omni_runner", [(MODEL, _get_test_config())], indirect=True),
+]
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module")
-def run_level() -> str:
-    """Force full_model run level so the codec stage loads real weights.
-
-    The MOSS-TTS codec (Stage 1) must call load_weights() to initialise the
-    audio tokenizer.  The default core_model run level patches all stages to
-    load_format=dummy, which skips load_weights() and produces silence.
-    """
-    return "full_model"
 
 
 @pytest.fixture(scope="module")
