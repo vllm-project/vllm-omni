@@ -401,9 +401,10 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                     if chunk.numel() > 0 and chunk.shape[0] == span_len:
                         codes = chunk.to(device=device, dtype=torch.long).clamp_(0, self.audio_vocab_size)
                         if self._stacked_audio_emb_w is not None:
-                            # (n_vq, V+1, H)[arange[:,None], codes.T] → (n_vq, L, H) → sum → (L, H)
-                            n_vq_idx = torch.arange(self.n_vq, device=device)
-                            audio_embed = self._stacked_audio_emb_w[n_vq_idx.unsqueeze(1), codes.t()].sum(0)
+                            codes_nq = codes.t()  # (n_vq, L)
+                            audio_embed = self._stacked_audio_emb_w[
+                                torch.arange(self.n_vq, device=device)[:, None], codes_nq
+                            ].sum(0)
                         else:
                             audio_embed = torch.zeros_like(embeds)
                             for i, emb_layer in enumerate(self.audio_embeddings):
@@ -526,7 +527,6 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             # Single batched matmul: (n_vq, V+1, H) @ (H,) → (n_vq, V+1).
             # Replaces n_vq serial nn.Linear calls.
             all_logits = self._stacked_audio_head_w @ last_h.reshape(-1)  # (n_vq, V+1)
-            all_logits = all_logits.float()
             all_logits[:, -1] = float("-inf")  # invalid sentinel
             all_logits[:, self.audio_pad_code] = float("-inf")
 
