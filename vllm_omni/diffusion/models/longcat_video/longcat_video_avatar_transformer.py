@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import os
+from collections import OrderedDict
 from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
@@ -307,9 +308,7 @@ def _get_attn_map_with_target(
     ref_seq_len = num_h * num_w
     ref_k = key[:, :ref_seq_len]
     if ref_target_masks.shape[-1] != ref_seq_len:
-        raise ValueError(
-            f"Expected ref_target_masks token length {ref_seq_len}, got {ref_target_masks.shape[-1]}."
-        )
+        raise ValueError(f"Expected ref_target_masks token length {ref_seq_len}, got {ref_target_masks.shape[-1]}.")
 
     _, seq_len, heads, _ = noise_q.shape
     class_num = ref_target_masks.shape[0]
@@ -324,17 +323,23 @@ def _get_attn_map_with_target(
 
 
 class RotaryPositionalEmbedding(nn.Module):
+    _MAX_FREQS_LRU_CACHE_SIZE = 32
+
     def __init__(self, head_dim, cp_split_hw=None):
         super().__init__()
         self.head_dim = head_dim
         assert self.head_dim % 8 == 0, "Dim must be a multiply of 8 for 3D RoPE."
         self.cp_split_hw = tuple(cp_split_hw or (1, 1))
         self.base = 10000
-        self.freqs_dict = {}
+        self.freqs_dict = OrderedDict()
 
     def register_grid_size(self, grid_size, key_name, frame_index=None, num_ref_latents=None):
-        if key_name not in self.freqs_dict:
-            self.freqs_dict.update({key_name: self.precompute_freqs_cis_3d(grid_size, frame_index, num_ref_latents)})
+        if key_name in self.freqs_dict:
+            self.freqs_dict.move_to_end(key_name)
+            return
+        self.freqs_dict[key_name] = self.precompute_freqs_cis_3d(grid_size, frame_index, num_ref_latents)
+        if len(self.freqs_dict) > self._MAX_FREQS_LRU_CACHE_SIZE:
+            self.freqs_dict.popitem(last=False)
 
     def precompute_freqs_cis_3d(self, grid_size, frame_index=None, num_ref_latents=None):
         num_frames, height, width = grid_size
@@ -371,9 +376,8 @@ class RotaryPositionalEmbedding(nn.Module):
         return freqs
 
     def forward(self, q, k, grid_size, frame_index=None, num_ref_latents=None):
-        key_name = ".".join(str(item) for item in grid_size) + f"-{frame_index}-{num_ref_latents}"
-        if key_name not in self.freqs_dict:
-            self.register_grid_size(grid_size, key_name, frame_index, num_ref_latents)
+        key_name = (tuple(grid_size), frame_index, num_ref_latents)
+        self.register_grid_size(grid_size, key_name, frame_index, num_ref_latents)
 
         freqs_cis = self.freqs_dict[key_name].to(q.device)
         q_, k_ = q.float(), k.float()
@@ -1448,6 +1452,8 @@ class LongCatVideoAvatarTransformer3DModel(nn.Module):
                 module_loras.setdefault(module_name, []).append(lora)
             self.active_loras.append(lora_key)
 
+        # This mutates module.forward and is expected to run only during
+        # single-threaded model initialization, before requests are served.
         for module_name, loras in module_loras.items():
             module = self._get_module_by_name(module_name)
             if not hasattr(module, "org_forward"):

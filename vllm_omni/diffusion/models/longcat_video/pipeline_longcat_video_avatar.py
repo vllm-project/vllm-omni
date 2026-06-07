@@ -48,6 +48,12 @@ _DEFAULT_NEGATIVE_PROMPT = (
 )
 _DEFAULT_AT2V_RATIO = 480 / 832
 
+# Whisper uses a 30-second context window: 30s * 16kHz raw samples,
+# represented as 3000 mel frames after feature extraction.
+_WHISPER_AUDIO_SAMPLE_RATE = 16000
+_WHISPER_AUDIO_CHUNK_SAMPLES = 30 * _WHISPER_AUDIO_SAMPLE_RATE
+_WHISPER_ENCODER_CHUNK_FRAMES = 3000
+
 # Mirrors official LongCat-Video `longcat_video/utils/bukcet_config.py`
 # for scale_factor_spatial in {16, 32}. Used for Avatar condition sizing
 # and AT2V defaults without importing the official repository at runtime.
@@ -168,6 +174,14 @@ def _resolve_num_segments(
         if audio_duration <= first_segment_duration or stride_duration <= 0:
             return 1
         return 1 + math.ceil((audio_duration - first_segment_duration) / stride_duration)
+    return max(1, int(value))
+
+
+def _requested_num_segments(value: Any) -> int:
+    if value is None:
+        return 1
+    if isinstance(value, str) and value.lower() == "auto":
+        return 0
     return max(1, int(value))
 
 
@@ -942,17 +956,15 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
 
     @torch.no_grad()
     def _get_audio_embedding_whisper(self, speech_array, fps=25, sample_rate=16000):
-        mel_chunk = 750 * 640
-        enc_chunk = 3000
         enc_fps = 50
         audio_duration = len(speech_array) / sample_rate
         video_length = int(audio_duration * fps)
         speech_array = self._loudness_norm(speech_array, sample_rate)
 
         mel_chunks = []
-        for idx in range(0, len(speech_array), mel_chunk):
+        for idx in range(0, len(speech_array), _WHISPER_AUDIO_CHUNK_SAMPLES):
             mel = self.audio_feature_extractor(
-                speech_array[idx : idx + mel_chunk],
+                speech_array[idx : idx + _WHISPER_AUDIO_CHUNK_SAMPLES],
                 sampling_rate=sample_rate,
                 return_tensors="pt",
             ).input_features
@@ -960,9 +972,9 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         audio_features = torch.cat(mel_chunks, dim=-1).to(self.audio_encoder.dtype)
 
         enc_chunks = []
-        for idx in range(0, audio_features.shape[-1], enc_chunk):
+        for idx in range(0, audio_features.shape[-1], _WHISPER_ENCODER_CHUNK_FRAMES):
             chunk_hs = self.audio_encoder.encoder(
-                audio_features[:, :, idx : idx + enc_chunk].to(self.device),
+                audio_features[:, :, idx : idx + _WHISPER_ENCODER_CHUNK_FRAMES].to(self.device),
                 output_hidden_states=True,
             ).hidden_states
             enc_chunks.append(torch.stack(chunk_hs, dim=2))
@@ -1217,8 +1229,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
                 return self.video_processor.preprocess_video(video, height=height, width=width)
 
         frame_tensors = [
-            self._preprocess_image(frame.convert("RGB"), height, width, resize_mode=resize_mode)
-            for frame in video
+            self._preprocess_image(frame.convert("RGB"), height, width, resize_mode=resize_mode) for frame in video
         ]
         return torch.stack([frame.squeeze(0) for frame in frame_tensors], dim=1).unsqueeze(0)
 
@@ -1500,10 +1511,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         ref_target_masks: torch.Tensor | None = None,
         use_kv_cache: bool = True,
         offload_kv_cache: bool = False,
-        enhance_hf: bool = False,
     ):
-        if use_distill and enhance_hf:
-            raise ValueError("LongCat-Video-Avatar AVC cannot enable both distill and enhance_hf.")
         self._text_guidance_scale = text_guidance_scale
         self._audio_guidance_scale = audio_guidance_scale
         device = self.device
@@ -1534,24 +1542,6 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         sigmas = self.get_timesteps_sigmas(steps, use_distill=use_distill)
         self.scheduler.set_timesteps(steps, sigmas=sigmas, device=device)
         timesteps = self.scheduler.timesteps
-        if enhance_hf:
-            tail_uniform_start = 500
-            tail_uniform_end = 0
-            num_tail_uniform_steps = 10
-            timesteps_uniform_tail = list(
-                np.linspace(
-                    tail_uniform_start,
-                    tail_uniform_end,
-                    num_tail_uniform_steps,
-                    dtype=np.float32,
-                    endpoint=(tail_uniform_end != 0),
-                )
-            )
-            timesteps_uniform_tail = [torch.tensor(t, device=device).unsqueeze(0) for t in timesteps_uniform_tail]
-            filtered_timesteps = [timestep.unsqueeze(0) for timestep in timesteps if timestep > tail_uniform_start]
-            timesteps = torch.cat(filtered_timesteps + timesteps_uniform_tail)
-            self.scheduler.timesteps = timesteps
-            self.scheduler.sigmas = torch.cat([timesteps / 1000, torch.zeros(1, device=timesteps.device)])
 
         video_tensor = self._preprocess_video_frames(video, height, width, resize_mode=resize_mode).to(
             device=device,
@@ -1749,14 +1739,11 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
 
         image = None
         ref_target_masks = None
-        num_segments = _resolve_num_segments(
-            num_segments_value,
-            audio_duration=num_frames / save_fps,
-            num_frames=num_frames,
-            num_cond_frames=num_cond_frames,
-            save_fps=save_fps,
-        )
         full_audio_embs = None
+        explicit_num_segments = _requested_num_segments(num_segments_value)
+        auto_num_segments = isinstance(num_segments_value, str) and num_segments_value.lower() == "auto"
+        needs_full_audio = auto_num_segments or explicit_num_segments > 1
+        num_segments = explicit_num_segments or 1
         if inputs["is_multi_speaker"]:
             if stage != "ai2v":
                 raise NotImplementedError("LongCat-Video-Avatar multi-speaker generation only supports AI2V.")
@@ -1765,13 +1752,10 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
                 image,
                 inputs["bbox"],
             )
-            needs_continuation = num_segments > 1 or (
-                isinstance(num_segments_value, str) and num_segments_value.lower() == "auto"
-            )
-            if needs_continuation:
+            if needs_full_audio:
                 requested_duration = (
                     0.0
-                    if isinstance(num_segments_value, str) and num_segments_value.lower() == "auto"
+                    if auto_num_segments
                     else num_frames / save_fps + (num_segments - 1) * (num_frames - num_cond_frames) / save_fps
                 )
                 full_audio_embs, effective_audio_duration = self._multi_audio_full_embeddings(
@@ -1802,9 +1786,10 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
                     include_background_silent_audio=include_background_silent_audio,
                 )
         else:
-            if num_segments > 1 or (isinstance(num_segments_value, str) and num_segments_value.lower() == "auto"):
+            if needs_full_audio:
                 raise NotImplementedError(
-                    "LongCat-Video-Avatar AVC continuation currently requires multi-speaker AI2V."
+                    "LongCat-Video-Avatar single-speaker AVC continuation is not supported; "
+                    "use a multi-speaker AI2V input JSON for continuation."
                 )
             audio_emb = self._audio_embedding(inputs["audio_path"], num_frames, save_fps)
 
@@ -1893,7 +1878,6 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
                         ref_target_masks=ref_target_masks,
                         use_kv_cache=use_kv_cache,
                         offload_kv_cache=offload_kv_cache,
-                        enhance_hf=False,
                     )
                     new_video = [
                         Image.fromarray((np.clip(frame, 0.0, 1.0) * 255).round().astype("uint8"))

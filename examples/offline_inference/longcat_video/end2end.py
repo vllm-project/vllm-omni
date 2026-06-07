@@ -20,6 +20,7 @@ from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar impo
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args():
@@ -184,10 +185,7 @@ def _create_merged_audio_for_case(
     audio_type: str,
     output_path: Path,
 ) -> str:
-    sorted_paths = [
-        path
-        for _, path in sorted(audio_paths.items(), key=lambda item: _speaker_sort_key(str(item[0])))
-    ]
+    sorted_paths = [path for _, path in sorted(audio_paths.items(), key=lambda item: _speaker_sort_key(str(item[0])))]
     if len(sorted_paths) == 1:
         return sorted_paths[0]
     inputs = [arg for path in sorted_paths for arg in ("-i", path)]
@@ -280,7 +278,7 @@ def main():
         output = omni.generate(
             prompt,
             OmniDiffusionSamplingParams(
-                generator=torch.Generator(device="cuda").manual_seed(args.seed),
+                generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed),
                 seed=args.seed,
                 guidance_scale=1.0 if args.use_distill else 4.0,
                 guidance_scale_2=1.0 if args.use_distill else 4.0,
