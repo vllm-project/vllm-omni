@@ -74,6 +74,7 @@ class _I2VVideoAudioScheduler:
 
 
 class LTX2ImageToVideoPipeline(LTX2Pipeline):
+    supports_request_batch = True
     support_image_input = True
 
     def __init__(

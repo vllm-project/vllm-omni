@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ast
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,66 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
 pytestmark = [pytest.mark.diffusion]
+
+
+def _annotation_text(annotation: ast.expr | None) -> str:
+    if annotation is None:
+        return ""
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        return annotation.value
+    return ast.unparse(annotation)
+
+
+def _supports_request_batch_value(class_def: ast.ClassDef) -> bool | None:
+    for node in class_def.body:
+        value = None
+        targets = []
+        if isinstance(node, ast.Assign):
+            value = node.value
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            value = node.value
+            targets = [node.target]
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, bool):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == "supports_request_batch":
+                return value.value
+    return None
+
+
+def _base_class_names(class_def: ast.ClassDef) -> list[str]:
+    return [ast.unparse(base).split(".")[-1] for base in class_def.bases]
+
+
+def _return_annotation_is_diffusion_output_list(annotation: ast.expr | None) -> bool:
+    return _annotation_text(annotation).replace(" ", "") in {
+        "list[DiffusionOutput]",
+        "List[DiffusionOutput]",
+    }
+
+
+def _class_inherits_explicit_request_batch_support(
+    class_name: str,
+    class_defs: dict[str, ast.ClassDef],
+    visiting: set[str] | None = None,
+) -> bool:
+    visiting = visiting or set()
+    if class_name in visiting:
+        return False
+    visiting.add(class_name)
+    class_def = class_defs.get(class_name)
+    if class_def is None:
+        return False
+    for base_name in _base_class_names(class_def):
+        base_def = class_defs.get(base_name)
+        if base_def is None:
+            continue
+        if _supports_request_batch_value(base_def) is True:
+            return True
+        if _class_inherits_explicit_request_batch_support(base_name, class_defs, visiting):
+            return True
+    return False
 
 
 @contextmanager
@@ -64,6 +126,58 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None,
     )
     return runner
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_pipeline_forward_contract_uses_request_batch_static_contract():
+    models_root = Path(__file__).resolve().parents[2] / "vllm_omni" / "diffusion" / "models"
+    class_defs: dict[str, ast.ClassDef] = {}
+    class_paths: dict[str, Path] = {}
+    class_forwards: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+
+    for path in models_root.rglob("pipeline_*.py"):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef) or not node.name.endswith("Pipeline"):
+                continue
+            forward = next(
+                (
+                    item
+                    for item in node.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "forward"
+                ),
+                None,
+            )
+            class_defs[node.name] = node
+            class_paths[node.name] = path.relative_to(models_root)
+            if forward is not None:
+                class_forwards[node.name] = forward
+
+    failures: list[str] = []
+    for class_name, forward in sorted(class_forwards.items()):
+        req_arg = next((arg for arg in forward.args.args if arg.arg == "req"), None)
+        req_annotation = _annotation_text(req_arg.annotation if req_arg is not None else None)
+        return_annotation = _annotation_text(forward.returns)
+        supports_request_batch = _supports_request_batch_value(class_defs[class_name])
+        inherits_request_batch_support = _class_inherits_explicit_request_batch_support(class_name, class_defs)
+
+        if req_annotation == "OmniDiffusionRequest":
+            failures.append(f"{class_paths[class_name]}:{class_name}.forward annotates req as OmniDiffusionRequest")
+        if return_annotation == "DiffusionOutput":
+            failures.append(f"{class_paths[class_name]}:{class_name}.forward returns single DiffusionOutput")
+        if supports_request_batch is True and not _return_annotation_is_diffusion_output_list(forward.returns):
+            failures.append(
+                f"{class_paths[class_name]}:{class_name} declares supports_request_batch=True "
+                "but forward does not return list[DiffusionOutput]"
+            )
+        if supports_request_batch is None and inherits_request_batch_support:
+            failures.append(
+                f"{class_paths[class_name]}:{class_name} inherits request-batch support; "
+                "declare supports_request_batch explicitly"
+            )
+
+    assert not failures, "\n".join(failures)
 
 
 @pytest.mark.core_model

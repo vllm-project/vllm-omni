@@ -14,6 +14,8 @@ import torch
 from PIL import Image
 from torch import nn
 
+from vllm_omni.diffusion.worker.request_batch import RequestBatch
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
@@ -215,6 +217,18 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def make_request_batch(prompt: Any, sampling_params: SimpleNamespace) -> RequestBatch:
+    return RequestBatch(
+        requests=[
+            SimpleNamespace(
+                prompt=prompt,
+                request_id="cosmos3-test",
+                sampling_params=sampling_params,
+            )
+        ]
+    )
 
 
 def _ids(value: int) -> torch.Tensor:
@@ -737,7 +751,7 @@ class TestForwardRouting:
         pipeline = make_cosmos3_pipeline()
         captured = self._install_forward_stubs(pipeline)
 
-        output = pipeline.forward(SimpleNamespace(prompts=[prompt], sampling_params=sampling_params))
+        output = pipeline.forward(make_request_batch(prompt, sampling_params))[0]
 
         assert expected["key"] in output.output
         assert captured["format"]["is_t2i"] is expected["is_t2i"]
@@ -757,15 +771,13 @@ class TestForwardRouting:
             torch.zeros(1, 2, 1, 1, 1),
         )
         pipeline.forward(
-            SimpleNamespace(
-                prompts=[
-                    {
-                        "prompt": "move",
-                        "modalities": ["video"],
-                        "additional_information": {"preprocessed_image": image_tensor},
-                    }
-                ],
-                sampling_params=make_sampling_params(height=16, width=16, num_frames=5),
+            make_request_batch(
+                {
+                    "prompt": "move",
+                    "modalities": ["video"],
+                    "additional_information": {"preprocessed_image": image_tensor},
+                },
+                make_sampling_params(height=16, width=16, num_frames=5),
             )
         )
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["noisy_frame_mask"] is velocity_mask
@@ -804,25 +816,24 @@ class TestForwardRouting:
         pipeline._prepare_sound_latents = lambda *args: (sound_latents, 4)
         pipeline._decode_sound_latents = lambda *args: torch.ones(1, 2, 20)
         output = pipeline.forward(
-            SimpleNamespace(
-                prompts=[{"prompt": "A robot", "modalities": ["video"], "generate_sound": True}],
-                sampling_params=make_sampling_params(num_frames=9, frame_rate=3.0),
+            make_request_batch(
+                {"prompt": "A robot", "modalities": ["video"], "generate_sound": True},
+                make_sampling_params(num_frames=9, frame_rate=3.0),
             )
         )
+        output = output[0]
         assert captured["diffuse_calls"][-1]["sound_latents"] is sound_latents
         assert output.output["audio_sample_rate"] == 10
 
         pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, action_gen=True, action_dim=4)
         output = pipeline.forward(
-            SimpleNamespace(
-                prompts=[
-                    {
-                        "prompt": "Pick the block.",
-                        "modalities": ["video"],
-                        "additional_information": {"preprocessed_image": image_tensor},
-                    }
-                ],
-                sampling_params=make_sampling_params(
+            make_request_batch(
+                {
+                    "prompt": "Pick the block.",
+                    "modalities": ["video"],
+                    "additional_information": {"preprocessed_image": image_tensor},
+                },
+                make_sampling_params(
                     height=16,
                     width=16,
                     extra_args={
@@ -834,6 +845,7 @@ class TestForwardRouting:
                 ),
             )
         )
+        output = output[0]
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
         assert output.custom_output["action"].shape == (1, 2, 2)
         assert "action_only_output" not in output.custom_output
@@ -930,9 +942,9 @@ class TestForwardRouting:
         ("prompt", "sampling_params", "message"),
         [
             (["one", "two"], make_sampling_params(), "single prompt"),
-            ([{"prompt": "one", "modalities": ["image", "video"]}], make_sampling_params(), "both image and video"),
+            ({"prompt": "one", "modalities": ["image", "video"]}, make_sampling_params(), "both image and video"),
             (
-                [{"prompt": "x", "modalities": ["image"], "generate_sound": True}],
+                {"prompt": "x", "modalities": ["image"], "generate_sound": True},
                 make_sampling_params(),
                 "only for video",
             ),
@@ -949,4 +961,4 @@ class TestForwardRouting:
         pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, sound_gen=True, sound_dim=3)
 
         with pytest.raises(ValueError, match=message):
-            pipeline.forward(SimpleNamespace(prompts=prompt, sampling_params=sampling_params))
+            pipeline.forward(make_request_batch(prompt, sampling_params))
