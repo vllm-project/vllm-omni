@@ -1,6 +1,6 @@
 # π0 (Pi-Zero) VLA deploy: single diffusion stage.
 #
-# Topology is declared in vllm_omni/model_executor/models/pi0/pipeline.py.
+# Topology (PI0_PIPELINE) is declared in vllm_omni/diffusion/models/pi0/pipeline_pi0.py.
 # π0 takes multi-camera images + a language instruction + robot state and emits
 # a continuous action chunk [chunk_size, max_action_dim] via flow matching.
 # Actions are exposed through the OpenPI realtime serving API

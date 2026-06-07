@@ -8,10 +8,8 @@ transformer dimensions (hidden size, head count, ...) are derived from
 ``get_gemma_config`` (see ``modeling_pi0``).
 
 The resolver reads the **raw LeRobot ``config.json``** (the field surface of
-``lerobot.policies.pi0.PI0Config``). SGLang's checkpoint conversion appends
-``model_type`` / ``architectures`` / ``auto_map`` to that file so its
-HF-AutoConfig-driven loader can dispatch; vllm-omni selects the pipeline via
-``model_class_name`` instead, so those keys are tolerated but ignored here.
+``lerobot.policies.pi0.PI0Config``): only the recognized dataclass fields are
+used; any other keys in the file are ignored.
 """
 
 from __future__ import annotations
@@ -28,9 +26,6 @@ ACTION = "action"
 OBS_STR = "observation"
 OBS_STATE = OBS_STR + ".state"
 OBS_IMAGES = OBS_STR + ".images"
-
-# SGLang-only config keys we explicitly ignore when reading a converted ckpt.
-_SGLANG_ONLY_KEYS = ("model_type", "architectures", "auto_map")
 
 
 @dataclass
@@ -125,14 +120,14 @@ class Pi0Config:
     def from_model_config(cls, model_config: dict[str, Any] | None) -> Pi0Config:
         """Build from a config dict (LeRobot ``config.json`` or deploy yaml).
 
-        Filters to recognized dataclass fields (the LeRobot config carries many
-        training-only keys), coerces ``image_resolution`` to a tuple, and drops
-        SGLang-only keys.
+        Keeps only the recognized dataclass fields (the LeRobot config also
+        carries many training-only keys) and coerces ``image_resolution`` to a
+        tuple.
         """
         if not model_config:
             return cls()
 
-        raw = {k: v for k, v in model_config.items() if k not in _SGLANG_ONLY_KEYS}
+        raw = dict(model_config)
         if "image_resolution" in raw:
             raw["image_resolution"] = tuple(raw["image_resolution"])
 

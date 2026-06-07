@@ -2,11 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only π0 (Pi-Zero) VLA math kernel for vllm-omni.
 
-Ported nearly verbatim from the parity-tested SGLang implementation
-(``sglang/srt/models/pi0.py``); only the SGLang serving glue
-(``forward(input_ids, forward_batch)``, ``_extract_request_inputs``,
-``pad_input_ids``, ``LogitsProcessorOutput``) was dropped — the math is
-unchanged so the LeRobot parity (``max|Δ| < 1e-4``) is preserved.
+A self-contained inference kernel: only the math that turns a robot observation
+into an action chunk, with no serving/request glue — validated bit-for-bit
+against the LeRobot ``PI0Policy`` reference (``max|Δ| < 1e-4``).
 
 π0 = PaliGemma (SigLIP vision + Gemma 2B LM) prefix + Gemma 300M action expert
 suffix + flow-matching head. Inference:

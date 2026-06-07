@@ -1,8 +1,16 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Parity test: vllm-omni π0 vs LeRobot π0.
+"""π0 e2e: LeRobot parity (in-process) + OpenPI online serving (websocket).
 
+This file holds two tests:
+  * ``test_pi0_vllm_omni_vs_lerobot`` (below) — the bit-for-bit parity oracle.
+  * ``test_pi0_openpi_online`` (bottom) — boots ``vllm serve --deploy-config
+    pi0.yaml`` and drives the real OpenPI websocket, asserting ``[50, 32]``
+    actions. Needs a GPU; skipped in CI. Mirrors
+    ``tests/e2e/online_serving/test_dreamzero_expansion.py``.
+
+--- LeRobot parity ---
 Verifies that vllm-omni's ``Pi0ForActionPrediction`` produces bit-for-bit
 matching action chunks with LeRobot's ``PI0Policy`` when fed:
   * the same weights (``lerobot/pi0_base``)
@@ -12,14 +20,14 @@ matching action chunks with LeRobot's ``PI0Policy`` when fed:
 π0 is a flow-matching model (Euler-integrated ODE from t=1 → t=0 with a fixed
 ``num_steps``), so the output is deterministic once the noise is fixed and
 ``torch.allclose`` on the final action chunk is a valid oracle. This is the
-authoritative correctness oracle for the SGLang→vllm-omni port (max|Δ| < 1e-4).
+authoritative correctness oracle for the vllm-omni π0 port (max|Δ| < 1e-4).
 
 Run in a SEPARATE ``lerobot[pi]`` venv (avoids dep conflict with the vllm-omni
 env), with the vllm-omni ``pi0`` package importable::
 
     PI0_PARITY_MODEL_PATH=lerobot/pi0_base \
     PI0_PARITY_DEVICE=cpu PI0_PARITY_DTYPE=float32 \
-        python -m pytest tests/pi0/test_pi0_parity.py -v -s
+        python -m pytest tests/pi0/test_pi0_e2e.py::test_pi0_vllm_omni_vs_lerobot -v -s
 
 Skipped automatically when LeRobot is not installed (e.g. the vllm-omni env / CI).
 
@@ -30,11 +38,8 @@ Environment variables:
   PI0_PARITY_FROM_PRETRAINED  "1" real weights, "0" random (default: 1)
   PI0_PARITY_BATCH_SIZE   default: 2
   PI0_PARITY_NUM_STEPS    flow-matching steps (default: 10)
-  PI0_PARITY_MODEL_PATH   Local path or HF repo id of the pi0_base checkpoint IN
-                          LEROBOT FORMAT (consumed by PI0Policy.from_pretrained,
-                          which rejects SGLang-only keys model_type/architectures/
-                          auto_map). Default: "lerobot/pi0_base" (HF download).
-                          DO NOT point at a SGLang-config dir like /data08/models/pi0.
+  PI0_PARITY_MODEL_PATH   Local path or HF repo id of the pi0_base checkpoint in
+                          LeRobot format. Default: "lerobot/pi0_base" (HF download).
 """
 
 from __future__ import annotations
@@ -73,6 +78,59 @@ ACTION_DIM = 32
 STATE_DIM = 32
 ACTION_HORIZON = 50
 MAX_TOKEN_LEN = 48
+
+
+# ─── Online-serving e2e wiring (guarded) ──────────────────────────────
+# The serving stack (tests.helpers.runtime + the OpenPI websocket client) is
+# only needed by test_pi0_openpi_online. Guard the imports so the LeRobot parity
+# test can still be collected / run as a script (``python tests/pi0/test_pi0_e2e.py``)
+# in a minimal lerobot venv that lacks the full vllm-omni serving deps.
+try:
+    from tests.helpers.mark import hardware_test
+    from tests.helpers.runtime import OmniServerParams, get_open_port
+    from tests.pi0 import openpi_client_helper
+
+    _HAS_SERVING_DEPS = True
+except Exception:  # noqa: BLE001 - serving stack absent (e.g. lerobot parity venv)
+    _HAS_SERVING_DEPS = False
+
+    def hardware_test(**_kwargs):  # type: ignore[misc]
+        def _wrap(fn):
+            return fn
+
+        return _wrap
+
+    OmniServerParams = None  # type: ignore[assignment]
+    get_open_port = None  # type: ignore[assignment]
+    openpi_client_helper = None  # type: ignore[assignment]
+
+# Server model for the online e2e: a local pi0_base dir via PI0_E2E_CKPT, else
+# the HF repo id (downloaded on first boot).
+E2E_MODEL = os.environ.get("PI0_E2E_CKPT", "lerobot/pi0_base")
+test_params: list = []
+if _HAS_SERVING_DEPS:
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
+    test_params = [
+        OmniServerParams(
+            model=E2E_MODEL,
+            port=8092,
+            server_args=[
+                "--deploy-config",
+                "vllm_omni/deploy/pi0.yaml",
+                "--served-model-name",
+                "pi0",
+                "--enforce-eager",
+                "--disable-log-stats",
+            ],
+            env_dict={
+                "ATTENTION_BACKEND": "torch",
+                "DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA",
+                "VLLM_DISABLE_COMPILE_CACHE": "1",
+                "MASTER_PORT": str(get_open_port()),
+            },
+        )
+    ]
 
 
 def _resolve_checkpoint_dir() -> str:
@@ -139,27 +197,6 @@ def _create_dummy_batch(batch_size: int = BATCH_SIZE, device: str = DEVICE) -> d
 def _instantiate_lerobot():
     from lerobot.policies.pi0 import PI0Config, PI0Policy
     from lerobot.policies.pi0.processor_pi0 import make_pi0_pre_post_processors
-
-    # Friendly check: a SGLang-flavor config.json (top-level model_type: pi0)
-    # makes PI0Policy.from_pretrained blow up deep inside draccus.
-    if FROM_PRETRAINED and os.path.isdir(MODEL_PATH):
-        cfg_path = os.path.join(MODEL_PATH, "config.json")
-        if os.path.exists(cfg_path):
-            try:
-                import json as _json
-
-                with open(cfg_path) as _f:
-                    _cfg = _json.load(_f)
-                if _cfg.get("model_type") == "pi0":
-                    raise RuntimeError(
-                        f"PI0_PARITY_MODEL_PATH={MODEL_PATH!r} looks like a "
-                        "SGLang-config π0 dir (config.json has 'model_type': "
-                        "'pi0'); LeRobot's PI0Policy.from_pretrained rejects "
-                        "SGLang-only keys. Unset it (defaults to the HF repo "
-                        "lerobot/pi0_base) or point it at a LeRobot-format dir."
-                    )
-            except (OSError, ValueError):
-                pass
 
     if FROM_PRETRAINED:
         policy = PI0Policy.from_pretrained(MODEL_PATH, strict=True)
@@ -409,53 +446,42 @@ def _diagnose_divergence(
     )
 
 
-# ─── End-to-end serving path (Pi0Pipeline.forward) ────────────────────
+# ─── End-to-end online serving (OpenPI websocket) ─────────────────────
 #
-# Exercises the real serving entry point — Pi0Pipeline.forward(req): raw
-# robot_obs → build_model_inputs → sample_actions → DiffusionOutput{actions}
-# (the same path the OpenPI websocket server drives, minus the wire transport).
-# Runs in the vllm-omni env on the production transformers; gated on a real
-# checkpoint via PI0_E2E_CKPT. Not a bit-for-bit LeRobot comparison (LeRobot's
-# reference is only valid at transformers 5.3.0); a shape + finiteness + spread
-# sanity that guards the pipeline wiring (config resolve, weight load, pre/post).
-E2E_CKPT = os.environ.get("PI0_E2E_CKPT")
+# Boots ``vllm serve --omni --deploy-config pi0.yaml`` and drives the real
+# OpenPI websocket (``/v1/realtime/robot/openpi``) — the same wire path a robot
+# uses (handshake metadata → send observation → receive action chunk). Mirrors
+# ``tests/e2e/online_serving/test_dreamzero_expansion.py``. Needs a GPU + a
+# pi0_base checkpoint; skipped in CI (module-level ``pytestmark``) and when the
+# serving stack / OpenPI client deps are unavailable.
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100"})
+@pytest.mark.skipif(not _HAS_SERVING_DEPS, reason="serving stack / OpenPI deps unavailable")
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_pi0_openpi_online(omni_server):
+    try:
+        openpi_client_helper.require_dependencies()
+    except ModuleNotFoundError as exc:
+        pytest.skip(str(exc))
 
+    result = openpi_client_helper.run_policy_session(
+        host=omni_server.host,
+        port=omni_server.port,
+        prompt="pick up the red block and place it in the bin",
+        session_id="pi0-online-e2e",
+        num_steps=2,
+    )
 
-@pytest.mark.skipif(not E2E_CKPT, reason="Set PI0_E2E_CKPT to a pi0_base dir for the e2e path.")
-def test_pi0_pipeline_e2e():
-    import numpy as np
+    # Asserts every returned chunk is [50, 32] + finite, and the handshake
+    # metadata matches pi0.yaml's policy_server_config.
+    openpi_client_helper.validate_session_result(result)
 
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.diffusion.models.pi0 import Pi0Pipeline
-    from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-    od = OmniDiffusionConfig(model=E2E_CKPT, model_class_name="Pi0Pipeline", dtype="float32")
-    pipe = Pi0Pipeline(od_config=od)
-
-    obs = {
-        "observation.images.base_0_rgb": np.zeros((224, 224, 3), dtype=np.uint8),
-        "observation.images.left_wrist_0_rgb": np.zeros((224, 224, 3), dtype=np.uint8),
-        "observation.images.right_wrist_0_rgb": np.zeros((224, 224, 3), dtype=np.uint8),
-        "state": np.zeros(STATE_DIM, dtype=np.float32),
-        "prompt": "pick up the red block",
-    }
-    sp = OmniDiffusionSamplingParams(extra_args={"robot_obs": obs, "session_id": "e2e", "reset": True})
-    req = OmniDiffusionRequest(prompts=["pick up the red block"], sampling_params=sp, request_id="e2e-0")
-
-    out = pipe.forward(req)
-    assert out.error is None, out.error
-    actions = np.asarray(out.output["actions"], dtype=np.float32)
-    assert actions.shape == (ACTION_HORIZON, ACTION_DIM), actions.shape
-    assert np.isfinite(actions).all()
-    assert float(actions.std()) > 1e-3, "action output collapsed"
-
-    # Dummy-warmup path returns zeros without touching the obs.
-    sp0 = OmniDiffusionSamplingParams(extra_args={})
-    req0 = OmniDiffusionRequest(prompts=["dummy run"], sampling_params=sp0, request_id="e2e-warmup")
-    out0 = pipe.forward(req0)
-    assert np.asarray(out0.output["actions"]).shape == (ACTION_HORIZON, ACTION_DIM)
-    assert not np.asarray(out0.output["actions"]).any()
+    metadata = result["metadata"]
+    assert tuple(metadata["image_resolution"]) == (224, 224)
+    assert metadata["needs_wrist_camera"] is True
+    assert metadata["needs_session_id"] is False
+    assert metadata["action_space"] == "joint_position"
 
 
 if __name__ == "__main__":

@@ -3,8 +3,8 @@
 """π0 (Pi-Zero) VLA model for vllm-omni.
 
 PaliGemma (SigLIP vision + Gemma-2B LM) + Gemma-300M action expert + a
-flow-matching action head. Ported from the parity-tested SGLang implementation.
-Outputs a continuous action chunk ``[horizon, action_dim]`` rather than tokens.
+flow-matching action head. Outputs a continuous action chunk
+``[horizon, action_dim]`` rather than tokens.
 """
 
 from vllm_omni.diffusion.models.pi0.config import Pi0Config

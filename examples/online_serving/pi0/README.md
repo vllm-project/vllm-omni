@@ -17,9 +17,7 @@ The core `pip install -e .` does not include the OpenPI client used here:
 
 π0 uses the LeRobot `lerobot/pi0_base` checkpoint (HF, ~13 GB). Either let the server
 download it (`MODEL=lerobot/pi0_base`) or point at a local copy
-(`MODEL=/path/to/pi0_base`). The checkpoint's `config.json` may carry SGLang-only keys
-(`model_type`/`architectures`/`auto_map`) — π0 reads the raw LeRobot fields and ignores
-those, so both the raw HF snapshot and an SGLang-converted dir work.
+(`MODEL=/path/to/pi0_base`).
 
 ## Run the server
 
@@ -68,9 +66,11 @@ Camera keys must match the server's `image_feature_keys` (the checkpoint's
 ## Correctness
 
 π0's flow-matching kernel is bit-for-bit matched to the LeRobot `PI0Policy` reference
-(`max|Δ| = 7.15e-07`, CPU/float32, fixed noise; see `tests/pi0/test_pi0_parity.py`)
-and is version-stable across transformers releases (the version-stability checks in
-`tests/pi0/test_pi0_units.py`).
+(`max|Δ| = 7.15e-07`, CPU/float32, fixed noise; see
+`tests/pi0/test_pi0_e2e.py::test_pi0_vllm_omni_vs_lerobot`) and is version-stable across
+transformers releases (the version-stability checks in `tests/pi0/test_pi0_units.py`). An
+OpenPI websocket online-serving e2e lives in the same file
+(`tests/pi0/test_pi0_e2e.py::test_pi0_openpi_online`).
 
 ## Limitations
 

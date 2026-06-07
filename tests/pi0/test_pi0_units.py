@@ -5,7 +5,7 @@
 Deliberately lightweight: pure utility code (config plumbing, mask building,
 sinusoidal embeddings, normalization, image preprocessing, weight-load remap)
 that runs on CPU with no weights and no lerobot. The full LeRobot parity check
-lives in ``test_pi0_parity.py`` and requires a model download.
+lives in ``test_pi0_e2e.py`` and requires a model download.
 
     pytest tests/pi0/test_pi0_units.py -v
 """
@@ -64,40 +64,11 @@ _LEROBOT_CFG = {
     },
 }
 
-# SGLang appends these keys during checkpoint conversion; we must ignore them.
-_SGLANG_CFG = {
-    **_LEROBOT_CFG,
-    "model_type": "pi0",
-    "architectures": ["Pi0ForActionPrediction"],
-    "auto_map": {"AutoConfig": "sglang.srt.models.pi0--Pi0Config"},
-}
-
 _EXPECTED_CAMERA_ORDER = [
     "observation.images.base_0_rgb",
     "observation.images.left_wrist_0_rgb",
     "observation.images.right_wrist_0_rgb",
 ]
-
-
-def _key_fields(c: Pi0Config) -> tuple:
-    return (
-        c.paligemma_variant,
-        c.action_expert_variant,
-        c.chunk_size,
-        c.max_action_dim,
-        c.max_state_dim,
-        c.num_inference_steps,
-        c.image_resolution,
-        c.tokenizer_max_length,
-        c.dtype,
-        tuple(c.image_feature_keys or []),
-    )
-
-
-def test_config_raw_lerobot_and_sglang_yield_identical_fields():
-    c_raw = Pi0Config.from_model_config(_LEROBOT_CFG)
-    c_sgl = Pi0Config.from_model_config(_SGLANG_CFG)
-    assert _key_fields(c_raw) == _key_fields(c_sgl)
 
 
 def test_config_camera_order_from_input_features():
@@ -530,7 +501,7 @@ def test_build_model_inputs_image_key_map():
 # ----------------------------------------------------------------------------
 # Version-stability / self-consistency (gated on a real pi0_base checkpoint)
 #
-# The LeRobot parity gate (test_pi0_parity.py) only validates correctness at
+# The LeRobot parity gate (test_pi0_e2e.py) only validates correctness at
 # transformers 5.3.0 (where LeRobot loads pi0_base cleanly). Production vllm-omni
 # ships transformers 5.6.2, and LeRobot is not a usable reference there (it
 # mis-loads the SigLIP vision tower at >=5.4). So we pin the kernel's deterministic
