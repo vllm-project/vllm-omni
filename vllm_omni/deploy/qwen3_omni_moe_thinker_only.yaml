@@ -1,0 +1,31 @@
+# Qwen3-Omni-MoE thinker-only deploy: multimodal understanding -> text.
+#
+# Single-stage configuration that drops the talker/code2wav stages. This is
+# required for thinker-only checkpoints (e.g. Qwen/Qwen3-Omni-30B-A3B-Thinking,
+# whose config.json has no talker_config — the full 3-stage pipeline cannot
+# load such checkpoints), and useful for Instruct deployments where only text
+# output is needed: the thinker then fits a single 80G GPU.
+#
+# Stage 0: Thinker — full memory budget since no talker/code2wav share the
+# device.
+pipeline: qwen3_omni_moe_thinker_only
+async_chunk: false
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.9
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.05
+
+platforms: {}

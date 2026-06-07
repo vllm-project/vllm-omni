@@ -1606,6 +1606,46 @@ class TestMingFlashOmniPipeline:
         assert stages[1].final_output_type == "image"
 
 
+class TestQwen3OmniThinkerOnlyPipeline:
+    """Thinker-only Qwen3-Omni variant (serves checkpoints without talker_config,
+    e.g. Qwen/Qwen3-Omni-30B-A3B-Thinking)."""
+
+    def test_thinker_only_pipeline_registered(self):
+        p = _PIPELINE_REGISTRY.get("qwen3_omni_moe_thinker_only")
+        assert p is not None
+        assert p.model_arch == "Qwen3OmniMoeForConditionalGeneration"
+        assert len(p.stages) == 1
+        assert p.validate() == []
+
+    def test_thinker_only_stage(self):
+        s = _PIPELINE_REGISTRY["qwen3_omni_moe_thinker_only"].get_stage(0)
+        assert s.model_stage == "thinker"
+        assert s.execution_type == StageExecutionType.LLM_AR
+        assert s.input_sources == ()
+        assert s.final_output is True
+        assert s.final_output_type == "text"
+        assert s.owns_tokenizer is True
+        assert s.requires_multimodal_data is True
+        assert s.engine_output_type == "text"
+        assert s.hf_config_name == "thinker_config"
+        assert s.sampling_constraints["detokenize"] is True
+
+    def test_thinker_only_yaml_loads_and_merges(self):
+        """deploy/qwen3_omni_moe_thinker_only.yaml parses and routes to the thinker-only pipeline."""
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe_thinker_only.yaml"
+        if not deploy_path.exists():
+            pytest.skip("qwen3_omni_moe_thinker_only deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+        assert len(deploy.stages) == 1
+        assert deploy.pipeline == "qwen3_omni_moe_thinker_only"
+
+        pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe_thinker_only"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert len(stages) == 1
+        assert stages[0].yaml_engine_args["model_arch"] == "Qwen3OmniMoeForConditionalGeneration"
+
+
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
 
