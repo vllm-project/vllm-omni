@@ -106,6 +106,7 @@ NPU_DIT_TP_ENV = "HUNYUAN_IMAGE3_NPU_DIT_TP"
 NPU_DIT_EP_ENV = "HUNYUAN_IMAGE3_NPU_DIT_ENABLE_EP"
 NPU_DIT_GPU_MEMORY_UTILIZATION_ENV = "HUNYUAN_IMAGE3_NPU_DIT_GPU_MEMORY_UTILIZATION"
 NPU_DIT_NUM_INFERENCE_STEPS = 8
+NPU_DIT_GUIDANCE_SCALE = 1.0
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 # fmt: off
 _DEPLOY_CONFIG = {
@@ -498,6 +499,7 @@ def _run_dit_model(
     output_path: Path,
     *,
     num_inference_steps: int = 20,
+    guidance_scale: float = 4.0,
     nvfp4_backend: str | None = None,
 ) -> tuple[Image.Image, float]:
     from tests.helpers.runtime import OmniRunner
@@ -517,7 +519,7 @@ def _run_dit_model(
                 seed=SEED,
                 generator=generator,
                 num_inference_steps=num_inference_steps,
-                guidance_scale=4.0,
+                guidance_scale=guidance_scale,
                 guidance_scale_provided=True,
             )
             t0 = time.perf_counter()
@@ -725,6 +727,7 @@ def test_npu_dit_distil_smoke_accuracy(accuracy_artifact_root: Path) -> None:
             str(deploy_config_path),
             output_dir / "npu_dit_distil.png",
             num_inference_steps=NPU_DIT_NUM_INFERENCE_STEPS,
+            guidance_scale=NPU_DIT_GUIDANCE_SCALE,
         )
 
     assert image.size == (QUANT_WIDTH, QUANT_HEIGHT)
@@ -736,7 +739,7 @@ def test_npu_dit_distil_smoke_accuracy(accuracy_artifact_root: Path) -> None:
         "height": QUANT_HEIGHT,
         "width": QUANT_WIDTH,
         "num_inference_steps": NPU_DIT_NUM_INFERENCE_STEPS,
-        "guidance_scale": 4.0,
+        "guidance_scale": NPU_DIT_GUIDANCE_SCALE,
         "elapsed_s": elapsed,
         "devices": _npu_dit_devices(),
         "tensor_parallel_size": _npu_dit_tensor_parallel_size(),
@@ -772,12 +775,14 @@ def test_npu_quantized_dit_matches_bf16_accuracy(
             str(deploy_config_path),
             output_dir / "npu_bf16.png",
             num_inference_steps=NPU_DIT_NUM_INFERENCE_STEPS,
+            guidance_scale=NPU_DIT_GUIDANCE_SCALE,
         )
         quant_image, quant_time = _run_dit_model(
             quant_model,
             str(deploy_config_path),
             output_dir / "npu_quant.png",
             num_inference_steps=NPU_DIT_NUM_INFERENCE_STEPS,
+            guidance_scale=NPU_DIT_GUIDANCE_SCALE,
         )
 
     ssim_score, psnr_score = compute_image_ssim_psnr(
@@ -808,7 +813,7 @@ def test_npu_quantized_dit_matches_bf16_accuracy(
         "height": QUANT_HEIGHT,
         "width": QUANT_WIDTH,
         "num_inference_steps": NPU_DIT_NUM_INFERENCE_STEPS,
-        "guidance_scale": 4.0,
+        "guidance_scale": NPU_DIT_GUIDANCE_SCALE,
         "bf16_elapsed_s": bf16_time,
         "quant_elapsed_s": quant_time,
         "ssim": ssim_score,
