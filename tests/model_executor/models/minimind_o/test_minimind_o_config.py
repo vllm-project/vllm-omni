@@ -22,6 +22,7 @@ def test_minimind_omni_nested_configs():
     assert cfg.audio_ids[0] == 16
     assert cfg.image_ids[0] == 12
     assert cfg.bridge_layer == cfg.text_config.num_hidden_layers // 2 - 1
+    assert cfg.talker_max_steps_after_last_thinker_token == 64
 
 
 def test_minimind_omni_hf_model_type():

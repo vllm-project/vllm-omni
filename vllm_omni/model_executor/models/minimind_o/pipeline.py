@@ -33,7 +33,11 @@ MINIMIND_OMNI_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             engine_output_type="latent",
-            sampling_constraints={"detokenize": True},
+            sampling_constraints={
+                "detokenize": True,
+                "ignore_eos": True,
+                "stop_token_ids": [17],
+            },
         ),
         StagePipelineConfig(
             stage_id=1,

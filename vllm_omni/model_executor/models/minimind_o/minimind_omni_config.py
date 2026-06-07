@@ -256,6 +256,11 @@ class MiniMindOmniConfig(PretrainedConfig):
         image_token_len: int = 64,
         vision_model_path: str = "jingyaogong/siglip2-base-p32-256-ve",
         bridge_layer: int | None = None,
+        thinker_post_eos_pad_tokens: int = 128,
+        thinker_post_eos_pad_token_id: int = 0,
+        thinker_post_eos_enter_token_id: int = 201,
+        thinker_internal_stop_token_id: int = 17,
+        talker_max_steps_after_last_thinker_token: int = 64,
         **kwargs: Any,
     ) -> None:
         text_defaults = {
@@ -430,6 +435,11 @@ class MiniMindOmniConfig(PretrainedConfig):
         self.image_token_len = self.vision_config.image_token_len
         self.vision_model_path = self.vision_config.vision_model_path
         self.bridge_layer = bridge_layer if bridge_layer is not None else int(self.num_hidden_layers) // 2 - 1
+        self.thinker_post_eos_pad_tokens = int(thinker_post_eos_pad_tokens)
+        self.thinker_post_eos_pad_token_id = int(thinker_post_eos_pad_token_id)
+        self.thinker_post_eos_enter_token_id = int(thinker_post_eos_enter_token_id)
+        self.thinker_internal_stop_token_id = int(thinker_internal_stop_token_id)
+        self.talker_max_steps_after_last_thinker_token = int(talker_max_steps_after_last_thinker_token)
 
     def get_text_config(self, **kwargs: Any) -> PretrainedConfig:
         return self.text_config

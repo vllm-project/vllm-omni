@@ -85,6 +85,7 @@ class MiniMindOmniForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             )
 
         self.have_multimodal_outputs = getattr(self.model, "have_multimodal_outputs", False)
+        self.prefer_model_sampler = getattr(self.model, "prefer_model_sampler", False)
         self.make_empty_intermediate_tensors = getattr(self.model, "make_empty_intermediate_tensors", lambda: None)
 
     def get_language_model(self) -> nn.Module:

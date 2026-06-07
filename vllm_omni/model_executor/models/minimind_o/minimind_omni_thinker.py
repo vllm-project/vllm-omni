@@ -57,6 +57,9 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.model_executor.models.minimind_o.minimind_omni_config import (
@@ -773,9 +776,17 @@ class MiniMindOmniThinkerForConditionalGeneration(
         self.multimodal_config = multimodal_config
         self.device = get_local_device()
         self.have_multimodal_outputs = True
+        self.prefer_model_sampler = True
 
         self.text_config = config.text_config
         self.text_config.bridge_layer = config.bridge_layer
+        self.real_eos_token_id = int(self.text_config.eos_token_id)
+        self.post_eos_pad_tokens = max(0, int(config.thinker_post_eos_pad_tokens))
+        self.post_eos_pad_token_id = int(config.thinker_post_eos_pad_token_id)
+        self.post_eos_enter_token_id = int(config.thinker_post_eos_enter_token_id)
+        self.internal_stop_token_id = int(config.thinker_internal_stop_token_id)
+        self._post_eos_states: dict[str, dict[str, int | str]] = {}
+        self.sampler = Sampler()
         with self._mark_language_model(vllm_config):
             self.language_model = MiniMindForCausalLM(
                 self.text_config,
@@ -962,6 +973,88 @@ class MiniMindOmniThinkerForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor, **kwargs):
         return self.language_model.compute_logits(hidden_states)
+
+    def _forced_post_eos_token(self, output_token_ids: list[int]) -> int | None:
+        try:
+            eos_pos = len(output_token_ids) - 1 - output_token_ids[::-1].index(self.real_eos_token_id)
+        except ValueError:
+            return None
+
+        post_eos_ids = output_token_ids[eos_pos + 1 :]
+        if not post_eos_ids:
+            return self.post_eos_enter_token_id
+        if post_eos_ids[0] != self.post_eos_enter_token_id:
+            return None
+        post_eos_ids = post_eos_ids[1:]
+
+        if len(post_eos_ids) < self.post_eos_pad_tokens:
+            return self.post_eos_pad_token_id
+        if len(post_eos_ids) == self.post_eos_pad_tokens:
+            return self.internal_stop_token_id
+        return None
+
+    def _enter_post_eos_state(self, request_id: str) -> None:
+        self._post_eos_states[request_id] = {
+            "phase": "enter",
+            "remaining_pad_tokens": self.post_eos_pad_tokens,
+        }
+
+    def _forced_post_eos_token_for_request(self, request_id: str) -> int | None:
+        state = self._post_eos_states.get(request_id)
+        if not state:
+            return None
+
+        phase = state.get("phase")
+        if phase == "enter":
+            state["phase"] = "pad" if self.post_eos_pad_tokens > 0 else "stop"
+            return self.post_eos_enter_token_id
+
+        if phase == "pad":
+            remaining = int(state.get("remaining_pad_tokens", 0))
+            if remaining <= 0:
+                state["phase"] = "stop"
+                return self.internal_stop_token_id
+            state["remaining_pad_tokens"] = remaining - 1
+            if remaining - 1 <= 0:
+                state["phase"] = "stop"
+            return self.post_eos_pad_token_id
+
+        if phase in {"stop", "stop_sent"}:
+            state["phase"] = "stop_sent"
+            return self.internal_stop_token_id
+
+        return None
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        for req_id in finished_req_ids:
+            self._post_eos_states.pop(req_id, None)
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput | None:
+        sampler_output = self.sampler(logits, sampling_metadata)
+        request_ids = list(getattr(sampling_metadata, "request_ids", None) or [])
+        if not request_ids:
+            return sampler_output
+
+        sampled = sampler_output.sampled_token_ids
+        for row in range(sampled.shape[0]):
+            raw_token = int(sampled[row, 0].item())
+            request_id = request_ids[row] if row < len(request_ids) else None
+            if raw_token == self.real_eos_token_id:
+                if request_id is not None and request_id not in self._post_eos_states:
+                    self._enter_post_eos_state(request_id)
+                # Match upstream HF behavior: keep the real EOS on this step,
+                # then force enter/pad/stop on subsequent decode steps.
+                continue
+
+            forced_token = self._forced_post_eos_token_for_request(request_id) if request_id is not None else None
+            if forced_token is not None:
+                sampled[row, 0] = int(forced_token)
+
+        return sampler_output
 
     @staticmethod
     def _module_dtype(module: nn.Module | None, default: torch.dtype = torch.float32) -> torch.dtype:

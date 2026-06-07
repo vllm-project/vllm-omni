@@ -229,8 +229,10 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
             return_bias=False,
             prefix=maybe_prefix(prefix, "spk_proj"),
         )
+        self.prefer_model_sampler = True
         self.sampler = Sampler()
         self._pending_audio_steps: list[int] = []
+        self._stop_pending_by_req: dict[str, bool] = {}
         self.make_empty_intermediate_tensors = lambda: None
 
     def get_language_model(self) -> nn.Module:
@@ -355,8 +357,9 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         temperature: float = 0.2,
         top_k: int = 50,
     ) -> torch.Tensor:
-        vocab_limit = min(2048, logits.shape[-1])
-        logits = logits[..., :vocab_limit].float()
+        # Match upstream HF behavior: codebook heads may emit special tokens
+        # such as pad/stop/spk (>= 2048), so sample over the full audio vocab.
+        logits = logits.float()
         if not do_sample:
             return logits.argmax(dim=-1)
         temperature = max(float(temperature), 1e-5)
@@ -446,7 +449,19 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> SamplerOutput | None:
-        return self.sampler(logits, sampling_metadata)
+        sampler_output = self.sampler(logits, sampling_metadata)
+        request_ids = list(getattr(sampling_metadata, "request_ids", None) or [])
+        if not request_ids:
+            return sampler_output
+
+        sampled = sampler_output.sampled_token_ids
+        for row in range(sampled.shape[0]):
+            request_id = request_ids[row] if row < len(request_ids) else None
+            if request_id is None or not self._stop_pending_by_req.get(request_id):
+                continue
+            sampled[row, 0] = self.audio_stop_token
+            self._stop_pending_by_req.pop(request_id, None)
+        return sampler_output
 
     @torch.inference_mode()
     def talker_mtp(
@@ -465,11 +480,6 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         logits_by_layer = self.lm_head(hidden)
         codes = []
         layer0 = input_ids.reshape(batch).to(device=input_embeds.device, dtype=torch.long)
-        layer0 = torch.where(
-            (layer0 >= 0) & (layer0 < 2048),
-            layer0,
-            torch.zeros_like(layer0),
-        )
         codes.append(layer0)
         for logits in logits_by_layer[1:]:
             codes.append(
@@ -559,11 +569,18 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
             codes.get("history") if isinstance(codes, dict) else None,
             device=current.device,
         )
+        request_id = kwargs.get("request_id")
         rows = current if history is None else torch.cat((history, current), dim=0)
+        if isinstance(request_id, str) and current[-1, -1].item() == self.audio_stop_token:
+            self._stop_pending_by_req[request_id] = True
         ready_frames = max(0, int(rows.shape[0]) - self.num_code_layers + 1)
         update.setdefault("codes", {})["history"] = rows.detach()
         update.setdefault("meta", {})["emitted_audio_frames"] = ready_frames
         return update
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        for req_id in finished_req_ids:
+            self._stop_pending_by_req.pop(req_id, None)
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **_kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):

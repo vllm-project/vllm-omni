@@ -202,8 +202,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return sampling_metadata
         output_token_ids = self._build_model_sampler_output_token_ids()
         if output_token_ids == sampling_metadata.output_token_ids:
-            return sampling_metadata
-        return replace(sampling_metadata, output_token_ids=output_token_ids)
+            metadata_for_model_sampler = sampling_metadata
+        else:
+            metadata_for_model_sampler = replace(sampling_metadata, output_token_ids=output_token_ids)
+        setattr(metadata_for_model_sampler, "request_ids", list(getattr(self.input_batch, "req_ids", [])))
+        return metadata_for_model_sampler
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)

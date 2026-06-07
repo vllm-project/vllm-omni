@@ -187,16 +187,3 @@ def talker2code2wav(
         )
 
     return code2wav_inputs
-
-
-def should_accumulate_minimind_omni_full_payload_output(
-    model_config: Any,
-    custom_process_func: Any,
-) -> bool:
-    """Return whether MiniMind-Omni should accumulate full-payload outputs."""
-    return (
-        custom_process_func is not None
-        and not getattr(model_config, "async_chunk", False)
-        and getattr(model_config, "model_arch", None) == "MiniMindOmniForConditionalGeneration"
-        and getattr(model_config, "model_stage", None) in {"thinker", "talker"}
-    )
