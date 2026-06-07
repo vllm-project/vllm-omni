@@ -117,20 +117,23 @@ class OmniTensorPrefixCache:
                 logger.info("Initializing multimodal output cache of size %s for key: %s", list(new_tensor_shape), key)
 
     def _get_cache_tensor(self, dtype: torch.dtype, hidden_size: int | None = None) -> torch.Tensor:
-        """Allocate a pinned CPU cache tensor for a specific key.
+        """Allocate a CPU cache tensor for a specific key.
 
-        ``pin_memory=True`` is required for the async-write pipeline: it lets
-        the GPU->CPU copy ride the dedicated copy stream as a true async
-        ``cudaMemcpyAsync``, and makes the post-copy CPU scatter
-        (``flat_cache[slots] = staged_pinned_buf``) avoid page-resolution
-        stalls.
+        When CUDA is available the tensor is pinned: this is what lets the
+        async-write pipeline ride the GPU->CPU copy on the dedicated copy
+        stream as a true async ``cudaMemcpyAsync`` and lets the post-copy CPU
+        scatter avoid page-resolution stalls. On CPU-only builds pinning is
+        unsupported (``torch.zeros(pin_memory=True)`` raises), and the async
+        pipeline is disabled anyway (``schedule_async_write`` early-returns
+        when ``torch.cuda.is_available()`` is False), so we fall back to a
+        plain pageable allocation with no behavioral change.
         """
         actual_hidden_size = hidden_size if hidden_size is not None else self.default_hidden_size
         return torch.zeros(
             (self.num_blocks, self.block_size, actual_hidden_size),
             dtype=dtype,
             device="cpu",
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )
 
     # =====================================================================
