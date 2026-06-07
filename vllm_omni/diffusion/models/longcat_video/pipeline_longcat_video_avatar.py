@@ -185,6 +185,19 @@ def _requested_num_segments(value: Any) -> int:
     return max(1, int(value))
 
 
+def _requested_audio_duration(
+    *,
+    auto_num_segments: bool,
+    num_segments: int,
+    num_frames: int,
+    num_cond_frames: int,
+    save_fps: int,
+) -> float:
+    if auto_num_segments:
+        return 0.0
+    return num_frames / save_fps + (num_segments - 1) * (num_frames - num_cond_frames) / save_fps
+
+
 def _asset_root() -> Path | None:
     raw = os.environ.get("LONGCAT_VIDEO_ASSET_ROOT")
     if raw and Path(raw).exists():
@@ -1000,26 +1013,13 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         num_frames: int,
         save_fps: int,
     ) -> torch.Tensor:
-        generate_duration = num_frames / save_fps
-        source_duration = len(speech_array) / sample_rate
-        added_sample_nums = math.ceil((generate_duration - source_duration) * sample_rate)
-        if added_sample_nums > 0:
-            speech_array = np.append(speech_array, np.zeros(added_sample_nums, dtype=np.float32))
-
-        full_audio_emb = self._get_audio_embedding_whisper(
+        full_audio_emb = self._full_audio_embedding_from_array(
             speech_array,
-            fps=save_fps * self.audio_stride,
             sample_rate=sample_rate,
+            min_duration=num_frames / save_fps,
+            save_fps=save_fps,
         )
-        if torch.isnan(full_audio_emb).any():
-            raise ValueError("Audio embedding contains NaN values.")
-
-        indices = torch.arange(5, device=full_audio_emb.device) - 2
-        audio_end_idx = self.audio_stride * num_frames
-        center_indices = torch.arange(0, audio_end_idx, self.audio_stride, device=full_audio_emb.device)
-        center_indices = center_indices.unsqueeze(1) + indices.unsqueeze(0)
-        center_indices = torch.clamp(center_indices, min=0, max=full_audio_emb.shape[0] - 1)
-        return full_audio_emb[center_indices][None, ...].to(self.device)
+        return self._slice_full_audio_embedding(full_audio_emb, audio_start_idx=0, num_frames=num_frames)
 
     def _full_audio_embedding_from_array(
         self,
@@ -1058,17 +1058,29 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         return full_audio_emb[center_indices][None, ...].to(self.device)
 
     def _audio_embedding(self, audio_path: str, num_frames: int, save_fps: int) -> torch.Tensor:
+        full_audio_emb, _ = self._audio_full_embedding(
+            audio_path,
+            min_duration=num_frames / save_fps,
+            save_fps=save_fps,
+        )
+        return self._slice_full_audio_embedding(full_audio_emb, audio_start_idx=0, num_frames=num_frames)
+
+    def _audio_full_embedding(
+        self, audio_path: str, *, min_duration: float, save_fps: int
+    ) -> tuple[torch.Tensor, float]:
         import soundfile as sf
 
         temp_vocal_path = self._extract_vocal(audio_path)
         try:
             speech_array, sample_rate = self._load_audio(temp_vocal_path, target_sr=16000, soundfile_module=sf)
-            return self._audio_embedding_from_array(
+            effective_duration = max(len(speech_array) / sample_rate, min_duration)
+            full_audio_emb = self._full_audio_embedding_from_array(
                 speech_array,
                 sample_rate=sample_rate,
-                num_frames=num_frames,
+                min_duration=effective_duration,
                 save_fps=save_fps,
             )
+            return full_audio_emb, effective_duration
         finally:
             Path(temp_vocal_path).unlink(missing_ok=True)
 
@@ -1180,6 +1192,70 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             dim=0,
         )
 
+    def _prepare_audio_embeddings(
+        self,
+        inputs: dict[str, Any],
+        *,
+        is_multi_speaker: bool,
+        include_background_silent_audio: bool,
+        needs_full_audio: bool,
+        auto_num_segments: bool,
+        num_segments_value: Any,
+        num_segments: int,
+        num_frames: int,
+        num_cond_frames: int,
+        save_fps: int,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None, int]:
+        if not needs_full_audio:
+            if is_multi_speaker:
+                audio_emb = self._multi_audio_embedding(
+                    inputs["audio_paths"],
+                    audio_type=inputs["audio_type"],
+                    num_frames=num_frames,
+                    save_fps=save_fps,
+                    include_background_silent_audio=include_background_silent_audio,
+                )
+            else:
+                audio_emb = self._audio_embedding(inputs["audio_path"], num_frames, save_fps)
+            return audio_emb, None, num_segments
+
+        requested_duration = _requested_audio_duration(
+            auto_num_segments=auto_num_segments,
+            num_segments=num_segments,
+            num_frames=num_frames,
+            num_cond_frames=num_cond_frames,
+            save_fps=save_fps,
+        )
+        if is_multi_speaker:
+            full_audio_embs, effective_audio_duration = self._multi_audio_full_embeddings(
+                inputs["audio_paths"],
+                audio_type=inputs["audio_type"],
+                save_fps=save_fps,
+                min_duration=requested_duration,
+                include_background_silent_audio=include_background_silent_audio,
+            )
+        else:
+            full_audio_emb, effective_audio_duration = self._audio_full_embedding(
+                inputs["audio_path"],
+                min_duration=requested_duration,
+                save_fps=save_fps,
+            )
+            full_audio_embs = [full_audio_emb]
+
+        num_segments = _resolve_num_segments(
+            num_segments_value,
+            audio_duration=effective_audio_duration,
+            num_frames=num_frames,
+            num_cond_frames=num_cond_frames,
+            save_fps=save_fps,
+        )
+        audio_emb = self._slice_multi_audio_embeddings(
+            full_audio_embs,
+            audio_start_idx=0,
+            num_frames=num_frames,
+        )
+        return audio_emb, full_audio_embs, num_segments
+
     @staticmethod
     def _load_audio(audio_path: str, target_sr: int, soundfile_module) -> tuple[np.ndarray, int]:
         speech_array, sr = soundfile_module.read(audio_path, dtype="float32", always_2d=True)
@@ -1279,6 +1355,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         generator,
         latents: torch.Tensor | None,
         max_sequence_length: int,
+        return_latents: bool = False,
     ):
         self._text_guidance_scale = text_guidance_scale
         self._audio_guidance_scale = audio_guidance_scale
@@ -1351,7 +1428,10 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
                         + audio_guidance_scale * (noise_pred_uncond_text - noise_pred_uncond)
                     )
                 latents = self.scheduler.step(-noise_pred, t, latents, return_dict=False)[0]
-        return self._decode_latents(latents, output_type="np")
+        output = self._decode_latents(latents, output_type="np")
+        if return_latents:
+            return output, latents.clone()
+        return output
 
     def _generate_ai2v(
         self,
@@ -1739,65 +1819,42 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
 
         image = None
         ref_target_masks = None
-        full_audio_embs = None
+        include_background_silent_audio = False
         explicit_num_segments = _requested_num_segments(num_segments_value)
         auto_num_segments = isinstance(num_segments_value, str) and num_segments_value.lower() == "auto"
         needs_full_audio = auto_num_segments or explicit_num_segments > 1
         num_segments = explicit_num_segments or 1
         if inputs["is_multi_speaker"]:
             if stage != "ai2v":
-                raise NotImplementedError("LongCat-Video-Avatar multi-speaker generation only supports AI2V.")
+                raise NotImplementedError(
+                    "LongCat-Video-Avatar multi-speaker generation requires AI2V "
+                    "because speaker bounding boxes and masks are defined on a reference image."
+                )
             image = _load_image(inputs["image"], asset_root=self.asset_root)
             ref_target_masks, include_background_silent_audio = _build_multi_speaker_ref_target_masks(
                 image,
                 inputs["bbox"],
             )
-            if needs_full_audio:
-                requested_duration = (
-                    0.0
-                    if auto_num_segments
-                    else num_frames / save_fps + (num_segments - 1) * (num_frames - num_cond_frames) / save_fps
-                )
-                full_audio_embs, effective_audio_duration = self._multi_audio_full_embeddings(
-                    inputs["audio_paths"],
-                    audio_type=inputs["audio_type"],
-                    save_fps=save_fps,
-                    min_duration=requested_duration,
-                    include_background_silent_audio=include_background_silent_audio,
-                )
-                num_segments = _resolve_num_segments(
-                    num_segments_value,
-                    audio_duration=effective_audio_duration,
-                    num_frames=num_frames,
-                    num_cond_frames=num_cond_frames,
-                    save_fps=save_fps,
-                )
-                audio_emb = self._slice_multi_audio_embeddings(
-                    full_audio_embs,
-                    audio_start_idx=0,
-                    num_frames=num_frames,
-                )
-            else:
-                audio_emb = self._multi_audio_embedding(
-                    inputs["audio_paths"],
-                    audio_type=inputs["audio_type"],
-                    num_frames=num_frames,
-                    save_fps=save_fps,
-                    include_background_silent_audio=include_background_silent_audio,
-                )
-        else:
-            if needs_full_audio:
-                raise NotImplementedError(
-                    "LongCat-Video-Avatar single-speaker AVC continuation is not supported; "
-                    "use a multi-speaker AI2V input JSON for continuation."
-                )
-            audio_emb = self._audio_embedding(inputs["audio_path"], num_frames, save_fps)
+
+        audio_emb, full_audio_embs, num_segments = self._prepare_audio_embeddings(
+            inputs,
+            is_multi_speaker=inputs["is_multi_speaker"],
+            include_background_silent_audio=include_background_silent_audio,
+            needs_full_audio=needs_full_audio,
+            auto_num_segments=auto_num_segments,
+            num_segments_value=num_segments_value,
+            num_segments=num_segments,
+            num_frames=num_frames,
+            num_cond_frames=num_cond_frames,
+            save_fps=save_fps,
+        )
 
         if num_segments > 1 and num_cond_frames >= num_frames:
             raise ValueError(
                 "LongCat-Video-Avatar AVC continuation requires num_cond_frames to be smaller than num_frames."
             )
 
+        latent = None
         if stage == "at2v":
             default_height, default_width = _default_at2v_shape(resolution)
             height = int(extra.get("height") or req.sampling_params.height or default_height)
@@ -1816,7 +1873,10 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
                 generator=generator,
                 latents=latents,
                 max_sequence_length=max_sequence_length,
+                return_latents=num_segments > 1,
             )
+            if num_segments > 1:
+                output, latent = output
         else:
             image = image or _load_image(inputs["image"], asset_root=self.asset_root)
             output, latent, height, width = self._generate_ai2v(
@@ -1836,60 +1896,57 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
                 resize_mode=resize_mode,
                 ref_target_masks=ref_target_masks,
             )
-            if num_segments > 1:
-                if full_audio_embs is None:
-                    raise RuntimeError("LongCat-Video-Avatar continuation requires full audio embeddings.")
-                segment_frames = output[0]
-                current_video = [
-                    Image.fromarray((np.clip(frame, 0.0, 1.0) * 255).round().astype("uint8"))
-                    for frame in segment_frames
-                ]
-                all_generated_frames = list(current_video)
-                ref_latent = latent[:, :, :1].clone()
-                audio_start_idx = 0
-                for _segment_idx in range(1, num_segments):
-                    audio_start_idx += self.audio_stride * (num_frames - num_cond_frames)
-                    segment_audio_emb = self._slice_multi_audio_embeddings(
-                        full_audio_embs,
-                        audio_start_idx=audio_start_idx,
-                        num_frames=num_frames,
-                    )
-                    segment_output, latent = self._generate_avc(
-                        video=current_video,
-                        video_latent=latent,
-                        prompt=inputs["prompt"],
-                        negative_prompt=inputs["negative_prompt"],
-                        audio_emb=segment_audio_emb,
-                        height=height,
-                        width=width,
-                        num_frames=num_frames,
-                        num_cond_frames=num_cond_frames,
-                        steps=steps,
-                        text_guidance_scale=text_guidance_scale,
-                        audio_guidance_scale=audio_guidance_scale,
-                        use_distill=use_distill,
-                        generator=generator,
-                        latents=None,
-                        max_sequence_length=max_sequence_length,
-                        resize_mode=resize_mode,
-                        ref_latent=ref_latent,
-                        ref_img_index=ref_img_index,
-                        mask_frame_range=mask_frame_range,
-                        ref_target_masks=ref_target_masks,
-                        use_kv_cache=use_kv_cache,
-                        offload_kv_cache=offload_kv_cache,
-                    )
-                    new_video = [
-                        Image.fromarray((np.clip(frame, 0.0, 1.0) * 255).round().astype("uint8"))
-                        for frame in segment_output[0]
-                    ]
-                    all_generated_frames.extend(new_video[num_cond_frames:])
-                    current_video = new_video
-                frames = np.asarray([np.asarray(frame) for frame in all_generated_frames], dtype=np.uint8)
-            else:
-                frames = (np.clip(output[0], 0.0, 1.0) * 255).round().astype("uint8")
 
-        if stage == "at2v":
+        if num_segments > 1:
+            if full_audio_embs is None or latent is None:
+                raise RuntimeError("LongCat-Video-Avatar continuation requires full audio embeddings and latents.")
+            segment_frames = output[0]
+            current_video = [
+                Image.fromarray((np.clip(frame, 0.0, 1.0) * 255).round().astype("uint8")) for frame in segment_frames
+            ]
+            all_generated_frames = list(current_video)
+            ref_latent = latent[:, :, :1].clone()
+            audio_start_idx = 0
+            for _segment_idx in range(1, num_segments):
+                audio_start_idx += self.audio_stride * (num_frames - num_cond_frames)
+                segment_audio_emb = self._slice_multi_audio_embeddings(
+                    full_audio_embs,
+                    audio_start_idx=audio_start_idx,
+                    num_frames=num_frames,
+                )
+                segment_output, latent = self._generate_avc(
+                    video=current_video,
+                    video_latent=latent,
+                    prompt=inputs["prompt"],
+                    negative_prompt=inputs["negative_prompt"],
+                    audio_emb=segment_audio_emb,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    num_cond_frames=num_cond_frames,
+                    steps=steps,
+                    text_guidance_scale=text_guidance_scale,
+                    audio_guidance_scale=audio_guidance_scale,
+                    use_distill=use_distill,
+                    generator=generator,
+                    latents=None,
+                    max_sequence_length=max_sequence_length,
+                    resize_mode=resize_mode,
+                    ref_latent=ref_latent,
+                    ref_img_index=ref_img_index,
+                    mask_frame_range=mask_frame_range,
+                    ref_target_masks=ref_target_masks,
+                    use_kv_cache=use_kv_cache,
+                    offload_kv_cache=offload_kv_cache,
+                )
+                new_video = [
+                    Image.fromarray((np.clip(frame, 0.0, 1.0) * 255).round().astype("uint8"))
+                    for frame in segment_output[0]
+                ]
+                all_generated_frames.extend(new_video[num_cond_frames:])
+                current_video = new_video
+            frames = np.asarray([np.asarray(frame) for frame in all_generated_frames], dtype=np.uint8)
+        else:
             frames = (np.clip(output[0], 0.0, 1.0) * 255).round().astype("uint8")
         return DiffusionOutput(
             output=torch.from_numpy(frames),

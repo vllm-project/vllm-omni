@@ -119,6 +119,57 @@ python end2end.py \
   --output official_asset_longcat_avatar_ai2v.mp4
 ```
 
+## Support Matrix
+
+| Mode | Speakers | Image required | AVC continuation | Validation |
+| --- | --- | --- | --- | --- |
+| AT2V | Single | No | Yes | Example smoke, native path |
+| AI2V | Single | Yes | Yes | Example smoke, e2e, full-audio Modal validation |
+| AT2V | Multi | Not supported | Not supported | Guarded with an explicit error |
+| AI2V | Multi | Yes | Yes | Example smoke, e2e, official multi-example validation |
+
+Multi-speaker Avatar requires AI2V because speaker bounding boxes and masks
+are defined on a reference image. AVC continuation uses full-audio embeddings
+only when `--num-segments` is greater than `1` or set to `auto`; single-segment
+AT2V/AI2V keeps the shorter first-segment audio path.
+
+## Official Single-Speaker AVC Continuation
+
+Use `--num-segments 5` with the official single-speaker JSON case to match
+the official Avatar 1.5 AVC example style.
+
+```bash
+python end2end.py \
+  --model "$AVATAR_MODEL" \
+  --base-model-dir "$BASE_MODEL_DIR" \
+  --input-json "$LONGCAT_VIDEO_ASSET_DIR/single_example_1.json" \
+  --num-frames 93 \
+  --num-cond-frames 13 \
+  --num-segments 5 \
+  --num-inference-steps 8 \
+  --output official_asset_longcat_avatar_single_example_1_ai2v_5seg.mp4
+```
+
+### Optional Full-Audio AVC Validation
+
+This runs AVC continuation until the full official audio is covered. It is a
+slow archival validation path, not a regular smoke test.
+
+```bash
+python end2end.py \
+  --model "$AVATAR_MODEL" \
+  --base-model-dir "$BASE_MODEL_DIR" \
+  --input-json "$LONGCAT_VIDEO_ASSET_DIR/single_example_1.json" \
+  --num-frames 93 \
+  --num-cond-frames 13 \
+  --num-segments auto \
+  --num-inference-steps 8 \
+  --output official_asset_longcat_avatar_single_example_1_ai2v_auto_full.mp4
+```
+
+Observed on Modal H100: about 24m28s end to end for the full official
+`single_example_1.json` audio with 8 inference steps.
+
 ## Official Multi-Speaker AI2V Smoke Test
 
 The downloaded asset set also includes multi-speaker Avatar cases in
@@ -190,8 +241,8 @@ python end2end.py \
 
 - `--stage`: `at2v` for audio-to-video, `ai2v` for audio-and-image-to-video.
 - `--resolution`: `480p` or `720p`.
-- `--input-json`: official LongCat Avatar JSON case. This is used for multi-speaker AI2V examples.
-- `--num-segments`: number of AVC segments, or `auto` to cover the full multi-speaker audio.
+- `--input-json`: official LongCat Avatar JSON case. This is used for single-speaker and multi-speaker AI2V examples.
+- `--num-segments`: number of AVC segments, or `auto` to cover the full input audio.
 - `--num-cond-frames`: previous-frame conditioning window for AVC continuation.
 - `--use-int8` / `--no-use-int8`: load the official INT8 Avatar DiT weights by default, or full precision weights.
 - `--use-distill` / `--no-use-distill`: enable the official distilled LoRA path by default.

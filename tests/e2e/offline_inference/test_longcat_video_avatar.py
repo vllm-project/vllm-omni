@@ -221,6 +221,34 @@ def test_longcat_video_avatar_multi_speaker_ai2v(
     [_omni_runner_param()],
     indirect=True,
 )
+def test_longcat_video_avatar_single_speaker_ai2v_avc_continuation(
+    omni_runner: OmniRunner,
+    synthetic_audio_path,
+    synthetic_image_path,
+):
+    frames = _generate_avatar_frames(
+        omni_runner,
+        stage="ai2v",
+        audio_path=synthetic_audio_path,
+        image_path=synthetic_image_path,
+        num_frames=17,
+        sampling_extra_args={
+            "num_segments": 2,
+            "num_cond_frames": 5,
+            "use_kv_cache": True,
+        },
+    )
+    _assert_frames(frames, expected_size=(768, 512), expected_count=29)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
+@pytest.mark.parametrize(
+    "omni_runner",
+    [_omni_runner_param()],
+    indirect=True,
+)
 def test_longcat_video_avatar_multi_speaker_ai2v_avc_continuation(
     omni_runner: OmniRunner,
     synthetic_multi_audio_paths,
