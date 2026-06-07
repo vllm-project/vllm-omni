@@ -53,7 +53,7 @@ def build_payload(
 ) -> dict:
     """Build the /v1/audio/speech request payload.
 
-    Fish Speech has no built-in speakers — omit ``voice`` so the model
+    Fish Speech has no built-in speakers; omit ``voice`` so the model
     generates with a random timbre (controllable via text tags like
     ``[cool]``, ``[warm]``, etc.).  When ``ref_audio`` is supplied we
     enter voice-cloning mode instead.
@@ -199,7 +199,7 @@ def build_interface(api_base: str, stream_chunk_seconds: float = 0.5):
                 with gr.Accordion("Voice Cloning (optional)", open=False):
                     gr.Markdown(
                         "Upload or link a short reference audio (10-30s) and provide its transcript to clone the voice. "
-                        "Leave empty for random timbre — use text tags like `[cool]`, `[warm]`, `[happy]` to steer the output."
+                        "Leave empty for random timbre; use text tags like `[cool]`, `[warm]`, `[happy]` to steer the output."
                     )
                     ref_audio = gr.Audio(
                         label="Reference Audio",
