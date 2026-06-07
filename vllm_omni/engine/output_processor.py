@@ -1,11 +1,7 @@
 from typing import Any
 
-import numpy as np
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    split_routed_experts,
-)
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
@@ -17,7 +13,7 @@ from vllm.v1.engine.output_processor import (
     RequestState,
 )
 from vllm.v1.engine.parallel_sampling import ParentRequest
-from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 
 from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.engine.output_modality import DRAINABLE_MODALITIES
@@ -39,12 +35,20 @@ class OmniRequestState(RequestState):
         *args,
         **kwargs,
     ):
+        arrival_time = kwargs.get("arrival_time")
+        if arrival_time is None and len(args) > 12:
+            arrival_time = args[12]
         super().__init__(*args, **kwargs)
+        self.native_text_stats = RequestStateStats(arrival_time=float(arrival_time or 0.0))
         # Omni-specific: multimodal output accumulation
         # NOTE: Keys in mm_accumulated matter, because they dictate which
         # outputs are drained (i.e., only drain modality keys, don't drain
         # hidden states).
         self.mm_accumulated: dict[str, Any] = {}
+
+    def apply_streaming_update(self, update) -> None:
+        super().apply_streaming_update(update)
+        self.native_text_stats.arrival_time = update.arrival_time
 
     @staticmethod
     def _to_cpu(x):
@@ -172,7 +176,6 @@ class OmniRequestState(RequestState):
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
-        routed_experts: np.ndarray | None = None,
     ) -> OmniRequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
 
@@ -199,7 +202,6 @@ class OmniRequestState(RequestState):
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
-                routed_experts,
             )
 
         finished = finish_reason is not None
@@ -234,16 +236,7 @@ class OmniRequestState(RequestState):
 
         external_req_id = self.external_req_id
 
-        # Split routing data into prompt and generation portions, matching
-        # upstream make_request_output behaviour.
-        prompt_routed_experts = None
-        gen_routed_experts = None
-        if routed_experts is not None:
-            prompt_len = len(self.prompt_token_ids) if self.prompt_token_ids else 0
-            num_gen = self.detokenizer.num_output_tokens() if self.detokenizer is not None else None
-            prompt_routed_experts, gen_routed_experts = split_routed_experts(routed_experts, prompt_len, num_gen)
-
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, gen_routed_experts)
+        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
 
         if self.parent_req is None:
             outputs = [output]
@@ -258,7 +251,6 @@ class OmniRequestState(RequestState):
             outputs,
             finished,
             kv_transfer_params,
-            prompt_routed_experts,
         )
 
     def _new_completion_output(
@@ -266,10 +258,11 @@ class OmniRequestState(RequestState):
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
-        routed_experts: np.ndarray | None = None,
     ) -> Any:
         # Reuse base text/logprobs logic, then annotate with pooling_result.
-        base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason, routed_experts)
+        # Note: upstream _new_completion_output no longer accepts routed_experts
+        # as a parameter; it reads from ``self.routed_experts_chunks`` internally.
+        base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
 
         # Inter-stage processors need the full cumulative token sequence.
         # In DELTA mode, base_output.token_ids only has the latest step's
@@ -333,6 +326,32 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             tracing_enabled=tracing_enabled,
         )
         self.engine_core_output_type = engine_core_output_type
+        self._native_text_metrics_by_request: dict[str, dict[str, Any]] = {}
+
+    def _native_text_metric_record(self, request_id: str) -> dict[str, Any]:
+        return self._native_text_metrics_by_request.setdefault(
+            request_id,
+            {
+                "vllm_ttft_ms": 0.0,
+                "vllm_tpot_ms": 0.0,
+                "vllm_itl_ms": 0.0,
+                "vllm_itls_ms": [],
+            },
+        )
+
+    def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
+        return self._native_text_metrics_by_request.pop(request_id, {})
+
+    def abort_requests(self, request_ids, internal: bool) -> list[str]:
+        request_ids = list(request_ids)
+        for request_id in request_ids:
+            if internal:
+                req_state = self.request_states.get(request_id)
+                if req_state is not None:
+                    self._native_text_metrics_by_request.pop(req_state.external_req_id, None)
+            else:
+                self._native_text_metrics_by_request.pop(request_id, None)
+        return super().abort_requests(request_ids, internal)
 
     def add_request(
         self,
@@ -386,6 +405,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
         external_req_id = getattr(req_state, "external_req_id", None)
         if external_req_id is not None:
+            self._native_text_metrics_by_request.pop(external_req_id, None)
             request_ids = self.external_req_ids.get(external_req_id)
             if request_ids is not None:
                 self.external_req_ids[external_req_id] = [rid for rid in request_ids if rid != request_id]
@@ -416,4 +436,74 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             engine_core_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
+        )
+
+    def _update_stats_from_output(
+        self,
+        req_state: RequestState,
+        engine_core_output: EngineCoreOutput,
+        engine_core_timestamp: float | None,
+        iteration_stats: IterationStats | None,
+    ):
+        was_prefilling = req_state.is_prefilling
+        native_stats = req_state.native_text_stats if isinstance(req_state, OmniRequestState) else None
+        previous_last_token_ts = native_stats.last_token_ts if native_stats is not None else 0.0
+
+        super()._update_stats_from_output(
+            req_state,
+            engine_core_output,
+            engine_core_timestamp,
+            None,
+        )
+
+        if iteration_stats is None or engine_core_timestamp is None or native_stats is None:
+            return
+
+        iteration_stats.update_from_output(
+            engine_core_output,
+            engine_core_timestamp,
+            was_prefilling,
+            native_stats,
+            self.lora_states,
+            req_state.lora_name,
+        )
+        record = self._native_text_metric_record(req_state.external_req_id)
+        if was_prefilling:
+            record["vllm_ttft_ms"] = max(float(native_stats.first_token_latency) * 1000.0, 0.0)
+            return
+
+        if previous_last_token_ts > 0:
+            itl_ms = max((engine_core_timestamp - previous_last_token_ts) * 1000.0, 0.0)
+            itls_ms = record.setdefault("vllm_itls_ms", [])
+            itls_ms.append(itl_ms)
+            record["vllm_itl_ms"] = sum(itls_ms) / float(len(itls_ms))
+
+    def _update_stats_from_finished(
+        self,
+        req_state: RequestState,
+        finish_reason: FinishReason | None,
+        iteration_stats: IterationStats | None,
+    ):
+        super()._update_stats_from_finished(req_state, finish_reason, None)
+
+        native_stats = req_state.native_text_stats if isinstance(req_state, OmniRequestState) else None
+        if iteration_stats is None or native_stats is None or finish_reason is None:
+            return
+
+        iteration_stats.update_from_finished_request(
+            finish_reason=finish_reason,
+            request_id=req_state.external_req_id,
+            num_prompt_tokens=req_state.prompt_len,
+            max_tokens_param=req_state.max_tokens_param,
+            req_stats=native_stats,
+            num_cached_tokens=req_state.num_cached_tokens,
+        )
+        if not iteration_stats.finished_requests:
+            return
+
+        finished_request = iteration_stats.finished_requests[-1]
+        if finished_request.request_id != req_state.external_req_id:
+            return
+        self._native_text_metric_record(req_state.external_req_id)["vllm_tpot_ms"] = (
+            float(finished_request.mean_time_per_output_token) * 1000.0
         )

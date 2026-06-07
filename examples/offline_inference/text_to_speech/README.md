@@ -271,6 +271,14 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --lang zh
 ```
 
+### Seed for Reproducibility
+```bash
+python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
+    --model k2-fsa/OmniVoice \
+    --text "Hello, this is a test." \
+    --seed 42
+```
+
 ### Notes
 - Stage 0 (Generator): Qwen3-0.6B with 32-step iterative unmasking.
 - Stage 1 (Decoder): HiggsAudioV2 RVQ + DAC at 24 kHz.

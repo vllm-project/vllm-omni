@@ -1,26 +1,21 @@
 from __future__ import annotations
 
-import base64
 import copy
-import io
-import os
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
-from urllib.parse import urlparse
 
 import numpy as np
-import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer
+from transformers import AutoFeatureExtractor
 from transformers.activations import ACT2FN
-from transformers.utils.hub import cached_file
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
 from vllm.multimodal.audio import AudioResampler
@@ -28,20 +23,21 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.utils.audio import mel_filter_bank
-from vllm_omni.utils.speaker_cache import get_speaker_cache
+from vllm_omni.utils.speaker_cache import (
+    get_speaker_cache,
+    iter_custom_voice_profiles,
+    load_validated_profile_tensors,
+)
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
+from .prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
-from .qwen3_tts_tokenizer import Qwen3TTSTokenizer
+from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
+from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Encoder
 
 logger = init_logger(__name__)
 
 _TRAILING_TEXT_COMPACT_MIN_FRAMES = 64
-_PRECOMPUTED_REF_CODE_KEY = "precomputed_ref"
-_NORMALIZED_REF_AUDIO_KEY = "_qwen3_tts_normalized_ref_audio"
-_PRECOMPUTED_TEXT_IDS_KEY = "_qwen3_tts_text_ids"
-_PRECOMPUTED_REF_IDS_KEY = "_qwen3_tts_ref_ids"
 
 
 # ---------------------------------------------------------------------------
@@ -248,65 +244,6 @@ class Qwen3TTSSpeakerEncoder(torch.nn.Module):
         return hidden_states.squeeze(-1)
 
 
-# ---- Audio utilities ----
-
-
-def _dynamic_range_compression(x, c=1, clip_val=1e-5):
-    return torch.log(torch.clamp(x, min=clip_val) * c)
-
-
-def mel_spectrogram(
-    y: torch.Tensor,
-    n_fft: int,
-    num_mels: int,
-    sampling_rate: int,
-    hop_size: int,
-    win_size: int,
-    fmin: int,
-    fmax: int | None = None,
-    center: bool = False,
-    mel_basis: torch.Tensor | None = None,
-    hann_window: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Calculate mel spectrogram of an input signal using torchaudio mel filterbank and torch STFT."""
-    if torch.min(y) < -1.0:
-        logger.warning("Min value of input waveform signal is %s", torch.min(y))
-    if torch.max(y) > 1.0:
-        logger.warning("Max value of input waveform signal is %s", torch.max(y))
-    device = y.device
-    if mel_basis is None:
-        mel_basis = mel_filter_bank(
-            sr=sampling_rate,
-            n_fft=n_fft,
-            n_mels=num_mels,
-            fmin=fmin,
-            fmax=fmax,
-        ).to(device)
-    elif mel_basis.device != device:
-        mel_basis = mel_basis.to(device)
-    if hann_window is None:
-        hann_window = torch.hann_window(win_size, device=device)
-    elif hann_window.device != device:
-        hann_window = hann_window.to(device)
-    padding = (n_fft - hop_size) // 2
-    y = torch.nn.functional.pad(y.unsqueeze(1), (padding, padding), mode="reflect").squeeze(1)
-    spec = torch.stft(
-        y,
-        n_fft,
-        hop_length=hop_size,
-        win_length=win_size,
-        window=hann_window,
-        center=center,
-        pad_mode="reflect",
-        normalized=False,
-        onesided=True,
-        return_complex=True,
-    )
-    spec = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1) + 1e-9)
-    mel_spec = torch.matmul(mel_basis, spec)
-    return _dynamic_range_compression(mel_spec)
-
-
 # ---------------------------------------------------------------------------
 # Main AR Talker model
 # ---------------------------------------------------------------------------
@@ -354,6 +291,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
+        # Qwen3-TTS postprocess() only reads hidden_states[-1, :]. On a prefix-
+        # cache hit, the last hidden state is in the newly computed tail, so
+        # reconstructing the full cached_prefix + new_tail span is wasted work.
+        # Opt out of the per-step GPU->CPU hidden-state cache write and merged-
+        # tensor read; postprocess receives the tail-only slice instead, which
+        # avoids ~18 ms merge + ~6 ms write per step (Sy0307 profile, #3665).
+        self.requires_full_prefix_cached_hidden_states = False
+        # ``codes.audio`` is only needed for future prefix-hit reconstruction
+        # after a request has produced codec rows. Keep per-step rows on GPU and
+        # materialize the CPU OmniTensorPrefixCache entry once at completion.
+        self.deferred_prefix_cache_mm_keys = {"codes.audio"}
         # Used by OmniGPUModelRunner for the GPU-side MTP fast-path.
         self.mtp_hidden_size = int(self.talker_config.hidden_size)
         # OmniGPUModelRunner will store talker_mtp output under this key in
@@ -434,19 +382,109 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("codes", "audio"),
             ("hidden_states", "last"),
-            ("embed", "tts_pad"),
             ("hidden_states", "trailing_text"),
         }
 
-        # Tokenizer for prompt building.
-        self._tokenizer = None
-        self._speech_tokenizer: Qwen3TTSTokenizer | None = None
+        # ``text_proj(text_emb(tts_pad_token_id))`` is request-independent —
+        # it depends only on frozen ``text_embedding`` / ``text_projection``
+        # weights, so we precompute it once in :meth:`_init_runtime_buffers`
+        # (called from :meth:`load_weights`) and reuse the same buffer at
+        # every prefill and decode step instead of round-tripping it through
+        # the per-request ``info_dict``. Declared here as zeros so the
+        # attribute exists under ``load_format: dummy`` (which bypasses
+        # ``load_weights`` entirely and leaves the value uninitialized).
+        model_dtype = getattr(vllm_config.model_config, "dtype", torch.bfloat16)
+        self.register_buffer(
+            "_tts_pad_embed",
+            torch.zeros(1, int(self.talker_config.hidden_size), dtype=model_dtype),
+            persistent=False,
+        )
+
+        tokenizer_config = Qwen3TTSTokenizerV2Config.from_pretrained(
+            self.model_path,
+            subfolder="speech_tokenizer",
+        )
+        self.encoder = Qwen3TTSTokenizerV2Encoder._from_config(
+            tokenizer_config.encoder_config,
+        )
+        self.encoder.eval()
+        self.encoder.to(dtype=torch.bfloat16)
+        self._encoder_valid_num_quantizers = int(tokenizer_config.encoder_valid_num_quantizers)
+        self._encoder_downsample_rate = int(tokenizer_config.encode_downsample_rate)
+
+        self._encoder_feature_extractor = AutoFeatureExtractor.from_pretrained(
+            self.model_path,
+            subfolder="speech_tokenizer",
+        )
 
         self._speaker_cache = get_speaker_cache()
         raw_subtalker_sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
         self._subtalker_sampling_params: dict[str, Any] = (
             dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
         )
+
+        self._stacked_codec_embed: torch.Tensor | None = None
+
+        # Stand-alone wrapper around the embedding layers, encoders and
+        # tokenizers required to assemble a talker prefill prompt. Owns the
+        # text + speech tokenizers (loaded lazily on first use) and the
+        # per-ref-audio / resampler caches, so they don't leak onto the
+        # talker class. Other talker variants can construct their own builder
+        # with the same set of dependencies and reuse ``build_prompt_embeds``
+        # verbatim.
+        self._prompt_builder = Qwen3TTSPromptEmbedsBuilder(
+            config=self.config,
+            talker_config=self.talker_config,
+            model_path=self.model_path,
+            text_embedding=self.text_embedding,
+            text_projection=self.text_projection,
+            codec_embed=self.embed_input_ids,
+            residual_code_embeddings=lambda: self.code_predictor.get_input_embeddings(),
+            speaker_encoder=self.speaker_encoder,
+            tts_pad_embed=self._tts_pad_embed,
+            encode_ref_audio_batch=self._encode_ref_audio_batch,
+            speaker_cache=self._speaker_cache,
+        )
+        self._load_custom_voice_profiles()
+
+    # -------------------- custom voice profiles --------------------
+
+    def _load_custom_voice_profiles(self) -> None:
+        """Preload offline Qwen3-TTS custom voice profiles into speaker cache."""
+        custom_voice_dir = getattr(self.config, "custom_voice_dir", None)
+        if not custom_voice_dir:
+            return
+
+        expected_dim = int(getattr(self.config.speaker_encoder_config, "enc_dim", 0) or 0)
+        loaded = 0
+        for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type="qwen3_tts"):
+            tensors = load_validated_profile_tensors(
+                profile,
+                expected_model_type="qwen3_tts",
+                qwen3_embedding_dim=expected_dim,
+            )
+            if tensors is None:
+                continue
+
+            speaker_embedding = tensors["speaker_embedding"].reshape(-1).contiguous().cpu()
+            mode = str(profile.get("mode") or "xvec").lower()
+            ref_code = tensors.get("ref_code")
+            artifacts: dict[str, Any] = {
+                "ref_spk_embedding": speaker_embedding,
+                "ref_code": ref_code.contiguous().cpu() if isinstance(ref_code, torch.Tensor) else None,
+                "icl_mode": mode == "icl",
+                "ref_text": profile.get("ref_text"),
+            }
+            key = self._speaker_cache.make_cache_key(
+                profile["voice_name_lower"],
+                model_type=f"qwen3_tts_{mode}",
+                created_at=0,
+            )
+            self._speaker_cache.put(key, artifacts)
+            loaded += 1
+
+        if loaded:
+            logger.info("Loaded %d precomputed Qwen3-TTS custom voice profile(s) from %s", loaded, custom_voice_dir)
 
     # -------------------- vLLM required hooks --------------------
 
@@ -519,21 +557,22 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             ref_len = meta.get("ref_code_len")
             if ref_len is None:
                 continue
+            if not isinstance(ac, torch.Tensor):
+                continue
+            span_len = int(ac.shape[0])
             if isinstance(ref_len, torch.Tensor):
                 if ref_len.numel() == 0:
                     raise ValueError("ref_code_len is an empty tensor")
-                ref_len_val = int(ref_len.reshape(-1)[-1].item())
-            elif isinstance(ref_len, list):
+                ref_len_tail = ref_len.reshape(-1)[-1:].to(dtype=torch.int32, device=ac.device)
+                ref_code_len_list.append(ref_len_tail.expand(span_len).contiguous())
+                continue
+            if isinstance(ref_len, list):
                 if len(ref_len) != 1:
                     raise ValueError(f"ref_code_len must be scalar or 1-element list, got len={len(ref_len)}")
                 ref_len_val = int(ref_len[0])
             else:
                 ref_len_val = int(ref_len)
-            if isinstance(ac, torch.Tensor):
-                # Emit ref_code_len per-token span for runner slicing (consumer takes the last value).
-                ref_code_len_list.append(
-                    torch.full((int(ac.shape[0]),), ref_len_val, dtype=torch.int32, device=ac.device)
-                )
+            ref_code_len_list.append(torch.full((span_len,), ref_len_val, dtype=torch.int32, device=ac.device))
 
         if not audio_codes_list:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
@@ -598,32 +637,30 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         else:
             codec_streaming = task_type == "Base"
 
+        # ``tts_pad_embed`` is a request-independent constant — see
+        # :meth:`_init_runtime_buffers`. Materialize once on the right
+        # device/dtype and reuse for both the prefill placeholder padding
+        # and the decode text-step fallback below.
+        tts_pad_embed = self._tts_pad_embed.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+
         if is_prefill:
             # Prefill (prompt embeddings)
             prompt_embeds_cpu = embed.get("prefill")
-            tts_pad_embed_cpu = embed.get("tts_pad")
-            tts_pad_embed = None
-            if isinstance(tts_pad_embed_cpu, torch.Tensor) and tts_pad_embed_cpu.numel() > 0:
-                tts_pad_embed = tts_pad_embed_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
             # First prefill round: prompt_embeds_cpu is not yet populated.
             # Subsequent prefill rounds (multi-chunk): prompt_embeds_cpu is a Tensor stored by the first round.
             is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
             if is_first_prefill:
-                full_prompt_embeds, tailing_text_hidden, tts_pad_embed, ref_code_len, ref_code = (
-                    self._build_prompt_embeds(task_type=task_type, info_dict=info_dict)
+                full_prompt_embeds, tailing_text_hidden, ref_code_len, ref_code = (
+                    self._prompt_builder.build_prompt_embeds(task_type=task_type, info_dict=info_dict)
                 )
                 # Store full prompt embeddings on CPU (large, prefill-only).
-                # tailing_text_hidden and tts_pad_embed stay on GPU (gpu_resident_buffer_keys).
+                # tailing_text_hidden stays on GPU (gpu_resident_buffer_keys).
                 prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
                 info_update: OmniPayload = {
-                    "embed": {
-                        "prefill": prompt_embeds_cpu,
-                        "tts_pad": tts_pad_embed.detach(),
-                    },
+                    "embed": {"prefill": prompt_embeds_cpu},
                     "hidden_states": {"trailing_text": tailing_text_hidden.detach()},
                     "meta": {
-                        "talker_prefill_offset": 0,
                         "talker_text_offset": 0,
                         "codec_streaming": codec_streaming,
                     },
@@ -632,39 +669,27 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     info_update.setdefault("codes", {})["ref"] = ref_code.detach().to("cpu").contiguous()
                 if ref_code_len is not None:
                     info_update["meta"]["ref_code_len"] = int(ref_code_len)
-                # Always return a span_len slice; if the scheduled placeholder is longer, pad with tts_pad_embed.
-                # This preserves placeholder/embedding alignment.
-                offset = 0
-                s = 0
-                e = span_len
-                take = prompt_embeds_cpu[s:e]
-                if int(take.shape[0]) < span_len:
-                    pad_n = int(span_len - int(take.shape[0]))
-                    pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
-                    take = torch.cat([take, pad_rows], dim=0)
-                prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
-                info_update["meta"]["talker_prefill_offset"] = int(offset + span_len)
+                # First prefill: source the slice offset from `_omni_num_computed_tokens`
+                # so cache-recovery (prefill replay at a later offset) lands on the right
+                # slice of the stored embeddings. Subsequent chunks below advance from
+                # `talker_prefill_offset` written here.
+                offset = max(0, int(info_dict.get("_omni_num_computed_tokens", 0) or 0))
             else:
                 # Subsequent prefill chunk: slice from stored embeddings at running offset.
-                if tts_pad_embed is None:
-                    raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must initialize it.")
-                offset = int(meta.get("talker_prefill_offset", 0) or 0)
-                if offset < 0:
-                    offset = 0
-                s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
-                e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
-                take = prompt_embeds_cpu[s:e]
-                if int(take.shape[0]) < span_len:
-                    pad_n = int(span_len - int(take.shape[0]))
-                    pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
-                    take = torch.cat([take, pad_rows], dim=0)
-                prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
-                info_update = {
-                    "meta": {
-                        "talker_prefill_offset": int(offset + span_len),
-                        "codec_streaming": codec_streaming,
-                    }
-                }
+                offset = max(0, int(meta.get("talker_prefill_offset", 0) or 0))
+                info_update = {"meta": {"codec_streaming": codec_streaming}}
+
+            # Always return a span_len slice; if the scheduled placeholder is longer than what
+            # the prompt actually fills, pad with tts_pad_embed (preserves placeholder/embedding alignment).
+            s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
+            e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
+            take = prompt_embeds_cpu[s:e]
+            if int(take.shape[0]) < span_len:
+                pad_n = int(span_len - int(take.shape[0]))
+                pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
+                take = torch.cat([take, pad_rows], dim=0)
+            prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
+            info_update["meta"]["talker_prefill_offset"] = int(offset + span_len)
 
             # When inputs_embeds is set, token ids are ignored by the model but must stay in-vocab for vLLM bookkeeping.
             input_ids_out = input_ids.clone()
@@ -680,11 +705,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         # Decode: span_len == 1
         # Pop one text-step vector from tailing_text_hidden queue.
-        # These tensors stay on GPU via gpu_resident_buffer_keys - .to() is a no-op.
-        tts_pad_embed_buf = embed.get("tts_pad")
-        if not isinstance(tts_pad_embed_buf, torch.Tensor):
-            raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must run first.")
-        tts_pad_embed = tts_pad_embed_buf.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+        # ``tts_pad_embed`` was materialized above from :attr:`_tts_pad_embed`
+        # (request-independent buffer) — no per-request fetch needed.
 
         tail = hs.get("trailing_text")
         text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
@@ -720,9 +742,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             next_text_offset = text_offset
 
         last_hidden = hs.get("last")
-        if not isinstance(last_hidden, torch.Tensor):
-            raise RuntimeError("Missing hidden_states['last'] in additional_information; postprocess must run.")
-        past_hidden = last_hidden.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+        if isinstance(last_hidden, torch.Tensor):
+            past_hidden = last_hidden.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+        else:
+            # Defensive: EOS step row is zeroed by the invalid-layer-0 mask and filtered downstream.
+            past_hidden = torch.zeros_like(text_step)
 
         # Use OmniGPUModelRunner talker_mtp fast-path for residual codebooks and per-step inputs_embeds update.
         last_id_hidden = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).to(
@@ -760,6 +784,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         device = input_ids_flat.device
         dtype = torch.bfloat16
+        # Request-independent constant (see :meth:`_init_runtime_buffers`) —
+        # compute once for the batch instead of fetching it per request from
+        # ``info_dict["embed"]["tts_pad"]``.
+        tts_pad_embed = self._tts_pad_embed.to(device=device, dtype=dtype).reshape(1, -1)
         past_hidden_list: list[torch.Tensor] = []
         text_step_list: list[torch.Tensor] = []
         updates: list[dict[str, Any]] = []
@@ -773,7 +801,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 info_dict = merged
 
             payload: OmniPayload = info_dict
-            embed = payload.get("embed", {})
             hs = payload.get("hidden_states", {})
             meta = payload.get("meta", {})
 
@@ -791,11 +818,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 codec_streaming = codec_streaming_raw
             else:
                 codec_streaming = task_type == "Base"
-
-            tts_pad_embed_buf = embed.get("tts_pad")
-            if not isinstance(tts_pad_embed_buf, torch.Tensor):
-                raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must run first.")
-            tts_pad_embed = tts_pad_embed_buf.to(device=device, dtype=dtype).reshape(1, -1)
 
             tail = hs.get("trailing_text")
             text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
@@ -860,647 +882,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         last = hidden_states[-1, :].detach()
         return {"hidden_states": {"last": last}}
 
-    # -------------------- prompt construction helpers --------------------
-
-    def _get_tokenizer(self):
-        if self._tokenizer is None:
-            import transformers
-
-            kwargs = dict(trust_remote_code=True, use_fast=True)
-            if transformers.__version__ < "5":
-                kwargs["fix_mistral_regex"] = True
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_path, **kwargs)
-            self._tokenizer.padding_side = "left"
-        return self._tokenizer
-
-    @staticmethod
-    def _build_assistant_text(text: str) -> str:
-        return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-
-    @staticmethod
-    def _build_ref_text(text: str) -> str:
-        return f"<|im_start|>assistant\n{text}<|im_end|>\n"
-
-    @staticmethod
-    def _build_instruct_text(instruct: str) -> str:
-        return f"<|im_start|>user\n{instruct}<|im_end|>\n"
-
-    @staticmethod
-    def estimate_prompt_len_from_additional_information(
-        additional_information: dict[str, Any] | None,
-        *,
-        task_type: str,
-        tokenize_prompt: Callable[[str], list[int]],
-        codec_language_id: Mapping[str, int] | None,
-        spk_is_dialect: Mapping[str, object] | None,
-        estimate_ref_code_len: Callable[[object], int | None] | None = None,
-    ) -> int:
-        """Compute Stage-0 placeholder prompt length (length-only mirror of `_build_prompt_embeds()`).
-        It must match the model-side `inputs_embeds` length to avoid extra padding and quality drop."""
-
-        def _first(x: object, default: object) -> object:
-            if isinstance(x, list):
-                return x[0] if x else default
-            return x if x is not None else default
-
-        info: dict[str, Any] = additional_information or {}
-        text = _first(info.get("text"), "")
-        language = _first(info.get("language"), "Auto")
-        speaker = _first(info.get("speaker"), "").lower().strip()
-        instruct = _first(info.get("instruct"), "")
-        non_streaming_mode_raw = _first(info.get("non_streaming_mode"), None)
-
-        if isinstance(non_streaming_mode_raw, bool):
-            non_streaming_mode = non_streaming_mode_raw
-        else:
-            # Official defaults: CustomVoice/VoiceDesign -> non_streaming_mode=True; Base -> False.
-            non_streaming_mode = task_type in ("CustomVoice", "VoiceDesign")
-
-        if not isinstance(text, str):
-            text = ""
-        if not isinstance(instruct, str):
-            instruct = ""
-        if not isinstance(language, str):
-            language = "Auto"
-
-        instruct_len = 0
-        if instruct.strip():
-            instruct_text = Qwen3TTSTalkerForConditionalGeneration._build_instruct_text(instruct)
-            instruct_len = len(tokenize_prompt(instruct_text))
-
-        # ---- codec prefix portion (matches _build_prompt_embeds) ----
-        language_id = None
-        if language.lower() != "auto" and codec_language_id:
-            language_id = codec_language_id.get(language.lower())
-        if (
-            language_id is None
-            and codec_language_id
-            and spk_is_dialect
-            and isinstance(language, str)
-            and language.lower() in ("chinese", "auto")
-            and isinstance(speaker, str)
-            and speaker.strip()
-        ):
-            dialect = spk_is_dialect.get(speaker.lower())
-            if isinstance(dialect, str) and dialect:
-                language_id = codec_language_id.get(dialect)
-        prefill_len = 3 if language_id is None else 4
-
-        speaker_len = 1 if task_type in ("CustomVoice", "Base") else 0
-        codec_input_len = prefill_len + speaker_len + 2  # + [codec_pad, codec_bos]
-        codec_prefix_len = codec_input_len - 1  # codec_input[:-1] + tts_bos
-
-        # Role header: input_ids[:, :3] in model.
-        role_len = 3
-        prompt_len = instruct_len + role_len + codec_prefix_len
-
-        # ---- text conditioning portion (matches _build_prompt_embeds) ----
-        assistant_text = Qwen3TTSTalkerForConditionalGeneration._build_assistant_text(text)
-        assistant_len = len(tokenize_prompt(assistant_text))
-        if assistant_len < 8:
-            raise ValueError(f"Unexpected assistant prompt length: {assistant_len}")
-
-        if task_type in ("CustomVoice", "VoiceDesign"):
-            if non_streaming_mode:
-                # model: full text ids (input_ids[:, 3:-5]) + eos + codec_bos step
-                prompt_len += assistant_len - 6
-            else:
-                # model: only first text token in prefill
-                prompt_len += 1
-
-        if task_type == "Base":
-            xvec_only = bool(_first(info.get("x_vector_only_mode"), False))
-            in_context_mode = not xvec_only
-
-            voice_clone_prompt = _first(info.get("voice_clone_prompt"), None)
-            if isinstance(voice_clone_prompt, dict):
-                icl_flag = _first(voice_clone_prompt.get("icl_mode"), None)
-                if isinstance(icl_flag, bool):
-                    in_context_mode = icl_flag
-
-            if in_context_mode:
-                ref_code = None
-                if isinstance(voice_clone_prompt, dict):
-                    ref_code = _first(voice_clone_prompt.get("ref_code"), None)
-
-                ref_code_len: int | None = None
-                if isinstance(ref_code, list):
-                    if ref_code and isinstance(ref_code[0], list):
-                        ref_code_len = len(ref_code)
-                    elif ref_code:
-                        ref_code_len = len(ref_code)
-                elif hasattr(ref_code, "shape"):
-                    try:
-                        shape = getattr(ref_code, "shape")
-                        if shape and len(shape) >= 1:
-                            ref_code_len = int(shape[0])
-                    except Exception:
-                        ref_code_len = None
-
-                if ref_code_len is None and estimate_ref_code_len is not None:
-                    ref_code_len = estimate_ref_code_len(info.get("ref_audio"))
-                if ref_code_len is None:
-                    raise ValueError(
-                        "Base in-context voice cloning requires either `voice_clone_prompt.ref_code` "
-                        "or a readable `ref_audio` that can be mapped to a codec frame length."
-                    )
-
-                codec_lens = 1 + int(ref_code_len)  # codec_bos + ref_code
-                if non_streaming_mode:
-                    # _generate_icl_prompt(non_streaming_mode=True):
-                    # text_embed = ref_ids + text_ids + eos.
-                    ref_ids = _first(info.get("ref_ids"), None)
-                    if isinstance(voice_clone_prompt, dict) and ref_ids is None:
-                        ref_ids = _first(voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id"), None)
-
-                    if ref_ids is None:
-                        ref_text = _first(info.get("ref_text"), "")
-                        if not isinstance(ref_text, str) or not ref_text.strip():
-                            raise ValueError(
-                                "Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`."
-                            )
-                        ref_text_ids = tokenize_prompt(Qwen3TTSTalkerForConditionalGeneration._build_ref_text(ref_text))
-                        ref_ids_len = len(ref_text_ids)
-                    elif hasattr(ref_ids, "shape"):
-                        shape = getattr(ref_ids, "shape", None)
-                        ref_ids_len = int(shape[-1]) if shape else 0
-                    elif isinstance(ref_ids, list):
-                        ref_ids_len = len(ref_ids)
-                    else:
-                        ref_ids_len = 0
-
-                    # model uses ref_ids[:, 3:-2] (strip 5 tokens) and text_id=input_ids[:, 3:-5] (strip 8).
-                    ref_id_len = max(0, int(ref_ids_len) - 5)
-                    text_id_len = max(0, int(assistant_len) - 8)
-                    text_embed_len = ref_id_len + text_id_len + 1  # + eos
-                    prompt_len += text_embed_len + codec_lens
-                else:
-                    # _generate_icl_prompt(non_streaming_mode=False): aligned to codec_lens.
-                    prompt_len += codec_lens
-            else:
-                # Base without ICL behaves like CustomVoice.
-                if non_streaming_mode:
-                    prompt_len += assistant_len - 6
-                else:
-                    prompt_len += 1
-
-        return max(2, int(prompt_len))
-
-    def _is_probably_base64(self, s: str) -> bool:
-        if s.startswith("data:audio"):
-            return True
-        if ("/" not in s and "\\" not in s) and len(s) > 256:
-            return True
-        return False
-
-    def _is_url(self, s: str) -> bool:
-        try:
-            u = urlparse(s)
-            if u.scheme in ("http", "https"):
-                return bool(u.netloc)
-            return u.scheme == "file"
-        except Exception:
-            return False
-
-    def _decode_base64_to_wav_bytes(self, b64: str) -> bytes:
-        if "," in b64 and b64.strip().startswith("data:"):
-            b64 = b64.split(",", 1)[1]
-        return base64.b64decode(b64)
-
-    def _load_audio_to_np(self, x: str) -> tuple[np.ndarray, int]:
-        """Load audio from local path, URL, or base64 data URI.
-
-        Uses upstream vLLM's MediaConnector for http(s) URLs and ``file:``
-        URIs, with unrestricted local access (offline inference is trusted).
-        """
-        from vllm.multimodal.media.audio import load_audio
-
-        if self._is_url(x):
-            from vllm.multimodal.media import MediaConnector
-
-            connector = MediaConnector(allowed_local_media_path="/")
-            audio, sr = connector.fetch_audio(x)
-        elif self._is_probably_base64(x):
-            wav_bytes = self._decode_base64_to_wav_bytes(x)
-            with io.BytesIO(wav_bytes) as f:
-                audio, sr = sf.read(f, dtype="float32", always_2d=False)
-        else:
-            audio, sr = load_audio(x, sr=None, mono=True)
-
-        if isinstance(audio, np.ndarray) and audio.ndim > 1:
-            audio = np.mean(audio, axis=-1)
-
-        return np.asarray(audio, dtype=np.float32), int(sr)
-
-    def _normalize_ref_audio(self, ref_audio: object) -> tuple[np.ndarray, int]:
-        # NOTE: additional_information may serialize (wav, sr) into (nested) lists across processes; be tolerant.
-        if isinstance(ref_audio, str):
-            return self._load_audio_to_np(ref_audio)
-
-        def _is_sr(x: object) -> bool:
-            try:
-                v = int(x)  # type: ignore[arg-type]
-            except Exception:
-                return False
-            return 1_000 <= v <= 200_000
-
-        def _is_number_sequence(xs: list[object]) -> bool:
-            if not xs:
-                return False
-            for v in xs[:8]:
-                if not isinstance(v, (int, float, np.number)):
-                    return False
-            return True
-
-        wav_candidates: list[object] = []
-        sr_candidates: list[int] = []
-
-        def _summarize(obj: object, depth: int = 0) -> str:
-            if depth > 2:
-                if isinstance(obj, (int, np.integer)):
-                    return f"int({int(obj)})"
-                return type(obj).__name__
-            if obj is None:
-                return "None"
-            if isinstance(obj, str):
-                if len(obj) <= 16:
-                    return f"str({obj!r})"
-                return f"str(len={len(obj)})"
-            if isinstance(obj, (int, float, np.number)):
-                return f"{type(obj).__name__}({obj})"
-            if isinstance(obj, np.ndarray):
-                return f"ndarray(shape={obj.shape}, dtype={obj.dtype})"
-            if isinstance(obj, torch.Tensor):
-                return f"Tensor(shape={tuple(obj.shape)}, dtype={obj.dtype}, device={obj.device})"
-            if isinstance(obj, dict):
-                keys = list(obj.keys())
-                return f"dict(keys={keys[:8]})"
-            if isinstance(obj, (tuple, list)):
-                items = list(obj)
-                head = ", ".join(_summarize(x, depth + 1) for x in items[:3])
-                return f"{type(obj).__name__}(len={len(items)}; head=[{head}])"
-            return f"{type(obj).__name__}"
-
-        def _scan(obj: object, depth: int = 0) -> None:
-            if depth > 4:
-                return
-            if obj is None:
-                return
-            if _is_sr(obj):
-                sr_candidates.append(int(obj))  # type: ignore[arg-type]
-                return
-            if isinstance(obj, np.ndarray) and obj.size > 0:
-                wav_candidates.append(obj)
-                return
-            if isinstance(obj, torch.Tensor) and obj.numel() > 0:
-                wav_candidates.append(obj)
-                return
-            if isinstance(obj, dict):
-                # Inlined ndarray/tensor payloads from the input processor.
-                if obj.get("__ndarray__") and "data" in obj and "dtype" in obj and "shape" in obj:
-                    try:
-                        data = obj["data"]
-                        dtype = obj["dtype"]
-                        shape = obj["shape"]
-                        if isinstance(data, (bytes, bytearray, memoryview)):
-                            arr = np.frombuffer(data, dtype=dtype).reshape(shape)
-                            if arr.size > 0:
-                                wav_candidates.append(arr)
-                                return
-                    except Exception:
-                        pass
-                if obj.get("__tensor__") and "data" in obj and "dtype" in obj and "shape" in obj:
-                    try:
-                        data = obj["data"]
-                        dtype = obj["dtype"]
-                        shape = obj["shape"]
-                        if isinstance(data, (bytes, bytearray, memoryview)):
-                            # Stored as raw CPU bytes; interpret as numpy for audio.
-                            np_dtype = np.dtype(dtype)
-                            arr = np.frombuffer(data, dtype=np_dtype).reshape(shape)
-                            if arr.size > 0:
-                                wav_candidates.append(arr)
-                                return
-                    except Exception:
-                        pass
-                wav_obj = obj.get("array") or obj.get("wav") or obj.get("audio")
-                sr_obj = obj.get("sampling_rate") or obj.get("sr") or obj.get("sample_rate")
-                if wav_obj is not None:
-                    _scan(wav_obj, depth + 1)
-                if sr_obj is not None:
-                    _scan(sr_obj, depth + 1)
-                return
-            if isinstance(obj, (tuple, list)):
-                obj_list = list(obj)
-                # Unwrap singleton nesting ([[wav, sr]]).
-                while isinstance(obj_list, list) and len(obj_list) == 1:
-                    inner = obj_list[0]
-                    if isinstance(inner, np.ndarray) and inner.size > 0:
-                        wav_candidates.append(inner)
-                        return
-                    if isinstance(inner, torch.Tensor) and inner.numel() > 0:
-                        wav_candidates.append(inner)
-                        return
-                    if isinstance(inner, dict):
-                        _scan(inner, depth + 1)
-                        return
-                    if isinstance(inner, (tuple, list)):
-                        obj_list = list(inner)  # type: ignore[list-item]
-                        continue
-                    break
-
-                # If the *unwrapped* list is a long list of numbers, treat it as waveform.
-                if len(obj_list) >= 512 and _is_number_sequence(obj_list):
-                    wav_candidates.append(obj_list)
-                    return
-
-                # Otherwise, recurse into elements (but avoid descending into huge numeric lists).
-                for item in obj_list:
-                    if isinstance(item, list) and len(item) >= 512 and _is_number_sequence(item):  # type: ignore[arg-type]
-                        wav_candidates.append(item)
-                        continue
-                    _scan(item, depth + 1)
-                return
-
-        _scan(ref_audio)
-        if not sr_candidates:
-            raise TypeError(f"ref_audio missing sample_rate: {_summarize(ref_audio)}")
-        sr = int(sr_candidates[0])
-
-        def _wav_len(x: object) -> int:
-            try:
-                if isinstance(x, np.ndarray):
-                    return int(x.size)
-                if isinstance(x, torch.Tensor):
-                    return int(x.numel())
-                if isinstance(x, list):
-                    return int(len(x))
-            except Exception:
-                pass
-            return 0
-
-        if not wav_candidates:
-            raise TypeError(f"ref_audio missing waveform: {_summarize(ref_audio)}")
-        wav_obj = max(wav_candidates, key=_wav_len)
-
-        def _to_np(x: object) -> np.ndarray:
-            if isinstance(x, np.ndarray):
-                return x.astype(np.float32).reshape(-1)
-            if isinstance(x, torch.Tensor):
-                return x.detach().to("cpu").float().contiguous().numpy().reshape(-1)
-            if isinstance(x, dict) and x.get("__ndarray__") and "data" in x and "dtype" in x and "shape" in x:
-                data = x["data"]
-                dtype = x["dtype"]
-                shape = x["shape"]
-                if isinstance(data, (bytes, bytearray, memoryview)):
-                    return np.frombuffer(data, dtype=dtype).reshape(shape).astype(np.float32).reshape(-1)
-            if isinstance(x, list):
-                # list of numbers
-                if len(x) >= 2 and _is_number_sequence(x):  # type: ignore[arg-type]
-                    return np.asarray(x, dtype=np.float32).reshape(-1)
-                # list of chunks
-                parts: list[np.ndarray] = []
-                for part in x:
-                    if isinstance(part, (np.ndarray, torch.Tensor, list)):
-                        parts.append(_to_np(part))
-                if parts:
-                    return np.concatenate(parts, axis=0)
-            raise TypeError(f"Unsupported waveform type: {type(x)}")
-
-        wav_np = _to_np(wav_obj)
-        if wav_np.size < 1024:
-            raise ValueError(f"ref_audio waveform too short: {wav_np.size} samples")
-        return wav_np, sr
-
-    def _extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
-        # vLLM workers do not automatically move arbitrary torch.nn.Modules to
-        # CUDA. Ensure the speaker encoder is on the same device/dtype as the
-        # main model before running it.
-        dev = next(self.parameters()).device
-        try:
-            spk_param = next(self.speaker_encoder.parameters())
-            if spk_param.device != dev or spk_param.dtype != torch.bfloat16:
-                self.speaker_encoder.to(device=dev, dtype=torch.bfloat16)
-        except StopIteration:
-            pass
-        # Resample to 24kHz for speaker encoder.
-        target_sr = int(getattr(self.config.speaker_encoder_config, "sample_rate", 24000))
-        if sr != target_sr:
-            resampler = AudioResampler(target_sr=target_sr)
-            wav = resampler.resample(wav.astype(np.float32), orig_sr=int(sr))
-            sr = target_sr
-
-        # Follow official implementation: mel_spectrogram expects 24kHz.  Move
-        # the waveform first so STFT/mel computation stays on the model device
-        # instead of materializing a CPU mel tensor and copying it per request.
-        wav_tensor = torch.from_numpy(wav).to(device=dev, dtype=torch.float32).unsqueeze(0)
-        mel_basis, hann_window = self._get_speaker_mel_buffers(
-            device=dev,
-            sampling_rate=24000,
-            n_fft=1024,
-            num_mels=128,
-            win_size=1024,
-            fmin=0,
-            fmax=12000,
-        )
-        mels = mel_spectrogram(
-            wav_tensor,
-            n_fft=1024,
-            num_mels=128,
-            sampling_rate=24000,
-            hop_size=256,
-            win_size=1024,
-            fmin=0,
-            fmax=12000,
-            mel_basis=mel_basis,
-            hann_window=hann_window,
-        ).transpose(1, 2)
-        spk = self.speaker_encoder(mels.to(dtype=torch.bfloat16))[0]
-        return spk.to(dtype=torch.bfloat16)
-
-    def _get_speaker_mel_buffers(
-        self,
-        *,
-        device: torch.device,
-        sampling_rate: int,
-        n_fft: int,
-        num_mels: int,
-        win_size: int,
-        fmin: int,
-        fmax: int | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        cache = getattr(self, "_speaker_mel_buffer_cache", None)
-        if cache is None:
-            cache = {}
-            self._speaker_mel_buffer_cache = cache
-        key = (str(device), int(sampling_rate), int(n_fft), int(num_mels), int(win_size), int(fmin), fmax)
-        cached = cache.get(key)
-        if cached is not None:
-            return cached
-        mel_basis = mel_filter_bank(
-            sr=int(sampling_rate),
-            n_fft=int(n_fft),
-            n_mels=int(num_mels),
-            fmin=int(fmin),
-            fmax=fmax,
-        ).to(device)
-        hann_window = torch.hann_window(int(win_size), device=device)
-        cached = (mel_basis, hann_window)
-        cache[key] = cached
-        return cached
-
-    def _ensure_speech_tokenizer_loaded(self) -> Qwen3TTSTokenizer:
-        if self._speech_tokenizer is not None:
-            return self._speech_tokenizer
-        speech_tokenizer_path = cached_file(self.model_path, "speech_tokenizer/config.json")
-        if speech_tokenizer_path is None:
-            raise ValueError(f"{self.model_path}/speech_tokenizer/config.json not found")
-        # Ensure the HF feature extractor config is present. Transformers'
-        # AutoFeatureExtractor does not proactively fetch this file.
-        preprocessor_config_path = cached_file(self.model_path, "speech_tokenizer/preprocessor_config.json")
-        if preprocessor_config_path is None:
-            raise ValueError(f"{self.model_path}/speech_tokenizer/preprocessor_config.json not found")
-        speech_tokenizer_dir = os.path.dirname(speech_tokenizer_path)
-        tok = Qwen3TTSTokenizer.from_pretrained(
-            speech_tokenizer_dir,
-            torch_dtype=torch.bfloat16,
-        )
-        # Only move encoder to GPU; the decoder is unused by Talker (which
-        # only calls tok.encode()) and would otherwise waste bf16 VRAM.
-        # NOTE: after this point the tokenizer instance is encode-only;
-        # calling tok.decode() will fail because tok.model.decoder is None.
-        dev = next(self.parameters()).device
-        if dev.type != "cpu":
-            try:
-                del tok.model.decoder
-                tok.model.decoder = None
-                tok.model.encoder.to(dev)
-                tok.device = dev
-            except Exception as e:
-                raise RuntimeError(f"Failed to move speech tokenizer encoder to {dev}: {e}") from e
-        else:
-            tok.device = dev
-        self._speech_tokenizer = tok
-        return tok
-
-    def _encode_ref_audio_to_code(self, wav: np.ndarray, sr: int) -> torch.Tensor:
-        tok = self._ensure_speech_tokenizer_loaded()
-        enc = tok.encode(wav, sr=int(sr), return_dict=True)
-        ref_code = getattr(enc, "audio_codes", None)
-        if isinstance(ref_code, list):
-            ref_code = ref_code[0] if ref_code else None
-        if isinstance(ref_code, torch.Tensor):
-            # 12Hz: likely [T, Q] or [B, T, Q]
-            if ref_code.ndim == 3:
-                ref_code = ref_code[0]
-            return ref_code.to(device=next(self.parameters()).device, dtype=torch.long)
-        raise ValueError("SpeechTokenizer.encode did not return audio_codes tensor")
-
-    @staticmethod
-    def _first_value(value: object, default: object = None) -> object:
-        if isinstance(value, list):
-            return value[0] if value else default
-        return value if value is not None else default
-
-    @staticmethod
-    def _coerce_ref_code_tensor(value: object, *, device: torch.device) -> torch.Tensor | None:
-        value = Qwen3TTSTalkerForConditionalGeneration._first_value(value)
-        if value is None:
-            return None
-        if isinstance(value, torch.Tensor):
-            ref_code = value
-        elif isinstance(value, np.ndarray):
-            ref_code = torch.from_numpy(value)
-        elif isinstance(value, list) and value:
-            ref_code = torch.as_tensor(value, dtype=torch.long)
-        else:
-            return None
-        if ref_code.ndim == 3:
-            ref_code = ref_code[0]
-        if ref_code.ndim != 2 or ref_code.numel() == 0:
-            return None
-        return ref_code.to(device=device, dtype=torch.long).contiguous()
-
-    @staticmethod
-    def _coerce_token_ids(value: object, *, device: torch.device) -> torch.Tensor | None:
-        value = Qwen3TTSTalkerForConditionalGeneration._first_value(value)
-        if value is None:
-            return None
-        if isinstance(value, torch.Tensor):
-            ids = value
-        elif isinstance(value, np.ndarray):
-            ids = torch.from_numpy(value)
-        elif isinstance(value, list) and value and all(isinstance(v, (int, np.integer)) for v in value):
-            ids = torch.tensor(value, dtype=torch.long)
-        else:
-            return None
-        if ids.ndim == 1:
-            ids = ids.unsqueeze(0)
-        if ids.ndim != 2 or ids.numel() == 0:
-            return None
-        return ids.to(device=device, dtype=torch.long).contiguous()
-
-    @staticmethod
-    def _split_ref_code_batch(ref_codes: object, expected: int) -> list[object] | None:
-        if isinstance(ref_codes, torch.Tensor):
-            if ref_codes.ndim == 3 and int(ref_codes.shape[0]) == expected:
-                return [ref_codes[i] for i in range(expected)]
-            if expected == 1:
-                return [ref_codes]
-            return None
-        if isinstance(ref_codes, (list, tuple)) and len(ref_codes) == expected:
-            return list(ref_codes)
-        return None
-
-    @staticmethod
-    def _voice_clone_prompt_dict(raw: object) -> dict[str, object] | None:
-        raw = Qwen3TTSTalkerForConditionalGeneration._first_value(raw)
-        if isinstance(raw, dict):
-            return raw
-        if isinstance(raw, list) and raw and isinstance(raw[0], dict):
-            return raw[0]
-        return None
-
-    @staticmethod
-    def _has_ref_code_like(value: object) -> bool:
-        value = Qwen3TTSTalkerForConditionalGeneration._first_value(value)
-        if isinstance(value, torch.Tensor):
-            return value.numel() > 0 and value.ndim in (2, 3)
-        if isinstance(value, np.ndarray):
-            return value.size > 0 and value.ndim in (2, 3)
-        if isinstance(value, list):
-            return bool(value)
-        return False
-
-    @staticmethod
-    def _needs_initial_prompt_preprocess(info_dict: dict[str, Any]) -> bool:
-        embed = info_dict.get("embed")
-        return not (isinstance(embed, dict) and "prefill" in embed)
-
-    def _needs_batched_ref_code(self, info_dict: dict[str, Any]) -> bool:
-        if not self._needs_initial_prompt_preprocess(info_dict):
-            return False
-        if self._first_value(info_dict.get("task_type"), "CustomVoice") != "Base":
-            return False
-        codes = info_dict.get("codes")
-        if isinstance(codes, dict) and self._has_ref_code_like(codes.get(_PRECOMPUTED_REF_CODE_KEY)):
-            return False
-
-        voice_clone_prompt = self._voice_clone_prompt_dict(info_dict.get("voice_clone_prompt"))
-        if voice_clone_prompt is not None:
-            if self._has_ref_code_like(voice_clone_prompt.get("ref_code")):
-                return False
-            icl_flag = self._first_value(voice_clone_prompt.get("icl_mode"))
-            if isinstance(icl_flag, bool) and not icl_flag:
-                return False
-
-        xvec_only = self._first_value(info_dict.get("x_vector_only_mode"), False)
-        if isinstance(xvec_only, bool) and xvec_only:
-            return False
-
-        ref_audio_list = info_dict.get("ref_audio")
-        return isinstance(ref_audio_list, list) and bool(ref_audio_list)
-
     @torch.inference_mode()
     def preprocess_batch(
         self,
@@ -1509,568 +890,42 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         model_intermediate_buffer: dict[str, dict[str, Any]],
         device: torch.device,
     ) -> None:
-        """Batch Base voice-clone ref-audio codec extraction for current prefill requests."""
-        pending_text: list[tuple[dict[str, Any], str]] = []
-        pending_ref_text: list[tuple[dict[str, Any], str]] = []
-        groups: dict[int, list[tuple[dict[str, Any], np.ndarray, int]]] = {}
-        for req_id in req_ids:
-            info_dict = model_intermediate_buffer.get(req_id)
-            if not isinstance(info_dict, dict):
-                continue
-
-            if (
-                self._needs_initial_prompt_preprocess(info_dict)
-                and self._first_value(info_dict.get("task_type"), "CustomVoice") == "Base"
-            ):
-                if _PRECOMPUTED_TEXT_IDS_KEY not in info_dict:
-                    text = self._first_value(info_dict.get("text"), "")
-                    if isinstance(text, str):
-                        pending_text.append((info_dict, self._build_assistant_text(text)))
-
-                if _PRECOMPUTED_REF_IDS_KEY not in info_dict:
-                    ref_text = self._first_value(info_dict.get("ref_text"))
-                    if isinstance(ref_text, str) and ref_text.strip():
-                        pending_ref_text.append((info_dict, self._build_ref_text(ref_text)))
-
-            if not self._needs_batched_ref_code(info_dict):
-                continue
-            ref_audio_list = info_dict.get("ref_audio")
-            if not isinstance(ref_audio_list, list) or not ref_audio_list:
-                continue
-            try:
-                wav, sr = self._normalize_ref_audio(ref_audio_list[0])
-            except Exception:
-                # Keep the original per-request path responsible for surfacing
-                # invalid ref_audio errors with its existing messages.
-                continue
-            info_dict[_NORMALIZED_REF_AUDIO_KEY] = (wav, sr)
-            groups.setdefault(int(sr), []).append((info_dict, wav, int(sr)))
-
-        if pending_text or pending_ref_text:
-            tok_text = self._get_tokenizer()
-            for items, key in (
-                (pending_text, _PRECOMPUTED_TEXT_IDS_KEY),
-                (pending_ref_text, _PRECOMPUTED_REF_IDS_KEY),
-            ):
-                if not items:
-                    continue
-                try:
-                    tokenized = tok_text([text for _, text in items], padding=False)
-                except Exception as exc:
-                    logger.debug("Qwen3-TTS batched text tokenization failed; falling back to serial path: %s", exc)
-                    continue
-                input_ids = tokenized.get("input_ids") if isinstance(tokenized, dict) else None
-                if not isinstance(input_ids, list) or len(input_ids) != len(items):
-                    continue
-                for (info_dict, _), ids in zip(items, input_ids, strict=True):
-                    if isinstance(ids, list) and ids:
-                        info_dict[key] = torch.tensor(ids, dtype=torch.long)
-
-        groups = {sr: items for sr, items in groups.items() if len(items) >= 2}
-        if not groups:
-            return
-
-        tok = self._ensure_speech_tokenizer_loaded()
-        for sr, items in groups.items():
-            wavs = [wav for _, wav, _ in items]
-            try:
-                enc = tok.encode(wavs, sr=int(sr), return_dict=True)
-                ref_codes = self._split_ref_code_batch(getattr(enc, "audio_codes", None), len(items))
-            except Exception as exc:
-                logger.debug("Qwen3-TTS batched ref_code encode failed; falling back to serial path: %s", exc)
-                continue
-            if ref_codes is None:
-                continue
-            for (info_dict, wav, item_sr), ref_code in zip(items, ref_codes, strict=True):
-                ref_code_t = self._coerce_ref_code_tensor(ref_code, device=device)
-                if ref_code_t is None:
-                    continue
-                info_dict.setdefault("codes", {})[_PRECOMPUTED_REF_CODE_KEY] = ref_code_t
-                info_dict[_NORMALIZED_REF_AUDIO_KEY] = (wav, item_sr)
-
-    def _generate_icl_prompt(
-        self,
-        *,
-        text_id: torch.Tensor,
-        ref_id: torch.Tensor,
-        ref_code: torch.Tensor,
-        tts_pad_embed: torch.Tensor,
-        tts_eos_embed: torch.Tensor,
-        non_streaming_mode: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Ported from official Qwen3TTSForConditionalGeneration.generate_icl_prompt
-        text_embed = self.text_projection(self.text_embedding(torch.cat([ref_id, text_id], dim=-1)))
-        text_embed = torch.cat([text_embed, tts_eos_embed], dim=1)
-
-        # codec embed (codec bos + codec) 1 T2 D
-        codec_embed: list[torch.Tensor] = []
-        for i in range(int(self.talker_config.num_code_groups)):
-            if i == 0:
-                codec_embed.append(self.embed_input_ids(ref_code[:, :1]))
-            else:
-                codec_embed.append(self.code_predictor.get_input_embeddings()[i - 1](ref_code[:, i : i + 1]))
-        codec_embed_sum = torch.cat(codec_embed, dim=1).sum(1).unsqueeze(0)  # [1,T,H]
-        codec_embed_sum = torch.cat(
-            [
-                self.embed_input_ids(
-                    torch.tensor([[self.talker_config.codec_bos_id]], device=codec_embed_sum.device, dtype=torch.long)
-                ),
-                codec_embed_sum,
-            ],
-            dim=1,
+        """Delegate batched preprocess to :class:`Qwen3TTSPromptEmbedsBuilder`."""
+        self._prompt_builder.preprocess_batch(
+            req_ids=req_ids,
+            model_intermediate_buffer=model_intermediate_buffer,
+            device=device,
         )
 
-        text_lens = int(text_embed.shape[1])
-        codec_lens = int(codec_embed_sum.shape[1])
-        if non_streaming_mode:
-            # Official non-streaming mode: append the full text conditioning in
-            # prefill, and use PAD in decode steps.
-            icl_input_embed = text_embed + self.embed_input_ids(
-                torch.tensor(
-                    [[self.talker_config.codec_pad_id] * text_lens],
-                    device=codec_embed_sum.device,
-                    dtype=torch.long,
-                )
-            )
-            icl_input_embed = torch.cat([icl_input_embed, codec_embed_sum + tts_pad_embed], dim=1)
-            return icl_input_embed, tts_pad_embed
-        if text_lens > codec_lens:
-            return text_embed[:, :codec_lens] + codec_embed_sum, text_embed[:, codec_lens:]
-        text_embed = torch.cat([text_embed] + [tts_pad_embed] * (codec_lens - text_lens), dim=1)
-        return text_embed + codec_embed_sum, tts_pad_embed
+    def _encode_ref_audio_batch(self, wavs: list[np.ndarray], sr: int, *, device: torch.device) -> list[torch.Tensor]:
+        fe = self._encoder_feature_extractor
+        target_sr = int(fe.sampling_rate)
+        if int(sr) != target_sr:
+            resampler = AudioResampler(target_sr=target_sr)
+            wavs = [resampler.resample(w.astype(np.float32), orig_sr=int(sr)) for w in wavs]
 
-    def _build_prompt_embeds(
-        self,
-        *,
-        task_type: str,
-        info_dict: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None, torch.Tensor | None]:
-        text = (info_dict.get("text") or [""])[0]
-        language = (info_dict.get("language") or ["Auto"])[0]
-        non_streaming_mode_val = info_dict.get("non_streaming_mode")
-        if isinstance(non_streaming_mode_val, list):
-            non_streaming_mode_raw = non_streaming_mode_val[0] if non_streaming_mode_val else None
-        else:
-            non_streaming_mode_raw = non_streaming_mode_val
-        if isinstance(non_streaming_mode_raw, bool):
-            non_streaming_mode = non_streaming_mode_raw
-        else:
-            # Match official inference defaults:
-            # - CustomVoice/VoiceDesign: non_streaming_mode=True
-            # - Base: non_streaming_mode=False
-            non_streaming_mode = task_type in ("CustomVoice", "VoiceDesign")
+        inputs = fe(
+            raw_audio=wavs,
+            sampling_rate=target_sr,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(device).to(torch.bfloat16)
 
-        # Text ids for assistant template (always).
-        tok = self._get_tokenizer()
-        dev = next(self.parameters()).device
-        input_ids = self._coerce_token_ids(info_dict.pop(_PRECOMPUTED_TEXT_IDS_KEY, None), device=dev)
-        if input_ids is None:
-            input_ids = tok(self._build_assistant_text(text), return_tensors="pt", padding=False)["input_ids"].to(
-                device=dev
+        input_values = inputs["input_values"].squeeze(1)
+        padding_mask = inputs["padding_mask"].squeeze(1)
+
+        with torch.inference_mode():
+            encoded = self.encoder.encode(
+                input_values=input_values.unsqueeze(1),
+                return_dict=True,
             )
 
-        # Optional instruct prefix.
-        instruct = (info_dict.get("instruct") or [""])[0]
-        instruct_embed = None
-        if isinstance(instruct, str) and instruct.strip():
-            instruct_ids = tok(self._build_instruct_text(instruct), return_tensors="pt", padding=False)["input_ids"].to(
-                device=input_ids.device
-            )
-            instruct_embed = self.text_projection(self.text_embedding(instruct_ids))
-
-        # tts special token embeds (projected into talker hidden).
-        tts_tokens = torch.tensor(
-            [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
-            device=input_ids.device,
-            dtype=input_ids.dtype,
-        )
-        tts_bos_embed, tts_eos_embed, tts_pad_embed = self.text_projection(self.text_embedding(tts_tokens)).chunk(
-            3, dim=1
-        )
-
-        # Codec prefill tags.
-        language_id = None
-        if isinstance(language, str) and language.lower() != "auto":
-            language_id = self.talker_config.codec_language_id.get(language.lower())
-        # Match official dialect override:
-        # If language is Chinese/Auto and the selected speaker is a dialect voice,
-        # set language_id to that dialect to improve code generation stability.
-        if language_id is None and isinstance(language, str) and language.lower() in ("chinese", "auto"):
-            speaker_for_dialect = None
-            if task_type == "CustomVoice":
-                speaker_for_dialect = (info_dict.get("speaker") or [""])[0]
-            if isinstance(speaker_for_dialect, str) and speaker_for_dialect.strip():
-                spk_is_dialect = getattr(self.talker_config, "spk_is_dialect", None) or {}
-                dialect = spk_is_dialect.get(speaker_for_dialect.lower())
-                if isinstance(dialect, str) and dialect:
-                    language_id = self.talker_config.codec_language_id.get(dialect)
-        if language_id is None:
-            codec_prefill_list = [
-                [
-                    self.talker_config.codec_nothink_id,
-                    self.talker_config.codec_think_bos_id,
-                    self.talker_config.codec_think_eos_id,
-                ]
-            ]
-        else:
-            codec_prefill_list = [
-                [
-                    self.talker_config.codec_think_id,
-                    self.talker_config.codec_think_bos_id,
-                    int(language_id),
-                    self.talker_config.codec_think_eos_id,
-                ]
-            ]
-
-        codec_input_0 = self.embed_input_ids(
-            torch.tensor(codec_prefill_list, device=input_ids.device, dtype=torch.long)
-        )
-        codec_input_1 = self.embed_input_ids(
-            torch.tensor([[self.talker_config.codec_pad_id, self.talker_config.codec_bos_id]], device=input_ids.device)
-        )
-
-        # Speaker embedding/token (task-dependent)
-        speaker_embed = None
-        ref_code_len: int | None = None
-        ref_code_prompt: torch.Tensor | None = None
-
-        def _as_singleton(x: object) -> object:
-            if isinstance(x, list):
-                return x[0] if x else None
-            return x
-
-        def _to_long_tensor(x: object, *, device: torch.device) -> torch.Tensor | None:
-            x = _as_singleton(x)
-            if x is None:
-                return None
-            if isinstance(x, torch.Tensor):
-                t = x
-            elif isinstance(x, np.ndarray):
-                t = torch.from_numpy(x)
-            elif isinstance(x, list) and x and all(isinstance(v, (int, np.integer)) for v in x):
-                t = torch.tensor(x, dtype=torch.long)
-            else:
-                return None
-            if t.ndim == 1:
-                t = t.unsqueeze(0)
-            return t.to(device=device, dtype=torch.long)
-
-        def _normalize_voice_clone_prompt(raw: object) -> dict[str, object] | None:
-            raw = _as_singleton(raw)
-            if raw is None:
-                return None
-            if isinstance(raw, dict):
-                return raw
-            # Some callers may pass list[dict] directly.
-            if isinstance(raw, list) and raw and isinstance(raw[0], dict):
-                return raw[0]
-            return None
-
-        if task_type == "Base":
-            # Base supports voice clone prompt with in-context mode.
-            xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
-            in_context_mode = not xvec_only
-            voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
-            ref_audio_wav: np.ndarray | None = None
-            ref_audio_sr: int | None = None
-
-            def _get_ref_audio() -> tuple[np.ndarray, int]:
-                nonlocal ref_audio_wav, ref_audio_sr
-                if ref_audio_wav is None or ref_audio_sr is None:
-                    normalized_ref_audio = info_dict.pop(_NORMALIZED_REF_AUDIO_KEY, None)
-                    if (
-                        isinstance(normalized_ref_audio, tuple)
-                        and len(normalized_ref_audio) == 2
-                        and isinstance(normalized_ref_audio[0], np.ndarray)
-                    ):
-                        ref_audio_wav = normalized_ref_audio[0]
-                        ref_audio_sr = int(normalized_ref_audio[1])
-                        return ref_audio_wav, ref_audio_sr
-                    ref_audio_list = info_dict.get("ref_audio")
-                    if not isinstance(ref_audio_list, list) or not ref_audio_list:
-                        raise ValueError("Base requires `ref_audio`.")
-                    ref_audio_wav, ref_audio_sr = self._normalize_ref_audio(ref_audio_list[0])
-                return ref_audio_wav, ref_audio_sr
-
-            # Speaker cache: only for uploaded (named) speakers
-            _speaker_cache_key = None
-            if voice_clone_prompt is None:
-                _speaker_list = info_dict.get("speaker")
-                if isinstance(_speaker_list, list) and _speaker_list:
-                    _voice_name = str(_speaker_list[0]).lower()
-                    # Per-mode namespace — xvec and icl produce different artifacts
-                    # for the same voice, so they must not share a cache slot.
-                    _mode = "xvec" if xvec_only else "icl"
-                    _voice_created_at = int((info_dict.get("voice_created_at") or [0])[0])
-                    _speaker_cache_key = self._speaker_cache.make_cache_key(
-                        _voice_name,
-                        model_type=f"qwen3_tts_{_mode}",
-                        created_at=_voice_created_at,
-                    )
-                    _cached = self._speaker_cache.get(_speaker_cache_key)
-                    if _cached is not None:
-                        # Transfer cached tensors to current device
-                        ref_code_cached = _cached.get("ref_code")
-                        ref_spk_embed_cached = _cached.get("ref_spk_embedding")
-                        if isinstance(ref_code_cached, torch.Tensor):
-                            ref_code_cached = ref_code_cached.to(device=input_ids.device)
-                        if isinstance(ref_spk_embed_cached, torch.Tensor):
-                            ref_spk_embed_cached = ref_spk_embed_cached.to(device=input_ids.device)
-                        voice_clone_prompt = {
-                            "ref_code": ref_code_cached,
-                            "ref_spk_embedding": ref_spk_embed_cached,
-                            "icl_mode": _cached.get("icl_mode"),
-                        }
-                        _speaker_cache_key = None  # hit → don't store again
-
-            # Official implementation may pass `voice_clone_prompt.icl_mode`.
-            if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
-                icl_flag = _as_singleton(voice_clone_prompt.get("icl_mode"))
-                if isinstance(icl_flag, bool):
-                    in_context_mode = icl_flag
-                    xvec_only = not in_context_mode
-            ref_code = None
-            if voice_clone_prompt is not None:
-                ref_code = _as_singleton(voice_clone_prompt.get("ref_code"))
-            ref_code_t = None
-            if isinstance(ref_code, torch.Tensor):
-                ref_code_t = ref_code
-            elif isinstance(ref_code, np.ndarray):
-                ref_code_t = torch.from_numpy(ref_code)
-            if isinstance(ref_code_t, torch.Tensor):
-                if ref_code_t.ndim == 3:
-                    ref_code_t = ref_code_t[0]
-                ref_code_t = ref_code_t.to(device=input_ids.device, dtype=torch.long)
-                ref_code_len = int(ref_code_t.shape[0])
-            else:
-                codes = info_dict.get("codes")
-                precomputed_ref_code = codes.get(_PRECOMPUTED_REF_CODE_KEY) if isinstance(codes, dict) else None
-                ref_code_t = self._coerce_ref_code_tensor(precomputed_ref_code, device=input_ids.device)
-                if isinstance(ref_code_t, torch.Tensor):
-                    ref_code_len = int(ref_code_t.shape[0])
-            if ref_code_t is None and in_context_mode:
-                # Compute ref_code from ref_audio if not provided.
-                wav_np, sr = _get_ref_audio()
-                ref_code_t = self._encode_ref_audio_to_code(wav_np, sr).to(device=input_ids.device)
-                ref_code_len = int(ref_code_t.shape[0])
-            if isinstance(ref_code_t, torch.Tensor):
-                ref_code_prompt = ref_code_t
-
-            # Speaker embedding: use prompt embed if provided; otherwise extract from audio.
-            # NOTE: Do NOT use _as_singleton here — the embedding may be a plain
-            # float list (from API via msgspec IPC) that _as_singleton would
-            # destructively unwrap to a single scalar.
-            spk = None
-            if voice_clone_prompt is not None:
-                spk = voice_clone_prompt.get("ref_spk_embedding")
-            if isinstance(spk, torch.Tensor):
-                speaker_embed = spk.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
-            elif isinstance(spk, (list, np.ndarray)):
-                # Plain list/array from API (survived msgspec IPC serialization).
-                speaker_embed = torch.tensor(spk, dtype=torch.bfloat16, device=input_ids.device).view(1, 1, -1)
-            else:
-                wav_np, sr = _get_ref_audio()
-                speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
-
-            # Cache miss: store extraction result
-            if _speaker_cache_key is not None and speaker_embed is not None:
-                self._speaker_cache.put(
-                    _speaker_cache_key,
-                    {
-                        "ref_code": ref_code_prompt.detach().cpu()
-                        if isinstance(ref_code_prompt, torch.Tensor)
-                        else None,
-                        "ref_spk_embedding": speaker_embed.detach().cpu().reshape(-1),
-                        "icl_mode": in_context_mode,
-                    },
-                )
-
-            codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
-
-            # Role header (<|im_start|>assistant\n) -> projected text embeds.
-            role_embed = self.text_projection(self.text_embedding(input_ids[:, :3]))
-
-            codec_prefix = torch.cat((tts_pad_embed.expand(-1, codec_input.shape[1] - 2, -1), tts_bos_embed), dim=1)
-            codec_prefix = codec_prefix + codec_input[:, :-1]
-            talker_prompt = torch.cat((role_embed, codec_prefix), dim=1)
-
-            if in_context_mode:
-                # Prefer explicit tokenized `ref_ids` if provided (matches official signature).
-                ref_ids = self._coerce_token_ids(info_dict.pop(_PRECOMPUTED_REF_IDS_KEY, None), device=input_ids.device)
-                if ref_ids is None:
-                    ref_ids = _to_long_tensor(info_dict.get("ref_ids"), device=input_ids.device)
-                if ref_ids is None and voice_clone_prompt is not None:
-                    ref_ids = _to_long_tensor(
-                        voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id"), device=input_ids.device
-                    )
-                if ref_ids is None:
-                    ref_text = _as_singleton(info_dict.get("ref_text"))
-                    if isinstance(ref_text, str) and ref_text.strip():
-                        ref_ids = tok(
-                            self._build_ref_text(ref_text),
-                            return_tensors="pt",
-                            padding=False,
-                        )["input_ids"].to(device=input_ids.device)
-                    else:
-                        logger.warning("Base ICL: ref_text/ref_ids missing, falling back to x-vector-only mode.")
-                        in_context_mode = False
-            if in_context_mode:
-                icl_input_embed, trailing_text_hidden = self._generate_icl_prompt(
-                    text_id=input_ids[:, 3:-5],
-                    ref_id=ref_ids[:, 3:-2],
-                    ref_code=ref_code_t,  # type: ignore[arg-type]
-                    tts_pad_embed=tts_pad_embed,
-                    tts_eos_embed=tts_eos_embed,
-                    non_streaming_mode=non_streaming_mode,
-                )
-                talker_prompt = torch.cat([talker_prompt, icl_input_embed], dim=1)
-            else:
-                # First text token (+ codec_bos).
-                if non_streaming_mode:
-                    # Official non-streaming mode: put the full text into the
-                    # prefill prompt and use PAD for decode steps.
-                    text_all = self.text_projection(self.text_embedding(input_ids[:, 3:-5]))
-                    text_all = torch.cat([text_all, tts_eos_embed], dim=1)
-                    pad_ids = torch.full(
-                        (1, int(text_all.shape[1])),
-                        int(self.talker_config.codec_pad_id),
-                        device=input_ids.device,
-                        dtype=torch.long,
-                    )
-                    talker_prompt = torch.cat(
-                        [
-                            talker_prompt,
-                            text_all + self.embed_input_ids(pad_ids),
-                            tts_pad_embed
-                            + self.embed_input_ids(
-                                torch.tensor([[self.talker_config.codec_bos_id]], device=input_ids.device)
-                            ),
-                        ],
-                        dim=1,
-                    )
-                    trailing_text_hidden = tts_pad_embed
-                else:
-                    first_text = self.text_projection(self.text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]
-                    talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
-                    trailing_text_hidden = torch.cat(
-                        (
-                            self.text_projection(self.text_embedding(input_ids[:, 4:-5])),
-                            tts_eos_embed,
-                        ),
-                        dim=1,
-                    )
-
-        elif task_type == "CustomVoice":
-            _speaker_raw = info_dict.get("speaker") or [""]
-            speaker = (
-                ((_speaker_raw[0] if isinstance(_speaker_raw, (list, tuple)) else _speaker_raw) or "").lower().strip()
-            )
-            if not speaker:
-                raise ValueError("CustomVoice requires additional_information.speaker.")
-            spk_id_map = {k.lower(): v for k, v in (getattr(self.talker_config, "spk_id", None) or {}).items()}
-            if speaker not in spk_id_map:
-                raise ValueError(f"Unsupported speaker: {speaker}")
-            spk_id = spk_id_map[speaker]
-            # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
-            spk_tensor = torch.tensor([spk_id], device=input_ids.device, dtype=torch.long)
-            spk_embed = self.embed_input_ids(spk_tensor)
-            if spk_embed.ndim == 1:
-                spk_embed = spk_embed.view(1, 1, -1)
-            elif spk_embed.ndim == 2:
-                spk_embed = spk_embed.view(1, 1, -1)
-            speaker_embed = spk_embed
-            codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
-
-            role_embed = self.text_projection(self.text_embedding(input_ids[:, :3]))
-            codec_prefix = torch.cat((tts_pad_embed.expand(-1, codec_input.shape[1] - 2, -1), tts_bos_embed), dim=1)
-            codec_prefix = codec_prefix + codec_input[:, :-1]
-            talker_prompt = torch.cat((role_embed, codec_prefix), dim=1)
-
-            if non_streaming_mode:
-                text_all = self.text_projection(self.text_embedding(input_ids[:, 3:-5]))
-                text_all = torch.cat([text_all, tts_eos_embed], dim=1)
-                pad_ids = torch.full(
-                    (1, int(text_all.shape[1])),
-                    int(self.talker_config.codec_pad_id),
-                    device=input_ids.device,
-                    dtype=torch.long,
-                )
-                talker_prompt = torch.cat(
-                    [
-                        talker_prompt,
-                        text_all + self.embed_input_ids(pad_ids),
-                        tts_pad_embed
-                        + self.embed_input_ids(
-                            torch.tensor([[self.talker_config.codec_bos_id]], device=input_ids.device)
-                        ),
-                    ],
-                    dim=1,
-                )
-                trailing_text_hidden = tts_pad_embed
-            else:
-                first_text = self.text_projection(self.text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]
-                talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
-                trailing_text_hidden = torch.cat(
-                    (
-                        self.text_projection(self.text_embedding(input_ids[:, 4:-5])),
-                        tts_eos_embed,
-                    ),
-                    dim=1,
-                )
-
-        elif task_type == "VoiceDesign":
-            # No known speaker identity; only codec tags + text.
-            codec_input = torch.cat([codec_input_0, codec_input_1], dim=1)
-
-            role_embed = self.text_projection(self.text_embedding(input_ids[:, :3]))
-            codec_prefix = torch.cat((tts_pad_embed.expand(-1, codec_input.shape[1] - 2, -1), tts_bos_embed), dim=1)
-            codec_prefix = codec_prefix + codec_input[:, :-1]
-            talker_prompt = torch.cat((role_embed, codec_prefix), dim=1)
-
-            if non_streaming_mode:
-                text_all = self.text_projection(self.text_embedding(input_ids[:, 3:-5]))
-                text_all = torch.cat([text_all, tts_eos_embed], dim=1)
-                pad_ids = torch.full(
-                    (1, int(text_all.shape[1])),
-                    int(self.talker_config.codec_pad_id),
-                    device=input_ids.device,
-                    dtype=torch.long,
-                )
-                talker_prompt = torch.cat(
-                    [
-                        talker_prompt,
-                        text_all + self.embed_input_ids(pad_ids),
-                        tts_pad_embed
-                        + self.embed_input_ids(
-                            torch.tensor([[self.talker_config.codec_bos_id]], device=input_ids.device)
-                        ),
-                    ],
-                    dim=1,
-                )
-                trailing_text_hidden = tts_pad_embed
-            else:
-                first_text = self.text_projection(self.text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]
-                talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
-                trailing_text_hidden = torch.cat(
-                    (
-                        self.text_projection(self.text_embedding(input_ids[:, 4:-5])),
-                        tts_eos_embed,
-                    ),
-                    dim=1,
-                )
-        else:
-            raise ValueError(f"Unsupported task_type={task_type}")
-
-        if instruct_embed is not None:
-            talker_prompt = torch.cat([instruct_embed, talker_prompt], dim=1)
-
-        return (
-            talker_prompt.squeeze(0),  # [prompt_len, H]
-            trailing_text_hidden.squeeze(0),  # [T, H]
-            tts_pad_embed.squeeze(0),  # [1, H]
-            ref_code_len,
-            ref_code_prompt.contiguous() if isinstance(ref_code_prompt, torch.Tensor) else None,
-        )
+        audio_codes = encoded.audio_codes[:, : self._encoder_valid_num_quantizers]
+        downsample = self._encoder_downsample_rate
+        return [
+            code[..., : -(-mask.sum() // downsample)].transpose(0, 1).to(device=device, dtype=torch.long)
+            for code, mask in zip(audio_codes, padding_mask)
+        ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Consume talker weights, and conditionally consume speaker encoder
@@ -2096,8 +951,75 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             # Some checkpoints do not include speaker_encoder weights; keep the
             # eagerly initialized module and satisfy the strict loader check.
             loaded |= {name for name, _ in self.named_parameters() if name.startswith("speaker_encoder.")}
+        # Load speech tokenizer encoder weights from speech_tokenizer/
+        # subfolder.  Skip decoder weights — the Talker only uses the
+        # encoder for ref_audio encoding.
+        model_loader = DefaultModelLoader(self.vllm_config.load_config)
+        source = DefaultModelLoader.Source(
+            model_or_path=self.model_path,
+            revision=self.vllm_config.model_config.revision,
+            subfolder="speech_tokenizer",
+        )
+        subfolder_weights = model_loader._get_weights_iterator(source)
+        enc_loaded = AutoWeightsLoader(
+            self,
+            skip_prefixes=["decoder."],
+        ).load_weights(subfolder_weights)
+        loaded |= enc_loaded
+
+        # AutoWeightsLoader only loads parameters; the encoder's VQ
+        # codebook state (embed, embed_sum, cluster_usage, initialized)
+        # are registered as buffers. Load them from the checkpoint
+        # directly so the quantizer produces correct codes.
+        encoder_buffers = dict(self.encoder.named_buffers())
+        source2 = DefaultModelLoader.Source(
+            model_or_path=self.model_path,
+            revision=self.vllm_config.model_config.revision,
+            subfolder="speech_tokenizer",
+        )
+        for name, tensor in model_loader._get_weights_iterator(source2):
+            if not name.startswith("encoder."):
+                continue
+            buf_name = name[len("encoder.") :]
+            if buf_name in encoder_buffers:
+                encoder_buffers[buf_name].copy_(tensor)
+                loaded.add(name)
+
+        device = self.vllm_config.device_config.device
+        self.encoder.to(device=device, dtype=torch.bfloat16)
+
+        self._init_runtime_buffers()
+
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
+        self._build_stacked_codec_embed()
         return loaded
+
+    def _build_stacked_codec_embed(self) -> None:
+        embeds = self.code_predictor.get_input_embeddings()
+        if not embeds:
+            return
+        w = embeds[0].weight
+        self._stacked_codec_embed = torch.stack([e.weight.detach() for e in embeds], dim=0).to(
+            device=w.device, dtype=w.dtype
+        )
+
+    @torch.no_grad()
+    def _init_runtime_buffers(self) -> None:
+        """Populate request-independent runtime buffers from frozen weights.
+
+        Currently this only computes :attr:`_tts_pad_embed`
+        (``text_proj(text_emb(tts_pad_token_id))``), which the prefill
+        prompt builder and every decode step mix into the input embedding
+        in place of an actual text token. The value depends only on the
+        ``text_embedding`` / ``text_projection`` weights and is therefore
+        the same for every request — computing it once here avoids
+        recomputing (and round-tripping through ``info_dict``) on each
+        forward call.
+        """
+        device = next(self.parameters()).device
+        pad_ids = torch.tensor([[int(self.config.tts_pad_token_id)]], device=device, dtype=torch.long)
+        pad_proj = self.text_projection(self.text_embedding(pad_ids)).reshape(1, -1)
+        self._tts_pad_embed.copy_(pad_proj.to(device=self._tts_pad_embed.device, dtype=self._tts_pad_embed.dtype))
 
     # -------------------- GPU-side MTP fast-path --------------------
 
@@ -2158,11 +1080,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         invalid0 = (layer0 < 0) | (layer0 >= int(self._codebook_vocab_size))
         audio_codes = torch.where(invalid0.expand_as(audio_codes), torch.zeros_like(audio_codes), audio_codes)
 
-        # Sum embeddings of all code groups, then add the current text step.
+        # Single gather over stacked [Q-1, V, H] replaces Q-1 serial embedding kernels.
         residual_ids_t = audio_codes[:, 1:]
-        embeds: list[torch.Tensor] = [last_id_hidden]
-        for i in range(max_steps):
-            embeds.append(self.code_predictor.get_input_embeddings()[i](residual_ids_t[:, i : i + 1]))
-        summed = torch.cat(embeds, dim=1).sum(1, keepdim=True)  # [B,1,H]
+        if self._stacked_codec_embed is None:
+            self._build_stacked_codec_embed()
+        embed_weight = self._stacked_codec_embed.to(device=dev)
+        row_idx = torch.arange(max_steps, device=dev).unsqueeze(0).expand(bsz, -1)
+        gathered = embed_weight[row_idx, residual_ids_t]
+        summed = (last_id_hidden.squeeze(1) + gathered.sum(dim=1)).unsqueeze(1)
         inputs_embeds_out = (summed + text_step).reshape(bsz, -1)
         return inputs_embeds_out, audio_codes.to(dtype=torch.long)

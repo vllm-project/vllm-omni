@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 The Qwen team.
-"""Shared SnakeBeta activation for speech decoders (Qwen3-TTS, Qwen3-Omni Code2Wav)."""
+"""Shared Snake/SnakeBeta activations for speech decoders.
+
+Used by: Qwen3-TTS, Qwen3-Omni Code2Wav, Qwen2.5-Omni, CoVo-Audio, CosyVoice3.
+"""
 
 import torch
 from torch import nn
@@ -70,12 +73,17 @@ class SnakeBeta(nn.Module):
         SnakeBeta._triton_kernel = _kernel
         return True
 
-    def __init__(self, in_features, alpha=1.0):
+    def __init__(self, in_features, alpha=1.0, alpha_logscale=True):
         super().__init__()
         self.in_features = in_features
+        self.alpha_logscale = alpha_logscale
 
-        self.alpha = Parameter(torch.zeros(in_features) * alpha)
-        self.beta = Parameter(torch.zeros(in_features) * alpha)
+        if alpha_logscale:
+            self.alpha = Parameter(torch.zeros(in_features) * alpha)
+            self.beta = Parameter(torch.zeros(in_features) * alpha)
+        else:
+            self.alpha = Parameter(torch.ones(in_features) * alpha)
+            self.beta = Parameter(torch.ones(in_features) * alpha)
 
         self.no_div_by_zero = 0.000000001
 
@@ -86,8 +94,12 @@ class SnakeBeta(nn.Module):
     def precompute_exp_cache(self):
         """Materialize exp(alpha) and 1/(exp(beta)+eps) as frozen buffers."""
         with torch.no_grad():
-            self._exp_alpha = torch.exp(self.alpha).contiguous()
-            self._inv_beta = (1.0 / (torch.exp(self.beta) + self.no_div_by_zero)).contiguous()
+            if self.alpha_logscale:
+                self._exp_alpha = torch.exp(self.alpha).contiguous()
+                self._inv_beta = (1.0 / (torch.exp(self.beta) + self.no_div_by_zero)).contiguous()
+            else:
+                self._exp_alpha = self.alpha.contiguous()
+                self._inv_beta = (1.0 / (self.beta + self.no_div_by_zero)).contiguous()
 
     @property
     def _cached(self):
@@ -104,12 +116,10 @@ class SnakeBeta(nn.Module):
         return self._eager_forward(hidden_states)
 
     def _eager_forward(self, hidden_states):
-        if self._cached:
-            exp_alpha = self._exp_alpha.unsqueeze(0).unsqueeze(-1)
-            inv_beta = self._inv_beta.unsqueeze(0).unsqueeze(-1)
-        else:
-            exp_alpha = torch.exp(self.alpha).unsqueeze(0).unsqueeze(-1)
-            inv_beta = (1.0 / (torch.exp(self.beta) + self.no_div_by_zero)).unsqueeze(0).unsqueeze(-1)
+        if not self._cached:
+            self.precompute_exp_cache()
+        exp_alpha = self._exp_alpha.unsqueeze(0).unsqueeze(-1)
+        inv_beta = self._inv_beta.unsqueeze(0).unsqueeze(-1)
         hidden_states = hidden_states + inv_beta * torch.pow(torch.sin(hidden_states * exp_alpha), 2)
         return hidden_states
 
@@ -134,3 +144,33 @@ class SnakeBeta(nn.Module):
             block_t=block_t,
         )
         return out
+
+
+class Snake(SnakeBeta):
+    """Original Snake activation with a single parameter: x + 1/α * sin²(αx).
+
+    Unlike SnakeBeta which has separate alpha (frequency) and beta (magnitude)
+    parameters, Snake uses alpha for both.  Only ``alpha`` appears in the
+    state_dict — ``beta`` is absent, keeping checkpoint compatibility with
+    CosyVoice3's HiFi-GAN.
+
+    The Triton kernel and precomputed-cache path from SnakeBeta are reused;
+    ``precompute_exp_cache`` derives ``_inv_beta`` from ``alpha`` so the
+    forward path is identical.
+    """
+
+    def __init__(self, in_features, alpha=1.0, alpha_logscale=False):
+        # Initialise SnakeBeta — creates both alpha and beta Parameters.
+        super().__init__(in_features, alpha=alpha, alpha_logscale=alpha_logscale)
+        # Drop beta as a Parameter so it won't appear in state_dict.
+        del self.beta
+
+    def precompute_exp_cache(self):
+        """Derive both exp_alpha and inv_beta from the single alpha parameter."""
+        with torch.no_grad():
+            if self.alpha_logscale:
+                self._exp_alpha = torch.exp(self.alpha).contiguous()
+                self._inv_beta = (1.0 / (torch.exp(self.alpha) + self.no_div_by_zero)).contiguous()
+            else:
+                self._exp_alpha = self.alpha.contiguous()
+                self._inv_beta = (1.0 / (self.alpha + self.no_div_by_zero)).contiguous()

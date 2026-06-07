@@ -1,0 +1,63 @@
+# Ming-flash-omni-2.0 deploy: thinker + image-generation (text-to-image / img2img).
+#
+# Stage 0: Thinker — multimodal understanding -> final-layer hidden states.
+#          TP=4 across GPUs 0-3.
+# Stage 1: DiT (MingImagePipeline) — condition encoder + FlowMatchEuler
+#          denoise + VAE decode. Diffusion worker, runs eager on GPU 4.
+#
+# Cross-stage transport: shared_memory_connector (intra-node).
+#
+# Fields omitted from a stage fall back to StageDeployConfig dataclass
+# defaults (see vllm_omni/config/stage_config.py).
+#   * Stage 0 max_num_seqs=2 leaves room for the CFG-text companion that
+#     `expand_cfg_prompts` (pipeline-level) spawns when a request carries
+#     a negative prompt — positive and negative hidden states both reach
+#     the diffusion stage.
+#   * Image-gen warmup adds latency on top of the thinker;
+#     pass `--stage-init-timeout <seconds>` if the default 300s is tight.
+pipeline: ming_flash_omni_image
+async_chunk: false
+
+trust_remote_code: true
+distributed_executor_backend: mp
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    # max_num_seqs=2: parent + 1 CFG-text companion (negative prompt).
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.85
+    enforce_eager: true
+    tensor_parallel_size: 4
+    devices: "0,1,2,3"
+    output_connectors:
+      to_stage_1: shared_memory_connector
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 1  # image-gen request: prefill only, no AR decode
+      seed: 42
+
+  - stage_id: 1
+    enforce_eager: true
+    devices: "4"
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      seed: 42
+
+connectors:
+  shared_memory_connector:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536  # 64KB threshold
+
+edges:
+  - from: 0
+    to: 1
+    window_size: -1
+    max_inflight: 1
+
+# Ming-flash-omni-2.0 has only been manually verified on CUDA devices
+platforms: {}

@@ -1,4 +1,10 @@
 # Common dependencies for all platforms
+# transformers: keep aligned with upstream vLLM constraint.
+# vLLM pins ">= 4.56.0, != 5.0.*, != 5.1.*, != 5.2.*, != 5.3.*, != 5.4.*, != 5.5.0".
+# 5.9.0 breaks models that define _keys_to_ignore_on_load_unexpected as a list
+# (e.g. OpenMOSS-Team/MOSS-TTS-Nano) because it changed
+# _adjust_missing_and_unexpected_keys from list+list to set|set.
+transformers >= 4.56.0, != 5.0.*, != 5.1.*, != 5.2.*, != 5.3.*, != 5.4.*, != 5.5.0, < 5.9.0
 av>=14.0.0
 omegaconf>=2.3.0
 diffusers==0.38.0

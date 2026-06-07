@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Iterable
 from typing import ClassVar
 
@@ -51,6 +52,76 @@ def get_omnivoice_post_process_func(od_config: OmniDiffusionConfig):
         return audio.cpu().float().numpy()
 
     return post_process_func
+
+
+def _combine_text(text, ref_text: str | None = None) -> str:
+    # combine with reference text if not None
+    if ref_text:
+        full_text = ref_text.strip() + " " + text.strip()
+    else:
+        full_text = text.strip()
+
+    # filter out newline / carriage-return characters
+    full_text = re.sub(r"[\r\n]+", "", full_text)
+
+    # replace Chinese parentheses with English ones
+    full_text = full_text.replace("\uff08", "(").replace("\uff09", ")")
+
+    # collapse consecutive spaces / tabs into a single space
+    full_text = re.sub(r"[ \t]+", " ", full_text)
+
+    # remove spaces around chinese characters
+    chinese_range = r"[\u4e00-\u9fff]"
+    pattern = rf"(?<={chinese_range})\s+|\s+(?={chinese_range})"
+    full_text = re.sub(pattern, "", full_text)
+
+    return full_text
+
+
+_NONVERBAL_PATTERN = re.compile(
+    r"\[(laughter|sigh|confirmation-en|question-en|question-ah|question-oh|"
+    r"question-ei|question-yi|surprise-ah|surprise-oh|surprise-wa|"
+    r"surprise-yo|dissatisfaction-hnn)\]"
+)
+
+
+def _tokenize_with_nonverbal_tags(text: str, tokenizer) -> list[int]:
+    """Tokenize text containing non-verbal tags, handling each tag independently.
+
+    Non-verbal tags are tokenized standalone to guarantee consistent token
+    IDs regardless of surrounding language context (Chinese, English, etc.).
+
+    Args:
+        text: Full text string potentially containing non-verbal tags.
+        tokenizer: HuggingFace text tokenizer instance.
+    Returns:
+        Token IDs list of length seq_len.
+    """
+    parts = []
+    last_end = 0
+    for m in _NONVERBAL_PATTERN.finditer(text):
+        if m.start() > last_end:
+            segment = text[last_end : m.start()]
+            ids = tokenizer.encode(segment)
+            if ids:
+                parts.append(ids)
+        tag_ids = tokenizer.encode(m.group())
+        if tag_ids:
+            parts.append(tag_ids)
+        last_end = m.end()
+    if last_end < len(text):
+        segment = text[last_end:]
+        ids = tokenizer.encode(segment)
+        if ids:
+            parts.append(ids)
+
+    if not parts:
+        return tokenizer.encode(text).ids
+    else:
+        combined = []
+        for p in parts:
+            combined.extend(p.ids)
+    return combined
 
 
 class OmniVoicePipeline(nn.Module, SupportAudioOutput):
@@ -147,6 +218,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         ref_text = None
         lang = "None"
         instruct = "None"
+        extra = req.sampling_params.extra_args or {}
+        seed = extra.get("seed", None)
 
         voice_name = None
         if isinstance(prompt, dict):
@@ -157,7 +230,6 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             voice_name = prompt.get("voice_name")
             lang = prompt.get("lang")
             instruct = prompt.get("instruct")
-
             # OmniTextPrompt format (used by offline Omni.generate path):
             # ref_audio comes via multi_modal_data["audio"] and the rest via
             # mm_processor_kwargs. Fall back to those when top-level keys are
@@ -211,14 +283,13 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         target_len = max(1, int(target_len))
 
         # Build text prompt with control tokens
-        style = f"<|denoise|><|lang_start|>{lang}<|lang_end|><|instruct_start|>{instruct}<|instruct_end|>"
-        if ref_text:
-            full_text = f"{ref_text} {text}"
-        else:
-            full_text = text
-        full_prompt = f"{style}<|text_start|>{full_text}<|text_end|>"
-        encoding = self.tokenizer.encode(full_prompt)
-        text_tokens = torch.tensor(encoding.ids, dtype=torch.long, device=device)
+        style_text = f"<|denoise|><|lang_start|>{lang}<|lang_end|><|instruct_start|>{instruct}<|instruct_end|>"
+        full_text = _combine_text(ref_text=ref_text, text=text)
+        wrapped_text = f"<|text_start|>{full_text}<|text_end|>"
+        style_tokens = self.tokenizer.encode(style_text).ids
+        text_tokens = _tokenize_with_nonverbal_tags(wrapped_text, self.tokenizer)
+        encoding_ids = style_tokens + text_tokens
+        text_tokens = torch.tensor(encoding_ids, dtype=torch.long, device=device)
         text_len = text_tokens.shape[0]
 
         # Encode reference audio tokens if provided (with voice caching)
@@ -262,7 +333,6 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         else:
             cond_ids = torch.cat([text_ids, target_ids], dim=1)
         cond_len = cond_ids.shape[1]
-
         uncond_ids = target_ids.clone()
         uncond_len = target_len
         max_len = max(cond_len, uncond_len)
@@ -297,8 +367,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             layer_penalty_factor=self.layer_penalty_factor,
             position_temperature=self.position_temperature,
             class_temperature=self.class_temperature,
+            seed=seed,
         )
-
         # Decode tokens to audio
         audio = self.decoder(tokens)  # [1, 1, samples]
 

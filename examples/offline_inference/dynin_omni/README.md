@@ -42,7 +42,7 @@ pip install \
 ## 3. Hardware and VRAM Requirements
 
 This example uses a 3-stage pipeline on one GPU by default
-([`dynin_omni.yaml`](../../../vllm_omni/model_executor/stage_configs/dynin_omni.yaml)):
+([`dynin_omni.yaml`](../../../vllm_omni/deploy/dynin_omni.yaml)):
 
 - Stage-0 (`token2text`): `gpu_memory_utilization: 0.5`
 - Stage-1 (`token2image`): `gpu_memory_utilization: 0.1`

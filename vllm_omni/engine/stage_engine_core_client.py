@@ -6,11 +6,13 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import multiprocessing.connection
 import os
 import socket
 import threading
+import time
 import weakref
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -158,6 +160,7 @@ class StageEngineCoreClientBase(StageClientBase):
 
         self.engine_outputs: Any = None
         self._proc = proc
+        self._shutting_down = False
         self.client_addresses = dict(client_addresses or {})
         self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
         self._kv_sender_host = self._resolve_contact_host()
@@ -233,15 +236,37 @@ class StageEngineCoreClientBase(StageClientBase):
                 multiprocessing.connection.wait([proc.sentinel])
             except Exception:
                 return
+
+            # Give multiprocessing a brief chance to publish a stable exitcode
+            # before emitting the monitor log. Without this, the sentinel can
+            # fire first and the log may misleadingly print ``None``.
+            with contextlib.suppress(Exception):
+                proc.join(timeout=0)
+            exitcode = proc.exitcode
+            if exitcode is None:
+                deadline = time.monotonic() + 0.2
+                while exitcode is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    with contextlib.suppress(Exception):
+                        proc.join(timeout=0)
+                    exitcode = proc.exitcode
+
             resources = resources_ref()
-            if resources is None or resources.engine_dead:
+            if resources is None or resources.engine_dead or self._shutting_down:
+                return
+            if exitcode == 0:
+                logger.info(
+                    "[StageEngineCoreClient] stage-%s [rep-%s] subprocess exited cleanly.",
+                    stage_id,
+                    replica_id,
+                )
                 return
             resources.engine_dead = True
             logger.error(
                 "[StageEngineCoreClient] stage-%s [rep-%s] subprocess died unexpectedly (exit code %s).",
                 stage_id,
                 replica_id,
-                proc.exitcode,
+                exitcode,
             )
 
         t = threading.Thread(
@@ -462,6 +487,7 @@ class StageEngineCoreClientBase(StageClientBase):
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown managed resources and any externally spawned subprocess."""
+        self._shutting_down = True
         child_procs: list[psutil.Process] = []
         if self._proc is not None and self._proc.pid is not None:
             try:
