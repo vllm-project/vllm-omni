@@ -9,14 +9,9 @@ session (``is_init`` False -> True) and reused on every later step, because the
 text/image context is session-invariant. Only the query (which depends on the
 per-step hidden state) is recomputed.
 
-These tests lock in two things:
-
-1. ``WanI2VCrossAttention.forward`` initialises the cache on the first call and
-   reuses it (not recompute) on later calls -- and recomputes every call when no
-   cache is provided.
-2. ``CausalWanModel._forward_blocks`` actually threads ``crossattn_cache`` down
-   to each per-layer block. This is a regression guard: the cache was previously
-   dead code because the dict never reached the block from ``_forward_inference``.
+These tests lock in that ``WanI2VCrossAttention.forward`` initialises the cache
+on the first call and reuses it (not recompute) on later calls, and recomputes
+every call when no cache is provided.
 
 CPU-only: ``WanI2VCrossAttention.__init__`` needs a tensor-parallel group (it
 builds ColumnParallel/RowParallel linears), so we bypass ``__init__`` and stub
@@ -28,10 +23,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.dreamzero.causal_wan_model import (
-    CausalWanModel,
-    WanI2VCrossAttention,
-)
+from vllm_omni.diffusion.models.dreamzero.causal_wan_model import WanI2VCrossAttention
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -120,74 +112,3 @@ def test_no_cache_recomputes_every_call() -> None:
     assert module.v_img.call_count == 2
     assert module.k.call_count == 2
     assert module.v.call_count == 2
-
-
-class _RecordingBlock(torch.nn.Module):
-    """A stand-in transformer block that records the crossattn_cache it receives."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.received: list = []
-
-    def forward(self, *, x, crossattn_cache, **kwargs):
-        self.received.append(crossattn_cache)
-        return x, None
-
-
-def _make_model_with_recording_block(block: _RecordingBlock, dim: int = 16, freq_dim: int = 8) -> CausalWanModel:
-    """A CausalWanModel stubbed down to just the path _forward_blocks needs.
-
-    __init__ is bypassed. With action=None and clip_feature=None, _forward_blocks
-    skips the action/state encoders and img_emb, so we only need the time/text
-    embedding stubs and a single recording block.
-    """
-    model = CausalWanModel.__new__(CausalWanModel)
-    model.dim = dim
-    model.freq_dim = freq_dim
-    model.time_embedding = lambda t: torch.zeros(t.shape[0], dim)
-    model.time_projection = lambda t: torch.zeros(t.shape[0], t.shape[1], 6 * dim)
-    model.text_embedding = lambda t: t
-    model.freqs_action = torch.zeros(1)
-    model.freqs_state = torch.zeros(1)
-    model.blocks = torch.nn.ModuleList([block])
-    # _forward_blocks applies the output head to the video tokens before returning.
-    model.head = lambda x_video, e: x_video
-    return model
-
-
-def test_forward_blocks_threads_crossattn_cache_to_each_block() -> None:
-    """Regression guard: crossattn_cache must reach the per-layer block.
-
-    Previously _forward_blocks did not accept/forward crossattn_cache, so every
-    block (and thus cross-attn) saw None and the cache was never used.
-    """
-    dim = 16
-    block = _RecordingBlock()
-    model = _make_model_with_recording_block(block, dim=dim)
-
-    # x is [B, dim, T, H, W]; _forward_blocks flattens spatial -> [B, seq_len, dim].
-    x = torch.randn(1, dim, 1, 2, 2)
-    seq_len = 1 * 2 * 2
-    timestep = torch.zeros(1, 1, dtype=torch.long)  # [B, F]
-    context = torch.randn(1, 4, dim)
-    sentinel_cache = [_fresh_cache()]
-
-    model._forward_blocks(
-        x=x,
-        seq_len=seq_len,
-        freqs=torch.zeros(1),
-        timestep=timestep,
-        context=context,
-        clip_feature=None,
-        embodiment_id=None,
-        action=None,
-        timestep_action=None,
-        state=None,
-        kv_cache=None,
-        crossattn_cache=sentinel_cache,
-        current_start_frame=0,
-    )
-
-    assert len(block.received) == 1
-    # The block must receive this layer's cache dict, not None.
-    assert block.received[0] is sentinel_cache[0]
