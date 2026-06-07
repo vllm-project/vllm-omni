@@ -75,6 +75,16 @@ _MODEL_COEFFICIENTS = {
     ],
     # LongCat Image transformer coefficients
     "LongCatImageTransformer2DModel": [652.5980, -424.1615, 84.5526, -4.5923, 0.1694],
+    # ERNIE-Image transformer coefficients
+    # Using Qwen-Image coefficients as initial default (single-stream AdaLN DiT architecture)
+    # TODO: Tune specifically for ERNIE-Image using coefficient estimator
+    "ErnieImageTransformer2DModel": [
+        -4.50000000e02,
+        2.80000000e02,
+        -4.50000000e01,
+        3.20000000e00,
+        -2.00000000e-02,
+    ],
 }
 
 
