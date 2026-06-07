@@ -232,8 +232,9 @@ def test_moss_tts_batch(omni_runner: OmniRunner) -> None:
         if isinstance(audio, torch.Tensor) and audio.numel() > 0:
             results.append(audio.reshape(-1).cpu())
 
-    # async_chunk streaming may split each request into multiple chunks; we
-    # need at least one non-empty audio tensor per request (i.e. >= 2 total).
+    # With async_chunk streaming + FINAL_ONLY, each request produces one
+    # consolidated output. The >= 2 guard handles backward-compatibility if
+    # consolidation behavior changes.
     assert len(results) >= 2, f"Expected at least 2 audio outputs, got {len(results)}"
     for i, audio in enumerate(results):
         assert audio.numel() > 0, f"Audio chunk[{i}] is empty"
