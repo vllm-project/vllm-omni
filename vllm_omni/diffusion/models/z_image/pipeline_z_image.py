@@ -42,7 +42,7 @@ from vllm_omni.diffusion.models.z_image.z_image_transformer import (
     ZImageTransformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -412,7 +412,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
 
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         image: PipelineImageInput = None,
         strength: float = 0.6,

@@ -40,7 +40,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.lora.request import LoRARequest
 
 from .ltx2_transformer import LTX2VideoTransformer3DModel
@@ -748,7 +748,7 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompon
     @torch.no_grad()
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -1210,7 +1210,7 @@ class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
 
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,

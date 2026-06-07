@@ -27,7 +27,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.audiox.audiox_transformer import MMDiffusionTransformer
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.transformers_utils.processors import audiox as _audiox_transforms
 
 _VIDEO_ONLY_TASKS = _audiox_transforms.VIDEO_ONLY_TASKS
@@ -812,7 +812,7 @@ class AudioXPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMix
                 )
         return batch
 
-    def forward(self, req: RequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         if req.prompts is None or len(req.prompts) == 0:
             raise ValueError("AudioXPipeline requires at least one prompt.")
         normalized_prompts = _normalize_prompts(list(req.prompts))

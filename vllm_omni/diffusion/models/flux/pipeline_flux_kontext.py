@@ -34,7 +34,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComp
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.logger import init_logger
 
 logger = init_logger(__name__)
@@ -468,7 +468,7 @@ class FluxKontextPipeline(
     @torch.no_grad()
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
         image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
         prompt: str | list[str] | None = None,
         prompt_2: str | list[str] | None = None,

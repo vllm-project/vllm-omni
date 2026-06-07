@@ -30,7 +30,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -270,7 +270,7 @@ class HeliosPipeline(
 
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
         prompt: str | None = None,
         negative_prompt: str | None = None,
         height: int = 384,

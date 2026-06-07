@@ -49,7 +49,7 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -670,7 +670,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         return kv_caches
 
     @torch.inference_mode()
-    def forward(self, req: RequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         """
         Main generation forward pass.
 

@@ -43,7 +43,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -431,7 +431,7 @@ class Wan22I2VPipeline(
 
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
         prompt: str | None = None,
         negative_prompt: str | None = None,
         image: PIL.Image.Image | torch.Tensor | None = None,

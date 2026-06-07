@@ -45,7 +45,7 @@ from vllm_omni.diffusion.utils.size_utils import (
     normalize_min_aligned_size,
 )
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -646,7 +646,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
         image: PIL.Image.Image | torch.Tensor | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,

@@ -25,7 +25,7 @@ from torch import nn
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import BasePipelineUtils, get_pipeline_utils
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniPromptType, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -152,7 +152,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     # Forward pass
     # ------------------------------------------------------------------
 
-    def forward(self, req: RequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Full delegation to diffusers ``pipeline.__call__()``."""
 
         kwargs = self._build_call_kwargs(req)
@@ -291,8 +291,8 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 f"{dict(zip(attention_backend_attempts, attempt_errors))}"
             )
 
-    def _build_call_kwargs(self, req: RequestBatch) -> dict[str, Any]:
-        """Translate a ``RequestBatch`` into diffusers ``__call__`` kwargs."""
+    def _build_call_kwargs(self, req: DiffusionRequestBatch) -> dict[str, Any]:
+        """Translate a ``DiffusionRequestBatch`` into diffusers ``__call__`` kwargs."""
         sampling = req.sampling_params
         input_kwargs = self._extract_input(req.prompts)
 

@@ -29,7 +29,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
 
@@ -2243,7 +2243,7 @@ class HunyuanImage3Pipeline(
 
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] = "",
         image_size="auto",
         height: int = 1024,

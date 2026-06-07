@@ -27,7 +27,7 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.lora.request import LoRARequest
 
 from .pipeline_ltx2 import (
@@ -286,7 +286,7 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
     @torch.no_grad()
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
         image: PIL.Image.Image | torch.Tensor | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
@@ -796,7 +796,7 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     @torch.no_grad()
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
         image: PIL.Image.Image | torch.Tensor | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,

@@ -37,7 +37,7 @@ from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
 from vllm_omni.diffusion.models.longcat_image.pipeline_longcat_image import calculate_shift
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -544,7 +544,7 @@ class LongCatImageEditPipeline(
 
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
         image: PIL.Image.Image | torch.Tensor | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,

@@ -36,7 +36,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import WanVACETransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -460,7 +460,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
 
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
         prompt: str | None = None,
         negative_prompt: str | None = None,
         height: int = 480,

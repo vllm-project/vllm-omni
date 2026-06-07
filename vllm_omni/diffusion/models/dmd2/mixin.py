@@ -10,7 +10,7 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.dmd2.config import DMD2Config
 from vllm_omni.diffusion.models.schedulers import DMD2EulerScheduler
 from vllm_omni.diffusion.models.utils import _load_json
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class DMD2PipelineMixin:
         )
 
     def _sanitize_dmd2_request(self, req) -> None:
-        """Sanitize CFG-related fields in-place. Works with both OmniDiffusionRequest and RequestBatch."""
+        """Sanitize CFG-related fields in-place. Works with both OmniDiffusionRequest and DiffusionRequestBatch."""
         sp = req.sampling_params
 
         if sp.num_inference_steps and sp.num_inference_steps != self.dmd2_config.num_inference_steps:
@@ -83,7 +83,7 @@ class DMD2PipelineMixin:
                 logger.warning("DMD2: ignoring negative_prompt.")
                 request.prompt = {k: v for k, v in p.items() if k != "negative_prompt"}
 
-    def forward(self, req: RequestBatch, **kwargs) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
         self._sanitize_dmd2_request(req)
         kwargs.pop("guidance_scale", None)
         kwargs.pop("num_inference_steps", None)

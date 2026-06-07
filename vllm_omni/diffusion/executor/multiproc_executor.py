@@ -351,7 +351,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute request-mode work through a single batched worker RPC.
 
-        The worker builds RequestBatch from scheduler output and returns
+        The worker builds DiffusionRequestBatch from scheduler output and returns
         BatchRunnerOutput with one RunnerOutput per scheduled request.
         """
         from vllm_omni.diffusion.worker.utils import BatchRunnerOutput

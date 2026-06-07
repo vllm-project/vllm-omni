@@ -17,7 +17,7 @@ class OmniDiffusionRequest:
 
     This dataclass contains the prompt and sampling parameters for the diffusion pipeline
     execution. It also contains a request_id for other components to trace this request and its outputs.
-    The runner wraps one or more requests into a RequestBatch before pipeline execution.
+    The runner wraps one or more requests into a DiffusionRequestBatch before pipeline execution.
     """
 
     # TODO(will): double check that args are separate from server_args

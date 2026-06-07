@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -98,7 +98,7 @@ def test_forward_delegates_denoising_to_diffuse(monkeypatch) -> None:
             extra_args={},
         ),
     )
-    batch = RequestBatch(requests=[mock_req])
+    batch = DiffusionRequestBatch(requests=[mock_req])
 
     outputs = pipeline.forward(batch, prompt_embeds=prompt_embeds, output_type="latent", guidance_scale=1.0)
 

@@ -26,7 +26,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.models.omnivoice.duration import RuleDurationEstimator
 from vllm_omni.model_executor.models.omnivoice.omnivoice_decoder import OmniVoiceDecoder
 from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import OmniVoiceGenerator
@@ -206,7 +206,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         return tokens
 
     @torch.inference_mode()
-    def forward(self, req: RequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Generate speech audio from text, optionally with voice cloning.
 
         Accepts either a plain text prompt or a structured dict:

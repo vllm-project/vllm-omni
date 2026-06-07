@@ -49,7 +49,7 @@ from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
     MingZImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -279,7 +279,7 @@ class MingImagePipeline(ZImagePipeline):
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
-    def forward(self, req: RequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Run one text-to-image generation request.
 
         Args:

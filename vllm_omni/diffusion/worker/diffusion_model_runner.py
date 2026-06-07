@@ -38,7 +38,7 @@ from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
@@ -325,7 +325,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
-                    batch = RequestBatch(requests=[req])
+                    batch = DiffusionRequestBatch(requests=[req])
                     outputs = self.pipeline.forward(batch)
                     output = outputs[0]
 
@@ -354,7 +354,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     ) -> BatchRunnerOutput:
         """Execute scheduled request-mode requests through the batch forward path.
 
-        Builds a ``RequestBatch`` from scheduled new requests, runs
+        Builds a ``DiffusionRequestBatch`` from scheduled new requests, runs
         per-request setup, and calls ``pipeline.forward(batch)``. The pipeline
         must declare ``supports_request_batch = True``.
         """
@@ -397,7 +397,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 if num_inference_steps is not None:
                     self.cache_backend.refresh(self.pipeline, num_inference_steps)
 
-            batch = RequestBatch(requests=reqs)
+            batch = DiffusionRequestBatch(requests=reqs)
 
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if is_primary:

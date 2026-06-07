@@ -50,7 +50,7 @@ from vllm_omni.diffusion.models.interface import (
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from .action import (
@@ -1240,7 +1240,7 @@ class Cosmos3OmniDiffusersPipeline(
         return self._sound_tokenizer
 
     @staticmethod
-    def _is_t2i_request(req: RequestBatch) -> bool:
+    def _is_t2i_request(req: DiffusionRequestBatch) -> bool:
         """Detect text-to-image mode from request-level prompt modalities."""
         if not req.prompts:
             return False
@@ -2181,7 +2181,7 @@ class Cosmos3OmniDiffusersPipeline(
 
     def forward(
         self,
-        req: RequestBatch,
+        req: DiffusionRequestBatch,
     ) -> list[DiffusionOutput]:
         if req.num_reqs != 1:
             raise ValueError("Cosmos3OmniDiffusersPipeline currently supports single-request forward.")

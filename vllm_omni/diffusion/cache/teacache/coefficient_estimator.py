@@ -208,10 +208,10 @@ class TeaCacheCoefficientEstimator:
                 seed=generate_kwargs.get("seed", 42),
             ),
         )
-        from vllm_omni.diffusion.worker.request_batch import RequestBatch
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
         with torch.no_grad():
-            self.pipeline.forward(RequestBatch(requests=[req]))
+            self.pipeline.forward(DiffusionRequestBatch(requests=[req]))
         trajectory = self.hook.stop_collection()
         if trajectory:
             self.collected_data.append(trajectory)

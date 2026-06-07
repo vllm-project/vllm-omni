@@ -11,7 +11,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
 @dataclass
-class RequestBatch:
+class DiffusionRequestBatch:
     """Request-level batch wrapping original diffusion requests.
 
     This is distinct from ``InputBatch`` (aliased as ``StepInputBatch``),

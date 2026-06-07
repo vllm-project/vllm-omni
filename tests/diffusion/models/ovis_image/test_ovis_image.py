@@ -24,7 +24,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.ovis_image.pipeline_ovis_image import OvisImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import RequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
@@ -177,7 +177,7 @@ def test_basic_generation(ovis_pipeline):
         ),
     )
 
-    output = ovis_pipeline(RequestBatch(requests=[req]))[0]
+    output = ovis_pipeline(DiffusionRequestBatch(requests=[req]))[0]
 
     assert output is not None
     assert output.output is not None
@@ -215,7 +215,7 @@ def test_guidance_scale(ovis_pipeline, monkeypatch: pytest.MonkeyPatch):
         ),
     )
 
-    ovis_pipeline(RequestBatch(requests=[req]))
+    ovis_pipeline(DiffusionRequestBatch(requests=[req]))
     assert ovis_pipeline.transformer.call_count >= 2
 
 
@@ -236,7 +236,7 @@ def test_resolution_check(ovis_pipeline):
     # Should warn but proceed (as per code I read earlier) or resize?
     # The code had `logger.warning(...)`
 
-    output = ovis_pipeline(RequestBatch(requests=[req]))[0]
+    output = ovis_pipeline(DiffusionRequestBatch(requests=[req]))[0]
     assert output is not None
 
 
