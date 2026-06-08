@@ -185,7 +185,7 @@ def ar2diffusion(
     for i, ar_output in enumerate(ar_outputs):
         output = ar_output.outputs[0]
         generated_token_ids = output.cumulative_token_ids
-        generated_text = getattr(output, "text", "") or ""
+        generated_text = getattr(output, "cumulative_text", "") or ""
 
         # Get original prompt info
         original_prompt = prompt[i] if i < len(prompt) else {}

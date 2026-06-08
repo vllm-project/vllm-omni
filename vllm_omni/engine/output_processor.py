@@ -45,6 +45,8 @@ class OmniRequestState(RequestState):
         # outputs are drained (i.e., only drain modality keys, don't drain
         # hidden states).
         self.mm_accumulated: dict[str, Any] = {}
+        # Cache cumulative text to avoid re-decoding in DELTA mode
+        self.cumulative_text_cache: str = ""
 
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)
@@ -268,6 +270,12 @@ class OmniRequestState(RequestState):
         # In DELTA mode, base_output.token_ids only has the latest step's
         # tokens, so we always store a cumulative copy here.
         base_output.cumulative_token_ids = list(self.detokenizer.output_token_ids)
+        if self.output_kind == RequestOutputKind.DELTA:
+            # negligible overhead
+            self.cumulative_text_cache += base_output.text
+            base_output.cumulative_text = self.cumulative_text_cache
+        else:
+            base_output.cumulative_text = base_output.text
 
         if not hasattr(base_output, "multimodal_output"):
             setattr(base_output, "multimodal_output", {})
