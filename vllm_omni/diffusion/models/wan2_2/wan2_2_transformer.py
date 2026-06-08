@@ -751,7 +751,7 @@ def convert_original_to_diffusers_key(name: str) -> str:
     convention.
 
     The original release (e.g. ``Wan2.2-VACE-Fun-A14B``) names weights
-    differently than the diffusers conversion. To make use of existing code, 
+    differently than the diffusers conversion. To make use of existing code,
     we translate original names into diffusers form first.
 
     This is a no-op on keys already in diffusers form, so it is currently called
@@ -769,10 +769,14 @@ def convert_original_to_diffusers_key(name: str) -> str:
         ("time_projection.1.", "condition_embedder.time_proj."),
         (".self_attn.", ".attn1."),
         (".cross_attn.", ".attn2."),
-        (".q.weight", ".to_q.weight"), (".q.bias", ".to_q.bias"),
-        (".k.weight", ".to_k.weight"), (".k.bias", ".to_k.bias"),
-        (".v.weight", ".to_v.weight"), (".v.bias", ".to_v.bias"),
-        (".o.weight", ".to_out.0.weight"), (".o.bias", ".to_out.0.bias"),
+        (".q.weight", ".to_q.weight"),
+        (".q.bias", ".to_q.bias"),
+        (".k.weight", ".to_k.weight"),
+        (".k.bias", ".to_k.bias"),
+        (".v.weight", ".to_v.weight"),
+        (".v.bias", ".to_v.bias"),
+        (".o.weight", ".to_out.0.weight"),
+        (".o.bias", ".to_out.0.bias"),
         (".ffn.0.", ".ffn.net.0.proj."),
         (".ffn.2.", ".ffn.net.2."),
         (".norm3.", ".norm2."),  # cross-attn pre-norm (only affine norm in block)

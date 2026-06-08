@@ -282,7 +282,7 @@ def resolve_model_config_path(model: str) -> str:
             model_type = _try_resolve_omni_model_type(model)
             if model_type is None and _looks_like_wan2_2_vace_original(model):
                 model_type = "vace"
-                
+
             if model_type is None:
                 raise ValueError(
                     f"Could not determine model_type for model: {model}. "

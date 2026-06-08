@@ -21,34 +21,35 @@ from dataclasses import replace
 
 import PIL.Image
 import torch
+
+# Loading the original (non-diffusers) Wan2.2 VACE layout (high_noise_model/
+# low_noise_model + google/umt5-xxl tokenizer + .pth text-encoder/VAE).
+from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
+    build_wan_scheduler,
+    load_transformer_config,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_post_process_func as get_wan22_vace_post_process_func,  # noqa: F401
 )
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import _WAN_UMT5_CONFIG, _load_wan_t5_as_umt5
 from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import WanVACETransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.hf_utils import _looks_like_wan2_2_vace_original
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
-
-# Loading the original (non-diffusers) Wan2.2 VACE layout (high_noise_model/
-# low_noise_model + google/umt5-xxl tokenizer + .pth text-encoder/VAE).
-from transformers import AutoTokenizer, UMT5EncoderModel
-from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
-from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import build_wan_scheduler, load_transformer_config
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import _WAN_UMT5_CONFIG, _load_wan_t5_as_umt5
-from vllm_omni.diffusion.utils.hf_utils import _looks_like_wan2_2_vace_original
 
 logger = init_logger(__name__)
 
@@ -266,21 +267,29 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         if load_transformer:
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=model, subfolder="high_noise_model",
-                    revision=None, prefix="transformer.", fall_back_to_pt=True,
+                    model_or_path=model,
+                    subfolder="high_noise_model",
+                    revision=None,
+                    prefix="transformer.",
+                    fall_back_to_pt=True,
                 )
             )
         if load_transformer_2:
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=model, subfolder="low_noise_model",
-                    revision=None, prefix="transformer_2.", fall_back_to_pt=True,
+                    model_or_path=model,
+                    subfolder="low_noise_model",
+                    revision=None,
+                    prefix="transformer_2.",
+                    fall_back_to_pt=True,
                 )
             )
 
         self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(model, "google", "umt5-xxl"))
         t5_pth = os.path.join(model, "models_t5_umt5-xxl-enc-bf16.pth")
-        self.text_encoder = _load_wan_t5_as_umt5(UMT5EncoderModel(_WAN_UMT5_CONFIG), t5_pth, dtype=dtype).to(self.device)
+        self.text_encoder = _load_wan_t5_as_umt5(UMT5EncoderModel(_WAN_UMT5_CONFIG), t5_pth, dtype=dtype).to(
+            self.device
+        )
         vae_pth = os.path.join(model, "Wan2.1_VAE.pth")
         self.vae = DistributedAutoencoderKLWan.from_single_file(vae_pth, torch_dtype=dtype)
         self.vae.init_distributed()

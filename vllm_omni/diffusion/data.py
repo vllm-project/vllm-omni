@@ -925,7 +925,7 @@ class OmniDiffusionConfig:
                         self.set_tf_model_config(TransformerConfig())
                         self.update_multimodal_support()
                         return
-                    
+
                     # Lance ships its top-level config.json one directory above
                     # the per-checkpoint subfolders (``Lance_3B/`` or
                     # ``Lance_3B_Video/``).  Try to recover that case before
