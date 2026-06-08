@@ -58,7 +58,7 @@ def _looks_like_wan2_2_vace_original(model_name: str) -> bool:
     try:
         cfg = get_hf_file_to_dict("high_noise_model/config.json", model_name)
         return cfg is not None and cfg.get("model_type") == "vace"
-    except Exception:
+    except (OSError, ValueError):
         return False
 
 

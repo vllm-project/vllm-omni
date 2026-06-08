@@ -779,7 +779,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             )
             if boundary_ratio is None:
                 boundary_ratio = 0.875
-                logger.warning("boundary_ratio is required for Wan2.2 VACE generation. using default value 0.875")
+                logger.warning_once("boundary_ratio is required for Wan2.2 VACE generation. using default value 0.875")
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
 
         latents = self.diffuse(
