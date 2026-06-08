@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 
 class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
+    def cfg_normalize_function(self, noise_pred: torch.Tensor, comb_pred: torch.Tensor) -> torch.Tensor:
+        cond_norm = torch.norm(noise_pred, dim=2, keepdim=True)
+        noise_norm = torch.norm(comb_pred, dim=2, keepdim=True)
+        return comb_pred * (cond_norm / noise_norm.clamp_min(1e-6))
+
     def diffuse(
         self,
         latents: torch.Tensor,
@@ -26,7 +31,7 @@ class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         timesteps: torch.Tensor,
         do_true_cfg: bool,
         true_cfg_scale: float,
-        cfg_normalize: bool = False,
+        cfg_normalize: bool = True,
     ) -> torch.Tensor:
         self.scheduler.set_begin_index(0)
         with self.progress_bar(total=len(timesteps)) as pbar:
@@ -37,15 +42,12 @@ class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
 
                 latents[:, : image_latents.shape[1]] = image_latents
                 latent_model_input = latents
-                timestep_expand = timestep.expand(latents.shape[0]).to(
-                    device=latents.device, dtype=latents.dtype
-                )
+                timestep_expand = timestep.expand(latents.shape[0]).to(device=latents.device)
 
                 positive_kwargs = {
                     "hidden_states": latent_model_input,
                     "timestep": timestep_expand,
                     "encoder_hidden_states": prompt_embeds,
-                    "encoder_hidden_states_mask": prompt_embeds_mask,
                     "return_dict": False,
                 }
                 negative_kwargs = None
@@ -54,7 +56,6 @@ class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                         "hidden_states": latent_model_input,
                         "timestep": timestep_expand,
                         "encoder_hidden_states": negative_prompt_embeds,
-                        "encoder_hidden_states_mask": negative_prompt_embeds_mask,
                         "return_dict": False,
                     }
 

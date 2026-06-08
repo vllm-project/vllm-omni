@@ -12,14 +12,19 @@ from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.models.joy_image import (
     pipeline_joy_image_edit as joy_pipeline_module,
 )
+from vllm_omni.diffusion.models.joy_image.cfg_parallel import JoyImageEditCFGParallelMixin
 from vllm_omni.diffusion.models.joy_image.joy_image_edit_transformer import (
     JoyImageEditTransformer3DModel,
 )
 from vllm_omni.diffusion.models.joy_image.pipeline_joy_image_edit import (
     JOY_MAX_IMAGE_SEQ_LEN,
+    JOY_PROMPT_TEMPLATE,
+    JOY_VISION_TOKEN,
     JoyImageEditPipeline,
     _cast_floating_model_inputs,
+    _format_qwen_multimodal_prompt,
     _get_transformer_config_kwargs_from_od_config,
+    _pil_to_tensor,
     _should_defer_component_device_placement,
     get_joy_image_edit_pre_process_func,
 )
@@ -222,7 +227,7 @@ def test_preprocess_rejects_batched_prompts_and_partial_size(tmp_path):
         preprocess(partial_size)
 
 
-def test_preprocess_aligns_and_caps_default_image_size(tmp_path):
+def test_preprocess_uses_diffusers_bucket_for_default_image_size(tmp_path):
     od_config = _write_model_configs(tmp_path)
     preprocess = get_joy_image_edit_pre_process_func(od_config)
 
@@ -232,8 +237,7 @@ def test_preprocess_aligns_and_caps_default_image_size(tmp_path):
     height = info["height"]
     width = info["width"]
 
-    assert height % 16 == 0
-    assert width % 16 == 0
+    assert (height, width) == (704, 1408)
     assert (height // 16) * (width // 16) <= JOY_MAX_IMAGE_SEQ_LEN
     assert info["image_tensor"].shape == (1, 3, 1, height, width)
     assert info["original_size"] == (2048, 1024)
@@ -242,13 +246,111 @@ def test_preprocess_aligns_and_caps_default_image_size(tmp_path):
     assert request.sampling_params.width == width
 
 
-def test_preprocess_rejects_explicit_size_over_token_budget(tmp_path):
+def test_pil_to_tensor_uses_center_crop_instead_of_stretch():
+    image = Image.new("RGB", (4, 2))
+    pixels = image.load()
+    colors = [
+        (255, 0, 0),
+        (0, 255, 0),
+        (0, 0, 255),
+        (255, 255, 255),
+    ]
+    for x, color in enumerate(colors):
+        for y in range(2):
+            pixels[x, y] = color
+
+    tensor = _pil_to_tensor(image, height=2, width=2)
+    restored = ((tensor.squeeze(0).squeeze(1).permute(1, 2, 0) + 1.0) * 127.5).round().to(torch.uint8)
+
+    assert restored[:, 0].tolist() == [[0, 255, 0], [0, 255, 0]]
+    assert restored[:, 1].tolist() == [[0, 0, 255], [0, 0, 255]]
+
+
+def test_joy_cfg_normalize_uses_channel_dimension():
+    mixin = JoyImageEditCFGParallelMixin()
+    noise_pred = torch.tensor([[[[[[3.0, 4.0]]], [[[4.0, 3.0]]]]]])
+    comb_pred = torch.tensor([[[[[[6.0, 8.0]]], [[[8.0, 6.0]]]]]])
+
+    normalized = mixin.cfg_normalize_function(noise_pred, comb_pred)
+    expected = comb_pred * (
+        torch.norm(noise_pred, dim=2, keepdim=True) / torch.norm(comb_pred, dim=2, keepdim=True).clamp_min(1e-6)
+    )
+
+    assert torch.equal(normalized, expected)
+
+
+def test_joy_diffuse_preserves_scheduler_timestep_dtype_for_time_embedding():
+    class FakeProgressBar:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def update(self):
+            pass
+
+    class FakeScheduler:
+        def set_begin_index(self, index):
+            self.begin_index = index
+
+    class FakeMixin(JoyImageEditCFGParallelMixin):
+        def __init__(self):
+            self.scheduler = FakeScheduler()
+            self.captured_timestep_dtype = None
+            self._interrupt = False
+
+        @property
+        def interrupt(self):
+            return self._interrupt
+
+        def progress_bar(self, total):
+            return FakeProgressBar()
+
+        def predict_noise_maybe_with_cfg(self, **kwargs):
+            self.captured_timestep_dtype = kwargs["positive_kwargs"]["timestep"].dtype
+            return torch.zeros_like(kwargs["positive_kwargs"]["hidden_states"])
+
+        def scheduler_step_maybe_with_cfg(self, noise_pred, timestep, latents, do_true_cfg):
+            return latents
+
+    mixin = FakeMixin()
+    latents = torch.zeros(1, 2, 4, 1, 4, 4, dtype=torch.bfloat16)
+    image_latents = torch.zeros(1, 1, 4, 1, 4, 4, dtype=torch.bfloat16)
+
+    mixin.diffuse(
+        latents=latents,
+        image_latents=image_latents,
+        prompt_embeds=torch.zeros(1, 2, 4, dtype=torch.bfloat16),
+        prompt_embeds_mask=torch.ones(1, 2, dtype=torch.long),
+        negative_prompt_embeds=None,
+        negative_prompt_embeds_mask=None,
+        timesteps=torch.tensor([999.125], dtype=torch.float32),
+        do_true_cfg=False,
+        true_cfg_scale=1.0,
+    )
+
+    assert mixin.captured_timestep_dtype == torch.float32
+
+
+def test_format_qwen_multimodal_prompt_matches_diffusers_image_placeholder_replacement():
+    formatted = _format_qwen_multimodal_prompt("make it brighter")
+
+    assert formatted == (
+        f"<|im_start|>user\n{JOY_VISION_TOKEN}"
+        "make it brighter<|im_end|>\n"
+    )
+
+
+def test_preprocess_maps_explicit_size_to_nearest_diffusers_bucket(tmp_path):
     od_config = _write_model_configs(tmp_path)
     preprocess = get_joy_image_edit_pre_process_func(od_config)
     params = _make_params(height=2048, width=2048)
 
-    with pytest.raises(ValueError, match="token budget"):
-        preprocess(_make_request(params=params))
+    request = preprocess(_make_request(params=params))
+
+    assert request.sampling_params.height == 1024
+    assert request.sampling_params.width == 1024
 
 
 def test_guidance_scale_alias_only_when_true_cfg_absent():
@@ -300,10 +402,14 @@ def test_pad_prompt_embeds_keeps_last_tokens_and_builds_mask():
 
 
 def test_last_layer_capture_passes_mm_token_type_ids():
+    class FakeDecoderLayer(torch.nn.Module):
+        def forward(self, hidden_states):
+            return (hidden_states + 1.0,)
+
     class FakeLanguageModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.layers = torch.nn.ModuleList([torch.nn.Identity()])
+            self.layers = torch.nn.ModuleList([FakeDecoderLayer()])
 
     class FakeTextEncoder(torch.nn.Module):
         def __init__(self):
@@ -326,6 +432,7 @@ def test_last_layer_capture_passes_mm_token_type_ids():
         pixel_values=torch.zeros(1, 3, 16, 16),
         image_grid_thw=torch.tensor([[1, 1, 1]], dtype=torch.long),
         mm_token_type_ids=mm_token_type_ids,
+        extra_processor_field=torch.tensor([7], dtype=torch.long),
     )
 
     hidden_states = JoyImageEditPipeline._get_last_layer_pre_norm_hidden(
@@ -333,8 +440,10 @@ def test_last_layer_capture_passes_mm_token_type_ids():
         model_inputs,
     )
 
-    assert hidden_states.shape == (1, 2, 4)
+    assert torch.equal(hidden_states, torch.ones(1, 2, 4))
     assert pipeline.text_encoder.calls[0]["mm_token_type_ids"] is mm_token_type_ids
+    assert torch.equal(pipeline.text_encoder.calls[0]["extra_processor_field"], torch.tensor([7], dtype=torch.long))
+    assert pipeline.text_encoder.calls[0]["output_hidden_states"] is False
 
 
 def test_cast_floating_model_inputs_only_casts_pixel_tensors():
@@ -395,7 +504,7 @@ def test_qwen_prompt_embeds_casts_processor_pixel_values_to_encoder_dtype():
     pipeline.device = torch.device("cpu")
     pipeline.processor = FakeProcessor()
     pipeline.text_encoder = FakeTextEncoder()
-    pipeline.prompt_template_encode = "{}"
+    pipeline.prompt_template_encode = JOY_PROMPT_TEMPLATE
     pipeline.prompt_template_encode_start_idx = 0
     pipeline.tokenizer_max_length = 8
     captured = {}
@@ -417,6 +526,14 @@ def test_qwen_prompt_embeds_casts_processor_pixel_values_to_encoder_dtype():
         "pixel_dtype": torch.bfloat16,
         "attention_mask_dtype": torch.long,
     }
+    text = pipeline.processor.kwargs["text"][0]
+    assert text.startswith("<|im_start|>system\n \\nDescribe")
+    assert "Describe the image by detailing the color, shape, size, texture" in text
+    assert (
+        f"<|im_start|>user\n{JOY_VISION_TOKEN}"
+        "make it brighter<|im_end|>\n"
+    ) in text
+    assert text.endswith("<|im_start|>assistant\n")
     assert prompt_embeds.dtype == torch.bfloat16
     assert prompt_mask.dtype == torch.long
 
@@ -447,6 +564,41 @@ def test_prepare_latents_casts_encoded_image_latents_to_requested_dtype():
 
     assert latents.dtype == torch.bfloat16
     assert image_latents.dtype == torch.bfloat16
+
+
+def test_encode_vae_image_does_not_forward_noise_generator_to_posterior_sample():
+    class FakeLatentDist:
+        def __init__(self):
+            self.received_generator = object()
+
+        def sample(self, generator=None):
+            self.received_generator = generator
+            return torch.zeros(1, 4, 1, 8, 8)
+
+    class FakeVAE:
+        def __init__(self):
+            self.config = SimpleNamespace(
+                latents_mean=[0.0, 0.0, 0.0, 0.0],
+                latents_std=[1.0, 1.0, 1.0, 1.0],
+            )
+            self.latent_dist = FakeLatentDist()
+
+        def encode(self, image):
+            return SimpleNamespace(latent_dist=self.latent_dist)
+
+    pipeline = object.__new__(JoyImageEditPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.vae = FakeVAE()
+    pipeline.latent_channels = 4
+
+    generator = torch.Generator(device="cpu").manual_seed(123)
+    JoyImageEditPipeline._encode_vae_image(
+        pipeline,
+        torch.zeros(1, 3, 1, 64, 64),
+        generator,
+    )
+
+    assert pipeline.vae.latent_dist.received_generator is None
 
 
 def test_transformer_shape_and_masked_forward():

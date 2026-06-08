@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import time
@@ -22,7 +21,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
+from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -60,14 +59,65 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-JOY_DEFAULT_TARGET_AREA = 1024 * 1024
 JOY_MAX_IMAGE_SEQ_LEN = 4096
+JOY_BUCKETS = [
+    (512, 1792),
+    (512, 1856),
+    (512, 1920),
+    (512, 1984),
+    (512, 2048),
+    (576, 1600),
+    (576, 1664),
+    (576, 1728),
+    (576, 1792),
+    (640, 1472),
+    (640, 1536),
+    (640, 1600),
+    (704, 1344),
+    (704, 1408),
+    (704, 1472),
+    (768, 1216),
+    (768, 1280),
+    (768, 1344),
+    (832, 1152),
+    (832, 1216),
+    (896, 1088),
+    (896, 1152),
+    (960, 1024),
+    (960, 1088),
+    (1024, 960),
+    (1024, 1024),
+    (1088, 896),
+    (1088, 960),
+    (1152, 832),
+    (1152, 896),
+    (1216, 768),
+    (1216, 832),
+    (1280, 768),
+    (1344, 704),
+    (1344, 768),
+    (1408, 704),
+    (1472, 640),
+    (1472, 704),
+    (1536, 640),
+    (1600, 576),
+    (1600, 640),
+    (1664, 576),
+    (1728, 576),
+    (1792, 512),
+    (1792, 576),
+    (1856, 512),
+    (1920, 512),
+    (1984, 512),
+    (2048, 512),
+]
 JOY_PROMPT_TEMPLATE_START_IDX = 34
 JOY_PROMPT_TEMPLATE = (
-    "<|im_start|>system\nYou are an assistant designed to generate high-quality images with the highest degree of "
-    "image-text alignment based on textual prompts. <|im_end|>\n<|im_start|>user\n"
-    "<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
+    "<|im_start|>system\n \\nDescribe the image by detailing the color, shape, size, texture, "
+    "quantity, text, spatial relationships of the objects and background:<|im_end|>\n"
+    "{}<|im_start|>assistant\n"
 )
+JOY_VISION_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
 
 
 def _joy_trace_enabled() -> bool:
@@ -90,11 +140,6 @@ def _get_model_path(model_name: str) -> str:
         ["vae/config.json", "transformer/config.json"],
         require_all=True,
     )
-
-
-def _load_json(path: str | Path) -> dict[str, Any]:
-    with open(path) as config_file:
-        return json.load(config_file)
 
 
 def _get_transformer_config_kwargs_from_od_config(
@@ -125,50 +170,35 @@ def _is_dummy_request(req: Any) -> bool:
     return getattr(req, "request_id", None) == DUMMY_DIFFUSION_REQUEST_ID
 
 
-def _calculate_dimensions(
-    target_area: int, ratio: float, alignment: int
-) -> tuple[int, int]:
-    width = math.sqrt(target_area * ratio)
-    height = width / ratio
-    width = max(alignment, int(round(width / alignment) * alignment))
-    height = max(alignment, int(round(height / alignment) * alignment))
-    return width, height
+def _format_qwen_multimodal_prompt(prompt: str) -> str:
+    prompt = f"<image>\n{prompt}"
+    prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n"
+    return prompt.replace("<image>\n", JOY_VISION_TOKEN)
 
 
-def _fit_to_token_budget(height: int, width: int, alignment: int) -> tuple[int, int]:
-    token_count = (height // alignment) * (width // alignment)
-    if token_count <= JOY_MAX_IMAGE_SEQ_LEN:
-        return height, width
-    scale = math.sqrt(JOY_MAX_IMAGE_SEQ_LEN / token_count)
-    height = max(alignment, int(math.floor((height * scale) / alignment) * alignment))
-    width = max(alignment, int(math.floor((width * scale) / alignment) * alignment))
-    while (height // alignment) * (width // alignment) > JOY_MAX_IMAGE_SEQ_LEN:
-        if height >= width and height > alignment:
-            height -= alignment
-        elif width > alignment:
-            width -= alignment
-        else:
-            break
-    return height, width
+def _find_best_bucket(height: int, width: int) -> tuple[int, int]:
+    target_ratio = height / width
+    return min(JOY_BUCKETS, key=lambda size: abs(size[0] / size[1] - target_ratio))
 
 
-def _normalize_explicit_size(
-    height: int, width: int, alignment: int
-) -> tuple[int, int]:
-    height = max(alignment, int(round(height / alignment) * alignment))
-    width = max(alignment, int(round(width / alignment) * alignment))
-    token_count = (height // alignment) * (width // alignment)
-    if token_count > JOY_MAX_IMAGE_SEQ_LEN:
-        raise ValueError(
-            "`height` and `width` exceed JoyAI-Image-Edit token budget: "
-            f"({height} / {alignment}) * ({width} / {alignment}) = {token_count}, "
-            f"max {JOY_MAX_IMAGE_SEQ_LEN}."
-        )
-    return height, width
+def _resize_center_crop(
+    image: PIL.Image.Image,
+    height: int,
+    width: int,
+) -> PIL.Image.Image:
+    image = image.convert("RGB")
+    source_width, source_height = image.size
+    scale = max(height / source_height, width / source_width)
+    resized_height = math.ceil(source_height * scale)
+    resized_width = math.ceil(source_width * scale)
+    image = image.resize((resized_width, resized_height), PIL.Image.Resampling.BILINEAR)
+    left = (resized_width - width) // 2
+    top = (resized_height - height) // 2
+    return image.crop((left, top, left + width, top + height))
 
 
 def _pil_to_tensor(image: PIL.Image.Image, height: int, width: int) -> torch.Tensor:
-    image = image.convert("RGB").resize((width, height), PIL.Image.Resampling.LANCZOS)
+    image = _resize_center_crop(image, height, width)
     array = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
     tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
     return tensor.unsqueeze(2).contiguous()
@@ -257,13 +287,6 @@ def _cast_floating_model_inputs(model_inputs: Any, dtype: torch.dtype) -> Any:
 def get_joy_image_edit_pre_process_func(
     od_config: OmniDiffusionConfig,
 ) -> Callable[[OmniDiffusionRequest], OmniDiffusionRequest]:
-    model_path = _get_model_path(od_config.model)
-    vae_config = _load_json(Path(model_path) / "vae" / "config.json")
-    transformer_config = _load_json(Path(model_path) / "transformer" / "config.json")
-    scale_factor_spatial = int(vae_config.get("scale_factor_spatial", 8))
-    patch_size = transformer_config.get("patch_size", [1, 2, 2])
-    alignment = scale_factor_spatial * int(patch_size[1])
-
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         if len(request.prompts) != 1:
             raise ValueError(
@@ -282,21 +305,14 @@ def get_joy_image_edit_pre_process_func(
                     "JoyAI-Image-Edit requires both `height` and `width`, or neither."
                 )
             if not height_is_set and not width_is_set:
-                ratio = original_width / original_height
-                width, height = _calculate_dimensions(
-                    JOY_DEFAULT_TARGET_AREA, ratio, alignment
-                )
-                height, width = _fit_to_token_budget(height, width, alignment)
+                height, width = _find_best_bucket(original_height, original_width)
             else:
-                height, width = _normalize_explicit_size(
+                height, width = _find_best_bucket(
                     request.sampling_params.height,
                     request.sampling_params.width,
-                    alignment,
                 )
 
-            prompt_image = _to_pil_image(image).resize(
-                (width, height), PIL.Image.Resampling.LANCZOS
-            )
+            prompt_image = _resize_center_crop(_to_pil_image(image), height, width)
             image_tensor = _pil_to_tensor(prompt_image, height, width)
             prompt["additional_information"].update(
                 {
@@ -381,10 +397,6 @@ class JoyImageEditPipeline(
             ],
             local_files_only=local_files_only,
         )
-        from vllm_omni.diffusion.models.qwen3_vl.adapter_qwen3_vl import (
-            Qwen3VLForConditionalGeneration,
-        )
-
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model,
             subfolder="scheduler",
@@ -442,7 +454,7 @@ class JoyImageEditPipeline(
 
         self.vae_scale_factor = int(getattr(self.vae.config, "scale_factor_spatial", 8))
         self.latent_channels = int(getattr(self.vae.config, "z_dim", 16))
-        self.tokenizer_max_length = 1024
+        self.tokenizer_max_length = JOY_MAX_IMAGE_SEQ_LEN
         self.prompt_template_encode = JOY_PROMPT_TEMPLATE
         self.prompt_template_encode_start_idx = JOY_PROMPT_TEMPLATE_START_IDX
         self.setup_diffusion_pipeline_profiler(
@@ -528,8 +540,8 @@ class JoyImageEditPipeline(
     ) -> torch.Tensor:
         captured: dict[str, torch.Tensor] = {}
 
-        def hook(_module: nn.Module, args: tuple[Any, ...], _output: Any) -> None:
-            captured["hidden_states"] = args[0]
+        def hook(_module: nn.Module, _args: tuple[Any, ...], output: Any) -> None:
+            captured["hidden_states"] = output[0] if isinstance(output, tuple) else output
 
         handle = self.text_encoder.model.language_model.layers[
             -1
@@ -543,14 +555,13 @@ class JoyImageEditPipeline(
                     model_inputs.pixel_values.device,
                 )
             start = time.perf_counter()
-            self.text_encoder(
-                input_ids=model_inputs.input_ids,
-                attention_mask=model_inputs.attention_mask,
-                pixel_values=model_inputs.pixel_values,
-                image_grid_thw=model_inputs.image_grid_thw,
-                mm_token_type_ids=getattr(model_inputs, "mm_token_type_ids", None),
-                output_hidden_states=False,
-            )
+            input_items = getattr(model_inputs, "items", None)
+            if callable(input_items):
+                text_encoder_inputs = dict(input_items())
+            else:
+                text_encoder_inputs = dict(vars(model_inputs))
+            text_encoder_inputs["output_hidden_states"] = False
+            self.text_encoder(**text_encoder_inputs)
             if _joy_trace_enabled():
                 logger.info(
                     "[joy-trace] text_encoder forward done encoder_device=%s elapsed=%.2fs",
@@ -575,7 +586,8 @@ class JoyImageEditPipeline(
         dtype = dtype or self.text_encoder.dtype
         prompt_list = [prompt] if isinstance(prompt, str) else prompt
         image_list = [image] if isinstance(image, PIL.Image.Image) else image
-        texts = [self.prompt_template_encode.format(item) for item in prompt_list]
+        texts = [_format_qwen_multimodal_prompt(item) for item in prompt_list]
+        texts = [self.prompt_template_encode.format(item) for item in texts]
         if _joy_trace_enabled():
             logger.info(
                 "[joy-trace] processor start prompts=%d images=%d target_device=%s",
@@ -674,17 +686,12 @@ class JoyImageEditPipeline(
         start = time.perf_counter()
         if isinstance(generator, list):
             image_latents = [
-                retrieve_latents(
-                    self.vae.encode(image[item_index : item_index + 1]),
-                    generator=generator[item_index],
-                )
+                retrieve_latents(self.vae.encode(image[item_index : item_index + 1]))
                 for item_index in range(image.shape[0])
             ]
             image_latents = torch.cat(image_latents, dim=0)
         else:
-            image_latents = retrieve_latents(
-                self.vae.encode(image), generator=generator
-            )
+            image_latents = retrieve_latents(self.vae.encode(image))
         if _joy_trace_enabled():
             logger.info(
                 "[joy-trace] vae encode done vae_device=%s latent_device=%s latent_shape=%s elapsed=%.2fs",
@@ -1003,7 +1010,7 @@ class JoyImageEditPipeline(
             timesteps=self.scheduler.timesteps,
             do_true_cfg=do_true_cfg,
             true_cfg_scale=true_cfg_scale,
-            cfg_normalize=req.sampling_params.cfg_normalize,
+            cfg_normalize=True,
         )
         if _joy_trace_enabled():
             logger.info(
