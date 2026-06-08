@@ -43,6 +43,9 @@ class MiniMindOmniCode2Wav(nn.Module):
         self.mimi_path = self.code2wav_config.mimi_path
         self._mimi_model: MimiModel | None = None
 
+    def get_language_model(self) -> nn.Module:
+        return self
+
     @staticmethod
     def _module_device(module: nn.Module) -> torch.device:
         try:
