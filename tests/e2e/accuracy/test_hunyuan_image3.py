@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import gc
 import importlib
+import logging
 import json
 import os
 import tempfile
@@ -32,6 +33,7 @@ from tests.helpers.runtime import OmniRunner, OmniServer
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens, resolve_stop_token_ids
 
 os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
+logger = logging.getLogger(__name__)
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 
@@ -530,7 +532,7 @@ def _run_online(
             )
             elapsed = time.perf_counter() - t0
             if not response.ok:
-                print(f"[ONLINE] HTTP {response.status_code} response body: {response.text}")
+                logger.error("[ONLINE] HTTP %s response body: %s", response.status_code, response.text)
             response.raise_for_status()
             payload = response.json()
             assert len(payload["data"]) == 1
@@ -577,7 +579,7 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path, accuracy_
         ["SSIM", f"{ssim_value:.4f}", 0.242],
         ["PSNR (dB)", f"{psnr_value:.2f}", 14.1],
     ]
-    print("[ONLINE] " + tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
+    logger.info("[ONLINE] %s", tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
 
     assert cot_results["cot_semantic_sim"] >= THRESHOLDS["cot_semantic_sim"], (
         f"[ONLINE] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} below threshold {THRESHOLDS['cot_semantic_sim']}"
@@ -643,7 +645,7 @@ def test_image_to_image_alignment_npu(
         ["SSIM", f"{ssim_value:.4f}", NPU_THRESHOLDS["ssim"]],
         ["PSNR (dB)", f"{psnr_value:.2f}", NPU_THRESHOLDS["psnr"]],
     ]
-    print(f"[NPU][{case_name}] " + tabulate(table, headers=["Metric", "Value", "Threshold"], tablefmt="grid"))
+    logger.info("[NPU][%s] %s", case_name, tabulate(table, headers=["Metric", "Value", "Threshold"], tablefmt="grid"))
 
     assert cot_results["cot_semantic_sim"] >= NPU_THRESHOLDS["cot_semantic_sim"], (
         f"[NPU][{case_name}] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} "
@@ -725,9 +727,9 @@ def _run_dit_model(
         os.environ["VLLM_NVFP4_GEMM_BACKEND"] = nvfp4_backend
 
     try:
-        print(f"[NPU DiT] launching OmniRunner for model={model}", flush=True)
+        logger.info("[NPU DiT] launching OmniRunner for model=%s", model)
         with OmniRunner(model, deploy_config=deploy_config_path, mode="text-to-image", log_stats=True) as runner:
-            print("[NPU DiT] OmniRunner ready, starting generation", flush=True)
+            logger.info("[NPU DiT] OmniRunner ready, starting generation")
             generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
             params = OmniDiffusionSamplingParams(
                 height=QUANT_HEIGHT,
@@ -825,7 +827,7 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path, accuracy_assets_
         ["PSNR (dB)", f"{psnr_value:.2f}", 14.1],
     ]
 
-    print(tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
+    logger.info("%s", tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
 
     assert cot_results["cot_semantic_sim"] >= THRESHOLDS["cot_semantic_sim"], (
         f"COT semantic similarity {cot_results['cot_semantic_sim']:.4f} is below threshold {THRESHOLDS['cot_semantic_sim']}"
@@ -907,13 +909,21 @@ def test_quantized_dit_matches_bf16_accuracy(
     metrics_path = output_dir / f"{case.name}_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
 
-    print(f"\nHunyuanImage3 quant accuracy ({case.name})")
-    print(f"  bf16 model:       {bf16_model}")
-    print(f"  quant model:      {quant_model}")
-    print(f"  BF16 CLIP score:  {bf16_clip_score:.4f}")
-    print(f"  quant CLIP score: {quant_clip_score:.4f} threshold>={QUANT_CLIP_SCORE_THRESHOLD:.4f}")
-    print(f"  CLIP score drop:  {clip_score_drop:.4f} threshold<={QUANT_CLIP_SCORE_DROP_THRESHOLD:.4f}")
-    print(f"  metrics:          {metrics_path}")
+    logger.info("HunyuanImage3 quant accuracy (%s)", case.name)
+    logger.info("  bf16 model:       %s", bf16_model)
+    logger.info("  quant model:      %s", quant_model)
+    logger.info("  BF16 CLIP score:  %.4f", bf16_clip_score)
+    logger.info(
+        "  quant CLIP score: %.4f threshold>=%0.4f",
+        quant_clip_score,
+        QUANT_CLIP_SCORE_THRESHOLD,
+    )
+    logger.info(
+        "  CLIP score drop:  %.4f threshold<=%.4f",
+        clip_score_drop,
+        QUANT_CLIP_SCORE_DROP_THRESHOLD,
+    )
+    logger.info("  metrics:          %s", metrics_path)
 
     assert quant_clip_score >= QUANT_CLIP_SCORE_THRESHOLD, (
         f"{case.name} CLIP score below threshold: got {quant_clip_score:.4f}, "
@@ -964,7 +974,7 @@ def test_npu_dit_distil_smoke_accuracy(accuracy_artifact_root: Path) -> None:
     }
     metrics_path = output_dir / "npu_dit_distil_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
-    print(f"\nHunyuanImage3 NPU DiT smoke accuracy metrics: {metrics_path}")
+    logger.info("HunyuanImage3 NPU DiT smoke accuracy metrics: %s", metrics_path)
 
 
 @pytest.mark.npu
@@ -1045,13 +1055,21 @@ def test_npu_quantized_dit_matches_bf16_accuracy(
     metrics_path = output_dir / "npu_quant_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
 
-    print("\nHunyuanImage3 NPU DiT quant accuracy")
-    print(f"  bf16 model:       {NPU_DIT_BF16_MODEL}")
-    print(f"  quant model:      {quant_model}")
-    print(f"  BF16 CLIP score:  {bf16_clip_score:.4f}")
-    print(f"  quant CLIP score: {quant_clip_score:.4f} threshold>={QUANT_CLIP_SCORE_THRESHOLD:.4f}")
-    print(f"  CLIP score drop:  {clip_score_drop:.4f} threshold<={QUANT_CLIP_SCORE_DROP_THRESHOLD:.4f}")
-    print(f"  metrics:          {metrics_path}")
+    logger.info("HunyuanImage3 NPU DiT quant accuracy")
+    logger.info("  bf16 model:       %s", NPU_DIT_BF16_MODEL)
+    logger.info("  quant model:      %s", quant_model)
+    logger.info("  BF16 CLIP score:  %.4f", bf16_clip_score)
+    logger.info(
+        "  quant CLIP score: %.4f threshold>=%0.4f",
+        quant_clip_score,
+        QUANT_CLIP_SCORE_THRESHOLD,
+    )
+    logger.info(
+        "  CLIP score drop:  %.4f threshold<=%.4f",
+        clip_score_drop,
+        QUANT_CLIP_SCORE_DROP_THRESHOLD,
+    )
+    logger.info("  metrics:          %s", metrics_path)
 
     assert quant_clip_score >= QUANT_CLIP_SCORE_THRESHOLD, (
         f"NPU quant CLIP score below threshold: got {quant_clip_score:.4f}, "
