@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +30,9 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard_with_padding
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 logger = init_logger(__name__)
 
@@ -332,6 +335,8 @@ class HunyuanVideo15Attention(nn.Module):
         out_bias: bool = True,
         eps: float = 1e-6,
         out_dim: int | None = None,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -350,6 +355,8 @@ class HunyuanVideo15Attention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.heads,
             bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv",
         )
 
         self.to_out = nn.ModuleList(
@@ -360,6 +367,8 @@ class HunyuanVideo15Attention(nn.Module):
                     bias=out_bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0",
                 ),
                 nn.Identity(),  # placeholder for dropout (none used)
             ]
@@ -374,6 +383,8 @@ class HunyuanVideo15Attention(nn.Module):
                 head_size=self.head_dim,
                 total_num_heads=self.heads,
                 bias=added_proj_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.add_kv_proj",
             )
 
             self.to_add_out = RowParallelLinear(
@@ -382,6 +393,8 @@ class HunyuanVideo15Attention(nn.Module):
                 bias=out_bias,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out",
             )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
@@ -401,6 +414,8 @@ class HunyuanVideo15Attention(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         hidden_states_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Ensure contiguous for FP8 quantized linear layers
+        hidden_states = hidden_states.contiguous()
         qkv, _ = self.to_qkv(hidden_states)
         q_size = self.to_qkv.num_heads * self.head_dim
         kv_size = self.to_qkv.num_kv_heads * self.head_dim
@@ -421,6 +436,7 @@ class HunyuanVideo15Attention(nn.Module):
             key = self.rope(key, cos, sin)
 
         if encoder_hidden_states is not None:
+            encoder_hidden_states = encoder_hidden_states.contiguous()
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
             add_q_size = self.add_kv_proj.num_heads * self.head_dim
             add_kv_size = self.add_kv_proj.num_kv_heads * self.head_dim
@@ -492,6 +508,8 @@ class HunyuanVideo15TransformerBlock(nn.Module):
         attention_head_dim: int,
         mlp_ratio: float = 4.0,
         qk_norm: str = "rms_norm",
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         hidden_size = num_attention_heads * attention_head_dim
@@ -507,13 +525,23 @@ class HunyuanVideo15TransformerBlock(nn.Module):
             out_dim=hidden_size,
             bias=True,
             eps=1e-6,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
 
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=hidden_size, dim_out=hidden_size, mult=mlp_ratio)
+        self.ff = FeedForward(
+            dim=hidden_size, dim_out=hidden_size, mult=mlp_ratio, quant_config=quant_config, prefix=f"{prefix}.ff"
+        )
 
         self.norm2_context = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(dim=hidden_size, dim_out=hidden_size, mult=mlp_ratio)
+        self.ff_context = FeedForward(
+            dim=hidden_size,
+            dim_out=hidden_size,
+            mult=mlp_ratio,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ff_context",
+        )
 
     def forward(
         self,
@@ -601,6 +629,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         target_size: int = 640,
         task_type: str = "i2v",
         use_meanflow: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
 
@@ -632,9 +661,14 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         self.transformer_blocks = nn.ModuleList(
             [
                 HunyuanVideo15TransformerBlock(
-                    num_attention_heads, attention_head_dim, mlp_ratio=mlp_ratio, qk_norm=qk_norm
+                    num_attention_heads,
+                    attention_head_dim,
+                    mlp_ratio=mlp_ratio,
+                    qk_norm=qk_norm,
+                    quant_config=quant_config,
+                    prefix=f"transformer_blocks.{i}",
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 

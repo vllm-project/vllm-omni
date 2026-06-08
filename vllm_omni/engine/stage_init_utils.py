@@ -428,6 +428,8 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         _mod, _fn = _ckf_path.rsplit(".", 1)
         cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
 
+    model_stage = getattr(engine_args, "model_stage", None)
+
     if stage_type == "diffusion":
         return StageMetadata(
             stage_id=stage_id,
@@ -440,12 +442,11 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             final_output_type=final_output_type,
             default_sampling_params=default_sampling_params,
             custom_process_input_func=custom_process_input_func,
-            model_stage=None,
+            model_stage=model_stage,
             runtime_cfg=runtime_cfg,
             cfg_kv_collect_func=cfg_kv_collect_func,
         )
 
-    model_stage = getattr(engine_args, "model_stage", None)
     engine_output_type = getattr(engine_args, "engine_output_type", None)
     is_comprehension = getattr(stage_config, "is_comprehension", False)
     requires_multimodal_data = getattr(runtime_cfg, "requires_multimodal_data", False)
