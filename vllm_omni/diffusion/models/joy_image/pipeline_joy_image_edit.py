@@ -108,6 +108,8 @@ JOY_BUCKETS = [
     (2048, 512),
 ]
 JOY_PROMPT_TEMPLATE_START_IDX = 34
+# The upstream template is named "multiple_images", but this port currently
+# inserts a single reference-image token and rejects multi-image prompts.
 JOY_PROMPT_TEMPLATE = (
     "<|im_start|>system\n \\nDescribe the image by detailing the color, shape, size, texture, "
     "quantity, text, spatial relationships of the objects and background:<|im_end|>\n"
@@ -825,12 +827,10 @@ class JoyImageEditPipeline(
         do_true_cfg = true_cfg_scale > 1.0
         self.check_cfg_parallel_validity(true_cfg_scale)
         negative_prompt = (
-            None
+            ""
             if isinstance(first_prompt, str)
-            else first_prompt.get("negative_prompt")
+            else first_prompt.get("negative_prompt") or ""
         )
-        if do_true_cfg and negative_prompt is None:
-            negative_prompt = ""
 
         self._current_timestep = None
         self._interrupt = False
@@ -845,7 +845,7 @@ class JoyImageEditPipeline(
         )
         if do_true_cfg:
             negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
-                negative_prompt or "",
+                negative_prompt,
                 prompt_image,
                 num_images_per_prompt=num_images_per_prompt,
                 prompt_embeds=negative_prompt_embeds,
