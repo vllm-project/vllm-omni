@@ -21,6 +21,7 @@ Generate videos from text prompts, images, or video conditions using vLLM-Omni's
 |-------|-------------|-------------------|---------------------|-------------|
 | Wan2.1-VACE (1.3B) | Wan2.1 | TBD | ~10 | [Wan-AI/Wan2.1-VACE-1.3B-diffusers](https://huggingface.co/Wan-AI/Wan2.1-VACE-1.3B-diffusers) |
 | Wan2.1-VACE (14B) | Wan2.1 | TBD | ~38 | [Wan-AI/Wan2.1-VACE-14B-diffusers](https://huggingface.co/Wan-AI/Wan2.1-VACE-14B-diffusers) |
+| Wan2.2-VACE-Fun (A14B) | Wan2.2 | TBD | ~76 | [alibaba-pai/Wan2.2-VACE-Fun-A14B](https://huggingface.co/alibaba-pai/Wan2.2-VACE-Fun-A14B) |
 
 !!! info
 *Peak VRAM: based on basic single-card usage, 480x832 resolution, 81 frames, 30 inference steps, without any acceleration/optimization features.
