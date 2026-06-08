@@ -2926,3 +2926,58 @@ class TestTTSAsyncOffloading:
         server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mocker.MagicMock(), model_name="test-model")
         assert server._tts_executor is None
         server.shutdown()  # Should not raise
+
+
+class TestSongGenParams:
+    """Unit tests for ``_build_songgen_params`` (issue #3388 review).
+
+    These guard two regressions in the SongGen serving path:
+      * the talker must receive the resolved reference waveform under the
+        ``ref_voice_array`` key the model actually reads, not a ``ref_voice_url``
+        key it silently ignores; and
+      * the no-reference path must not emit any voice-conditioning key.
+
+    A lightweight stub ``self`` (only ``_resolve_ref_audio`` is touched) keeps
+    the test on the CPU/core CI lane with no GPU, weights, or network.
+    """
+
+    @staticmethod
+    def _build(request, resolved=([0.0, 0.25, -0.25, 0.5], 24000)):
+        calls: list[str] = []
+
+        async def _fake_resolve(ref_audio_str):
+            calls.append(ref_audio_str)
+            return resolved
+
+        stub = SimpleNamespace(_resolve_ref_audio=_fake_resolve)
+        params = asyncio.run(OmniOpenAIServingSpeech._build_songgen_params(stub, request))
+        return params, calls
+
+    def test_without_ref_audio_emits_no_voice_key(self):
+        request = OpenAICreateSpeechRequest(
+            input="la la la under the moonlight",
+            instructions="dreamy pop ballad with piano",
+        )
+        params, calls = self._build(request)
+        assert params["lyrics"] == ["la la la under the moonlight"]
+        assert params["text_description"] == ["dreamy pop ballad with piano"]
+        assert "ref_voice_array" not in params
+        assert "ref_voice_url" not in params
+        assert calls == []
+
+    def test_ref_audio_resolved_to_array_not_url(self):
+        request = OpenAICreateSpeechRequest(
+            input="sing me a song",
+            instructions="a pop song",
+            ref_audio="data:audio/wav;base64,AAAA",
+        )
+        params, calls = self._build(request)
+        # The model consumes ref_voice_array=[[wav, sr]]; ref_voice_url is dead.
+        assert "ref_voice_url" not in params
+        assert params["ref_voice_array"] == [[[0.0, 0.25, -0.25, 0.5], 24000]]
+        assert calls == ["data:audio/wav;base64,AAAA"]
+
+    def test_missing_instructions_default_empty_description(self):
+        request = OpenAICreateSpeechRequest(input="just lyrics")
+        params, _ = self._build(request)
+        assert params["text_description"] == [""]

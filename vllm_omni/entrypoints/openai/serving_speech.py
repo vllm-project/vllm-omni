@@ -1890,14 +1890,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Returns a dict with keys expected by SongGenForGeneration._create_stream_gen():
           lyrics            : list[str]  - song lyrics (from request.input)
           text_description  : list[str]  - style / genre description
-          ref_voice_url     : list[str]  - reference voice audio URL (if provided)
+          ref_voice_array   : list[[list[float], int]]  - resolved reference
+                              voice waveform + sample rate (only when ref_audio
+                              is provided)
+
+        The model reads ``ref_voice_array`` (a resolved ``[wav_samples, sr]``
+        pair that it stages to a temp WAV), not a URL. We resolve
+        ``request.ref_audio`` to a waveform here so the server path matches the
+        offline example (``ref_voice_array=[[wav, sr]]``) and the MOSS-TTS
+        ``prompt_audio_array`` convention; emitting ``ref_voice_url`` instead
+        would be silently dropped by the model.
         """
         params: dict = {
             "lyrics": [request.input],
             "text_description": [request.instructions or ""],
         }
         if request.ref_audio is not None:
-            params["ref_voice_url"] = [request.ref_audio]
+            wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+            params["ref_voice_array"] = [[wav_list, sr]]
         return params
 
     async def _build_higgs_audio_v2_params(self, request: OpenAICreateSpeechRequest):

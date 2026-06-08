@@ -113,20 +113,47 @@ class SongGenForGeneration(nn.Module):
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self._device = device
 
-            logger.info("Loading SongGen from %s on %s", self.model_path, device)
+            # Match the MOSS-TTS convention: bf16 on bf16-capable CUDA, fp16 on
+            # older CUDA, fp32 on CPU. The deploy config targets H100/A100, so
+            # the bf16 path is the common one in practice.
+            if device.type == "cuda" and torch.cuda.is_bf16_supported():
+                model_dtype = torch.bfloat16
+            elif device.type == "cuda":
+                model_dtype = torch.float16
+            else:
+                model_dtype = torch.float32
 
+            # SongGen ships two architectures (Mixed and DualTrack). Both are
+            # served by this wrapper, but they are distinct upstream classes, so
+            # load the one named in the checkpoint config instead of always
+            # loading Mixed (which would load the wrong weights for a DualTrack
+            # checkpoint).
+            architectures = list(getattr(self.config, "architectures", None) or [])
+            want_dualtrack = any("DualTrack" in arch for arch in architectures)
             try:
-                from songgen import SongGenMixedForConditionalGeneration, SongGenProcessor
+                from songgen import SongGenProcessor
+
+                if want_dualtrack:
+                    from songgen import SongGenDualTrackForConditionalGeneration as _SongGenModelClass
+                else:
+                    from songgen import SongGenMixedForConditionalGeneration as _SongGenModelClass
             except ImportError as exc:
                 raise ImportError(
                     "SongGen requires the 'songgen' package. "
                     "Install it from: pip install git+https://github.com/LiuZH-19/SongGen.git"
                 ) from exc
 
-            model = SongGenMixedForConditionalGeneration.from_pretrained(
+            logger.info(
+                "Loading SongGen (%s) from %s on %s (dtype=%s)",
+                _SongGenModelClass.__name__,
+                self.model_path,
+                device,
+                model_dtype,
+            )
+            model = _SongGenModelClass.from_pretrained(
                 self.model_path,
                 attn_implementation="sdpa",
-                torch_dtype=torch.float32,
+                torch_dtype=model_dtype,
             )
             model.to(device=device)
             model.eval()
@@ -200,8 +227,16 @@ class SongGenForGeneration(nn.Module):
                 separate=False,
                 return_tensors="pt",
             )
+            # Move every tensor to the model device. Floating-point inputs (e.g.
+            # reference-voice features) are also cast to the model dtype so the
+            # bf16/fp16 weight path does not hit a dtype mismatch inside
+            # generate(); integer token ids keep their dtype.
+            model_dtype = next(self._model.parameters()).dtype
             model_inputs = {
-                k: v.to(self._device) if isinstance(v, torch.Tensor) else v for k, v in model_inputs.items()
+                k: (v.to(device=self._device, dtype=model_dtype) if v.is_floating_point() else v.to(self._device))
+                if isinstance(v, torch.Tensor)
+                else v
+                for k, v in model_inputs.items()
             }
 
             output = self._model.generate(**model_inputs, do_sample=_DEFAULT_DO_SAMPLE)
