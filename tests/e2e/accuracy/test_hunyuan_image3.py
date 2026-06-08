@@ -129,6 +129,7 @@ _DEPLOY_CONFIG = {
                 "stop_token_ids": [128025],
                 "detokenize": True,
                 "skip_special_tokens": False,
+                "include_stop_str_in_output": True,
             },
         },
         {
