@@ -53,6 +53,15 @@ def _looks_like_dreamzero(model_name: str) -> bool:
         return False
 
 
+def _looks_like_wan2_2_vace_original(model_name: str) -> bool:
+    """Best-effort detection for the original (non-diffusers) Wan2.2 VACE checkpoint."""
+    try:
+        cfg = get_hf_file_to_dict("high_noise_model/config.json", model_name)
+        return cfg is not None and cfg.get("model_type") == "vace"
+    except Exception:
+        return False
+
+
 @lru_cache
 def is_diffusion_model(model_name: str) -> bool:
     """Check if a model is a diffusion model.

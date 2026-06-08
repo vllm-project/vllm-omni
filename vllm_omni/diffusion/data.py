@@ -915,6 +915,17 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model)
                 if cfg is None:
+                    # Original (non-diffusers) Wan2.2 VACE checkpoint has no top-level
+                    # config.json; the DiT config lives in high_noise_model/. The
+                    # real transformer config is loaded later by the VACE pipeline.
+                    from vllm_omni.diffusion.utils.hf_utils import _looks_like_wan2_2_vace_original
+
+                    if _looks_like_wan2_2_vace_original(self.model):
+                        self.model_class_name = "WanVACEPipeline"
+                        self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                        return
+                    
                     # Lance ships its top-level config.json one directory above
                     # the per-checkpoint subfolders (``Lance_3B/`` or
                     # ``Lance_3B_Video/``).  Try to recover that case before
