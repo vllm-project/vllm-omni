@@ -502,19 +502,6 @@ class OmniKVTransferManager:
             )
         return None
 
-    @staticmethod
-    def _clone_received_payload_tensors(data: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(data, dict) or "layer_blocks" not in data:
-            return data
-
-        layer_blocks = data["layer_blocks"]
-        for cache_name in ("key_cache", "value_cache"):
-            cache_list = layer_blocks.get(cache_name, [])
-            for idx, tensor in enumerate(cache_list):
-                if isinstance(tensor, torch.Tensor):
-                    cache_list[idx] = tensor.clone()
-        return data
-
     def _slice_transfer_data_for_target(self, kv_data: KVCacheTransferData, target_rank: int) -> KVCacheTransferData:
         """Pre-slice sender payload for one target rank when sender TP < receiver TP."""
         topo = self._tp_topo
@@ -1031,6 +1018,7 @@ class OmniKVTransferManager:
         )
         pending_pairs = list(recv_key_pairs)
         received_payloads: dict[str, tuple[dict[str, Any], int]] = {}
+        pending_release_buffers: list[Any] = []
 
         logger.info(
             "Wait for KV cache for request %s from stage %s to %s via %s key(s)...",
@@ -1077,8 +1065,7 @@ class OmniKVTransferManager:
                                 managed_buffer = None
                             else:
                                 data = KVCacheTransferData.from_bytes(memoryview(buf_tensor.numpy()))
-                                data = self._clone_received_payload_tensors(data)
-                                raw_data.release()
+                                pending_release_buffers.append(raw_data)
                                 managed_buffer = None
                         except Exception as e:
                             logger.error("Failed to deserialize KV cache from ManagedBuffer: %s", e)
@@ -1110,6 +1097,7 @@ class OmniKVTransferManager:
                         data = merge_received_rank_shards(ordered_payloads, merger=self.kv_payload_merger)
                     data = slice_received_rank_shard(data, topo, slicer=self.kv_payload_slicer)
 
+                    needs_buffer_detach = bool(pending_release_buffers)
                     try:
                         if isinstance(data, dict) and "layer_blocks" in data:
                             layer_blocks = data["layer_blocks"]
@@ -1122,8 +1110,20 @@ class OmniKVTransferManager:
                                         continue
                                     if target_device is not None and tensor.device != target_device:
                                         cache_list[i] = tensor.to(target_device).contiguous()
+                                    elif needs_buffer_detach:
+                                        # CPU pinned-pool + CPU/None target: no .to() to
+                                        # detach the tensor, so clone before the pooled
+                                        # buffer is released.
+                                        cache_list[i] = tensor.clone()
                     except Exception:
                         logger.exception("Failed to move KV cache tensors to target device")
+                    finally:
+                        for buf in pending_release_buffers:
+                            try:
+                                buf.release()
+                            except Exception:
+                                logger.exception("Failed to release KV pool buffer")
+                        pending_release_buffers.clear()
 
                     logger.info(
                         "Successfully received KV cache for %s, %s bytes across %s key(s), wait=%.3fs, link=%.1fms",
@@ -1145,6 +1145,12 @@ class OmniKVTransferManager:
         except Exception:
             logger.exception("Error receiving KV cache for %s", request_id)
             return None, 0
+        finally:
+            for buf in pending_release_buffers:
+                try:
+                    buf.release()
+                except Exception:
+                    pass
 
     def apply_kv_cache_to_request(self, req: Any, data: dict[str, Any]) -> None:
         """Apply received KV cache data to a request object.
