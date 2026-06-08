@@ -25,6 +25,7 @@ from vllm_omni.diffusion.models.joy_image.pipeline_joy_image_edit import (
     _format_qwen_multimodal_prompt,
     _get_transformer_config_kwargs_from_od_config,
     _pil_to_tensor,
+    _raise_if_unsupported_hsdp,
     _should_defer_component_device_placement,
     get_joy_image_edit_pre_process_func,
 )
@@ -162,7 +163,7 @@ def test_transformer_config_kwargs_from_od_config_filters_metadata():
     }
 
 
-def test_defer_component_device_placement_for_offload_and_hsdp():
+def test_defer_component_device_placement_for_offload_only():
     assert (
         _should_defer_component_device_placement(
             SimpleNamespace(
@@ -177,8 +178,16 @@ def test_defer_component_device_placement_for_offload_and_hsdp():
     assert _should_defer_component_device_placement(SimpleNamespace(enable_layerwise_offload=True)) is True
     assert (
         _should_defer_component_device_placement(SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=True)))
-        is True
+        is False
     )
+
+
+def test_joy_hsdp_is_explicitly_unsupported():
+    with pytest.raises(ValueError, match="does not support HSDP"):
+        _raise_if_unsupported_hsdp(SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=True)))
+
+    _raise_if_unsupported_hsdp(SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=False)))
+    _raise_if_unsupported_hsdp(SimpleNamespace())
 
 
 def test_component_discovery_treats_vae_as_offload_peer():
@@ -847,7 +856,7 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
     cfg_checks = []
 
     def encode_prompt(prompt, image, **kwargs):
-        encode_calls.append((kwargs["prompt_name"], prompt))
+        encode_calls.append(prompt)
         return torch.zeros(1, 3, 4), torch.ones(1, 3, dtype=torch.long)
 
     def prepare_latents(**kwargs):
@@ -882,7 +891,7 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
 
     assert output.output.shape == (1, 3, 2, 2)
     assert cfg_checks == [2.0]
-    assert encode_calls == [("prompt", "make it brighter"), ("negative_prompt", "")]
+    assert encode_calls == ["make it brighter", ""]
     assert diffuse_calls[0]["do_true_cfg"] is True
     assert diffuse_calls[0]["true_cfg_scale"] == 2.0
 

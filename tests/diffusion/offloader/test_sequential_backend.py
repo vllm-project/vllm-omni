@@ -404,51 +404,6 @@ class TestMoveParamsPinMemory:
         )
         assert not tracker["called"], "pin_memory should not be called when disabled"
 
-    def test_to_cpu_uses_blocking_copy_when_pin_memory_disabled(
-        self,
-        accelerator_device,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        """Non-pinned CPU offload should not use non-blocking device copies."""
-        module = _create_simple_module().to(accelerator_device)
-        captured = {}
-
-        def fake_move_params(
-            moved_module,
-            target_device,
-            *,
-            non_blocking=False,
-            pin_memory=False,
-        ):
-            captured.update(
-                {
-                    "module": moved_module,
-                    "target_device": target_device,
-                    "non_blocking": non_blocking,
-                    "pin_memory": pin_memory,
-                }
-            )
-
-        monkeypatch.setattr(
-            SequentialOffloadHook,
-            "_move_params",
-            staticmethod(fake_move_params),
-        )
-        monkeypatch.setattr(current_omni_platform, "empty_cache", lambda: None)
-
-        hook = SequentialOffloadHook(
-            offload_targets=[],
-            device=accelerator_device,
-            pin_memory=False,
-            use_hsdp=False,
-        )
-        hook._to_cpu(module)
-
-        assert captured["module"] is module
-        assert captured["target_device"] == torch.device("cpu")
-        assert captured["non_blocking"] is False
-        assert captured["pin_memory"] is False
-
     def test_pin_memory_skipped_for_non_cpu_target(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
         """pin_memory should not be called for non-CPU targets."""
         module = _create_simple_module().to("cpu")

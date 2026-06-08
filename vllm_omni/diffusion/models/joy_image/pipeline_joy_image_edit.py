@@ -145,12 +145,19 @@ def _get_transformer_config_kwargs_from_od_config(
 def _should_defer_component_device_placement(
     od_config: OmniDiffusionConfig,
 ) -> bool:
-    parallel_config = getattr(od_config, "parallel_config", None)
     return bool(
         getattr(od_config, "enable_cpu_offload", False)
         or getattr(od_config, "enable_layerwise_offload", False)
-        or getattr(parallel_config, "use_hsdp", False)
     )
+
+
+def _raise_if_unsupported_hsdp(od_config: OmniDiffusionConfig) -> None:
+    parallel_config = getattr(od_config, "parallel_config", None)
+    if getattr(parallel_config, "use_hsdp", False):
+        raise ValueError(
+            "JoyImageEditPipeline does not support HSDP yet. "
+            "Please disable `use_hsdp`, or add `_hsdp_shard_conditions` and HSDP parity tests."
+        )
 
 
 def _is_dummy_request(req: Any) -> bool:
@@ -259,7 +266,9 @@ def _cast_floating_model_inputs(model_inputs: Any, dtype: torch.dtype) -> Any:
 
 
 # Normalize the single reference image into a supported Joy bucket before
-# forward(); bucket sizes keep VAE/DiT latent grids within trained resolutions.
+# forward(); default and explicitly requested sizes are both snapped to the
+# nearest bucket, so the final output size can differ from user-provided
+# height/width while keeping VAE/DiT latent grids within trained resolutions.
 def get_joy_image_edit_pre_process_func(
     od_config: OmniDiffusionConfig,
 ) -> Callable[[OmniDiffusionRequest], OmniDiffusionRequest]:
@@ -350,6 +359,9 @@ class JoyImageEditPipeline(
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # Joy has no `_hsdp_shard_conditions` yet, so fail before generic
+        # HSDP setup reaches the transformer.
+        _raise_if_unsupported_hsdp(od_config)
         self.od_config = od_config
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -545,7 +557,6 @@ class JoyImageEditPipeline(
         prompt: str | list[str],
         image: PIL.Image.Image | list[PIL.Image.Image],
         dtype: torch.dtype | None = None,
-        prompt_name: str = "prompt",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         dtype = dtype or self.text_encoder.dtype
         prompt_list = [prompt] if isinstance(prompt, str) else prompt
@@ -582,14 +593,12 @@ class JoyImageEditPipeline(
         num_images_per_prompt: int,
         prompt_embeds: torch.Tensor | None = None,
         prompt_embeds_mask: torch.Tensor | None = None,
-        prompt_name: str = "prompt",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prompt_list = [prompt] if isinstance(prompt, str) else prompt
         if prompt_embeds is None:
             prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(
                 prompt_list,
                 image,
-                prompt_name=prompt_name,
             )
         if prompt_embeds_mask is None:
             raise ValueError("prompt_embeds_mask must be provided with prompt_embeds.")
@@ -835,7 +844,6 @@ class JoyImageEditPipeline(
             num_images_per_prompt=num_images_per_prompt,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
-            prompt_name="prompt",
         )
         if do_true_cfg:
             negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
@@ -844,7 +852,6 @@ class JoyImageEditPipeline(
                 num_images_per_prompt=num_images_per_prompt,
                 prompt_embeds=negative_prompt_embeds,
                 prompt_embeds_mask=negative_prompt_embeds_mask,
-                prompt_name="negative_prompt",
             )
         else:
             negative_prompt_embeds = None

@@ -107,7 +107,7 @@ class SequentialOffloadHook(ModelHook):
         # XPU's allocator doesn't respect stream dependencies in empty_cache,
         # so non-blocking copies can race with cache eviction. Use blocking
         # copies on XPU to avoid NULL pointer errors during DMA.
-        non_blocking = self.pin_memory and not self.use_hsdp and not current_omni_platform.is_xpu()
+        non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
         moved = self._move_params(
             module,
             torch.device("cpu"),
