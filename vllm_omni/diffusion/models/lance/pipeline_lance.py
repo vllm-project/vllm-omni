@@ -187,12 +187,6 @@ class LancePipeline(BagelPipeline):
     """Lance pipeline.  Inherits BAGEL's forward/generation; overrides only
     construction (checkpoint layout, Qwen2.5-VL ViT, Wan2.2 VAE)."""
 
-    _PROFILER_TARGETS = [
-        "bagel.generate_image",
-        "vae.encode",
-        "vae.decode",
-    ]
-
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         # Intentionally do NOT call BagelPipeline.__init__ — its assumptions
         # about config.json / vit_config.json / SigLIP / the BAGEL AE do not
