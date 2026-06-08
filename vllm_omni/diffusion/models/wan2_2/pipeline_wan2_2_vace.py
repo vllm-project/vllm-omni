@@ -31,13 +31,11 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
-from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
-    build_wan_scheduler,
     load_transformer_config,
     retrieve_latents,
 )
@@ -214,7 +212,9 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             od_config = replace(od_config, flow_shift=3.0)
 
         if _looks_like_wan2_2_vace_original(od_config.model):
-            self._init_original_format(od_config)
+            self._init_runtime(od_config)
+            self._load_components_original(od_config)
+            self._finalize(od_config)
         else:
             super().__init__(od_config=od_config, prefix=prefix)
 
@@ -225,7 +225,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         quant_config = getattr(self.od_config, "quantization_config", None)
         return create_vace_transformer_from_config(config, quant_config=quant_config)
 
-    def _init_original_format(self, od_config: OmniDiffusionConfig) -> None:
+    def _load_components_original(self, od_config: OmniDiffusionConfig) -> None:
         """Load the original (non-diffusers) Wan2.2 VACE A14B layout::
 
             model/
@@ -235,7 +235,9 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             ├── models_t5_umt5-xxl-enc-bf16.pth                -> text_encoder (#4)
             └── Wan2.1_VAE.pth                                 -> vae        (#4)
 
-        Mirrors the S2V original-format path; the .pth loaders are reused from it.
+        Original-format counterpart to the base ``_load_components``; the shared
+        ``_init_runtime``/``_finalize`` seams (called from ``__init__``) handle the
+        rest. The .pth text-encoder/VAE loaders are reused from the S2V path.
         """
         model = od_config.model
         # Resolve a HF repo ID to its local snapshot dir; the layout below is read
@@ -247,11 +249,6 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             model = download_weights_from_hf_specific(
                 model, None, ["high_noise_model/**", "low_noise_model/**", "google/**", "*.pth", "*.json"]
             )
-        # Init nn.Module + pipeline mixins WITHOUT running the base's diffusers-only
-        # __init__ body (this is the chain init Wan22Pipeline.__init__ does first).
-        super(Wan22Pipeline, self).__init__()
-        self.od_config = od_config
-        self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         self.expand_timesteps = False
 
@@ -307,20 +304,6 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             else None
         )
         self.transformer_config = (self.transformer or self.transformer_2).config
-
-        # Common setup (mirrors Wan22Pipeline.__init__ tail).
-        self._sample_solver = "unipc"
-        self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
-        self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
-        self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
-        self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
-        self._guidance_scale = None
-        self._guidance_scale_2 = None
-        self._num_timesteps = None
-        self._current_timestep = None
-        self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
-        )
 
     def diffuse(
         self,

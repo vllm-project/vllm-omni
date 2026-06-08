@@ -265,10 +265,16 @@ class Wan22Pipeline(
         od_config: OmniDiffusionConfig,
         prefix: str = "",
     ):
+        self._init_runtime(od_config)
+        self._load_components(od_config)
+        self._finalize(od_config)
+
+    def _init_runtime(self, od_config: OmniDiffusionConfig) -> None:
         super().__init__()
         self.od_config = od_config
-
         self.device = get_local_device()
+
+    def _load_components(self, od_config: OmniDiffusionConfig) -> None:
         dtype = getattr(od_config, "dtype", torch.bfloat16)
 
         model = od_config.model
@@ -392,6 +398,7 @@ class Wan22Pipeline(
         else:
             raise RuntimeError("No transformer loaded")
 
+    def _finalize(self, od_config: OmniDiffusionConfig) -> None:
         self._sample_solver = "unipc"
         self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
         self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
