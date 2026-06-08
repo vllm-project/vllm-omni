@@ -23,10 +23,10 @@
                 "ignore_eos": true,
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [1000, 2000, 3000, 4000],
-                    "mean_tpot_ms": [200, 200, 200, 200],
-                    "mean_audio_ttfp_ms": [10000, 15000, 20000, 25000],
-                    "mean_audio_rtf": [1.5, 1.5, 1.5, 1.5]
+                    "mean_ttft_ms": [203, 283, 470, 869],
+                    "mean_tpot_ms": [28, 36, 41, 45],
+                    "mean_audio_ttfp_ms": [861, 1200, 1528, 2100],
+                    "mean_audio_rtf": [0.24, 0.30, 0.35, 0.39]
                 }
             },
             {
@@ -49,9 +49,9 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [2000],
-                    "mean_audio_ttfp_ms": [2000],
-                    "mean_audio_rtf": [0.25]
+                    "mean_ttft_ms": [377],
+                    "mean_audio_ttfp_ms": [684],
+                    "mean_audio_rtf": [0.14]
                 }
             },
             {
@@ -76,9 +76,9 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [6000],
-                    "mean_audio_ttfp_ms": [6000],
-                    "mean_audio_rtf": [0.7]
+                    "mean_ttft_ms": [228],
+                    "mean_audio_ttfp_ms": [686],
+                    "mean_audio_rtf": [0.16]
                 }
             },
             {
@@ -105,9 +105,9 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [12000],
-                    "mean_audio_ttfp_ms": [12000],
-                    "mean_audio_rtf": [1.0]
+                    "mean_ttft_ms": [522],
+                    "mean_audio_ttfp_ms": [1119],
+                    "mean_audio_rtf": [0.21]
                 }
             }
         ]

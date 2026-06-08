@@ -64,7 +64,9 @@ dev = [
     "lpips>=0.1.4", # for quantization fp8
     "orjson>=3.11.7", # to make v1/embeddings API fast
     "voxcpm>=2.0.2", # for VoxCPM2 path-locating in tests
-    "torchdiffeq>=0.2.5" # for covo_audio Test
+    "torchdiffeq>=0.2.5", # for covo_audio Test
+    "FlagEmbedding", # for hunyuan_image3 tests
+    "kernels<0.15.0" # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
 ]
 
 demo = [
@@ -86,6 +88,12 @@ local = [
 # who only need other models; opt in with `pip install vllm-omni[minicpmo]`.
 minicpmo = [
     "stepaudio2-minicpmo",
+]
+
+# Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
+# as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
+quack = [
+    "quack-kernels>=0.3.11",
 ]
 
 docs = [

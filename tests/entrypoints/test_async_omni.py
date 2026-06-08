@@ -16,7 +16,7 @@ OMNI_MODEL = "Qwen/Qwen2.5-Omni-7B"
 OMNI_STAGE_CONFIG = get_deploy_config_path("ci/qwen2_5_omni_thinker_only.yaml")
 
 
-async def _noop(**kw):
+async def _noop(*args, **kw):
     pass
 
 
@@ -61,6 +61,7 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni._final_output_handler = lambda: None
     omni.resolve_sampling_params_list = lambda params, allow_delta_coercion: params
     omni._compute_final_stage_id = lambda output_modalities: 0
+    omni._compute_final_output_stage_ids = lambda output_modalities: [0]
     omni._process_orchestrator_results = fake_process_results
     omni._log_summary_and_cleanup = lambda request_id: omni.request_states.pop(request_id, None)
     return omni

@@ -156,7 +156,7 @@ class FakeAsyncOmni:
         self.captured_prompt = None
         self._images = images or [Image.new("RGB", (64, 64), color="green")]
 
-    async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
         if sampling_params_list is not None:
             self.captured_sampling_params_list = sampling_params_list
         else:
@@ -254,7 +254,7 @@ def async_omni_test_client():
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             if sampling_params_list is not None:
                 self.captured_sampling_params_list = sampling_params_list
             else:
@@ -318,7 +318,7 @@ def async_omni_rgba_test_client():
             self._images = [Image.new("RGBA", (64, 64), color=(0, 255, 0, 128))]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             if sampling_params_list is not None:
                 self.captured_sampling_params_list = sampling_params_list
             else:
@@ -382,7 +382,7 @@ def async_omni_stage_configs_only_client():
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             if sampling_params_list is not None:
                 self.captured_sampling_params_list = sampling_params_list
             else:
@@ -442,7 +442,7 @@ def streaming_image_edit_client():
             self.captured_prompt = None
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             self.captured_prompt = prompt
             self.captured_sampling_params_list = sampling_params_list or [sampling_params]
             assert self.captured_sampling_params_list[0].output_kind == RequestOutputKind.DELTA
@@ -696,7 +696,7 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             self.captured_sampling_params_list = (
                 sampling_params_list if sampling_params_list is not None else [sampling_params]
             )
@@ -815,7 +815,9 @@ def test_image_edits_streaming_returns_ar_delta_then_image(streaming_image_edit_
 
 
 def test_image_edits_streaming_ar_delta_chunks_include_index(streaming_image_edit_client):
-    async def generate_multi_output_delta(prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate_multi_output_delta(
+        prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs
+    ):
         yield MockStageResult(stage_id=0, final_output_type="text", texts=["first", "second"])
         yield MockStageResult(
             stage_id=1,
@@ -843,7 +845,7 @@ def test_image_edits_streaming_ar_delta_chunks_include_index(streaming_image_edi
 
 
 def test_image_edits_streaming_errors_without_final_image(streaming_image_edit_client):
-    async def generate_without_image(prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate_without_image(prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
         yield MockStageResult(stage_id=0, final_output_type="text", text="recap")
 
     streaming_image_edit_client.app.state.engine_client.generate = generate_without_image
@@ -866,7 +868,7 @@ def test_image_edits_streaming_errors_without_final_image(streaming_image_edit_c
 
 
 def test_image_edits_streaming_errors_on_empty_final_image(streaming_image_edit_client):
-    async def generate_empty_image(prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate_empty_image(prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
         yield MockStageResult(stage_id=0, final_output_type="text", text="recap")
         yield MockStageResult(stage_id=1, final_output_type="image", images=[])
 

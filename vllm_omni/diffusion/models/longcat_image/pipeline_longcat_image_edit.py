@@ -29,6 +29,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
     LongCatImageTransformer2DModel,
@@ -244,19 +245,32 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, D
         model = od_config.model
         local_files_only = os.path.exists(model)
 
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the whole component set before any from_pretrained.
+        longcat_subfolders = ["scheduler", "text_encoder", "text_processor", "tokenizer", "vae"]
+        prefetch_subfolders(model, longcat_subfolders, local_files_only=local_files_only)
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
+        self.text_encoder = from_pretrained_with_prefetch(
+            Qwen2_5_VLForConditionalGeneration.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=longcat_subfolders,
+            local_files_only=local_files_only,
         )
         self.text_processor = Qwen2VLProcessor.from_pretrained(
             model, subfolder="text_processor", local_files_only=local_files_only
         )
 
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKL.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=longcat_subfolders,
+            local_files_only=local_files_only,
+        ).to(self.device)
         self.transformer = LongCatImageTransformer2DModel(od_config=od_config)
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 

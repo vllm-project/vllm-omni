@@ -57,12 +57,6 @@ Adjust `devices` in the YAML to match your hardware.
 
 #### Command
 
-Thinker only (text output):
-
-```bash
-vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni --port 8091
-```
-
 Thinker + talker (text and/or audio output):
 
 ```bash
@@ -70,6 +64,15 @@ vllm serve Jonathan1909/Ming-flash-omni-2.0 \
     --omni \
     --port 8091 \
     --log-stats
+```
+
+Thinker only (text-only output):
+
+```bash
+vllm serve Jonathan1909/Ming-flash-omni-2.0 \
+    --omni \
+    --deploy-config vllm_omni/deploy/ming_flash_omni_thinker_only.yaml \
+    --port 8091
 ```
 
 `--log-stats` is optional but recommended while validating the deployment.
