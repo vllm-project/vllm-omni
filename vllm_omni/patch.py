@@ -217,3 +217,43 @@ def _patch_scaled_mm_fp8_contiguous_activation():
 
 
 _patch_scaled_mm_fp8_contiguous_activation()
+
+
+def _patch_flashinfer_fp8_scaled_mm_output_shape():
+    """Restore the N-D output shape for the FlashInfer FP8 ScaledMM kernel.
+
+    ``FlashInferFP8ScaledMMLinearKernel.apply_scaled_mm`` returns the raw 2-D
+    GEMM result and ignores ``output_shape``, unlike the CUTLASS / PyTorch
+    ScaledMM kernels which reshape to it. A 3-D activation ``(B, S, D)`` thus
+    collapses to ``(B*S, D)``, breaking diffusion DiTs that reshape the linear
+    output by absolute dim (e.g. Wan2.2 ``qkv.unflatten(2, ...)``) with
+    ``IndexError: Dimension out of range``. It only bites >2-D inputs, so LLM
+    (token-flattened, 2-D) paths are unaffected.
+
+    Carried here because the upstream fix may not have landed yet; this override
+    becomes a harmless no-op once vLLM honors ``output_shape`` itself.
+    """
+    try:
+        from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+            FlashInferFP8ScaledMMLinearKernel,
+        )
+    except ImportError:
+        return
+
+    _original_apply_scaled_mm = FlashInferFP8ScaledMMLinearKernel.apply_scaled_mm
+    if getattr(_original_apply_scaled_mm, "_omni_output_shape_patched", False):
+        return
+
+    def _patched_apply_scaled_mm(self, *, A, B, out_dtype, As, Bs, bias, output_shape):  # noqa: N803
+        out = _original_apply_scaled_mm(
+            self, A=A, B=B, out_dtype=out_dtype, As=As, Bs=Bs, bias=bias, output_shape=output_shape
+        )
+        if tuple(out.shape) != tuple(output_shape):
+            out = out.view(*output_shape)
+        return out
+
+    _patched_apply_scaled_mm._omni_output_shape_patched = True
+    FlashInferFP8ScaledMMLinearKernel.apply_scaled_mm = _patched_apply_scaled_mm
+
+
+_patch_flashinfer_fp8_scaled_mm_output_shape()

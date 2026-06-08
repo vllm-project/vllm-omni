@@ -33,6 +33,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     SpeechBatchItem,
 )
 from vllm_omni.entrypoints.openai.serving_speech import (
+    _TTS_LANGUAGES,
     OmniOpenAIServingSpeech,
     _create_wav_header,
 )
@@ -1256,6 +1257,67 @@ class TestTTSMethods:
 
         # Verify speakers are normalized to lowercase
         assert server.supported_speakers == {"ryan", "vivian", "aiden"}
+
+    def test_load_supported_languages_from_config(self, speech_server):
+        """Languages/dialects from codec_language_id are loaded title-cased; 'Auto' is added."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(
+                    codec_language_id={"chinese": 2055, "english": 2050, "beijing_dialect": 2074}
+                )
+            )
+        )
+        assert speech_server._load_supported_languages() == {
+            "Chinese",
+            "English",
+            "Beijing_Dialect",
+            "Auto",
+        }
+
+    def test_load_supported_languages_from_dict_config(self, speech_server):
+        """talker_config provided as a plain dict is handled the same as an object."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(talker_config={"codec_language_id": {"chinese": 2055, "english": 2050}})
+        )
+        assert speech_server._load_supported_languages() == {"Chinese", "English", "Auto"}
+
+    def test_validate_language_custom_dialect_accepted(self, speech_server):
+        """A language present in the model config passes validation, case-insensitively."""
+        speech_server.supported_languages = {"Chinese", "English", "Beijing_Dialect", "Auto"}
+        for language in ("Beijing_Dialect", "beijing_dialect", "English", "english", "Auto", "AUTO"):
+            req = OpenAICreateSpeechRequest(input="Hello", language=language)
+            result = speech_server._validate_tts_request(req)
+            assert result is None or "Invalid language" not in result
+            # Language is normalized to the title-cased config form.
+            assert req.language == language.title()
+
+    def test_validate_language_unknown_rejected(self, speech_server):
+        """A language not in the configured set is rejected."""
+        speech_server.supported_languages = {"Chinese", "English", "Auto"}
+        for language in ("Klingon", "klingon"):
+            req = OpenAICreateSpeechRequest(input="Hello", language=language)
+            assert "Invalid language" in speech_server._validate_tts_request(req)
+
+    def test_load_supported_languages_default_when_no_config(self, speech_server):
+        """Empty/missing codec_language_id on a Qwen3-TTS model falls back to the default list."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(talker_config=SimpleNamespace(codec_language_id={}))
+        )
+        assert speech_server._load_supported_languages() == _TTS_LANGUAGES
+
+    def test_load_supported_languages_default_on_config_error(self, speech_server):
+        """If the model config cannot be read, fall back to the default list."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client = SimpleNamespace()  # no model_config -> AttributeError
+        assert speech_server._load_supported_languages() == _TTS_LANGUAGES
+
+    def test_load_supported_languages_default_for_non_qwen(self, speech_server):
+        """Non-qwen3_tts model types get the default language set."""
+        speech_server._tts_model_type = None
+        assert speech_server._load_supported_languages() == _TTS_LANGUAGES
 
     def test_build_tts_params_with_uploaded_voice(self, speech_server, mocker: MockerFixture):
         """Test _build_tts_params auto-sets ref_audio for uploaded voices (x_vector only)."""
