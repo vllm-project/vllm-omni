@@ -9,6 +9,7 @@ import re
 import struct
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
@@ -76,6 +77,7 @@ _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
 _MOSS_TTS_FULL_MODEL_STAGES = {"moss_tts", "moss_tts_codec"}
 _HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
+_HIGGS_AUDIO_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
@@ -84,6 +86,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _COSYVOICE3_TTS_MODEL_STAGES
     | _OMNIVOICE_TTS_MODEL_STAGES
     | _HIGGS_AUDIO_V2_TTS_MODEL_STAGES
+    | _HIGGS_AUDIO_V3_TTS_MODEL_STAGES
     | _COVO_AUDIO_MODEL_STAGES
     | _VOXCPM2_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
@@ -98,20 +101,23 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "cosyvoice3",
     "voxcpm2",
     "higgs_audio_v2",
+    "higgs_audio_v3",
 }
-_TTS_LANGUAGES: set[str] = {
-    "Auto",
-    "Chinese",
-    "English",
-    "Japanese",
-    "Korean",
-    "German",
-    "French",
-    "Russian",
-    "Portuguese",
-    "Spanish",
-    "Italian",
-}
+_TTS_LANGUAGES = frozenset(
+    {
+        "Auto",
+        "Chinese",
+        "English",
+        "Japanese",
+        "Korean",
+        "German",
+        "French",
+        "Russian",
+        "Portuguese",
+        "Spanish",
+        "Italian",
+    }
+)
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
@@ -431,6 +437,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Merge built-in speakers into the set initialized by _init_speaker_storage.
         self.supported_speakers |= self._load_supported_speakers()
         self.supported_speakers |= set(self.precomputed_speakers)
+
+        self.supported_languages = self._load_supported_languages()
+
         self._tts_tokenizer = None
         self._voxcpm2_tokenizer = None
         self._voxcpm2_split_map: dict[int, list[int]] = {}
@@ -594,6 +603,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "moss_tts"
         if model_stage in _HIGGS_AUDIO_V2_TTS_MODEL_STAGES:
             return "higgs_audio_v2"
+        if model_stage in _HIGGS_AUDIO_V3_TTS_MODEL_STAGES:
+            return "higgs_audio_v3"
         if model_stage in _GLM_TTS_MODEL_STAGES:
             return "glm_tts"
         return None
@@ -688,6 +699,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.warning("Could not load speakers from model config: %s", e)
 
         return set()
+
+    def _load_supported_languages(self) -> frozenset[str]:
+        """Load supported languages (title-cased) from the model configuration"""
+        if self._tts_model_type != "qwen3_tts":
+            return _TTS_LANGUAGES
+        try:
+            config = self.engine_client.model_config.hf_config.talker_config
+
+            if isinstance(config, dict):
+                codec_language_id = config.get("codec_language_id")
+            else:
+                codec_language_id = getattr(config, "codec_language_id", None)
+
+            if codec_language_id and isinstance(codec_language_id, Mapping):
+                return frozenset(str(language).title() for language in codec_language_id) | {"Auto"}
+
+            logger.warning("No codec_language_id found in talker_config; falling back to default languages")
+        except Exception as e:
+            logger.warning("Could not load languages from model config: %s", e)
+        return _TTS_LANGUAGES
 
     def _estimate_ref_code_len(self, ref_audio: object) -> int | None:
         """Estimate ref_code length from ref_audio waveform without running the codec.
@@ -934,6 +965,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 "moss_tts_nano",
                 "glm_tts",
                 "higgs_audio_v2",
+                "higgs_audio_v3",
             ):
                 label = {
                     "cosyvoice3": "CosyVoice3",
@@ -941,6 +973,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "omnivoice": "OmniVoice",
                     "moss_tts_nano": "MOSS-TTS-Nano",
                     "higgs_audio_v2": "Higgs-Audio V2",
+                    "higgs_audio_v3": "Higgs-Audio V3",
                     "glm_tts": "GLM-TTS",
                 }.get(self._tts_model_type, self._tts_model_type)
                 return (
@@ -1413,9 +1446,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
-        # Validate language
-        if request.language is not None and request.language not in _TTS_LANGUAGES:
-            return f"Invalid language '{request.language}'. Supported: {', '.join(sorted(_TTS_LANGUAGES))}"
+        # Validate language (case-insensitive; normalized to the title-cased config form)
+        if request.language is not None:
+            request.language = request.language.title()
+            if request.language not in self.supported_languages:
+                return (
+                    f"Invalid language '{request.language}'. Supported: {', '.join(sorted(self.supported_languages))}"
+                )
 
         # Validate speaker for CustomVoice task
         if task_type == "CustomVoice":
@@ -1895,6 +1932,90 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         processor = AutoProcessor.from_pretrained(model_path)
         self._higgs_audio_v2_processor = processor
         return processor
+
+    # ---- higgs-audio v3 ----
+
+    def _validate_higgs_audio_v3_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate higgs_audio_v3 request parameters."""
+        if not request.input or not request.input.strip():
+            return "higgs_audio_v3: input text cannot be empty"
+        if request.ref_audio is not None and not request.ref_text:
+            # Voice clone ref_text is optional for v3 (improves fidelity but not required)
+            pass
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+        return None
+
+    async def _build_higgs_audio_v3_params(self, request: OpenAICreateSpeechRequest):
+        """Build prompt_token_ids for higgs_audio_v3.
+
+        Plain-text path: builds ``[tts, text, tokens, audio]``.
+        Voice-clone path: encodes reference audio, applies delay pattern,
+        builds ``[tts, (ref_text, tokens,) ref_audio, -100xN, text, tokens, audio]``.
+        """
+        adapter = await self._resolve_higgs_audio_v3_adapter()
+
+        if request.ref_audio is None:
+            prompt_ids = adapter.build_prompt(request.input)
+            return tokens_input(prompt_token_ids=prompt_ids)
+
+        # Voice clone
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import (
+            apply_delay_pattern,
+            encode_reference_audio,
+        )
+        from vllm_omni.model_executor.models.higgs_audio_v3.ref_audio_cache import (
+            cached_encode_reference_audio,
+        )
+
+        wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+        wav = np.asarray(wav_list, dtype=np.float32)
+        # Cache the codec encode by content hash so identical ref_audio
+        # payloads skip the encode and reuse the same [num_frames,
+        # num_codebooks] codes tensor across requests.
+        ref_codes_raw = await asyncio.to_thread(cached_encode_reference_audio, wav, int(sr), encode_reference_audio)
+        ref_codes_delayed = apply_delay_pattern(ref_codes_raw)
+
+        prompt_ids = adapter.build_prompt(
+            request.input,
+            num_ref_tokens=int(ref_codes_delayed.shape[0]),
+            reference_text=request.ref_text or None,
+        )
+        prompt = tokens_input(prompt_token_ids=prompt_ids)
+        import torch
+
+        prompt["additional_information"] = {
+            "audio_input_ids": ref_codes_delayed.to(torch.long),
+            "audio_input_ids_mask": torch.ones(ref_codes_delayed.shape[0], dtype=torch.bool),
+        }
+        return prompt
+
+    async def _resolve_higgs_audio_v3_adapter(self):
+        """Lazy-load the tokenizer adapter for higgs_audio_v3."""
+        cached = getattr(self, "_higgs_audio_v3_adapter", None)
+        if cached is not None:
+            return cached
+
+        from transformers import AutoTokenizer
+
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import (
+            HiggsAudioV3TokenizerAdapter,
+        )
+
+        model_path = None
+        for stage in self.engine_client.stage_configs:
+            model_path = getattr(getattr(stage, "engine_args", None), "model", None)
+            if model_path:
+                break
+        if model_path is None:
+            model_path = getattr(self.engine_client, "model", None)
+        if model_path is None:
+            raise RuntimeError("higgs_audio_v3 serving could not resolve model path")
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        adapter = HiggsAudioV3TokenizerAdapter(tokenizer)
+        self._higgs_audio_v3_adapter = adapter
+        return adapter
 
     def _validate_fish_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate Fish Speech request parameters. Returns error message or None."""
@@ -2795,6 +2916,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     additional = prompt.setdefault("additional_information", {})
                     additional["voice_name"] = voice_lower
                     additional["voice_created_at"] = self._voice_created_at(voice_lower)
+            tts_params = {}
+        elif self._tts_model_type == "higgs_audio_v3":
+            err = self._apply_uploaded_speaker(request)
+            if err:
+                raise ValueError(err)
+            validation_error = self._validate_higgs_audio_v3_request(request)
+            if validation_error:
+                raise ValueError(validation_error)
+            prompt = await self._build_higgs_audio_v3_params(request)
             tts_params = {}
         elif self._tts_model_type == "voxcpm2":
             # voxcpm2 doesn't use `_apply_uploaded_speaker` because the prompt builder needs the
