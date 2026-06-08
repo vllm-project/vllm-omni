@@ -233,6 +233,11 @@ def fused_qk_rms_norm(
     if not (isinstance(norm_q, DistributedRMSNorm) and isinstance(norm_k, DistributedRMSNorm)):
         return norm_q(q), norm_k(k)
 
+    # The fused path reduces one packed sum-of-squares and reuses q's token width
+    # as the RMS count for BOTH q and k, so q and k must share the same shape.
+    # (Self-attention guarantees this: q and k are projected from the same x.)
+    assert q.shape == k.shape, "fused_qk_rms_norm requires q and k to have the same shape."
+
     tp_size = get_tensor_model_parallel_world_size()
     q_float, q_sum_sq, count = norm_q._local_sum_sq(q)
     k_float, k_sum_sq, _ = norm_k._local_sum_sq(k)
@@ -480,6 +485,13 @@ class CausalWanSelfAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=num_heads,
             bias=True,
+        )
+        # The forward splits qkv into three equal q/k/v shards, which is only
+        # correct without GQA. total_num_kv_heads defaults to total_num_heads
+        # here; fail loud if a future checkpoint introduces GQA so the equal
+        # split does not silently misalign k/v.
+        assert self.qkv.total_num_kv_heads == self.qkv.total_num_heads, (
+            "Self-attn QKV fusion requires no GQA (total_num_kv_heads == total_num_heads)."
         )
         self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
         self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
