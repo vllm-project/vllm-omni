@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import PIL.Image
 import torch
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -56,6 +57,8 @@ if TYPE_CHECKING:
 
 
 JOY_MAX_IMAGE_SEQ_LEN = 4096
+# Reference: Hugging Face Diffusers commit 23ba73e1d2079c4b89959484ed0ca1c22e7ef998,
+# src/diffusers/pipelines/joyimage/pipeline_joyimage_edit.py.
 JOY_BUCKETS = [
     (512, 1792),
     (512, 1856),
@@ -191,22 +194,6 @@ def _pil_to_tensor(image: PIL.Image.Image, height: int, width: int) -> torch.Ten
     return tensor.unsqueeze(2).contiguous()
 
 
-def _tensor_to_pil(images: torch.Tensor) -> list[PIL.Image.Image]:
-    if images.ndim == 3:
-        images = images.unsqueeze(0)
-    if images.ndim != 4:
-        raise ValueError(
-            f"Expected image tensor (B, C, H, W), got {tuple(images.shape)}."
-        )
-    images = images.detach().cpu().float().clamp(-1.0, 1.0)
-    images = (images + 1.0) / 2.0
-    images = (images * 255.0).round().to(torch.uint8)
-    result = []
-    for image in images:
-        result.append(PIL.Image.fromarray(image.permute(1, 2, 0).numpy()))
-    return result
-
-
 def _extract_single_image(
     prompt: dict[str, Any] | str,
 ) -> PIL.Image.Image | torch.Tensor | np.ndarray:
@@ -271,6 +258,8 @@ def _cast_floating_model_inputs(model_inputs: Any, dtype: torch.dtype) -> Any:
     return model_inputs
 
 
+# Normalize the single reference image into a supported Joy bucket before
+# forward(); bucket sizes keep VAE/DiT latent grids within trained resolutions.
 def get_joy_image_edit_pre_process_func(
     od_config: OmniDiffusionConfig,
 ) -> Callable[[OmniDiffusionRequest], OmniDiffusionRequest]:
@@ -322,8 +311,10 @@ def get_joy_image_edit_pre_process_func(
 def get_joy_image_edit_post_process_func(
     od_config: OmniDiffusionConfig,
 ) -> Callable[[torch.Tensor], list[PIL.Image.Image]]:
+    image_processor = VaeImageProcessor()
+
     def post_process_func(images: torch.Tensor) -> list[PIL.Image.Image]:
-        return _tensor_to_pil(images)
+        return image_processor.postprocess(images, output_type="pil")
 
     return post_process_func
 
@@ -796,6 +787,7 @@ class JoyImageEditPipeline(
         latents: torch.Tensor | None = None,
         output_type: str | None = "pil",
     ) -> DiffusionOutput:
+        # Step 1: read the preprocessed single-image edit request.
         if len(req.prompts) != 1:
             raise ValueError(
                 "JoyImageEditPipeline supports exactly one prompt per request."
@@ -835,6 +827,8 @@ class JoyImageEditPipeline(
         self._current_timestep = None
         self._interrupt = False
 
+        # Step 2: encode text plus the reference image through Qwen3-VL
+        # (including its vision/ViT path) to produce DiT conditioning.
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(
             prompt,
             prompt_image,
@@ -862,6 +856,8 @@ class JoyImageEditPipeline(
                 req.sampling_params.seed
             )
 
+        # Step 3: VAE-encode the reference image and create the target noise
+        # latent; the latent stack is [reference image latents, target noise].
         latents, image_latents = self.prepare_latents(
             image=image,
             batch_size=batch_size,
@@ -873,7 +869,10 @@ class JoyImageEditPipeline(
             generator=generator,
             latents=latents,
         )
+        # Step 4: build the scheduler timestep/sigma schedule.
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+        # Step 5: run the DiT denoising loop. The reference image latents stay
+        # fixed while the target noise latent is updated each scheduler step.
         latents = self.diffuse(
             latents=latents,
             image_latents=image_latents,
@@ -889,6 +888,7 @@ class JoyImageEditPipeline(
         if output_type == "latent" or _is_dummy_request(req):
             self._offload_transformer_if_deferred()
             return DiffusionOutput(output=latents[:, -1].detach().cpu())
+        # Step 6: decode only the target latent back to image space.
         images = self._decode_latents(latents)
         return DiffusionOutput(output=images)
 
