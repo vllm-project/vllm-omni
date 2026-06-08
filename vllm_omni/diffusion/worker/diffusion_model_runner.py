@@ -82,6 +82,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
+        # This runner waits via wait_kv_copy() before forward, so it can use the
+        # async H2D copy path (Phase 2).  Other receivers keep the sync path.
+        self.kv_transfer_manager.enable_async_kv_copy()
 
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
@@ -322,6 +325,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if is_primary:
                 current_omni_platform.reset_peak_memory_stats()
+
+            # Make the compute stream wait for the async KV H2D copy (Phase 2);
+            # no-op unless an async copy was issued during receive.
+            self.kv_transfer_manager.wait_kv_copy()
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
