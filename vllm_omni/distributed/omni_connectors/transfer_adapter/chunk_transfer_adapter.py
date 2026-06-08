@@ -445,22 +445,24 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         waiting_queue: Any,
         running_queue: list[Request],
         *,
-        scheduler_requests: dict[str, Request],
+        scheduler_requests: dict[str, Request] | None = None,
     ) -> None:
         """
         Process pending chunks for waiting and running queues.
 
-        Purges any ``waiting_for_chunk_*_requests`` deque entries whose
-        ``request_id`` is no longer tracked by ``scheduler_requests``
-        (e.g. after a mid-flight abort that ran
-        ``Scheduler._free_request``) before processing chunks. Without
-        this purge, ``restore_queues`` would later re-inject the freed
-        ``Request`` onto ``running_queue`` and the worker's
-        ``_update_states`` would crash with ``KeyError`` reading
-        ``self.requests[req_id]``. See vllm-project/vllm-omni#3736.
+        When ``scheduler_requests`` is provided, purges any
+        ``waiting_for_chunk_*_requests`` deque entries whose
+        ``request_id`` is no longer tracked by it (e.g. after a
+        mid-flight abort that ran ``Scheduler._free_request``) before
+        processing chunks. Without this purge, ``restore_queues`` would
+        later re-inject the freed ``Request`` onto ``running_queue`` and
+        the worker's ``_update_states`` would crash with ``KeyError``
+        reading ``self.requests[req_id]``. See vllm-project/vllm-omni#3736.
 
-        ``scheduler_requests`` is keyword-only and required so callers
-        cannot accidentally fall back to the unguarded path.
+        ``scheduler_requests`` is keyword-only and optional; production
+        schedulers always pass their live request map, while legacy
+        callers that don't track aborts may omit it to keep the prior
+        (unguarded) behaviour.
         """
         if self.connector.stage_id == 0:
             return
@@ -469,8 +471,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # Scheduler._free_request) before any chunk processing, so neither
         # the legacy nor the active-stream path can re-inject a zombie
         # Request onto the queues. See vllm-project/vllm-omni#3736.
-        self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
-        self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
+        if scheduler_requests is not None:
+            self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
+            self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
 
         if self._active_window <= 0:
             self._process_chunk_queue_legacy(
