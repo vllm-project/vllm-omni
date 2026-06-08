@@ -756,9 +756,7 @@ def _run_dit_model(
         _empty_accelerator_cache()
 
 
-def test_npu_dit_config_defaults_to_four_card_expert_parallel(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_npu_dit_config_defaults_to_four_card_expert_parallel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(NPU_DIT_DEVICES_ENV, raising=False)
     monkeypatch.delenv(NPU_DIT_TP_ENV, raising=False)
     monkeypatch.delenv(NPU_DIT_EP_ENV, raising=False)
