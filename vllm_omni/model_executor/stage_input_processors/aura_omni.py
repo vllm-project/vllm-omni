@@ -4,8 +4,12 @@
 
 from __future__ import annotations
 
+import math
+import os
 from pathlib import Path
 from typing import Any
+
+import soundfile as sf
 
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
@@ -191,16 +195,123 @@ def asr2aura(
 
 
 def _estimate_tts_prompt_len(text: str) -> int:
-    # Qwen3-TTS replaces placeholder token embeddings during prefill.  A safe
-    # overestimate avoids underfilling the prefill span; the model pads surplus
-    # rows with its TTS pad embedding.
-    return max(32, min(4096, len(text) + 64))
+    # Fallback path when token ids are unavailable. This mirrors the structured
+    # prompt-length formula using character count as an approximation of token
+    # count for the assistant segment.
+    return _estimate_tts_prompt_len_from_token_ids([0] * max(0, len(text)))
 
 
-def _estimate_tts_prompt_len_from_token_ids(token_ids: list[int]) -> int:
-    # Token-passthrough avoids TTS text tokenization, so size the placeholder
-    # span from the assistant-template token ids that Qwen3-TTS will consume.
-    return max(32, min(4096, len(token_ids) + 64))
+def _estimate_ref_code_len_from_ref_audio(ref_audio: Any) -> int | None:
+    """Estimate Qwen3-TTS ref_code length from a ref-audio payload.
+
+    For Qwen3-TTS 12Hz models, code length is approximately:
+        ceil(duration_seconds * 12.5)
+    i.e. one codec frame per 1920 samples at 24kHz.
+    """
+
+    codec_frame_rate = 24000.0 / 1920.0
+
+    # Unwrap common list wrappers.
+    item = ref_audio
+    while isinstance(item, list) and item:
+        item = item[0]
+
+    # Accept tuple/list like (wav, sr).
+    if isinstance(item, (tuple, list)) and len(item) == 2 and isinstance(item[1], (int, float)):
+        wav, sr = item
+        sr_i = int(sr)
+        if sr_i <= 0:
+            return None
+        if hasattr(wav, "__len__"):
+            n_samples = len(wav)
+        elif hasattr(wav, "shape"):
+            shape = getattr(wav, "shape", None)
+            if not shape:
+                return None
+            n_samples = shape[-1] if len(shape) > 1 else shape[0]
+        else:
+            return None
+        if n_samples <= 0:
+            return None
+        return max(1, int(math.ceil((float(n_samples) / float(sr_i)) * codec_frame_rate)))
+
+    # Accept file path (wav only).
+    if isinstance(item, str) and item:
+        audio_path = item
+        if not os.path.isfile(audio_path) or not audio_path.lower().endswith(".wav"):
+            return None
+        try:
+            info = sf.info(audio_path)
+            n_frames = int(info.frames)
+            sr = int(info.samplerate)
+            if n_frames <= 0 or sr <= 0:
+                return None
+            return max(1, int(math.ceil((float(n_frames) / float(sr)) * codec_frame_rate)))
+        except Exception:
+            return None
+
+    return None
+
+
+def _estimate_tts_prompt_len_from_token_ids(
+    token_ids: list[int],
+    *,
+    task_type: str = "Base",
+    language: str = "Chinese",
+    instruct: str = "",
+    x_vector_only_mode: bool = False,
+    non_streaming_mode: bool | None = None,
+    ref_code_len: int | None = None,
+) -> int:
+    """Estimate Talker prefill length from prompt structure.
+
+    This mirrors Qwen3-TTS prompt assembly at length level:
+      prompt_len = instruct_len + role_len + codec_prefix_len + text/icl term
+    """
+
+    # Official defaults: Base -> streaming, others -> non-streaming.
+    if non_streaming_mode is None:
+        non_streaming_mode = task_type in ("CustomVoice", "VoiceDesign")
+
+    # We do not have tokenizer here; use char length as a monotonic proxy.
+    instruct_len = len(instruct.strip()) if isinstance(instruct, str) else 0
+    assistant_len = max(0, len(token_ids))
+
+    # role_len = 3; codec_prefix_len = (prefill_len + speaker_len + 2) - 1
+    # prefill_len = 4 when language_id exists else 3. Use non-auto language as
+    # the language-id-present proxy.
+    has_language_id = isinstance(language, str) and language.strip().lower() != "auto"
+    prefill_len = 4 if has_language_id else 3
+    speaker_len = 1 if task_type in ("CustomVoice", "Base") else 0
+    base_len = instruct_len + 3 + (prefill_len + speaker_len + 2 - 1)
+    if task_type in ("CustomVoice", "VoiceDesign"):
+        if non_streaming_mode:
+            prompt_len = base_len + max(0, assistant_len - 6)
+        else:
+            prompt_len = base_len + 1
+        return max(32, min(4096, int(prompt_len)))
+
+    if task_type == "Base":
+        in_context_mode = not bool(x_vector_only_mode)
+        if in_context_mode and ref_code_len is not None:
+            codec_lens = 1 + int(ref_code_len)
+            if non_streaming_mode:
+                # Exact non-streaming ICL needs ref_ids token length; unavailable
+                # in this processor. Keep a conservative upper estimate.
+                prompt_len = base_len + codec_lens + max(0, assistant_len - 8) + 1
+            else:
+                # Streaming ICL exact length term: 1 + ref_code_len
+                prompt_len = base_len + codec_lens
+        else:
+            # Base x-vector-only (or missing ref_code length) follows CV shape.
+            if non_streaming_mode:
+                prompt_len = base_len + max(0, assistant_len - 6)
+            else:
+                prompt_len = base_len + 1
+        return max(32, min(4096, int(prompt_len)))
+
+    # Defensive fallback for unknown task types.
+    return max(32, min(4096, int(base_len + max(assistant_len, 1))))
 
 
 def aura2tts(
@@ -229,8 +340,35 @@ def aura2tts(
         }
         if assistant_token_ids:
             tts_info[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids]
-            prompt_len = _estimate_tts_prompt_len_from_token_ids(assistant_token_ids)
+            language = _first_value(additional_info.get("tts_language"), "Chinese")
+            instruct = _first_value(additional_info.get("tts_instruct"), "")
+            x_vector_only_mode = _first_bool(additional_info.get("tts_x_vector_only_mode"), False)
+            non_streaming_mode_raw = _first_value(additional_info.get("tts_non_streaming_mode"), None)
+            non_streaming_mode = non_streaming_mode_raw if isinstance(non_streaming_mode_raw, bool) else None
+            ref_code_len_raw = _first_value(additional_info.get("tts_ref_code_length"), None)
+            ref_code_len = int(ref_code_len_raw) if isinstance(ref_code_len_raw, int) else None
+            print("ref_code_len: %r", ref_code_len)
+            if task_type == "Base" and not x_vector_only_mode and ref_code_len is None:
+                ref_audio_for_len = _first_value(
+                    additional_info.get("tts_ref_audio"),
+                    default_qwen3_tts_ref_audio_path(),
+                )
+                print("ref_audio_for_len: %r", ref_audio_for_len)
+                ref_code_len = _estimate_ref_code_len_from_ref_audio(ref_audio_for_len)
+                print("ref_code_len: %r", ref_code_len)
+            if ref_code_len is not None:
+                tts_info["ref_code_length"] = [int(ref_code_len)]
+            prompt_len = _estimate_tts_prompt_len_from_token_ids(
+                assistant_token_ids,
+                task_type=str(task_type),
+                language=str(language),
+                instruct=str(instruct),
+                x_vector_only_mode=x_vector_only_mode,
+                non_streaming_mode=non_streaming_mode,
+                ref_code_len=ref_code_len,
+            )
             print("Using assistant token ids for TTS prompt length estimation: %r", assistant_token_ids)
+            print("prompt_len: %r", prompt_len)
         else:
             # Defensive fallback for synthetic outputs or legacy callers that do
             # not populate cumulative_token_ids.

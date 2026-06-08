@@ -662,7 +662,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if is_prefill:
             # Prefill (prompt embeddings)
             prompt_embeds_cpu = embed.get("prefill")
-
             # First prefill round: prompt_embeds_cpu is not yet populated.
             # Subsequent prefill rounds (multi-chunk): prompt_embeds_cpu is a Tensor stored by the first round.
             is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
