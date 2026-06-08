@@ -105,6 +105,12 @@ class StreamingVideoSessionConfig(BaseModel):
         le=1.0,
         description="EVS similarity threshold (higher = keep more frames).",
     )
+    speaker: str | None = Field(
+        default=None,
+        description="TTS speaker/voice name (e.g. ethan, chelsie, aiden). "
+        "Applies to the whole session. Uses the model default when unset; "
+        "an unsupported name yields an error on the first query.",
+    )
 
 
 class OmniStreamingVideoHandler:
@@ -524,6 +530,23 @@ class OmniStreamingVideoHandler:
         except Exception as e:
             await self._send_error(websocket, f"Preprocess failed: {e}")
             return
+
+        # Inject the session-level speaker into additional_information
+        if config.speaker:
+            from vllm_omni.entrypoints.openai.utils import (
+                validate_requested_speaker,
+            )
+
+            supported = self._chat_service._get_supported_speakers()
+            try:
+                normalized = validate_requested_speaker(config.speaker, supported)
+            except ValueError as e:
+                await self._send_error(websocket, str(e))
+                return
+            if normalized is not None:
+                ai = engine_prompt.get("additional_information") or {}
+                ai["speaker"] = [normalized]
+                engine_prompt["additional_information"] = ai
 
         await websocket.send_json({"type": "response.start"})
         text_parts: list[str] = []
