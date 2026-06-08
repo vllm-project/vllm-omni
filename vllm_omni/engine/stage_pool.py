@@ -24,6 +24,7 @@ from vllm_omni.engine.stage_client import (
     StagePoolLLMClient,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
@@ -96,6 +97,10 @@ class StagePool:
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
+        self._output_timestamps_by_request: dict[str, list[float]] = {}
+        self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
+        self._audio_frames_by_request: dict[str, int] = {}
+        self._audio_sample_rate_by_request: dict[str, int] = {}
 
         # Distributed-mode state. Populated by add_client / remove_client.
         self._addr_to_replica_id: dict[str, int] = {}
@@ -428,6 +433,10 @@ class StagePool:
         """Drop the route binding for *request_id* in this stage."""
         self._request_bindings.pop(request_id, None)
         self._affinity.pop(request_id, None)
+        self._output_timestamps_by_request.pop(str(request_id), None)
+        self._non_empty_first_output_timestamps_by_request.pop(str(request_id), None)
+        self._audio_frames_by_request.pop(str(request_id), None)
+        self._audio_sample_rate_by_request.pop(str(request_id), None)
 
     def release_bindings(self, request_ids: list[str]) -> None:
         """Drop route bindings for the given request ids in this stage."""
@@ -485,13 +494,66 @@ class StagePool:
         request_outputs: list[Any],
         *,
         submit_ts: float,
+        request_timestamp: float,
         replica_id: int,
+        sampling_params: Any | None = None,
     ) -> StageRequestMetrics:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
         stage_gen_time_ms = (now - submit_ts) * 1000.0
 
+        request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
+        output_timestamps = self._output_timestamps_by_request.pop(request_id, []) if request_id else []
+        non_empty_first_output_ts = (
+            self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
+        )
         num_tokens_out = count_tokens_from_outputs(request_outputs)
+        output_unit_type = self._infer_output_unit_type(request_outputs, token_count=num_tokens_out)
+        output_unit_count = self._count_output_units(
+            request_outputs,
+            unit_type=output_unit_type,
+            fallback_token_count=num_tokens_out,
+        )
+        native_text_metrics = {}
+        if request_id:
+            pop_native_text_metrics = getattr(self.output_processor, "pop_native_text_metrics", None)
+            if callable(pop_native_text_metrics):
+                native_text_metrics = pop_native_text_metrics(request_id)
+        current_audio_frames, current_audio_sample_rate, _ = self._collect_audio_metrics(request_outputs)
+        accumulated_audio_frames = self._audio_frames_by_request.pop(request_id, 0) if request_id else 0
+        accumulated_audio_sample_rate = self._audio_sample_rate_by_request.pop(request_id, 0) if request_id else 0
+        audio_generated_frames = max(accumulated_audio_frames, current_audio_frames)
+        audio_sample_rate = accumulated_audio_sample_rate or current_audio_sample_rate
+        audio_duration_s = (
+            float(audio_generated_frames) / float(audio_sample_rate)
+            if audio_generated_frames > 0 and audio_sample_rate > 0
+            else 0.0
+        )
+        image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
+        num_inference_steps = self._coerce_int_scalar(getattr(sampling_params, "num_inference_steps", None))
+        denoise_step_latency_ms = (
+            defs.compute_denoise_step_latency(stage_gen_time_ms, num_inference_steps)
+            if output_unit_type == "image"
+            else 0.0
+        )
+        has_output_timestamps = bool(output_timestamps)
+        first_ts = output_timestamps[0] if has_output_timestamps else now
+        serving_time_to_first_output_ms = (
+            max((non_empty_first_output_ts - request_timestamp) * 1000.0, 0.0)
+            if non_empty_first_output_ts is not None
+            else 0.0
+        )
+        remaining_ms = max((now - first_ts) * 1000.0, 0.0)
+        if output_unit_count > 1 and self._is_streaming_output_unit_type(output_unit_type):
+            time_per_output_unit_ms = remaining_ms / float(output_unit_count - 1)
+        else:
+            time_per_output_unit_ms = 0.0
+        inter_output_latencies_ms = [
+            max((cur_ts - prev_ts) * 1000.0, 0.0) for prev_ts, cur_ts in zip(output_timestamps, output_timestamps[1:])
+        ]
+        inter_output_latency_ms = (
+            sum(inter_output_latencies_ms) / float(len(inter_output_latencies_ms)) if inter_output_latencies_ms else 0.0
+        )
         num_tokens_in = 0
         if self.stage_id == 0:
             for ro in request_outputs:
@@ -504,6 +566,7 @@ class StagePool:
         batch_id = metrics.batch_seq
         metrics.agg_total_tokens += num_tokens_out
         metrics.agg_total_gen_time_ms += stage_gen_time_ms
+        audio_rtf = defs.compute_audio_rtf(stage_gen_time_ms / 1000.0, audio_duration_s)
 
         return StageRequestMetrics(
             num_tokens_in=num_tokens_in,
@@ -519,7 +582,320 @@ class StagePool:
                 total_token=metrics.agg_total_tokens,
                 total_gen_time_ms=metrics.agg_total_gen_time_ms,
             ),
+            audio_generated_frames=audio_generated_frames,
+            audio_sample_rate=audio_sample_rate,
+            audio_duration_s=audio_duration_s,
+            audio_rtf=audio_rtf,
+            image_pixels=image_pixels,
+            denoise_step_latency_ms=denoise_step_latency_ms,
+            output_unit_type=output_unit_type,
+            output_unit_count=output_unit_count,
+            serving_time_to_first_output_ms=serving_time_to_first_output_ms,
+            time_per_output_unit_ms=time_per_output_unit_ms,
+            inter_output_latency_ms=inter_output_latency_ms,
+            inter_output_latencies_ms=inter_output_latencies_ms,
+            vllm_ttft_ms=float(native_text_metrics.get("vllm_ttft_ms") or 0.0),
+            vllm_tpot_ms=float(native_text_metrics.get("vllm_tpot_ms") or 0.0),
+            vllm_itl_ms=float(native_text_metrics.get("vllm_itl_ms") or 0.0),
+            vllm_itls_ms=list(native_text_metrics.get("vllm_itls_ms") or []),
         )
+
+    def _infer_output_unit_type(self, request_outputs: list[Any], *, token_count: int) -> str:
+        final_output_type = getattr(self.stage_client, "final_output_type", None)
+
+        if self._has_image_output(request_outputs) or final_output_type in {"image", "images"}:
+            return "image"
+        if self._has_video_output(request_outputs) or final_output_type in {"video", "videos"}:
+            return "video"
+        if self._has_audio_output(request_outputs) or final_output_type == "audio":
+            return "audio"
+        if self._has_trajectory_latent_output(request_outputs) or self._has_latent_output(request_outputs):
+            return "latent"
+        if final_output_type in {"latent", "latents"}:
+            return "latent"
+        if final_output_type == "text":
+            return "text"
+        if token_count > 0:
+            return "stream"
+        return "other"
+
+    @staticmethod
+    def _is_streaming_output_unit_type(unit_type: str) -> bool:
+        return unit_type in {"text", "stream"}
+
+    def _count_output_units(
+        self,
+        request_outputs: list[Any],
+        *,
+        unit_type: str,
+        fallback_token_count: int,
+    ) -> int:
+        if unit_type == "audio":
+            total_frames, _, _ = self._collect_audio_metrics(request_outputs)
+            if total_frames > 0:
+                return total_frames
+        if unit_type == "image":
+            total_images = sum(self._count_images(ro) for ro in request_outputs)
+            if total_images > 0:
+                return total_images
+        if unit_type == "video":
+            total_videos = sum(self._count_videos(ro) for ro in request_outputs)
+            if total_videos > 0:
+                return total_videos
+        if unit_type == "latent":
+            total_latents = sum(
+                self._count_value_units(getattr(ro, "trajectory_latents", None))
+                + self._count_value_units(getattr(ro, "latents", None))
+                for ro in request_outputs
+            )
+            if total_latents > 0:
+                return total_latents
+        return int(fallback_token_count)
+
+    def _has_audio_output(self, request_outputs: list[Any]) -> bool:
+        for ro in request_outputs:
+            for mm_output in self._iter_multimodal_outputs(ro):
+                if isinstance(mm_output, dict) and mm_output.get("audio") is not None:
+                    return True
+        return False
+
+    def _collect_audio_metrics(self, request_outputs: list[Any]) -> tuple[int, int, float]:
+        total_frames = 0
+        sample_rate = 0
+        for ro in request_outputs:
+            for mm_output in self._iter_multimodal_outputs(ro):
+                if not isinstance(mm_output, dict):
+                    continue
+                if sample_rate <= 0:
+                    sample_rate = self._infer_audio_sample_rate(mm_output)
+                audio_output = mm_output.get("audio")
+                if audio_output is None:
+                    continue
+                items = audio_output if isinstance(audio_output, list) else [audio_output]
+                for item in items:
+                    total_frames += self._count_audio_frames(item)
+        duration_s = (float(total_frames) / float(sample_rate)) if total_frames > 0 and sample_rate > 0 else 0.0
+        return int(total_frames), int(sample_rate), duration_s
+
+    @staticmethod
+    def _count_audio_frames(audio_output: Any) -> int:
+        shape = getattr(audio_output, "shape", None)
+        if shape is not None and len(shape) > 0:
+            # Audio chunks are concatenated on dim=-1 in the output processor,
+            # so the frame/sample axis is the last dim (e.g. [channels, frames]).
+            # Keep this aligned with serving_chat.py: audio tensors are consumed
+            # as (T,), (C, T), or (B, C, T). Flattening would corrupt
+            # multi-channel audio.
+            return int(shape[-1])
+        try:
+            return len(audio_output)
+        except TypeError:
+            return 1
+
+    def _infer_audio_sample_rate(self, mm_output: dict[str, Any]) -> int:
+        for key in ("audio_sample_rate", "sample_rate", "sampling_rate", "sr"):
+            rate = self._coerce_int_scalar(mm_output.get(key))
+            if rate > 0:
+                return rate
+        for attr in ("audio_sample_rate", "sample_rate", "sampling_rate", "output_sample_rate"):
+            rate = self._coerce_int_scalar(getattr(self.stage_client, attr, None))
+            if rate > 0:
+                return rate
+            rate = self._coerce_int_scalar(getattr(self._stage_vllm_config, attr, None))
+            if rate > 0:
+                return rate
+        return 0
+
+    @classmethod
+    def _coerce_int_scalar(cls, value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                coerced = cls._coerce_int_scalar(item)
+                if coerced > 0:
+                    return coerced
+            return 0
+        item = getattr(value, "item", None)
+        if callable(item):
+            try:
+                return int(item())
+            except Exception:
+                return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _has_image_output(self, request_outputs: list[Any]) -> bool:
+        for ro in request_outputs:
+            if self._count_images(ro) > 0:
+                return True
+        return False
+
+    def _has_video_output(self, request_outputs: list[Any]) -> bool:
+        for ro in request_outputs:
+            if self._count_videos(ro) > 0:
+                return True
+        return False
+
+    def _has_trajectory_latent_output(self, request_outputs: list[Any]) -> bool:
+        return any(self._is_non_empty_value(getattr(ro, "trajectory_latents", None)) for ro in request_outputs)
+
+    def _has_latent_output(self, request_outputs: list[Any]) -> bool:
+        return any(self._is_non_empty_value(getattr(ro, "latents", None)) for ro in request_outputs)
+
+    def _count_images(self, request_output: Any) -> int:
+        total_images = self._count_value_units(getattr(request_output, "images", None))
+        for mm_output in self._iter_multimodal_outputs(request_output):
+            if isinstance(mm_output, dict):
+                total_images += self._count_value_units(mm_output.get("image"))
+                total_images += self._count_value_units(mm_output.get("images"))
+        return total_images
+
+    def _count_image_pixels(self, request_outputs: list[Any]) -> int:
+        total_pixels = 0
+        for ro in request_outputs:
+            total_pixels += self._count_image_value_pixels(getattr(ro, "images", None))
+            for mm_output in self._iter_multimodal_outputs(ro):
+                if isinstance(mm_output, dict):
+                    total_pixels += self._count_image_value_pixels(mm_output.get("image"))
+                    total_pixels += self._count_image_value_pixels(mm_output.get("images"))
+        return total_pixels
+
+    @classmethod
+    def _count_image_value_pixels(cls, value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, (list, tuple)):
+            return sum(cls._count_image_value_pixels(item) for item in value)
+
+        size = getattr(value, "size", None)
+        if isinstance(size, tuple) and len(size) >= 2:
+            try:
+                return int(size[0]) * int(size[1])
+            except (TypeError, ValueError):
+                return 0
+
+        shape = getattr(value, "shape", None)
+        if shape is None or len(shape) < 2:
+            return 0
+        dims = [int(dim) for dim in shape]
+        if len(dims) >= 4:
+            return dims[0] * dims[-2] * dims[-1]
+        if len(dims) == 3 and dims[0] in (1, 3, 4):
+            return dims[1] * dims[2]
+        if len(dims) == 3 and dims[-1] in (1, 3, 4):
+            return dims[0] * dims[1]
+        return dims[-2] * dims[-1]
+
+    def _count_videos(self, request_output: Any) -> int:
+        total_videos = self._count_video_units(getattr(request_output, "video", None))
+        total_videos += self._count_video_units(getattr(request_output, "videos", None))
+        for mm_output in self._iter_multimodal_outputs(request_output):
+            if isinstance(mm_output, dict):
+                total_videos += self._count_video_units(mm_output.get("video"))
+                total_videos += self._count_video_units(mm_output.get("videos"))
+        return total_videos
+
+    def has_non_empty_output(self, request_output: Any) -> bool:
+        return self._has_non_empty_output(request_output)
+
+    def _has_non_empty_output(self, request_output: Any) -> bool:
+        final_output_type = getattr(request_output, "final_output_type", None)
+        if final_output_type is None:
+            final_output_type = getattr(self.stage_client, "final_output_type", None)
+        if final_output_type == "text":
+            return any(bool(getattr(output, "text", "")) for output in getattr(request_output, "outputs", None) or [])
+
+        if getattr(request_output, "images", None):
+            return True
+        if getattr(request_output, "video", None) or getattr(request_output, "videos", None):
+            return True
+        if getattr(request_output, "trajectory_latents", None) is not None:
+            return True
+        custom_output = getattr(request_output, "_custom_output", None)
+        if isinstance(custom_output, dict) and custom_output:
+            return True
+        for mm_output in self._iter_multimodal_outputs(request_output):
+            if isinstance(mm_output, dict) and any(self._is_non_empty_value(value) for value in mm_output.values()):
+                return True
+        for output in getattr(request_output, "outputs", None) or []:
+            if getattr(output, "text", None):
+                return True
+            token_ids = getattr(output, "token_ids", None)
+            if self._is_non_empty_value(token_ids):
+                return True
+            cumulative_token_ids = getattr(output, "cumulative_token_ids", None)
+            if self._is_non_empty_value(cumulative_token_ids):
+                return True
+        return False
+
+    @staticmethod
+    def _is_non_empty_value(value: Any) -> bool:
+        if value is None:
+            return False
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            return all(int(dim) > 0 for dim in shape)
+        try:
+            return len(value) > 0
+        except TypeError:
+            return True
+
+    @staticmethod
+    def _count_value_units(value: Any) -> int:
+        if value is None:
+            return 0
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            return int(shape[0]) if len(shape) > 0 and int(shape[0]) > 0 else 0
+        try:
+            return len(value)
+        except TypeError:
+            return 1
+
+    @staticmethod
+    def _count_video_units(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, (list, tuple)):
+            return len(value)
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            return 1 if all(int(dim) > 0 for dim in shape) else 0
+        try:
+            return len(value)
+        except TypeError:
+            return 1
+
+    def record_output_timestamps(self, request_outputs: list[Any], *, output_ts: float | None = None) -> None:
+        """Record all output timestamps and the first non-empty output timestamp."""
+        output_ts = _time.time() if output_ts is None else output_ts
+        for request_output in request_outputs:
+            request_id = getattr(request_output, "request_id", None)
+            if request_id is None:
+                continue
+            rid = str(request_id)
+            self._output_timestamps_by_request.setdefault(rid, []).append(output_ts)
+            if self._has_non_empty_output(request_output):
+                self._non_empty_first_output_timestamps_by_request.setdefault(rid, output_ts)
+            audio_frames, audio_sample_rate, _ = self._collect_audio_metrics([request_output])
+            if audio_frames > 0:
+                self._audio_frames_by_request[rid] = self._audio_frames_by_request.get(rid, 0) + audio_frames
+            if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
+                self._audio_sample_rate_by_request[rid] = audio_sample_rate
+
+    def _iter_multimodal_outputs(self, request_output: Any) -> list[dict[str, Any]]:
+        multimodal_outputs: list[dict[str, Any]] = []
+        outer_mm = getattr(request_output, "multimodal_output", None)
+        if isinstance(outer_mm, dict) and outer_mm:
+            multimodal_outputs.append(outer_mm)
+        for output in getattr(request_output, "outputs", None) or []:
+            inner_mm = getattr(output, "multimodal_output", None)
+            if isinstance(inner_mm, dict) and inner_mm:
+                multimodal_outputs.append(inner_mm)
+        return multimodal_outputs
 
     # ---- Stage-local admission ----
 
@@ -658,11 +1034,16 @@ class StagePool:
             return []
         client = cast(StagePoolLLMClient, raw_client)
         processor = self.output_processor
+        iteration_stats = IterationStats()
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
             iteration_stats,
         )
+        # Use the same wall-clock source as OrchestratorRequestState.stage_submit_ts.
+        # EngineCoreOutputs.timestamp may use a different clock base, which would
+        # make TTFO negative and get clamped to 0.
+        self.record_output_timestamps(processed.request_outputs, output_ts=_time.time())
 
         if processed.reqs_to_abort:
             await client.abort_requests_async(processed.reqs_to_abort)

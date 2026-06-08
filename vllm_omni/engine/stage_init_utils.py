@@ -428,6 +428,8 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         _mod, _fn = _ckf_path.rsplit(".", 1)
         cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
 
+    model_stage = getattr(engine_args, "model_stage", None)
+
     if stage_type == "diffusion":
         return StageMetadata(
             stage_id=stage_id,
@@ -440,12 +442,11 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             final_output_type=final_output_type,
             default_sampling_params=default_sampling_params,
             custom_process_input_func=custom_process_input_func,
-            model_stage=None,
+            model_stage=model_stage,
             runtime_cfg=runtime_cfg,
             cfg_kv_collect_func=cfg_kv_collect_func,
         )
 
-    model_stage = getattr(engine_args, "model_stage", None)
     engine_output_type = getattr(engine_args, "engine_output_type", None)
     is_comprehension = getattr(stage_config, "is_comprehension", False)
     requires_multimodal_data = getattr(runtime_cfg, "requires_multimodal_data", False)
@@ -480,6 +481,15 @@ def prepare_engine_environment() -> None:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass
+
+
+def _maybe_set_qwen3_omni_moe_env(engine_args_dict: dict[str, Any]) -> None:
+    if (
+        engine_args_dict.get("model_arch") == "Qwen3OmniMoeForConditionalGeneration"
+        and "VLLM_USE_FLASHINFER_MOE_FP16" not in os.environ
+    ):
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
+        logger.info("[stage_init] Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni stage")
 
 
 def split_devices_for_replicas(
@@ -761,6 +771,10 @@ def build_engine_args_dict(
     # Check whether the stage's default_sampling_params defines extra_args.
     default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
     engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
+
+    # TODO: Remove this after the performance regression is fixed
+    # Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni to avoid performance regression
+    _maybe_set_qwen3_omni_moe_env(engine_args_dict)
 
     return engine_args_dict
 

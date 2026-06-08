@@ -13,7 +13,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMSchedu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -68,6 +68,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # completes so that kv_ready can be emitted while the request is still
         # alive.  Stopped on the first scheduler step after extraction ack.
         self.pending_stop_after_extraction: set[str] = set()
+
+        self.finished_req_ids_dict = defaultdict(set)
 
         # [Omni] Pre-parse KV transfer criteria
         self.kv_transfer_criteria = self._get_kv_transfer_criteria()
@@ -434,7 +436,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                             # Downstream async-chunk stages receive real payloads from the
                             # connector. This update only resumes polling for the next segment.
                             self.chunk_transfer_adapter.segment_finished_requests.discard(request.request_id)
-                    request.discard_latest_async_tokens = True
+                    request.async_tokens_to_discard = 1
                     request.num_output_placeholders = 0
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
@@ -556,16 +558,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # outputs in this step.
         engine_core_outputs = {client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()}
 
+        # FIXME: finished_req_ids_dict is unconditionally initialized as
+        # defaultdict(set) in __init__ (not gated by include_finished_set).
+        # This branch is therefore always eligible once any client_index is
+        # populated; revisit when wiring streaming-only / upstream semantics.
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids:
             # Include ids of requests that finished since last outputs
             # were sent.
             for client_index, finished_set in finished_req_ids.items():
-                # Set finished request set in EngineCoreOutputs for this client.
-                if (eco := engine_core_outputs.get(client_index)) is not None:
-                    eco.finished_requests = finished_set
-                else:
-                    engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=finished_set)
+                eco = engine_core_outputs.get(client_index)
+                if eco is None:
+                    eco = EngineCoreOutputs()
+                    engine_core_outputs[client_index] = eco
+                emitted = {o.request_id for o in eco.outputs}
+                for req_id in finished_set:
+                    if req_id not in emitted:
+                        eco.outputs.append(EngineCoreOutput(req_id, [], finish_reason=FinishReason.ABORT))
+                eco.finished_requests = finished_set
             finished_req_ids.clear()
 
         if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)) is not None:
@@ -632,13 +642,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         req_id = session.request_id
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
-        session.discard_latest_async_tokens = False
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         if outstanding_async_tokens > 0:
             # Async scheduling may already have sampled the previous
             # segment's next token. Drop that late token instead of
             # appending it to the new streaming segment.
-            session.discard_latest_async_tokens = True
+            session.async_tokens_to_discard = 1
             session.num_computed_tokens -= session.num_output_placeholders
             session.num_output_placeholders = 0
             session.spec_token_ids = []

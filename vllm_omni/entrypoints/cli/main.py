@@ -24,10 +24,10 @@ def main():
             os.environ["VLLM_LOGGING_COLOR"] = "1"
 
         from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
-        from vllm.utils.argparse_utils import FlexibleArgumentParser
 
         import vllm_omni.entrypoints.cli.benchmark.main
         import vllm_omni.entrypoints.cli.serve
+        from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
         CMD_MODULES = [
             vllm_omni.entrypoints.cli.serve,
@@ -40,7 +40,7 @@ def main():
 
         _ensure_vllm_platform()
 
-        parser = FlexibleArgumentParser(
+        parser = TrackingArgumentParser(
             description="vLLM OMNI CLI",
             epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),
         )

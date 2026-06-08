@@ -32,7 +32,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
-from .autoencoder import AutoEncoder, AutoEncoderParams
+from .autoencoder import AutoEncoder, AutoEncoderParams, DistributedAutoEncoder
 from .bagel_transformer import Bagel, NaiveCache, Qwen2MoTConfig, Qwen2MoTForCausalLM
 
 logger = init_logger(__name__)
@@ -253,7 +253,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         )
         self.transformer = self.language_model.model
         ae_params: AutoEncoderParams = default_ae_params()
-        self.vae = AutoEncoder(ae_params)
+        self.vae = DistributedAutoEncoder(ae_params)
 
         self.bagel = Bagel(
             language_model=self.language_model,
@@ -777,7 +777,9 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
-        self._regen_init_noise_on_device(generation_input, req.sampling_params.seed)
+        # NOTE: For now we disable device specific noise regeneration so that e2e tests can run
+        # on both CUDA and ROCm. Context: https://github.com/vllm-project/vllm-omni/pull/4081
+        # self._regen_init_noise_on_device(generation_input, req.sampling_params.seed)
 
         # text cfg
         generation_input_cfg_text = self.bagel.prepare_vae_latent_cfg(

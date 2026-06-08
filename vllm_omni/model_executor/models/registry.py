@@ -119,6 +119,22 @@ _OMNI_MODELS = {
         "higgs_audio_v2_code2wav",
         "HiggsAudioV2Code2WavForConditionalGeneration",
     ),
+    ## higgs-audio v3
+    "HiggsMultimodalQwen3ForConditionalGeneration": (
+        "higgs_audio_v3",
+        "higgs_audio_v3_talker",
+        "HiggsAudioV3TalkerForConditionalGeneration",
+    ),
+    "HiggsAudioV3TalkerForConditionalGeneration": (
+        "higgs_audio_v3",
+        "higgs_audio_v3_talker",
+        "HiggsAudioV3TalkerForConditionalGeneration",
+    ),
+    "HiggsAudioV3Code2WavForConditionalGeneration": (
+        "higgs_audio_v3",
+        "higgs_audio_v3_code2wav",
+        "HiggsAudioV3Code2WavForConditionalGeneration",
+    ),
     ## mimo_audio
     "MiMoAudioModel": (
         "mimo_audio",
@@ -222,6 +238,25 @@ _OMNI_MODELS = {
         "moss_tts_nano",
         "modeling_moss_tts_nano",
         "MossTTSNanoForGeneration",
+    ),
+    ## MOSS-TTS (full variants: Delay + Realtime)
+    # MossTTSDelayModel: MOSS-TTS (8B), MOSS-TTSD (8B), MOSS-SoundEffect (8B), MOSS-VoiceGenerator (1.7B)
+    "MossTTSDelayModel": (
+        "moss_tts",
+        "modeling_moss_tts_talker",
+        "MossTTSDelayTalkerForGeneration",
+    ),
+    # MossTTSRealtime: MOSS-TTS-Realtime (1.7B)
+    "MossTTSRealtime": (
+        "moss_tts",
+        "modeling_moss_tts_talker",
+        "MossTTSRealtimeTalkerForGeneration",
+    ),
+    # Stage-1 codec decoder (shared by all 5 variants)
+    "MossTTSCodecDecoder": (
+        "moss_tts",
+        "modeling_moss_tts_codec",
+        "MossTTSCodecDecoder",
     ),
     "DyninOmniForConditionalGeneration": (
         "dynin_omni",

@@ -1747,7 +1747,7 @@ class Bagel(nn.Module):
         if use_sp and use_cfg_text:
             if return_trajectory_latents and len(timesteps) > 0:
                 trajectory_latents.append(x_t.clone())
-            for i, t in enumerate(timesteps):
+            for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             if frame_condition_token_indexes is not None:
                 # Cond positions stay at t=0 (clean signal).  Matches upstream
@@ -1816,7 +1816,7 @@ class Bagel(nn.Module):
         if use_sp:
             if return_trajectory_latents and len(timesteps) > 0:
                 trajectory_latents.append(x_t.clone())
-            for i, t in enumerate(timesteps):
+            for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             if frame_condition_token_indexes is not None:
                 # Cond positions stay at t=0 (clean signal).  Matches upstream
@@ -1867,7 +1867,7 @@ class Bagel(nn.Module):
         if return_trajectory_latents and len(timesteps) > 0:
             trajectory_latents.append(x_t.clone())
 
-        for i, t in enumerate(timesteps):
+        for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             if frame_condition_token_indexes is not None:
                 # Cond positions stay at t=0 (clean signal).  Matches upstream
@@ -2000,7 +2000,7 @@ class Bagel(nn.Module):
         if return_trajectory_latents and len(timesteps) > 0:
             trajectory_latents.append(x_t.clone())
 
-        for i, t in enumerate(timesteps):
+        for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             if frame_condition_token_indexes is not None:
                 # Cond positions stay at t=0 (clean signal).  Matches upstream

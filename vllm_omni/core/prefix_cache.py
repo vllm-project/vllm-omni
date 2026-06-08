@@ -406,30 +406,36 @@ class OmniTensorPrefixCache:
         self,
         query_start_loc: torch.Tensor,
         input_batch: InputBatch,
-        multimodal_outputs: dict,
+        multimodal_outputs: dict | None,
         num_scheduled_tokens: dict[str, int],
     ):
         """Get the merged multimodal states if hidden state prefix caching is enabled."""
         combined_multimodal_outputs = {}
+        # Talkers that produce multimodal outputs only at decode (e.g. Higgs
+        # Audio v3's audio codes) have ``multimodal_outputs is None`` at the
+        # initial prefill step. Treat it as an empty mapping so the merger
+        # short-circuits cleanly and the cache merge still runs once codes
+        # start arriving.
+        mm_outputs = multimodal_outputs if multimodal_outputs is not None else {}
         # First get the prefix cached tensors that are present in the mm data
         for mm_key in self.mm_cache_keys:
-            if mm_key in multimodal_outputs:
+            if mm_key in mm_outputs:
                 combined_multimodal_outputs[mm_key] = self._get_merged_tensors(
                     query_start_loc=query_start_loc,
                     input_batch=input_batch,
                     cache=self.mm_outputs_cache[mm_key],
-                    hidden_states=multimodal_outputs[mm_key],
+                    hidden_states=mm_outputs[mm_key],
                     num_scheduled_tokens=num_scheduled_tokens,
                 )
 
         # Then, get everything else (passthrough data); first, convert to CPU
         # tensors similarly to the non prefix cached path, and then populate
         # the subdicts mapping request IDs -> payload objects
-        passthrough_keys = set(multimodal_outputs.keys()) - self.mm_cache_keys
+        passthrough_keys = set(mm_outputs.keys()) - self.mm_cache_keys
         total_scheduled_tokens = sum(int(num_scheduled_tokens[r]) for r in input_batch.req_ids)
         passthrough_mm_data: dict[str, object] = {}
         for k in passthrough_keys:
-            v = multimodal_outputs[k]
+            v = mm_outputs[k]
             if (
                 k in self._mm_oversized_keys
                 and isinstance(v, torch.Tensor)

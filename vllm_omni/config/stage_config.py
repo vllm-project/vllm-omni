@@ -30,15 +30,6 @@ def get_pipeline_path(model_dir: str, filename: str) -> Path:
 logger = init_logger(__name__)
 
 
-def _warn_deprecated_kwargs(kwargs: dict[str, Any]) -> None:
-    if "cli_explicit_keys" in kwargs:
-        warnings.warn(
-            "cli_explicit_keys= is deprecated and ignored. Remove the kwarg.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-
-
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
 
@@ -837,15 +828,6 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
 )
 
 
-def deploy_override_field_names() -> frozenset[str]:
-    """Return deploy-schema fields whose CLI defaults must not override YAML."""
-    return (
-        frozenset(_STAGE_DEPLOY_FIELDS)
-        | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
-        | frozenset({"async_chunk", "devices"})
-    )
-
-
 def _build_engine_args(
     ps: StagePipelineConfig,
     ds: StageDeployConfig | None,
@@ -1169,14 +1151,11 @@ class StageConfigFactory:
         model: str,
         cli_overrides: dict[str, Any] | None = None,
         deploy_config_path: str | None = None,
-        **deprecated_kwargs: Any,
     ) -> list[StageConfig] | None:
         """Load pipeline + deploy config, merge with CLI overrides.
 
         Checks _PIPELINE_REGISTRY first (new path), falls back to legacy YAML.
         """
-        _warn_deprecated_kwargs(deprecated_kwargs)
-
         if cli_overrides is None:
             cli_overrides = {}
 
@@ -1186,6 +1165,11 @@ class StageConfigFactory:
 
         # --- New path: check pipeline registry by model_type first ---
         model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
+        if model_type == "vla":
+            from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
+
+            if _looks_like_dreamzero(model):
+                model_type = "dreamzero"
         if model_type and model_type in _PIPELINE_REGISTRY:
             return cls._create_from_registry(model_type, cli_overrides, deploy_config_path)
 
@@ -1256,20 +1240,28 @@ class StageConfigFactory:
         model_type: str,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None = None,
-        **deprecated_kwargs: Any,
     ) -> list[StageConfig]:
         """Create StageConfigs from pipeline registry + deploy YAML.
 
         Precedence: caller-typed (non-None) value > deploy YAML >
         StageDeployConfig dataclass default.
         """
-        _warn_deprecated_kwargs(deprecated_kwargs)
-
         # Resolve deploy config path
         if deploy_config_path is None:
             deploy_path = _DEPLOY_DIR / f"{model_type}.yaml"
         else:
             deploy_path = Path(deploy_config_path)
+            # Bare-name lookup: if the value isn't a real path, try the
+            # built-in deploy directory. This lets ``deploy_config="moss_tts"``
+            # resolve to ``vllm_omni/deploy/moss_tts.yaml`` when several model
+            # variants share an HF ``model_type`` and need different YAMLs.
+            if not deploy_path.exists() and deploy_path.parent == Path("."):
+                bare_name = deploy_path.name
+                if not bare_name.endswith(".yaml"):
+                    bare_name = f"{bare_name}.yaml"
+                candidate = _DEPLOY_DIR / bare_name
+                if candidate.exists():
+                    deploy_path = candidate
 
         if not deploy_path.exists():
             logger.warning(

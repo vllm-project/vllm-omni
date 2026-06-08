@@ -45,6 +45,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -149,26 +150,59 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             ),
         ]
 
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the whole component set before any from_pretrained.
+        ltx2_subfolders = [
+            "tokenizer",
+            "text_encoder",
+            "connectors",
+            "vae",
+            "audio_vae",
+            "vocoder",
+            "scheduler",
+        ]
+        prefetch_subfolders(model, ltx2_subfolders, local_files_only=local_files_only)
+
         # --- Tokenizer (lightweight, stays wherever) ---
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         # --- Text encoder: load on CPU, move to GPU only during encoding ---
         with torch.device("cpu"):
-            self.text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
-                model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+            self.text_encoder = from_pretrained_with_prefetch(
+                Gemma3ForConditionalGeneration.from_pretrained,
+                model,
+                subfolder="text_encoder",
+                prefetch_list=ltx2_subfolders,
+                local_files_only=local_files_only,
+                torch_dtype=dtype,
             )
 
         # --- Connectors: CPU (LTX-2.3 connectors include caption projection) ---
-        self.connectors = LTX2TextConnectors.from_pretrained(
-            model, subfolder="connectors", torch_dtype=dtype, local_files_only=local_files_only
+        self.connectors = from_pretrained_with_prefetch(
+            LTX2TextConnectors.from_pretrained,
+            model,
+            subfolder="connectors",
+            prefetch_list=ltx2_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         )
 
         # --- VAE, Audio VAE: CPU ---
-        self.vae = AutoencoderKLLTX2Video.from_pretrained(
-            model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKLLTX2Video.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=ltx2_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         )
-        self.audio_vae = AutoencoderKLLTX2Audio.from_pretrained(
-            model, subfolder="audio_vae", torch_dtype=dtype, local_files_only=local_files_only
+        self.audio_vae = from_pretrained_with_prefetch(
+            AutoencoderKLLTX2Audio.from_pretrained,
+            model,
+            subfolder="audio_vae",
+            prefetch_list=ltx2_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         )
 
         # --- Vocoder: prefer BWE vocoder (48kHz) for LTX-2.3 ---
