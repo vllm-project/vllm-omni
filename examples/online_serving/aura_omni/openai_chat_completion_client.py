@@ -12,6 +12,7 @@ import soundfile as sf
 from openai import OpenAI
 from vllm.assets.audio import AudioAsset
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     DEFAULT_QWEN3_TTS_REF_TEXT,
     default_qwen3_tts_ref_audio_path,

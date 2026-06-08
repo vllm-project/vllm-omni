@@ -1,4 +1,4 @@
-# AURA Omni Native Pipeline
+# AURA Omni Pipeline
 
 `aura_omni` wires ASR, AURA, and Qwen3-TTS into one vLLM-Omni pipeline:
 

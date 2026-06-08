@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL="aura_omni"
+MODEL="/data/models/AURA"
 SERVER_MODEL="/data/models/AURA"
 DEPLOY_CONFIG="/data/yrr/vllm-omni/vllm_omni/deploy/aura_omni.yaml"
 SERVER_PORT=8666
@@ -9,6 +9,7 @@ GRADIO_PORT=7862
 SERVER_HOST="0.0.0.0"
 GRADIO_IP="127.0.0.1"
 GRADIO_SHARE=false
+
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

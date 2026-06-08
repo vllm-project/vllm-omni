@@ -20,6 +20,7 @@ import janus
 import torch
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
+from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
@@ -50,6 +51,36 @@ from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _build_terminal_empty_output(
+    request_id: str,
+    *,
+    final_output_type: str | None,
+) -> RequestOutput:
+    """Build a terminal empty output when no downstream stage input exists."""
+    completion = CompletionOutput(
+        index=0,
+        text="",
+        token_ids=[],
+        cumulative_logprob=None,
+        logprobs=None,
+        finish_reason="stop",
+        stop_reason=None,
+    )
+    if final_output_type == "audio":
+        completion.multimodal_output = {
+            "audio": torch.zeros((0,), dtype=torch.float32),
+            "sr": 24000,
+        }
+    return RequestOutput(
+        request_id=request_id,
+        prompt=None,
+        prompt_token_ids=[],
+        prompt_logprobs=None,
+        outputs=[completion],
+        finished=True,
+    )
 
 
 def build_engine_core_request_from_tokens(
@@ -1278,6 +1309,48 @@ class Orchestrator:
                 next_logical,
             )
             raise
+
+        if not next_inputs:
+            if not getattr(output, "finished", False):
+                logger.debug(
+                    "[Orchestrator] req=%s stage-%s produced no inputs for stage-%s; waiting for more outputs",
+                    req_id,
+                    src_stage_id,
+                    next_logical,
+                )
+                return
+
+            final_stage_id = req_state.final_stage_id
+            final_pool = self.stage_pools[final_stage_id]
+            final_output_type = getattr(final_pool.stage_client, "final_output_type", None)
+            terminal_output = _build_terminal_empty_output(
+                req_id,
+                final_output_type=final_output_type,
+            )
+            submit_ts = _time.time()
+            req_state.stage_submit_ts[final_stage_id] = submit_ts
+            logger.info(
+                "[Orchestrator] req=%s stage-%s produced no terminal inputs for stage-%s; "
+                "returning empty %s output from final stage-%s",
+                req_id,
+                src_stage_id,
+                next_logical,
+                final_output_type or "text",
+                final_stage_id,
+            )
+            await self.output_async_queue.put(
+                OutputMessage(
+                    request_id=req_id,
+                    stage_id=final_stage_id,
+                    replica_id=0,
+                    engine_outputs=terminal_output,
+                    metrics=None,
+                    finished=True,
+                    stage_submit_ts=submit_ts,
+                )
+            )
+            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+            return
 
         # Build and submit requests for each input
         for next_input in next_inputs:

@@ -11,10 +11,10 @@ from typing import Any
 
 import soundfile as sf
 
+from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
-from vllm_omni.inputs.data import OmniTokensPrompt
 
 DEFAULT_AURA_SYSTEM_PROMPT = (
     "You are receiving a live video stream where the final frame is the present moment. "
@@ -36,7 +36,9 @@ QWEN_ASSISTANT_SUFFIX_IDS = [
     QWEN_NEWLINE_ID,
 ]
 DEFAULT_QWEN3_TTS_REF_AUDIO = "vllm-omni/tests/assets/qwen3_tts/clone_2.wav"
-DEFAULT_QWEN3_TTS_REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+DEFAULT_QWEN3_TTS_REF_TEXT = (
+    "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+)
 
 
 def default_qwen3_tts_ref_audio_path() -> str:

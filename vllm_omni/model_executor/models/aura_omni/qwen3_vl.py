@@ -19,8 +19,8 @@ from vllm.model_executor.models.qwen3_vl import (
     Qwen3VLDummyInputsBuilder,
     Qwen3VLForConditionalGeneration,
     Qwen3VLMultiModalProcessor,
-    Qwen3VLProcessor,
     Qwen3VLProcessingInfo,
+    Qwen3VLProcessor,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 

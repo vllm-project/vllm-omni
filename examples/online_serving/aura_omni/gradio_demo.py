@@ -18,6 +18,7 @@ except ImportError:
 import numpy as np
 import soundfile as sf
 from openai import OpenAI
+
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     DEFAULT_QWEN3_TTS_REF_TEXT,
     default_qwen3_tts_ref_audio_path,
@@ -40,19 +41,43 @@ def parse_args():
 def _audio_to_data_url(audio_file: Any | None) -> str | None:
     if audio_file is None:
         return None
-    if isinstance(audio_file, str):
-        with open(audio_file, "rb") as f:
+
+    def _path_to_data_url(path_str: str) -> str | None:
+        if not path_str:
+            return None
+        path = Path(path_str)
+        if not path.exists():
+            return None
+        with open(path, "rb") as f:
             return f"data:audio/wav;base64,{base64.b64encode(f.read()).decode('utf-8')}"
-    if isinstance(audio_file, tuple) and len(audio_file) == 2:
-        sample_rate, audio_np = audio_file
-        audio_np = np.asarray(audio_np)
-        if audio_np.ndim > 1:
-            audio_np = audio_np[:, 0]
-        if audio_np.dtype != np.int16:
-            audio_np = np.clip(audio_np.astype(np.float32), -1.0, 1.0)
-        buf = io.BytesIO()
-        sf.write(buf, audio_np, int(sample_rate), format="WAV")
-        return f"data:audio/wav;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+
+    if isinstance(audio_file, str):
+        return _path_to_data_url(audio_file)
+
+    # Gradio >=5 may return dict payloads with local temp path.
+    if isinstance(audio_file, dict):
+        path_val = audio_file.get("path") or audio_file.get("name")
+        if isinstance(path_val, str):
+            return _path_to_data_url(path_val)
+        return None
+
+    if isinstance(audio_file, tuple):
+        # Common shape: (sample_rate, np.ndarray)
+        if len(audio_file) == 2 and isinstance(audio_file[0], (int, float)):
+            sample_rate, audio_np = audio_file
+            audio_np = np.asarray(audio_np)
+            if audio_np.ndim > 1:
+                audio_np = audio_np[:, 0]
+            if audio_np.dtype != np.int16:
+                audio_np = np.clip(audio_np.astype(np.float32), -1.0, 1.0)
+            buf = io.BytesIO()
+            sf.write(buf, audio_np, int(sample_rate), format="WAV")
+            return f"data:audio/wav;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+        # Compatibility shape from some gradio builds: (filepath, (sr, np.ndarray))
+        if len(audio_file) >= 1 and isinstance(audio_file[0], str):
+            path_url = _path_to_data_url(audio_file[0])
+            if path_url is not None:
+                return path_url
     return None
 
 
