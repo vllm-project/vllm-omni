@@ -104,6 +104,7 @@ def test_text_to_audio_002(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
+@pytest.mark.advanced_model
 @pytest.mark.full_model
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
