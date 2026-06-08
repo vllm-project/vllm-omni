@@ -597,10 +597,16 @@ class CosyVoice3Model(
     ) -> int:
         """Vectorized nucleus + top-k sampling.
 
-        Bit-equivalent semantics to the reference iterative implementation
-        (token i is kept iff ``cumsum(sorted_probs)[i] - sorted_probs[i] < top_p``
-        AND ``i < top_k``), but without the Python loop's per-token ``.item()``
-        D2H syncs — those dominated the sampler CPU time in profiling.
+        Distribution-equivalent to the reference iterative implementation: the
+        keep-set is identical (token i is kept iff
+        ``cumsum(sorted_probs)[i] - sorted_probs[i] < top_p`` AND ``i < top_k``)
+        and the renormalized sampling distribution matches, but the exact token
+        drawn for a given seed is NOT guaranteed to match. The reference draws
+        via ``multinomial`` over the stacked kept subset while this draws over
+        the full sorted vector (zeroed outside the keep-set), so the generator
+        advances over different-sized inputs and may yield a different sample.
+        The win: no per-token ``.item()`` D2H syncs from the Python loop —
+        those dominated the sampler CPU time in profiling.
         """
         probs = weighted_scores.softmax(dim=0)
         sorted_prob, sorted_idx = probs.sort(descending=True, stable=True)
