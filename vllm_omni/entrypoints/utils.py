@@ -317,7 +317,7 @@ def _validate_stage_overrides(stage_overrides: Any) -> None:
     ``--stage-overrides`` is documented as a JSON object mapping each
     ``stage_id`` to a dict of per-stage overrides, e.g.
     ``{"0": {"gpu_memory_utilization": 0.8}}``. The engine only checks that the
-    value is valid JSON, so a syntactically-valid but mis-shaped payload (a list,
+    value is valid JSON, so a syntactically-valid but malformed payload (a list,
     a scalar, or a ``stage_id -> scalar`` mapping) would otherwise blow up deep in
     config loading with a bare ``AttributeError`` that names neither the flag nor
     the offending value. Stage ids must be integers: the downstream parser
