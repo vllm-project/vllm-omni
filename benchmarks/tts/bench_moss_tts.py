@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""E2E benchmark: MOSS-TTS offline inference throughput and RTF.
+"""E2E benchmark: MOSS-TTS offline inference single-stream latency and RTF.
 
 Loads MOSS-VoiceGenerator via Omni offline inference and measures end-to-end
-latency and Real-Time Factor (RTF) across a configurable number of requests.
+latency and Real-Time Factor (RTF = wall_clock / audio_duration, lower is
+better) across a configurable number of sequential requests.
 
 Requires the model to be cached locally (or network access to HuggingFace).
 
@@ -61,7 +62,7 @@ _PROMPTS = [
     ("人工智能正在改变我们的生活方式。", "沉稳男声"),
     ("Benchmarking neural text-to-speech synthesis.", "a neutral professional voice"),
     ("语音合成技术在近年来取得了显著进步。", "明亮活泼的女声"),
-    ("This benchmark measures end-to-end generation throughput.", "a deep calm male voice"),
+    ("This benchmark measures end-to-end generation latency.", "a deep calm male voice"),
     ("开始测试批量语音合成的性能指标。", "标准普通话女声"),
     ("Real-time factor measures how fast we generate audio.", "a warm friendly voice"),
     ("批量推理能够显著提升系统吞吐量。", "年轻男声"),
@@ -138,11 +139,12 @@ def _build_config(gpu_memory_utilization: float, codec_cuda_graph: bool = False)
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8")
     yaml.dump(cfg, tmp)
     tmp.flush()
+    tmp.close()
     return tmp.name
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="E2E benchmark: MOSS-TTS offline inference throughput and RTF")
+    parser = argparse.ArgumentParser(description="MOSS-TTS offline inference: single-stream latency and RTF")
     parser.add_argument("--num-requests", type=int, default=8, help="Number of timed requests")
     parser.add_argument("--warmup", type=int, default=2, help="Warm-up requests (untimed)")
     parser.add_argument("--max-tokens", type=int, default=256, help="Stage 0 max_tokens")
@@ -188,26 +190,32 @@ def main() -> None:
     config_path = _build_config(args.gpu_memory_utilization, codec_cuda_graph=args.codec_cuda_graph)
     codec_mode = "cuda-graph" if args.codec_cuda_graph else "eager"
     print(f"Loading Omni (model={_MODEL}, config={config_path}, codec={codec_mode}) …")
-    omni = Omni(model=_MODEL, stage_configs_path=config_path, stage_init_timeout=300)
-    device = torch.device("cuda")
-    print(f"Device: {torch.cuda.get_device_name(device)}\n")
+    try:
+        omni = Omni(model=_MODEL, stage_configs_path=config_path, stage_init_timeout=300)
+        device = torch.device("cuda")
+        print(f"Device: {torch.cuda.get_device_name(device)}\n")
 
-    print(f"Warming up ({args.warmup} requests) …")
-    for i in range(args.warmup):
-        _run_one(omni, requests[i], sampling)
+        print(f"Warming up ({args.warmup} requests) …")
+        for i in range(args.warmup):
+            _run_one(omni, requests[i], sampling)
 
-    print(f"Timing {args.num_requests} requests (max_tokens={args.max_tokens}) …\n")
-    results = []
-    for i in range(args.num_requests):
-        r = _run_one(omni, requests[args.warmup + i], sampling)
-        results.append(r)
-        audio_s = r["audio_samples"] / _SAMPLE_RATE
-        rtf = audio_s / r["total_s"] if r["total_s"] > 0 else 0.0
-        print(f"  req {i + 1:2d}: total={r['total_s'] * 1000:.0f}ms  audio={audio_s:.1f}s  RTF={rtf:.2f}")
+        print(f"Timing {args.num_requests} requests (max_tokens={args.max_tokens}) …\n")
+        results = []
+        for i in range(args.num_requests):
+            r = _run_one(omni, requests[args.warmup + i], sampling)
+            results.append(r)
+            audio_s = r["audio_samples"] / _SAMPLE_RATE
+            rtf = r["total_s"] / audio_s if audio_s > 0 else float("inf")
+            print(f"  req {i + 1:2d}: total={r['total_s'] * 1000:.0f}ms  audio={audio_s:.1f}s  RTF={rtf:.3f}")
+
+        omni.close()
+    finally:
+        Path(config_path).unlink(missing_ok=True)
 
     total_s_list = [r["total_s"] for r in results]
     audio_s_list = [r["audio_samples"] / _SAMPLE_RATE for r in results]
-    rtf_list = [a / t for a, t in zip(audio_s_list, total_s_list) if t > 0]
+    # RTF = wall_clock / audio_duration; lower is better (consistent with Fish Speech benchmarks)
+    rtf_list = [t / a for t, a in zip(total_s_list, audio_s_list) if a > 0]
 
     print("\n### MOSS-TTS — E2E Benchmark\n")
     print(
@@ -217,7 +225,9 @@ def main() -> None:
         f"n_requests: {args.num_requests}  "
         f"codec: {codec_mode}\n"
     )
-    print("| Metric | Mean | Median | P99 |")
+    n = len(total_s_list)
+    p99_note = "" if n >= 100 else f" (n={n}; P99 ≈ max for small runs)"
+    print(f"| Metric | Mean | Median | P99{p99_note} |")
     print("|--------|------|--------|-----|")
 
     def _row(label: str, values: list[float], fmt: str = ".1f") -> str:
@@ -230,9 +240,7 @@ def main() -> None:
 
     print(_row("Total latency (ms)", [v * 1000 for v in total_s_list]))
     print(_row("Audio duration (s)", audio_s_list))
-    print(_row("RTF (audio/wall-clock)", rtf_list, ".3f"))
-
-    omni.close()
+    print(_row("RTF (wall-clock/audio, lower is better)", rtf_list, ".3f"))
 
 
 if __name__ == "__main__":
