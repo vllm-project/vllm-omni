@@ -269,6 +269,10 @@ class OmniRequestState(RequestState):
         # tokens, so we always store a cumulative copy here.
         base_output.cumulative_token_ids = list(self.detokenizer.output_token_ids)
 
+        # Attach cumulative_text only at the final step for inter-stage use.
+        if finish_reason is not None and hasattr(self.detokenizer, "output_text"):
+            base_output.cumulative_text = self.detokenizer.output_text
+
         if not hasattr(base_output, "multimodal_output"):
             setattr(base_output, "multimodal_output", {})
         if self.mm_accumulated:
