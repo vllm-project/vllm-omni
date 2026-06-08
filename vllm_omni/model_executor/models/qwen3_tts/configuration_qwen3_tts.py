@@ -175,12 +175,9 @@ class Qwen3TTSTalkerCodePredictorConfig(PretrainedConfig):
 
     # Default tensor parallel plan for base model `Qwen3TTSTalkerCodePredictor`
     base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
+        "layers.*.self_attn.qkv_proj": "colwise",
         "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.gate_up_proj": "colwise",
         "layers.*.mlp.down_proj": "rowwise",
     }
     base_model_pp_plan = {

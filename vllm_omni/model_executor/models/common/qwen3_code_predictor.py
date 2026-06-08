@@ -34,11 +34,11 @@ logger = init_logger(__name__)
 # ===================================================================
 #
 # These use plain PyTorch ops (nn.Linear, manual RMSNorm in float32,
-# rotate_half RoPE) to produce outputs numerically identical to the
-# HuggingFace reference. vLLM's fused kernels (RMSNorm, QKVParallel,
-# get_rope) introduce small precision differences that compound across
-# the autoregressive steps of the code predictor, causing severe
-# audio quality degradation.
+# rotate_half RoPE) to stay as close as practical to the HuggingFace
+# reference math. They avoid the larger drift we saw from vLLM's fused
+# kernels (RMSNorm, QKVParallel, get_rope), but GPU bit-level
+# differences can still happen when packing changes kernel selection or
+# accumulation order across autoregressive steps.
 #
 # See: https://github.com/vllm-project/vllm-omni/issues/2274
 
@@ -134,11 +134,23 @@ class CodePredictorAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.max_seq = int(config.num_code_groups) + 1
 
-        # Separate q/k/v projections matching HF (no fused packing)
+        # Fused QKV projection.
+        #
+        # The HF reference uses three separate ``nn.Linear`` modules for
+        # q/k/v. Packing those weights row-wise into one ``nn.Linear`` keeps
+        # the same matmul at the algebra level, but GPU executions may still
+        # differ by a few ULPs once the output shape changes. The goal here is
+        # narrower: reduce eager host launch overhead while keeping the
+        # downstream q_norm / k_norm / SDPA math and HF checkpoint loading
+        # contract intact.
         bias = getattr(config, "attention_bias", False)
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=bias)
+        self._q_size = self.num_heads * self.head_dim
+        self._kv_size = self.num_kv_heads * self.head_dim
+        self.qkv_proj = nn.Linear(
+            self.hidden_size,
+            self._q_size + 2 * self._kv_size,
+            bias=bias,
+        )
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -156,6 +168,15 @@ class CodePredictorAttention(nn.Module):
                 diagonal=1,
             )
             self.register_buffer("_fusion_causal_mask", fusion_mask, persistent=False)
+
+    def _split_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_raw = qkv[..., : self._q_size]
+        kv_raw = qkv[..., self._q_size :]
+        # ``split`` would leave the non-leading k/v slices strided like the
+        # packed qkv buffer. Materialize them once here so SDPA sees the same
+        # dense k/v layout as the unfused projection path.
+        k_raw, v_raw = kv_raw.unflatten(-1, (2, self._kv_size)).movedim(-2, 0).contiguous().unbind(0)
+        return q_raw, k_raw, v_raw
 
     def _forward_npu_attention(
         self,
@@ -219,9 +240,14 @@ class CodePredictorAttention(nn.Module):
         hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
         hidden_shape_kv = (bsz, seq_len, self.num_kv_heads, self.head_dim)
 
-        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape_q)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape_kv)).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(hidden_shape_kv).transpose(1, 2)
+        # Single fused matmul. ``q`` is immediately consumed by RMSNorm; for
+        # ``k/v`` we re-densify the packed tail once so SDPA does not inherit
+        # the packed-buffer stride pattern from the fused projection.
+        qkv = self.qkv_proj(hidden_states)
+        q_raw, k_raw, v_raw = self._split_qkv(qkv)
+        q = self.q_norm(q_raw.view(hidden_shape_q)).transpose(1, 2)
+        k = self.k_norm(k_raw.view(hidden_shape_kv)).transpose(1, 2)
+        v = v_raw.view(hidden_shape_kv).transpose(1, 2)
 
         cos, sin = position_embeddings
         # cos/sin are [batch, seq_len, head_dim], need unsqueeze at dim=1 for heads
@@ -256,12 +282,22 @@ class CodePredictorMLP(nn.Module):
 
     def __init__(self, config, *, prefix: str = "") -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        # Fused gate_up projection. Same packing idea as ``qkv_proj`` above:
+        # one matmul instead of two, with the same algebraic result as
+        # separate gate/up linears, though GPU bit-level drift is still
+        # possible if kernel choices differ.
+        self._intermediate_size = int(config.intermediate_size)
+        self.gate_up_proj = nn.Linear(
+            config.hidden_size,
+            2 * config.intermediate_size,
+            bias=False,
+        )
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
+        gate_up = self.gate_up_proj(hidden_states)
+        gate, up = gate_up.split([self._intermediate_size, self._intermediate_size], dim=-1)
+        return self.down_proj(F.silu(gate) * up)
 
 
 # ===================================================================
@@ -365,11 +401,84 @@ class CodePredictorBaseModel(nn.Module):
             hidden_states = self.norm(hidden_states)
         return hidden_states.to(input_dtype)
 
+    # Mapping from HF checkpoint shard name to the (fused parameter,
+    # slice index) pair used to assemble the fused tensor.  See
+    # ``load_weights`` below.
+    _FUSED_QKV_SHARDS: tuple[tuple[str, str, int], ...] = (
+        ("q_proj", "qkv_proj", 0),
+        ("k_proj", "qkv_proj", 1),
+        ("v_proj", "qkv_proj", 2),
+    )
+    _FUSED_GATE_UP_SHARDS: tuple[tuple[str, str, int], ...] = (
+        ("gate_proj", "gate_up_proj", 0),
+        ("up_proj", "gate_up_proj", 1),
+    )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights, transparently re-packing HF q/k/v and gate/up shards
+        into the fused ``qkv_proj`` and ``gate_up_proj`` parameters.
+
+        HF checkpoints ship q_proj / k_proj / v_proj (and gate_proj /
+        up_proj) as separate tensors.  Our model defines a single
+        ``qkv_proj`` (``gate_up_proj``) whose weight is the row-wise
+        concatenation of those shards in q/k/v (gate/up) order.  We
+        buffer the shards per layer prefix and write the fused parameter
+        in one go once all shards have arrived.
+        """
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
+
+        # layer_prefix -> {fused_name: {slice_idx: shard_tensor}}
+        pending: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
+
+        def _try_finalize_fused(
+            layer_prefix: str,
+            fused_name: str,
+            num_shards: int,
+        ) -> None:
+            bucket = pending.get(layer_prefix, {}).get(fused_name)
+            if bucket is None or len(bucket) < num_shards:
+                return
+            target_param_name = f"{layer_prefix}.{fused_name}.weight"
+            target_param = params_dict.get(target_param_name)
+            if target_param is None:
+                return
+            ordered = [bucket[i] for i in range(num_shards)]
+            fused_weight = torch.cat(ordered, dim=0)
+            weight_loader = getattr(target_param, "weight_loader", default_weight_loader)
+            weight_loader(target_param, fused_weight)
+            loaded_params.add(target_param_name)
+            del pending[layer_prefix][fused_name]
+            if not pending[layer_prefix]:
+                del pending[layer_prefix]
+
+        def _route_shard(
+            name: str,
+            loaded_weight: torch.Tensor,
+            shard_table: tuple[tuple[str, str, int], ...],
+            parent_attr: str,
+        ) -> bool:
+            """Stash a HF shard if its fused counterpart exists in this
+            module; return True iff the shard was consumed."""
+            for shard_name, fused_name, slice_idx in shard_table:
+                suffix = f".{parent_attr}.{shard_name}.weight"
+                if not name.endswith(suffix):
+                    continue
+                layer_prefix = name[: -len(f".{shard_name}.weight")]  # ...self_attn or ...mlp
+                fused_param_name = f"{layer_prefix}.{fused_name}.weight"
+                if fused_param_name not in params_dict:
+                    return False
+                pending.setdefault(layer_prefix, {}).setdefault(fused_name, {})[slice_idx] = loaded_weight
+                _try_finalize_fused(layer_prefix, fused_name, num_shards=len(shard_table))
+                return True
+            return False
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            if _route_shard(name, loaded_weight, self._FUSED_QKV_SHARDS, parent_attr="self_attn"):
+                continue
+            if _route_shard(name, loaded_weight, self._FUSED_GATE_UP_SHARDS, parent_attr="mlp"):
                 continue
             param = params_dict.get(name)
             if param is None:
@@ -377,6 +486,13 @@ class CodePredictorBaseModel(nn.Module):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        if pending:
+            unfinished = {lp: list(buckets.keys()) for lp, buckets in pending.items()}
+            raise RuntimeError(
+                f"CodePredictor load_weights: incomplete fused shards for layers {unfinished}; "
+                f"check that the checkpoint contains all q/k/v and gate/up tensors."
+            )
         return loaded_params
 
 
@@ -903,7 +1019,7 @@ class CodePredictorWrapper(nn.Module):
     # ------------------------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights directly (no fused projection remapping needed)."""
+        """Load wrapper weights, delegating ``model.*`` tensors to the inner fused loader."""
         loaded: set[str] = set()
         model_weights: list[tuple[str, torch.Tensor]] = []
         other_weights: list[tuple[str, torch.Tensor]] = []
