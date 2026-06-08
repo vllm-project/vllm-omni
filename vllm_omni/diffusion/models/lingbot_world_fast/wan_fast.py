@@ -7,12 +7,15 @@ import torch.nn as nn
 import torch.nn.functional as torch_F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
+from diffusers.models.normalization import FP32LayerNorm
 from einops import rearrange
+from vllm.model_executor.layers.layernorm import RMSNorm
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.platforms import current_omni_platform
 
 from .state_lingbot_world_fast import CacheIndex
-from .wan_model import WanLayerNorm, WanRMSNorm, WanSelfAttention, rope_params, sinusoidal_embedding_1d
+from .wan_model import rope_params, sinusoidal_embedding_1d
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
@@ -64,8 +67,8 @@ class CausalWanSelfAttention(nn.Module):
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
-        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
         self.attn = Attention(
             num_heads=self.num_heads,
@@ -156,9 +159,24 @@ class CausalWanSelfAttention(nn.Module):
         return x
 
 
-class WanCrossAttention(WanSelfAttention):
+class WanCrossAttention(nn.Module):
     def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
-        super().__init__(dim, num_heads, window_size, qk_norm, eps)
+        assert dim % num_heads == 0
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.window_size = window_size
+        self.qk_norm = qk_norm
+        self.eps = eps
+
+        # layers
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.o = nn.Linear(dim, dim)
+        self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
         self.attn = Attention(
             num_heads=self.num_heads,
@@ -217,13 +235,13 @@ class CausalWanAttentionBlock(nn.Module):
         self.eps = eps
 
         # layers
-        self.norm1 = WanLayerNorm(dim, eps)
+        self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
         self.self_attn = CausalWanSelfAttention(
             dim=dim, num_heads=num_heads, local_attn_size=local_attn_size, sink_size=sink_size, qk_norm=qk_norm, eps=eps
         )
-        self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+        self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
         self.cross_attn = WanCrossAttention(dim, num_heads, (-1, -1), qk_norm, eps)
-        self.norm2 = WanLayerNorm(dim, eps)
+        self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=False)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
 
         # modulation
@@ -259,7 +277,7 @@ class CausalWanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast("cuda", dtype=torch.float32):
+        with torch.amp.autocast(current_omni_platform.device_type, dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
         assert e[0].dtype == torch.float32
         # self-attention
@@ -274,7 +292,7 @@ class CausalWanAttentionBlock(nn.Module):
             current_start,
             max_attention_size,
         )
-        with torch.amp.autocast("cuda", dtype=torch.float32):
+        with torch.amp.autocast(current_omni_platform.device_type, dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
         # cam injection (only if dit_cond_dict is provided and contains c2ws_plucker_emb)
@@ -290,7 +308,7 @@ class CausalWanAttentionBlock(nn.Module):
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
             x = x + self.cross_attn(self.norm3(x), context, context_lens, crossattn_cache=crossattn_cache)
             y = self.ffn(self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
-            with torch.amp.autocast("cuda", dtype=torch.float32):
+            with torch.amp.autocast(current_omni_platform.device_type, dtype=torch.float32):
                 x = x + y * e[5].squeeze(2)
             return x
 
@@ -308,7 +326,7 @@ class CausalHead(nn.Module):
 
         # layers
         out_dim = math.prod(patch_size) * out_dim
-        self.norm = WanLayerNorm(dim, eps)
+        self.norm = FP32LayerNorm(dim, eps, elementwise_affine=False)
         self.head = nn.Linear(dim, out_dim)
 
         # modulation
@@ -321,7 +339,7 @@ class CausalHead(nn.Module):
             e(Tensor): Shape [B, L1, C]
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast("cuda", dtype=torch.float32):
+        with torch.amp.autocast(current_omni_platform.device_type, dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
             x = self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2))
         return x
@@ -535,7 +553,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # time embeddings
         if t.dim() == 1:
             t = t.expand(t.size(0), seq_lens)
-        with torch.amp.autocast("cuda", dtype=torch.float32):
+        with torch.amp.autocast(current_omni_platform.device_type, dtype=torch.float32):
             bt = t.size(0)
             t = t.flatten()
             e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).unflatten(0, (bt, seq_lens)).float())
