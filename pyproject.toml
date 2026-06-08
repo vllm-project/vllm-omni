@@ -90,6 +90,11 @@ minicpmo = [
     "stepaudio2-minicpmo",
 ]
 
+# Official-style OmniWeaving I2V: multimodal Qwen uses `qwen_vl_utils.process_vision_info`.
+omniweaving = [
+    "qwen-vl-utils>=0.0.8",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",

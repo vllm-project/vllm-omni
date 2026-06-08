@@ -300,7 +300,7 @@ class OmniRequestOutput:
     @property
     def is_diffusion_output(self) -> bool:
         """Check if this is a diffusion model output."""
-        return len(self.images) > 0 or self.final_output_type == "image"
+        return len(self.images) > 0 or self.final_output_type in {"image", "images", "video", "videos"}
 
     @property
     def is_pipeline_output(self) -> bool:

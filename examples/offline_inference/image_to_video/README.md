@@ -48,6 +48,24 @@ python image_to_video.py \
   --output i2v_output.mp4
 ```
 
+### OmniWeaving I2V (Offline)
+
+Use the offline wrapper script in this directory to run OmniWeaving with a
+single reference image:
+
+```bash
+bash run_i2v_omniweaving.sh
+```
+
+The script defaults to a 480p OmniWeaving setup and uses this prompt:
+
+```text
+The cartoon character in the picture suddenly bursts into laughter, clutching their stomach with exaggerated movements.
+```
+
+You can override the defaults with environment variables such as `IMAGE_PATH`,
+`MODEL`, `TENSOR_PARALLEL_SIZE`, and `OUTPUT`.
+
 Key arguments:
 
 - `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V).
