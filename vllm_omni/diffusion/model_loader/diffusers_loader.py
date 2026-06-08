@@ -433,8 +433,13 @@ class DiffusersPipelineLoader:
         # that have loaded weights tracking currently.
         if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
-            # NOTE: if the model is quantized, ignore not_loaded check for scale weights
-            weights_scale_not_loaded = {name for name in weights_not_loaded if name.endswith("weight_scale")}
+            # NOTE: if the model is quantized, ignore not_loaded check for scale
+            # weights. ModelOpt FP8 carries a per-tensor `weight_scale` and a
+            # static activation `input_scale`, which the quant method may
+            # fold/track differently than plain parameters.
+            weights_scale_not_loaded = {
+                name for name in weights_not_loaded if name.endswith(("weight_scale", "input_scale"))
+            }
             weights_not_loaded = weights_not_loaded - weights_scale_not_loaded
             if weights_not_loaded:
                 self._check_unloaded_weights(weights_not_loaded)
