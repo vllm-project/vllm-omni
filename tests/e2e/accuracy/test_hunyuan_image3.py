@@ -61,13 +61,17 @@ def _empty_accelerator_cache() -> None:
 
 AR_DEVICES, DIT_DEVICES = _default_ar_dit_devices()
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
+NPU_MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct-Distil"
 NUM_INFERENCE_STEPS = 50
 GUIDANCE_SCALE = 2.5
+NPU_NUM_INFERENCE_STEPS = 8
+NPU_GUIDANCE_SCALE = 1.0
 
 # ============================================================================
 # Constants
 # ============================================================================
 MODEL_PATH = os.environ.get("HUNYUAN_MODEL_PATH", MODEL_NAME)
+NPU_MODEL_PATH = os.environ.get("HUNYUAN_NPU_MODEL_PATH", NPU_MODEL_NAME)
 # Test input
 PROMPT = "基于图一的logo，参考图二中冰箱贴的材质，制作一个新的冰箱贴"
 TEST_IMAGE_URLS = [
@@ -87,6 +91,13 @@ THRESHOLDS = {
     "clip_score": 90,  # CLIP image semantic similarity
     "ssim": 0.26,  # Structural similarity
     "psnr": 12.5,  # Peak signal-to-noise ratio (dB)
+}
+NPU_THRESHOLDS = {
+    "text_prefix_match": 10,
+    "cot_semantic_sim": 0.9,
+    "clip_score": 85,
+    "ssim": 0.20,
+    "psnr": 11.0,
 }
 
 QUANT_PROMPT = "A brown and white dog is running on the grass."
@@ -162,6 +173,73 @@ _DEPLOY_CONFIG = {
         },
     ],
     "edges": [{"from": 0, "to": 1}],
+}
+# fmt: on
+
+# fmt: off
+_NPU_DEPLOY_CONFIG = {
+    "pipeline": "hunyuan_image_3_moe",
+    "async_chunk": False,
+    "trust_remote_code": True,
+    "connectors": {
+        "shared_memory_connector": {
+            "name": "SharedMemoryConnector",
+            "extra": {"shm_threshold_bytes": 65536},
+        },
+    },
+    "stages": [
+        {
+            "stage_id": 0,
+            "is_comprehension": True,
+            "final_output": True,
+            "final_output_type": "text",
+            "max_num_seqs": 1,
+            "gpu_memory_utilization": 0.8,
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "enable_prefix_caching": False,
+            "max_num_batched_tokens": 8192,
+            "devices": "0,1,2,3",
+            "tensor_parallel_size": 4,
+            "hf_overrides": {
+                "rope_parameters": {"mrope_section": [0, 32, 32], "rope_type": "default"},
+            },
+            "omni_kv_config": {"need_send_cache": True},
+            "output_connectors": {"to_stage_1": "shared_memory_connector"},
+            "default_sampling_params": {
+                "temperature": 0.0,
+                "top_p": 1,
+                "top_k": -1,
+                "max_tokens": 8192,
+                "stop_token_ids": [128025],
+                "detokenize": True,
+                "skip_special_tokens": False,
+            },
+        },
+        {
+            "stage_id": 1,
+            "max_num_seqs": 1,
+            "gpu_memory_utilization": 0.65,
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "devices": "4,5,6,7",
+            "distributed_executor_backend": "mp",
+            "max_num_batched_tokens": 8192,
+            "omni_kv_config": {"need_recv_cache": True},
+            "parallel_config": {
+                "tensor_parallel_size": 4,
+                "enable_expert_parallel": False,
+                "sequence_parallel_size": 1,
+                "ulysses_degree": 1,
+            },
+            "input_connectors": {"from_stage_0": "shared_memory_connector"},
+            "default_sampling_params": {
+                "num_inference_steps": NPU_NUM_INFERENCE_STEPS,
+                "guidance_scale": NPU_GUIDANCE_SCALE,
+            },
+        },
+    ],
+    "edges": [{"from": 0, "to": 1, "window_size": -1, "max_inflight": 1}],
 }
 # fmt: on
 
@@ -263,6 +341,10 @@ def _make_config(enable_kv_reuse: bool, path: Path) -> None:
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
+def _make_npu_config(path: Path) -> None:
+    path.write_text(yaml.dump(_NPU_DEPLOY_CONFIG, default_flow_style=False, sort_keys=False))
+
+
 def _quant_devices() -> str:
     return os.environ.get("HUNYUAN_IMAGE3_QUANT_DEVICES", "0,1")
 
@@ -303,7 +385,32 @@ def _make_npu_dit_config(path: Path) -> None:
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
-def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+def _apply_offline_it2i_size_overrides(
+    params_list: list[object],
+    prompt: dict,
+    *,
+    height: int,
+    width: int,
+) -> None:
+    prompt["height"] = height
+    prompt["width"] = width
+    prompt["mm_processor_kwargs"] = {"target_h": height, "target_w": width}
+
+    for sp in params_list:
+        if hasattr(sp, "height") and hasattr(sp, "width"):
+            sp.height = height
+            sp.width = width
+
+
+def _run_offline(
+    deploy_config_path: str,
+    output_path: Path,
+    *,
+    num_inference_steps: int = NUM_INFERENCE_STEPS,
+    guidance_scale: float = GUIDANCE_SCALE,
+    model_path: str = MODEL_PATH,
+    output_size: tuple[int, int] | None = None,
+) -> tuple[Image.Image, str, float]:
     from transformers import AutoTokenizer
 
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -311,7 +418,7 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
 
     build_kwargs: dict = {"task": "it2i", "bot_task": "think_recaption", "sys_type": "en_unified", "num_images": 2}
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     result = build_prompt_tokens(
         PROMPT,
         tokenizer,
@@ -321,12 +428,12 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     system_prompt_type = result.system_prompt_type
 
     ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
-    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path) as runner:
+    with OmniRunner(model_path, deploy_config=deploy_config_path) as runner:
         params_list = list(runner.omni.default_sampling_params_list)
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
-                sp.num_inference_steps = NUM_INFERENCE_STEPS
-                sp.guidance_scale = GUIDANCE_SCALE
+                sp.num_inference_steps = num_inference_steps
+                sp.guidance_scale = guidance_scale
                 sp.seed = SEED
                 sp.generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
             elif hasattr(sp, "stop_token_ids"):
@@ -342,6 +449,9 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
                 "multi_modal_data": {"image": images},
             }
         ]
+        if output_size is not None:
+            height, width = output_size
+            _apply_offline_it2i_size_overrides(params_list, prompts[0], height=height, width=width)
         t0 = time.perf_counter()
         outputs = list(runner.omni.generate(prompts=prompts, sampling_params_list=params_list))
         elapsed = time.perf_counter() - t0
@@ -373,12 +483,18 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     image.save(output_path / "image_offline.png")
     (output_path / "cot_offline.txt").write_text(cot_text, encoding="utf-8")
     gc.collect()
-    if torch.accelerator.is_available():
-        torch.accelerator.empty_cache()
+    _empty_accelerator_cache()
     return image, cot_text, elapsed
 
 
-def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+def _run_online(
+    stage_configs_path: str,
+    output_path: Path,
+    *,
+    num_inference_steps: int = NUM_INFERENCE_STEPS,
+    guidance_scale: float = GUIDANCE_SCALE,
+    model_path: str = MODEL_PATH,
+) -> tuple[Image.Image, str, float]:
     from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 
     server_args = [
@@ -390,7 +506,7 @@ def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image
         "900",
     ]
     try:
-        with OmniServer(MODEL_PATH, server_args, use_omni=True) as omni_server:
+        with OmniServer(model_path, server_args, use_omni=True) as omni_server:
             images = download_images(TEST_IMAGE_URLS)
             t0 = time.perf_counter()
             response = requests.post(
@@ -400,8 +516,8 @@ def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image
                     "prompt": PROMPT,
                     "n": 1,
                     "response_format": "b64_json",
-                    "num_inference_steps": NUM_INFERENCE_STEPS,
-                    "guidance_scale": GUIDANCE_SCALE,
+                    "num_inference_steps": num_inference_steps,
+                    "guidance_scale": guidance_scale,
                     "seed": SEED,
                     "sys_type": "en_unified",
                     "bot_task": "think_recaption",
@@ -426,8 +542,7 @@ def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image
             return image, cot_text, elapsed
     finally:
         gc.collect()
-        if torch.accelerator.is_available():
-            torch.accelerator.empty_cache()
+        _empty_accelerator_cache()
 
 
 @pytest.mark.skipif(
@@ -479,6 +594,105 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path, accuracy_
     )
 
 
+@pytest.mark.parametrize(
+    "case_name,runner",
+    [
+        pytest.param("offline", _run_offline, id="npu_offline"),
+        pytest.param("online", _run_online, id="npu_online"),
+    ],
+)
+@pytest.mark.npu
+@pytest.mark.distributed_npu(num_cards=8)
+@pytest.mark.skipif(torch.accelerator.device_count() < 8, reason="Needs 8+ NPUs (4 AR + 4 DiT)")
+def test_image_to_image_alignment_npu(
+    case_name: str,
+    runner,
+    accuracy_artifact_root: Path,
+    accuracy_assets_root: Path,
+) -> None:
+    if importlib.util.find_spec("FlagEmbedding") is None:
+        raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
+    from tabulate import tabulate
+
+    output_dir = model_output_dir(accuracy_artifact_root, NPU_MODEL_NAME + f"-npu-{case_name}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "npu.yaml"
+        _make_npu_config(config_path)
+        runner_kwargs = {
+            "num_inference_steps": NPU_NUM_INFERENCE_STEPS,
+            "guidance_scale": NPU_GUIDANCE_SCALE,
+            "model_path": NPU_MODEL_PATH,
+        }
+        if case_name == "offline":
+            runner_kwargs["output_size"] = (720, 1280)
+        npu_image, npu_cot, _ = runner(str(config_path), output_dir, **runner_kwargs)
+
+    npu_cot = npu_cot.lstrip("\n")
+    scorer = SemanticSimilarityScorer()
+    clip_scorer = CLIPScorer()
+    cot_results = scorer.text_similarity(npu_cot, COT_REF)
+    image_ref = Image.open(str(accuracy_assets_root / "hunyuan_image_ref.png")).convert("RGB")
+    image_clip_score = clip_scorer.image_image_score(npu_image, image_ref)
+    ssim_value, psnr_value = compute_image_ssim_psnr(prediction=npu_image, reference=image_ref, compare_mode="RGB")
+
+    table = [
+        ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", NPU_THRESHOLDS["cot_semantic_sim"]],
+        ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", NPU_THRESHOLDS["text_prefix_match"]],
+        ["Image-Image similarity", f"{image_clip_score:.4f}", NPU_THRESHOLDS["clip_score"]],
+        ["SSIM", f"{ssim_value:.4f}", NPU_THRESHOLDS["ssim"]],
+        ["PSNR (dB)", f"{psnr_value:.2f}", NPU_THRESHOLDS["psnr"]],
+    ]
+    print(f"[NPU][{case_name}] " + tabulate(table, headers=["Metric", "Value", "Threshold"], tablefmt="grid"))
+
+    assert cot_results["cot_semantic_sim"] >= NPU_THRESHOLDS["cot_semantic_sim"], (
+        f"[NPU][{case_name}] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} "
+        f"below threshold {NPU_THRESHOLDS['cot_semantic_sim']}"
+    )
+    assert cot_results["text_prefix_match_count"] >= NPU_THRESHOLDS["text_prefix_match"], (
+        f"[NPU][{case_name}] COT prefix match {cot_results['text_prefix_match_count']} "
+        f"below threshold {NPU_THRESHOLDS['text_prefix_match']}"
+    )
+    assert image_clip_score >= NPU_THRESHOLDS["clip_score"], (
+        f"[NPU][{case_name}] Image-Image similarity {image_clip_score:.4f} "
+        f"below threshold {NPU_THRESHOLDS['clip_score']}"
+    )
+    assert ssim_value >= NPU_THRESHOLDS["ssim"], (
+        f"[NPU][{case_name}] SSIM {ssim_value:.4f} below threshold {NPU_THRESHOLDS['ssim']}"
+    )
+    assert psnr_value >= NPU_THRESHOLDS["psnr"], (
+        f"[NPU][{case_name}] PSNR {psnr_value:.2f} dB below threshold {NPU_THRESHOLDS['psnr']} dB"
+    )
+
+
+def test_offline_it2i_size_overrides_align_with_online() -> None:
+    from types import SimpleNamespace
+
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    ar_params = SimpleNamespace(extra_args={}, stop_token_ids=[])
+    dit_params = OmniDiffusionSamplingParams()
+    prompt = {"prompt": PROMPT}
+
+    _apply_offline_it2i_size_overrides([ar_params, dit_params], prompt, height=720, width=1280)
+
+    assert prompt["height"] == 720
+    assert prompt["width"] == 1280
+    assert prompt["mm_processor_kwargs"] == {"target_h": 720, "target_w": 1280}
+    assert ar_params.extra_args == {}
+    assert dit_params.height == 720
+    assert dit_params.width == 1280
+
+
+def test_npu_it2i_config_uses_distil_params(tmp_path: Path) -> None:
+    config_path = tmp_path / "npu.yaml"
+    _make_npu_config(config_path)
+    config = yaml.safe_load(config_path.read_text())
+
+    assert config["stages"][1]["default_sampling_params"]["num_inference_steps"] == NPU_NUM_INFERENCE_STEPS
+    assert config["stages"][1]["default_sampling_params"]["guidance_scale"] == NPU_GUIDANCE_SCALE
+
+
 def _extract_image(outputs) -> Image.Image:
     assert outputs, "Pipeline produced no outputs"
     for output in outputs:
@@ -511,7 +725,9 @@ def _run_dit_model(
         os.environ["VLLM_NVFP4_GEMM_BACKEND"] = nvfp4_backend
 
     try:
-        with OmniRunner(model, deploy_config=deploy_config_path, mode="text-to-image") as runner:
+        print(f"[NPU DiT] launching OmniRunner for model={model}", flush=True)
+        with OmniRunner(model, deploy_config=deploy_config_path, mode="text-to-image", log_stats=True) as runner:
+            print("[NPU DiT] OmniRunner ready, starting generation", flush=True)
             generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
             params = OmniDiffusionSamplingParams(
                 height=QUANT_HEIGHT,
