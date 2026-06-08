@@ -69,6 +69,39 @@ def get_omniweaving_post_process_func(od_config: OmniDiffusionConfig):
     return get_hunyuan_video_15_post_process_func(od_config)
 
 
+def _resolve_single_conditioning_image(raw_image: Any) -> Any | None:
+    if isinstance(raw_image, (list, tuple)):
+        if len(raw_image) == 0:
+            return None
+        if len(raw_image) > 1:
+            raise ValueError(
+                "OmniWeaving currently supports at most one conditioning image in vLLM-Omni. "
+                "Multi-image OmniWeaving requests are not implemented yet."
+            )
+        return raw_image[0]
+    return raw_image
+
+
+def _offline_env_enabled() -> bool:
+    truthy = {"1", "ON", "TRUE", "YES"}
+    return any(
+        os.environ.get(name, "").strip().upper() in truthy
+        for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "DIFFUSERS_OFFLINE")
+    )
+
+
+def _resolve_cached_hub_snapshot_if_offline(model_path: str) -> str:
+    if os.path.exists(model_path) or not _offline_env_enabled():
+        return model_path
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(model_path, local_files_only=True)
+    except Exception as e:
+        logger.debug("Could not resolve cached Hub snapshot for %s in offline mode: %s", model_path, e)
+        return model_path
+
+
 def get_omniweaving_pre_process_func(od_config: OmniDiffusionConfig):
     # Official aligned I2V 480p: 480×848 (26:15). Use the same area target when inferring WxH from the image.
     max_area = 480 * 848
@@ -85,8 +118,9 @@ def get_omniweaving_pre_process_func(od_config: OmniDiffusionConfig):
         raw_image = multi_modal_data.get("image", None)
         if raw_image is None:
             return req
-        if isinstance(raw_image, list):
-            raw_image = raw_image[0]
+        raw_image = _resolve_single_conditioning_image(raw_image)
+        if raw_image is None:
+            return req
 
         if isinstance(raw_image, str):
             image = PIL.Image.open(raw_image).convert("RGB")
@@ -143,9 +177,15 @@ class OmniWeavingPipeline(
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
         local_files_only = os.path.exists(model)
-        self.qwen_path = self._resolve_external_model_path(od_config, "qwen_path", self.DEFAULT_QWEN_PATH)
-        self.siglip_path = self._resolve_external_model_path(od_config, "siglip_path", self.DEFAULT_SIGLIP_PATH)
-        self.t2v_path = self._resolve_external_model_path(od_config, "t2v_path", self.DEFAULT_T2V_PATH)
+        self.qwen_path = _resolve_cached_hub_snapshot_if_offline(
+            self._resolve_external_model_path(od_config, "qwen_path", self.DEFAULT_QWEN_PATH)
+        )
+        self.siglip_path = _resolve_cached_hub_snapshot_if_offline(
+            self._resolve_external_model_path(od_config, "siglip_path", self.DEFAULT_SIGLIP_PATH)
+        )
+        self.t2v_path = _resolve_cached_hub_snapshot_if_offline(
+            self._resolve_external_model_path(od_config, "t2v_path", self.DEFAULT_T2V_PATH)
+        )
         # Only force offline HF when the *Qwen* path itself is a local directory/file; do not use the
         # OmniWeaving checkpoint's local_files_only (that would break Hub IDs when the main model is local).
         qwen_local_files_only: bool = os.path.isdir(self.qwen_path)
@@ -758,7 +798,7 @@ class OmniWeavingPipeline(
                     device=device,
                     dtype=dtype,
                 )
-                glyph_text_embeds_mask = torch.ones((1, self.tokenizer_2_max_length), device=device, dtype=torch.int64)
+                glyph_text_embeds_mask = torch.zeros((1, self.tokenizer_2_max_length), device=device, dtype=torch.int64)
             else:
                 txt_tokens = self.tokenizer_2(
                     glyph_text,
@@ -936,8 +976,7 @@ class OmniWeavingPipeline(
         multi_modal_data = prompt_data.get("multi_modal_data", {}) if not isinstance(prompt_data, str) else {}
 
         raw_image = multi_modal_data.get("image", None)
-        if isinstance(raw_image, list):
-            raw_image = raw_image[0]
+        raw_image = _resolve_single_conditioning_image(raw_image)
 
         image = None
         if raw_image is not None:

@@ -375,6 +375,18 @@ class HunyuanVideo15SingleAttention(nn.Module):
             total_num_heads=heads,
             bias=bias,
         )
+        self.to_out = nn.ModuleList(
+            [
+                RowParallelLinear(
+                    self.inner_dim,
+                    query_dim,
+                    bias=bias,
+                    input_is_parallel=True,
+                    return_bias=False,
+                ),
+                nn.Identity(),
+            ]
+        )
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
             num_heads=self.to_qkv.num_heads,
@@ -422,7 +434,8 @@ class HunyuanVideo15SingleAttention(nn.Module):
 
         hidden_states = self.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
-        return hidden_states.to(query.dtype)
+        hidden_states = hidden_states.to(query.dtype)
+        return self.to_out[0](hidden_states)
 
 
 class HunyuanVideo15SingleTransformerBlock(nn.Module):
@@ -1082,7 +1095,9 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
             else:
                 # Handle .to_out.0. -> .to_out. remapping
                 if lookup_name not in params_dict and ".to_out.0." in lookup_name:
-                    lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
+                    legacy_lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
+                    if legacy_lookup_name in params_dict:
+                        lookup_name = legacy_lookup_name
                 if lookup_name not in params_dict:
                     continue
                 param = params_dict[lookup_name]

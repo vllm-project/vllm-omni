@@ -130,6 +130,11 @@ def build_prompt_payload(
     if negative_prompt:
         payload["negative_prompt"] = negative_prompt
     resolved_image_paths = image_paths or ([image_path] if image_path else [])
+    if len(resolved_image_paths) > 1:
+        raise ValueError(
+            "vLLM-Omni OmniWeaving currently supports at most one conditioning image. "
+            "Multi-image OmniWeaving requests are not implemented yet."
+        )
     if resolved_image_paths:
         images = [Image.open(path).convert("RGB") for path in resolved_image_paths]
         payload["multi_modal_data"] = {"image": images[0] if len(images) == 1 else images}

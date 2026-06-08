@@ -538,7 +538,7 @@ class OmniBase(PDDisaggregationMixin):
         self.prom_metrics.set_running(running)
         self.prom_metrics.set_waiting(max(0, total - running))
 
-        images = getattr(engine_outputs, "images", []) if output_type == "image" else []
+        images = getattr(engine_outputs, "images", []) if output_type in {"image", "images", "video", "videos"} else []
         response_metrics: dict[str, Any] = {}
         stage_metrics: dict[str, dict[str, Any]] = {}
         rid_key = str(req_id)

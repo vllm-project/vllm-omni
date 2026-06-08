@@ -22,7 +22,7 @@ except ModuleNotFoundError:
 
 
 # T2V 480p: landscape grid (common diffusers 832-wide convention).
-# I2V 480p (official / bench): `aspect_ratio=26:15` → 480×848 (see OMNIWEAVING_I2V_MI2V_PERF.md).
+# I2V 480p follows the official 26:15 portrait preset, 480x848.
 RESOLUTION_PRESETS = {
     "480p": {"height": 480, "width": 832},
     "720p": {"height": 720, "width": 1280},
@@ -31,9 +31,8 @@ RESOLUTION_PRESETS_I2V_480P = {"height": 480, "width": 848}
 
 FLOW_SHIFT_PRESETS = {
     "t2v": {"480p": 5.0, "720p": 9.0},
-    # Official OmniWeaving I2V 480p aligned case uses flow_shift=7.0 (same table as perf doc).
+    # Official OmniWeaving I2V presets use flow_shift=7.0.
     "i2v": {"480p": 7.0, "720p": 7.0},
-    "mi2v": {"480p": 7.0, "720p": 7.0},
 }
 
 # Required by DiffusionWorker.re_init_pipeline whenever custom_pipeline_args is non-empty.
@@ -83,7 +82,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         nargs="+",
         default=None,
-        help="Optional multiple image paths for multi-image conditioning.",
+        help=(
+            "Optional image path list. vLLM-Omni currently accepts one conditioning image for OmniWeaving; "
+            "passing more than one path raises an error."
+        ),
     )
     parser.add_argument("--output", type=str, default="omniweaving_output.mp4", help="Output MP4 path.")
     parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1, help="Tensor parallel size.")
@@ -94,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         choices=sorted(RESOLUTION_PRESETS),
         default="480p",
-        help="Resolution preset. For I2V/MI2V with 480p and no explicit --height/--width, uses official-aligned "
+        help="Resolution preset. For I2V with 480p and no explicit --height/--width, uses official-aligned "
         "480×848 (26:15). T2V 480p remains 480×832. --height/--width override.",
     )
     parser.add_argument("--height", type=int, default=None, help="Video height.")
@@ -171,7 +173,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _infer_mode(args: argparse.Namespace) -> str:
     if args.image_paths:
-        return "mi2v" if len(args.image_paths) > 1 else "i2v"
+        if len(args.image_paths) > 1:
+            raise ValueError(
+                "vLLM-Omni OmniWeaving currently supports at most one conditioning image. "
+                "Multi-image OmniWeaving requests are not implemented yet."
+            )
+        return "i2v"
     if args.image_path:
         return "i2v"
     return "t2v"
@@ -187,14 +194,14 @@ def _infer_resolution(height: int, width: int, fallback: str) -> str:
 
 
 def main(args: argparse.Namespace) -> None:
+    mode = _infer_mode(args)
     ensure_cuda_available()
     from vllm_omni.entrypoints.omni import Omni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    mode = _infer_mode(args)
     resolution_preset = dict(RESOLUTION_PRESETS[args.resolution])
-    # Match official 480p I2V / MI2V output size (26:15) when user does not override dimensions.
-    if args.resolution == "480p" and mode in ("i2v", "mi2v") and not args.height and not args.width:
+    # Match official 480p I2V output size (26:15) when user does not override dimensions.
+    if args.resolution == "480p" and mode == "i2v" and not args.height and not args.width:
         resolution_preset.update(RESOLUTION_PRESETS_I2V_480P)
     args.height = args.height or resolution_preset["height"]
     args.width = args.width or resolution_preset["width"]
