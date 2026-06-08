@@ -497,24 +497,26 @@ def main():
         omni.start_profile()
 
     # Generate edited image
+    sampling_params = OmniDiffusionSamplingParams(
+        width=args.width,
+        height=args.height,
+        generator=generator,
+        true_cfg_scale=args.cfg_scale,
+        guidance_scale=args.guidance_scale,
+        guidance_scale_2=args.guidance_scale_2,
+        num_inference_steps=args.num_inference_steps,
+        num_outputs_per_prompt=args.num_outputs_per_prompt,
+        layers=args.layers,
+    )
+    if args.resolution:
+        sampling_params.resolution = args.resolution
     outputs = omni.generate(
         {
             "prompt": args.prompt,
             "negative_prompt": args.negative_prompt,
             "multi_modal_data": {"image": input_image},
         },
-        OmniDiffusionSamplingParams(
-            width=args.width,
-            height=args.height,
-            generator=generator,
-            true_cfg_scale=args.cfg_scale,
-            guidance_scale=args.guidance_scale,
-            guidance_scale_2=args.guidance_scale_2,
-            num_inference_steps=args.num_inference_steps,
-            num_outputs_per_prompt=args.num_outputs_per_prompt,
-            layers=args.layers,
-            resolution=args.resolution,
-        ),
+        sampling_params,
     )
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
