@@ -54,7 +54,7 @@ tts_server_params = [
 ]
 
 
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
@@ -79,7 +79,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config, request_num=MAX_CONCURRENT)
 
 
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
