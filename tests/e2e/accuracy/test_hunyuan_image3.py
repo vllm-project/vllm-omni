@@ -32,7 +32,6 @@ from tests.helpers.runtime import OmniRunner, OmniServer
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     build_prompt_tokens,
     resolve_stop_token_ids,
-    HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
 )
 
 # CoT structural markers that MUST appear in AR output text.
@@ -42,11 +41,14 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
 # Test deploy config sets include_stop_str_in_output=True and
 # skip_special_tokens=False, so ALL opening and closing markers
 # should be present in the detokenized text.
-_THINK_CLOSE = "</" + "think>"   # avoid Python slash-t-as-TAB pitfall
+_THINK_CLOSE = "</" + "think>"  # avoid Python slash-t-as-TAB pitfall
 _COT_REQUIRED_MARKERS = (
-    "<recaption>", "</recaption>",
-    "<relation_1>", "</relation_1>",
-    "<relation_2>", "</relation_2>",
+    "<recaption>",
+    "</recaption>",
+    "<relation_1>",
+    "</relation_1>",
+    "<relation_2>",
+    "</relation_2>",
     _THINK_CLOSE,
 )
 
@@ -66,6 +68,7 @@ def _assert_cot_structural_markers(cot_text: str, label: str) -> None:
         f"_truncate_at_cot_end truncation removed CoT content. "
         f"CoT text length={len(cot_text)}, first 100 chars: {repr(cot_text[:100])}"
     )
+
 
 os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
 
