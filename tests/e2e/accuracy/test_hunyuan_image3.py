@@ -95,11 +95,7 @@ THRESHOLDS = {
     "psnr": 12.5,  # Peak signal-to-noise ratio (dB)
 }
 NPU_THRESHOLDS = {
-    "text_prefix_match": 10,
-    "cot_semantic_sim": 0.9,
-    "clip_score": 85,
-    "ssim": 0.20,
-    "psnr": 11.0,
+    **THRESHOLDS,
 }
 
 QUANT_PROMPT = "A brown and white dog is running on the grass."
