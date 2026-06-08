@@ -8,9 +8,18 @@ latency and Real-Time Factor (RTF) across a configurable number of requests.
 
 Requires the model to be cached locally (or network access to HuggingFace).
 
+Args:
+    --num-requests          Number of timed requests (default: 8)
+    --warmup                Number of warm-up requests, excluded from timing (default: 2)
+    --max-tokens            Stage-0 max_tokens, controls audio length (default: 256)
+    --gpu-memory-utilization
+                            Stage-0 GPU memory fraction (default: 0.70)
+    --codec-cuda-graph      Enable CUDA Graph for Stage-1 codec decoder
+                            (sets enforce_eager=False on Stage 1)
+
 Usage::
 
-    # default: 2 warmup + 8 timed requests, max_tokens=256
+    # default: 2 warmup + 8 timed requests, eager codec
     python benchmarks/tts/bench_moss_tts.py
 
     # with CUDA Graph codec (Stage-1)
@@ -21,7 +30,8 @@ Usage::
         --num-requests 10 \\
         --max-tokens 512 \\
         --warmup 2 \\
-        --gpu-memory-utilization 0.70
+        --gpu-memory-utilization 0.70 \\
+        --codec-cuda-graph
 
 Output is printed as a Markdown table suitable for pasting into a PR description.
 """
@@ -132,7 +142,7 @@ def _build_config(gpu_memory_utilization: float, codec_cuda_graph: bool = False)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="E2E bench: MOSS-TTS stacked audio ops")
+    parser = argparse.ArgumentParser(description="E2E benchmark: MOSS-TTS offline inference throughput and RTF")
     parser.add_argument("--num-requests", type=int, default=8, help="Number of timed requests")
     parser.add_argument("--warmup", type=int, default=2, help="Warm-up requests (untimed)")
     parser.add_argument("--max-tokens", type=int, default=256, help="Stage 0 max_tokens")
@@ -199,7 +209,7 @@ def main() -> None:
     audio_s_list = [r["audio_samples"] / _SAMPLE_RATE for r in results]
     rtf_list = [a / t for a, t in zip(audio_s_list, total_s_list) if t > 0]
 
-    print("\n### MOSS-TTS Stacked Audio Ops — E2E Benchmark\n")
+    print("\n### MOSS-TTS — E2E Benchmark\n")
     print(
         f"GPU: {torch.cuda.get_device_name(device)}  "
         f"model: {_MODEL}  "
