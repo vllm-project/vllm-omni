@@ -110,7 +110,6 @@ QUANT_FP8_ENV = "HUNYUAN_IMAGE3_FP8_MODEL"
 QUANT_NVFP4_ENV = "HUNYUAN_IMAGE3_NVFP4_MODEL"
 NPU_DIT_BF16_MODEL = os.environ.get("HUNYUAN_IMAGE3_NPU_DIT_BF16_MODEL", "tencent/HunyuanImage-3.0-Instruct-Distil")
 NPU_DIT_QUANT_MODEL_ENV = "HUNYUAN_IMAGE3_NPU_DIT_QUANT_MODEL"
-NPU_DIT_DEVICES_ENV = "HUNYUAN_IMAGE3_NPU_DIT_DEVICES"
 NPU_DIT_TP_ENV = "HUNYUAN_IMAGE3_NPU_DIT_TP"
 NPU_DIT_EP_ENV = "HUNYUAN_IMAGE3_NPU_DIT_ENABLE_EP"
 NPU_DIT_GPU_MEMORY_UTILIZATION_ENV = "HUNYUAN_IMAGE3_NPU_DIT_GPU_MEMORY_UTILIZATION"
@@ -359,7 +358,7 @@ def _make_quant_dit_config(path: Path) -> None:
 
 
 def _npu_dit_devices() -> str:
-    return os.environ.get(NPU_DIT_DEVICES_ENV, "0,1,2,3")
+    return os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
 
 
 def _npu_dit_tensor_parallel_size() -> int:
@@ -753,7 +752,7 @@ def _run_dit_model(
 
 
 def test_npu_dit_config_defaults_to_four_card_expert_parallel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(NPU_DIT_DEVICES_ENV, raising=False)
+    monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
     monkeypatch.delenv(NPU_DIT_TP_ENV, raising=False)
     monkeypatch.delenv(NPU_DIT_EP_ENV, raising=False)
     monkeypatch.delenv(NPU_DIT_GPU_MEMORY_UTILIZATION_ENV, raising=False)
@@ -773,7 +772,7 @@ def test_npu_dit_config_defaults_to_four_card_expert_parallel(tmp_path: Path, mo
 
 
 def test_npu_dit_config_accepts_env_parallelism(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(NPU_DIT_DEVICES_ENV, "2,3")
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2,3")
     monkeypatch.setenv(NPU_DIT_TP_ENV, "2")
     monkeypatch.setenv(NPU_DIT_EP_ENV, "0")
     monkeypatch.setenv(NPU_DIT_GPU_MEMORY_UTILIZATION_ENV, "0.8")
