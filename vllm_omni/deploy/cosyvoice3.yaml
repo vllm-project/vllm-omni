@@ -11,6 +11,18 @@
 #   * Stage 0 (talker) — enforce_eager: false (CUDA graphs enabled).
 #   * Stage 1 (code2wav) — enforce_eager: true (CUDA graphs don't work with
 #     dynamic conv shapes).
+#
+# Streaming continuity is GPU-class sensitive — TUNE PER GPU.
+#   The defaults below (max_num_seqs: 8, codec_chunk_frames: 15) are tuned for
+#   H100, where streaming continuity at concurrency 4 stays ~100%. They push
+#   more audio per scheduler step through the SharedMemoryConnector than a
+#   slower GPU can keep up with: on H20-3e the same config regressed continuity
+#   to ~78% at c=4 (vs ~86% with smaller batch/chunk), because code2wav can't
+#   produce mel chunks fast enough to feed the streaming output → buffer
+#   underruns → audible gaps.
+#   On a slower GPU class, lower max_num_seqs (e.g. 4) and/or codec_chunk_frames
+#   first. Raising connector_get_sleep_s also relaxes the consumer's polling
+#   cadence, but trades against TTFP — keep it as a last resort.
 async_chunk: true
 dtype: float32
 
