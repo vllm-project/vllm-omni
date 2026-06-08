@@ -1128,6 +1128,7 @@ class AsyncOmniEngine:
 
         stage_configs_path = kwargs.get("stage_configs_path", None)
         deploy_config_path = kwargs.pop("deploy_config", None)
+        strategy_config_path = kwargs.pop("strategy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
         explicit_stage_configs = kwargs.pop("stage_configs", None)
         if explicit_stage_configs is not None:
@@ -1161,6 +1162,7 @@ class AsyncOmniEngine:
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
+            strategy_config_path=strategy_config_path,
         )
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.

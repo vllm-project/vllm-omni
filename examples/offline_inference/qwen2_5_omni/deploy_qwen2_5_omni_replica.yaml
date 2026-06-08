@@ -1,0 +1,63 @@
+# Qwen2.5-Omni deploy laid out for stage replication (4-GPU box).
+#
+# The thinker gets a TWO-GPU pool so a `stage_replica: 2` strategy can place one
+# independent engine per card; the talker and code2wav share a third GPU. Pair
+# this with strategy_stage_replica.yaml:
+#
+#   python3 end2end.py --query-type text --num-prompts 6 \
+#       --deploy-config deploy_qwen2_5_omni_replica.yaml \
+#       --strategy-config strategy_stage_replica.yaml --omni-lb-policy round-robin
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.8
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    mm_processor_cache_gb: 0
+    # Two-GPU pool: stage_replica=2 places replica 0 on GPU 0, replica 1 on GPU 1.
+    devices: "0,1"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_batched_tokens: 32768
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.8
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "2"
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 0.8
+      top_k: 40
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 2
+    max_num_batched_tokens: 32768
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.15
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_flashinfer_autotune: false
+    async_scheduling: false
+    devices: "2"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.1

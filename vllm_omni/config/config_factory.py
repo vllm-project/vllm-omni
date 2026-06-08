@@ -8,7 +8,7 @@ import dataclasses
 import functools
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
@@ -267,6 +267,7 @@ class StageConfigFactory:
         trust_remote_code: bool = False,
         cli_overrides: dict[str, Any] | None = None,
         deploy_config_path: str | None = None,
+        strategy_specs: Mapping[Any, Any] | None = None,
         **deprecated_kwargs: Any,
     ) -> list[StageConfig] | None:
         """Load pipeline + deploy config, merge with CLI overrides.
@@ -275,6 +276,11 @@ class StageConfigFactory:
         registered. If a model is not registered in OMNI_PIPELINES, tries to fall
         back to using the Transformers config & finding pipelines that have overlapping
         supported architectures.
+
+        When ``strategy_specs`` is provided (a mapping of role -> list of
+        ``StrategySpec``), the derived parallel sizing is overlaid onto the
+        merged stages (see ``vllm_omni.config.composable_parallel``). This is
+        opt-in: omitting it leaves the existing merge path untouched.
         """
         if cli_overrides is None:
             cli_overrides = {}
@@ -290,6 +296,7 @@ class StageConfigFactory:
                 pipeline_cfg,
                 cli_overrides,
                 deploy_config_path,
+                strategy_specs=strategy_specs,
             )
         return None
 
@@ -300,6 +307,7 @@ class StageConfigFactory:
         pipeline_cfg: PipelineConfig,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None = None,
+        strategy_specs: Mapping[Any, Any] | None = None,
         **deprecated_kwargs: Any,
     ) -> list[StageConfig]:
         """Create StageConfigs from pipeline registry + deploy YAML.
@@ -338,12 +346,38 @@ class StageConfigFactory:
 
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 
+        # Overlay declarative parallel strategies (opt-in) before CLI overrides.
+        cls._apply_strategy_specs(stages, strategy_specs)
+
         explicit_overrides = {k: v for k, v in cli_overrides.items() if v is not None}
 
         for stage in stages:
             stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
 
         return stages
+
+    @staticmethod
+    def _apply_strategy_specs(
+        stages: list[StageConfig],
+        strategy_specs: Mapping[Any, Any] | None,
+    ) -> None:
+        """Overlay derived parallel sizing onto merged stages (opt-in).
+
+        ``omni_lb_policy`` cannot be set from stage configs (omni reads it once
+        at engine construction), so a derived non-default policy is logged for
+        the caller to pass via ``--omni-lb-policy``.
+        """
+        if not strategy_specs:
+            return
+        from vllm_omni.config.composable_parallel import apply_strategy_specs
+
+        applied = apply_strategy_specs(stages, strategy_specs)
+        if applied.omni_lb_policy is not None:
+            logger.info(
+                "[composable_parallel] strategy derived omni_lb_policy=%r; pass it via "
+                "--omni-lb-policy (it is an engine-level knob, not a per-stage config field).",
+                applied.omni_lb_policy,
+            )
 
     @classmethod
     def create_default_diffusion(cls, kwargs: dict[str, Any]) -> list[dict[str, Any]]:

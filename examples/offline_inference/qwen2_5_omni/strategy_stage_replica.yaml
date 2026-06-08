@@ -1,0 +1,15 @@
+# Composable-parallel strategy for Qwen2.5-Omni.
+#
+# Replicate the thinker stage across 2 independent engines and let the omni
+# StagePool balance requests round-robin across them. The thinker's deploy
+# `devices` entry acts as a per-replica template, so omni expands it to one GPU
+# per replica.
+#
+# Usage:
+#   python3 end2end.py --query-type text --num-prompts 6 \
+#       --strategy-config strategy_stage_replica.yaml --omni-lb-policy round-robin
+strategies:
+  thinker:
+    - axis: stage_replica
+      size: 2
+      routing: round_robin

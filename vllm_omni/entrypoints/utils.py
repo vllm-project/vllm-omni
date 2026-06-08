@@ -316,6 +316,7 @@ def load_stage_configs_from_model(
     base_engine_args: dict | None = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
+    strategy_config_path: str | None = None,
 ) -> list:
     """Load stage configurations from model's default config file.
 
@@ -330,6 +331,9 @@ def load_stage_configs_from_model(
         base_engine_args: Base engine args to merge as CLI overrides.
         deploy_config_path: Optional explicit deploy config path.
         stage_overrides: Per-stage overrides from --stage-overrides.
+        strategy_config_path: Optional path to a composable-parallel
+            ``strategy.yaml`` whose derived sizing is overlaid onto the
+            registry-merged stages (opt-in; ignored on the legacy YAML path).
 
     Returns:
         List of stage configuration dictionaries
@@ -343,11 +347,18 @@ def load_stage_configs_from_model(
             for key, val in overrides.items():
                 cli_overrides[f"stage_{stage_id_str}_{key}"] = val
 
+    strategy_specs = None
+    if strategy_config_path is not None:
+        from vllm_omni.config.composable_parallel.strategy_yaml import load_strategy_specs
+
+        strategy_specs = load_strategy_specs(strategy_config_path)
+
     stages = StageConfigFactory.create_from_model(
         model,
         trust_remote_code=cli_overrides.get("trust_remote_code", False),
         cli_overrides=cli_overrides,
         deploy_config_path=deploy_config_path,
+        strategy_specs=strategy_specs,
     )
     if stages is not None:
         # Convert StageConfig objects to OmegaConf for backward compat
@@ -508,6 +519,7 @@ def load_and_resolve_stage_configs(
     default_stage_cfg_factory: Any = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
+    strategy_config_path: str | None = None,
 ) -> tuple[str, list]:
     """Load stage configurations from model or YAML file with fallback to defaults.
 
@@ -558,6 +570,7 @@ def load_and_resolve_stage_configs(
             base_engine_args=kwargs,
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
+            strategy_config_path=strategy_config_path,
         )
         if not stage_configs:
             if default_stage_cfg_factory is not None:
@@ -571,6 +584,7 @@ def load_and_resolve_stage_configs(
             model,
             base_engine_args=kwargs,
             stage_overrides=stage_overrides,
+            strategy_config_path=strategy_config_path,
         )
         if not stage_configs:
             if default_stage_cfg_factory is not None:
