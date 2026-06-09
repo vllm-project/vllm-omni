@@ -14,8 +14,28 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 class DiffusionRequestBatch:
     """Request-level batch wrapping original diffusion requests.
 
+    Each :class:`~vllm_omni.diffusion.request.OmniDiffusionRequest` represents
+    one logical diffusion request with one prompt. The scheduler and runner use
+    this wrapper to present a compatible request batch to pipeline
+    ``forward()`` methods without reintroducing list-shaped request payloads.
+
     This is distinct from ``InputBatch`` (aliased as ``StepInputBatch``),
     which manages step/tensor-level data for stepwise execution.
+
+    Args:
+        requests: Independent diffusion requests scheduled together for
+            request-mode execution.
+
+    Attributes:
+        requests: Original request objects in scheduler order.
+        num_reqs: Number of requests in the batch.
+        request_ids: Request IDs in the same order as ``requests``.
+        prompts: Prompt list assembled from each request's single ``prompt``.
+        sampling_params: Sampling parameters shared by the batch. Scheduler
+            compatibility checks ensure batched requests can use this value.
+        request_id: First request ID, kept as a compatibility convenience for
+            code paths that handle a single-request batch.
+        kv_sender_info: KV-transfer metadata from the first request.
     """
 
     requests: list[OmniDiffusionRequest]

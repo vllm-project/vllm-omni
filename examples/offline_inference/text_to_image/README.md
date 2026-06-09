@@ -179,7 +179,6 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output flux2-dev.png
 ```
 
-
 ### HiDream-I1-Full Models
 
 The `--auxiliary-text-encoder` parameter is required when running HiDream‑I1‑Full:
@@ -199,7 +198,9 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 
 ### Batch Requests (Multiple Prompts)
 
-You can pass multiple prompts in a single `generate` call.
+You can pass multiple prompts in a single `Omni.generate` call. `Omni`
+submits each prompt as an independent request and returns one output per
+prompt.
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
@@ -224,11 +225,13 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion pipelines, the stage config field `stage_args.[].runtime.max_batch_size` is 1 by
-    default, and the input list is sliced into single-item requests before feeding into the diffusion
-    pipeline. For models that do internally support batched inputs, you can
-    [modify this configuration](../../../configuration/stage_configs.md) to let the model accept a
-    longer batch of prompts.
+    For diffusion pipelines, the stage config field `stage_args.[].engine_args.max_num_seqs`
+    controls how many independent requests the scheduler may keep active. The
+    input list is sliced into single-item requests before feeding into the
+    diffusion pipeline; this is different from submitting a packed list-prompt
+    diffusion request. For models that support runtime batching, you can
+    [modify this configuration](../../../configuration/stage_configs.md) to let
+    the scheduler batch more compatible requests internally.
 
 ### Negative Prompts
 
