@@ -28,6 +28,50 @@ in deep DiT blocks.
 Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
 guide. FP8 on Ampere may use a weight-only path where available.
 
+### Faster FP8 GEMM on Blackwell (quack)
+
+On Blackwell (SM 100+), vLLM runs FP8 linears through the FlashInfer kernel, which
+applies the bias as a separate kernel after the GEMM. On the small GEMMs in video
+DiTs this bias add is a significant overhead. Installing the optional `quack` kernel
+lets vLLM-Omni fuse `alpha * (A @ B) + bias` into a single CuteDSL GEMM, recovering
+that overhead (e.g. HunyuanVideo-1.5 FP8 goes from slower-than-BF16 to faster).
+
+```bash
+# CUDA 12.9
+pip install vllm-omni[quack]
+
+# CUDA 13.x
+pip install 'quack-kernels[cu13]' --extra-index-url https://download.pytorch.org/whl/cu130
+```
+
+It is enabled automatically once installed (no flag needed) and is **Blackwell-only**:
+on Hopper/Ada the CUTLASS FP8 kernel already fuses bias, so quack is not used there.
+Set `VLLM_OMNI_USE_QUACK_FP8=0` to force the FlashInfer path. If `quack-kernels` is
+not installed, FP8 still works — it just keeps the unfused FlashInfer path.
+
+#### Compile cache and warmup
+
+quack JIT-compiles its kernel once per distinct GEMM shape (tens of seconds, longer
+the first time across all autotuned configs). The compiled `.o` files are cached on
+disk and reused on later runs, so this is a one-time cost — **not** per request.
+
+vLLM-Omni points that cache at `~/.cache/vllm_omni/quack` (override with
+`QUACK_CACHE_DIR`) instead of quack's default under `/tmp`, so it survives restarts.
+In containers, set `QUACK_CACHE_DIR` to a mounted/persistent path — or bake it into
+the image — so the first cold start does not recompile. The engine's startup dummy
+run already exercises the kernels, so with a warm cache the first real request is fast.
+
+To pre-warm specific shapes (e.g. at image build time):
+
+```python
+from vllm_omni.quantization.quack_fp8 import warmup_quack_fp8
+# (M, K, N) per linear; M = number of tokens for your resolution/frame count
+warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
+```
+
+> The PyPI package is `quack-kernels` (imported as `quack`); plain `pip install
+> quack` is an unrelated statistics library. Requires CUDA 12.9+ and Python 3.12.
+
 ## Model Type Support
 
 ### Diffusion Model (Qwen-Image, Wan2.2)

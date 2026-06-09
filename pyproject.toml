@@ -90,6 +90,12 @@ minicpmo = [
     "stepaudio2-minicpmo",
 ]
 
+# Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
+# as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
+quack = [
+    "quack-kernels>=0.3.11",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
