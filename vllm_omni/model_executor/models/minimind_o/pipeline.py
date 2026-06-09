@@ -46,7 +46,7 @@ MINIMIND_OMNI_PIPELINE = PipelineConfig(
             input_sources=(0,),
             engine_output_type="latent",
             custom_process_input_func=f"{_PROC}.thinker2talker",
-            sampling_constraints={"detokenize": False},
+            sampling_constraints={"detokenize": False, "stop_token_ids": [2052]},
         ),
         StagePipelineConfig(
             stage_id=2,

@@ -144,6 +144,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         self.quant_config = vllm_config.quant_config
         self.audio_pad_token = int(talker_config.audio_pad_token)
         self.audio_stop_token = int(talker_config.audio_stop_token)
+        self.internal_stop_token_id = int(talker_config.internal_stop_token_id)
         self.audio_spk_token = int(talker_config.audio_spk_token)
         self.audio_vocab_size = int(talker_config.audio_vocab_size)
         self.num_code_layers = int(talker_config.num_code_layers)
@@ -449,7 +450,12 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> SamplerOutput | None:
-        sampler_output = self.sampler(logits, sampling_metadata)
+        logits_for_sampler = logits
+        if 0 <= self.internal_stop_token_id < logits.shape[-1]:
+            logits_for_sampler = logits.clone()
+            logits_for_sampler[:, self.internal_stop_token_id] = -torch.inf
+
+        sampler_output = self.sampler(logits_for_sampler, sampling_metadata)
         request_ids = list(getattr(sampling_metadata, "request_ids", None) or [])
         if not request_ids:
             return sampler_output
@@ -459,7 +465,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
             request_id = request_ids[row] if row < len(request_ids) else None
             if request_id is None or not self._stop_pending_by_req.get(request_id):
                 continue
-            sampled[row, 0] = self.audio_stop_token
+            sampled[row, 0] = self.internal_stop_token_id
             self._stop_pending_by_req.pop(request_id, None)
         return sampler_output
 

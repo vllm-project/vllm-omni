@@ -158,8 +158,6 @@ def talker2code2wav(
     code2wav_inputs: list[OmniTokensPrompt] = []
 
     for talker_output in source_outputs:
-        if not getattr(talker_output, "finished", True):
-            continue
         output = talker_output.outputs[0]
         mm: OmniPayload = getattr(output, "multimodal_output", None) or {}
         codes = mm.get("codes", {}) if isinstance(mm, dict) else {}

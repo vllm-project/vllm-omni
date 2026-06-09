@@ -173,6 +173,7 @@ class MiniMindOmniTalkerConfig(MiniMindConfig):
         audio_pad_token: int = 2049,
         audio_stop_token: int = 2050,
         audio_spk_token: int = 2051,
+        internal_stop_token_id: int = 2052,
         spk_emb_size: int = 192,
         **kwargs: Any,
     ) -> None:
@@ -191,6 +192,7 @@ class MiniMindOmniTalkerConfig(MiniMindConfig):
         self.audio_pad_token = audio_pad_token
         self.audio_stop_token = audio_stop_token
         self.audio_spk_token = audio_spk_token
+        self.internal_stop_token_id = internal_stop_token_id
         self.spk_emb_size = spk_emb_size
 
 
