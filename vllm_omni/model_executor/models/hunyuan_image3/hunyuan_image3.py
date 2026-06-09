@@ -1465,12 +1465,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     # _vit_encode_dp.
     supports_encoder_tp_data = True
 
-    # Siglip2 ViT supports data-parallel encoding (mm_encoder_tp_mode="data"):
-    # weights are replicated and the image batch is sharded across TP ranks.
-    # Without this flag, vLLM silently falls back to "weights" (TP). See
-    # _vit_encode_dp.
-    supports_encoder_tp_data = True
-
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -1925,16 +1919,23 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         cfg_factor: int = 1,
         vae_generator_seed: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
-        def _make_generator(img_idx: int, device: torch.device) -> torch.Generator:
+        def _seed_for_index(img_idx: int) -> int:
             if vae_generator_seed is None or vae_generator_seed.numel() == 0:
-                return torch.Generator(device=device).manual_seed(0)
+                return 0
             seed_values = vae_generator_seed.reshape(-1)
             seed_idx = img_idx if img_idx < seed_values.numel() else 0
-            return torch.Generator(device=device).manual_seed(
-                int(seed_values[seed_idx].item())
-            )
+            return int(seed_values[seed_idx].item())
+
+        def _make_sequential_generator(device: torch.device) -> torch.Generator:
+            return torch.Generator(device=device).manual_seed(_seed_for_index(0))
+
+        def _make_generator(img_idx: int, device: torch.device) -> torch.Generator:
+            return torch.Generator(device=device).manual_seed(_seed_for_index(img_idx))
 
         batch_size = len(vae_pixel_values)
+        if batch_size == 0:
+            return []
+
         if not self._logged_vae_encode_state:
             try:
                 tp_size = get_tensor_model_parallel_world_size()
@@ -1958,16 +1959,13 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                     batch_size,
                 )
             vae_token_embeddings = []
-            for img_idx, vae_image_i in enumerate(vae_pixel_values):
-                generator = _make_generator(img_idx, vae_image_i.device)
+            generator = _make_sequential_generator(vae_pixel_values[0].device)
+            for vae_image_i in vae_pixel_values:
                 t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), cfg_factor, generator=generator)
                 t_emb = self.time_embed(t_i[0])
                 vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
                 vae_token_embeddings.append(vae_tokens)
             return vae_token_embeddings
-
-        if batch_size == 0:
-            return []
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
