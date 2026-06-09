@@ -257,3 +257,15 @@ def _patch_flashinfer_fp8_scaled_mm_output_shape():
 
 
 _patch_flashinfer_fp8_scaled_mm_output_shape()
+
+
+def _patch_fp8_use_quack_fused_bias():
+    try:
+        from vllm_omni.quantization.quack_fp8 import install_quack_fp8_patch
+
+        install_quack_fp8_patch()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_patch_fp8_use_quack_fused_bias()

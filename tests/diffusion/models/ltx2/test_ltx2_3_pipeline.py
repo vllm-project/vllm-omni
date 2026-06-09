@@ -72,6 +72,31 @@ class TestPipelineIndependence:
 
         assert issubclass(LTX23Pipeline, CFGParallelMixin)
 
+    def test_ltx23_pipeline_declares_offload_components(self):
+        """LTX23Pipeline must expose LTX-2.3-specific modules to offload discovery."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+        pipe = object.__new__(LTX23Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.transformer = torch.nn.Linear(1, 1)
+        pipe.text_encoder = torch.nn.Linear(1, 1)
+        pipe.connectors = torch.nn.Linear(1, 1)
+        pipe.vae = torch.nn.Linear(1, 1)
+        pipe.audio_vae = torch.nn.Linear(1, 1)
+        pipe.vocoder = torch.nn.Linear(1, 1)
+
+        modules = ModuleDiscovery.discover(pipe)
+
+        assert LTX23Pipeline._dit_modules == ["transformer"]
+        assert LTX23Pipeline._encoder_modules == ["text_encoder", "connectors"]
+        assert LTX23Pipeline._vae_modules == ["vae", "audio_vae"]
+        assert LTX23Pipeline._resident_modules == ["vocoder"]
+        assert modules.dit_names == ["transformer"]
+        assert modules.encoder_names == ["text_encoder", "connectors"]
+        assert modules.resident_names == ["vocoder"]
+        assert len(modules.vaes) == 2
+
 
 class TestCFGParallelHelpers:
     """Test LTX-2.3 CFG helper math without loading model weights."""

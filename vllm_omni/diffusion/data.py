@@ -610,9 +610,6 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
-    # sleep mode
-    enable_sleep_mode: bool = False
-
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
