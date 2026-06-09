@@ -59,6 +59,7 @@ class _ConcurrencyTrackingExecutor:
         self.rpc_delay = rpc_delay
         self.is_failed = False
         self._closed = False
+        self.od_config = SimpleNamespace()
 
     def collective_rpc(
         self,
@@ -101,14 +102,15 @@ class _ConcurrencyTrackingExecutor:
         # Mimic the real MultiprocDiffusionExecutor.execute_request: it
         # forwards a single request through collective_rpc.
         new_req = scheduler_output.scheduled_new_reqs[0]
+        req = new_req.req
         result = self.collective_rpc(
             "execute_model",
-            args=(new_req,),
+            args=(req, self.od_config),
             unique_reply_rank=0,
             exec_all_ranks=True,
         )
         return RunnerOutput(
-            request_id=new_req.request_id,
+            request_id=req.request_id,
             step_index=None,
             finished=True,
             result=result,

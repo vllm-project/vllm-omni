@@ -791,18 +791,16 @@ class TestForwardRouting:
             v2v_condition,
         )
         pipeline.forward(
-            SimpleNamespace(
-                prompts=[
-                    {
-                        "prompt": "continue",
-                        "modalities": ["video"],
-                        "additional_information": {
-                            "preprocessed_video": video_tensor,
-                            "condition_frame_indexes_vision": [0],
-                        },
-                    }
-                ],
-                sampling_params=make_sampling_params(height=16, width=16, num_frames=5),
+            make_request_batch(
+                {
+                    "prompt": "continue",
+                    "modalities": ["video"],
+                    "additional_information": {
+                        "preprocessed_video": video_tensor,
+                        "condition_frame_indexes_vision": [0],
+                    },
+                },
+                make_sampling_params(height=16, width=16, num_frames=5),
             )
         )
         assert captured["flow_shifts"][-1] == 10.0
