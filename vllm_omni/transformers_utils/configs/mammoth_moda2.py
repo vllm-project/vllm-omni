@@ -247,7 +247,10 @@ class Mammothmoda2Config(PretrainedConfig):
         super().__init__(**kwargs)
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
-        return self.llm_config
+        if self.llm_config is None:
+            return None
+        # llm_config is a Mammothmoda2Qwen2_5_VLConfig which has nested text_config
+        return self.llm_config.text_config
 
     def _require_llm_config(self) -> PretrainedConfig:
         if self.llm_config is None:
