@@ -33,6 +33,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         # in _pad_for_sequence_parallelism during execute_model.
         # This is a workaround for vllm-ascend not passing vllm_config to enable_sp().
         enable_sp(self.vllm_config)
+        self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
 
     @torch.inference_mode()

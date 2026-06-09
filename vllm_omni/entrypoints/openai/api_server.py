@@ -91,6 +91,7 @@ from vllm.utils import random_uuid
 from vllm.utils.system_utils import decorate_logs
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -125,7 +126,7 @@ from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServin
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
-from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
+from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage, ReferenceVideo
 from vllm_omni.entrypoints.openai.serving_video_stream import OmniStreamingVideoHandler
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
@@ -2531,6 +2532,84 @@ def _parse_form_json(value: str | None, expected_type: type | None = None) -> An
     return parsed
 
 
+def _config_get(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    if hasattr(config, "get"):
+        try:
+            return config.get(key, default)
+        except Exception:
+            pass
+    return getattr(config, key, default)
+
+
+def _stage_engine_args(stage_cfg: Any) -> Any:
+    return _config_get(stage_cfg, "engine_args", {}) or {}
+
+
+def _diffusion_model_classes(stage_configs: list[Any] | None) -> list[type]:
+    if not stage_configs:
+        return []
+
+    from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+    model_classes: list[type] = []
+    for stage_cfg in stage_configs:
+        if get_stage_type(stage_cfg) != "diffusion":
+            continue
+        model_class_name = _config_get(_stage_engine_args(stage_cfg), "model_class_name")
+        if not model_class_name:
+            continue
+        model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+        if model_cls is not None:
+            model_classes.append(model_cls)
+    return model_classes
+
+
+def _normalize_reference_video_decode_spec(spec: ReferenceVideoDecodeSpec) -> ReferenceVideoDecodeSpec:
+    max_frames = spec.max_frames
+    if max_frames is not None:
+        try:
+            max_frames = int(max_frames)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="Invalid reference video decode spec: max_frames must be an integer.",
+            ) from exc
+        if max_frames <= 0:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="Invalid reference video decode spec: max_frames must be positive.",
+            )
+
+    keep = str(spec.keep or "first").strip().lower()
+    if keep not in {"first", "last"}:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Invalid reference video decode spec: keep must be either 'first' or 'last'.",
+        )
+    return ReferenceVideoDecodeSpec(max_frames=max_frames, keep=cast(Literal["first", "last"], keep))
+
+
+def _reference_video_decode_spec(
+    req: VideoGenerationRequest,
+    stage_configs: list[Any] | None,
+) -> ReferenceVideoDecodeSpec:
+    video_params = req.resolve_video_params()
+    extra_params = req.extra_params if isinstance(req.extra_params, dict) else {}
+    for model_cls in _diffusion_model_classes(stage_configs):
+        resolver = getattr(model_cls, "reference_video_decode_spec", None)
+        if resolver is None:
+            continue
+        try:
+            spec = resolver(num_frames=video_params.num_frames, extra_args=extra_params)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+        if spec is not None:
+            return _normalize_reference_video_decode_spec(spec)
+    return ReferenceVideoDecodeSpec(max_frames=video_params.num_frames, keep="first")
+
+
 def video_response_from_request(model_name: str, req: VideoGenerationRequest) -> VideoResponse:
     resp = VideoResponse(
         model=model_name,
@@ -2597,6 +2676,7 @@ async def _run_video_generation_job(
     request: VideoGenerationRequest,
     video_id: str,
     reference_image: ReferenceImage | None = None,
+    reference_video: ReferenceVideo | None = None,
     app_state: Any | None = None,
 ) -> None:
     job = await VIDEO_STORE.get(video_id)
@@ -2609,7 +2689,10 @@ async def _run_video_generation_job(
     output_path = None
     try:
         video_bytes, stage_durations, peak_memory_mb, action = await handler.generate_video_bytes(
-            request, video_id, reference_image=reference_image
+            request,
+            video_id,
+            reference_image=reference_image,
+            reference_video=reference_video,
         )
 
         file_name = f"{video_id}.{job.file_extension}"
@@ -2676,6 +2759,7 @@ async def _parse_video_form(
     prompt: str = Form(...),
     input_reference: UploadFile | None = File(default=None),
     image_reference: str | None = Form(default=None),
+    video_reference: str | None = Form(default=None),
     model: str | None = Form(default=None),
     seconds: SecondStr | None = Form(default=None),
     size: SizeStr | None = Form(default=None),
@@ -2700,7 +2784,7 @@ async def _parse_video_form(
     frame_interpolation_model_path: str | None = Form(default=None),
     lora: str | None = Form(default=None),
     extra_params: str | None = Form(default=None),
-) -> tuple[VideoGenerationRequest, "OmniOpenAIServingVideo", str, ReferenceImage | None]:
+) -> tuple[VideoGenerationRequest, "OmniOpenAIServingVideo", str, ReferenceImage | None, ReferenceVideo | None]:
     """FastAPI dependency that parses video form data, validates inputs,
     resolves the handler, and decodes any reference image.
 
@@ -2708,11 +2792,15 @@ async def _parse_video_form(
     """
     input_reference_bytes = await input_reference.read() if input_reference is not None else None
     parsed_image_reference = _parse_form_json(image_reference)
+    parsed_video_reference = _parse_form_json(video_reference)
 
-    if parsed_image_reference is not None and input_reference_bytes is not None:
+    provided_references = sum(
+        item is not None for item in (parsed_image_reference, parsed_video_reference, input_reference_bytes)
+    )
+    if provided_references > 1:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="Provide either input_reference or image_reference, not both.",
+            detail="Provide only one of input_reference, image_reference, or video_reference.",
         )
 
     request_data: dict[str, Any] = {
@@ -2721,6 +2809,7 @@ async def _parse_video_form(
         "seconds": seconds,
         "size": size,
         "image_reference": parsed_image_reference,
+        "video_reference": parsed_video_reference,
         "user": user,
         "width": width,
         "height": height,
@@ -2774,13 +2863,28 @@ async def _parse_video_form(
             detail=f"Video generation setup failed: {str(e)}",
         )
 
+    decode_spec = ReferenceVideoDecodeSpec()
+    if parsed_video_reference is not None or input_reference_bytes is not None:
+        stage_configs = (
+            handler.stage_configs
+            or app_stage_configs
+            or getattr(getattr(handler, "_engine_client", None), "stage_configs", None)
+        )
+        decode_spec = _reference_video_decode_spec(request, stage_configs)
     try:
-        image_data = await decode_input_reference(request.image_reference, input_reference_bytes)
+        media_data = await decode_input_reference(
+            request.image_reference,
+            request.video_reference,
+            input_reference_bytes,
+            max_video_frames=decode_spec.max_frames,
+            video_keep=decode_spec.keep,
+        )
     except InvalidInputReferenceError as exc:
         raise HTTPException(400, detail=str(exc) or "Invalid input reference.") from exc
 
-    reference_image = ReferenceImage(data=image_data) if image_data is not None else None
-    return request, handler, effective_model_name, reference_image
+    reference_image = ReferenceImage(data=media_data) if isinstance(media_data, Image.Image) else None
+    reference_video = ReferenceVideo(data=media_data) if isinstance(media_data, list) else None
+    return request, handler, effective_model_name, reference_image, reference_video
 
 
 @router.post(
@@ -2794,18 +2898,31 @@ async def _parse_video_form(
 )
 async def create_video(
     raw_request: Request,
-    ctx: tuple[VideoGenerationRequest, OmniOpenAIServingVideo, str, ReferenceImage | None] = Depends(_parse_video_form),
+    ctx: tuple[
+        VideoGenerationRequest,
+        OmniOpenAIServingVideo,
+        str,
+        ReferenceImage | None,
+        ReferenceVideo | None,
+    ] = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
 
     Accepts multipart form-data (see ``_parse_video_form`` for parameters),
     persists a queued job record, and starts generation in the background.
     """
-    request, handler, effective_model_name, reference_image = ctx
+    request, handler, effective_model_name, reference_image, reference_video = ctx
     ref = video_response_from_request(effective_model_name, request)
     await VIDEO_STORE.upsert(ref.id, ref)
     task = asyncio.create_task(
-        _run_video_generation_job(handler, request, ref.id, reference_image, app_state=raw_request.app.state)
+        _run_video_generation_job(
+            handler,
+            request,
+            ref.id,
+            reference_image,
+            reference_video,
+            app_state=raw_request.app.state,
+        )
     )
     await VIDEO_TASKS.upsert(ref.id, task)
     return ref
@@ -2822,7 +2939,13 @@ async def create_video(
 )
 async def create_video_sync(
     raw_request: Request,
-    ctx: tuple[VideoGenerationRequest, OmniOpenAIServingVideo, str, ReferenceImage | None] = Depends(_parse_video_form),
+    ctx: tuple[
+        VideoGenerationRequest,
+        OmniOpenAIServingVideo,
+        str,
+        ReferenceImage | None,
+        ReferenceVideo | None,
+    ] = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
 
@@ -2833,13 +2956,18 @@ async def create_video_sync(
     Metadata is returned via response headers ``X-Request-Id``,
     ``X-Model``, and ``X-Inference-Time-S``.
     """
-    request, handler, effective_model_name, reference_image = ctx
+    request, handler, effective_model_name, reference_image, reference_video = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
         video_bytes, stage_durations, peak_memory_mb, _action = await asyncio.wait_for(
-            handler.generate_video_bytes(request, request_id, reference_image=reference_image),
+            handler.generate_video_bytes(
+                request,
+                request_id,
+                reference_image=reference_image,
+                reference_video=reference_video,
+            ),
             timeout=VIDEO_SYNC_TIMEOUT_S,
         )
     except asyncio.TimeoutError:

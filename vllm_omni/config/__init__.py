@@ -6,7 +6,6 @@ from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.config.stage_config import (
     DeployConfig,
-    ModelPipeline,
     PipelineConfig,
     StageConfig,
     StageConfigFactory,
@@ -30,7 +29,6 @@ __all__ = [
     "LoRAConfig",
     "StageConfig",
     "StageConfigFactory",
-    "ModelPipeline",
     "StageType",
     "StageExecutionType",
     "StagePipelineConfig",

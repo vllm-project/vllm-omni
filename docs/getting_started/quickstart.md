@@ -22,7 +22,7 @@ source .venv/bin/activate
 uv pip install vllm==0.22.0 --torch-backend=auto
 
 # On ROCm
-uv pip install vllm==0.22.0+rocm721 --extra-index-url https://wheels.vllm.ai/rocm/0.22.0/rocm721
+uv pip install vllm==0.22.0+rocm722 --extra-index-url https://wheels.vllm.ai/rocm/0.22.0/rocm722
 
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
