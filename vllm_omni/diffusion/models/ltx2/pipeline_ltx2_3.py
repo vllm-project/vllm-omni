@@ -23,7 +23,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 import torch
-from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
+from diffusers import AutoencoderKLLTX2Audio, FlowMatchEulerDiscreteScheduler
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
@@ -36,6 +36,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import DistributedAutoencoderKLLTX2Video
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
@@ -48,6 +49,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .pipeline_ltx2 import (
@@ -113,7 +115,13 @@ def get_ltx2_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsComponentDiscovery):
+class LTX23Pipeline(
+    nn.Module,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    SupportsComponentDiscovery,
+    DiffusionPipelineProfilerMixin,
+):
     """Fully independent LTX-2.3 pipeline.
 
     Key differences from LTX2Pipeline:
@@ -193,7 +201,7 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompo
 
         # --- VAE, Audio VAE ---
         self.vae = from_pretrained_with_prefetch(
-            AutoencoderKLLTX2Video.from_pretrained,
+            DistributedAutoencoderKLLTX2Video.from_pretrained,
             model,
             subfolder="vae",
             prefetch_list=ltx2_subfolders,
@@ -265,6 +273,10 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompo
         self._interrupt = False
         self._num_timesteps = None
         self._current_timestep = None
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     def _place_aux_components(self) -> None:
         parallel_config = getattr(self.od_config, "parallel_config", None)
@@ -1253,14 +1265,18 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompo
 
             latents = latents.to(self.vae.dtype)
             video = self.vae.decode(latents, timestep_decode, return_dict=False)[0]
-            video = self.video_processor.postprocess_video(video, output_type=output_type)
+            if video.numel() > 0:
+                video = self.video_processor.postprocess_video(video, output_type=output_type)
 
             audio_latents = audio_latents.to(self.audio_vae.dtype)
             generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
 
             audio = self.vocoder(generated_mel_spectrograms)
 
-        return DiffusionOutput(output=(video, audio))
+        return DiffusionOutput(
+            output=(video, audio),
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
