@@ -211,7 +211,7 @@ _REALTIME_WS_INVALID_AUDIO_APPEND = object()
         pytest.param(
             json.dumps({"type": "session.update"}),
             "invalid_event",
-            "model",
+            ("model", "Missing required field"),
             id="session_update_missing_model",
         ),
         pytest.param(
@@ -223,7 +223,7 @@ _REALTIME_WS_INVALID_AUDIO_APPEND = object()
         pytest.param(
             json.dumps({"type": "input_audio_buffer.commit", "final": False}),
             "model_not_validated",
-            "session.update",
+            ("session.update", "validate the model"),
             id="commit_without_model_validation",
         ),
         pytest.param(
@@ -235,7 +235,7 @@ _REALTIME_WS_INVALID_AUDIO_APPEND = object()
         pytest.param(
             _REALTIME_WS_INVALID_AUDIO_APPEND,
             "invalid_audio",
-            "Invalid audio",
+            "Invalid audio data",
             id="invalid_audio_append",
         ),
     ],
