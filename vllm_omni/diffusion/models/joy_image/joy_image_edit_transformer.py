@@ -105,9 +105,7 @@ class Timesteps(nn.Module):
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
         timesteps = timesteps.flatten().float()
         half_dim = self.num_channels // 2
-        exponent = -math.log(10000) * torch.arange(
-            half_dim, dtype=torch.float32, device=timesteps.device
-        )
+        exponent = -math.log(10000) * torch.arange(half_dim, dtype=torch.float32, device=timesteps.device)
         exponent = exponent / (half_dim - self.downscale_freq_shift)
         emb = timesteps[:, None] * torch.exp(exponent)[None, :]
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
@@ -153,12 +151,7 @@ class JoyImageModulate(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> list[torch.Tensor]:
         if hidden_states.ndim != 3:
             hidden_states = hidden_states.unsqueeze(1)
-        return [
-            item.squeeze(1)
-            for item in (self.modulate_table + hidden_states).chunk(
-                self.factor, dim=1
-            )
-        ]
+        return [item.squeeze(1) for item in (self.modulate_table + hidden_states).chunk(self.factor, dim=1)]
 
 
 class JoyImageAttention(nn.Module):
@@ -241,9 +234,7 @@ class JoyImageAttention(nn.Module):
                 dtype=encoder_hidden_states_mask.dtype,
             )
             valid_mask = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)
-            attention_mask = valid_mask[:, None, None, :].to(
-                device=joint_query.device, dtype=torch.bool
-            )
+            attention_mask = valid_mask[:, None, None, :].to(device=joint_query.device, dtype=torch.bool)
 
         joint_hidden_states = F.scaled_dot_product_attention(
             joint_query.transpose(1, 2),
@@ -258,9 +249,7 @@ class JoyImageAttention(nn.Module):
 
         img_attn_output = joint_hidden_states[:, : hidden_states.shape[1], :]
         txt_attn_output = joint_hidden_states[:, hidden_states.shape[1] :, :]
-        return self.img_attn_proj(img_attn_output), self.txt_attn_proj(
-            txt_attn_output
-        )
+        return self.img_attn_proj(img_attn_output), self.txt_attn_proj(txt_attn_output)
 
 
 class JoyImageTransformerBlock(nn.Module):
@@ -322,14 +311,8 @@ class JoyImageTransformerBlock(nn.Module):
 
         img_normed = self.img_norm1(hidden_states)
         txt_normed = self.txt_norm1(encoder_hidden_states)
-        img_modulated = (
-            img_normed * (1 + img_mod1_scale.unsqueeze(1))
-            + img_mod1_shift.unsqueeze(1)
-        )
-        txt_modulated = (
-            txt_normed * (1 + txt_mod1_scale.unsqueeze(1))
-            + txt_mod1_shift.unsqueeze(1)
-        )
+        img_modulated = img_normed * (1 + img_mod1_scale.unsqueeze(1)) + img_mod1_shift.unsqueeze(1)
+        txt_modulated = txt_normed * (1 + txt_mod1_scale.unsqueeze(1)) + txt_mod1_shift.unsqueeze(1)
         img_attn, txt_attn = self.attn(
             hidden_states=img_modulated,
             encoder_hidden_states=txt_modulated,
@@ -338,26 +321,14 @@ class JoyImageTransformerBlock(nn.Module):
         )
 
         hidden_states = hidden_states + img_attn * img_mod1_gate.unsqueeze(1)
-        encoder_hidden_states = (
-            encoder_hidden_states + txt_attn * txt_mod1_gate.unsqueeze(1)
-        )
+        encoder_hidden_states = encoder_hidden_states + txt_attn * txt_mod1_gate.unsqueeze(1)
 
         img_ffn_normed = self.img_norm2(hidden_states)
         txt_ffn_normed = self.txt_norm2(encoder_hidden_states)
-        img_ffn_input = (
-            img_ffn_normed * (1 + img_mod2_scale.unsqueeze(1))
-            + img_mod2_shift.unsqueeze(1)
-        )
-        txt_ffn_input = (
-            txt_ffn_normed * (1 + txt_mod2_scale.unsqueeze(1))
-            + txt_mod2_shift.unsqueeze(1)
-        )
-        hidden_states = hidden_states + self.img_mlp(
-            img_ffn_input
-        ) * img_mod2_gate.unsqueeze(1)
-        encoder_hidden_states = encoder_hidden_states + self.txt_mlp(
-            txt_ffn_input
-        ) * txt_mod2_gate.unsqueeze(1)
+        img_ffn_input = img_ffn_normed * (1 + img_mod2_scale.unsqueeze(1)) + img_mod2_shift.unsqueeze(1)
+        txt_ffn_input = txt_ffn_normed * (1 + txt_mod2_scale.unsqueeze(1)) + txt_mod2_shift.unsqueeze(1)
+        hidden_states = hidden_states + self.img_mlp(img_ffn_input) * img_mod2_gate.unsqueeze(1)
+        encoder_hidden_states = encoder_hidden_states + self.txt_mlp(txt_ffn_input) * txt_mod2_gate.unsqueeze(1)
         return hidden_states, encoder_hidden_states
 
 
@@ -447,9 +418,7 @@ class JoyImageEditTransformer3DModel(nn.Module):
                 rope_dim_list = [base, base, attention_head_dim - base * 2]
         self.rope_dim_list = [int(dim) for dim in rope_dim_list]
         if sum(self.rope_dim_list) != attention_head_dim:
-            raise ValueError(
-                "sum(rope_dim_list) must equal hidden_size // num_attention_heads."
-            )
+            raise ValueError("sum(rope_dim_list) must equal hidden_size // num_attention_heads.")
 
         self.img_in = nn.Conv3d(
             in_channels,
@@ -476,9 +445,7 @@ class JoyImageEditTransformer3DModel(nn.Module):
             ]
         )
         self.norm_out = FP32LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.proj_out = nn.Linear(
-            hidden_size, self.out_channels * math.prod(self.patch_size)
-        )
+        self.proj_out = nn.Linear(hidden_size, self.out_channels * math.prod(self.patch_size))
         self.gradient_checkpointing = False
 
     @classmethod
@@ -504,16 +471,11 @@ class JoyImageEditTransformer3DModel(nn.Module):
     ]:
         target_ndim = 3
         if len(vis_rope_size) != target_ndim:
-            vis_rope_size = [1] * (target_ndim - len(vis_rope_size)) + list(
-                vis_rope_size
-            )
+            vis_rope_size = [1] * (target_ndim - len(vis_rope_size)) + list(vis_rope_size)
 
         grid = torch.stack(
             torch.meshgrid(
-                *[
-                    torch.linspace(0, size, size + 1, dtype=torch.float32)[:size]
-                    for size in vis_rope_size
-                ],
+                *[torch.linspace(0, size, size + 1, dtype=torch.float32)[:size] for size in vis_rope_size],
                 indexing="ij",
             ),
             dim=0,
@@ -523,10 +485,7 @@ class JoyImageEditTransformer3DModel(nn.Module):
         vis_sin: list[torch.Tensor] = []
         for axis, dim in enumerate(self.rope_dim_list):
             pos = grid[axis].reshape(-1)
-            freqs = 1.0 / (
-                self.theta
-                ** (torch.arange(0, dim, 2, dtype=torch.float32)[: dim // 2] / dim)
-            )
+            freqs = 1.0 / (self.theta ** (torch.arange(0, dim, 2, dtype=torch.float32)[: dim // 2] / dim))
             freqs = torch.outer(pos.float(), freqs)
             vis_cos.append(freqs.cos().repeat_interleave(2, dim=1))
             vis_sin.append(freqs.sin().repeat_interleave(2, dim=1))
@@ -539,10 +498,7 @@ class JoyImageEditTransformer3DModel(nn.Module):
         txt_cos: list[torch.Tensor] = []
         txt_sin: list[torch.Tensor] = []
         for dim in self.rope_dim_list:
-            freqs = 1.0 / (
-                self.theta
-                ** (torch.arange(0, dim, 2, dtype=torch.float32)[: dim // 2] / dim)
-            )
+            freqs = 1.0 / (self.theta ** (torch.arange(0, dim, 2, dtype=torch.float32)[: dim // 2] / dim))
             freqs = torch.outer(text_positions.float(), freqs)
             txt_cos.append(freqs.cos().repeat_interleave(2, dim=1))
             txt_sin.append(freqs.sin().repeat_interleave(2, dim=1))
@@ -553,12 +509,8 @@ class JoyImageEditTransformer3DModel(nn.Module):
         channels = self.out_channels
         patch_t, patch_h, patch_w = self.patch_size
         if t * h * w != image_tokens.shape[1]:
-            raise ValueError(
-                f"Expected t*h*w ({t * h * w}) to equal token count ({image_tokens.shape[1]})."
-            )
-        image_tokens = image_tokens.reshape(
-            image_tokens.shape[0], t, h, w, patch_t, patch_h, patch_w, channels
-        )
+            raise ValueError(f"Expected t*h*w ({t * h * w}) to equal token count ({image_tokens.shape[1]}).")
+        image_tokens = image_tokens.reshape(image_tokens.shape[0], t, h, w, patch_t, patch_h, patch_w, channels)
         image_tokens = image_tokens.permute(0, 7, 1, 4, 2, 5, 3, 6)
         return image_tokens.reshape(
             image_tokens.shape[0],
@@ -585,9 +537,7 @@ class JoyImageEditTransformer3DModel(nn.Module):
             if num_items > 1:
                 if self.patch_size[0] != 1:
                     raise ValueError("For multi-item input, patch_size[0] must be 1.")
-                hidden_states = torch.cat(
-                    [hidden_states[:, -1:], hidden_states[:, :-1]], dim=1
-                )
+                hidden_states = torch.cat([hidden_states[:, -1:], hidden_states[:, :-1]], dim=1)
             batch_size, num_items, channels, frames, height, width = hidden_states.shape
             hidden_states = hidden_states.permute(0, 2, 1, 3, 4, 5).reshape(
                 batch_size,
@@ -602,15 +552,9 @@ class JoyImageEditTransformer3DModel(nn.Module):
                 f"(B, N, C, T, H, W), got {tuple(hidden_states.shape)}."
             )
 
-        batch_size, _, original_frames, original_height, original_width = (
-            hidden_states.shape
-        )
+        batch_size, _, original_frames, original_height, original_width = hidden_states.shape
         patch_t, patch_h, patch_w = self.patch_size
-        if (
-            original_frames % patch_t
-            or original_height % patch_h
-            or original_width % patch_w
-        ):
+        if original_frames % patch_t or original_height % patch_h or original_width % patch_w:
             raise ValueError(
                 "Latent shape must be divisible by patch_size; "
                 f"got {(original_frames, original_height, original_width)} and {self.patch_size}."
@@ -622,9 +566,7 @@ class JoyImageEditTransformer3DModel(nn.Module):
         image_tokens = self.img_in(hidden_states).flatten(2).transpose(1, 2)
 
         if not torch.is_tensor(timestep):
-            timestep = torch.tensor(
-                [timestep], device=hidden_states.device, dtype=hidden_states.dtype
-            )
+            timestep = torch.tensor([timestep], device=hidden_states.device, dtype=hidden_states.dtype)
         timestep = timestep.to(device=hidden_states.device).reshape(-1)
         if timestep.numel() == 1:
             timestep = timestep.expand(batch_size)
@@ -645,9 +587,7 @@ class JoyImageEditTransformer3DModel(nn.Module):
             txt_freqs = tuple(item.to(hidden_states.device) for item in txt_freqs)
 
         if encoder_hidden_states_mask is not None:
-            encoder_hidden_states_mask = encoder_hidden_states_mask.to(
-                device=hidden_states.device
-            )
+            encoder_hidden_states_mask = encoder_hidden_states_mask.to(device=hidden_states.device)
 
         for block in self.double_blocks:
             image_tokens, text_tokens = block(
