@@ -455,6 +455,14 @@ class OmniDiffusionConfig:
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = 32
 
+    # KV async H2D copy (Phase 2). Opt-in. When enabled, the diffusion runner
+    # hands a dedicated CUDA stream to the KV transfer manager so the pinned-pool
+    # -> GPU copy of received AR KV overlaps host-side setup before forward. Only
+    # the diffusion runner waits via wait_kv_copy() before consuming the KV, so
+    # it is the only receiver that opts in. Defaults False (synchronous copy);
+    # set True to enable the async path.
+    enable_kv_async_copy: bool = False
+
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None

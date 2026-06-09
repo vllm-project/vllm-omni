@@ -3,7 +3,6 @@
 """Unified OmniConnector and KV cache transfer management."""
 
 import json
-import os
 import struct
 import time
 from collections.abc import Callable
@@ -291,7 +290,7 @@ class OmniKVTransferManager:
     - KV cache receiving with timeout
     """
 
-    def __init__(self, config: OmniKVCacheConfig):
+    def __init__(self, config: OmniKVCacheConfig, *, async_kv_copy: bool = False):
         self.config = config
         self._connector = None
 
@@ -337,16 +336,10 @@ class OmniKVTransferManager:
         self._sender_base_host: str | None = None
         self._sender_base_zmq_port: int | None = None
 
-        # Phase 2: async H2D copy of received KV.  A dedicated stream lets the
-        # ~51ms pinned-pool -> GPU copy overlap host-side setup before forward;
-        # an event gates safe pool-buffer release, deferred until the copy ends.
-        # Opt-in per manager (see enable_async_kv_copy): only callers that wait
-        # via wait_kv_copy() before consuming the KV may enable it.  Disabled by
-        # default so receivers without that handshake keep the sync path.
         self._kv_copy_stream: torch.cuda.Stream | None = None
         self._kv_copy_event: torch.cuda.Event | None = None
         self._kv_inflight_buffers: list[Any] = []
-        self._kv_async_copy = False
+        self._async_kv_copy = async_kv_copy
 
         if config.need_send_cache and config.connector_config:
             try:
@@ -360,10 +353,10 @@ class OmniKVTransferManager:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def _create(cls, cfg: dict | None) -> "OmniKVTransferManager":
+    def _create(cls, cfg: dict | None, *, async_kv_copy: bool = False) -> "OmniKVTransferManager":
         """Create manager from raw config dict."""
         if not cfg or not isinstance(cfg, dict):
-            return cls(OmniKVCacheConfig())
+            return cls(OmniKVCacheConfig(), async_kv_copy=async_kv_copy)
 
         rank_mapping = cfg.get("rank_mapping", {})
         if not isinstance(rank_mapping, dict):
@@ -381,13 +374,22 @@ class OmniKVTransferManager:
                 recv_timeout=cfg.get("recv_timeout", 30.0),
                 from_tp=int(rank_mapping.get("from_tp", 1)),
                 to_tp=int(rank_mapping.get("to_tp", 1)),
-            )
+            ),
+            async_kv_copy=async_kv_copy,
         )
 
     @classmethod
     def from_od_config(cls, config: Any) -> "OmniKVTransferManager":
-        """Create from model or OmniDiffusion config."""
-        return cls._create(getattr(config, "omni_kv_config", None))
+        """Create from model or OmniDiffusion config.
+
+        The diffusion runner waits via wait_kv_copy() before forward, so it is
+        the only construction path that may opt into the async H2D copy; the
+        decision is driven by ``OmniDiffusionConfig.enable_kv_async_copy``.
+        """
+        return cls._create(
+            getattr(config, "omni_kv_config", None),
+            async_kv_copy=bool(getattr(config, "enable_kv_async_copy", False)),
+        )
 
     from_model_config = from_od_config
 
@@ -983,15 +985,6 @@ class OmniKVTransferManager:
 
         return False, 0, None
 
-    def enable_async_kv_copy(self, enabled: bool = True) -> None:
-        """Opt this manager into async H2D copy of received KV (Phase 2).
-
-        Only safe for callers that invoke :meth:`wait_kv_copy` before consuming
-        the KV (currently the diffusion model runner).  ``VLLM_OMNI_KV_ASYNC_COPY=0``
-        force-disables it regardless.
-        """
-        self._kv_async_copy = enabled and os.environ.get("VLLM_OMNI_KV_ASYNC_COPY", "1") != "0"
-
     def _get_kv_copy_stream(self) -> "torch.cuda.Stream | None":
         """Lazily create the dedicated H2D copy stream (CUDA only)."""
         if not torch.cuda.is_available():
@@ -1169,7 +1162,7 @@ class OmniKVTransferManager:
                     # Async H2D only pays off when the source is the pinned pool
                     # (needs_buffer_detach) and the target is a GPU.
                     gpu_async = (
-                        self._kv_async_copy
+                        self._async_kv_copy
                         and copy_stream is not None
                         and target_device is not None
                         and target_device.type != "cpu"
