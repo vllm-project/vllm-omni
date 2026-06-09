@@ -129,6 +129,20 @@ def test_dp_hash_routing_rejected():
         translate_strategy_stack([spec])
 
 
+def test_dp_invalid_routing_policy_rejected():
+    spec = StrategySpec("dp", MeshAxisSpec("dp", 2), RouteByStage("bogus"), Union())
+    with pytest.raises(UnsupportedRouting):
+        translate_strategy_stack([spec])
+
+
+def test_lb_policy_never_in_engine_kwargs_even_when_replicated():
+    # omni_lb_policy is pipeline-wide (applied at engine construction), not a
+    # per-stage engine arg, so it must never leak into as_engine_kwargs().
+    cfg = translate_strategy_stack([_tp(2), _stage_replica(2, "least_queue")])
+    assert cfg.omni_lb_policy == "least-queue-length"
+    assert "omni_lb_policy" not in cfg.as_engine_kwargs()
+
+
 def test_stage_replica_hash_routing_rejected():
     spec = StrategySpec(
         "sr", MeshAxisSpec("stage_replica", 2), RouteByStage("hash"), FanInByStage()

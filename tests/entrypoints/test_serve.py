@@ -31,6 +31,20 @@ def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
     assert not explicit["async_chunk"]
 
 
+def test_serve_parser_accepts_strategy_config() -> None:
+    """``--strategy-config`` must parse onto the ``strategy_config`` dest and be
+    forwarded as an explicit kwarg so the engine can overlay the strategy."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    cmd = OmniServeCommand()
+    cmd.subparser_init(subparsers)
+
+    argv = ["serve", "fake-model", "--omni", "--strategy-config", "/tmp/strategy.yaml"]
+    args = parser.parse_args(argv)
+    assert args.strategy_config == "/tmp/strategy.yaml"
+    assert args.get_explicit_kwargs_dict()["strategy_config"] == "/tmp/strategy.yaml"
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",

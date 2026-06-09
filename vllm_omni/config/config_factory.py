@@ -268,6 +268,7 @@ class StageConfigFactory:
         cli_overrides: dict[str, Any] | None = None,
         deploy_config_path: str | None = None,
         strategy_specs: Mapping[Any, Any] | None = None,
+        strategy_out: dict[str, Any] | None = None,
         **deprecated_kwargs: Any,
     ) -> list[StageConfig] | None:
         """Load pipeline + deploy config, merge with CLI overrides.
@@ -281,6 +282,10 @@ class StageConfigFactory:
         ``StrategySpec``), the derived parallel sizing is overlaid onto the
         merged stages (see ``vllm_omni.config.composable_parallel``). This is
         opt-in: omitting it leaves the existing merge path untouched.
+
+        ``strategy_out`` is an optional mutable dict the caller can pass to
+        receive strategy-derived, pipeline-wide outputs that are *not* per-stage
+        config (currently ``omni_lb_policy``), so the engine can apply them.
         """
         if cli_overrides is None:
             cli_overrides = {}
@@ -297,6 +302,7 @@ class StageConfigFactory:
                 cli_overrides,
                 deploy_config_path,
                 strategy_specs=strategy_specs,
+                strategy_out=strategy_out,
             )
         return None
 
@@ -308,6 +314,7 @@ class StageConfigFactory:
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None = None,
         strategy_specs: Mapping[Any, Any] | None = None,
+        strategy_out: dict[str, Any] | None = None,
         **deprecated_kwargs: Any,
     ) -> list[StageConfig]:
         """Create StageConfigs from pipeline registry + deploy YAML.
@@ -347,12 +354,15 @@ class StageConfigFactory:
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 
         # Overlay declarative parallel strategies (opt-in) before CLI overrides.
-        cls._apply_strategy_specs(stages, strategy_specs)
+        applied = cls._apply_strategy_specs(stages, strategy_specs, strategy_out)
 
         explicit_overrides = {k: v for k, v in cli_overrides.items() if v is not None}
 
         for stage in stages:
             stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
+
+        # Re-validate the resolved layout now that CLI overrides are on top.
+        cls._reconcile_strategy_with_cli(stages, applied)
 
         return stages
 
@@ -360,23 +370,97 @@ class StageConfigFactory:
     def _apply_strategy_specs(
         stages: list[StageConfig],
         strategy_specs: Mapping[Any, Any] | None,
-    ) -> None:
+        strategy_out: dict[str, Any] | None = None,
+    ) -> Any:
         """Overlay derived parallel sizing onto merged stages (opt-in).
 
         ``omni_lb_policy`` cannot be set from stage configs (omni reads it once
-        at engine construction), so a derived non-default policy is logged for
-        the caller to pass via ``--omni-lb-policy``.
+        at engine construction), so a derived non-default policy is surfaced via
+        ``strategy_out`` (when provided) for the engine to apply, and logged.
+
+        Returns the ``StrategyApplyResult`` (or ``None`` when no strategy was
+        supplied) so the caller can re-validate the resolved layout once CLI
+        overrides have been merged on top.
         """
         if not strategy_specs:
-            return
+            return None
         from vllm_omni.config.composable_parallel import apply_strategy_specs
 
         applied = apply_strategy_specs(stages, strategy_specs)
         if applied.omni_lb_policy is not None:
+            if strategy_out is not None:
+                strategy_out["omni_lb_policy"] = applied.omni_lb_policy
             logger.info(
-                "[composable_parallel] strategy derived omni_lb_policy=%r; pass it via "
-                "--omni-lb-policy (it is an engine-level knob, not a per-stage config field).",
+                "[composable_parallel] strategy derived omni_lb_policy=%r; it will be applied "
+                "to the engine unless an explicit --omni-lb-policy was given.",
                 applied.omni_lb_policy,
+            )
+        return applied
+
+    @staticmethod
+    def _reconcile_strategy_with_cli(
+        stages: list[StageConfig],
+        applied: Any,
+    ) -> None:
+        """Reconcile CLI overrides applied *after* a strategy overlay.
+
+        CLI overrides are applied last (in ``to_omegaconf``), so for any stage a
+        strategy touched we must (a) warn loudly when a CLI arg overrides a
+        strategy-declared axis — the strategy is meant to be the single writer
+        for the axes it declares, so a silent CLI win is surprising — and
+        (b) re-run the device-count check against the *effective* (post-CLI)
+        ``tp``/``dp``/``pp``/``num_replicas``/``devices`` so a CLI
+        ``--devices``/``--tensor-parallel-size``/``--num-replicas`` cannot slip
+        past the pre-spawn guard that exists to prevent silent OOMs.
+        """
+        if applied is None:
+            return
+        from vllm_omni.config.composable_parallel import check_device_layout
+
+        # Axis kind -> (engine-arg field, strategy-derived attribute on the cfg).
+        axis_fields = {
+            "tp": ("tensor_parallel_size", "tensor_parallel_size"),
+            "dp": ("data_parallel_size", "data_parallel_size"),
+            "pp": ("pipeline_parallel_size", "pipeline_parallel_size"),
+        }
+
+        for stage in stages:
+            cfg = applied.per_stage_config.get(stage.stage_id)
+            if cfg is None:
+                continue
+            overrides = stage.runtime_overrides or {}
+            declared = set(cfg.l1_owners.keys())
+
+            for kind, (field_name, attr) in axis_fields.items():
+                if kind in declared and overrides.get(field_name) is not None:
+                    cli_val = overrides[field_name]
+                    derived = getattr(cfg, attr)
+                    if cli_val != derived:
+                        logger.warning(
+                            "[composable_parallel] stage %s: CLI %s=%s overrides the "
+                            "strategy-derived %s=%s. The CLI value wins; remove one to avoid ambiguity.",
+                            stage.stage_id, field_name, cli_val, field_name, derived,
+                        )
+            if "stage_replica" in declared and overrides.get("num_replicas") is not None:
+                cli_val = overrides["num_replicas"]
+                if cli_val != cfg.stage_replica_size:
+                    logger.warning(
+                        "[composable_parallel] stage %s: CLI num_replicas=%s overrides the "
+                        "strategy-derived num_replicas=%s. The CLI value wins; remove one to avoid ambiguity.",
+                        stage.stage_id, cli_val, cfg.stage_replica_size,
+                    )
+
+            def _eff(field_name: str, fallback: Any) -> Any:
+                val = overrides.get(field_name)
+                return val if val is not None else fallback
+
+            check_device_layout(
+                _eff("devices", stage.yaml_runtime.get("devices")),
+                tensor_parallel_size=int(_eff("tensor_parallel_size", stage.yaml_engine_args.get("tensor_parallel_size", 1)) or 1),
+                data_parallel_size=int(_eff("data_parallel_size", stage.yaml_engine_args.get("data_parallel_size", 1)) or 1),
+                pipeline_parallel_size=int(_eff("pipeline_parallel_size", stage.yaml_engine_args.get("pipeline_parallel_size", 1)) or 1),
+                num_replicas=int(_eff("num_replicas", stage.yaml_runtime.get("num_replicas", 1)) or 1),
+                role=stage.model_stage,
             )
 
     @classmethod

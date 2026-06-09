@@ -1123,6 +1123,35 @@ class AsyncOmniEngine:
 
         return result
 
+    def _apply_strategy_lb_policy(self, derived: str | None, kwargs: dict[str, Any]) -> None:
+        """Apply a strategy-derived ``omni_lb_policy`` to the engine.
+
+        Precedence: an explicit ``--omni-lb-policy`` always wins. ``"random"`` is
+        the engine default and is treated as "unset" (indistinguishable from no
+        flag), so a strategy value overrides it. If the user explicitly passed a
+        non-default policy that conflicts with the strategy-derived one, raise so
+        the mismatch is not silently ignored.
+        """
+        if not derived:
+            return
+        explicit = kwargs.get("omni_lb_policy")
+        user_set = explicit is not None and str(explicit) != "random"
+        if user_set:
+            if str(explicit) != str(derived):
+                raise ValueError(
+                    f"Conflicting load-balancer policy: --omni-lb-policy={explicit!r} was given "
+                    f"but the composable-parallel strategy derived omni_lb_policy={derived!r}. "
+                    "Drop --omni-lb-policy to use the strategy value, or make them match."
+                )
+            return
+        if self._omni_lb_policy != str(derived):
+            logger.info(
+                "[composable_parallel] applying strategy-derived omni_lb_policy=%r (was %r).",
+                derived,
+                self._omni_lb_policy,
+            )
+            self._omni_lb_policy = str(derived)
+
     def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
@@ -1155,6 +1184,7 @@ class AsyncOmniEngine:
             else:
                 stage_overrides = stage_overrides_json
 
+        strategy_out: dict[str, Any] = {}
         config_path, stage_configs = load_and_resolve_stage_configs(
             model,
             stage_configs_path,
@@ -1163,7 +1193,13 @@ class AsyncOmniEngine:
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
+            strategy_out=strategy_out,
         )
+
+        # A strategy.yaml may derive a pipeline-wide load-balancer policy. It is
+        # an engine-level knob (read once at construction), so apply it here
+        # rather than as a per-stage config field.
+        self._apply_strategy_lb_policy(strategy_out.get("omni_lb_policy"), kwargs)
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
         for cfg in stage_configs:

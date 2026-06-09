@@ -132,7 +132,15 @@ def parse_strategy_specs(data: Mapping[str, Any]) -> dict[str, list[StrategySpec
             raise StrategyYamlError(
                 f"role {role!r}: expected a list of axis declarations, got {type(entries).__name__}"
             )
-        result[str(role)] = [_build_spec(str(role), dict(entry)) for entry in entries]
+        specs: list[StrategySpec] = []
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                raise StrategyYamlError(
+                    f"role {role!r}: each axis declaration must be a mapping, got "
+                    f"{type(entry).__name__}"
+                )
+            specs.append(_build_spec(str(role), dict(entry)))
+        result[str(role)] = specs
     return result
 
 

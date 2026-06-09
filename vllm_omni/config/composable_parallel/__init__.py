@@ -26,13 +26,13 @@ from vllm_omni.config.composable_parallel.aggregation import (
     Union,
 )
 from vllm_omni.config.composable_parallel.apply import (
-    STRATEGY_ROLE_REGISTRY,
     StrategyApplyError,
     StrategyApplyResult,
     StrategyConflictError,
     StrategyDeviceMismatchError,
     StrategyRoleError,
     apply_strategy_specs,
+    check_device_layout,
 )
 from vllm_omni.config.composable_parallel.routing import (
     ROUTING_PATTERN_VARIANTS,
@@ -110,7 +110,7 @@ __all__ = [
     # apply
     "apply_strategy_specs",
     "StrategyApplyResult",
-    "STRATEGY_ROLE_REGISTRY",
+    "check_device_layout",
     "StrategyApplyError",
     "StrategyRoleError",
     "StrategyConflictError",

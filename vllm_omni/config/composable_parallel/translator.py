@@ -147,20 +147,22 @@ class OmniParallelConfig:
         return tuple(kind for kind, owner in self.l1_owners.items() if owner == "delegated")
 
     def as_engine_kwargs(self) -> Dict[str, object]:
-        """Return kwargs keyed by real OmniEngineArgs/EngineArgs field names.
+        """Return per-stage kwargs keyed by real OmniEngineArgs/EngineArgs field names.
 
-        Note ``stage_replica_size`` is intentionally *not* emitted here: it is a
-        per-stage deploy ``num_replicas`` knob (``StageDeployConfig``), not an
-        ``OmniEngineArgs`` field. The deploy layer consumes it separately.
+        Two derived values are intentionally *not* emitted here because they are
+        not per-stage engine args:
+
+        * ``stage_replica_size`` — a per-stage deploy ``num_replicas`` knob
+          (``StageDeployConfig``); the deploy layer consumes it separately.
+        * ``omni_lb_policy`` — a pipeline-wide load-balancer policy the engine
+          reads once at construction (see ``StrategyApplyResult.omni_lb_policy``);
+          it is applied at the engine level, not folded into per-stage args.
         """
         kwargs: Dict[str, object] = {
             "tensor_parallel_size": self.tensor_parallel_size,
             "data_parallel_size": self.data_parallel_size,
             "pipeline_parallel_size": self.pipeline_parallel_size,
         }
-        if self.stage_replica_size > 1 and self.omni_lb_policy is not None:
-            # Hand replica routing to omni's StagePool load balancer.
-            kwargs["omni_lb_policy"] = self.omni_lb_policy
         if self.enable_expert_parallel:
             kwargs["enable_expert_parallel"] = True
         return kwargs
@@ -213,6 +215,12 @@ def _validate_dp(spec: StrategySpec, owner: str) -> None:
         raise AxisTranslationError(
             f"dp axis {spec.name!r} expects RouteByStage(random|round_robin|least_queue) routing, "
             f"got {type(spec.routing).__name__}"
+        )
+    if spec.routing.routing_policy not in _STAGE_POLICY_TO_OMNI_LB:
+        raise UnsupportedRouting(
+            f"dp axis {spec.name!r} has unsupported routing_policy "
+            f"{spec.routing.routing_policy!r}; expected one of "
+            f"{sorted(_STAGE_POLICY_TO_OMNI_LB)}."
         )
 
 

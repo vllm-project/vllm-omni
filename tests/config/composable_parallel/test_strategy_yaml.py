@@ -75,6 +75,13 @@ def test_entries_must_be_list():
         parse_strategy_specs({"thinker": {"axis": "tp", "size": 2}})
 
 
+def test_non_mapping_entry_raises():
+    # A list whose elements are not mappings (e.g. a bare string) must raise a
+    # StrategyYamlError, not an opaque TypeError from dict(entry).
+    with pytest.raises(StrategyYamlError):
+        parse_strategy_specs({"thinker": ["tp"]})
+
+
 def test_load_from_file(tmp_path):
     path = tmp_path / "strategy.yaml"
     path.write_text(

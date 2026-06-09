@@ -255,6 +255,14 @@ class OmniServeCommand(CLISubcommand):
             "Mutually exclusive with --stage-configs-path.",
         )
         omni_config_group.add_argument(
+            "--strategy-config",
+            type=str,
+            default=None,
+            help="Path to a composable-parallel strategy.yaml. Its derived parallel "
+            "sizing is overlaid onto the registry-merged stages before per-stage "
+            "engine args are built (opt-in; ignored on the legacy YAML path).",
+        )
+        omni_config_group.add_argument(
             "--stage-overrides",
             type=str,
             default=None,
@@ -807,6 +815,7 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_configs_path,
         args_dict,
         deploy_config_path=args_dict.get("deploy_config"),
+        strategy_config_path=args_dict.get("strategy_config"),
     )
 
     # Locate the stage config that matches stage_id.

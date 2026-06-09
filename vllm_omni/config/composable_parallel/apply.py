@@ -37,15 +37,6 @@ from vllm_omni.config.composable_parallel.translator import (
     translate_strategy_stack,
 )
 
-# Canonical logical roles for known omni pipelines (role name -> stage_id).
-# Resolution below keys primarily on a stage's ``model_stage`` string; this
-# registry documents the supported roles and lets callers/tests validate names.
-STRATEGY_ROLE_REGISTRY: dict[str, dict[str, int]] = {
-    "qwen2_5_omni": {"thinker": 0, "talker": 1, "code2wav": 2},
-    "qwen2_5_omni_thinker_only": {"thinker": 0},
-    "qwen3_omni_moe": {"thinker": 0, "talker": 1, "code2wav": 2},
-}
-
 # Role key -> the StageConfig fields each declared axis writes.
 _ENGINE_FIELD_BY_KIND: dict[str, str] = {
     "tp": "tensor_parallel_size",
@@ -81,11 +72,17 @@ class StrategyApplyResult:
     derived from any stage_replica axes (``None`` if none declared one); the
     caller wires it into the engine, since omni does not read it from stage
     configs.
+
+    ``per_role_config`` is keyed by the role key the caller supplied (which may
+    be a ``model_stage`` string or a ``stage_id`` int). ``per_stage_config`` is
+    the same information keyed by the resolved integer ``stage_id`` — handy for
+    re-validating a stage after later layers (e.g. CLI overrides) have run.
     """
 
     stages: list[Any]
     omni_lb_policy: str | None = None
     per_role_config: dict[RoleKey, OmniParallelConfig] = field(default_factory=dict)
+    per_stage_config: dict[int, OmniParallelConfig] = field(default_factory=dict)
 
 
 def _resolve_stage(stages: Sequence[Any], key: RoleKey) -> Any:
@@ -149,13 +146,27 @@ def _parse_device_count(devices: Any) -> int | None:
     return len([d for d in text.split(",") if d.strip()])
 
 
-def _check_devices(runtime: dict[str, Any], cfg: OmniParallelConfig, *, role: RoleKey) -> None:
-    """Pre-spawn check: device count must match world_size (× replicas in pool mode)."""
-    count = _parse_device_count(runtime.get("devices"))
+def check_device_layout(
+    devices: Any,
+    *,
+    tensor_parallel_size: int,
+    data_parallel_size: int,
+    pipeline_parallel_size: int,
+    num_replicas: int,
+    role: RoleKey,
+) -> None:
+    """Validate a stage's device count against its world size (× replicas in pool mode).
+
+    Raises :class:`StrategyDeviceMismatchError` when the declared ``devices``
+    count is neither the per-replica world size nor the full ``num_replicas``
+    pool. Exposed publicly so the resolved (post-CLI) layout can be re-checked
+    after later override layers, not just the strategy-derived snapshot.
+    """
+    count = _parse_device_count(devices)
     if count is None:
         return
-    world = cfg.world_size
-    replicas = int(runtime.get("num_replicas", 1) or 1)
+    world = int(tensor_parallel_size) * int(data_parallel_size) * int(pipeline_parallel_size)
+    replicas = int(num_replicas or 1)
     # Two valid shapes: a single per-replica template (== world) or the full
     # pool across replicas (== replicas * world). This mirrors omni's own
     # per-replica device splitter.
@@ -163,10 +174,22 @@ def _check_devices(runtime: dict[str, Any], cfg: OmniParallelConfig, *, role: Ro
     if count not in valid:
         raise StrategyDeviceMismatchError(
             f"role {role!r}: declared {count} device id(s) but the strategy world size is {world} "
-            f"(tp={cfg.tensor_parallel_size} * dp={cfg.data_parallel_size} * pp={cfg.pipeline_parallel_size}). "
+            f"(tp={tensor_parallel_size} * dp={data_parallel_size} * pp={pipeline_parallel_size}). "
             f"Provide either {world} (per-replica template) or {replicas * world} "
             f"(num_replicas={replicas} pool)."
         )
+
+
+def _check_devices(runtime: dict[str, Any], cfg: OmniParallelConfig, *, role: RoleKey) -> None:
+    """Pre-spawn check on the strategy-derived snapshot (see :func:`check_device_layout`)."""
+    check_device_layout(
+        runtime.get("devices"),
+        tensor_parallel_size=cfg.tensor_parallel_size,
+        data_parallel_size=cfg.data_parallel_size,
+        pipeline_parallel_size=cfg.pipeline_parallel_size,
+        num_replicas=int(runtime.get("num_replicas", 1) or 1),
+        role=role,
+    )
 
 
 def _apply_to_stage(stage: Any, cfg: OmniParallelConfig, *, role: RoleKey) -> None:
@@ -217,6 +240,9 @@ def apply_strategy_specs(
         cfg = translate_strategy_stack(specs)
         _apply_to_stage(stage, cfg, role=key)
         result.per_role_config[key] = cfg
+        stage_id = getattr(stage, "stage_id", None)
+        if stage_id is not None:
+            result.per_stage_config[int(stage_id)] = cfg
 
         if cfg.stage_replica_size > 1 and cfg.omni_lb_policy is not None:
             if lb_policy is not None and lb_policy != cfg.omni_lb_policy:
