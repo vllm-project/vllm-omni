@@ -88,7 +88,7 @@ class MoshiDepthConfig(PretrainedConfig):
         num_codebooks: int = 8,
         norm_type: str = "rms_norm",
         weights_per_step_schedule: list[int] | None = None,
-        cuda_graphs: bool = False,
+        use_kv_cache: bool = False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -109,7 +109,7 @@ class MoshiDepthConfig(PretrainedConfig):
         self.num_codebooks = num_codebooks
         self.norm_type = norm_type  # "rms_norm" (moshi) or "layer_norm" (hibiki)
         self.weights_per_step_schedule = weights_per_step_schedule  # e.g. [0,1,...,8,8,...,8]
-        self.cuda_graphs = cuda_graphs
+        self.use_kv_cache = use_kv_cache
         super().__init__(**kwargs)
 
 

@@ -295,8 +295,8 @@ class MoshiTTSTalkerForConditionalGeneration(nn.Module):
             pad_token_id=self._audio_vocab_size,
         )
 
-        self.depth_config.cuda_graphs = False  # MVP: disable until parity validated
         self.depth_decoder = MoshiDepthDecoder(self.depth_config)
+        self.depth_decoder.enable_compile()
 
         self._token_ids = TokenIds(card=self._text_card + 1)
         self._machine = StateMachine(

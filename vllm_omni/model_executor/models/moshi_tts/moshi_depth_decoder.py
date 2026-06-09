@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .configuration_moshi import MoshiDepthConfig
+from .profiling import nvtx_annotate
 
 logger = logging.getLogger(__name__)
 
@@ -329,20 +330,17 @@ class MoshiDepthDecoder(nn.Module):
         self._embed_buf: torch.Tensor | None = None
         self._weight_indices: torch.Tensor | None = None
 
-        # KV cache mode flag
-        self._use_kv_cache: bool = config.cuda_graphs
+        # KV cache mode flag. KV cache is a prerequisite for the full-depth
+        # body (and therefore for torch.compile).
+        self._use_kv_cache: bool = config.use_kv_cache
 
-        # CUDA graph state (lazily initialized)
-        self._cuda_graphs_enabled: bool = False
-        self._cuda_graphs_max_bsz: int = 0
-        self._cuda_graphs_ready: bool = False
+        # torch.compile wrapping of ``_full_depth_decode_body``.
         self._use_torch_compile: bool = False
-        # Per-step graphs: _step_graphs[step][padded_bsz] = (graph, static_output)
-        self._step_graphs: list[dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]]] = []
-        self._bucket_sizes: list[int] = []
-        # Stored tensors to prevent GC (CUDA graphs reference this memory)
-        self._full_weight_indices: torch.Tensor | None = None
-        self._compiled_run_layers_cached: callable | None = None
+        self._compiled_full_depth_decode: Callable[..., torch.Tensor] | None = None
+        # Pinned-at-init scalar buffers for the outer-capture path. Lazy-
+        # allocated on first eager call so they exist before any capture.
+        self._inv_temp_buf: torch.Tensor | None = None
+        self._top_p_buf: torch.Tensor | None = None
 
     def _map_step_to_weight_idx(self, step_positions: torch.Tensor) -> torch.Tensor:
         """Map step indices to weight indices via the schedule (if present)."""
@@ -382,121 +380,33 @@ class MoshiDepthDecoder(nn.Module):
         return hidden_states
 
     # ------------------------------------------------------------------
-    #  CUDA graph support (on top of KV cache)
+    #  Outer-capture configuration
     # ------------------------------------------------------------------
 
-    def enable_cuda_graphs(self, max_batch_size: int, *, compile: bool = False) -> None:
-        """Enable KV cache + CUDA graphs, optionally with torch.compile.
+    def enable_compile(self) -> None:
+        """Wrap ``_full_depth_decode_body`` with ``torch.compile``.
 
-        Args:
-            max_batch_size: Maximum batch size for graph capture buckets.
-            compile: If True, also use torch.compile for kernel fusion.
-                     Adds warmup time but gives additional speedup (~2x on
-                     top of CUDA graphs alone).
+        The compiled body is recorded into vllm-omni's outer
+        ``CUDAGraphWrapper`` (``MoshiMainTransformerForConditionalGeneration.talker_mtp_graph_safe``)
+        on first capture. KV cache is a prerequisite (the compiled body uses
+        ``_run_layers_cached``), so it is forced on here.
         """
         self._use_kv_cache = True
-        self._cuda_graphs_enabled = True
-        self._cuda_graphs_max_bsz = max_batch_size
-        self._use_torch_compile = compile
-        logger.info(
-            "Depth decoder: CUDA graphs enabled (max_batch_size=%d, compile=%s)",
-            max_batch_size,
-            compile,
-        )
+        self._use_torch_compile = True
+        logger.info("Depth decoder: torch.compile enabled for full-depth body")
 
-    def _padded_bsz(self, bsz: int) -> int:
-        for bucket in self._bucket_sizes:
-            if bsz <= bucket:
-                return bucket
-        return bsz
+    def _get_full_depth_run_fn(self) -> Callable[..., torch.Tensor]:
+        if not self._use_torch_compile:
+            return self._full_depth_decode_body
 
-    def _setup_cuda_graphs(self) -> None:
-        """Capture per-step CUDA graphs for KV-cached _run_layers_cached.
-
-        With KV cache, each step processes [bsz, 1, hidden] — fixed shape.
-        We capture one graph per (step, bucket) to also fix the step-dependent
-        weight_idx and KV cache write position.
-
-        torch.compile is used with dynamic=False since all graphs share the
-        same [bsz, 1, hidden] input shape (only weight_idx differs, which
-        is a captured constant).
-        """
-        if self._cuda_graphs_ready or not self._cuda_graphs_enabled:
-            return
-
-        device = self._embed_buf.device
-        if device.type != "cuda":
-            logger.warning("Depth decoder: CUDA graphs require CUDA device")
-            self._cuda_graphs_enabled = False
-            return
-
-        num_cb = self.num_codebooks
-        max_bsz = self._cuda_graphs_max_bsz
-        self._bucket_sizes = sorted({1 << i for i in range(max_bsz.bit_length()) if (1 << i) <= max_bsz} | {max_bsz})
-
-        # Store weight indices as instance attr to prevent GC
-        self._full_weight_indices = self._map_step_to_weight_idx(self._weight_indices[: self.num_codebooks])
-
-        if self._use_torch_compile:
-            # Raise recompile limit: dynamic=False specializes on `step` int
-            # (KV cache slice step:step+1) AND batch size, so needs
-            # num_codebooks × num_buckets specializations.
-            torch._dynamo.config.cache_size_limit = max(
-                torch._dynamo.config.cache_size_limit, num_cb * len(self._bucket_sizes) + 4
-            )
-            self._compiled_run_layers_cached = torch.compile(
-                self._run_layers_cached,
+        if self._compiled_full_depth_decode is None:
+            self._compiled_full_depth_decode = torch.compile(
+                self._full_depth_decode_body,
                 dynamic=False,
                 options={"epilogue_fusion": False},
             )
-            run_fn = self._compiled_run_layers_cached
-            logger.info("Depth decoder: using torch.compile for CUDA graph capture")
-        else:
-            run_fn = self._run_layers_cached
-            self._compiled_run_layers_cached = run_fn
-
-        # Ensure KV caches are allocated for max batch size
-        self._init_kv_caches(max_bsz, device, self._embed_buf.dtype)
-
-        # Pre-allocate a static input buffer for graph capture
-        # (embed_buf position 0 is reused as the static input for all steps)
-        static_embed = torch.zeros(max_bsz, 1, self.hidden_size, device=device, dtype=self._embed_buf.dtype)
-
-        # Warmup: run forward for each (step, bucket) to trigger compilation
-        for step in range(num_cb):
-            wi = int(self._full_weight_indices[step].item())
-            for bsz in self._bucket_sizes:
-                for _ in range(3):
-                    run_fn(static_embed[:bsz], wi, step)
-        torch.cuda.synchronize(device)
-        logger.info("Depth decoder: warmup done (%d steps × %d buckets)", num_cb, len(self._bucket_sizes))
-
-        # Capture per-step CUDA graphs
-        try:
-            from vllm.platforms import current_platform
-
-            pool = current_platform.get_global_graph_pool()
-        except (ImportError, AttributeError):
-            pool = None
-
-        capture_kwargs = {"pool": pool} if pool is not None else {}
-        self._step_graphs = []
-        for step in range(num_cb):
-            wi = int(self._full_weight_indices[step].item())
-            step_graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
-            for bsz in self._bucket_sizes:
-                inp = static_embed[:bsz]
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, **capture_kwargs):
-                    out = run_fn(inp, wi, step)
-                step_graphs[bsz] = (graph, out)
-            self._step_graphs.append(step_graphs)
-
-        # Store static_embed so it stays alive and we can write into it before replay
-        self._static_embed = static_embed
-
-        self._cuda_graphs_ready = True
-        logger.info("Depth decoder: captured %d CUDA graphs", num_cb * len(self._bucket_sizes))
+            logger.info("Depth decoder: torch.compile wrapper installed for full-depth body")
+        return self._compiled_full_depth_decode
 
     # ------------------------------------------------------------------
     #  Re-prefill AR step (original path)
@@ -635,51 +545,129 @@ class MoshiDepthDecoder(nn.Module):
         return logits
 
     # ------------------------------------------------------------------
-    #  CUDA graph + KV cache AR step
+    #  Full-depth decode body (torch.compile / outer graph capture)
     # ------------------------------------------------------------------
 
-    def _ar_step_cuda_graph(
+    def _full_depth_decode_body(
         self,
-        step: int,
-        bsz: int,
-        padded_bsz: int,
         main_hidden: torch.Tensor,
         text_token_id: torch.Tensor,
-        prev_code: torch.Tensor | None,
+        inv_temperature: torch.Tensor,
+        top_p: torch.Tensor,
+        use_sampling: bool,
+        top_k: int,
+        top_p_enabled: bool,
     ) -> torch.Tensor:
-        """Run one AR step using CUDA graph replay (KV cache + F.linear)."""
-        wi = self._get_weight_idx_int(step)
+        """Run the whole depth AR loop for CUDA graph capture/replay."""
+        bsz = main_hidden.shape[0]
+        all_codes = torch.empty(bsz, self.num_codebooks, dtype=torch.long, device=main_hidden.device)
 
-        # Embed single position via F.linear
-        proj = self.input_projections.forward_single(main_hidden, wi)
-        if step == 0:
-            embed = self._text_embed(text_token_id) + proj
-        else:
-            embed = self.embed_tokens[step - 1](prev_code) + proj
+        for step in range(self.num_codebooks):
+            wi = self._get_weight_idx_int(step)
+            proj = self.input_projections.forward_single(main_hidden, wi)
+            if step == 0:
+                embed = self._text_embed(text_token_id) + proj
+            else:
+                embed = self.embed_tokens[step - 1](all_codes[:, step - 1]) + proj
 
-        # Copy into static buffer and replay graph
-        graph_entry = self._step_graphs[step].get(padded_bsz)
-        if graph_entry is not None:
-            self._static_embed[:bsz, 0, :] = embed
-            if padded_bsz > bsz:
-                self._static_embed[bsz:padded_bsz, 0, :].zero_()
-            graph_entry[0].replay()
-            hidden_out = graph_entry[1][:bsz]
-        else:
             hidden_out = self._run_layers_cached(embed.unsqueeze(1), wi, step)
+            last_h = hidden_out.squeeze(1)
+            if self.output_norms is not None:
+                last_h = self.output_norms[step](last_h.unsqueeze(1)).squeeze(1)
+            logits = self.lm_heads.forward_single(last_h, step)
+            all_codes[:, step] = self._sample_graph(
+                logits,
+                use_sampling,
+                inv_temperature,
+                top_k,
+                top_p,
+                top_p_enabled,
+            ).reshape(bsz)
 
-        # Extract logits via F.linear
-        last_h = hidden_out.squeeze(1)  # [B, H]
-        if self.output_norms is not None:
-            last_h = self.output_norms[step](last_h.unsqueeze(1)).squeeze(1)
-        logits = self.lm_heads.forward_single(last_h, step)
-        return logits
+        return all_codes
+
+    @staticmethod
+    def _sample_graph(
+        logits: torch.Tensor,
+        use_sampling: bool,
+        inv_temperature: torch.Tensor,
+        top_k: int,
+        top_p: torch.Tensor,
+        top_p_enabled: bool,
+    ) -> torch.Tensor:
+        """Graph-capturable sampling variant with shape-affecting args fixed."""
+        if not use_sampling:
+            return logits.argmax(dim=-1, keepdim=True)
+
+        scaled = logits * inv_temperature
+        if top_k > 0:
+            topk_vals, _ = scaled.topk(top_k, dim=-1)
+            scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+        if top_p_enabled:
+            sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            sorted_mask = cumulative_probs - sorted_probs >= top_p
+            sorted_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
+            scaled = sorted_logits.scatter(1, sorted_indices, sorted_logits)
+        probs = F.softmax(scaled, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
+    def _run_full_depth_body_direct(
+        self,
+        *,
+        main_hidden: torch.Tensor,
+        text_token_id: torch.Tensor,
+        use_sampling: bool,
+        inv_temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> torch.Tensor:
+        """Call (compiled) ``_full_depth_decode_body`` without internal capture.
+
+        Used when an outer ``CUDAGraphWrapper`` is wrapping the call site:
+        the body's kernels get recorded into the outer graph rather than an
+        internal one. KV caches and embedding buffers must already be sized
+        for ``bsz`` — caller is responsible (we call ``_init_kv_caches`` here
+        defensively).
+
+        Sampling scalars (``inv_temperature``, ``top_p``) are wrapped in 0-D
+        buffers that are allocated and filled exactly once, on the first
+        eager call. Per-call ``torch.tensor(scalar, device=cuda)`` would do
+        a host→device copy that ``cudaStreamBeginCapture`` forbids. Since
+        the values are pinned at the main-transformer level
+        (``resolve_depth_sampling_kwargs``), capturing the storage once is
+        correct forever.
+        """
+        bsz = main_hidden.shape[0]
+        device = main_hidden.device
+        dtype = main_hidden.dtype
+        self._ensure_buffers(bsz, device, dtype)
+        self._init_kv_caches(bsz, device, dtype)
+
+        if self._inv_temp_buf is None or self._inv_temp_buf.device != device:
+            self._inv_temp_buf = torch.empty((), device=device, dtype=torch.float32)
+            self._top_p_buf = torch.empty((), device=device, dtype=torch.float32)
+            self._inv_temp_buf.fill_(inv_temperature)
+            self._top_p_buf.fill_(top_p)
+
+        run_fn = self._get_full_depth_run_fn()
+        return run_fn(
+            main_hidden,
+            text_token_id,
+            self._inv_temp_buf,
+            self._top_p_buf,
+            use_sampling,
+            top_k,
+            top_p < 1.0,
+        )
 
     # ------------------------------------------------------------------
     #  Main forward
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
+    @nvtx_annotate("moshi.model.depth_transformer.forward")
     def forward(
         self,
         main_hidden: torch.Tensor,
@@ -716,15 +704,19 @@ class MoshiDepthDecoder(nn.Module):
         use_sampling = do_sample and temperature > 0
         inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
 
-        if self._cuda_graphs_enabled:
-            self._init_kv_caches(max(bsz, self._cuda_graphs_max_bsz), device, dtype)
-            self._setup_cuda_graphs()
-            padded_bsz = self._padded_bsz(bsz) if self._cuda_graphs_ready else bsz
-            for step in range(num_cb):
-                prev_code = all_codes[:, step - 1] if step > 0 else None
-                logits = self._ar_step_cuda_graph(step, bsz, padded_bsz, main_hidden, text_token_id, prev_code)
-                all_codes[:, step] = self._sample(logits, use_sampling, inv_temperature, top_k, top_p).reshape(bsz)
-        elif self._use_kv_cache:
+        if self._use_kv_cache and self._use_torch_compile:
+            # Outer-capture mode: the compiled full-depth body is recorded
+            # into vllm-omni's ``CUDAGraphWrapper`` on first call.
+            return self._run_full_depth_body_direct(
+                main_hidden=main_hidden,
+                text_token_id=text_token_id,
+                use_sampling=use_sampling,
+                inv_temperature=inv_temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+
+        if self._use_kv_cache:
             self._init_kv_caches(bsz, device, dtype)
             for step in range(num_cb):
                 prev_code = all_codes[:, step - 1] if step > 0 else None
