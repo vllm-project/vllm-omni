@@ -209,7 +209,7 @@ walkthroughs, see:
 
 - [Text-to-Video](../user_guide/examples/online_serving/text_to_video.md)
 - [Image-to-Video](../user_guide/examples/online_serving/image_to_video.md)
-- [Speech-to-Video](../../examples/online_serving/speech_to_video/README.md)
+- [Speech-to-Video](../user_guide/examples/online_serving/speech_to_video.md)
   for Wan2.2-S2V audio-driven lip-sync generation
 - [Cosmos3 recipes](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano.md)
   for model-specific video-to-video examples and conditioning controls

@@ -224,7 +224,7 @@ async def decode_audio_url(audio_url: str) -> str:
             suffix = ".mp3"
         elif ext == "wav":
             suffix = ".wav"
-        else:
+        elif ext.isalnum() and len(ext) <= 8:
             suffix = f".{ext}"
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
