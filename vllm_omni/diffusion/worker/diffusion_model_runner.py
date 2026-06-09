@@ -101,8 +101,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def load_model(
         self,
         memory_pool_context_fn: callable | None = None,
-        load_format: str | None = None,
-        custom_pipeline_name: str | type | None = None,
+        load_format: str = "default",
+        custom_pipeline_name: str | None = None,
     ) -> None:
         """
         Load the diffusion model, apply compilation and offloading.
@@ -138,7 +138,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         with get_memory_context():
             with DeviceMemoryProfiler() as m:
                 self.pipeline = model_loader.load_model(
-                    od_config=self.od_config,
                     load_device=load_device,
                     load_format=load_format,
                     custom_pipeline_name=custom_pipeline_name,

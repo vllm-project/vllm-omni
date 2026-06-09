@@ -135,7 +135,25 @@ def talker2code2wav(
         codes_qt = audio_codes.transpose(0, 1).contiguous().cpu()
 
         # Step 1: Revert delay pattern
-        codes_qt = _revert_delay_pattern(codes_qt)
+        try:
+            codes_qt = _revert_delay_pattern(codes_qt)
+        except ValueError:
+            logger.warning(
+                "Skipping request: insufficient frames for delay pattern "
+                "reversal (T=%d < Q=%d). This is a request-level error, "
+                "not a server-fatal condition.",
+                codes_qt.shape[1],
+                codes_qt.shape[0],
+            )
+            code2wav_inputs.append(
+                OmniTokensPrompt(
+                    prompt_token_ids=[],
+                    multi_modal_data=None,
+                    mm_processor_kwargs=None,
+                    additional_information=None,
+                )
+            )
+            continue
 
         # Step 2: Replace out-of-range codes (BOC=1024, EOC=1025, -1) with 0.
         # Must use torch.where, NOT clamp: clamp(max=1023) turns 1025→1023
@@ -336,7 +354,21 @@ def talker2code2wav_async_chunk(
         return None
 
     codes_qt = torch.tensor(window_rows, dtype=torch.long).t().contiguous()
-    de_delayed = _revert_delay_pattern(codes_qt)
+    try:
+        de_delayed = _revert_delay_pattern(codes_qt)
+    except ValueError:
+        logger.warning(
+            "async_chunk: insufficient frames for delay pattern reversal "
+            "(T=%d < Q=%d, request=%s). Returning empty chunk.",
+            codes_qt.shape[1],
+            codes_qt.shape[0],
+            request_id,
+        )
+        emitted_frames.pop(request_id, None)
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+            meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+        )
     # Replace BOC=1024/EOC=1025 (and any negative pads) with 0; matches the
     # sync-path substitution. Clamp would turn 1025 into 1023 which is a
     # VALID codec code and decodes to audible artifacts.
