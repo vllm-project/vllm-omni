@@ -63,7 +63,7 @@ def build_query(args) -> QueryResult:
     prompt = (
         "<|im_start|>user\n"
         "<|audio_start|><|audio_pad|><|audio_end|>"
-        "请转写这段语音，并结合视频判断是否需要回应。<|im_end|>\n"
+        "Please transcribe this speech and use the video context to decide whether a reply is needed.<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
     audio_data = _load_audio(args.audio_path, args.sampling_rate)

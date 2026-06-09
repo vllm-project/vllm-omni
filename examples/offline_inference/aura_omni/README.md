@@ -47,5 +47,15 @@ For local checkpoints, edit the stage `model` entries in
 `vllm_omni/deploy/aura_omni.yaml` or pass a copied deploy config with
 `--deploy-config`.
 
+## GPU Utilization Recommendation
+
+Set `gpu_memory_utilization` in `vllm_omni/deploy/aura_omni.yaml` by stage.
+Suggested starting point:
+
+- Stage 0 (ASR): `0.10`
+- Stage 1 (AURA): `0.4`
+- Stage 2 (Qwen3-TTS Talker): `0.20`
+- Stage 3 (Qwen3-TTS Code2Wav): `0.20`
+
 Generated text and audio are written to `--output-dir`
 (default: `output_aura_omni`).

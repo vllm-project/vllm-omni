@@ -349,15 +349,12 @@ def aura2tts(
             non_streaming_mode = non_streaming_mode_raw if isinstance(non_streaming_mode_raw, bool) else None
             ref_code_len_raw = _first_value(additional_info.get("tts_ref_code_length"), None)
             ref_code_len = int(ref_code_len_raw) if isinstance(ref_code_len_raw, int) else None
-            print("ref_code_len: %r", ref_code_len)
             if task_type == "Base" and not x_vector_only_mode and ref_code_len is None:
                 ref_audio_for_len = _first_value(
                     additional_info.get("tts_ref_audio"),
                     default_qwen3_tts_ref_audio_path(),
                 )
-                print("ref_audio_for_len: %r", ref_audio_for_len)
                 ref_code_len = _estimate_ref_code_len_from_ref_audio(ref_audio_for_len)
-                print("ref_code_len: %r", ref_code_len)
             if ref_code_len is not None:
                 tts_info["ref_code_length"] = [int(ref_code_len)]
             prompt_len = _estimate_tts_prompt_len_from_token_ids(
@@ -369,14 +366,11 @@ def aura2tts(
                 non_streaming_mode=non_streaming_mode,
                 ref_code_len=ref_code_len,
             )
-            print("Using assistant token ids for TTS prompt length estimation: %r", assistant_token_ids)
-            print("prompt_len: %r", prompt_len)
         else:
             # Defensive fallback for synthetic outputs or legacy callers that do
             # not populate cumulative_token_ids.
             tts_info["text"] = [text]
             prompt_len = _estimate_tts_prompt_len(text)
-            print("Using text fallback for TTS prompt length estimation: %r", text)
         if task_type == "Base":
             ref_audio = _first_value(additional_info.get("tts_ref_audio"), DEFAULT_QWEN3_TTS_REF_AUDIO)
             ref_text = _first_value(additional_info.get("tts_ref_text"), DEFAULT_QWEN3_TTS_REF_TEXT)

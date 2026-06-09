@@ -155,7 +155,7 @@ def parse_args():
     parser.add_argument("--video-path", default=None, help="Video file, URL, or data URL.")
     parser.add_argument(
         "--prompt",
-        default="请结合语音和视频判断是否需要回应。如果需要，请用中文简短回答。",
+        default="Use the audio and video together to decide whether a reply is needed. If needed, respond briefly in English.",
     )
     parser.add_argument("--modalities", default="text,audio")
     parser.add_argument("--output-dir", default="output_aura_omni_online")
@@ -163,11 +163,11 @@ def parse_args():
         "--aura-system-prompt",
         default=(
             "You are receiving a live video stream where the final frame is the present moment. "
-            "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in Chinese."
+            "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in English."
         ),
     )
     parser.add_argument("--tts-task-type", default="Base", choices=["Base", "CustomVoice"])
-    parser.add_argument("--tts-language", default="Chinese")
+    parser.add_argument("--tts-language", default="English")
     parser.add_argument("--tts-speaker", default="Vivian")
     parser.add_argument("--tts-instruct", default="")
     parser.add_argument(

@@ -160,7 +160,9 @@ def build_interface(client: OpenAI, model: str):
         content: list[dict[str, Any]] = [{"type": "audio_url", "audio_url": {"url": audio_url}}]
         if video_url:
             content.append({"type": "video_url", "video_url": {"url": video_url}})
-        content.append({"type": "text", "text": prompt or "请结合语音和视频判断是否需要回应。"})
+        content.append(
+            {"type": "text", "text": prompt or "Use the audio and video together to decide whether a reply is needed."}
+        )
 
         additional_information: dict[str, Any] = {
             "aura_system_prompt": aura_system_prompt,
@@ -170,7 +172,7 @@ def build_interface(client: OpenAI, model: str):
         if tts_task_type == "CustomVoice":
             additional_information.update(
                 {
-                    "tts_language": tts_language or "Chinese",
+                    "tts_language": tts_language or "English",
                     "tts_speaker": tts_speaker or "Vivian",
                 }
             )
@@ -206,7 +208,7 @@ def build_interface(client: OpenAI, model: str):
 
     default_system = (
         "You are receiving a live video stream where the final frame is the present moment. "
-        "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in Chinese."
+        "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in English."
     )
 
     def _toggle_tts_advanced(task_type: str):
@@ -224,7 +226,7 @@ def build_interface(client: OpenAI, model: str):
             video_input = gr.Video(label="Video input (optional)", sources=["upload"])
         prompt = gr.Textbox(
             label="Instruction",
-            value="请结合语音和视频判断是否需要回应。如果需要，请用中文简短回答。",
+            value="Use the audio and video together to decide whether a reply is needed. If needed, respond briefly in English.",
             lines=2,
         )
         with gr.Accordion("Advanced", open=False):

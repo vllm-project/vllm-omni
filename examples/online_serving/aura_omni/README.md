@@ -53,6 +53,16 @@ Expected request shape:
 If AURA emits `<|silent|>`, the `aura2tts` processor returns no TTS request, so
 the TTS stages are skipped for that turn.
 
+## GPU Utilization Recommendation
+
+Tune `gpu_memory_utilization` per stage in `vllm_omni/deploy/aura_omni.yaml`.
+Recommended baseline on one GPU for H200
+
+- Stage 0 (ASR): `0.10`
+- Stage 1 (AURA): `0.4`
+- Stage 2 (Qwen3-TTS Talker): `0.20`
+- Stage 3 (Qwen3-TTS Code2Wav): `0.20`
+
 ## Python Client
 
 ```bash

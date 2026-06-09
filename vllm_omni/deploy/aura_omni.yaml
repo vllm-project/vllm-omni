@@ -25,14 +25,14 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 8
-    gpu_memory_utilization: 0.2
+    gpu_memory_utilization: 0.1
     trust_remote_code: true
     enable_prefix_caching: true
     async_scheduling: true
     max_model_len: 8192
     max_num_batched_tokens: 4096
     devices: "0"
-    model: /data/models/Qwen3-ASR-1.7B # Qwen/Qwen3-ASR-1.7B
+    model: Qwen/Qwen3-ASR-1.7B
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -41,14 +41,14 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 4
-    gpu_memory_utilization: 0.45
+    gpu_memory_utilization: 0.4
     trust_remote_code: true
     enable_prefix_caching: false
     async_scheduling: true
     max_model_len: 262144
     max_num_batched_tokens: 15360
     devices: "0"
-    model: /data/models/AURA # aurateam/AURA
+    model: aurateam/AURA
     default_sampling_params:
       temperature: 0.5
       top_p: 1.0
@@ -64,11 +64,11 @@ stages:
     async_scheduling: true
     max_num_batched_tokens: 512
     max_model_len: 4096
-    devices: "1"
+    devices: "0"
     output_connectors:
       to_stage_3: connector_of_shared_memory
-    # model: /data/model/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe #Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-    model: /data/model/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3 #Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    # model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
     default_sampling_params:
       temperature: 0.9
       top_k: 50
@@ -90,11 +90,11 @@ stages:
     async_scheduling: true
     max_num_batched_tokens: 65536
     max_model_len: 65536
-    devices: "1"
+    devices: "0"
     input_connectors:
       from_stage_2: connector_of_shared_memory
-    # model: /data/model/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe #Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-    model: /data/model/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3 #Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    # model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

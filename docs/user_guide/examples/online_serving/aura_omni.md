@@ -30,6 +30,16 @@ The AURA stage can emit `<|silent|>`. Silent outputs are treated as a gate:
 they produce no Qwen3-TTS Talker input, so no audio is synthesized for that
 turn.
 
+## GPU Utilization Recommendation
+
+`gpu_memory_utilization` in `vllm_omni/deploy/aura_omni.yaml` controls how much
+VRAM each stage can reserve. Start with this split for a single GPU:
+
+- Stage 0 (ASR): `0.10`
+- Stage 1 (AURA): `0.40`
+- Stage 2 (Qwen3-TTS Talker): `0.20`
+- Stage 3 (Qwen3-TTS Code2Wav): `0.20`
+
 ## TTS Modes
 
 `aura_omni` can pass AURA text to Qwen3-TTS in two task modes:
