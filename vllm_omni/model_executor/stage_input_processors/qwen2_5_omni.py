@@ -12,6 +12,10 @@ from vllm_omni.data_entry_keys import (
     to_dict,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.payload_builder import (
+    count_trailing_placeholders,
+    ensure_list,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +128,7 @@ def _strip_codec_boundaries(token_ids: list[int]) -> list[int]:
     their length by repeating the last valid codec id.
     """
     tids = list(token_ids)
-    trailing_placeholder_count = 0
-    while trailing_placeholder_count < len(tids) and tids[-1 - trailing_placeholder_count] == -1:
-        trailing_placeholder_count += 1
+    trailing_placeholder_count = count_trailing_placeholders(tids, placeholder=-1)
 
     if tids and tids[-1] == TALKER_CODEC_END_TOKEN_ID:
         tids = tids[:-1]
@@ -318,19 +320,9 @@ def thinker2talker_full_payload(
         )
         return None
 
-    def _ensure_list(x):
-        if x is None:
-            return []
-        if hasattr(x, "_x"):
-            # vLLM wraps cached token-id lists in ConstantList-like objects.
-            return list(x._x)
-        if isinstance(x, list):
-            return list(x)
-        return list(x)
-
-    prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", None))
-    output_token_ids = _ensure_list(getattr(request, "output_token_ids", None))
-    all_token_ids = _ensure_list(getattr(request, "all_token_ids", None) or [])
+    prompt_token_ids = ensure_list(getattr(request, "prompt_token_ids", None))
+    output_token_ids = ensure_list(getattr(request, "output_token_ids", None))
+    all_token_ids = ensure_list(getattr(request, "all_token_ids", None) or [])
     if not all_token_ids:
         all_token_ids = list(prompt_token_ids) + list(output_token_ids)
 

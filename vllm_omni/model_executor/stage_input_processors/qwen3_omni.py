@@ -23,6 +23,11 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.payload_builder import (
+    ensure_list,
+    layer_tensor,
+    to_tensor_or_none,
+)
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
     extract_language_from_request,
@@ -47,15 +52,7 @@ _QWEN3_CODEC_BOS_TOKEN_ID = 4197
 _QWEN3_CODEC_EOS_TOKEN_ID = 4198
 
 
-def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
-    """Fetch layer tensor with tolerant key lookup (str/int)."""
-    if not isinstance(layers, dict):
-        return None
-    key_int = int(key)
-    val = layers.get(key_int)
-    if val is None:
-        val = layers.get(key)
-    return val if isinstance(val, torch.Tensor) else None
+# _layer_tensor now imported from payload_builder.py
 
 
 def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | str = "cuda") -> int:
@@ -98,23 +95,11 @@ def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | 
 # =========================
 # Common helpers
 # =========================
-
-
-def _ensure_list(x):
-    """Convert ConstantList / tensor-like to Python list."""
-    if hasattr(x, "_x"):
-        return list(x._x)
-    elif not isinstance(x, list):
-        return x
-    return list(x)
-
-
-def _as_tensor_or_none(value: Any) -> torch.Tensor | None:
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    if isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
-        return value[0].detach().cpu()
-    return None
+# Helper functions now imported from payload_builder.py:
+# - ensure_list
+# - layer_tensor
+# - to_cpu_tensor
+# - to_tensor_or_none
 
 
 def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
@@ -279,7 +264,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     request_id = request.external_req_id
     output_token_ids = request.output_token_ids
     # Convert ConstantList to regular list for OmniSerializer serialization
-    output_token_ids = _ensure_list(output_token_ids)
+    output_token_ids = ensure_list(output_token_ids)
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
@@ -296,8 +281,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                 embed=EmbeddingsStruct(prefill=emb_cpu),
                 hidden_states=HiddenStatesStruct(output=hid_cpu),
                 ids=IdsStruct(
-                    all=_ensure_list(request.all_token_ids[-new_prompt_len - 1 :]),
-                    prompt=_ensure_list(request.prompt_token_ids[-new_prompt_len:]),
+                    all=ensure_list(request.all_token_ids[-new_prompt_len - 1 :]),
+                    prompt=ensure_list(request.prompt_token_ids[-new_prompt_len:]),
                 ),
                 speaker=speaker,
                 language=language,
@@ -454,8 +439,8 @@ def thinker2talker_async_chunk(
     thinker_layers = thinker_hs.get("layers", {}) if isinstance(thinker_hs, dict) else {}
     thinker_embed_raw = pooling_output.get("embed", {})
     thinker_embed = thinker_embed_raw if isinstance(thinker_embed_raw, dict) else {}
-    thinker_emb = _layer_tensor(thinker_layers, _EMBED_LAYER_KEY)
-    thinker_hid = _layer_tensor(thinker_layers, _HIDDEN_LAYER_KEY)
+    thinker_emb = layer_tensor(thinker_layers, _EMBED_LAYER_KEY)
+    thinker_hid = layer_tensor(thinker_layers, _HIDDEN_LAYER_KEY)
     if thinker_emb is None or thinker_hid is None:
         logger.debug(
             "thinker2talker_async_chunk: missing thinker layers for req=%s (embed=%s hidden=%s)",
@@ -471,8 +456,8 @@ def thinker2talker_async_chunk(
         return t.detach().cpu() if isinstance(t, torch.Tensor) else None
 
     if chunk_id == 0:
-        all_token_ids = _ensure_list(request.all_token_ids)
-        prompt_token_ids = _ensure_list(request.prompt_token_ids)
+        all_token_ids = ensure_list(request.all_token_ids)
+        prompt_token_ids = ensure_list(request.prompt_token_ids)
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
                 prefill=thinker_emb.detach().cpu(),
@@ -546,8 +531,8 @@ def thinker2talker_full_payload(
         0: pooling_output.get("hidden_states.layer_0"),
         24: pooling_output.get("hidden_states.layer_24"),
     }
-    thinker_emb = _layer_tensor(layers, _EMBED_LAYER_KEY)
-    thinker_hid = _layer_tensor(layers, _HIDDEN_LAYER_KEY)
+    thinker_emb = layer_tensor(layers, _EMBED_LAYER_KEY)
+    thinker_hid = layer_tensor(layers, _HIDDEN_LAYER_KEY)
     if thinker_emb is None:
         hidden = pooling_output.get("hidden")
         thinker_emb = hidden if isinstance(hidden, torch.Tensor) else None
@@ -562,10 +547,10 @@ def thinker2talker_full_payload(
         )
         return None
 
-    prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
-    all_token_ids = _ensure_list(getattr(request, "all_token_ids", None) or [])
+    prompt_token_ids = ensure_list(getattr(request, "prompt_token_ids", []) or [])
+    all_token_ids = ensure_list(getattr(request, "all_token_ids", None) or [])
     if not all_token_ids:
-        output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+        output_token_ids = ensure_list(getattr(request, "output_token_ids", []) or [])
         all_token_ids = list(prompt_token_ids) + list(output_token_ids)
 
     # Trim the trailing stop-token row from the accumulated thinker output.
@@ -590,9 +575,9 @@ def thinker2talker_full_payload(
     payload: OmniPayload = {
         "embed": {
             "prefill": thinker_emb_prefill.detach().cpu(),
-            "tts_bos": _as_tensor_or_none(pooling_output.get("embed.tts_bos")),
-            "tts_eos": _as_tensor_or_none(pooling_output.get("embed.tts_eos")),
-            "tts_pad": _as_tensor_or_none(pooling_output.get("embed.tts_pad")),
+            "tts_bos": to_tensor_or_none(pooling_output.get("embed.tts_bos")),
+            "tts_eos": to_tensor_or_none(pooling_output.get("embed.tts_eos")),
+            "tts_pad": to_tensor_or_none(pooling_output.get("embed.tts_pad")),
         },
         "hidden_states": {"output": thinker_hid_prefill.detach().cpu()},
         "ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)},
@@ -641,8 +626,8 @@ def thinker2talker(
     for i, thinker_output in enumerate(thinker_outputs):
         output = thinker_output.outputs[0]
         req_id = str(getattr(thinker_output, "request_id", f"idx-{i}"))
-        prompt_token_ids = _ensure_list(thinker_output.prompt_token_ids)
-        output_ids = _ensure_list(output.cumulative_token_ids)
+        prompt_token_ids = ensure_list(thinker_output.prompt_token_ids)
+        output_ids = ensure_list(output.cumulative_token_ids)
         is_streaming_session = bool(getattr(streaming_context, "enabled", False))
         if is_streaming_session:
             prompt_token_ids, output_ids = _get_streaming_talker_tokens(
@@ -663,8 +648,8 @@ def thinker2talker(
         thinker_mm: OmniPayload = thinker_mm_raw
         mm_hs = thinker_mm.get("hidden_states", {})
         mm_layers = mm_hs.get("layers", {}) if isinstance(mm_hs, dict) else {}
-        emb_layer = _layer_tensor(mm_layers, _EMBED_LAYER_KEY)
-        hid_layer = _layer_tensor(mm_layers, _HIDDEN_LAYER_KEY)
+        emb_layer = layer_tensor(mm_layers, _EMBED_LAYER_KEY)
+        hid_layer = layer_tensor(mm_layers, _HIDDEN_LAYER_KEY)
         if emb_layer is None or hid_layer is None:
             logger.debug("thinker2talker: skip req=%s due to missing hidden-state layers", req_id)
             continue
@@ -753,11 +738,11 @@ def thinker2talker_token_only(
             continue
         mm_hs = thinker_mm_raw.get("hidden_states", {})
         mm_layers = mm_hs.get("layers", {}) if isinstance(mm_hs, dict) else {}
-        if _layer_tensor(mm_layers, _EMBED_LAYER_KEY) is None or _layer_tensor(mm_layers, _HIDDEN_LAYER_KEY) is None:
+        if layer_tensor(mm_layers, _EMBED_LAYER_KEY) is None or layer_tensor(mm_layers, _HIDDEN_LAYER_KEY) is None:
             logger.debug("thinker2talker_token_only: skip req=%s due to missing hidden-state layers", req_id)
             continue
-        prompt_token_ids = _ensure_list(thinker_output.prompt_token_ids)
-        output_ids = _ensure_list(output.cumulative_token_ids)
+        prompt_token_ids = ensure_list(thinker_output.prompt_token_ids)
+        output_ids = ensure_list(output.cumulative_token_ids)
         is_streaming_session = bool(getattr(streaming_context, "enabled", False))
         if is_streaming_session:
             prompt_token_ids, output_ids = _get_streaming_talker_tokens(
@@ -913,7 +898,7 @@ def talker2code2wav_full_payload(
         )
         return None
 
-    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+    output_token_ids = ensure_list(getattr(request, "output_token_ids", []) or [])
     raw_shape = tuple(code_predictor_codes.shape)
     code_predictor_codes, codec_stats = _extract_qwen3_full_payload_codec_rows(
         code_predictor_codes.to(torch.long),

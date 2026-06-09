@@ -16,6 +16,10 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.payload_builder import (
+    ensure_list,
+    to_cpu_tensor,
+)
 
 logger = init_logger(__name__)
 
@@ -36,19 +40,7 @@ def _build_prompt_embed_struct(prompt_payload: dict[str, Any]) -> EmbeddingsStru
     )
 
 
-def _ensure_list(x: Any) -> list[Any]:
-    if hasattr(x, "_x"):
-        return list(x._x)
-    if isinstance(x, list):
-        return list(x)
-    if isinstance(x, tuple):
-        return list(x)
-    if x is None:
-        return []
-    try:
-        return list(x)
-    except TypeError:
-        return [x]
+# _ensure_list now imported from payload_builder.py
 
 
 def _to_token_id_list(value: Any) -> list[int]:
@@ -57,7 +49,7 @@ def _to_token_id_list(value: Any) -> list[int]:
     if isinstance(value, torch.Tensor):
         value = value.detach().to("cpu").reshape(-1).tolist()
     token_ids: list[int] = []
-    for item in _ensure_list(value):
+    for item in ensure_list(value):
         if isinstance(item, torch.Tensor):
             token_ids.extend(_to_token_id_list(item))
             continue
@@ -97,14 +89,7 @@ def _set_non_stream_prompt_trim(additional_info: dict[str, Any], prompt_speech_l
     meta["talker_prefill_offset"] = prompt_speech_len
 
 
-def _to_cpu_tensor(x: Any) -> torch.Tensor | None:
-    if isinstance(x, list):
-        if not x:
-            return None
-        x = x[0]
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu()
-    return None
+# _to_cpu_tensor now imported from payload_builder.py
 
 
 def _decode_additional_information(raw_info: Any) -> dict[str, Any]:
@@ -146,8 +131,8 @@ def text2flow(
         if multi_modal_data is None:
             raise RuntimeError(f"Missing multimodal_output for request {source_output.request_id}")
 
-        prefix_ids = _ensure_list(source_output.prompt_token_ids)
-        raw_output_ids = _ensure_list(output.cumulative_token_ids)
+        prefix_ids = ensure_list(source_output.prompt_token_ids)
+        raw_output_ids = ensure_list(output.cumulative_token_ids)
         prompt_speech_ids = _prompt_speech_token_ids(multi_modal_data)
         output_ids = _strip_prompt_prefix(raw_output_ids, prefix_ids)
         output_ids = _strip_prompt_prefix(output_ids, prompt_speech_ids)
@@ -193,7 +178,7 @@ def talker2code2wav_async_chunk(
                 info_embed = info.get("embed", {}) if isinstance(info, dict) else {}
                 prompt_payload = {}
                 for key in ("speech_token", "speech_feat", "embedding"):
-                    value = _to_cpu_tensor(info_embed.get(key))
+                    value = to_cpu_tensor(info_embed.get(key))
                     if value is not None:
                         prompt_payload[key] = value
                 if isinstance(pooling_output, dict):
@@ -201,7 +186,7 @@ def talker2code2wav_async_chunk(
                     for key in ("speech_token", "speech_feat", "embedding"):
                         if key in prompt_payload:
                             continue
-                        value = _to_cpu_tensor(po_embed.get(key))
+                        value = to_cpu_tensor(po_embed.get(key))
                         if value is not None:
                             prompt_payload[key] = value
                 prompt_token = prompt_payload.get("speech_token")
@@ -237,7 +222,7 @@ def talker2code2wav_async_chunk(
             return None
 
         with nullcontext():
-            output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
+            output_token_ids = ensure_list(getattr(request, "output_token_ids", []))
             seen_len = int(state.get("seen_len", 0))
             new_tokens = output_token_ids[seen_len:] if seen_len < len(output_token_ids) else []
             state["seen_len"] = len(output_token_ids)
@@ -363,8 +348,8 @@ def text2flow_token_only(
         if not source_output.finished:
             continue
         output = source_output.outputs[0]
-        prefix_ids = _ensure_list(source_output.prompt_token_ids)
-        raw_output_ids = _ensure_list(output.cumulative_token_ids)
+        prefix_ids = ensure_list(source_output.prompt_token_ids)
+        raw_output_ids = ensure_list(output.cumulative_token_ids)
         output_ids = _strip_prompt_prefix(raw_output_ids, prefix_ids)
         multi_modal_data = output.multimodal_output
         if multi_modal_data is None:
