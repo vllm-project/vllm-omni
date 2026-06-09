@@ -80,10 +80,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, DiffusionRequestState] = {}
 
-        # Initialize KV cache manager for connector management.  This runner
-        # waits via wait_kv_copy() before forward, so from_od_config enables the
-        # async H2D copy path (Phase 2) only when od_config.enable_kv_async_copy
-        # is set (opt-in; default is the synchronous copy path).
+        # Initialize KV cache manager for connector management.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
     def _compile_transformer(self, attr_name: str) -> None:
