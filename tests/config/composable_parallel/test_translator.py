@@ -8,7 +8,7 @@ import pytest
 
 from vllm_omni.config.composable_parallel import (
     Broadcast,
-    DuplicateAxisKind,
+    DuplicateAxisKindError,
     FanInByStage,
     MeshAxisSpec,
     PartitionByHash,
@@ -18,8 +18,8 @@ from vllm_omni.config.composable_parallel import (
     StrategySpec,
     TakeRank,
     Union,
-    UnsupportedAxisKind,
-    UnsupportedRouting,
+    UnsupportedAxisKindError,
+    UnsupportedRoutingError,
     translate_strategy_stack,
 )
 from vllm_omni.config.composable_parallel.aggregation import StitchPipeline
@@ -113,25 +113,25 @@ def test_ep_mismatch_raises():
 
 
 def test_duplicate_kind_rejected():
-    with pytest.raises(DuplicateAxisKind):
+    with pytest.raises(DuplicateAxisKindError):
         translate_strategy_stack([_tp(2), _tp(2)])
 
 
 def test_unsupported_kind_rejected():
     spec = StrategySpec("sp", MeshAxisSpec("sp_ulysses", 2), Broadcast(), TakeRank())
-    with pytest.raises(UnsupportedAxisKind):
+    with pytest.raises(UnsupportedAxisKindError):
         translate_strategy_stack([spec])
 
 
 def test_dp_hash_routing_rejected():
     spec = StrategySpec("dp", MeshAxisSpec("dp", 2), PartitionByHash(), Union())
-    with pytest.raises(UnsupportedRouting):
+    with pytest.raises(UnsupportedRoutingError):
         translate_strategy_stack([spec])
 
 
 def test_dp_invalid_routing_policy_rejected():
     spec = StrategySpec("dp", MeshAxisSpec("dp", 2), RouteByStage("bogus"), Union())
-    with pytest.raises(UnsupportedRouting):
+    with pytest.raises(UnsupportedRoutingError):
         translate_strategy_stack([spec])
 
 
@@ -147,7 +147,7 @@ def test_stage_replica_hash_routing_rejected():
     spec = StrategySpec(
         "sr", MeshAxisSpec("stage_replica", 2), RouteByStage("hash"), FanInByStage()
     )
-    with pytest.raises(UnsupportedRouting):
+    with pytest.raises(UnsupportedRoutingError):
         translate_strategy_stack([spec])
 
 

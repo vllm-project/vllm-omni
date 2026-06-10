@@ -28,8 +28,9 @@ be ignored.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence, Union
+from typing import Any
 
 from vllm_omni.config.composable_parallel.spec import StrategySpec
 from vllm_omni.config.composable_parallel.translator import (
@@ -44,7 +45,7 @@ _ENGINE_FIELD_BY_KIND: dict[str, str] = {
     "pp": "pipeline_parallel_size",
 }
 
-RoleKey = Union[str, int]
+RoleKey = str | int
 
 
 class StrategyApplyError(ValueError):
@@ -98,16 +99,10 @@ def _resolve_stage(stages: Sequence[Any], key: RoleKey) -> Any:
         descriptor = f"model_stage={key!r}"
 
     if not matches:
-        available = ", ".join(
-            f"{getattr(s, 'model_stage', '?')!r}(id={getattr(s, 'stage_id', '?')})" for s in stages
-        )
-        raise StrategyRoleError(
-            f"strategy role {descriptor} did not match any stage; available stages: {available}"
-        )
+        available = ", ".join(f"{getattr(s, 'model_stage', '?')!r}(id={getattr(s, 'stage_id', '?')})" for s in stages)
+        raise StrategyRoleError(f"strategy role {descriptor} did not match any stage; available stages: {available}")
     if len(matches) > 1:
-        raise StrategyRoleError(
-            f"strategy role {descriptor} is ambiguous; it matched {len(matches)} stages"
-        )
+        raise StrategyRoleError(f"strategy role {descriptor} is ambiguous; it matched {len(matches)} stages")
     return matches[0]
 
 

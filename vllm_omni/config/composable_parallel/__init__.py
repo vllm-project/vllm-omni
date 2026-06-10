@@ -14,7 +14,7 @@ config objects.
 
 from vllm_omni.config.composable_parallel.aggregation import (
     AGGREGATION_PATTERN_VARIANTS,
-    AggregationConflict,
+    AggregationConflictError,
     AggregationPattern,
     AllGather,
     Combine,
@@ -53,16 +53,16 @@ from vllm_omni.config.composable_parallel.spec import (
     LayerHookSpec,
     MeshAxisKind,
     MeshAxisSpec,
-    SpecMergeConflict,
+    SpecMergeConflictError,
     StrategySpec,
 )
 from vllm_omni.config.composable_parallel.translator import (
     AxisTranslationError,
-    DuplicateAxisKind,
+    DuplicateAxisKindError,
     OmniParallelConfig,
     RoutingOwnershipError,
-    UnsupportedAxisKind,
-    UnsupportedRouting,
+    UnsupportedAxisKindError,
+    UnsupportedRoutingError,
     translate_strategy_stack,
 )
 
@@ -74,7 +74,7 @@ __all__ = [
     "LayerHookSpec",
     "KernelSpec",
     "StrategySpec",
-    "SpecMergeConflict",
+    "SpecMergeConflictError",
     # routing patterns
     "RoutingPattern",
     "RoutingKeyError",
@@ -89,7 +89,7 @@ __all__ = [
     "ROUTING_PATTERN_VARIANTS",
     # aggregation patterns
     "AggregationPattern",
-    "AggregationConflict",
+    "AggregationConflictError",
     "TakeRank",
     "Union",
     "GatherDim",
@@ -103,10 +103,10 @@ __all__ = [
     "OmniParallelConfig",
     "translate_strategy_stack",
     "AxisTranslationError",
-    "UnsupportedAxisKind",
-    "DuplicateAxisKind",
+    "UnsupportedAxisKindError",
+    "DuplicateAxisKindError",
     "RoutingOwnershipError",
-    "UnsupportedRouting",
+    "UnsupportedRoutingError",
     # apply
     "apply_strategy_specs",
     "StrategyApplyResult",

@@ -10,8 +10,8 @@ subclasses may only be defined in this module.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ class AggregationPattern:
         raise NotImplementedError
 
 
-class AggregationConflict(ValueError):
+class AggregationConflictError(ValueError):
     """Raised when two aggregation inputs conflict for the same request id."""
 
 
@@ -70,7 +70,7 @@ class GatherDim(AggregationPattern):
 class AllGather(AggregationPattern):
     """All ranks materialize the same aggregate result across the axis."""
 
-    dim: Optional[int] = None
+    dim: int | None = None
 
     def pattern_kind(self) -> str:
         return "all_gather"
@@ -80,7 +80,7 @@ class AllGather(AggregationPattern):
 class StitchSpatial(AggregationPattern):
     """Stitch spatial patches (VAE-PP)."""
 
-    grid: Tuple[int, int] = (1, 1)
+    grid: tuple[int, int] = (1, 1)
 
     def pattern_kind(self) -> str:
         return "stitch_spatial"

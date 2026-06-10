@@ -37,7 +37,8 @@ the file stays compact; the translator validates the combination.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from vllm_omni.config.composable_parallel.aggregation import (
     AggregationPattern,
@@ -93,15 +94,12 @@ def _build_spec(role: str, entry: Mapping[str, Any]) -> StrategySpec:
     try:
         size = int(entry["size"])
     except (TypeError, ValueError) as exc:
-        raise StrategyYamlError(
-            f"role {role!r}: axis {kind!r} size must be an integer, got {entry['size']!r}"
-        ) from exc
+        raise StrategyYamlError(f"role {role!r}: axis {kind!r} size must be an integer, got {entry['size']!r}") from exc
 
     routing_policy = entry.get("routing")
     if routing_policy is not None and kind not in _ROUTING_POLICY_KINDS:
         raise StrategyYamlError(
-            f"role {role!r}: axis {kind!r} does not accept a 'routing' policy "
-            f"(only {sorted(_ROUTING_POLICY_KINDS)} do)"
+            f"role {role!r}: axis {kind!r} does not accept a 'routing' policy (only {sorted(_ROUTING_POLICY_KINDS)} do)"
         )
 
     shard_extension: dict[str, Any] = {}
@@ -122,9 +120,7 @@ def parse_strategy_specs(data: Mapping[str, Any]) -> dict[str, list[StrategySpec
     """Parse an already-loaded strategy mapping into per-role spec stacks."""
     strategies = data.get("strategies", data)
     if not isinstance(strategies, Mapping):
-        raise StrategyYamlError(
-            "strategy file must contain a 'strategies' mapping of role -> list of axes"
-        )
+        raise StrategyYamlError("strategy file must contain a 'strategies' mapping of role -> list of axes")
 
     result: dict[str, list[StrategySpec]] = {}
     for role, entries in strategies.items():
@@ -136,8 +132,7 @@ def parse_strategy_specs(data: Mapping[str, Any]) -> dict[str, list[StrategySpec
         for entry in entries:
             if not isinstance(entry, Mapping):
                 raise StrategyYamlError(
-                    f"role {role!r}: each axis declaration must be a mapping, got "
-                    f"{type(entry).__name__}"
+                    f"role {role!r}: each axis declaration must be a mapping, got {type(entry).__name__}"
                 )
             specs.append(_build_spec(str(role), dict(entry)))
         result[str(role)] = specs

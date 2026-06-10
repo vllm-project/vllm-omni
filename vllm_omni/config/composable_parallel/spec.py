@@ -15,8 +15,9 @@ are reserved for future work.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Optional, Tuple
+from typing import Any, Literal
 
 from vllm_omni.config.composable_parallel.aggregation import AggregationPattern
 from vllm_omni.config.composable_parallel.routing import RoutingPattern
@@ -72,7 +73,7 @@ HOOK_CATEGORY_ORDER: dict[HookCategory, int] = {
 }
 
 
-class SpecMergeConflict(ValueError):
+class SpecMergeConflictError(ValueError):
     """Raised when merged hook/kernel specs have conflicting declarations."""
 
 
@@ -85,9 +86,7 @@ class MeshAxisSpec:
 
     def __post_init__(self) -> None:
         if self.kind not in MESH_AXIS_KINDS:
-            raise ValueError(
-                f"MeshAxisSpec.kind must be one of {MESH_AXIS_KINDS}, got {self.kind!r}"
-            )
+            raise ValueError(f"MeshAxisSpec.kind must be one of {MESH_AXIS_KINDS}, got {self.kind!r}")
         if self.size <= 0:
             raise ValueError(f"MeshAxisSpec.size must be > 0, got {self.size}")
 
@@ -97,7 +96,7 @@ class LayerHookSpec:
     """L2 hook slot referenced by StrategySpec; resolved by the model walker."""
 
     hook_id: str
-    target: Optional[str] = None
+    target: str | None = None
     category: HookCategory = "other"
     priority: int = 0
     axis_index: int = 0
@@ -108,11 +107,11 @@ class KernelSpec:
     """L3 kernel slot referenced by StrategySpec; resolved by the kernel registry."""
 
     kernel_id: str
-    target: Optional[str] = None
+    target: str | None = None
     category: HookCategory = "other"
     priority: int = 0
     axis_index: int = 0
-    group_axis_kind: Optional[MeshAxisKind] = None
+    group_axis_kind: MeshAxisKind | None = None
     requires_collective: bool = False
 
 
@@ -124,6 +123,6 @@ class StrategySpec:
     mesh_axis: MeshAxisSpec
     routing: RoutingPattern
     aggregation: AggregationPattern
-    layer_hook_specs: Tuple[LayerHookSpec, ...] = ()
-    kernel_specs: Tuple[KernelSpec, ...] = ()
+    layer_hook_specs: tuple[LayerHookSpec, ...] = ()
+    kernel_specs: tuple[KernelSpec, ...] = ()
     shard_extension: Mapping[str, Any] = field(default_factory=dict)

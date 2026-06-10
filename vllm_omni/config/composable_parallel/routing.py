@@ -11,8 +11,9 @@ exhaustively matchable contract.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Literal, Tuple
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -34,9 +35,7 @@ class RoutingKeyError(KeyError):
     def __init__(self, request_id: object, missing_key: str) -> None:
         self.request_id = request_id
         self.missing_key = missing_key
-        super().__init__(
-            f"Missing routing key {missing_key!r} for request_id={request_id!r}"
-        )
+        super().__init__(f"Missing routing key {missing_key!r} for request_id={request_id!r}")
 
 
 @dataclass(frozen=True)
@@ -71,7 +70,7 @@ class ShardSequence(RoutingPattern):
 class ShardSpatial(RoutingPattern):
     """Shard along a spatial grid (VAE-PP)."""
 
-    grid: Tuple[int, int] = (1, 1)
+    grid: tuple[int, int] = (1, 1)
 
     def pattern_kind(self) -> str:
         return "shard_spatial"
