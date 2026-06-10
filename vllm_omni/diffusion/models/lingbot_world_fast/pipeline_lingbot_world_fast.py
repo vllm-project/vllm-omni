@@ -728,11 +728,9 @@ class LingbotWorldFastPipeline(
         if is_pipeline_first_stage():
             self.vae.reset()
             if not extension:
-                anchor_pixels = (
-                    torch.nn.functional.interpolate(img[None].cpu(), size=(h, w), mode="bicubic")
-                    .transpose(0, 1)
-                    .to(self.device)
-                )
+                anchor_pixels = torch.nn.functional.interpolate(
+                    img[None], size=(h, w), mode="bicubic"
+                ).transpose(0, 1)
                 anchor_latent = self.vae.init(anchor_pixels)  # [16, 1, lat_h, lat_w]
             else:
                 zero_frame = torch.zeros(3, 1, h, w, device=self.device)
@@ -740,11 +738,11 @@ class LingbotWorldFastPipeline(
 
         # Per-block self-attn config from sampling.extra_args. sink_size and
         # local_attn_size are in chunks (each chunk has chunk_latent_frames).
-        # Defaults match the unbounded behaviour: no sinks, no rolling, no
-        # adaptive refresh.
         sink_size = int(extra_args.get("sink_size", 3))
         local_attn_size = int(extra_args.get("local_attn_size", 3))
         sink_threshold = float(extra_args.get("sink_threshold", 0.2))
+        if local_attn_size <= 0:
+            raise ValueError(f"Unbounded KV cache is not supported for stream-batch.")
 
         if extension:
             prev = (
@@ -778,10 +776,7 @@ class LingbotWorldFastPipeline(
         model_args = self.model.config
         transformer_dtype = self.target_dtype
         frame_seqlen = int(lat_h * lat_w // 4)
-        if local_attn_size > 0:
-            extra_kv_size = (sink_size + local_attn_size) * chunk_latent_frames * frame_seqlen
-        else:
-            extra_kv_size = frame_seqlen * new_lat_f
+        extra_kv_size = (sink_size + local_attn_size) * chunk_latent_frames * frame_seqlen
         head_dim = model_args.dim // model_args.num_heads
         local_num_heads = model_args.num_heads // self.sp_size
         owned_num_layers = self.model.end_layer - self.model.start_layer
@@ -797,11 +792,6 @@ class LingbotWorldFastPipeline(
                 head_dim,
                 num_slots=sampling.num_inference_steps,
             )
-        elif local_attn_size <= 0:
-            # Unbounded slots: grow on extension to fit the new frames.
-            self.state.extend_kv_caches(extra_kv_size)
-        # If local_attn_size > 0, slot capacity is fixed; rolling region absorbs
-        # new chunks without needing to grow the buffer.
 
         prev_lat_f = self.state.current_lat_f
         total_kv_size = frame_seqlen * (prev_lat_f + new_lat_f)

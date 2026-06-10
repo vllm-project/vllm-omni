@@ -7,22 +7,28 @@ from contextlib import nullcontext
 
 import torch
 from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan, patchify
+from torch import nn
 
 from vllm_omni.platforms import current_omni_platform
 
 
-class StreamAutoencoderKLWan:
+class StreamAutoencoderKLWan(nn.Module):
     """Chunked-encode wrapper over ``AutoencoderKLWan``.
 
+    Subclasses ``nn.Module`` so it can be assigned to an ``nn.Module``
+    attribute (e.g. ``LingbotWorldFastPipeline.vae``) without triggering
+    PyTorch's "child must be nn.Module" check; the inner VAE becomes a
+    registered child submodule.
+
     Args:
-        vae: Loaded ``AutoencoderKLWan`` (or subclass). The wrapper holds a
-            reference; weights/dtype/device are the caller's responsibility.
+        vae: Loaded ``AutoencoderKLWan`` (or subclass).
         latents_scale: ``[mean, inv_std]`` tensors, each shape
             ``(1, z_dim, 1, 1, 1)``. Used to normalize encoder output and
             de-normalize decoder input.
     """
 
     def __init__(self, vae: AutoencoderKLWan, latents_scale: list[torch.Tensor]) -> None:
+        super().__init__()
         self._vae = vae
         self._mean, self._inv_std = latents_scale
 
@@ -72,16 +78,22 @@ class StreamAutoencoderKLWan:
     @torch.no_grad()
     def decode(self, zs: list[torch.Tensor]) -> list[torch.Tensor]:
         """De-normalize each ``[z_dim, T, H, W]`` latent and run VAE decode."""
-        dtype = self._vae.dtype
-        device = zs[0].device
-        mean = self._mean.to(device, dtype)
-        inv_std = self._inv_std.to(device, dtype)
-        out = []
-        for z in zs:
-            z_in = z.unsqueeze(0).to(dtype) / inv_std + mean
-            sample = self._vae.decode(z_in, return_dict=False)[0]
-            out.append(sample.float().clamp_(-1, 1).squeeze(0))
-        return out
+        enc_feat_map_save = self._vae._enc_feat_map
+        enc_conv_idx_save = self._vae._enc_conv_idx
+        try:
+            dtype = self._vae.dtype
+            device = zs[0].device
+            mean = self._mean.to(device, dtype)
+            inv_std = self._inv_std.to(device, dtype)
+            out = []
+            for z in zs:
+                z_in = z.unsqueeze(0).to(dtype) / inv_std + mean
+                sample = self._vae.decode(z_in, return_dict=False)[0]
+                out.append(sample.float().clamp_(-1, 1).squeeze(0))
+            return out
+        finally:
+            self._vae._enc_feat_map = enc_feat_map_save
+            self._vae._enc_conv_idx = enc_conv_idx_save
 
     def _autocast(self, device: torch.device):
         dtype = self._vae.dtype
