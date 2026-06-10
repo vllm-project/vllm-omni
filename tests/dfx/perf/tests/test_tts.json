@@ -339,5 +339,66 @@
         }
       }
     ]
+  },
+  {
+    "test_name": "test_voxtral_tts",
+    "server_params": {
+      "model": "mistralai/Voxtral-4B-TTS-2603"
+    },
+    "benchmark_params": [
+      {
+        "task": "default_voice",
+        "eval_phase": "latency",
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "num_prompts": [20],
+        "max_concurrency": [1],
+        "seed_tts_locale": "en",
+        "extra_body": {"voice": "casual_male"},
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {
+          "median_audio_ttfp_ms": [150],
+          "median_audio_rtf": [0.15]
+        }
+      },
+      {
+        "task": "default_voice",
+        "eval_phase": "throughput",
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "num_prompts": [80],
+        "max_concurrency": [8],
+        "seed_tts_locale": "en",
+        "extra_body": {"voice": "casual_male"},
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {
+          "median_audio_ttfp_ms": [1500],
+          "median_audio_rtf": [0.30],
+          "audio_throughput": [30.0]
+        }
+      },
+      {
+        "task": "default_voice",
+        "eval_phase": "stress",
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "num_prompts": [100],
+        "request_rate": [2.0],
+        "seed_tts_locale": "en",
+        "extra_body": {"voice": "casual_male"},
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {
+          "median_audio_ttfp_ms": [3000],
+          "median_audio_rtf": [0.25],
+          "audio_throughput": [4.0]
+        }
+      }
+    ]
   }
 ]
