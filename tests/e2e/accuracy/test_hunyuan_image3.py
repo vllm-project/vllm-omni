@@ -122,16 +122,9 @@ _DEPLOY_CONFIG = {
     "async_chunk": False,
     "trust_remote_code": True,
     "connectors": {
-        "rdma_connector": {
-            "name": "MooncakeTransferEngineConnector",
-            "extra": {
-                "host": "auto",
-                "zmq_port": 50051,
-                "protocol": "rdma",
-                "device_name": "",
-                "memory_pool_size": 4294967296,
-                "memory_pool_device": "cpu",
-            },
+        "shared_memory_connector": {
+            "name": "SharedMemoryConnector",
+            "extra": {"shm_threshold_bytes": 65536},
         },
     },
     "stages": [
@@ -150,13 +143,12 @@ _DEPLOY_CONFIG = {
             "hf_overrides": {
                 "rope_parameters": {"mrope_section": [0, 32, 32], "rope_type": "default"},
             },
-            "output_connectors": {"to_stage_1": "rdma_connector"},
+            "output_connectors": {"to_stage_1": "shared_memory_connector"},
             "default_sampling_params": {
                 "temperature": 0.0,
                 "top_p": 1,
                 "top_k": -1,
                 "max_tokens": 8192,
-                "stop_token_ids": [128025],
                 "detokenize": True,
                 "skip_special_tokens": False,
             },
@@ -169,7 +161,7 @@ _DEPLOY_CONFIG = {
             "devices": DIT_DEVICES,
             "distributed_executor_backend": "mp",
             "parallel_config": {"tensor_parallel_size": DIT_TP_SIZE, "enable_expert_parallel": True},
-            "input_connectors": {"from_stage_0": "rdma_connector"},
+            "input_connectors": {"from_stage_0": "shared_memory_connector"},
             "default_sampling_params": {
                 "num_inference_steps": NUM_INFERENCE_STEPS,
                 "guidance_scale": GUIDANCE_SCALE,
