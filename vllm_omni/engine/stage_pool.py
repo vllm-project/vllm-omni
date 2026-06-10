@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
@@ -969,34 +971,70 @@ class StagePool:
         client = self.clients[replica_id]
         if client is None:
             raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
-        try:
-            self.output_processor.add_request(
-                request=request,
-                prompt=prompt_text,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
-        except Exception:
-            self.release_binding(request_id)
-            raise
-
-        try:
-            await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
-        except Exception:
-            self.release_binding(request_id)
-            rollback = getattr(self.output_processor, "remove_request", None)
-            if callable(rollback):
+        n = getattr(params, "n", 1) or 1
+        if n > 1:
+            parent_request = ParentRequest(request)
+            for idx in range(n):
+                child_req_id, child_params = parent_request.get_child_info(idx)
+                child_request = copy(request)
+                child_request.request_id = child_req_id
+                child_request.sampling_params = child_params
                 try:
-                    rollback(request_id)
-                except Exception as rollback_error:
-                    logger.warning(
-                        "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
-                        request_id,
-                        self.stage_id,
-                        rollback_error,
+                    self.output_processor.add_request(
+                        request=child_request,
+                        prompt=prompt_text,
+                        parent_req=parent_request,
+                        request_index=idx,
+                        queue=None,
                     )
-            raise
+                except Exception:
+                    self.release_binding(request_id)
+                    raise
+                try:
+                    await self._llm_client(replica_id).add_request_async(child_request, **submit_kwargs)
+                except Exception:
+                    self.release_binding(request_id)
+                    rollback = getattr(self.output_processor, "remove_request", None)
+                    if callable(rollback):
+                        try:
+                            rollback(child_request.request_id)
+                        except Exception as rollback_error:
+                            logger.warning(
+                                "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
+                                child_request.request_id,
+                                self.stage_id,
+                                rollback_error,
+                            )
+                    raise
+        else:
+            try:
+                self.output_processor.add_request(
+                    request=request,
+                    prompt=prompt_text,
+                    parent_req=None,
+                    request_index=0,
+                    queue=None,
+                )
+            except Exception:
+                self.release_binding(request_id)
+                raise
+
+            try:
+                await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
+            except Exception:
+                self.release_binding(request_id)
+                rollback = getattr(self.output_processor, "remove_request", None)
+                if callable(rollback):
+                    try:
+                        rollback(request_id)
+                    except Exception as rollback_error:
+                        logger.warning(
+                            "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
+                            request_id,
+                            self.stage_id,
+                            rollback_error,
+                        )
+                raise
         return replica_id
 
     async def submit_update(

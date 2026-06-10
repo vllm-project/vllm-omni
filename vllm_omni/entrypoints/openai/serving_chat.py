@@ -1027,6 +1027,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         "stop_token_ids",
         "frequency_penalty",
         "presence_penalty",
+        "n",
     }
 
     def _apply_request_overrides(
