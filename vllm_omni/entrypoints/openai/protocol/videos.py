@@ -73,6 +73,19 @@ class UrlImageReference(BaseModel):
 ImageReference = UrlImageReference | FileImageReference
 
 
+class FileVideoReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    file_id: str
+
+
+class UrlVideoReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    video_url: str
+
+
+VideoReference = UrlVideoReference | FileVideoReference
+
+
 class VideoGenerationRequest(BaseModel):
     """
     OpenAI-style video generation request.
@@ -98,6 +111,10 @@ class VideoGenerationRequest(BaseModel):
     image_reference: ImageReference | None = Field(
         default=None,
         description="Optional JSON-safe image reference that guides generation. Provide either image_url or file_id.",
+    )
+    video_reference: VideoReference | None = Field(
+        default=None,
+        description="Optional JSON-safe video reference that guides generation. Provide either video_url or file_id.",
     )
 
     # Video params block for extensibility

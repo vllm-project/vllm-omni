@@ -1767,7 +1767,16 @@ class OpenAIClientHandler:
         # Qwen3-TTS custom fields, forwarded via extra_body.
         extra_body: dict[str, Any] = {}
         # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
-        for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens", "seed"):
+        for key in (
+            "task_type",
+            "ref_text",
+            "ref_audio",
+            "language",
+            "max_new_tokens",
+            "seed",
+            "instructions",
+            "speed",
+        ):
             if key in request_config:
                 extra_body[key] = request_config[key]
 
