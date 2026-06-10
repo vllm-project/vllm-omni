@@ -10,7 +10,7 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 
 def ar2dit(
     source_outputs: list[Any],
-    prompts: OmniTokensPrompt | TextPrompt | list | None = None,
+    prompts: OmniTokensPrompt | TextPrompt | list[OmniTokensPrompt | TextPrompt] | None = None,
     _requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
     """Convert AR stage outputs to DiT stage inputs."""
