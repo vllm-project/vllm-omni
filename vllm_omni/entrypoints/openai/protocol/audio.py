@@ -7,6 +7,43 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator, model_vali
 _MAX_EMBEDDING_DIM = 8192
 
 
+def _normalize_ref_audio_value(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        items = []
+        for item in value:
+            if not isinstance(item, str):
+                raise TypeError("'ref_audio' list entries must be strings")
+            items.append(item)
+        if not items:
+            raise ValueError("'ref_audio' list cannot be empty")
+        return items
+    raise TypeError("'ref_audio' must be a string or list of strings")
+
+
+def _normalize_speaker_embedding_value(value):
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("'speaker_embedding' must be a list of numbers or list of embedding vectors")
+    if not value:
+        return []
+
+    first = value[0]
+    if isinstance(first, (list, tuple)):
+        embeddings = []
+        for item in value:
+            if not isinstance(item, (list, tuple)):
+                raise TypeError("'speaker_embedding' must not mix flat and nested values")
+            embeddings.append([float(x) for x in item])
+        return embeddings
+
+    return [float(x) for x in value]
+
+
 class OpenAICreateSpeechRequest(BaseModel):
     input: str
     model: str | None = None
@@ -46,7 +83,7 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Language code (e.g., 'Chinese', 'English', 'Auto')",
     )
-    ref_audio: str | None = Field(
+    ref_audio: str | list[str] | None = Field(
         default=None,
         description="Reference audio for voice cloning (Base task). URL, base64, or file URI.",
     )
@@ -54,11 +91,26 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Transcript of reference audio for voice cloning (Base task)",
     )
+    ref_audio_2: str | None = Field(
+        default=None,
+        description="Second reference audio for two-speaker dialogue (MOSS-TTSD). "
+        "URL, base64, or file URI. Ignored by single-speaker models.",
+    )
+    ambient_sound: str | None = Field(
+        default=None,
+        description="Sound description for ambient/effect synthesis (MOSS-SoundEffect). "
+        "Natural language, e.g. 'ocean waves crashing on a rocky beach'.",
+    )
+    duration_seconds: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Target audio duration in seconds (MOSS-SoundEffect). Converted to ~12.5 frames/s internally.",
+    )
     x_vector_only_mode: bool | None = Field(
         default=None,
         description="Use speaker embedding only without in-context learning (Base task)",
     )
-    speaker_embedding: list[float] | None = Field(
+    speaker_embedding: list[float] | list[list[float]] | None = Field(
         default=None,
         max_length=_MAX_EMBEDDING_DIM,
         description="Pre-computed speaker embedding vector (1024-dim for 0.6B, "
@@ -93,17 +145,128 @@ class OpenAICreateSpeechRequest(BaseModel):
             raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
         return v
 
+    @field_validator("ref_audio", mode="before")
+    @classmethod
+    def normalize_ref_audio(cls, v):
+        return _normalize_ref_audio_value(v)
+
     @field_validator("speaker_embedding")
     @classmethod
-    def validate_speaker_embedding(cls, v: list[float] | None) -> list[float] | None:
-        if v is not None and not all(math.isfinite(x) for x in v):
+    def validate_speaker_embedding(
+        cls, v: list[float] | list[list[float]] | None
+    ) -> list[float] | list[list[float]] | None:
+        v = _normalize_speaker_embedding_value(v)
+        if v is None:
+            return None
+        if not v:
+            return []
+        if isinstance(v[0], list):
+            for item in v:
+                if not item:
+                    raise ValueError("'speaker_embedding' nested vectors must be non-empty")
+                if not all(math.isfinite(x) for x in item):
+                    raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
+            return v
+        if not all(math.isfinite(x) for x in v):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_references_alias(cls, data):
+        """Map the BosonAI Higgs Audio v3 cookbook ``references`` array onto ``ref_audio`` / ``ref_text``.
+
+        Upstream Higgs Audio v3 examples and the boson.ai cookbook send voice
+        clones as::
+
+            {"references": [{"audio_path": str, "text": str}]}
+
+        vllm-omni's existing convention is ``ref_audio`` + ``ref_text``.
+        Without this alias pydantic silently drops the unknown ``references``
+        field and the request falls through to zero-shot synthesis with no
+        error, which is hard to debug from the client side. The normalizer
+        translates a single reference and rejects multi-reference payloads
+        (vllm-omni does not yet support multi-shot voice clone) or conflicts
+        with the explicit ``ref_audio`` / ``ref_text`` fields.
+        """
+        if not isinstance(data, dict):
+            return data
+        refs = data.get("references")
+        if refs is None:
+            return data
+        if not isinstance(refs, list) or len(refs) == 0:
+            raise ValueError("'references' must be a non-empty array of {audio_path, text} objects")
+        if len(refs) > 1:
+            raise ValueError("'references' only supports a single reference; multi-shot voice clone is not supported")
+        first = refs[0]
+        if not isinstance(first, dict):
+            raise ValueError("'references[0]' must be an object with 'audio_path' and optional 'text'")
+        audio_path = first.get("audio_path")
+        if not isinstance(audio_path, str) or not audio_path:
+            raise ValueError(
+                "'references[0].audio_path' is required and must be a string (URL, data: URI, or file path)"
+            )
+        existing_ref_audio = data.get("ref_audio")
+        if existing_ref_audio and existing_ref_audio != audio_path:
+            raise ValueError("'references' and 'ref_audio' are mutually exclusive")
+        data["ref_audio"] = audio_path
+        text = first.get("text")
+        if isinstance(text, str) and text.strip():
+            existing_ref_text = data.get("ref_text")
+            if existing_ref_text and existing_ref_text != text:
+                raise ValueError("'references[0].text' and 'ref_text' conflict; supply only one")
+            data["ref_text"] = text
+        data.pop("references", None)
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_higgs_audio_v2_unsupported_aliases(cls, data):
+        """Reject unsupported rich-input aliases for higgs_audio_v2 BEFORE pydantic strips them.
+
+        OpenAICreateSpeechRequest is a permissive schema (it accepts any extra
+        field that the OpenAI Speech API didn't promise to ban) but several
+        of those aliases pull a request out of the v1 higgs_audio_v2 scope.
+        Catching them at parse time lets the API return a deterministic 4xx
+        with a model-specific error message instead of silently dropping the
+        field and proceeding with a degraded request.
+        """
+        # Keys that are silently dropped by pydantic when posted to /v1/audio/speech
+        # (the schema doesn't declare them) but which a model-specific
+        # validator MUST be able to reject. Kept inline to avoid clashing
+        # with pydantic's ModelPrivateAttr discovery for class-level
+        # underscore-prefixed attributes.
+        higgs_audio_v2_reserved_keys = (
+            "messages",  # ChatML rich content (out of scope for v1)
+            "reference_audio",  # voice-cloning alias 1
+            "voice_prompt",  # voice-cloning alias 2
+            "speaker_audio",  # voice-cloning alias 3
+            "speakers",  # multi-speaker dialogue
+        )
+        if not isinstance(data, dict):
+            return data
+        model_id = data.get("model")
+        if not isinstance(model_id, str):
+            return data
+        # Match the "higgs_audio_v2" model_type label, the HF architecture id
+        # in pipeline_registry.hf_architectures, and the hyphenated HF repo id
+        # (e.g. "bosonai/higgs-audio-v2-generation-3B-base") by normalizing
+        # both underscores and hyphens out of the id before substring matching.
+        normalized = model_id.lower().replace("-", "").replace("_", "")
+        if "higgsaudiov2" not in normalized:
+            return data
+        offending = sorted(k for k in higgs_audio_v2_reserved_keys if k in data)
+        if offending:
+            raise ValueError(
+                "higgs_audio_v2 v1 does not support these rich-input fields: "
+                f"{offending}. Supply plain text via the 'input' field instead."
+            )
+        return data
 
     @model_validator(mode="after")
     def validate_embedding_constraints(self) -> "OpenAICreateSpeechRequest":
         if self.speaker_embedding is not None:
-            if self.ref_audio is not None:
+            if self.ref_audio is not None and not isinstance(self.ref_audio, list):
                 raise ValueError("'speaker_embedding' and 'ref_audio' are mutually exclusive")
         return self
 

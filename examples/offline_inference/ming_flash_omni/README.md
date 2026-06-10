@@ -2,12 +2,13 @@
 
 [Ming-flash-omni-2.0](https://github.com/inclusionAI/Ming) is an omni-modal model supporting text, image, video, and audio understanding, with text and speech outputs.
 
-vLLM-Omni supports two deployment modes:
+vLLM-Omni supports three deployment modes:
 
 | Mode | Deploy config | Output |
 |------|--------------|--------|
 | Thinker + Talker (omni-speech, default) | `vllm_omni/deploy/ming_flash_omni.yaml` | Text + Audio |
 | Thinker only (multimodal understanding) | `vllm_omni/deploy/ming_flash_omni_thinker_only.yaml` | Text |
+| Thinker + Imagegen (text-to-image / img2img) | `vllm_omni/deploy/ming_flash_omni_image.yaml` | Image (online-serving only at the moment) |
 
 For standalone TTS (talker only), see the [Ming-flash-omni-TTS section in the Text-To-Speech hub](../text_to_speech/README.md#ming-flash-omni-tts).
 
@@ -52,7 +53,7 @@ python examples/offline_inference/ming_flash_omni/end2end.py \
     --image-path ./3_0.png
 ```
 
-### Omni-Speech (Thinker + Talker)
+### Omni-Speech (Thinker + Talker) {#omni-speech-thinker--talker}
 
 The default deploy YAML already runs thinker+talker, so spoken output only requires requesting `audio` (or `text,audio`) modalities.
 The thinker processes your multimodal input, generates text, then the talker synthesises the response as speech.
@@ -86,6 +87,17 @@ The default deploy YAML allocates thinker on GPUs 0–3 and talker on GPU 3 for 
 | `text,audio` | Text | Runs | `<id>.txt` + `<id>.wav` |
 
 Pass `--deploy-config /path/to/your_deploy.yaml` to any of the commands above to override the bundled deploy config.
+
+### Image generation (text-to-image / img2img)
+
+The diffusion-stage image-generation path is currently only wired through
+the online OpenAI-compatible chat endpoint (`/v1/chat/completions` with
+`"modalities": ["image"]`). For payloads, optional knobs
+(`steps`/`cfg`/`seed`/`byte5_text`/`negative_prompt`), and the img2img
+reference-image flow, see the
+[image-gen section in the online-serving README](../../online_serving/ming_flash_omni/README.md#image-generation-text-to-image).
+`end2end.py` does not yet exercise the imagegen stage; that is tracked as
+follow-up work.
 
 ## Online serving
 

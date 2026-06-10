@@ -14,13 +14,14 @@ list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
 |---|---|---|---|---|---|---|
-| CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 22.05 kHz |
+| CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
+| GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
+| Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | 2 (AR + audio VAE) | ✓ | ✓ | style / IP / dialect / TTA / podcast | 44.1 kHz |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
-| VoxCPM | `openbmb/VoxCPM-0.5B` | split | ✓ | ✓ | — | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
 
@@ -41,7 +42,7 @@ python examples/offline_inference/text_to_speech/<model>/end2end.py \
 
 ## CosyVoice3
 
-2-stage TTS pipeline (`talker` + `code2wav`) at 22.05 kHz.
+2-stage TTS pipeline (`talker` + `code2wav`) at 24 kHz.
 
 ### Prerequisites
 ```bash
@@ -73,13 +74,15 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 ```
 
 ### Voice cloning
-Pass a reference audio. Note that CosyVoice3's `--prompt-text` is a system-style prompt for the GPT stage, not a reference transcript:
+If `--ref-audio` is omitted, the script downloads the upstream
+[`zero_shot_prompt.wav`](https://github.com/FunAudioLLM/CosyVoice/blob/main/asset/zero_shot_prompt.wav) from the CosyVoice repo into the current directory.
+To use your own clip, pass `--ref-audio /path/to/reference.wav`, and modify `--prompt-text` correspondingly.
 ```bash
 python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
     --model pretrained_models/Fun-CosyVoice3-0.5B \
     --tokenizer pretrained_models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
-    --ref-audio prompt.wav \
-    --prompt-text "You are a helpful assistant.<|endofprompt|>Testing my voices. Why should I not?"
+    --ref-audio /path/to/reference.wav \
+    --prompt-text "You are a helpful assistant.<|endofprompt|>Trascript in your ref audio clip"
 ```
 
 ### Streaming
@@ -88,6 +91,35 @@ Streaming is enabled by default via `async_chunk: true` in `vllm_omni/deploy/cos
 ### Notes
 - Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
 - Deploy config auto-loads from `vllm_omni/deploy/cosyvoice3.yaml` based on HF `model_type`. Pass `--deploy-config <path>` to override.
+
+---
+
+## GLM-TTS
+
+2-stage TTS pipeline (AR + DiT flow-matching) at 24 kHz. Every request requires reference audio and its transcript for zero-shot voice cloning.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/glm_tts/end2end.py \
+    --model zai-org/GLM-TTS \
+    --text "你好，这是语音合成测试。" \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "这是参考音频的文本内容。" \
+    --output-dir ./output
+```
+
+### Architecture
+```
+Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24 kHz)
+        (Llama-based)    (32k vocab)      (Flow Matching)
+```
+
+### Notes
+- `--ref-audio` and `--ref-text` are **required** together; GLM-TTS does not support text-only synthesis.
+- Reference audio should be 3-10 seconds.
+- First run may be slow due to lazy loading of WhisperVQ tokenizer and CampPlus ONNX speaker embedder.
+- Default sampling: temperature=1.0, top_k=25, top_p=0.8 (RAS method).
+- The `--model` path should point to the repository root (not `llm/` subdirectory).
 
 ---
 
@@ -125,6 +157,46 @@ Streaming requires `async_chunk: true` in the stage config.
 ### Notes
 - Output: 44.1 kHz mono WAV.
 - DAC codec weights (`codec.pth`) are loaded lazily from the model directory.
+
+---
+
+## Ming-omni-tts
+
+Dense 0.5B two-stage TTS pipeline (`AR + flow` + audio VAE) at 44.1 kHz. The example covers style, IP voice, music-only generation, text-to-audio events, emotion, dialect, zero-shot cloning, podcast, speech+BGM, and speech+environment-sound cases.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
+    --case style \
+    --deploy-config vllm_omni/deploy/ming_tts.yaml \
+    --enforce-eager
+```
+
+### Voice cloning
+```bash
+python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
+    --case zero_shot \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "在此奉劝大家别乱打美白针。" \
+    --deploy-config vllm_omni/deploy/ming_tts.yaml \
+    --enforce-eager
+```
+
+### Streaming
+```bash
+python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
+    --case basic \
+    --ref-audio /path/to/reference.wav \
+    --streaming \
+    --deploy-config vllm_omni/deploy/ming_tts.yaml \
+    --enforce-eager
+```
+
+### Notes
+- `style`, `ip`, `bgm`, and `tta` do not require reference audio.
+- Reference-audio cases use `--ref-audio`; `zero_shot` also requires `--ref-text`.
+- `podcast` uses multiple references via `--ref-audio-paths`.
+- Full case details live in [`ming_tts/README.md`](ming_tts/README.md).
 
 ---
 
@@ -240,6 +312,14 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --lang zh
 ```
 
+### Seed for Reproducibility
+```bash
+python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
+    --model k2-fsa/OmniVoice \
+    --text "Hello, this is a test." \
+    --seed 42
+```
+
 ### Notes
 - Stage 0 (Generator): Qwen3-0.6B with 32-step iterative unmasking.
 - Stage 1 (Decoder): HiggsAudioV2 RVQ + DAC at 24 kHz.
@@ -303,61 +383,6 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
 ### Notes
 - Run `--help` for the full argument surface.
 - See `qwen3_tts/end2end.py` for the prompt-length-estimation logic the Talker uses.
-
----
-
-## VoxCPM
-
-Split-stage TTS. The hub example covers single TTS, single voice cloning, and streaming. Use `benchmarks/voxcpm/` for warmup, batch JSONL prompts, profiler injection, and offline TTFP / RTF measurement.
-
-### Prerequisites
-```bash
-pip install voxcpm soundfile
-# or use a local source tree:
-export VLLM_OMNI_VOXCPM_CODE_PATH=/path/to/VoxCPM/src
-```
-
-If the native VoxCPM `config.json` does not contain HF metadata such as `model_type`, prepare a persistent HF-compatible config directory and point the stage configs to it via `VLLM_OMNI_VOXCPM_HF_CONFIG_PATH`:
-
-```bash
-export VOXCPM_MODEL=/path/to/voxcpm-model
-export VLLM_OMNI_VOXCPM_HF_CONFIG_PATH=/tmp/voxcpm_hf_config
-mkdir -p "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"
-cp "$VOXCPM_MODEL/config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/config.json"
-cp "$VOXCPM_MODEL/generation_config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/generation_config.json" 2>/dev/null || true
-python3 -c 'import json, os; p=os.path.join(os.environ["VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"], "config.json"); cfg=json.load(open(p, "r", encoding="utf-8")); cfg["model_type"]="voxcpm"; cfg.setdefault("architectures", ["VoxCPMForConditionalGeneration"]); json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)'
-```
-
-### Quick start
-```bash
-python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This is a split-stage VoxCPM synthesis example running on vLLM Omni."
-```
-
-### Voice cloning
-```bash
-python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This sentence is synthesized with a cloned voice." \
-    --ref-audio /path/to/reference.wav \
-    --ref-text  "The exact transcript spoken in reference.wav."
-```
-
-### Streaming
-Pass the async-chunk stage config:
-```bash
-python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
-    --model "$VOXCPM_MODEL" \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml \
-    --text "This is a split-stage VoxCPM streaming example running on vLLM Omni."
-```
-
-### Notes
-- `voxcpm.yaml` is the default non-streaming stage config; `voxcpm_async_chunk.yaml` enables streaming.
-- Streaming is currently single-request oriented.
-- `--ref-text` must be the real transcript of `--ref-audio`; mismatched text degrades quality.
-- For online serving, see the [VoxCPM section in the online hub](../../online_serving/text_to_speech/README.md#voxcpm). For benchmark reporting, see [`benchmarks/voxcpm`](../../../benchmarks/voxcpm/README.md).
 
 ---
 

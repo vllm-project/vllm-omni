@@ -17,14 +17,16 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
@@ -135,7 +137,12 @@ def get_wan22_i2v_pre_process_func(
 
 
 class Wan22I2VPipeline(
-    nn.Module, SupportImageInput, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    SupportImageInput,
+    PipelineParallelMixin,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
 ):
     """
     Wan2.2 Image-to-Video Pipeline.
@@ -190,44 +197,88 @@ class Wan22I2VPipeline(
                 )
             )
 
-        # Text encoder
-        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
-        ).to(self.device)
-
         # Image encoder (CLIP) - optional, for Wan2.1-style I2V
         self.has_image_encoder = "image_encoder" in model_index and model_index["image_encoder"][0] is not None
 
-        # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
+        # See ``hub_prefetch.py`` for the transformers v5 subfolder race. The
+        # prefetch MUST run before any ``from_pretrained`` below - previously
+        # the tokenizer / text_encoder were loaded ahead of this call, so they
+        # never benefited from the prefetch and could hit the half-written
+        # cache directly.
         subfolders = ["tokenizer", "text_encoder", "vae"]
         if self.has_image_encoder:
             subfolders.extend(["image_processor", "image_encoder"])
         prefetch_subfolders(model, subfolders, local_files_only=local_files_only)
 
+        # Text encoder
+        self.tokenizer = from_pretrained_with_prefetch(
+            AutoTokenizer.from_pretrained,
+            model,
+            subfolder="tokenizer",
+            prefetch_list=subfolders,
+            local_files_only=local_files_only,
+        )
+        self.text_encoder = from_pretrained_with_prefetch(
+            UMT5EncoderModel.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
+        ).to(self.device)
+
         if self.has_image_encoder:
-            self.image_processor = CLIPImageProcessor.from_pretrained(
-                model, subfolder="image_processor", local_files_only=local_files_only
+            self.image_processor = from_pretrained_with_prefetch(
+                CLIPImageProcessor.from_pretrained,
+                model,
+                subfolder="image_processor",
+                prefetch_list=subfolders,
+                local_files_only=local_files_only,
             )
-            self.image_encoder = CLIPVisionModel.from_pretrained(
-                model, subfolder="image_encoder", torch_dtype=dtype, local_files_only=local_files_only
+            self.image_encoder = from_pretrained_with_prefetch(
+                CLIPVisionModel.from_pretrained,
+                model,
+                subfolder="image_encoder",
+                prefetch_list=subfolders,
+                local_files_only=local_files_only,
+                torch_dtype=dtype,
             ).to(self.device)
         else:
             self.image_processor = None
             self.image_encoder = None
 
         # VAE
-        self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
+        self.vae = from_pretrained_with_prefetch(
+            DistributedAutoencoderKLWan.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         # Transformers (weights loaded via load_weights)
         # Load config from model directory or HF Hub to get correct in_channels for I2V models
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = self._create_transformer(transformer_config)
+        self.transformer = create_transformer_from_config(
+            transformer_config,
+            quant_config=od_config.quantization_config,
+        )
         if self.has_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = self._create_transformer(transformer_2_config)
+            t2_quant = transformer_2_config.get("quantization_config")
+            if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
+                from vllm_omni.quantization.factory import build_quant_config
+
+                method = t2_quant["quant_method"]
+                kwargs = {k: v for k, v in t2_quant.items() if k != "quant_method"}
+                t2_quant = build_quant_config(method, **kwargs)
+            else:
+                t2_quant = None
+            self.transformer_2 = create_transformer_from_config(
+                transformer_2_config,
+                quant_config=t2_quant,
+            )
         else:
             self.transformer_2 = None
 
@@ -283,7 +334,7 @@ class Wan22I2VPipeline(
         attention_kwargs: dict[str, Any],
         condition: torch.Tensor,
         first_frame_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
         with self.progress_bar(total=len(timesteps)) as pbar:
@@ -348,7 +399,6 @@ class Wan22I2VPipeline(
 
                 # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
-
                 pbar.update()
 
         return latents
@@ -667,7 +717,11 @@ class Wan22I2VPipeline(
             output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
         )
 
-    def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
+    def predict_noise(
+        self,
+        current_model: nn.Module | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | IntermediateTensors:
         """
         Forward pass through transformer to predict noise.
 
@@ -676,11 +730,12 @@ class Wan22I2VPipeline(
             **kwargs: Arguments to pass to the transformer
 
         Returns:
-            Predicted noise tensor
+            Predicted noise tensor or IntermediateTensors on non-last PP stages.
         """
         if current_model is None:
             current_model = self.transformer
-        return current_model(**kwargs)[0]
+        result = current_model(**kwargs)
+        return result if isinstance(result, IntermediateTensors) else result[0]
 
     def encode_prompt(
         self,

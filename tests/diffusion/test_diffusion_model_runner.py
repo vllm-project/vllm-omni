@@ -52,6 +52,7 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     runner.pipeline = _DummyPipeline(output=SimpleNamespace(output="ok"))
     runner.cache_backend = cache_backend
     runner.offload_backend = None
+    runner.prompt_embed_cache = None
     runner.od_config = SimpleNamespace(
         cache_backend=cache_backend_name,
         enable_cache_dit_summary=enable_cache_dit_summary,
@@ -300,8 +301,4 @@ def test_vllm_set_forward_context_implementation(monkeypatch):
                 "vllm_config",
             ),
         ),
-        ("ir_op_priority", None),
-        ("enable_torch_wrap", vllm_config.compilation_config.ir_enable_torch_wrap),
-        ("enable_torch_wrap_exit", vllm_config.compilation_config.ir_enable_torch_wrap),
-        ("ir_op_priority_exit", None),
     ], ERROR_MESSAGE

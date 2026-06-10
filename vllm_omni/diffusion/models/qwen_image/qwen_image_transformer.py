@@ -17,7 +17,6 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 from vllm.logger import init_logger
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -47,6 +46,10 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+
+def _join_prefix(prefix: str, suffix: str) -> str:
+    return f"{prefix}.{suffix}" if prefix else suffix
 
 
 class ImageRopePrepare(nn.Module):
@@ -471,7 +474,12 @@ class FeedForward(nn.Module):
 
         layers: list[nn.Module] = [
             ColumnParallelApproxGELU(
-                dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config, prefix=prefix
+                dim,
+                inner_dim,
+                approximate="tanh",
+                bias=bias,
+                quant_config=quant_config,
+                prefix=_join_prefix(prefix, "net.0.proj"),
             ),
             nn.Identity(),  # placeholder for weight loading
             RowParallelLinear(
@@ -480,7 +488,7 @@ class FeedForward(nn.Module):
                 input_is_parallel=True,
                 return_bias=False,
                 quant_config=quant_config,
-                prefix=prefix,
+                prefix=_join_prefix(prefix, "net.2"),
             ),
         ]
 
@@ -507,6 +515,7 @@ class QwenImageCrossAttention(nn.Module):
         context_pre_only: bool = False,
         out_dim: int | None = None,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0
@@ -523,13 +532,13 @@ class QwenImageCrossAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=num_heads,
             quant_config=quant_config,
-            prefix="to_qkv",
+            prefix=_join_prefix(prefix, "to_qkv"),
         )
         self.query_num_heads = self.to_qkv.num_heads
         self.kv_num_heads = self.to_qkv.num_kv_heads
 
-        self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q = nn.RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = nn.RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
         self.inner_dim = out_dim if out_dim is not None else head_dim * self.total_num_heads
 
@@ -539,7 +548,7 @@ class QwenImageCrossAttention(nn.Module):
             head_size=head_dim,
             total_num_heads=num_heads,
             quant_config=quant_config,
-            prefix="add_kv_proj",
+            prefix=_join_prefix(prefix, "add_kv_proj"),
         )
         self.add_query_num_heads = self.add_kv_proj.num_heads
         self.add_kv_num_heads = self.add_kv_proj.num_kv_heads
@@ -552,7 +561,7 @@ class QwenImageCrossAttention(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix="to_add_out",
+            prefix=_join_prefix(prefix, "to_add_out"),
         )
 
         assert not pre_only
@@ -563,11 +572,11 @@ class QwenImageCrossAttention(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix="to_out",
+            prefix=_join_prefix(prefix, "to_out"),
         )
 
-        self.norm_added_q = RMSNorm(head_dim, eps=eps)
-        self.norm_added_k = RMSNorm(head_dim, eps=eps)
+        self.norm_added_q = nn.RMSNorm(head_dim, eps=eps)
+        self.norm_added_k = nn.RMSNorm(head_dim, eps=eps)
 
         self.attn = Attention(
             num_heads=self.query_num_heads,
@@ -697,6 +706,7 @@ class QwenImageTransformerBlock(nn.Module):
         eps: float = 1e-6,
         zero_cond_t: bool = False,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -705,18 +715,20 @@ class QwenImageTransformerBlock(nn.Module):
         self.attention_head_dim = attention_head_dim
 
         # Image processing modules.
-        # Modulation linear is kept full precision (quant_config=None) — it
+        # Modulation linear is kept unquantized (quant_config=None) — it
         # produces shift/scale/gate values that are precision-sensitive
-        # (see #2728).
+        # (see #2728). Use column TP with gather_output=True so weights are
+        # sharded while downstream modulation still receives full [B, 6 * dim].
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            ColumnParallelLinear(
                 dim,
                 6 * dim,
                 bias=True,
+                gather_output=True,
                 return_bias=False,
                 quant_config=None,
-                prefix="img_mod.1",
+                prefix=_join_prefix(prefix, "img_mod.1"),
             ),
         )
         self.img_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -727,26 +739,38 @@ class QwenImageTransformerBlock(nn.Module):
             context_pre_only=False,
             head_dim=attention_head_dim,
             quant_config=quant_config,
+            prefix=_join_prefix(prefix, "attn"),
         )
         self.img_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.img_mlp = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix="img_mlp")
+        self.img_mlp = FeedForward(
+            dim=dim,
+            dim_out=dim,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "img_mlp"),
+        )
 
         # Text processing modules.
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            ColumnParallelLinear(
                 dim,
                 6 * dim,
                 bias=True,
+                gather_output=True,
                 return_bias=False,
                 quant_config=None,
-                prefix="txt_mod.1",
+                prefix=_join_prefix(prefix, "txt_mod.1"),
             ),
         )
         self.txt_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
         self.txt_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.txt_mlp = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix="txt_mlp")
+        self.txt_mlp = FeedForward(
+            dim=dim,
+            dim_out=dim,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "txt_mlp"),
+        )
 
         self.zero_cond_t = zero_cond_t
 
@@ -967,7 +991,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
             quant_config=quant_config,
         )
 
-        self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
+        self.txt_norm = nn.RMSNorm(joint_attention_dim, eps=1e-6)
 
         # Entry projections (image/text) are kept full precision —
         # small sensitive layers at the network boundary (see #2728).
@@ -996,8 +1020,9 @@ class QwenImageTransformer2DModel(CachedTransformer):
                     attention_head_dim=attention_head_dim,
                     zero_cond_t=zero_cond_t,
                     quant_config=quant_config,
+                    prefix=f"transformer_blocks.{i}",
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 

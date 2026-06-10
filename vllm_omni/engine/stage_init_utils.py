@@ -13,9 +13,10 @@ import importlib
 import multiprocessing as mp
 import os
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
@@ -59,6 +60,63 @@ class LogicalStageInitPlan:
     stage_idx: int
     configured_stage_id: int
     replicas: list[ReplicaInitPlan]
+
+
+@dataclass
+class StageRemoteFactoryContext:
+    """Per-stage context cached by AsyncOmniEngine for dynamic replica attach.
+
+    Populated once during ``_bootstrap_orchestrator`` from the per-stage
+    init plans. ``_build_remote_replica`` consumes it to construct the
+    right head-side stage client when a headless replica registers.
+    """
+
+    stage_id: int
+    stage_type: str
+    stage_cfg: Any
+    base_metadata: Any
+    # LLM-only fields:
+    vllm_config: Any | None = None
+    executor_class: type | None = None
+    # Diffusion-only fields:
+    diffusion_batch_size: int = 1
+
+
+def capture_stage_factory_contexts(
+    stage_plans: Sequence[LogicalStageInitPlan],
+    diffusion_batch_size: int,
+) -> dict[int, StageRemoteFactoryContext]:
+    """Snapshot per-stage construction context for dynamic replica attach.
+
+    Called once after ``_initialize_stages`` finishes. The captured
+    context holds everything ``_build_remote_replica`` needs to build a
+    fresh head-side client when a new headless replica registers
+    (vllm_config / executor_class for LLM, batch_size for diffusion,
+    plus the base stage metadata).
+
+    Per-replica fields like ``replica_id`` are filled in at build time,
+    not at capture time.
+    """
+    contexts: dict[int, StageRemoteFactoryContext] = {}
+    for plan in stage_plans:
+        if not plan.replicas:
+            # Stage was declared but has zero replicas locally; we still
+            # want to be able to attach incoming headless ones, so use
+            # the stage_cfg-derived context if any replica plan exists.
+            continue
+        template = plan.replicas[0]
+        stage_id = int(plan.configured_stage_id)
+        stage_type = template.metadata.stage_type or "llm"
+        contexts[stage_id] = StageRemoteFactoryContext(
+            stage_id=stage_id,
+            stage_type=stage_type,
+            stage_cfg=template.stage_cfg,
+            base_metadata=template.metadata,
+            vllm_config=template.stage_vllm_config,
+            executor_class=template.executor_class,
+            diffusion_batch_size=diffusion_batch_size,
+        )
+    return contexts
 
 
 def _resolve_model_to_local_path(model: str) -> str:
@@ -122,6 +180,19 @@ def terminate_alive_proc(proc, timeout=5):
         proc.join(timeout=timeout)
         if proc.is_alive():
             proc.kill()
+
+
+def set_death_signal(sig: int) -> None:
+    """Best-effort parent-death signal for Linux subprocesses."""
+    try:
+        import ctypes
+        import platform
+
+        if platform.system() != "Linux":
+            return
+        ctypes.CDLL("libc.so.6").prctl(1, sig)
+    except Exception:
+        pass
 
 
 def patch_generation_config_if_needed(model_config: Any) -> None:
@@ -357,6 +428,8 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         _mod, _fn = _ckf_path.rsplit(".", 1)
         cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
 
+    model_stage = getattr(engine_args, "model_stage", None)
+
     if stage_type == "diffusion":
         return StageMetadata(
             stage_id=stage_id,
@@ -369,12 +442,11 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             final_output_type=final_output_type,
             default_sampling_params=default_sampling_params,
             custom_process_input_func=custom_process_input_func,
-            model_stage=None,
+            model_stage=model_stage,
             runtime_cfg=runtime_cfg,
             cfg_kv_collect_func=cfg_kv_collect_func,
         )
 
-    model_stage = getattr(engine_args, "model_stage", None)
     engine_output_type = getattr(engine_args, "engine_output_type", None)
     is_comprehension = getattr(stage_config, "is_comprehension", False)
     requires_multimodal_data = getattr(runtime_cfg, "requires_multimodal_data", False)
@@ -411,6 +483,15 @@ def prepare_engine_environment() -> None:
         pass
 
 
+def _maybe_set_qwen3_omni_moe_env(engine_args_dict: dict[str, Any]) -> None:
+    if (
+        engine_args_dict.get("model_arch") == "Qwen3OmniMoeForConditionalGeneration"
+        and "VLLM_USE_FLASHINFER_MOE_FP16" not in os.environ
+    ):
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
+        logger.info("[stage_init] Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni stage")
+
+
 def split_devices_for_replicas(
     devices_str: str | None,
     num_replicas: int,
@@ -420,32 +501,59 @@ def split_devices_for_replicas(
     """Split a devices string into per-replica subsets.
 
     When ``num_replicas`` is 1, returns ``[devices_str]`` unchanged.
-    Otherwise, the total number of device IDs must equal
-    ``num_replicas * tp_size``; each replica gets ``tp_size`` consecutive
-    device IDs.
+    Otherwise, two YAML shapes are accepted:
 
-    Example::
+    1. **Legacy / pool mode** — ``len(devices) == num_replicas * tp_size``:
+       the string enumerates the full per-stage pool. Each replica gets
+       ``tp_size`` consecutive entries. The values are logical indices
+       into the launcher's ``CUDA_VISIBLE_DEVICES``.
 
-        split_devices_for_replicas("1,2,3,4", num_replicas=2, tp_size=2, stage_id=1)
-        # → ["1,2", "3,4"]
+       ``split_devices_for_replicas("1,2,3,4", 2, 2, 1) → ["1,2", "3,4"]``
+
+    2. **Template mode** — ``len(devices) == tp_size``: the YAML declares
+       a single per-replica template (the same shape one replica would
+       use), and is **dp-independent**. Each replica r gets the offsets
+       ``[r*tp_size + a for a in template]`` of the launcher's
+       ``CUDA_VISIBLE_DEVICES``. The template's entries must lie in
+       ``[0, tp_size)``.
+
+       ``split_devices_for_replicas("0,1", 2, 2, 1) → ["0,1", "2,3"]``
+       ``split_devices_for_replicas("0,1", 4, 2, 1) → ["0,1", "2,3", "4,5", "6,7"]``
+
+       This lets the same ``devices: "0,1"`` YAML work for any
+       ``--omni-dp-size-local``: the launcher's CVD scales, the YAML
+       does not.
+
+    Any other length raises ``ValueError`` (the two modes are
+    length-disjoint for ``num_replicas > 1``).
     """
     if num_replicas <= 1 or devices_str is None:
         return [devices_str] if devices_str is not None else [devices_str]
 
     device_list = [d.strip() for d in devices_str.split(",") if d.strip()]
-    required = num_replicas * tp_size
-    if len(device_list) != required:
-        raise ValueError(
-            f"Stage {stage_id}: num_replicas={num_replicas}, "
-            f"tensor_parallel_size={tp_size} requires "
-            f"{required} devices, got {len(device_list)}: {devices_str}"
-        )
 
-    result: list[str] = []
-    for r in range(num_replicas):
-        chunk = device_list[r * tp_size : (r + 1) * tp_size]
-        result.append(",".join(chunk))
-    return result
+    if len(device_list) == num_replicas * tp_size:
+        return [",".join(device_list[r * tp_size : (r + 1) * tp_size]) for r in range(num_replicas)]
+
+    if len(device_list) == tp_size:
+        try:
+            offsets = [int(a) for a in device_list]
+        except ValueError as e:
+            raise ValueError(f"Stage {stage_id}: template-mode devices must be ints, got {devices_str!r}") from e
+        bad = [a for a in offsets if not (0 <= a < tp_size)]
+        if bad:
+            raise ValueError(
+                f"Stage {stage_id}: template-mode device offset(s) {bad} "
+                f"out of range [0, {tp_size}); devices={devices_str!r}"
+            )
+        return [",".join(str(r * tp_size + a) for a in offsets) for r in range(num_replicas)]
+
+    raise ValueError(
+        f"Stage {stage_id}: devices={devices_str!r} has {len(device_list)} id(s); "
+        f"need either {tp_size} (template, dp-independent) or "
+        f"{num_replicas * tp_size} (pool / legacy). "
+        f"num_replicas={num_replicas}, tensor_parallel_size={tp_size}."
+    )
 
 
 def get_stage_tp_size(stage_cfg: Any) -> int:
@@ -479,8 +587,18 @@ def get_stage_devices_per_replica(stage_cfg: Any) -> int:
 
 def compute_replica_layout(
     stage_configs: Sequence[Any],
+    *,
+    allow_zero: bool = False,
 ) -> tuple[list[int], dict[int, list[str]]]:
     """Compute per-stage replica counts and device assignments.
+
+    Args:
+        stage_configs: per-stage config objects with a ``runtime`` sub-config
+            exposing ``num_replicas`` and ``devices``.
+        allow_zero: when True, ``num_replicas == 0`` is honored (used by
+            single-stage / head-distributed mode for non-self stages that
+            will be filled dynamically by remote registrations); when False
+            (default), the count is clamped to at least 1.
 
     Returns:
         replicas_per_stage: num_replicas per logical stage.
@@ -495,7 +613,9 @@ def compute_replica_layout(
             if hasattr(runtime_cfg, "get")
             else getattr(runtime_cfg, "num_replicas", 1)
         )
-        replicas_per_stage.append(max(1, num_replicas))
+        if num_replicas < 0:
+            raise ValueError(f"num_replicas must be >= 0, got {num_replicas}")
+        replicas_per_stage.append(num_replicas if allow_zero else max(1, num_replicas))
 
     replica_devices_map: dict[int, list[str]] = {}
     for stage_id, stage_cfg in enumerate(stage_configs):
@@ -537,6 +657,62 @@ def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
             stage_id,
             physical_devices,
         )
+
+
+@contextmanager
+def stage_runtime_setup(stage_id: int, runtime_cfg: Any) -> Generator[None, None, None]:
+    """Apply per-stage ``runtime.env`` and ``runtime.devices`` for the context.
+
+    Restores ``runtime.env`` on exit. Device visibility restore remains the
+    caller's responsibility (e.g. ``AsyncOmniEngine`` saves/restores the
+    platform device-control env var around this block).
+    """
+    with stage_runtime_env(stage_id, runtime_cfg):
+        setup_stage_devices(stage_id, runtime_cfg)
+        yield
+
+
+@contextmanager
+def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, None]:
+    """Apply per-stage ``runtime.env`` for the duration of the context."""
+    if runtime_cfg is None:
+        runtime_cfg = {}
+    elif not isinstance(runtime_cfg, dict):
+        runtime_cfg = cast(dict[str, Any], _to_dict(runtime_cfg))
+
+    raw_env = runtime_cfg.get("env")
+    if raw_env is None:
+        yield
+        return
+    if isinstance(raw_env, dict):
+        runtime_env = cast(dict[str, Any], raw_env)
+    else:
+        runtime_env = cast(dict[str, Any], _to_dict(raw_env))
+        if not runtime_env:
+            logger.warning(
+                "[stage_init] Stage-%s ignored runtime.env with unsupported type %s",
+                stage_id,
+                type(raw_env).__name__,
+            )
+            yield
+            return
+
+    previous_env: dict[str, str | None] = {}
+    for key, value in runtime_env.items():
+        env_key = str(key)
+        previous_env[env_key] = os.environ.get(env_key)
+        os.environ[env_key] = str(value)
+
+    if previous_env:
+        logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
+    try:
+        yield
+    finally:
+        for key, old_value in previous_env.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
 
 
 def build_engine_args_dict(
@@ -596,6 +772,10 @@ def build_engine_args_dict(
     default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
     engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
 
+    # TODO: Remove this after the performance regression is fixed
+    # Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni to avoid performance regression
+    _maybe_set_qwen3_omni_moe_env(engine_args_dict)
+
     return engine_args_dict
 
 
@@ -619,6 +799,19 @@ def build_vllm_config(
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
+
+    # _to_dict serializes dataclass fields (e.g. StructuredOutputsConfig) into
+    # plain dicts.  When OmniEngineArgs is instantiated with the dict, these
+    # fields remain dicts instead of being reconstructed as dataclass objects.
+    # Later, EngineArgs.create_engine_config() does
+    #   self.structured_outputs_config.reasoning_parser = ...
+    # which fails on a plain dict.  Reconstruct the dataclass here.
+    soc = filtered_engine_args_dict.get("structured_outputs_config")
+    if isinstance(soc, dict):
+        from vllm.config import StructuredOutputsConfig
+
+        filtered_engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
+
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
 
     # Multi-stage pipelines (qwen3_tts code2wav, etc.) set max_model_len
@@ -645,11 +838,25 @@ def build_vllm_config(
     if upgraded is not vllm_config.quant_config:
         vllm_config = replace(vllm_config, quant_config=upgraded)
 
+    custom_voice_dir = engine_args_dict.get("custom_voice_dir")
+    if custom_voice_dir:
+        setattr(vllm_config.model_config.hf_config, "custom_voice_dir", custom_voice_dir)
+
     return vllm_config, executor_class
 
 
-def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_config: Any) -> Any | None:
-    """Build one output processor per logical LLM stage."""
+def build_llm_stage_output_processor(
+    plan: LogicalStageInitPlan,
+    stage_vllm_config: Any,
+    log_stats: bool = False,
+) -> Any | None:
+    """Build one output processor per logical LLM stage.
+
+    ``log_stats`` controls whether the processor populates per-request
+    IterationStats (consumed by the Prometheus wrap). Default False matches
+    the upstream MultimodalOutputProcessor default and respects the
+    --log-stats CLI flag plumbed through AsyncOmniEngine.
+    """
 
     metadata = plan.replicas[0].metadata
     if stage_vllm_config.model_config.skip_tokenizer_init:
@@ -660,7 +867,7 @@ def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_conf
         )
     return MultimodalOutputProcessor(
         tokenizer=tokenizer,
-        log_stats=False,
+        log_stats=log_stats,
         engine_core_output_type=metadata.engine_output_type,
     )
 
@@ -675,6 +882,45 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
         renderer=input_processor.renderer,
     )
     return input_processor
+
+
+def _cleanup_stale_lock_if_dead(lock_file: str) -> bool:
+    """If *lock_file* exists and its recorded PID is dead, unlink the file.
+
+    Returns ``True`` if the stale lock was cleaned up (caller should retry),
+    ``False`` otherwise (lock holder appears alive, or file could not be read).
+    """
+    try:
+        with open(lock_file) as fh:
+            content = fh.read().strip()
+        if not content:
+            return False
+        pid = int(content)
+    except (OSError, ValueError):
+        return False
+
+    # Check whether the PID is still alive.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        # PID does not exist — stale lock.
+        logger.info(
+            "Removing stale device lock %s (PID %s is dead)",
+            lock_file,
+            pid,
+        )
+        try:
+            os.unlink(lock_file)
+            return True
+        except OSError:
+            logger.debug("Failed to unlink stale lock %s", lock_file)
+            return False
+    except PermissionError:
+        # PID exists but we cannot signal it (different user) — treat as alive.
+        return False
+
+    # PID is alive — legitimate lock holder.
+    return False
 
 
 def acquire_device_locks(
@@ -755,6 +1001,7 @@ def acquire_device_locks(
         for device_id in devices_to_lock:
             lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
             lock_acquired = False
+            already_cleaned_stale = False  # only try stale cleanup once per device
 
             while not lock_acquired:
                 try:
@@ -769,6 +1016,11 @@ def acquire_device_locks(
                         logger.debug("Acquired exclusive lock for device %s", device_id)
                     except BlockingIOError:
                         os.close(lock_fd)
+                        # Detect and clean stale locks from dead processes.
+                        if not already_cleaned_stale:
+                            already_cleaned_stale = True
+                            if _cleanup_stale_lock_if_dead(lock_file):
+                                continue  # retry flock immediately
                         if time.time() - wait_start > stage_init_timeout:
                             logger.warning(
                                 "Timeout waiting for device %s initialization lock, proceeding anyway",

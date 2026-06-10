@@ -7,10 +7,11 @@ from __future__ import annotations
 import dataclasses
 import re
 import warnings
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
@@ -19,23 +20,7 @@ from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
-_MODELS_DIR = Path(__file__).resolve().parent.parent / "model_executor" / "models"
-
-
-def get_pipeline_path(model_dir: str, filename: str) -> Path:
-    return _MODELS_DIR / model_dir / filename
-
-
 logger = init_logger(__name__)
-
-
-def _warn_deprecated_kwargs(kwargs: dict[str, Any]) -> None:
-    if "cli_explicit_keys" in kwargs:
-        warnings.warn(
-            "cli_explicit_keys= is deprecated and ignored. Remove the kwarg.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
 
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
@@ -119,6 +104,38 @@ def strip_parent_engine_args(
             overridden.append(key)
 
     return result, sorted(overridden)
+
+
+def _apply_diffusion_parallel_runtime_overrides(
+    engine_args: dict[str, Any],
+    runtime_overrides: dict[str, Any],
+) -> None:
+    """Move diffusion parallel overrides into nested ``parallel_config``."""
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+    parallel_fields = frozenset(f.name for f in fields(DiffusionParallelConfig))
+    parallel_config = engine_args.get("parallel_config")
+    parallel_config_dict = dict(parallel_config) if parallel_config is not None else None
+    degree_overridden = False
+    sequence_parallel_explicit = runtime_overrides.get("sequence_parallel_size") is not None
+
+    for key in list(runtime_overrides.keys()):
+        value = runtime_overrides.get(key)
+        if value is None or key not in parallel_fields:
+            continue
+        if parallel_config_dict is None:
+            parallel_config_dict = {}
+        if key in ("ulysses_degree", "ring_degree"):
+            degree_overridden = True
+        parallel_config_dict[key] = runtime_overrides.pop(key)
+
+    if parallel_config_dict is not None and degree_overridden and not sequence_parallel_explicit:
+        ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
+        ring_degree = parallel_config_dict.get("ring_degree") or 1
+        parallel_config_dict["sequence_parallel_size"] = ulysses_degree * ring_degree
+
+    if parallel_config_dict is not None:
+        engine_args["parallel_config"] = parallel_config_dict
 
 
 class StageType(str, Enum):
@@ -210,6 +227,18 @@ class PipelineConfig:
     # matches ``hf_config.architectures[*]`` against this tuple to route
     # to the correct pipeline. Leave empty for models with unique model_type.
     hf_architectures: tuple[str, ...] = ()
+    # Optional second-stage predicate for resolving an arch-name collision
+    # between sibling model generations that ship the same
+    # ``architectures=[...]`` entry. When the arch-fallback in
+    # ``StageConfigFactory.create_from_model`` finds an intersection with
+    # ``hf_architectures``, it additionally evaluates this predicate against
+    # the loaded ``hf_config`` and only selects this pipeline when it
+    # returns ``True``. Leave ``None`` to skip the extra check (default).
+    # Example: MiniCPM-o 4.5 and 2.6 both ship ``architectures=["MiniCPMO"]``
+    # but differ on the ``version`` field, so the 4.5 pipeline declares
+    # ``hf_config_predicate=lambda c: getattr(c, "version", "") == "4.5"``
+    # to avoid misrouting 2.6 checkpoints.
+    hf_config_predicate: Callable[[Any], bool] | None = None
     # Diffusers pipeline class name: for models that ship a ``model_index.json``
     # (no root ``config.json``), the ``_class_name`` field is matched against
     # this value to auto-detect the pipeline.  Only needed for diffusers-style
@@ -408,6 +437,7 @@ class StageDeployConfig:
     stage_id: int
     devices: str | None = None
     num_replicas: int = 1
+    env: dict[str, Any] | None = None
 
     # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
@@ -428,6 +458,18 @@ class StageDeployConfig:
     async_scheduling: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
+
+    # Diffusion parallel_config deploy override fields.
+    enable_expert_parallel: bool | None = None
+    ulysses_degree: int | None = None
+    ulysses_mode: str | None = None
+    ring_degree: int | None = None
+    sequence_parallel_size: int | None = None
+    cfg_parallel_size: int | None = None
+    vae_patch_parallel_size: int | None = None
+    use_hsdp: bool | None = None
+    hsdp_shard_size: int | None = None
+    hsdp_replicate_size: int | None = None
 
     # Compilation, profiling, tokenizer/config parsing, and model loading.
     compilation_config: dict[str, Any] | None = None
@@ -455,6 +497,8 @@ class DeployConfig:
     """
 
     async_chunk: bool = True
+    # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
+    active_stream_window: int = 0
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -471,49 +515,60 @@ class DeployConfig:
     enable_chunked_prefill: bool | None = None
     data_parallel_size: int | None = None
     pipeline_parallel_size: int | None = None
+    custom_voice_dir: str | None = None
 
 
-_STAGE_NON_ENGINE_KEYS = frozenset(
+_STAGE_RESERVED_KEYS = frozenset(
     {
         "stage_id",
         "devices",
         "num_replicas",
+        "env",
         "output_connectors",
         "input_connectors",
         "default_sampling_params",
         "engine_extras",
+        "engine_args",
+        "runtime",
     }
 )
 
 # Fields on StageDeployConfig that are populated from engine_args dict
-_STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_NON_ENGINE_KEYS}
+_STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_RESERVED_KEYS}
 
 
 def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     """Parse a single stage entry from deploy YAML into StageDeployConfig."""
+    # Get the non-reserved keys for this stage
+    flat_args = {k: v for k, v in stage_data.items() if k not in _STAGE_RESERVED_KEYS}
+    runtime_cfg = dict(stage_data.get("runtime", {}))
+    devices = runtime_cfg.get("devices", stage_data.get("devices"))
+    num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
+    env = runtime_cfg.get("env", stage_data.get("env"))
+
     if "engine_args" in stage_data:
-        runtime_cfg = dict(stage_data.get("runtime", {}))
-        engine_args = dict(stage_data["engine_args"])
-        devices = stage_data.get("runtime", {}).get("devices", stage_data.get("devices"))
-        num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
-    else:
-        engine_args = {k: v for k, v in stage_data.items() if k not in _STAGE_NON_ENGINE_KEYS and k != "stage_id"}
-        devices = stage_data.get("devices")
-        num_replicas = stage_data.get("num_replicas", stage_data.get("runtime", {}).get("num_replicas", 1))
+        for k, v in stage_data["engine_args"].items():
+            existing = flat_args.get(k)
+            # If we have multiple dictionaries, merge recursively.
+            if isinstance(v, dict) and isinstance(existing, dict):
+                flat_args[k] = _get_recursively_merged_dict(existing, v)
+            else:
+                flat_args[k] = v
 
     kwargs: dict[str, Any] = {
         "stage_id": stage_data["stage_id"],
         "devices": devices,
         "num_replicas": int(num_replicas),
+        "env": env,
     }
     for name, f in _STAGE_DEPLOY_FIELDS.items():
-        if name in engine_args:
-            kwargs[name] = engine_args.pop(name)
+        if name in flat_args:
+            kwargs[name] = flat_args.pop(name)
 
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
-    kwargs["engine_extras"] = engine_args
+    kwargs["engine_extras"] = flat_args
     return StageDeployConfig(**kwargs)
 
 
@@ -522,24 +577,34 @@ _DEEP_MERGE_KEYS = frozenset({"default_sampling_params", "subtalker_sampling_par
 
 def _deep_merge_stage(base: dict, overlay: dict) -> dict:
     """Deep-merge ``_DEEP_MERGE_KEYS`` so thin overlays don't drop base keys."""
-    merged = dict(base)
-    for k, v in overlay.items():
-        if k in _DEEP_MERGE_KEYS:
-            base_val = merged.get(k)
-            if isinstance(v, dict) and isinstance(base_val, dict):
-                merged[k] = {**base_val, **v}
-                continue
-            # Deep-merge key but at least one side isn't a dict: surface the
-            # silent clobber so mismatched YAML types don't get past review.
-            if base_val is not None:
+    # Deep merge _DEEP_MERGE_KEYS recursively
+    base_merge_dict = {k: v for k, v in base.items() if k in _DEEP_MERGE_KEYS}
+    overlay_merge_dict = {k: v for k, v in overlay.items() if k in _DEEP_MERGE_KEYS}
+
+    # Get the merge dict; priority is base < overlay < merged sub
+    merged_subdict = _get_recursively_merged_dict(original=base_merge_dict, update=overlay_merge_dict)
+    merged_dict = {**base, **overlay, **merged_subdict}
+    return merged_dict
+
+
+def _get_recursively_merged_dict(original: dict, update: dict) -> dict:
+    """Recursively merge two dicts, returning a new dict."""
+    merged = original.copy()
+    for k, update_v in update.items():
+        orig_v = merged.get(k)
+        if isinstance(orig_v, dict) and isinstance(update_v, dict):
+            merged[k] = _get_recursively_merged_dict(orig_v, update_v)
+        else:
+            if orig_v is not None and (isinstance(orig_v, dict) != isinstance(update_v, dict)):
                 logger.warning(
                     "Deep-merge key %r has non-dict value (base=%s, overlay=%s); "
                     "overlay will fully replace base instead of merging.",
                     k,
-                    type(base_val).__name__,
-                    type(v).__name__,
+                    type(orig_v).__name__,
+                    type(update_v).__name__,
                 )
-        merged[k] = v
+
+            merged[k] = update_v
     return merged
 
 
@@ -611,6 +676,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
+        "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,
@@ -628,14 +694,21 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "enable_chunked_prefill",
         "data_parallel_size",
         "pipeline_parallel_size",
+        "custom_voice_dir",
     ):
         if name in raw_dict:
             kwargs[name] = raw_dict[name]
     return DeployConfig(**kwargs)
 
 
-def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-    """Return ``(overrides, devices)`` from a platform stage entry.
+class PlatformOverrides(NamedTuple):
+    overrides: dict[str, Any]
+    devices: str | None
+    env: dict[str, Any] | None
+
+
+def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
+    """Return overrides, devices, and env from a platform stage entry.
 
     Handles both the nested layout (``engine_args:`` / ``runtime.devices``) and
     the flat layout. ``devices`` is ``None`` when no override is set.
@@ -645,9 +718,9 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str
         runtime_cfg = ps.get("runtime", {})
         if "num_replicas" in runtime_cfg:
             overrides["num_replicas"] = runtime_cfg["num_replicas"]
-        return overrides, runtime_cfg.get("devices")
-    overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices")}
-    return overrides, ps.get("devices")
+        return PlatformOverrides(overrides, runtime_cfg.get("devices"), runtime_cfg.get("env"))
+    overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices", "env")}
+    return PlatformOverrides(overrides, ps.get("devices"), ps.get("env"))
 
 
 def _apply_platform_overrides(
@@ -672,10 +745,21 @@ def _apply_platform_overrides(
         base = base_by_id.get(ps["stage_id"])
         if base is None:
             continue
-        overrides, devices = _extract_platform_overrides(ps)
-        if devices is not None:
-            base.devices = devices
-        for key, val in overrides.items():
+        po = _extract_platform_overrides(ps)
+        if po.devices is not None:
+            base.devices = po.devices
+        if po.env is not None:
+            if isinstance(base.env, dict) and isinstance(po.env, dict):
+                base.env = {**base.env, **po.env}
+            else:
+                logger.warning(
+                    "Stage %s env override replaces base env entirely (base type=%s, override type=%s)",
+                    ps["stage_id"],
+                    type(base.env).__name__,
+                    type(po.env).__name__,
+                )
+                base.env = po.env
+        for key, val in po.overrides.items():
             if hasattr(base, key):
                 # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
                 # platform overlays don't silently clobber sibling keys (e.g.
@@ -732,16 +816,9 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "enable_chunked_prefill",
     "data_parallel_size",
     "pipeline_parallel_size",
+    "active_stream_window",
+    "custom_voice_dir",
 )
-
-
-def deploy_override_field_names() -> frozenset[str]:
-    """Return deploy-schema fields whose CLI defaults must not override YAML."""
-    return (
-        frozenset(_STAGE_DEPLOY_FIELDS)
-        | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
-        | frozenset({"async_chunk", "devices"})
-    )
 
 
 def _build_engine_args(
@@ -779,7 +856,7 @@ def _build_engine_args(
     # Per-stage StageDeployConfig values override pipeline-wide settings.
     if ds is not None:
         for k, v in asdict(ds).items():
-            if k in _STAGE_NON_ENGINE_KEYS or v is None:
+            if k in _STAGE_RESERVED_KEYS or v is None:
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
@@ -863,6 +940,8 @@ def merge_pipeline_deploy(
             if ds.devices is not None:
                 runtime["devices"] = ds.devices
             runtime["num_replicas"] = ds.num_replicas
+            if ds.env is not None:
+                runtime["env"] = ds.env
         runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
         result.append(
@@ -913,6 +992,7 @@ class StageConfig:
         """TODO(@lishunyang12): remove once engine consumes ResolvedStageConfig directly."""
         # Start with YAML engine_args defaults
         engine_args: dict[str, Any] = dict(self.yaml_engine_args)
+        runtime_overrides = dict(self.runtime_overrides)
 
         # Overlay topology-level fields
         engine_args["model_stage"] = self.model_stage
@@ -923,20 +1003,25 @@ class StageConfig:
         if self.hf_config_name:
             engine_args["hf_config_name"] = self.hf_config_name
 
+        if StageType(self.stage_type) == StageType.DIFFUSION:
+            _apply_diffusion_parallel_runtime_overrides(engine_args, runtime_overrides)
+
         # CLI overrides take precedence over YAML defaults
-        for key, value in self.runtime_overrides.items():
-            if value is not None and key not in ("devices", "max_batch_size"):
+        for key, value in runtime_overrides.items():
+            if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
                 engine_args[key] = value
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)
         runtime.setdefault("process", True)
-        if self.runtime_overrides.get("devices") is not None:
-            runtime["devices"] = self.runtime_overrides["devices"]
+        if runtime_overrides.get("devices") is not None:
+            runtime["devices"] = runtime_overrides["devices"]
+        if runtime_overrides.get("num_replicas") is not None:
+            runtime["num_replicas"] = runtime_overrides["num_replicas"]
 
         # Legacy compat: migrate runtime.max_batch_size → engine_args.max_num_seqs
         legacy_mbs = runtime.pop("max_batch_size", None)
-        cli_mbs = self.runtime_overrides.get("max_batch_size")
+        cli_mbs = runtime_overrides.get("max_batch_size")
         if legacy_mbs is not None or cli_mbs is not None:
             warnings.warn(
                 "runtime.max_batch_size is deprecated and will be removed in a "
@@ -969,77 +1054,6 @@ class StageConfig:
         return create_config(config_dict)
 
 
-@dataclass
-class ModelPipeline:
-    """Complete pipeline definition for a multi-stage model (legacy).
-
-    TODO(@lishunyang12): remove once all models migrate to PipelineConfig.
-    """
-
-    model_type: str
-    stages: list[StageConfig]
-
-    # Pipeline-wide behavior flags
-    async_chunk: bool = False
-
-    # Optional distributed configuration
-    connectors: dict[str, Any] | None = None
-    edges: list[dict[str, Any]] | None = None
-
-    def get_stage(self, stage_id: int) -> StageConfig | None:
-        """Look up a stage by its ID.
-
-        Args:
-            stage_id: The stage ID to search for.
-
-        Returns:
-            The matching StageConfig, or None if not found.
-        """
-        for stage in self.stages:
-            if stage.stage_id == stage_id:
-                return stage
-        return None
-
-    def validate_pipeline(self) -> list[str]:
-        """Validate pipeline topology at model integration time (not runtime).
-
-        Checks:
-        - All stage IDs are unique
-        - All input_sources reference valid stage IDs
-        - At least one entry point (stage with empty input_sources)
-
-        Returns:
-            List of validation error messages. Empty list if valid.
-        """
-        errors: list[str] = []
-
-        if not self.stages:
-            errors.append("Topology has no stages defined")
-            return errors
-
-        # Check for unique stage IDs
-        stage_ids = [s.stage_id for s in self.stages]
-        if len(stage_ids) != len(set(stage_ids)):
-            errors.append("Duplicate stage IDs found")
-
-        stage_id_set = set(stage_ids)
-
-        # Check input_sources reference valid stages
-        for stage in self.stages:
-            for source_id in stage.input_sources:
-                if source_id not in stage_id_set:
-                    errors.append(f"Stage {stage.stage_id} references non-existent input source {source_id}")
-                if source_id == stage.stage_id:
-                    errors.append(f"Stage {stage.stage_id} references itself as input source")
-
-        # Check for at least one entry point
-        entry_points = [s for s in self.stages if not s.input_sources]
-        if not entry_points:
-            errors.append("No entry point found (stage with empty input_sources)")
-
-        return errors
-
-
 class StageConfigFactory:
     """Factory that loads pipeline YAML and merges CLI overrides.
 
@@ -1059,14 +1073,11 @@ class StageConfigFactory:
         model: str,
         cli_overrides: dict[str, Any] | None = None,
         deploy_config_path: str | None = None,
-        **deprecated_kwargs: Any,
     ) -> list[StageConfig] | None:
         """Load pipeline + deploy config, merge with CLI overrides.
 
         Checks _PIPELINE_REGISTRY first (new path), falls back to legacy YAML.
         """
-        _warn_deprecated_kwargs(deprecated_kwargs)
-
         if cli_overrides is None:
             cli_overrides = {}
 
@@ -1076,46 +1087,63 @@ class StageConfigFactory:
 
         # --- New path: check pipeline registry by model_type first ---
         model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
+        if model_type == "vla":
+            from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
+
+            if _looks_like_dreamzero(model):
+                model_type = "dreamzero"
         if model_type and model_type in _PIPELINE_REGISTRY:
             return cls._create_from_registry(model_type, cli_overrides, deploy_config_path)
 
         # --- HF architecture fallback: some models report a generic
         # model_type that collides with another model. Match by the
         # hf_architectures declared on each registered PipelineConfig.
+        # When a pipeline declares ``hf_config_predicate`` (e.g. to
+        # disambiguate generation-revision collisions like MiniCPM-o 2.6 vs
+        # 4.5 which share ``architectures=["MiniCPMO"]``), the predicate
+        # must also accept the loaded ``hf_config``.
         if hf_config is not None:
             hf_archs = set(getattr(hf_config, "architectures", []) or [])
             if hf_archs:
                 for registered in _PIPELINE_REGISTRY.values():
-                    if hf_archs.intersection(registered.hf_architectures):
-                        return cls._create_from_registry(registered.model_type, cli_overrides, deploy_config_path)
+                    if not hf_archs.intersection(registered.hf_architectures):
+                        continue
+                    predicate = registered.hf_config_predicate
+                    if predicate is not None:
+                        try:
+                            if not predicate(hf_config):
+                                logger.debug(
+                                    "Pipeline %r matched on architectures %s but its "
+                                    "hf_config_predicate rejected the loaded config; "
+                                    "continuing fallback search.",
+                                    registered.model_type,
+                                    sorted(hf_archs.intersection(registered.hf_architectures)),
+                                )
+                                continue
+                        except Exception:
+                            logger.exception(
+                                "Pipeline %r hf_config_predicate raised; skipping.",
+                                registered.model_type,
+                            )
+                            continue
+                    return cls._create_from_registry(registered.model_type, cli_overrides, deploy_config_path)
 
-        # --- Legacy path: load from pipeline YAML ---
-        pipeline = cls._load_pipeline(model, trust_remote_code=trust_remote_code)
+        # An explicit deploy config can select a pipeline when the model's HF
+        # metadata is too generic for registry auto-detection.
+        if deploy_config_path is not None:
+            deploy_path = Path(deploy_config_path)
+            if deploy_path.exists():
+                deploy_config = load_deploy_config(deploy_path)
+                if deploy_config.pipeline in _PIPELINE_REGISTRY:
+                    return cls._create_from_registry(
+                        deploy_config.pipeline,
+                        cli_overrides,
+                        deploy_config_path,
+                    )
 
-        if pipeline is None:
-            return None
-
-        errors = pipeline.validate_pipeline()
-        if errors:
-            logger.warning(f"Pipeline validation warnings for {model}: {errors}")
-
-        # Materialize the resolved pipeline-wide async_chunk value into every
-        # stage so build_engine_args_dict() can inject the stage connector
-        # spec and explicit False overrides are preserved.
-        resolved_async_chunk = cli_overrides.get("async_chunk")
-        if resolved_async_chunk is None:
-            resolved_async_chunk = bool(pipeline.async_chunk)
-        for stage in pipeline.stages:
-            stage.yaml_engine_args["async_chunk"] = bool(resolved_async_chunk)
-
-        # Apply CLI overrides
-        result: list[StageConfig] = []
-        for stage in pipeline.stages:
-            # Merge global CLI overrides
-            stage.runtime_overrides = cls._merge_cli_overrides(stage, cli_overrides)
-            result.append(stage)
-
-        return result
+        # Not in the pipeline registry — let the caller fall back to the
+        # legacy ``stage_configs/*.yaml`` path (resolve_model_config_path).
+        return None
 
     @classmethod
     def _create_from_registry(
@@ -1123,20 +1151,28 @@ class StageConfigFactory:
         model_type: str,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None = None,
-        **deprecated_kwargs: Any,
     ) -> list[StageConfig]:
         """Create StageConfigs from pipeline registry + deploy YAML.
 
         Precedence: caller-typed (non-None) value > deploy YAML >
         StageDeployConfig dataclass default.
         """
-        _warn_deprecated_kwargs(deprecated_kwargs)
-
         # Resolve deploy config path
         if deploy_config_path is None:
             deploy_path = _DEPLOY_DIR / f"{model_type}.yaml"
         else:
             deploy_path = Path(deploy_config_path)
+            # Bare-name lookup: if the value isn't a real path, try the
+            # built-in deploy directory. This lets ``deploy_config="moss_tts"``
+            # resolve to ``vllm_omni/deploy/moss_tts.yaml`` when several model
+            # variants share an HF ``model_type`` and need different YAMLs.
+            if not deploy_path.exists() and deploy_path.parent == Path("."):
+                bare_name = deploy_path.name
+                if not bare_name.endswith(".yaml"):
+                    bare_name = f"{bare_name}.yaml"
+                candidate = _DEPLOY_DIR / bare_name
+                if candidate.exists():
+                    deploy_path = candidate
 
         if not deploy_path.exists():
             logger.warning(
@@ -1229,193 +1265,6 @@ class StageConfigFactory:
         }
 
         return [config_dict]
-
-    @classmethod
-    def _load_pipeline(cls, model: str, trust_remote_code: bool = True) -> ModelPipeline | None:
-        """Load a legacy ``pipeline.yaml`` for the model.
-
-        Searches ``model_executor/models/<dir>/pipeline.yaml`` by trying
-        (a) the raw ``model_type`` as the directory name, then
-        (b) ``model_type`` with hyphens replaced by underscores,
-        and finally (c) scanning every ``pipeline.yaml`` for one that
-        declares a matching ``model_type`` or ``hf_architectures``.
-
-        Returns None if no pipeline.yaml is found — caller handles the
-        ``resolve_model_config_path`` fallback via stage_configs/ YAMLs.
-        """
-        model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
-        if model_type is None:
-            return None
-
-        # Direct lookups by convention
-        candidates = [model_type, model_type.replace("-", "_")]
-        for dir_name in candidates:
-            pipeline_path = get_pipeline_path(dir_name, "pipeline.yaml")
-            if pipeline_path.exists():
-                return cls._parse_pipeline_yaml(pipeline_path, model_type)
-
-        # Scan fallback: read every pipeline.yaml and match on declared fields
-        hf_archs = set(getattr(hf_config, "architectures", []) or []) if hf_config else set()
-        if _MODELS_DIR.exists():
-            for subdir in sorted(_MODELS_DIR.iterdir()):
-                if not subdir.is_dir():
-                    continue
-                pipeline_path = subdir / "pipeline.yaml"
-                if not pipeline_path.exists():
-                    continue
-                try:
-                    cfg = load_yaml_config(pipeline_path)
-                except Exception as exc:
-                    logger.debug("Skip %s: %s", pipeline_path, exc)
-                    continue
-                declared_type = getattr(cfg, "model_type", None)
-                declared_archs = set(getattr(cfg, "hf_architectures", None) or [])
-                if declared_type == model_type or (hf_archs and hf_archs.intersection(declared_archs)):
-                    return cls._parse_pipeline_yaml(pipeline_path, declared_type or model_type)
-
-        logger.debug("No pipeline.yaml found for model_type %s (archs=%s)", model_type, sorted(hf_archs))
-        return None
-
-    # Keys consumed as explicit StageConfig fields — everything else is
-    # passed through via yaml_extras.
-    _KNOWN_STAGE_KEYS: set[str] = {
-        "stage_id",
-        "model_stage",
-        "stage_type",
-        "input_sources",
-        "engine_input_source",
-        "custom_process_input_func",
-        "final_output",
-        "final_output_type",
-        "worker_type",
-        "scheduler_cls",
-        "hf_config_name",
-        "is_comprehension",
-        "engine_args",
-        "runtime",
-    }
-
-    @classmethod
-    def _parse_pipeline_yaml(cls, path: Path, model_type: str) -> ModelPipeline:
-        """Parse a pipeline YAML file.
-
-        Args:
-            path: Path to the YAML file.
-            model_type: Model type identifier.
-
-        Returns:
-            ModelPipeline object.
-        """
-        config_data = load_yaml_config(path)
-
-        stages: list[StageConfig] = []
-        for stage_data in config_data.stages:
-            # Use .get() for optional fields — idiomatic for OmegaConf DictConfig
-            stage_type_str = stage_data.get("stage_type", "llm")
-            stage_type = StageType(stage_type_str) if stage_type_str else StageType.LLM
-
-            # Handle both 'input_sources' (new) and 'engine_input_source' (legacy)
-            input_sources = stage_data.get("input_sources", None)
-            if input_sources is None:
-                input_sources = stage_data.get("engine_input_source", [])
-            if input_sources is None:
-                input_sources = []
-            input_sources = list(input_sources)
-
-            # Extract per-stage engine_args and runtime dicts
-            raw_ea = stage_data.get("engine_args", None)
-            yaml_engine_args = to_dict(raw_ea) if raw_ea is not None else {}
-            raw_rt = stage_data.get("runtime", None)
-            yaml_runtime = to_dict(raw_rt) if raw_rt is not None else {}
-
-            # Migrate legacy runtime.max_batch_size → engine_args.max_num_seqs
-            if "max_batch_size" in yaml_runtime:
-                mbs = yaml_runtime.pop("max_batch_size")
-                yaml_engine_args.setdefault("max_num_seqs", int(mbs))
-                logger.debug(
-                    "Stage %s: migrated runtime.max_batch_size=%s to engine_args.max_num_seqs",
-                    stage_data.get("stage_id", "?"),
-                    mbs,
-                )
-
-            # Topology-level fields that also live inside engine_args in legacy
-            # YAMLs (worker_type, scheduler_cls, etc.) — read from both places.
-            worker_type = stage_data.get("worker_type", None) or yaml_engine_args.pop("worker_type", None)
-            scheduler_cls = stage_data.get("scheduler_cls", None) or yaml_engine_args.pop("scheduler_cls", None)
-            if scheduler_cls:
-                async_sched = yaml_engine_args.get("async_scheduling")
-                if async_sched is not None:
-                    logger.warning(
-                        "Stage %s: async_scheduling=%r and scheduler_cls=%r "
-                        "should not be set together. scheduler_cls will take "
-                        "precedence for which scheduler is used.",
-                        stage_data.stage_id,
-                        async_sched,
-                        scheduler_cls,
-                    )
-                else:
-                    logger.warning(
-                        "Stage %s: scheduler_cls=%r is deprecated. Use async_scheduling instead.",
-                        stage_data.stage_id,
-                        scheduler_cls,
-                    )
-            hf_config_name = stage_data.get("hf_config_name", None) or yaml_engine_args.pop("hf_config_name", None)
-            model_stage = getattr(stage_data, "model_stage", None) or yaml_engine_args.pop("model_stage", None)
-
-            # Collect pass-through fields (default_sampling_params,
-            # output_connectors, input_connectors, tts_args, etc.)
-            yaml_extras: dict[str, Any] = {}
-            for key in stage_data:
-                if key not in cls._KNOWN_STAGE_KEYS:
-                    val = stage_data[key]
-                    try:
-                        yaml_extras[key] = to_dict(val)
-                    except ValueError:
-                        yaml_extras[key] = val
-
-            stage = StageConfig(
-                stage_id=stage_data.stage_id,
-                model_stage=model_stage or "",
-                stage_type=stage_type,
-                input_sources=input_sources,
-                custom_process_input_func=stage_data.get("custom_process_input_func", None),
-                final_output=stage_data.get("final_output", False),
-                final_output_type=stage_data.get("final_output_type", None),
-                worker_type=worker_type,
-                scheduler_cls=scheduler_cls,
-                hf_config_name=hf_config_name,
-                is_comprehension=stage_data.get("is_comprehension", False),
-                yaml_engine_args=yaml_engine_args,
-                yaml_runtime=yaml_runtime,
-                yaml_extras=yaml_extras,
-            )
-            stages.append(stage)
-
-        # Get pipeline-wide flags
-        async_chunk = config_data.get("async_chunk", False)
-
-        # Get optional connector config — check both top-level and nested
-        # under ``runtime`` (legacy stage_configs format).
-        connectors = None
-        edges = None
-        if hasattr(config_data, "connectors"):
-            connectors = to_dict(config_data.connectors)
-        if hasattr(config_data, "edges"):
-            edges = to_dict(config_data.edges)
-        if hasattr(config_data, "runtime") and config_data.runtime is not None:
-            top_runtime = config_data.runtime
-            if connectors is None and hasattr(top_runtime, "connectors"):
-                connectors = to_dict(top_runtime.connectors)
-            if edges is None and hasattr(top_runtime, "edges"):
-                edges = to_dict(top_runtime.edges)
-
-        return ModelPipeline(
-            model_type=getattr(config_data, "model_type", model_type),
-            stages=stages,
-            async_chunk=async_chunk,
-            connectors=connectors,
-            edges=edges,
-        )
 
     @classmethod
     def _auto_detect_model_type(cls, model: str, trust_remote_code: bool = True) -> tuple[str | None, Any]:

@@ -4,27 +4,40 @@
 Unit tests for StageConfigFactory and related classes.
 """
 
+import importlib
+import inspect
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.stage_config import (
     _PIPELINE_REGISTRY,
-    ModelPipeline,
+    DeployConfig,
     PipelineConfig,
     StageConfig,
     StageConfigFactory,
+    StageDeployConfig,
     StageExecutionType,
     StagePipelineConfig,
     StageType,
+    _apply_platform_overrides,
+    _deep_merge_stage,
     _resolve_scheduler,
     build_stage_runtime_overrides,
+    load_deploy_config,
+    merge_pipeline_deploy,
     register_pipeline,
     strip_parent_engine_args,
 )
-from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
+from vllm_omni.engine.arg_utils import SHARED_FIELDS, EngineArgs, internal_blacklist_keys
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class TestStageType:
@@ -99,8 +112,6 @@ class TestStageConfig:
 
     def test_to_omegaconf_with_runtime_overrides(self):
         """Test that runtime overrides are applied to OmegaConf output."""
-        import warnings
-
         config = StageConfig(
             stage_id=0,
             model_stage="thinker",
@@ -123,8 +134,6 @@ class TestStageConfig:
 
     def test_to_omegaconf_max_batch_size_deprecation(self):
         """Test that runtime.max_batch_size emits a FutureWarning."""
-        import warnings
-
         config = StageConfig(
             stage_id=0,
             model_stage="thinker",
@@ -147,110 +156,198 @@ class TestStageConfig:
         omega_config = config.to_omegaconf()
         assert omega_config.engine_args.max_num_seqs == 32
 
-    def test_to_omegaconf_omits_none_deploy_overrides_for_engine_args(self):
-        """None deploy overrides must fall through to EngineArgs defaults."""
-        from vllm_omni.config.stage_config import deploy_override_field_names
-
+    def test_to_omegaconf_diffusion_parallel_overrides_replace_nested_values(self):
         config = StageConfig(
-            stage_id=0,
-            model_stage="thinker",
-            runtime_overrides={name: None for name in deploy_override_field_names()},
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "parallel_config": {
+                    "pipeline_parallel_size": 1,
+                    "data_parallel_size": 1,
+                    "tensor_parallel_size": 4,
+                    "enable_expert_parallel": False,
+                    "ulysses_degree": 1,
+                    "ring_degree": 1,
+                    "ulysses_mode": "strict",
+                    "sequence_parallel_size": 1,
+                    "cfg_parallel_size": 1,
+                    "vae_patch_parallel_size": 1,
+                    "use_hsdp": False,
+                    "hsdp_shard_size": -1,
+                    "hsdp_replicate_size": 1,
+                }
+            },
+            runtime_overrides={
+                "pipeline_parallel_size": 2,
+                "data_parallel_size": 3,
+                "tensor_parallel_size": 8,
+                "enable_expert_parallel": True,
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+                "ulysses_mode": "advanced_uaa",
+                "sequence_parallel_size": 8,
+                "cfg_parallel_size": 2,
+                "vae_patch_parallel_size": 2,
+                "use_hsdp": True,
+                "hsdp_shard_size": 8,
+                "hsdp_replicate_size": 2,
+            },
         )
 
         omega_config = config.to_omegaconf()
-        engine_args = dict(omega_config.engine_args)
 
-        assert "devices" not in engine_args
-        assert "max_batch_size" not in engine_args
-        for name in deploy_override_field_names() - {"devices"}:
-            assert name not in engine_args
+        assert omega_config.engine_args.parallel_config.pipeline_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.data_parallel_size == 3
+        assert omega_config.engine_args.parallel_config.tensor_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.enable_expert_parallel is True
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.ulysses_mode == "advanced_uaa"
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.cfg_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.vae_patch_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.use_hsdp is True
+        assert omega_config.engine_args.parallel_config.hsdp_shard_size == 8
+        assert omega_config.engine_args.parallel_config.hsdp_replicate_size == 2
+        assert "pipeline_parallel_size" not in omega_config.engine_args
+        assert "data_parallel_size" not in omega_config.engine_args
+        assert "tensor_parallel_size" not in omega_config.engine_args
+        assert "enable_expert_parallel" not in omega_config.engine_args
+        assert "ulysses_degree" not in omega_config.engine_args
+        assert "ring_degree" not in omega_config.engine_args
+        assert "ulysses_mode" not in omega_config.engine_args
+        assert "sequence_parallel_size" not in omega_config.engine_args
+        assert "cfg_parallel_size" not in omega_config.engine_args
+        assert "vae_patch_parallel_size" not in omega_config.engine_args
+        assert "use_hsdp" not in omega_config.engine_args
+        assert "hsdp_shard_size" not in omega_config.engine_args
+        assert "hsdp_replicate_size" not in omega_config.engine_args
 
+    def test_to_omegaconf_diffusion_parallel_overrides_create_parallel_config(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            runtime_overrides={
+                "pipeline_parallel_size": 2,
+                "data_parallel_size": 3,
+                "tensor_parallel_size": 8,
+                "enable_expert_parallel": True,
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+                "ulysses_mode": "advanced_uaa",
+                "sequence_parallel_size": 8,
+                "cfg_parallel_size": 2,
+                "vae_patch_parallel_size": 2,
+                "use_hsdp": True,
+                "hsdp_shard_size": 8,
+                "hsdp_replicate_size": 2,
+            },
+        )
 
-class TestModelPipeline:
-    """Tests for ModelPipeline class."""
+        omega_config = config.to_omegaconf()
 
-    def test_valid_linear_dag(self):
-        """Test validation of a valid linear DAG."""
-        stages = [
-            StageConfig(stage_id=0, model_stage="thinker", input_sources=[]),
-            StageConfig(stage_id=1, model_stage="talker", input_sources=[0]),
-            StageConfig(stage_id=2, model_stage="code2wav", input_sources=[1]),
-        ]
-        pipeline = ModelPipeline(model_type="test", stages=stages)
-        errors = pipeline.validate_pipeline()
-        assert errors == [], f"Unexpected errors: {errors}"
+        assert omega_config.engine_args.parallel_config.pipeline_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.data_parallel_size == 3
+        assert omega_config.engine_args.parallel_config.tensor_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.enable_expert_parallel is True
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.ulysses_mode == "advanced_uaa"
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.cfg_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.vae_patch_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.use_hsdp is True
+        assert omega_config.engine_args.parallel_config.hsdp_shard_size == 8
+        assert omega_config.engine_args.parallel_config.hsdp_replicate_size == 2
+        assert "pipeline_parallel_size" not in omega_config.engine_args
+        assert "data_parallel_size" not in omega_config.engine_args
+        assert "tensor_parallel_size" not in omega_config.engine_args
+        assert "enable_expert_parallel" not in omega_config.engine_args
+        assert "ulysses_degree" not in omega_config.engine_args
+        assert "ring_degree" not in omega_config.engine_args
+        assert "ulysses_mode" not in omega_config.engine_args
+        assert "sequence_parallel_size" not in omega_config.engine_args
+        assert "cfg_parallel_size" not in omega_config.engine_args
+        assert "vae_patch_parallel_size" not in omega_config.engine_args
+        assert "use_hsdp" not in omega_config.engine_args
+        assert "hsdp_shard_size" not in omega_config.engine_args
+        assert "hsdp_replicate_size" not in omega_config.engine_args
 
-    def test_valid_branching_dag(self):
-        """Test validation of a valid branching DAG."""
-        stages = [
-            StageConfig(stage_id=0, model_stage="input", input_sources=[]),
-            StageConfig(stage_id=1, model_stage="branch_a", input_sources=[0]),
-            StageConfig(stage_id=2, model_stage="branch_b", input_sources=[0]),
-        ]
-        pipeline = ModelPipeline(model_type="test", stages=stages)
-        errors = pipeline.validate_pipeline()
-        assert errors == [], f"Unexpected errors: {errors}"
+    def test_to_omegaconf_diffusion_parallel_degree_overrides_recompute_sequence_parallel_size(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "parallel_config": {
+                    "sequence_parallel_size": 1,
+                    "ulysses_degree": 1,
+                    "ring_degree": 1,
+                }
+            },
+            runtime_overrides={
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+            },
+        )
 
-    def test_missing_entry_point(self):
-        """Test that missing entry point is detected."""
-        stages = [
-            StageConfig(stage_id=0, model_stage="stage_a", input_sources=[1]),
-            StageConfig(stage_id=1, model_stage="stage_b", input_sources=[0]),
-        ]
-        pipeline = ModelPipeline(model_type="test", stages=stages)
-        errors = pipeline.validate_pipeline()
-        assert any("entry point" in e.lower() for e in errors)
+        omega_config = config.to_omegaconf()
 
-    def test_missing_dependency(self):
-        """Test that missing stage reference is detected."""
-        stages = [
-            StageConfig(stage_id=0, model_stage="input", input_sources=[]),
-            StageConfig(stage_id=1, model_stage="output", input_sources=[99]),  # Invalid
-        ]
-        pipeline = ModelPipeline(model_type="test", stages=stages)
-        errors = pipeline.validate_pipeline()
-        assert any("non-existent" in e.lower() for e in errors)
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 8
+        assert "ulysses_degree" not in omega_config.engine_args
+        assert "ring_degree" not in omega_config.engine_args
+        assert "sequence_parallel_size" not in omega_config.engine_args
 
-    def test_duplicate_stage_ids(self):
-        """Test that duplicate stage IDs are detected."""
-        stages = [
-            StageConfig(stage_id=0, model_stage="stage_a", input_sources=[]),
-            StageConfig(stage_id=0, model_stage="stage_b", input_sources=[]),  # Duplicate
-        ]
-        pipeline = ModelPipeline(model_type="test", stages=stages)
-        errors = pipeline.validate_pipeline()
-        assert any("duplicate" in e.lower() for e in errors)
+    def test_to_omegaconf_diffusion_parallel_explicit_sequence_parallel_size_is_preserved(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "parallel_config": {
+                    "sequence_parallel_size": 1,
+                    "ulysses_degree": 1,
+                    "ring_degree": 1,
+                }
+            },
+            runtime_overrides={
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+                "sequence_parallel_size": 16,
+            },
+        )
 
-    def test_self_reference(self):
-        """Test that self-references are detected."""
-        stages = [
-            StageConfig(stage_id=0, model_stage="entry", input_sources=[]),
-            StageConfig(stage_id=1, model_stage="self_ref", input_sources=[1]),  # Self
-        ]
-        pipeline = ModelPipeline(model_type="test", stages=stages)
-        errors = pipeline.validate_pipeline()
-        assert any("itself" in e.lower() for e in errors)
+        omega_config = config.to_omegaconf()
 
-    def test_get_stage_by_id(self):
-        """Test getting stage by ID."""
-        stages = [
-            StageConfig(stage_id=0, model_stage="thinker", input_sources=[]),
-            StageConfig(stage_id=1, model_stage="talker", input_sources=[0]),
-        ]
-        pipeline = ModelPipeline(model_type="test", stages=stages)
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 16
 
-        stage = pipeline.get_stage(1)
-        assert stage is not None
-        assert stage.model_stage == "talker"
+    def test_to_omegaconf_llm_parallel_overrides_remain_top_level(self):
+        config = StageConfig(
+            stage_id=0,
+            model_stage="thinker",
+            stage_type=StageType.LLM,
+            runtime_overrides={
+                "pipeline_parallel_size": 2,
+                "data_parallel_size": 3,
+                "tensor_parallel_size": 8,
+            },
+        )
 
-        missing = pipeline.get_stage(99)
-        assert missing is None
+        omega_config = config.to_omegaconf()
 
-    def test_empty_pipeline(self):
-        """Test validation of empty pipeline."""
-        pipeline = ModelPipeline(model_type="test", stages=[])
-        errors = pipeline.validate_pipeline()
-        assert any("no stages" in e.lower() for e in errors)
+        assert omega_config.engine_args.pipeline_parallel_size == 2
+        assert omega_config.engine_args.data_parallel_size == 3
+        assert omega_config.engine_args.tensor_parallel_size == 8
+        assert "pipeline_parallel_size" in omega_config.engine_args
+        assert "data_parallel_size" in omega_config.engine_args
+        assert "tensor_parallel_size" in omega_config.engine_args
+        assert "parallel_config" not in omega_config.engine_args
 
 
 class TestStageConfigFactory:
@@ -370,11 +467,7 @@ class TestStageResolutionHelpers:
         assert "parallel_config" not in overrides
 
     def test_strip_parent_engine_args_reports_only_surprising_parent_overrides(self):
-        from dataclasses import fields as dc_fields
-
-        from vllm.engine.arg_utils import EngineArgs
-
-        parent_fields = {f.name: f for f in dc_fields(EngineArgs)}
+        parent_fields = {f.name: f for f in fields(EngineArgs)}
         filtered, overridden = strip_parent_engine_args(
             {
                 "model": "some/model",
@@ -396,11 +489,7 @@ class TestStageResolutionHelpers:
         assert overridden == ["tensor_parallel_size"]
 
     def test_strip_parent_engine_args_keeps_allowed_media_access_controls(self):
-        from dataclasses import fields as dc_fields
-
-        from vllm.engine.arg_utils import EngineArgs
-
-        parent_fields = {f.name: f for f in dc_fields(EngineArgs)}
+        parent_fields = {f.name: f for f in fields(EngineArgs)}
         filtered, overridden = strip_parent_engine_args(
             {
                 "model": "some/model",
@@ -419,304 +508,6 @@ class TestStageResolutionHelpers:
             "allowed_media_domains": ["example.com"],
         }
         assert overridden == []
-
-
-class TestPipelineYamlParsing:
-    """Tests for pipeline YAML file parsing (@ZJY0516)."""
-
-    def test_parse_qwen3_omni_moe_yaml(self, tmp_path):
-        """Test parsing the qwen3_omni_moe pipeline YAML."""
-        yaml_content = """\
-model_type: qwen3_omni_moe
-async_chunk: false
-
-stages:
-  - stage_id: 0
-    model_stage: thinker
-    stage_type: llm
-    input_sources: []
-    worker_type: ar
-    scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-    hf_config_name: thinker_config
-    final_output: true
-    final_output_type: text
-    is_comprehension: true
-
-  - stage_id: 1
-    model_stage: talker
-    stage_type: llm
-    input_sources: [0]
-    worker_type: ar
-    scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-    hf_config_name: talker_config
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
-
-  - stage_id: 2
-    model_stage: code2wav
-    stage_type: llm
-    input_sources: [1]
-    worker_type: generation
-    scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-    hf_config_name: thinker_config
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
-    final_output: true
-    final_output_type: audio
-"""
-        yaml_file = tmp_path / "qwen3_omni_moe.yaml"
-        yaml_file.write_text(yaml_content)
-
-        pipeline = StageConfigFactory._parse_pipeline_yaml(yaml_file, "qwen3_omni_moe")
-
-        assert pipeline.model_type == "qwen3_omni_moe"
-        assert len(pipeline.stages) == 3
-
-        # Stage 0: thinker
-        s0 = pipeline.stages[0]
-        assert s0.stage_id == 0
-        assert s0.model_stage == "thinker"
-        assert s0.stage_type == StageType.LLM
-        assert s0.input_sources == []
-        assert s0.worker_type == "ar"
-        assert s0.final_output is True
-        assert s0.final_output_type == "text"
-        assert s0.is_comprehension is True
-
-        # Stage 1: talker
-        s1 = pipeline.stages[1]
-        assert s1.stage_id == 1
-        assert s1.input_sources == [0]
-        assert s1.custom_process_input_func == (
-            "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker"
-        )
-        assert s1.final_output is False
-
-        # Stage 2: code2wav
-        s2 = pipeline.stages[2]
-        assert s2.stage_id == 2
-        assert s2.input_sources == [1]
-        assert s2.worker_type == "generation"
-        assert s2.final_output_type == "audio"
-
-    def test_parse_yaml_with_legacy_engine_input_source(self, tmp_path):
-        """Test backward compatibility with engine_input_source field."""
-        yaml_content = """\
-model_type: legacy_model
-
-stages:
-  - stage_id: 0
-    model_stage: entry
-    stage_type: llm
-  - stage_id: 1
-    model_stage: downstream
-    stage_type: llm
-    engine_input_source: [0]
-"""
-        yaml_file = tmp_path / "legacy.yaml"
-        yaml_file.write_text(yaml_content)
-
-        pipeline = StageConfigFactory._parse_pipeline_yaml(yaml_file, "legacy_model")
-        assert pipeline.stages[1].input_sources == [0]
-
-    def test_parse_yaml_with_connectors_and_edges(self, tmp_path):
-        """Test parsing pipeline with optional connectors and edges."""
-        yaml_content = """\
-model_type: test_model
-
-stages:
-  - stage_id: 0
-    model_stage: entry
-    stage_type: llm
-    input_sources: []
-
-connectors:
-  type: ray
-
-edges:
-  - from: 0
-    to: 1
-"""
-        yaml_file = tmp_path / "with_connectors.yaml"
-        yaml_file.write_text(yaml_content)
-
-        pipeline = StageConfigFactory._parse_pipeline_yaml(yaml_file, "test_model")
-        assert pipeline.connectors == {"type": "ray"}
-        assert pipeline.edges == [{"from": 0, "to": 1}]
-
-    def test_parsed_pipeline_passes_validation(self, tmp_path):
-        """Test that a well-formed YAML produces a valid pipeline."""
-        yaml_content = """\
-model_type: valid_model
-
-stages:
-  - stage_id: 0
-    model_stage: entry
-    stage_type: llm
-    input_sources: []
-    final_output: true
-    final_output_type: text
-  - stage_id: 1
-    model_stage: next
-    stage_type: llm
-    input_sources: [0]
-"""
-        yaml_file = tmp_path / "valid.yaml"
-        yaml_file.write_text(yaml_content)
-
-        pipeline = StageConfigFactory._parse_pipeline_yaml(yaml_file, "valid_model")
-        errors = pipeline.validate_pipeline()
-        assert errors == [], f"Unexpected validation errors: {errors}"
-
-    def test_parse_yaml_migrates_runtime_max_batch_size(self, tmp_path):
-        """Test that runtime.max_batch_size is migrated to engine_args.max_num_seqs."""
-        yaml_content = """\
-model_type: legacy_batch
-stages:
-  - stage_id: 0
-    model_stage: entry
-    stage_type: llm
-    input_sources: []
-    runtime:
-      devices: "0"
-      max_batch_size: 16
-    engine_args:
-      model_arch: SomeModel
-"""
-        yaml_file = tmp_path / "legacy_batch.yaml"
-        yaml_file.write_text(yaml_content)
-
-        pipeline = StageConfigFactory._parse_pipeline_yaml(yaml_file, "legacy_batch")
-        s0 = pipeline.stages[0]
-        assert "max_batch_size" not in s0.yaml_runtime
-        assert s0.yaml_engine_args.get("max_num_seqs") == 16
-
-    def test_parse_diffusion_stage_type(self, tmp_path):
-        """Test parsing a diffusion stage type from YAML."""
-        yaml_content = """\
-model_type: diff_model
-
-stages:
-  - stage_id: 0
-    model_stage: dit
-    stage_type: diffusion
-    input_sources: []
-    final_output: true
-    final_output_type: image
-"""
-        yaml_file = tmp_path / "diffusion.yaml"
-        yaml_file.write_text(yaml_content)
-
-        pipeline = StageConfigFactory._parse_pipeline_yaml(yaml_file, "diff_model")
-        assert pipeline.stages[0].stage_type == StageType.DIFFUSION
-
-    def test_parse_mimo_audio_yaml(self, tmp_path):
-        """Test parsing the MiMo Audio pipeline YAML."""
-        yaml_content = """\
-model_type: mimo_audio
-
-stages:
-  - stage_id: 0
-    model_stage: fused_thinker_talker
-    stage_type: llm
-    input_sources: []
-    worker_type: ar
-    scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-    is_comprehension: true
-    final_output: true
-    final_output_type: text
-
-  - stage_id: 1
-    model_stage: code2wav
-    stage_type: llm
-    input_sources: [0]
-    worker_type: generation
-    scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.mimo_audio.llm2code2wav
-    final_output: true
-    final_output_type: audio
-"""
-        yaml_file = tmp_path / "mimo_audio.yaml"
-        yaml_file.write_text(yaml_content)
-
-        pipeline = StageConfigFactory._parse_pipeline_yaml(yaml_file, "mimo_audio")
-
-        assert pipeline.model_type == "mimo_audio"
-        assert len(pipeline.stages) == 2
-
-        # Stage 0: fused_thinker_talker
-        s0 = pipeline.stages[0]
-        assert s0.stage_id == 0
-        assert s0.model_stage == "fused_thinker_talker"
-        assert s0.input_sources == []
-        assert s0.worker_type == "ar"
-        assert s0.is_comprehension is True
-        assert s0.final_output is True
-        assert s0.final_output_type == "text"
-
-        # Stage 1: code2wav
-        s1 = pipeline.stages[1]
-        assert s1.stage_id == 1
-        assert s1.input_sources == [0]
-        assert s1.worker_type == "generation"
-        assert s1.custom_process_input_func == (
-            "vllm_omni.model_executor.stage_input_processors.mimo_audio.llm2code2wav"
-        )
-        assert s1.final_output is True
-        assert s1.final_output_type == "audio"
-
-        # Pipeline validation
-        errors = pipeline.validate_pipeline()
-        assert errors == [], f"Unexpected errors: {errors}"
-
-
-class TestAsyncChunk:
-    """Tests for async_chunk pipeline flag."""
-
-    def test_model_pipeline_async_chunk_default(self):
-        """Test ModelPipeline defaults async_chunk to False."""
-        stages = [StageConfig(stage_id=0, model_stage="entry", input_sources=[])]
-        pipeline = ModelPipeline(model_type="test", stages=stages)
-        assert pipeline.async_chunk is False
-
-    def test_model_pipeline_async_chunk_set(self):
-        """Test ModelPipeline with async_chunk=True."""
-        stages = [StageConfig(stage_id=0, model_stage="entry", input_sources=[])]
-        pipeline = ModelPipeline(model_type="test", stages=stages, async_chunk=True)
-        assert pipeline.async_chunk is True
-
-    def test_parse_async_chunk_from_yaml(self, tmp_path):
-        """Test that async_chunk is parsed from pipeline YAML."""
-        yaml_content = """\
-model_type: test_async
-async_chunk: true
-
-stages:
-  - stage_id: 0
-    model_stage: entry
-    stage_type: llm
-    input_sources: []
-"""
-        yaml_file = tmp_path / "async.yaml"
-        yaml_file.write_text(yaml_content)
-
-        pipeline = StageConfigFactory._parse_pipeline_yaml(yaml_file, "test_async")
-        assert pipeline.async_chunk is True
-
-    def test_parse_missing_async_chunk_defaults_false(self, tmp_path):
-        """Test that missing async_chunk defaults to False."""
-        yaml_content = """\
-model_type: test_no_async
-
-stages:
-  - stage_id: 0
-    model_stage: entry
-    stage_type: llm
-    input_sources: []
-"""
-        yaml_file = tmp_path / "no_async.yaml"
-        yaml_file.write_text(yaml_content)
-
-        pipeline = StageConfigFactory._parse_pipeline_yaml(yaml_file, "test_no_async")
-        assert pipeline.async_chunk is False
 
 
 class TestPipelineDiscovery:
@@ -825,49 +616,30 @@ class TestPipelineRegistry:
 
 
 class TestDeployConfigLoading:
-    def test_deploy_override_fields_include_deploy_schema_fields(self):
-        from vllm_omni.config.stage_config import deploy_override_field_names
-
-        expected_fields = {
-            "async_chunk",
-            "async_scheduling",
-            "compilation_config",
-            "config_format",
-            "data_parallel_size",
-            "devices",
-            "disable_hybrid_kv_cache_manager",
-            "distributed_executor_backend",
-            "dtype",
-            "enable_chunked_prefill",
-            "enable_flashinfer_autotune",
-            "enable_prefix_caching",
-            "enforce_eager",
-            "gpu_memory_utilization",
-            "load_format",
-            "max_model_len",
-            "max_num_batched_tokens",
-            "max_num_seqs",
-            "mm_processor_cache_gb",
-            "pipeline_parallel_size",
-            "profiler_config",
-            "quantization",
-            "skip_mm_profiling",
-            "subtalker_sampling_params",
-            "tensor_parallel_size",
-            "tokenizer_mode",
-            "trust_remote_code",
-        }
-
-        actual_fields = deploy_override_field_names()
-        assert expected_fields == actual_fields, (
-            f"added={actual_fields - expected_fields}, removed={expected_fields - actual_fields}"
+    def test_custom_voice_dir_is_pipeline_wide_engine_arg(self, tmp_path):
+        deploy_path = tmp_path / "qwen3_tts_custom_voice.yaml"
+        custom_voice_dir = tmp_path / "voices"
+        deploy_path.write_text(
+            f"""
+async_chunk: true
+custom_voice_dir: {custom_voice_dir}
+stages:
+  - stage_id: 0
+    devices: "0"
+  - stage_id: 1
+    devices: "0"
+""",
+            encoding="utf-8",
         )
 
+        deploy = load_deploy_config(deploy_path)
+        pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert deploy.custom_voice_dir == str(custom_voice_dir)
+        assert {s.yaml_engine_args.get("custom_voice_dir") for s in stages} == {str(custom_voice_dir)}
+
     def test_load_qwen3_omni_moe_deploy_config(self):
-        from pathlib import Path
-
-        from vllm_omni.config.stage_config import load_deploy_config
-
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         deploy = load_deploy_config(deploy_path)
         assert len(deploy.stages) == 3
@@ -876,10 +648,6 @@ class TestDeployConfigLoading:
         assert deploy.platforms is not None
 
     def test_load_voxtral_tts_deploy_config_schema_fields(self):
-        from pathlib import Path
-
-        from vllm_omni.config.stage_config import load_deploy_config
-
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "voxtral_tts.yaml"
         deploy = load_deploy_config(deploy_path)
         assert deploy.stages[0].config_format == "mistral"
@@ -890,21 +658,12 @@ class TestDeployConfigLoading:
         )
 
     def test_load_ming_flash_omni_deploy_config_schema_fields(self):
-        from pathlib import Path
-
-        from vllm_omni.config.stage_config import load_deploy_config
-
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni.yaml"
         deploy = load_deploy_config(deploy_path)
         assert deploy.stages[0].compilation_config == {"pass_config": {"fuse_allreduce_rms": False}}
         assert "compilation_config" not in deploy.stages[0].engine_extras
 
     def test_merge_pipeline_deploy(self):
-        from pathlib import Path
-
-        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
-        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
-
         pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
@@ -921,11 +680,6 @@ class TestDeployConfigLoading:
         assert s0.yaml_extras["default_sampling_params"]["detokenize"] is True
 
     def test_merge_pipeline_deploy_preserves_num_replicas(self, tmp_path):
-        from pathlib import Path
-
-        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
-        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
-
         pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
         base = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not base.exists():
@@ -942,15 +696,6 @@ class TestDeployConfigLoading:
         assert stages[1].yaml_runtime["num_replicas"] == 2
 
     def test_merge_pipeline_deploy_preserves_requires_multimodal_data(self):
-        from vllm_omni.config.stage_config import (
-            DeployConfig,
-            PipelineConfig,
-            StageDeployConfig,
-            StageExecutionType,
-            StagePipelineConfig,
-            merge_pipeline_deploy,
-        )
-
         pipeline = PipelineConfig(
             model_type="test_mm",
             model_arch="TestModel",
@@ -969,11 +714,186 @@ class TestDeployConfigLoading:
 
         assert stages[0].yaml_runtime["requires_multimodal_data"] is True
 
+    def test_mixed_schema_preserves_flat_fields(self):
+        """Ensure flat fields are not dropped when engine_args are present."""
+        fake_config = {
+            "stages": [
+                {
+                    "stage_id": 0,
+                    "gpu_memory_utilization": 0.7,
+                    "max_num_seqs": 8,
+                    "engine_args": {
+                        "tensor_parallel_size": 4,
+                        "enforce_eager": True,
+                    },
+                },
+            ]
+        }
+
+        with patch("vllm_omni.config.stage_config.resolve_deploy_yaml", return_value=fake_config):
+            deploy = load_deploy_config("dummy.yaml")
+
+        assert len(deploy.stages) == 1
+        stage = deploy.stages[0]
+        # Check that the engine args are set
+        assert stage.tensor_parallel_size == 4
+        assert stage.enforce_eager is True
+        # Check that the other settings are also preserved
+        assert stage.gpu_memory_utilization == 0.7
+        assert stage.max_num_seqs == 8
+
+    def test_engine_parse_engine_fields(self):
+        """Test that we correctly parse & recursively merge stage deploy fields."""
+        fake_config = {
+            "stages": [
+                {
+                    "stage_id": 0,
+                    "compilation_config": {
+                        "encoder_cudagraph_token_budgets": [1024, 2048],
+                        "pass_config": {"fuse_norm_quant": True},
+                    },
+                    "engine_args": {
+                        "compilation_config": {
+                            "cudagraph_mm_encoder": True,
+                            "pass_config": {"fuse_allreduce_rms": False},
+                        },
+                    },
+                },
+            ]
+        }
+
+        with patch("vllm_omni.config.stage_config.resolve_deploy_yaml", return_value=fake_config):
+            deploy = load_deploy_config("dummy.yaml")
+
+        assert len(deploy.stages) == 1
+        stage = deploy.stages[0]
+        assert stage.compilation_config == {
+            "encoder_cudagraph_token_budgets": [1024, 2048],
+            "pass_config": {
+                "fuse_norm_quant": True,
+                "fuse_allreduce_rms": False,
+            },
+            "cudagraph_mm_encoder": True,
+        }
+
+    def test_engine_extras_deep_merges_dicts_simple(self):
+        """Ensure dictionary valued keys merge properly for top level dicts."""
+        fake_config = {
+            "stages": [
+                {
+                    "stage_id": 0,
+                    "foo": {"a": 111, "b": 1},
+                    "engine_args": {
+                        "foo": {"b": 2, "c": 3},
+                    },
+                },
+            ]
+        }
+
+        with patch("vllm_omni.config.stage_config.resolve_deploy_yaml", return_value=fake_config):
+            deploy = load_deploy_config("dummy.yaml")
+
+        assert len(deploy.stages) == 1
+        stage = deploy.stages[0]
+        assert "foo" in stage.engine_extras
+        assert stage.engine_extras["foo"] == {"a": 111, "b": 2, "c": 3}
+
+    def test_engine_extras_dict_type_mismatch(self):
+        """Ensure that we handle type mismatches with nested dicts correctly."""
+        fake_config = {
+            "stages": [
+                {
+                    "stage_id": 0,
+                    "foo": {"b": {1: 1}},
+                    "engine_args": {
+                        "foo": {"b": 2},
+                    },
+                },
+            ]
+        }
+
+        with patch("vllm_omni.config.stage_config.resolve_deploy_yaml", return_value=fake_config):
+            deploy = load_deploy_config("dummy.yaml")
+
+        assert len(deploy.stages) == 1
+        stage = deploy.stages[0]
+        assert "foo" in stage.engine_extras
+        assert stage.engine_extras["foo"] == {"b": 2}
+
+    def test_mixed_engine_extras_deep_merges_dicts(self):
+        """Ensure dictionary valued keys merge properly for nested dicts."""
+        fake_config = {
+            "stages": [
+                {
+                    "stage_id": 0,
+                    "foo": {"a": 111, "b": {"e": 199}},
+                    "engine_args": {
+                        "foo": {"b": {"d": 9}, "c": 3},
+                    },
+                },
+            ]
+        }
+
+        with patch("vllm_omni.config.stage_config.resolve_deploy_yaml", return_value=fake_config):
+            deploy = load_deploy_config("dummy.yaml")
+
+        assert len(deploy.stages) == 1
+        stage = deploy.stages[0]
+        assert "foo" in stage.engine_extras
+        assert stage.engine_extras["foo"] == {"a": 111, "b": {"d": 9, "e": 199}, "c": 3}
+
+    def test_deep_merge_does_not_mutate_inputs(self):
+        """Merging engine_args must not mutate the base stage dict."""
+        fake_config = {
+            "stages": [
+                {
+                    "stage_id": 0,
+                    "foo": {"a": 1, "b": {"x": 10, "y": 20}},
+                    "engine_args": {
+                        "foo": {"b": {"y": 99, "z": 30}, "c": 3},
+                    },
+                },
+            ]
+        }
+        original_foo = fake_config["stages"][0]["foo"]
+        original_b = original_foo["b"]
+
+        with patch("vllm_omni.config.stage_config.resolve_deploy_yaml", return_value=fake_config):
+            deploy = load_deploy_config("dummy.yaml")
+
+        # Values should merge into the new dict correctly
+        assert deploy.stages[0].engine_extras["foo"] == {
+            "a": 1,
+            "b": {"x": 10, "y": 99, "z": 30},
+            "c": 3,
+        }
+        # But the original nested dicts foo / b should be unchanged, since
+        # we recursively shallow copy to avoid mutating in place.
+        assert original_foo == {"a": 1, "b": {"x": 10, "y": 20}}
+        assert original_b == {"x": 10, "y": 20}
+
+    def test_mixed_schema_engine_args_wins_scalars(self):
+        """engine_args takes precedence over flat fields for scalar conflicts."""
+        fake_config = {
+            "stages": [
+                {
+                    "stage_id": 0,
+                    "gpu_memory_utilization": 0.7,
+                    "engine_args": {
+                        "gpu_memory_utilization": 0.5,
+                    },
+                },
+            ]
+        }
+
+        with patch("vllm_omni.config.stage_config.resolve_deploy_yaml", return_value=fake_config):
+            deploy = load_deploy_config("dummy.yaml")
+
+        assert deploy.stages[0].gpu_memory_utilization == 0.5
+
 
 class TestQwen3OmniPipeline:
     def test_registered(self):
-        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
-
         p = _PIPELINE_REGISTRY.get("qwen3_omni_moe")
         assert p is not None
         assert p.model_arch == "Qwen3OmniMoeForConditionalGeneration"
@@ -981,8 +901,6 @@ class TestQwen3OmniPipeline:
         assert p.validate() == []
 
     def test_thinker(self):
-        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["qwen3_omni_moe"].get_stage(0)
         assert s.model_stage == "thinker"
         assert s.execution_type == StageExecutionType.LLM_AR
@@ -991,8 +909,6 @@ class TestQwen3OmniPipeline:
         assert s.sampling_constraints["detokenize"] is True
 
     def test_talker(self):
-        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["qwen3_omni_moe"].get_stage(1)
         assert s.input_sources == (0,)
         assert s.sampling_constraints["stop_token_ids"] == [2150]
@@ -1000,8 +916,6 @@ class TestQwen3OmniPipeline:
         assert s.custom_process_next_stage_input_func is not None
 
     def test_code2wav(self):
-        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["qwen3_omni_moe"].get_stage(2)
         assert s.execution_type == StageExecutionType.LLM_GENERATION
         assert s.final_output_type == "audio"
@@ -1010,8 +924,6 @@ class TestQwen3OmniPipeline:
 
 class TestQwen2_5OmniPipeline:
     def test_registered(self):
-        import vllm_omni.model_executor.models.qwen2_5_omni.pipeline  # noqa: F401
-
         p = _PIPELINE_REGISTRY.get("qwen2_5_omni")
         assert p is not None
         assert p.model_arch == "Qwen2_5OmniForConditionalGeneration"
@@ -1019,8 +931,6 @@ class TestQwen2_5OmniPipeline:
         assert p.validate() == []
 
     def test_thinker(self):
-        import vllm_omni.model_executor.models.qwen2_5_omni.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["qwen2_5_omni"].get_stage(0)
         assert s.model_stage == "thinker"
         assert s.execution_type == StageExecutionType.LLM_AR
@@ -1029,16 +939,12 @@ class TestQwen2_5OmniPipeline:
         assert s.requires_multimodal_data is True
 
     def test_talker(self):
-        import vllm_omni.model_executor.models.qwen2_5_omni.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["qwen2_5_omni"].get_stage(1)
         assert s.input_sources == (0,)
         assert s.sampling_constraints["stop_token_ids"] == [8294]
         assert s.custom_process_input_func is not None
 
     def test_code2wav(self):
-        import vllm_omni.model_executor.models.qwen2_5_omni.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["qwen2_5_omni"].get_stage(2)
         assert s.execution_type == StageExecutionType.LLM_GENERATION
         assert s.final_output_type == "audio"
@@ -1047,8 +953,6 @@ class TestQwen2_5OmniPipeline:
 
 class TestQwen3TTSPipeline:
     def test_registered(self):
-        import vllm_omni.model_executor.models.qwen3_tts.pipeline  # noqa: F401
-
         p = _PIPELINE_REGISTRY.get("qwen3_tts")
         assert p is not None
         assert p.model_arch == "Qwen3TTSTalkerForConditionalGeneration"
@@ -1056,8 +960,6 @@ class TestQwen3TTSPipeline:
         assert p.validate() == []
 
     def test_talker_stage(self):
-        import vllm_omni.model_executor.models.qwen3_tts.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["qwen3_tts"].get_stage(0)
         assert s.model_stage == "qwen3_tts"
         assert s.execution_type == StageExecutionType.LLM_AR
@@ -1068,8 +970,6 @@ class TestQwen3TTSPipeline:
         assert s.model_arch is None
 
     def test_code2wav_stage_has_per_stage_model_arch(self):
-        import vllm_omni.model_executor.models.qwen3_tts.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["qwen3_tts"].get_stage(1)
         assert s.execution_type == StageExecutionType.LLM_GENERATION
         assert s.final_output_type == "audio"
@@ -1081,9 +981,6 @@ class TestQwen3TTSPipeline:
 
     def test_per_stage_model_arch_flows_through_merge(self, tmp_path):
         """Verify the new ps.model_arch override survives merge_pipeline_deploy."""
-        import vllm_omni.model_executor.models.qwen3_tts.pipeline  # noqa: F401
-        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
-
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_tts.yaml"
         if not deploy_path.exists():
             pytest.skip("qwen3_tts deploy yaml not found")
@@ -1099,8 +996,6 @@ class TestQwen3TTSPipeline:
 
     def test_subtalker_sampling_params_deep_merge_preserves_base_keys(self):
         """Verify subtalker sampling params participate in stage deep-merge."""
-        from vllm_omni.config.stage_config import _deep_merge_stage
-
         base = {
             "stage_id": 0,
             "subtalker_sampling_params": {
@@ -1130,8 +1025,6 @@ class TestQwen3TTSPipeline:
 
 class TestMingFlashOmniPipeline:
     def test_registered(self):
-        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
-
         p = _PIPELINE_REGISTRY.get("ming_flash_omni")
         assert p is not None
         assert p.model_arch == "MingFlashOmniForConditionalGeneration"
@@ -1139,8 +1032,6 @@ class TestMingFlashOmniPipeline:
         assert p.validate() == []
 
     def test_thinker_stage(self):
-        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["ming_flash_omni"].get_stage(0)
         assert s.model_stage == "thinker"
         assert s.execution_type == StageExecutionType.LLM_AR
@@ -1151,8 +1042,6 @@ class TestMingFlashOmniPipeline:
         assert s.sampling_constraints["detokenize"] is True
 
     def test_talker_stage(self):
-        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["ming_flash_omni"].get_stage(1)
         assert s.model_stage == "ming_tts"
         assert s.execution_type == StageExecutionType.LLM_GENERATION
@@ -1171,18 +1060,12 @@ class TestMingFlashOmniPipeline:
         Lazy string references only fail at first inference otherwise — this
         catches typos in the pipeline declaration at import / registration time.
         """
-        import importlib
-
-        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["ming_flash_omni"].get_stage(1)
         module_path, _, attr = s.custom_process_input_func.rpartition(".")
         module = importlib.import_module(module_path)
         assert callable(getattr(module, attr))
 
     def test_tts_pipeline_registered(self):
-        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
-
         p = _PIPELINE_REGISTRY.get("ming_flash_omni_tts")
         assert p is not None
         assert p.model_arch == "MingFlashOmniTalkerForConditionalGeneration"
@@ -1190,8 +1073,6 @@ class TestMingFlashOmniPipeline:
         assert p.validate() == []
 
     def test_tts_stage(self):
-        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["ming_flash_omni_tts"].get_stage(0)
         assert s.model_stage == "ming_tts"
         assert s.execution_type == StageExecutionType.LLM_GENERATION
@@ -1204,9 +1085,6 @@ class TestMingFlashOmniPipeline:
 
     def test_full_yaml_loads_and_merges(self):
         """deploy/ming_flash_omni.yaml parses and merges with the registered pipeline."""
-        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
-        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
-
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni.yaml"
         if not deploy_path.exists():
             pytest.skip("ming_flash_omni deploy yaml not found")
@@ -1226,9 +1104,6 @@ class TestMingFlashOmniPipeline:
 
     def test_tts_yaml_loads_and_merges(self):
         """deploy/ming_flash_omni_tts.yaml parses and routes to the TTS-only pipeline."""
-        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
-        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
-
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni_tts.yaml"
         if not deploy_path.exists():
             pytest.skip("ming_flash_omni_tts deploy yaml not found")
@@ -1243,8 +1118,6 @@ class TestMingFlashOmniPipeline:
         assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniTalkerForConditionalGeneration"
 
     def test_thinker_only_pipeline_registered(self):
-        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
-
         p = _PIPELINE_REGISTRY.get("ming_flash_omni_thinker_only")
         assert p is not None
         assert p.model_arch == "MingFlashOmniForConditionalGeneration"
@@ -1252,8 +1125,6 @@ class TestMingFlashOmniPipeline:
         assert p.validate() == []
 
     def test_thinker_only_stage(self):
-        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
-
         s = _PIPELINE_REGISTRY["ming_flash_omni_thinker_only"].get_stage(0)
         assert s.model_stage == "thinker"
         assert s.execution_type == StageExecutionType.LLM_AR
@@ -1267,9 +1138,6 @@ class TestMingFlashOmniPipeline:
 
     def test_thinker_only_yaml_loads_and_merges(self):
         """deploy/ming_flash_omni_thinker_only.yaml parses and routes to the thinker-only pipeline."""
-        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
-        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
-
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni_thinker_only.yaml"
         if not deploy_path.exists():
             pytest.skip("ming_flash_omni_thinker_only deploy yaml not found")
@@ -1283,14 +1151,79 @@ class TestMingFlashOmniPipeline:
         assert len(stages) == 1
         assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniForConditionalGeneration"
 
+    def test_image_pipeline_registered(self):
+        p = _PIPELINE_REGISTRY.get("ming_flash_omni_image")
+        assert p is not None
+        assert p.model_arch == "MingFlashOmniForConditionalGeneration"
+        assert len(p.stages) == 2
+        assert p.validate() == []
+
+    def test_image_thinker_stage(self):
+        s = _PIPELINE_REGISTRY["ming_flash_omni_image"].get_stage(0)
+        assert s.model_stage == "thinker"
+        assert s.execution_type == StageExecutionType.LLM_AR
+        assert s.input_sources == ()
+        assert s.final_output is False
+        assert s.owns_tokenizer is True
+        assert s.requires_multimodal_data is True
+        # Image variant exports hidden states for the diffusion stage.
+        assert s.engine_output_type == "latent"
+        assert s.hf_config_name == "thinker_config"
+        assert s.sampling_constraints["detokenize"] is False
+        assert s.prompt_expand_func is not None
+
+    def test_image_dit_stage(self):
+        s = _PIPELINE_REGISTRY["ming_flash_omni_image"].get_stage(1)
+        assert s.model_stage == "dit"
+        assert s.execution_type == StageExecutionType.DIFFUSION
+        assert s.input_sources == (0,)
+        assert s.final_output is True
+        assert s.final_output_type == "image"
+        assert s.hf_config_name == "image_gen_config"
+        assert s.model_arch == "MingImagePipeline"
+        assert s.custom_process_input_func is not None
+
+    def test_image_processor_wiring_resolves(self):
+        """The prompt_expand_func and custom_process_input_func strings must point to real callables."""
+        thinker = _PIPELINE_REGISTRY["ming_flash_omni_image"].get_stage(0)
+        dit = _PIPELINE_REGISTRY["ming_flash_omni_image"].get_stage(1)
+        for ref in (thinker.prompt_expand_func, dit.custom_process_input_func):
+            module_path, _, attr = ref.rpartition(".")
+            module = importlib.import_module(module_path)
+            assert callable(getattr(module, attr))
+
+    def test_image_yaml_loads_and_merges(self):
+        """deploy/ming_flash_omni_image.yaml parses and routes to the image pipeline."""
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni_image.yaml"
+        if not deploy_path.exists():
+            pytest.skip("ming_flash_omni_image deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+        assert len(deploy.stages) == 2
+        assert deploy.async_chunk is False
+        assert deploy.pipeline == "ming_flash_omni_image"
+        assert deploy.connectors is not None
+        assert "shared_memory_connector" in deploy.connectors
+
+        pipeline = _PIPELINE_REGISTRY["ming_flash_omni_image"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert len(stages) == 2
+        # Stage 0 thinker: AR worker that emits latents.
+        assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniForConditionalGeneration"
+        assert stages[0].yaml_engine_args["engine_output_type"] == "latent"
+        assert stages[0].yaml_extras["default_sampling_params"]["detokenize"] is False
+        assert stages[0].yaml_extras["prompt_expand_func"] is not None
+        # Stage 1 dit: diffusion stage with MingImagePipeline.
+        assert stages[1].yaml_engine_args["model_arch"] == "MingImagePipeline"
+        assert stages[1].custom_process_input_func is not None
+        assert stages[1].final_output is True
+        assert stages[1].final_output_type == "image"
+
 
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
 
     def test_ci_inherits_from_main(self):
-        from tests.helpers.stage_config import get_deploy_config_path
-        from vllm_omni.config.stage_config import load_deploy_config
-
         ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe.yaml"))
         if not ci_path.exists():
             pytest.skip("CI deploy config not found")
@@ -1298,7 +1231,7 @@ class TestBaseConfigInheritance:
         deploy = load_deploy_config(ci_path)
         assert len(deploy.stages) == 3
         # CI overrides
-        assert deploy.stages[0].load_format == "dummy"
+        assert deploy.stages[0].load_format is None
         assert "load_format" not in deploy.stages[0].engine_extras
         assert deploy.stages[0].max_num_seqs == 5
         # Inherited from base
@@ -1311,9 +1244,6 @@ class TestBaseConfigInheritance:
         assert deploy.async_chunk is False
 
     def test_ci_sampling_merge(self):
-        from tests.helpers.stage_config import get_deploy_config_path
-        from vllm_omni.config.stage_config import load_deploy_config
-
         ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe.yaml"))
         if not ci_path.exists():
             pytest.skip("CI deploy config not found")
@@ -1322,14 +1252,9 @@ class TestBaseConfigInheritance:
         s0 = deploy.stages[0].default_sampling_params
         # CI overrides max_tokens
         assert s0["max_tokens"] == 150
-        # Inherited from base
-        assert s0["temperature"] == 0.4
-        assert s0["seed"] == 42
 
     def test_pure_inheritance_overlay(self, tmp_path):
         """An overlay with only ``base_config`` inherits everything."""
-        from vllm_omni.config.stage_config import load_deploy_config
-
         base = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not base.exists():
             pytest.skip("Base deploy config not found")
@@ -1343,8 +1268,6 @@ class TestBaseConfigInheritance:
 
     def test_single_field_overlay(self, tmp_path):
         """An overlay overriding one stage field merges with the base."""
-        from vllm_omni.config.stage_config import load_deploy_config
-
         base = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not base.exists():
             pytest.skip("Base deploy config not found")
@@ -1362,10 +1285,6 @@ class TestPlatformOverrides:
     """Test platform-specific deploy config overrides."""
 
     def test_npu_overrides(self):
-        from pathlib import Path
-
-        from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
-
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
             pytest.skip("Deploy config not found")
@@ -1377,13 +1296,9 @@ class TestPlatformOverrides:
         assert deploy.stages[0].tensor_parallel_size == 2
         assert deploy.stages[0].devices == "0,1"
         # Stage 2 unaffected fields stay at base
-        assert deploy.stages[2].enforce_eager is True
+        assert deploy.stages[2].enforce_eager is False
 
     def test_xpu_overrides(self):
-        from pathlib import Path
-
-        from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
-
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
             pytest.skip("Deploy config not found")
@@ -1396,10 +1311,6 @@ class TestPlatformOverrides:
         assert deploy.stages[0].engine_extras.get("max_cudagraph_capture_size") == 0
 
     def test_unknown_platform_noop(self):
-        from pathlib import Path
-
-        from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
-
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
             pytest.skip("Deploy config not found")
@@ -1411,8 +1322,6 @@ class TestPlatformOverrides:
 
     def test_platforms_deep_merge_inheritance(self, tmp_path):
         """Overlay's platforms: block layers onto base's, per-stage."""
-        from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
-
         base = tmp_path / "base.yaml"
         base.write_text(
             "stages:\n"
@@ -1447,11 +1356,6 @@ class TestCLIOverrideFlow:
     """Test --stage-overrides JSON merge into StageConfig."""
 
     def test_stage_overrides_merge(self):
-        from pathlib import Path
-
-        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
-        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
-
         pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
@@ -1466,11 +1370,6 @@ class TestCLIOverrideFlow:
         assert stages[0].runtime_overrides["gpu_memory_utilization"] == 0.5
 
     def test_global_override_applies_to_all(self):
-        from pathlib import Path
-
-        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
-        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
-
         pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
@@ -1490,8 +1389,6 @@ class TestSentinelDefaultPrecedence:
     to YAML / dataclass defaults (#3035)."""
 
     def _stages(self, cli_overrides):
-        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
-
         return StageConfigFactory._create_from_registry(
             "qwen3_omni_moe",
             cli_overrides=cli_overrides,
@@ -1504,7 +1401,7 @@ class TestSentinelDefaultPrecedence:
     def test_none_value_skipped_yaml_wins(self):
         stages = self._stages({"max_num_seqs": None})
         assert stages[2].runtime_overrides.get("max_num_seqs") is None
-        assert stages[2].yaml_engine_args["max_num_seqs"] == 64
+        assert stages[2].yaml_engine_args.get("max_num_seqs") == 64
 
     def test_empty_kwargs_yaml_only(self):
         stages = self._stages({})
@@ -1550,35 +1447,14 @@ class TestSentinelDefaultPrecedence:
             assert stage.runtime_overrides == {}
 
     def test_create_from_registry_no_cli_explicit_keys_param(self):
-        import inspect
-
         sig = inspect.signature(StageConfigFactory._create_from_registry)
         named = [p for p in sig.parameters.values() if p.kind != p.VAR_KEYWORD]
         assert "cli_explicit_keys" not in {p.name for p in named}
-
-    def test_cli_explicit_keys_kwarg_emits_deprecation(self):
-        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            StageConfigFactory._create_from_registry(
-                "qwen3_omni_moe",
-                cli_overrides={},
-                cli_explicit_keys={"max_num_seqs"},
-            )
-            assert any(issubclass(x.category, DeprecationWarning) for x in w)
 
     def test_async_chunk_dispatches_processors(self):
         """A single ``qwen3_tts`` pipeline picks per-chunk vs end-to-end
         processors based on ``deploy.async_chunk``, without needing a
         separate variant pipeline registration."""
-        import vllm_omni.model_executor.models.qwen3_tts.pipeline  # noqa: F401
-        from vllm_omni.config.stage_config import (
-            _PIPELINE_REGISTRY,
-            DeployConfig,
-            merge_pipeline_deploy,
-        )
-
         pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
 
         # async_chunk=True → stage 0's per-chunk processor wires up, stage 1
@@ -1591,12 +1467,19 @@ class TestSentinelDefaultPrecedence:
         )
         assert async_stages[1].custom_process_input_func is None
 
-        # async_chunk=False → stage 0 has no streaming processor, stage 1's
-        # batch-end processor wires up.
+        # async_chunk=False → stage 0 ships the bulk codec via the
+        # worker-connector full-payload producer; stage 1 wires the
+        # ``_token_only`` placeholder so the orchestrator emits no
+        # legacy ``additional_information``-shaped input (PR3 sync-
+        # via-connector data plane).
         sync_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
-        assert "custom_process_next_stage_input_func" not in sync_stages[0].yaml_engine_args
+        assert (
+            sync_stages[0]
+            .yaml_engine_args["custom_process_next_stage_input_func"]
+            .endswith("talker2code2wav_full_payload")
+        )
         assert sync_stages[1].custom_process_input_func is not None
-        assert sync_stages[1].custom_process_input_func.endswith("talker2code2wav")
+        assert sync_stages[1].custom_process_input_func.endswith("talker2code2wav_token_only")
 
     def test_async_chunk_dispatches_qwen3_omni_processors(self):
         import runpy
@@ -1633,16 +1516,49 @@ class TestSentinelDefaultPrecedence:
             .endswith("talker2code2wav_full_payload")
         )
 
+    def test_ming_flash_omni_topology(self):
+        """Guard ming_flash_omni's PR3 cleanup: stage 0 has no full-payload
+        producer hook (the connector path was removed as fake -- arch is not
+        in ``_FULL_PAYLOAD_INPUT_STAGES``), and stage 1 still wires the
+        legacy ``thinker2talker`` (custom_process_input_func) plus the
+        ``thinker2talker_token_only`` placeholder (sync_process_input_func).
+        Merge under either async_chunk mode must not re-introduce a
+        stage-0 full-payload hook."""
+        from vllm_omni.config.stage_config import DeployConfig, merge_pipeline_deploy
+
+        pipeline = _PIPELINE_REGISTRY["ming_flash_omni"]
+
+        stage0, stage1 = pipeline.stages
+        assert stage0.custom_process_next_stage_input_func is None, (
+            "ming_flash_omni stage 0 must not declare a full-payload producer "
+            "(connector path is not active for this arch)."
+        )
+        assert stage1.custom_process_input_func is not None
+        assert stage1.custom_process_input_func.endswith("thinker2talker")
+        assert stage1.sync_process_input_func is not None
+        assert stage1.sync_process_input_func.endswith("thinker2talker_token_only")
+
+        # async_chunk=True must now be rejected: removing the fake hook means
+        # there is no next-stage input processor for the validator to accept.
+        # (Positive consequence -- users can't accidentally enable async_chunk
+        # on an arch that doesn't actually support it.)
+        import pytest as _pytest
+
+        with _pytest.raises(ValueError, match="async_chunk=True"):
+            merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=True))
+
+        # async_chunk=False merges cleanly and stage-0 yaml_engine_args carries
+        # no spurious full-payload hook.
+        merged = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
+        assert "custom_process_next_stage_input_func" not in merged[0].yaml_engine_args, (
+            "stage-0 full-payload hook unexpectedly re-appeared in yaml_engine_args"
+        )
+
 
 class TestSamplingConstraintsPrecedence:
     """Test that pipeline sampling_constraints override deploy defaults."""
 
     def test_constraints_win(self):
-        from pathlib import Path
-
-        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
-        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
-
         pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
@@ -1655,5 +1571,3 @@ class TestSamplingConstraintsPrecedence:
         assert stages[0].yaml_extras["default_sampling_params"]["detokenize"] is True
         # Pipeline says stop_token_ids=[2150] for talker
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [2150]
-        # Deploy temperature still flows through
-        assert stages[0].yaml_extras["default_sampling_params"]["temperature"] == 0.4

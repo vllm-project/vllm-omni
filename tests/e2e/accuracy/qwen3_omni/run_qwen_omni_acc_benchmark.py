@@ -8,7 +8,7 @@ L4-style smoke runs against an already-running server. The pytest wrappers in
 H100 / MI325) because they launch the live Omni server inside the test.
 
 1. **Daily-Omni** — MCQ accuracy fields in the saved JSON (``daily_omni_accuracy``, …); by default the
-   run **fails** if accuracy is strictly below **0.67** (``--min-daily-omni-accuracy`` / ``ACC_BENCH_MIN_DAILY_OMNI_ACCURACY``).
+   run **fails** if accuracy is strictly below **0.69** (``--min-daily-omni-accuracy`` / ``ACC_BENCH_MIN_DAILY_OMNI_ACCURACY``).
 2. **Seed-TTS** — ``seed-tts-eval``-style metrics when ``--seed-tts-wer-eval`` is used
    (WER / SIM / UTMOS keys from :func:`compute_seed_tts_wer_metrics`).
 
@@ -308,9 +308,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-daily-omni-accuracy",
         type=float,
-        default=float((os.environ.get("ACC_BENCH_MIN_DAILY_OMNI_ACCURACY") or "0.67").strip() or "0.67"),
+        default=float((os.environ.get("ACC_BENCH_MIN_DAILY_OMNI_ACCURACY") or "0.69").strip() or "0.69"),
         help="Fail when daily_omni_accuracy is strictly below this threshold (0–1). "
-        "Default baseline 0.67; override with env ACC_BENCH_MIN_DAILY_OMNI_ACCURACY or pass 0 to disable the floor.",
+        "Default baseline 0.69; override with env ACC_BENCH_MIN_DAILY_OMNI_ACCURACY or pass 0 to disable the floor.",
     )
 
     p.add_argument(
@@ -340,7 +340,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-seed-tts-mean-wer",
         type=float,
-        default=0.5,
+        default=0.35,
         help="If set, fail when seed_tts_content_error_mean is strictly above this value.",
     )
     p.add_argument(

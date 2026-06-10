@@ -11,7 +11,7 @@ from vllm.model_executor.utils import get_packed_modules_mapping
 
 logger = init_logger(__name__)
 
-MODEL_OPT_SCALE_SUFFIXES = (".input_scale", ".weight_scale", ".weight_scale_inv")
+MODEL_OPT_SCALE_SUFFIXES = (".input_scale", ".weight_scale", ".weight_scale_2", ".weight_scale_inv")
 DEFAULT_PACKED_MODULES_MAPPING = {
     "to_qkv": ("to_q", "to_k", "to_v"),
     "add_kv_proj": ("add_q_proj", "add_k_proj", "add_v_proj"),
@@ -249,3 +249,24 @@ class ModelOptFp8CheckpointAdapter:
 
         self._check_pending_weights(state)
         self._log_adaptation_summary(state)
+
+
+class ModelOptNvFp4CheckpointAdapter(ModelOptFp8CheckpointAdapter):
+    @staticmethod
+    def _is_checkpoint_quant_config(quant_config: object | None) -> bool:
+        return (
+            quant_config is not None
+            and hasattr(quant_config, "get_name")
+            and quant_config.get_name() == "modelopt_fp4"
+            and bool(getattr(quant_config, "is_checkpoint_nvfp4_serialized", False))
+        )
+
+
+class ModelOptMixedPrecisionCheckpointAdapter(ModelOptFp8CheckpointAdapter):
+    @staticmethod
+    def _is_checkpoint_quant_config(quant_config: object | None) -> bool:
+        return (
+            quant_config is not None
+            and hasattr(quant_config, "get_name")
+            and quant_config.get_name() == "modelopt_mixed"
+        )

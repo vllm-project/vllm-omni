@@ -24,7 +24,9 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     sampling_params_list: list[OmniSamplingParams]
     final_stage_id: int
     preprocess_ms: float
+    request_timestamp: float
     enqueue_ts: float
+    final_output_stage_ids: list[int] | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -56,6 +58,18 @@ class ShutdownRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["shutdown"] = "shutdown"
 
 
+class RegisterRemoteReplicaMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["register_remote_replica"] = "register_remote_replica"
+    stage_id: int
+    replica_id: int
+
+
+class UnregisterRemoteReplicaMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["unregister_remote_replica"] = "unregister_remote_replica"
+    stage_id: int
+    input_addr: str
+
+
 class ErrorMessage(EngineQueueMessage, kw_only=True):
     type: Literal["error"] = "error"
     error: str
@@ -68,6 +82,7 @@ class OutputMessage(EngineQueueMessage, kw_only=True):
     type: Literal["output"] = "output"
     request_id: str
     stage_id: int
+    replica_id: int | None = None
     engine_outputs: OmniRequestOutput
     metrics: StageRequestMetrics | None = None
     finished: bool
@@ -78,6 +93,7 @@ class StageMetricsMessage(EngineQueueMessage, kw_only=True):
     type: Literal["stage_metrics"] = "stage_metrics"
     request_id: str
     stage_id: int
+    replica_id: int | None = None
     metrics: StageRequestMetrics
     stage_submit_ts: float | None = None
 
