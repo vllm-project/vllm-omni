@@ -1,2 +1,3 @@
 -r common.txt
 onnxruntime>=1.23.2
+auto-round-lib

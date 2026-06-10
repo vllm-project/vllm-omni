@@ -368,6 +368,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
 
         # Constant logit mask: allow only codec ids [1, codebook_vocab_size) plus codec EOS.
+        # Register the *disallowed* form so compute_logits doesn't recompute ~mask per step.
         vocab = int(self.talker_config.vocab_size)
         codec_mask = torch.zeros((vocab,), dtype=torch.bool)
         lo, hi = 1, min(self._codebook_vocab_size, vocab)
@@ -375,7 +376,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             codec_mask[lo:hi] = True
         if 0 <= self._codec_eos_token_id < vocab:
             codec_mask[self._codec_eos_token_id] = True
-        self.register_buffer("_codec_allowed_mask", codec_mask, persistent=False)
+        self.register_buffer("_codec_disallowed_mask", ~codec_mask, persistent=False)
 
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
@@ -513,7 +514,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             return None
 
         # Mask out invalid codec ids using the pre-built constant buffer.
-        logits = logits.masked_fill(~self._codec_allowed_mask, float("-inf"))
+        logits = logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
 
         if self._eos_logit_bias != 0.0:
             eos_id = self._codec_eos_token_id
