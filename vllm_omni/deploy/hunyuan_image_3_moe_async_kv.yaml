@@ -2,12 +2,11 @@
 # with AR-to-DiT KV reuse, plus async KV H2D copy enabled on the DiT stage.
 #
 # Same topology as hunyuan_image_3_moe.yaml. The only difference is the DiT
-# stage (stage 1) sets `enable_kv_async_copy: true`, so the received AR KV
-# pinned-pool -> GPU copy (Phase 2) is issued on a dedicated CUDA stream and
-# overlaps host-side setup before forward instead of blocking the main thread
-# (~51ms). This is the stage that actually receives KV (need_recv_cache: true +
-# input_connectors), so this is where the flag has effect. Opt-in; the base
-# config defaults to the synchronous copy path.
+# stage (stage 1) sets `enable_kv_async_copy: true`: the received AR KV
+# pinned-pool -> GPU copy runs on a dedicated CUDA stream and overlaps
+# host-side setup before forward instead of blocking the main thread (~51ms).
+# Stage 1 is the one that receives KV (need_recv_cache + input_connectors),
+# so it is where the flag has effect.
 #
 # The base CUDA layout uses 2 GPUs for AR and 2 GPUs for DiT.
 pipeline: hunyuan_image_3_moe

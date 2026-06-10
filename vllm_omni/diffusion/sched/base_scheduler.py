@@ -113,17 +113,21 @@ class _BaseScheduler(SchedulerInterface):
             else:
                 scheduled_cached_request_ids.append(request_id)
 
-        # Phase 3: expose the next waiting request so the runner can prefetch its
-        # KV during this cycle's forward.  Request mode is serial (one running),
-        # so _waiting[0] is the unique next request.
+        # Expose the next waiting request (_waiting[0]; request mode is serial)
+        # so the runner can prefetch its KV during this cycle's forward.  A
+        # request without kv_sender_info is not exposed — prefetching it would
+        # fall back to the previous request's sender endpoint, which is wrong
+        # under multi-replica senders; it uses the sync path instead.
         prefetch_stub: dict | None = None
         if self._prefetch_enabled and self._waiting:
             nxt = self._request_states.get(self._waiting[0])
             if nxt is not None:
-                prefetch_stub = {
-                    "request_id": nxt.request_id,
-                    "kv_sender_info": getattr(nxt.req, "kv_sender_info", None),
-                }
+                sender_info = getattr(nxt.req, "kv_sender_info", None)
+                if sender_info:
+                    prefetch_stub = {
+                        "request_id": nxt.request_id,
+                        "kv_sender_info": sender_info,
+                    }
 
         scheduler_output = DiffusionSchedulerOutput(
             step_id=self._step_id,

@@ -585,7 +585,7 @@ class OmniServeCommand(CLISubcommand):
             "--enable-kv-async-prefetch",
             action="store_true",
             help="Prefetch the next request's AR KV on a background thread during the "
-            "current forward (diffusion stage, request mode + Branch A only). Off by default.",
+            "current forward (diffusion stage, request mode, rank-local receive only). Off by default.",
         )
 
         # Video model parameters (e.g., Wan2.2) - engine-level

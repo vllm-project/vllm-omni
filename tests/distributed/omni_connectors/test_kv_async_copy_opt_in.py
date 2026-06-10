@@ -1,4 +1,4 @@
-"""Async KV H2D copy (Phase 2) opt-in contract.
+"""Async KV H2D copy opt-in contract.
 
 The async pinned-pool -> GPU copy is only safe for callers that wait via
 ``wait_kv_copy()`` before consuming the KV (the diffusion runner).  These tests

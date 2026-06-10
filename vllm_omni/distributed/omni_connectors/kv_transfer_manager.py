@@ -37,12 +37,9 @@ logger = init_logger(__name__)
 
 LayerKV = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
-# Phase 3: a background prefetch must not block the single prefetch worker (or
-# the main thread waiting on its result) for the full recv_timeout when the KV
-# is not yet available (e.g. an aborted/reordered request).  Bound it to a small
-# value; on timeout the consumer falls back to the synchronous receive, which
-# uses the full recv_timeout.  Nothing is consumed on a timed-out get, so the
-# fallback can still fetch the payload.
+# Poll bound for a background prefetch so an unavailable KV (e.g. aborted
+# request) cannot hold the worker for the full recv_timeout.  A timed-out get
+# consumes nothing on the sender, so the sync fallback can still fetch it.
 _DEFAULT_PREFETCH_TIMEOUT = 5.0
 
 _SAFE_TORCH_DTYPES = {
@@ -349,12 +346,9 @@ class OmniKVTransferManager:
         self._kv_inflight_buffers: list[Any] = []
         self._async_kv_copy = async_kv_copy
 
-        # Phase 3: background prefetch of the next request's KV.  A 1-worker
-        # executor runs receive() (get + deserialize + pin) off the main thread
-        # during the current forward; results are keyed by request_id and
-        # consumed on the next execute_model.  Opt-in (async_prefetch); the
-        # caller (diffusion runner) further gates on Branch A.  Disabled => all
-        # prefetch paths are no-ops.
+        # Background prefetch of the next request's KV: a 1-worker executor
+        # runs receive() off the main thread during the current forward;
+        # results are keyed by request_id and consumed on the next request.
         self._async_prefetch = async_prefetch
         self._load_executor: Any = None
         self._load_futures: dict[str, Any] = {}
@@ -403,11 +397,9 @@ class OmniKVTransferManager:
     def from_od_config(cls, config: Any) -> "OmniKVTransferManager":
         """Create from model or OmniDiffusion config.
 
-        The diffusion runner waits via wait_kv_copy() before forward, so it is
-        the only construction path that may opt into the async H2D copy
-        (``enable_kv_async_copy``) and background prefetch
-        (``enable_kv_async_prefetch``).  The runner further gates prefetch on
-        Branch A (no CFG/SP) before triggering it.
+        Only this path may opt into the async H2D copy and background
+        prefetch: the diffusion runner waits via wait_kv_copy() before forward
+        and gates prefetch on rank-local receive mode.
         """
         return cls._create(
             getattr(config, "omni_kv_config", None),
@@ -496,6 +488,17 @@ class OmniKVTransferManager:
         return self._connector if self._connector else None
 
     get_connector = property(lambda self: self.connector)
+
+    @property
+    def kv_topology_rank_aware(self) -> bool:
+        """True when the KV transfer topology uses per-rank recv keys.
+
+        In this mode every rank receives its own shard independently (no
+        collectives), which is what makes background prefetch safe to run
+        per-rank.
+        """
+        topo = self._tp_topo
+        return topo.source_tp_size > 1 or topo.target_tp_size > 1
 
     def _resolve_sender_info(
         self, sender_info: dict[str, Any], sender_stage_id: str | int | None = None
@@ -1018,12 +1021,10 @@ class OmniKVTransferManager:
         return self._kv_copy_stream
 
     def _drain_inflight_buffers(self) -> None:
-        """Release pinned-pool buffers whose async H2D copy has completed.
+        """Release source buffers whose async H2D copy has completed.
 
-        Called at the start of each receive.  By then the previous request's
-        forward has run, so the copy is long done and the event sync is
-        effectively free; it only guards against freeing a buffer the DMA is
-        still reading.
+        Runs when the next request's KV handling starts; the previous forward
+        has run by then, so the event sync is effectively free.
         """
         if not self._kv_inflight_buffers:
             return
@@ -1034,9 +1035,8 @@ class OmniKVTransferManager:
                 logger.exception("Failed to synchronize KV copy event")
             self._kv_copy_event = None
         for buf in self._kv_inflight_buffers:
-            # Pool ManagedBuffers expose release(); prefetch keep-alive refs
-            # (owned pinned source tensors) do not — dropping the reference on
-            # clear() is enough for those.
+            # Pool buffers expose release(); pinned keep-alive refs just need
+            # the reference dropped on clear().
             release = getattr(buf, "release", None)
             if callable(release):
                 try:
@@ -1048,16 +1048,14 @@ class OmniKVTransferManager:
     def wait_kv_copy(self) -> None:
         """Make the compute stream wait for the pending KV H2D copy.
 
-        Call right before forward.  GPU-side ordering only — it does not block
-        the CPU.  The event is kept for :meth:`_drain_inflight_buffers` to gate
-        pool-buffer release on the next receive.
+        Call right before forward.  GPU-side ordering only; does not block the CPU.
         """
         if self._kv_copy_event is None or self._kv_copy_stream is None:
             return
         torch.cuda.current_stream().wait_stream(self._kv_copy_stream)
 
     # ------------------------------------------------------------------ #
-    #  Phase 3: background prefetch of the next request's KV
+    #  Background prefetch of the next request's KV
     # ------------------------------------------------------------------ #
 
     def _resolve_sender_base(self, sender_info: dict[str, Any] | None) -> tuple[str | None, int | None]:
@@ -1070,14 +1068,12 @@ class OmniKVTransferManager:
 
     @staticmethod
     def _to_owned_pinned(t: torch.Tensor) -> torch.Tensor:
-        """Own a pinned CPU copy so the pooled buffer can be released now.
+        """Own a pinned CPU copy (async-H2D-capable) so the pooled buffer can
+        be released now.
 
-        Keeps the tensor usable as a real-async H2D source on the main thread.
-
-        NOTE (R1): ``pin_memory()`` allocates page-locked host memory and may
-        trigger an implicit device sync that stalls the concurrent forward.  If
-        profiling shows that, switch to copying into a reusable pinned staging
-        buffer (this method is the only swap point).
+        ``pin_memory()`` takes the CUDA driver lock and may stall the
+        concurrent forward; if profiling shows that, swap in a reusable pinned
+        staging buffer here (the only swap point).
         """
         return t.contiguous().pin_memory()
 
@@ -1100,15 +1096,19 @@ class OmniKVTransferManager:
         rid = prefetch_stub.get("request_id")
         if not rid:
             return
-        # Orphan guard: serial request mode keeps at most one prefetch
-        # outstanding.  Drop any other un-consumed entries — e.g. a request that
-        # was prefetched then aborted/reordered and whose get_loaded_kv() will
-        # never be called — so their pinned-CPU payloads do not leak.
+        # At most one prefetch is outstanding in serial request mode; any other
+        # entry is an un-consumed leftover (aborted/reordered) — drop it.
         for stale in [k for k in self._load_futures if k != rid]:
             self._discard_future(stale)
         if rid in self._load_futures:
             return
         sender_info = prefetch_stub.get("kv_sender_info")
+        if not sender_info:
+            # Without an explicit endpoint the background receive would fall
+            # back to the previous request's sender, which is wrong under
+            # multi-replica senders.  Let the sync path handle it.
+            logger.debug("Skip KV prefetch for %s: stub has no kv_sender_info", rid)
+            return
         try:
             self._load_futures[rid] = self._get_load_executor().submit(self._prefetch_payload, rid, sender_info)
         except Exception:
@@ -1121,13 +1121,10 @@ class OmniKVTransferManager:
     def _prefetch_payload(
         self, request_id: str, sender_info: dict[str, Any] | None
     ) -> tuple[dict[str, Any] | None, int]:
-        """Background-thread body: pure CPU/IO get + deserialize + pin.
-
-        Bounded by a short prefetch timeout so a not-yet-available KV (e.g. the
-        sender AR was reordered/aborted) cannot pin the single prefetch worker
-        for the full recv_timeout; the consumer falls back to a synchronous
-        receive on miss.
+        """Background-thread body: CPU/IO-only get + deserialize + pin,
+        bounded by the prefetch timeout (consumer falls back to sync on miss).
         """
+
         try:
             return self.receive_kv_cache_for_request(
                 request_id,
@@ -1140,23 +1137,28 @@ class OmniKVTransferManager:
             logger.exception("KV prefetch payload failed for %s", request_id)
             return None, 0
 
-    def get_loaded_kv(self, request_id: str, timeout: float | None = None) -> tuple[dict[str, Any] | None, int]:
-        """Retrieve an already-started prefetch result, or (None, 0) on miss.
+    def get_loaded_kv(self, request_id: str) -> tuple[dict[str, Any] | None, int]:
+        """Return a completed/started prefetch result, or (None, 0) on miss.
 
-        The wait is bounded by the same prefetch timeout the background get uses,
-        so the main thread never blocks here longer than that even if forward N
-        finished before the prefetch did; on miss the caller falls back to a
-        synchronous receive (full recv_timeout).
+        Wait for any running prefetch instead of abandoning it: KV payloads are
+        consume-once, so a background get racing with sync fallback could otherwise
+        claim and drop the payload.
+
+        The wait is bounded by prefetch/socket timeouts.  A (None, 0) result is safe
+        for sync fallback because timed-out gets consume nothing.
+
+        Also sweep stale prefetches from aborted/reordered requests to avoid leaking
+        pinned payloads.
         """
         fut = self._load_futures.pop(request_id, None)
+        for stale in list(self._load_futures):
+            self._discard_future(stale)
         if fut is None:
             return None, 0
         try:
-            # +1s slack so we observe the bounded get's own (None, 0) result
-            # rather than racing it with a result()-timeout that would orphan it.
-            return fut.result(timeout=timeout if timeout is not None else self._prefetch_timeout() + 1.0)
+            return fut.result()
         except Exception:
-            logger.exception("KV prefetch failed/timeout for %s; falling back to sync", request_id)
+            logger.exception("KV prefetch failed for %s; falling back to sync receive", request_id)
             return None, 0
 
     def abort_load_kv(self, request_id: str) -> None:
@@ -1164,12 +1166,8 @@ class OmniKVTransferManager:
         self._discard_future(request_id)
 
     def _discard_future(self, request_id: str) -> None:
-        """Stop tracking a prefetch and free its result.
-
-        If the future hasn't started it is cancelled.  If it is already
-        running/done we attach a callback that retrieves (and drops) the result
-        so the pinned-CPU payload is released once the get completes and is not
-        held as an un-retrieved future result.
+        """Stop tracking a prefetch: cancel if not started, otherwise attach a
+        callback that drops the result so its pinned payload can be freed.
         """
         fut = self._load_futures.pop(request_id, None)
         if fut is None:
@@ -1179,9 +1177,7 @@ class OmniKVTransferManager:
 
     def shutdown_prefetch(self) -> None:
         """Cancel all pending prefetches, stop the executor, drain inflight.
-
-        Call on engine/worker teardown so no orphaned prefetch keeps the process
-        or its pinned buffers alive.
+        Call on engine/worker teardown.
         """
         for rid in list(self._load_futures):
             self._discard_future(rid)
@@ -1196,9 +1192,8 @@ class OmniKVTransferManager:
     def apply_prefetched_kv(self, req: Any, data: dict[str, Any], target_device: torch.device | None = None) -> None:
         """Apply a prefetched KV payload (owned pinned CPU) onto a request.
 
-        Issues the pinned -> GPU copy on the main thread, reusing the Phase 2
-        async stream/event when enabled, and keeps the pinned source tensors
-        alive (via ``_kv_inflight_buffers``) until the next drain.
+        Issues the pinned -> GPU copy on the main thread (async copy stream
+        when enabled) and keeps the sources alive until the next drain.
         """
         self._drain_inflight_buffers()
         if isinstance(data, dict) and "layer_blocks" in data:
@@ -1242,24 +1237,20 @@ class OmniKVTransferManager:
         Args:
             request_id: The request ID to receive KV cache for
             target_device: Optional device to move tensors to
-            sender_info: Phase 3 — explicit per-call sender endpoint (raw
-                ``kv_sender_info``).  When provided, the rank-aware connector
-                metadata is built from it instead of the instance-level
-                ``_sender_base_*`` fields, so a background prefetch never races
+            sender_info: Explicit per-call sender endpoint (raw
+                ``kv_sender_info``).  Used instead of the instance-level
+                ``_sender_base_*`` fields so a background prefetch never races
                 the main thread on shared sender state.
-            pin: Phase 3 — background prefetch mode.  Skips CUDA work (no drain,
-                no copy stream) and, for the ``target_device=None`` path, returns
-                an owned *pinned* CPU tensor (so the pooled buffer can be
-                released immediately while the result stays a real-async H2D
-                source for the main thread).
+            pin: Background prefetch mode.  Skips CUDA work (no drain, no copy
+                stream) and returns owned *pinned* CPU tensors, so the pooled
+                buffer is released immediately while the result stays an
+                async-H2D-capable source for the main thread.
 
         Returns:
             Tuple of (data dict, size) if successful, (None, 0) otherwise
         """
-        # Release pinned-pool buffers from the previous request's async copy
-        # (Phase 2).  The prior forward has run, so this is effectively free.
-        # Skip in pin mode: drain calls event.synchronize() (a CUDA op) and must
-        # stay on the main thread, never the background prefetch thread.
+        # Release the previous request's async-copy sources.  Skip in pin mode:
+        # the drain is a CUDA op and must stay on the main thread.
         if not pin:
             self._drain_inflight_buffers()
 
@@ -1295,10 +1286,9 @@ class OmniKVTransferManager:
         received_payloads: dict[str, tuple[dict[str, Any], int]] = {}
         pending_release_buffers: list[Any] = []
 
-        # Resolve the sender base endpoint.  An explicit per-call sender_info
-        # (Phase 3 prefetch) wins over the instance-level fields populated by the
-        # sync path's update_sender_info(), so a background prefetch never
-        # reads/writes shared sender state and cannot race the main thread.
+        # An explicit per-call sender_info (prefetch) wins over the instance
+        # fields set by update_sender_info(), so a background prefetch never
+        # touches shared sender state.
         if sender_info is not None:
             base_host, base_port = self._resolve_sender_base(sender_info)
         else:
@@ -1316,14 +1306,11 @@ class OmniKVTransferManager:
             while True:
                 link_start = time.perf_counter()
                 for get_key, from_rank in list(pending_pairs):
-                    # Construct per-rank metadata so the connector queries
-                    # the correct sender endpoint (heterogeneous TP path).
-                    # When from_rank is None (TP<=1), metadata stays None
-                    # and the connector falls back to its default sender.
+                    # Per-rank metadata routes the connector to the right sender
+                    # endpoint for heterogeneous TP (from_rank set) and for
+                    # prefetch (sender_info given).  Otherwise it stays None and
+                    # the connector uses its default sender.
                     rank_metadata: dict[str, Any] | None = None
-                    # Build metadata for heterogeneous TP (from_rank set) or for
-                    # the prefetch path (sender_info given) so it never relies on
-                    # the connector's global default sender.
                     build_meta = from_rank is not None or sender_info is not None
                     if build_meta and base_host and base_port is not None:
                         rank_metadata = {
@@ -1386,11 +1373,10 @@ class OmniKVTransferManager:
                     data = slice_received_rank_shard(data, topo, slicer=self.kv_payload_slicer)
 
                     needs_buffer_detach = bool(pending_release_buffers)
-                    # In pin mode (background prefetch) never touch a CUDA stream;
-                    # the main thread does all H2D in apply_prefetched_kv().
+                    # Pin mode never touches a CUDA stream; the main thread does
+                    # all H2D in apply_prefetched_kv().
                     copy_stream = None if pin else self._get_kv_copy_stream()
-                    # Async H2D only pays off when the source is the pinned pool
-                    # (needs_buffer_detach) and the target is a GPU.
+                    # Async H2D pays off only for pinned-pool source + GPU target.
                     gpu_async = (
                         self._async_kv_copy
                         and copy_stream is not None
@@ -1406,11 +1392,9 @@ class OmniKVTransferManager:
                                 layer_blocks.get("value_cache", []),
                             ]
                             if gpu_async:
-                                # Issue the pinned-pool -> GPU copies on a dedicated
-                                # stream so the ~51ms transfer overlaps host-side
-                                # setup before forward.  Pool release is deferred to
-                                # the next receive (see _drain_inflight_buffers);
-                                # forward waits via wait_kv_copy().
+                                # Copies run on a dedicated stream; forward waits
+                                # via wait_kv_copy(), pool release is deferred to
+                                # the next drain.
                                 with torch.cuda.stream(copy_stream):
                                     for cache_list in cache_lists:
                                         for i, tensor in enumerate(cache_list):
@@ -1427,18 +1411,16 @@ class OmniKVTransferManager:
                                         if target_device is not None and tensor.device != target_device:
                                             cache_list[i] = tensor.to(target_device).contiguous()
                                         elif needs_buffer_detach:
-                                            # CPU pinned-pool + CPU/None target: no .to()
-                                            # to detach the tensor, so copy it out before
-                                            # the pooled buffer is released.  Prefetch (pin)
-                                            # keeps the copy pinned for a later async H2D.
+                                            # No .to() to detach from the pool, so copy
+                                            # out before release; pin mode keeps the
+                                            # copy pinned for a later async H2D.
                                             cache_list[i] = self._to_owned_pinned(tensor) if pin else tensor.clone()
                     except Exception:
                         logger.exception("Failed to move KV cache tensors to target device")
                     finally:
-                        # Sync path (and the gpu_async error path, where copies may
-                        # be partially in flight) releases the pool now; the
-                        # gpu_async success path already moved its buffers to
-                        # _kv_inflight_buffers and cleared the list below.
+                        # Release the pool now on the sync path and the gpu_async
+                        # error path; the gpu_async success path already moved its
+                        # buffers to _kv_inflight_buffers.
                         if pending_release_buffers:
                             if gpu_async and copy_stream is not None:
                                 copy_stream.synchronize()
@@ -1703,11 +1685,8 @@ class OmniKVTransferManager:
 
 
 def _drop_prefetch_result(fut: Any) -> None:
-    """Retrieve and discard an orphaned prefetch result so it can be GC'd.
-
-    Used as a done-callback for prefetch futures we stopped awaiting; pulling the
-    result (or exception) lets the owned pinned-CPU payload be freed and avoids a
-    lingering un-retrieved future result.
+    """Done-callback for prefetch futures we stopped awaiting: retrieve and
+    discard the result (or exception) so the pinned payload can be GC'd.
     """
     try:
         if not fut.cancelled():

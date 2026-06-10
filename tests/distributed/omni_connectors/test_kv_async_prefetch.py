@@ -1,9 +1,9 @@
-"""Phase 3 background KV prefetch — CPU-testable mechanism.
+"""Background KV prefetch — CPU-testable mechanism.
 
-Covers the opt-in gating, the start_load_kv/get_loaded_kv round trip over a mock
-connector, dedup, per-call sender_info isolation, and the generalized
-inflight-buffer drain.  The pinned H2D path (apply_prefetched_kv on GPU) needs
-CUDA and is exercised by integration tests, not here.
+Covers the opt-in gating, the start_load_kv/get_loaded_kv round trip over a
+mock connector, dedup, per-call sender_info isolation, and the inflight-buffer
+drain.  The pinned H2D path (apply_prefetched_kv on GPU) needs CUDA and is
+exercised by integration tests, not here.
 """
 
 from types import SimpleNamespace
@@ -19,6 +19,11 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+# Explicit per-request sender endpoint: start_load_kv() skips stubs without
+# one (the background receive must never fall back to a previous request's
+# sender), so every stub that expects a submission must carry it.
+_SENDER_INFO = {"host": "127.0.0.1", "zmq_port": 50051}
 
 
 class MockConnector:
@@ -102,7 +107,7 @@ def test_prefetch_round_trip_returns_data():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-1")
 
-    receiver.start_load_kv({"request_id": "rid-1", "kv_sender_info": None})
+    receiver.start_load_kv({"request_id": "rid-1", "kv_sender_info": _SENDER_INFO})
     assert "rid-1" in receiver._load_futures
 
     data, size = receiver.get_loaded_kv("rid-1")
@@ -122,16 +127,38 @@ def test_get_loaded_kv_miss_returns_none():
 def test_start_load_kv_dedups_same_request():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-dup")
-    receiver.start_load_kv({"request_id": "rid-dup", "kv_sender_info": None})
+    receiver.start_load_kv({"request_id": "rid-dup", "kv_sender_info": _SENDER_INFO})
     fut1 = receiver._load_futures["rid-dup"]
-    receiver.start_load_kv({"request_id": "rid-dup", "kv_sender_info": None})
+    receiver.start_load_kv({"request_id": "rid-dup", "kv_sender_info": _SENDER_INFO})
     assert receiver._load_futures["rid-dup"] is fut1
+
+
+def test_start_load_kv_skips_without_sender_info():
+    # No explicit endpoint => no submission; the sync path handles the request.
+    sender, receiver, _ = _make_sender_receiver()
+    _seed_payload(sender, "rid-nosi")
+    receiver.start_load_kv({"request_id": "rid-nosi", "kv_sender_info": None})
+    assert receiver._load_futures == {}
+
+
+def test_get_loaded_kv_sweeps_stale_entries():
+    # Consuming a request's slot must drop every other tracked prefetch: at
+    # that point only the current request's own entry is legitimate.  A
+    # leftover (e.g. a prefetched request aborted while waiting) might never
+    # see another start_load_kv to reclaim it under low queue depth.
+    sender, receiver, _ = _make_sender_receiver()
+    _seed_payload(sender, "rid-stale")
+    receiver.start_load_kv({"request_id": "rid-stale", "kv_sender_info": _SENDER_INFO})
+    assert "rid-stale" in receiver._load_futures
+    # The current request was never prefetched (miss) — sweep must still run.
+    assert receiver.get_loaded_kv("rid-current") == (None, 0)
+    assert receiver._load_futures == {}
 
 
 def test_abort_load_kv_drops_future():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-ab")
-    receiver.start_load_kv({"request_id": "rid-ab", "kv_sender_info": None})
+    receiver.start_load_kv({"request_id": "rid-ab", "kv_sender_info": _SENDER_INFO})
     receiver.abort_load_kv("rid-ab")
     assert "rid-ab" not in receiver._load_futures
 
@@ -142,10 +169,10 @@ def test_start_load_kv_sweeps_orphan():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-orphan")
     _seed_payload(sender, "rid-next")
-    receiver.start_load_kv({"request_id": "rid-orphan", "kv_sender_info": None})
+    receiver.start_load_kv({"request_id": "rid-orphan", "kv_sender_info": _SENDER_INFO})
     receiver.get_loaded_kv("rid-orphan")  # ensure the orphan's bg get finished
-    receiver.start_load_kv({"request_id": "rid-orphan", "kv_sender_info": None})  # re-add to simulate leftover
-    receiver.start_load_kv({"request_id": "rid-next", "kv_sender_info": None})
+    receiver.start_load_kv({"request_id": "rid-orphan", "kv_sender_info": _SENDER_INFO})  # re-add as leftover
+    receiver.start_load_kv({"request_id": "rid-next", "kv_sender_info": _SENDER_INFO})
     assert "rid-orphan" not in receiver._load_futures
     assert "rid-next" in receiver._load_futures
 
@@ -153,7 +180,7 @@ def test_start_load_kv_sweeps_orphan():
 def test_shutdown_prefetch_clears_state():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-sd")
-    receiver.start_load_kv({"request_id": "rid-sd", "kv_sender_info": None})
+    receiver.start_load_kv({"request_id": "rid-sd", "kv_sender_info": _SENDER_INFO})
     receiver.shutdown_prefetch()
     assert receiver._load_futures == {}
     assert receiver._load_executor is None
@@ -205,7 +232,7 @@ def test_drain_handles_keepalive_and_releasable():
 def test_apply_prefetched_kv_cpu_target_applies_without_h2d():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-apply")
-    receiver.start_load_kv({"request_id": "rid-apply", "kv_sender_info": None})
+    receiver.start_load_kv({"request_id": "rid-apply", "kv_sender_info": _SENDER_INFO})
     data, _ = receiver.get_loaded_kv("rid-apply")
     assert data is not None
 

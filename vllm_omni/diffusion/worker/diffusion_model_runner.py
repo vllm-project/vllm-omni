@@ -83,17 +83,27 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Initialize KV cache manager for connector management.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
-        # Phase 3: background KV prefetch is request-mode + Branch A only (no
-        # CFG/SP, which need collectives that can't run off-thread).  Gate here
-        # since this runner knows the parallel config; the manager's _async_prefetch
-        # already reflects od_config.enable_kv_async_prefetch.
-        pc = getattr(od_config, "parallel_config", None)
-        branch_a = (getattr(pc, "cfg_parallel_size", 1) or 1) <= 1 and (
-            getattr(pc, "sequence_parallel_size", 1) or 1
-        ) <= 1
+        # Prefetch is rank-local and skips collectives.
+        # Disable it when the normal KV receive path uses broadcasts/collectives,
+        # otherwise a prefetch hit can desync ranks and consume the KV on one rank only.
+        parallel_config = getattr(od_config, "parallel_config", None)
+        cfg_parallel_size = getattr(parallel_config, "cfg_parallel_size", 1) or 1
+        sequence_parallel_size = getattr(parallel_config, "sequence_parallel_size", 1) or 1
+        world_size = getattr(parallel_config, "world_size", 1) or 1
+        sync_recv_is_rank_local = (
+            cfg_parallel_size <= 1
+            and sequence_parallel_size <= 1
+            and (world_size <= 1 or self.kv_transfer_manager.kv_topology_rank_aware)
+        )
+
+        # apply_prefetched_kv() applies only the primary KV payload, so prefetch
+        # stays off when the model collects CFG companion KVs (e.g. Bagel).
+        has_cfg_companion_kv = getattr(od_config, "cfg_kv_collect_func", None) is not None
+
         self._kv_prefetch_enabled = (
             bool(getattr(od_config, "enable_kv_async_prefetch", False))
-            and branch_a
+            and sync_recv_is_rank_local
+            and not has_cfg_companion_kv
             and self.kv_transfer_manager.config.need_recv_cache
         )
 
@@ -290,9 +300,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
             target_device = getattr(self.pipeline, "device", None)
-            # Phase 3: consume a KV payload prefetched during the previous
-            # forward; fall back to a synchronous receive on miss (first request,
-            # prefetch disabled, timeout, or non-Branch-A).
+            # consume a KV payload prefetched during the previous forward;
+            # fall back to a synchronous receive on miss.
             prefetched = None
             if self._kv_prefetch_enabled:
                 prefetched, _ = self.kv_transfer_manager.get_loaded_kv(req.request_id)
@@ -351,8 +360,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary:
                 current_omni_platform.reset_peak_memory_stats()
 
-            # Make the compute stream wait for the async KV H2D copy (Phase 2);
-            # no-op unless an async copy was issued during receive.
+            # Make the compute stream wait for the async KV H2D copy, if any.
             self.kv_transfer_manager.wait_kv_copy()
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):

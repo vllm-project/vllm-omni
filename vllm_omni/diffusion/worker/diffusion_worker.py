@@ -640,8 +640,6 @@ class DiffusionWorker:
         if self.model_runner is not None:
             mgr = getattr(self.model_runner, "kv_transfer_manager", None)
             if mgr is not None:
-                # Cancel any in-flight KV prefetch and stop its executor so no
-                # orphaned background load keeps the process or pinned buffers alive.
                 mgr.shutdown_prefetch()
         destroy_distributed_env()
 
@@ -1031,7 +1029,7 @@ class WorkerWrapperBase:
         Args:
             reqs: List of diffusion requests
             od_config: OmniDiffusionConfig configuration
-            prefetch_stub: Optional Phase 3 next-request prefetch descriptor.
+            prefetch_stub: Optional next-request KV prefetch descriptor.
 
         Returns:
             DiffusionOutput with generated results
