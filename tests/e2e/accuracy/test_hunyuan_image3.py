@@ -517,8 +517,11 @@ def _run_online(
                     "guidance_scale": guidance_scale,
                     "seed": SEED,
                     "sys_type": "en_unified",
+                    "use_system_prompt": "en_unified",
                     "bot_task": "think_recaption",
                     "size": "1280x720",
+                    "vae_use_tiling": "false",
+                    "enforce_eager": "false",
                 },
                 files=[
                     ("image", (f"image_{i}.png", pil_to_png_bytes(img), "image/png")) for i, img in enumerate(images)
