@@ -9,7 +9,10 @@ The online serving pipeline of vLLM-Omni can be abstracted as: `Serve` (service 
 - `Worker` performs concrete model computation, usually bound to underlying GPU resources.
 - `GPU` is the resource layer that ultimately carries inference compute and memory usage.
 
+<div markdown style="text-align: center">
+
 ```mermaid
+%%{init: {'flowchart': {'useMaxWidth': false}}}%%
 flowchart TD
     R(request)--> A(serve)
     A --> B(engine)
@@ -22,6 +25,8 @@ flowchart TD
     F --> H(GPU)
     I --> L(GPU)
 ```
+
+</div>
 
 The diagram above shows an abstract relationship. Omni models and Diffusion models share the same hierarchy; differences mainly come from engine decomposition, worker count, and scheduling strategy.
 
