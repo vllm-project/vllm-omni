@@ -156,6 +156,22 @@ _OMNI_MODELS = {
         "mimo_audio_code2wav",
         "MiMoAudioToken2WavForConditionalGenerationVLLM",
     ),
+    ## ming-tts
+    "MingTTSForConditionalGeneration": (
+        "ming_tts",
+        "ming_tts",
+        "MingTTSForConditionalGeneration",
+    ),
+    "MingLLMModel": (
+        "ming_tts",
+        "ming_tts_llm",
+        "MingLLMModel",
+    ),
+    "MingAudioVAEModel": (
+        "ming_tts",
+        "ming_tts_audio_vae",
+        "MingAudioVAEModel",
+    ),
     ## glm_image
     "GlmImageForConditionalGeneration": (
         "glm_image",
