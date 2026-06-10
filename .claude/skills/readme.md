@@ -21,6 +21,8 @@ include:
 - `diffusion-perf-opt`: guides diffusion model performance optimization,
   including profiling traces, parallel strategies, stage timing analysis, and
   benchmark-driven tuning
+- `quantization`: guides quantization method selection, model integration,
+  checkpoint loading, and quality/performance validation for vLLM-Omni
 - `add-omni-model`: covers addition of new omni-modality model support
 - `add-tts-model`: covers integration of new TTS models and related serving
   workflows
