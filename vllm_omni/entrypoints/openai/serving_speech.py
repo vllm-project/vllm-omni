@@ -2879,6 +2879,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request, ref_audio_data=ref_audio_data, has_inline_ref_audio=has_inline_ref_audio
             )
             tts_params = {}
+            # Fish Speech resolves conditioning entirely from raw request fields
+            # (text / ref_audio / ref_text rebuilt into inputs_embeds); unlike
+            # uploaded-voice models it has no resolved tts_params to fold in, so
+            # the salt is derived from the request alone.
+            prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
         elif self._tts_model_type == "omnivoice":
             if not request.input or not request.input.strip():
                 raise ValueError("Input text cannot be empty")
