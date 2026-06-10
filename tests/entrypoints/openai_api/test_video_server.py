@@ -86,8 +86,10 @@ class BlockingVideoHandler:
         if self.stage_configs is None:
             self.stage_configs = stage_configs
 
-    async def generate_video_bytes(self, request, reference_id, *, reference_image=None, reference_video=None):
-        del request, reference_id, reference_image, reference_video
+    async def generate_video_bytes(
+        self, request, reference_id, *, reference_image=None, reference_video=None, reference_audio=None
+    ):
+        del request, reference_id, reference_image, reference_video, reference_audio
         self.started.set()
         try:
             await asyncio.Future()
