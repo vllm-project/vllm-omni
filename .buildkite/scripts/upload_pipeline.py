@@ -8,6 +8,8 @@ Bootstrap mode (pipeline.yml with __IMAGE_BUILD_IF__ placeholders):
 Test pipeline mode (e.g. test-merge.yml):
   - Drop steps or groups whose ``source_file_dependencies`` do not match changed files.
   - ``source_file_dependencies`` may be set on a leaf step or on a group step.
+  - Always strip ``source_file_dependencies`` from uploaded YAML (Buildkite does not
+    recognize this uploader-only key).
 
 Usage:
   python3 upload_pipeline.py [--upload] <pipeline.yml>
@@ -204,11 +206,41 @@ def _filter_steps(steps: list[Any], changed_files: list[str]) -> list[Any]:
     return filtered
 
 
-def render_test_pipeline(doc: dict[str, Any], changed_files: list[str]) -> dict[str, Any]:
+def _strip_uploader_metadata_from_steps(steps: list[Any]) -> list[Any]:
+    """Remove uploader-only keys while keeping all steps (no diff filtering)."""
+    stripped: list[Any] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            stripped.append(step)
+            continue
+
+        deps = step.get("source_file_dependencies")
+        if deps is not None and not isinstance(deps, list):
+            raise ValueError(
+                f"source_file_dependencies must be a list in step {_step_label(step)!r}",
+            )
+
+        nested = step.get("steps")
+        new_step = _strip_source_file_dependencies(step)
+        if nested is not None:
+            new_step["steps"] = _strip_uploader_metadata_from_steps(nested)
+        stripped.append(new_step)
+
+    return stripped
+
+
+def render_test_pipeline(
+    doc: dict[str, Any],
+    changed_files: list[str] | None,
+) -> dict[str, Any]:
     steps = doc.get("steps")
     if not isinstance(steps, list):
         return doc
-    return {**doc, "steps": _filter_steps(steps, changed_files)}
+    if changed_files is not None:
+        steps = _filter_steps(steps, changed_files)
+    else:
+        steps = _strip_uploader_metadata_from_steps(steps)
+    return {**doc, "steps": steps}
 
 
 def resolve_pipeline_path(arg: str) -> Path:
@@ -230,8 +262,7 @@ def render_pipeline(path: Path) -> str:
     if not isinstance(doc, dict):
         raise ValueError(f"invalid pipeline YAML: {path}")
 
-    if changed_files is not None:
-        doc = render_test_pipeline(doc, changed_files)
+    doc = render_test_pipeline(doc, changed_files)
 
     return yaml.safe_dump(doc, sort_keys=False)
 
