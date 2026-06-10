@@ -429,7 +429,8 @@ class OmniOpenAIServingVideo:
         elif hasattr(result, "request_output"):
             request_output = result.request_output
             ro_custom = (
-                request_output.get("custom_output") if isinstance(request_output, dict)
+                request_output.get("custom_output")
+                if isinstance(request_output, dict)
                 else getattr(request_output, "custom_output", None)
             ) or {}
             if ro_custom.get("video_frames"):
