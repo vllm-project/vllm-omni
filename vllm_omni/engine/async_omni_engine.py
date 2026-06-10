@@ -1363,6 +1363,7 @@ class AsyncOmniEngine:
 
         async def _run_orchestrator() -> None:
             self._initialize_stages(stage_init_timeout)
+
             pd_config = self._detect_pd_config()
             coordinator_pub_address: str | None = None
             load_balancer_factory: Callable[[], LoadBalancer] | None = None

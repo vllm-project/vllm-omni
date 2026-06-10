@@ -444,12 +444,37 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self,
         waiting_queue: Any,
         running_queue: list[Request],
+        *,
+        scheduler_requests: dict[str, Request] | None = None,
     ) -> None:
         """
         Process pending chunks for waiting and running queues.
+
+        When ``scheduler_requests`` is provided, purges any
+        ``waiting_for_chunk_*_requests`` deque entries whose
+        ``request_id`` is no longer tracked by it (e.g. after a
+        mid-flight abort that ran ``Scheduler._free_request``) before
+        processing chunks. Without this purge, ``restore_queues`` would
+        later re-inject the freed ``Request`` onto ``running_queue`` and
+        the worker's ``_update_states`` would crash with ``KeyError``
+        reading ``self.requests[req_id]``. See vllm-project/vllm-omni#3736.
+
+        ``scheduler_requests`` is keyword-only and optional; production
+        schedulers always pass their live request map, while legacy
+        callers that don't track aborts may omit it to keep the prior
+        (unguarded) behaviour.
         """
         if self.connector.stage_id == 0:
             return
+
+        # Purge deque entries whose request was freed mid-flight (abort →
+        # Scheduler._free_request) before any chunk processing, so neither
+        # the legacy nor the active-stream path can re-inject a zombie
+        # Request onto the queues. See vllm-project/vllm-omni#3736.
+        if scheduler_requests is not None:
+            self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
+            self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
+
         if self._active_window <= 0:
             self._process_chunk_queue_legacy(
                 waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
@@ -558,6 +583,29 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.requests_origin_status[request.request_id] = target_status
             waiting_for_chunk_list.append(request)
 
+    def _purge_untracked_chunk_requests(
+        self,
+        deque_list: deque[Any],
+        scheduler_requests: dict[str, Request],
+    ) -> None:
+        """Drop deque entries whose ``request_id`` is not in
+        ``scheduler_requests`` and reclaim their receiver-side state.
+
+        Handles requests that were aborted mid-flight while parked in a
+        chunk-transfer deque: ``Scheduler._free_request`` deleted the
+        entry from ``scheduler.requests`` but the deque still holds a
+        reference to the now-freed ``Request``. Order of survivors is
+        preserved.
+        """
+        if not deque_list:
+            return
+        for _ in range(len(deque_list)):
+            request = deque_list.popleft()
+            if request.request_id in scheduler_requests:
+                deque_list.append(request)
+            else:
+                self.cleanup_receiver(request.request_id)
+
     def restore_queues(
         self,
         waiting_queue: Any,
@@ -566,7 +614,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     ) -> None:
         """
         Restore requests waiting for chunk to the waiting and running queues.
+
+        Re-runs the zombie purge first to close the race window where an
+        abort fires *between* ``process_pending_chunks`` and the
+        ``finally``-clause ``restore_queues`` call. Without the second
+        purge, ``running_queue.extend(...)`` would still re-inject a
+        freed ``Request`` and crash the worker on the next tick.
+
+        ``scheduler_requests`` is optional for back-compat with legacy
+        callers (older tests pass only the two queue arguments). When
+        provided, it gates both the deque purge and the per-request
+        admit checks below; when ``None``, the purge is skipped and
+        every parked request is restored unconditionally (the
+        pre-purge behavior).
         """
+        if scheduler_requests is not None:
+            self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
+            self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
         # Add request waiting for chunk to the waiting and running queue
         for request in self.waiting_for_chunk_waiting_requests:
             if scheduler_requests is None or request.request_id in scheduler_requests:
