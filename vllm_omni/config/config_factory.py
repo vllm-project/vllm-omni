@@ -440,7 +440,11 @@ class StageConfigFactory:
                         logger.warning(
                             "[composable_parallel] stage %s: CLI %s=%s overrides the "
                             "strategy-derived %s=%s. The CLI value wins; remove one to avoid ambiguity.",
-                            stage.stage_id, field_name, cli_val, field_name, derived,
+                            stage.stage_id,
+                            field_name,
+                            cli_val,
+                            field_name,
+                            derived,
                         )
             if "stage_replica" in declared and overrides.get("num_replicas") is not None:
                 cli_val = overrides["num_replicas"]
@@ -448,7 +452,9 @@ class StageConfigFactory:
                     logger.warning(
                         "[composable_parallel] stage %s: CLI num_replicas=%s overrides the "
                         "strategy-derived num_replicas=%s. The CLI value wins; remove one to avoid ambiguity.",
-                        stage.stage_id, cli_val, cfg.stage_replica_size,
+                        stage.stage_id,
+                        cli_val,
+                        cfg.stage_replica_size,
                     )
 
             def _eff(field_name: str, fallback: Any) -> Any:

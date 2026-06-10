@@ -44,9 +44,7 @@ def test_parse_without_strategies_key():
 
 
 def test_l1_owner_goes_to_shard_extension():
-    specs = parse_strategy_specs(
-        {"talker": [{"axis": "stage_replica", "size": 2, "l1_owner": "delegated"}]}
-    )
+    specs = parse_strategy_specs({"talker": [{"axis": "stage_replica", "size": 2, "l1_owner": "delegated"}]})
     assert specs["talker"][0].shard_extension["l1_owner"] == "delegated"
 
 

@@ -28,9 +28,7 @@ def _tp(size: int) -> StrategySpec:
 
 
 def _stage_replica(size: int, policy: str = "round_robin") -> StrategySpec:
-    return StrategySpec(
-        "stage_replica", MeshAxisSpec("stage_replica", size), RouteByStage(policy), FanInByStage()
-    )
+    return StrategySpec("stage_replica", MeshAxisSpec("stage_replica", size), RouteByStage(policy), FanInByStage())
 
 
 def _stage(stage_id: int, model_stage: str, engine_args=None, runtime=None) -> StageConfig:

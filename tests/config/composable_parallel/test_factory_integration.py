@@ -36,9 +36,7 @@ def _tp(size: int) -> StrategySpec:
 
 
 def _stage_replica(size: int, policy: str = "round_robin") -> StrategySpec:
-    return StrategySpec(
-        "stage_replica", MeshAxisSpec("stage_replica", size), RouteByStage(policy), FanInByStage()
-    )
+    return StrategySpec("stage_replica", MeshAxisSpec("stage_replica", size), RouteByStage(policy), FanInByStage())
 
 
 def _qwen_stages():
@@ -72,9 +70,7 @@ def test_device_guard_rejects_tp_on_single_gpu_deploy():
 
 def test_overlay_stage_replica_on_talker():
     stages = _qwen_stages()
-    result = apply_strategy_specs(
-        stages, {"talker": [_stage_replica(2, "round_robin")]}
-    )
+    result = apply_strategy_specs(stages, {"talker": [_stage_replica(2, "round_robin")]})
     assert _stage(result.stages, "talker").yaml_runtime["num_replicas"] == 2
     assert result.omni_lb_policy == "round-robin"
 
@@ -147,6 +143,4 @@ def test_cli_overrides_strategy_with_warning():
     # CLI value wins in the resolved config.
     assert _resolved(stages, "talker").runtime.num_replicas == 3
     # ...and the override was warned about, naming the conflicting field.
-    assert any(
-        "num_replicas" in m and "overrides the strategy-derived" in m for m in messages
-    )
+    assert any("num_replicas" in m and "overrides the strategy-derived" in m for m in messages)

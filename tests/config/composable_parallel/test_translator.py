@@ -44,9 +44,7 @@ def _ep(size: int) -> StrategySpec:
 
 
 def _stage_replica(size: int, policy: str = "round_robin") -> StrategySpec:
-    return StrategySpec(
-        "stage_replica", MeshAxisSpec("stage_replica", size), RouteByStage(policy), FanInByStage()
-    )
+    return StrategySpec("stage_replica", MeshAxisSpec("stage_replica", size), RouteByStage(policy), FanInByStage())
 
 
 def test_tp_only():
@@ -144,16 +142,17 @@ def test_lb_policy_never_in_engine_kwargs_even_when_replicated():
 
 
 def test_stage_replica_hash_routing_rejected():
-    spec = StrategySpec(
-        "sr", MeshAxisSpec("stage_replica", 2), RouteByStage("hash"), FanInByStage()
-    )
+    spec = StrategySpec("sr", MeshAxisSpec("stage_replica", 2), RouteByStage("hash"), FanInByStage())
     with pytest.raises(UnsupportedRoutingError):
         translate_strategy_stack([spec])
 
 
 def test_dp_wrong_owner_rejected():
     spec = StrategySpec(
-        "dp", MeshAxisSpec("dp", 2), RouteByStage("round_robin"), Union(),
+        "dp",
+        MeshAxisSpec("dp", 2),
+        RouteByStage("round_robin"),
+        Union(),
         shard_extension={"l1_owner": "delegated"},
     )
     with pytest.raises(RoutingOwnershipError):
@@ -162,7 +161,10 @@ def test_dp_wrong_owner_rejected():
 
 def test_stage_replica_wrong_owner_rejected():
     spec = StrategySpec(
-        "sr", MeshAxisSpec("stage_replica", 2), RouteByStage("round_robin"), FanInByStage(),
+        "sr",
+        MeshAxisSpec("stage_replica", 2),
+        RouteByStage("round_robin"),
+        FanInByStage(),
         shard_extension={"l1_owner": "engine"},
     )
     with pytest.raises(RoutingOwnershipError):
