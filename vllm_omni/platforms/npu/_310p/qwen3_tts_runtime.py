@@ -9,50 +9,38 @@ from typing import Any
 
 import torch
 
-_QWEN3_TTS_ARCHS = {
-    "Qwen3TTSTalkerForConditionalGeneration",
-    "Qwen3TTSCode2Wav",
-}
+_QWEN3_TTS_TALKER_ARCH = "Qwen3TTSTalkerForConditionalGeneration"
 
 
-class ModuleTorchDtypeProxy:
-    """Module-local torch proxy used by 310P patches to replace bf16 constants."""
-
-    def __init__(self, torch_mod, *, bfloat16_replacement: torch.dtype) -> None:
-        self._torch_mod = torch_mod
-        self._bfloat16_replacement = bfloat16_replacement
-
-    def __getattr__(self, name: str):
-        if name == "bfloat16":
-            return self._bfloat16_replacement
-        return getattr(self._torch_mod, name)
-
-
-def patch_module_bfloat16(module) -> None:
-    """Replace one target module's bf16 constants without changing global torch."""
-    if isinstance(module.torch, ModuleTorchDtypeProxy):
-        return
-    module.torch = ModuleTorchDtypeProxy(module.torch, bfloat16_replacement=torch.float16)
-
-
-def runtime_dtype(_device: torch.device) -> torch.dtype:
-    """Use fp16 for Qwen3-TTS tensors on the validated 310P path."""
-    return torch.float16
-
-
-def audio_frontend_runtime(_device: torch.device) -> tuple[torch.device, torch.dtype]:
-    """Run unsupported 310P audio frontend/encoder paths on CPU fp32."""
-    return torch.device("cpu"), torch.float32
-
-
-def is_qwen3_tts_model(model_config: Any) -> bool:
-    return getattr(model_config, "model_arch", None) in _QWEN3_TTS_ARCHS
-
-
-def use_qwen3_tts_310p_path(model_config: Any) -> bool:
+def runtime_dtype(device: torch.device, *, default: torch.dtype = torch.bfloat16) -> torch.dtype:
+    """Return Qwen3-TTS runtime dtype; only 310P NPU uses fp16."""
     from vllm_omni.platforms.npu._310p import is_310p
 
-    return is_310p() and is_qwen3_tts_model(model_config)
+    return torch.float16 if is_310p(device) else default
+
+
+def audio_frontend_runtime(
+    device: torch.device,
+    *,
+    default: torch.dtype = torch.bfloat16,
+) -> tuple[torch.device, torch.dtype]:
+    """Return where Qwen3-TTS audio frontend/encoder work can execute."""
+    from vllm_omni.platforms.npu._310p import is_310p
+
+    # 310P does not support this Qwen3-TTS audio frontend path; run it on CPU.
+    if is_310p(device):
+        return torch.device("cpu"), torch.float32
+    return device, runtime_dtype(device, default=default)
+
+
+def is_qwen3_tts_talker_model(model_config: Any) -> bool:
+    return getattr(model_config, "model_arch", None) == _QWEN3_TTS_TALKER_ARCH
+
+
+def use_qwen3_tts_talker_310p_path(model_config: Any) -> bool:
+    from vllm_omni.platforms.npu._310p import is_310p
+
+    return is_310p() and is_qwen3_tts_talker_model(model_config)
 
 
 def aligned_code_predictor_seq_len(num_code_groups: int) -> int:
@@ -60,16 +48,27 @@ def aligned_code_predictor_seq_len(num_code_groups: int) -> int:
     return _align_up(int(num_code_groups) + 1, 16)
 
 
-def build_code_predictor_attention_mask(device: torch.device, max_seq_len: int):
-    """Reuse vLLM-Ascend's 310P mask builder for code predictor attention."""
-    from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
+class CodePredictorAttentionMask:
+    """Small 310P causal mask cache for the Qwen3-TTS code predictor."""
 
-    builder = object.__new__(AttentionMaskBuilder310)
-    builder.max_seqlen = int(max_seq_len)
-    builder.causal_attn_mask_cache = None
-    builder.non_causal_attn_mask_cache = None
-    builder.device = device
-    return builder
+    def __init__(self, device: torch.device, max_seq_len: int) -> None:
+        self.device = device
+        self.max_seq_len = int(max_seq_len)
+        self._causal_mask: torch.Tensor | None = None
+
+    def causal_mask(self) -> torch.Tensor:
+        if self._causal_mask is None:
+            import torch_npu
+            from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
+            from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, nd_to_nz_2d
+
+            mask = AttentionMaskBuilder310.gen_causal_additive_mask(self.max_seq_len, self.device)
+            self._causal_mask = torch_npu.npu_format_cast(nd_to_nz_2d(mask), ACL_FORMAT_FRACTAL_NZ)
+        return self._causal_mask
+
+
+def build_code_predictor_attention_mask(device: torch.device, max_seq_len: int) -> CodePredictorAttentionMask:
+    return CodePredictorAttentionMask(device, max_seq_len)
 
 
 def forward_code_predictor_attention(
@@ -133,7 +132,7 @@ def forward_code_predictor_attention(
         query=q_f.contiguous(),
         key=k_f.contiguous(),
         value=v_f.contiguous(),
-        mask=mask_builder._get_causal_mask(mask_builder.max_seqlen),
+        mask=mask_builder.causal_mask(),
         seq_len=seq_lens,
         scale_value=float(scale),
         num_heads=int(num_heads),

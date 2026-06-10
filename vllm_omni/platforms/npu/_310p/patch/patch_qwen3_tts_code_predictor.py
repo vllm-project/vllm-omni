@@ -19,7 +19,7 @@ from vllm_omni.platforms.npu._310p.qwen3_tts_runtime import (
 _PATCHED = False
 _code_predictor: Any | None = None
 _original_attention_init: Callable[..., Any] | None = None
-_original_decoder_forward: Callable[..., Any] | None = None
+_original_attention_forward: Callable[..., Any] | None = None
 _original_base_init: Callable[..., Any] | None = None
 _original_base_forward: Callable[..., Any] | None = None
 
@@ -28,7 +28,7 @@ def apply_patch() -> None:
     global _PATCHED
     global _code_predictor
     global _original_attention_init
-    global _original_decoder_forward
+    global _original_attention_forward
     global _original_base_init
     global _original_base_forward
 
@@ -39,7 +39,7 @@ def apply_patch() -> None:
 
     _code_predictor = module
     _original_attention_init = module.CodePredictorAttention.__init__
-    _original_decoder_forward = module.CodePredictorDecoderLayer.forward
+    _original_attention_forward = module.CodePredictorAttention.forward
     _original_base_init = module.CodePredictorBaseModel.__init__
     _original_base_forward = module.CodePredictorBaseModel.forward
 
@@ -53,7 +53,8 @@ def apply_patch() -> None:
 
 
 def _attention_init_310p(self, *args, **kwargs) -> None:
-    assert _original_attention_init is not None
+    if _original_attention_init is None:
+        raise RuntimeError("310P code predictor attention patch was not initialized.")
     _original_attention_init(self, *args, **kwargs)
     self._buffers.pop("_fusion_causal_mask", None)
 
@@ -64,7 +65,12 @@ def _attention_forward_310p(
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
     attention_mask_builder=None,
 ) -> torch.Tensor:
-    assert _code_predictor is not None
+    if hidden_states.device.type != "npu":
+        if _original_attention_forward is None:
+            raise RuntimeError("310P code predictor attention patch was not initialized.")
+        return _original_attention_forward(self, hidden_states, position_embeddings)
+    if _code_predictor is None:
+        raise RuntimeError("310P code predictor module patch was not initialized.")
 
     bsz, seq_len, _ = hidden_states.shape
     hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
@@ -80,28 +86,18 @@ def _attention_forward_310p(
     q = (q * cos) + (_code_predictor._rotate_half(q) * sin)
     k = (k * cos) + (_code_predictor._rotate_half(k) * sin)
 
-    if q.device.type == "npu":
-        attn_out = forward_code_predictor_attention(
-            q,
-            k,
-            v,
-            batch_size=bsz,
-            seq_len=seq_len,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            scale=self.scaling,
-            mask_builder=attention_mask_builder,
-        )
-    else:
-        attn_out = _code_predictor.F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            scale=self.scaling,
-            is_causal=True,
-            enable_gqa=self.is_gqa,
-        )
+    attn_out = forward_code_predictor_attention(
+        q,
+        k,
+        v,
+        batch_size=bsz,
+        seq_len=seq_len,
+        num_heads=self.num_heads,
+        num_kv_heads=self.num_kv_heads,
+        head_dim=self.head_dim,
+        scale=self.scaling,
+        mask_builder=attention_mask_builder,
+    )
     attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
     return self.o_proj(attn_out)
 
@@ -113,8 +109,7 @@ def _decoder_forward_310p(
     attention_mask_builder=None,
 ) -> torch.Tensor:
     if attention_mask_builder is None:
-        assert _original_decoder_forward is not None
-        return _original_decoder_forward(self, hidden_states, position_embeddings)
+        return _decoder_forward_with_original_attention(self, hidden_states, position_embeddings)
 
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
@@ -133,7 +128,8 @@ def _decoder_forward_310p(
 
 
 def _base_init_310p(self, *args, **kwargs) -> None:
-    assert _original_base_init is not None
+    if _original_base_init is None:
+        raise RuntimeError("310P code predictor base patch was not initialized.")
     _original_base_init(self, *args, **kwargs)
     self._attention_mask_builder_310p_max_seq = aligned_code_predictor_seq_len(self.config.num_code_groups)
     self._attention_mask_builder_310p = None
@@ -158,7 +154,8 @@ def _base_forward_310p(
     position_ids: torch.Tensor,
 ) -> torch.Tensor:
     if inputs_embeds.device.type != "npu":
-        assert _original_base_forward is not None
+        if _original_base_forward is None:
+            raise RuntimeError("310P code predictor base patch was not initialized.")
         return _original_base_forward(self, inputs_embeds, position_ids)
 
     input_dtype = inputs_embeds.dtype
@@ -174,3 +171,22 @@ def _base_forward_310p(
             )
         hidden_states = self.norm(hidden_states)
     return hidden_states.to(input_dtype)
+
+
+def _decoder_forward_with_original_attention(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    if _original_attention_forward is None:
+        raise RuntimeError("310P code predictor attention patch was not initialized.")
+
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
+    hidden_states = _original_attention_forward(self.self_attn, hidden_states, position_embeddings)
+    hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    return residual + hidden_states
