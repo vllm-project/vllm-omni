@@ -153,7 +153,7 @@ class MembershipController:
         if pool is None:
             logger.warning("[MembershipController] register: stage_id %d out of range", stage_id)
             return
-        client = self._remote_replica_factory(stage_id, replica_id)
+        client = await asyncio.to_thread(self._remote_replica_factory, stage_id, replica_id)
         input_addr = StagePool._client_input_addr(client)
         if input_addr is None:
             raise RuntimeError(f"remote replica factory for stage {stage_id} produced a client without input address")
