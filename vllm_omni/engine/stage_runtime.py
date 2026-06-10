@@ -73,6 +73,7 @@ class StageRuntimeInfo:
     final_output: bool
     final_output_type: FinalOutputModalityType | None
     stage_type: str
+    model_stage: str | None = None
 
 
 @dataclass

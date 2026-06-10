@@ -131,6 +131,60 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_omni_benchmark_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add vLLM-Omni specific serving benchmark options."""
+    group = parser.add_argument_group("vLLM-Omni Multi-stage Benchmark Options")
+    group.add_argument(
+        "--print-stage",
+        action="store_true",
+        default=False,
+        help=(
+            "Print per-stage benchmark metrics for --omni serving when stage metrics are returned by the server. "
+            "Disabled by default. The latency sections follow --percentile-metrics by modality: "
+            "ttft/tpot/itl control text stages, ttfc/tpoc/icl control internal stream stages, "
+            "and tpop controls both text TPOP and internal stream TPOP."
+        ),
+    )
+    group.add_argument(
+        "--image-edits-bot-task",
+        type=str,
+        default="think",
+        help=(
+            "Default bot_task form field for --backend openai-image-edits-omni "
+            '(/v1/images/edits). Use --extra-body \'{"bot_task":"..."}\' to override per run.'
+        ),
+    )
+
+
+_OMNI_BENCH_DATASET_CHOICES = (
+    "daily-omni",
+    "seed-tts",
+    "seed-tts-text",
+    "seed-tts-design",
+    "ttsd",
+    "sound-effect",
+)
+
+
+def _extend_omni_dataset_name_choices(parser: argparse.ArgumentParser) -> None:
+    """Append omni benchmark dataset names to --dataset-name choices.
+
+    TrackingArgumentParser keeps a shadow parser for explicit-arg tracking; both
+    parsers must list the same choices or parse_args rejects valid omni values.
+    """
+    parsers = [parser]
+    shadow = getattr(parser, "_shadow", None)
+    if shadow is not None:
+        parsers.append(shadow)
+
+    for p in parsers:
+        for action in p._actions:
+            if action.dest == "dataset_name" and action.choices is not None:
+                extra = [c for c in _OMNI_BENCH_DATASET_CHOICES if c not in action.choices]
+                if extra:
+                    action.choices = list(action.choices) + extra
+
+
 class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
     """The `serve` subcommand for vllm bench."""
 
@@ -144,6 +198,7 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
         # Add Daily-Omni specific arguments
         add_daily_omni_cli_args(parser)
         add_seed_tts_cli_args(parser)
+        add_omni_benchmark_cli_args(parser)
 
         for action in parser._actions:
             if action.dest == "dataset_name" and action.choices is not None:
@@ -161,14 +216,21 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
                 ]
                 if extra:
                     action.choices = list(action.choices) + extra
+            if action.dest == "backend" and action.choices is not None:
+                extra = [c for c in ("openai-image-edits-omni",) if c not in action.choices]
+                if extra:
+                    action.choices = list(action.choices) + extra
+        _extend_omni_dataset_name_choices(parser)
 
         # Update help messages for omni-specific features
         for action in parser._actions:
             if action.dest == "percentile_metrics":
                 action.help = (
-                    "Comma-separated list of selected metrics to report percentiles."
-                    "This argument specifies the metrics to report percentiles."
-                    'Allowed metric names are "ttft", "tpot", "itl", "e2el", "audio_ttfp", "audio_rtf". '
+                    "Comma-separated list of selected metrics to report percentiles. "
+                    'For text metrics, "ttft", "tpot", and "itl" affect the global benchmark and text '
+                    'stage metrics. "tpop" also requests text TPOT/TPOP globally and per stage, and internal '
+                    'stream TPOP. "ttfc", "tpoc", and "icl" only affect internal stream stage metrics. '
+                    'Audio metrics include "audio_ttfp", "audio_rtf", "audio_duration", and "audio_underrun".'
                 )
             if action.dest == "random_mm_limit_mm_per_prompt":
                 action.help = (
@@ -202,4 +264,9 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
             os.environ["SEED_TTS_WER_EVAL"] = "1"
         if getattr(args, "seed_tts_wer_save_items", False):
             os.environ["SEED_TTS_WER_SAVE_ITEMS"] = "1"
+        image_edits_bot_task = getattr(args, "image_edits_bot_task", None)
+        if image_edits_bot_task is not None:
+            extra_body = dict(getattr(args, "extra_body", None) or {})
+            extra_body.setdefault("bot_task", image_edits_bot_task)
+            args.extra_body = extra_body
         main(args)

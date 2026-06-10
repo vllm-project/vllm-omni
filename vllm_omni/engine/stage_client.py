@@ -26,6 +26,7 @@ class StageClient(Protocol):
     stage_id: int
     replica_id: int
     stage_type: str
+    model_stage: str | None
     final_output: bool
     final_output_type: FinalOutputModalityType | None
     default_sampling_params: OmniSamplingParams

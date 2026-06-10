@@ -143,8 +143,13 @@ class OmniGPUModelRunner(GPUModelRunner):
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
+        self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
+
+    def _maybe_enable_output_token_ids_for_model_sampler(self) -> None:
+        if getattr(self.model, "logitsprocs_need_output_token_ids", False):
+            self.input_batch.logitsprocs_need_output_token_ids = True
 
     def _init_talker_mtp(self) -> None:
         # TODO move this model specific logic to a separate class
@@ -1785,10 +1790,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not isinstance(out_key, tuple) or len(out_key) != 2:
             raise TypeError(f"talker_mtp_output_key must be a 2-tuple, got {type(out_key).__name__}: {out_key!r}")
         if start_offsets is None:
-            start_offsets = []
-            for req_id in decode_req_ids:
-                req_index = self.input_batch.req_ids.index(req_id)
-                start_offsets.append(int(self.query_start_loc.cpu[req_index]))
+            id_to_index = self.input_batch.req_id_to_index
+            start_offsets = [int(self.query_start_loc.cpu[id_to_index[req_id]]) for req_id in decode_req_ids]
         for idx, (req_id, start_offset) in enumerate(zip(decode_req_ids, start_offsets, strict=True)):
             inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
             update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}

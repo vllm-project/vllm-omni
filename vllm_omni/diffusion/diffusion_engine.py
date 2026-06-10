@@ -96,6 +96,8 @@ def _move_tensor_tree_to_cpu(value: object) -> object:
 
 
 def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
+    """Get num_frames for the dummy warmup run. Returns 0 to skip warmup."""
+
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
         return int(getattr(model_cls, "dummy_run_num_frames"))
@@ -722,6 +724,9 @@ class DiffusionEngine:
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
         num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
+        if num_frames <= 0:
+            logger.info("Skipping dummy warmup run (num_frames=0)")
+            return
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_id=DUMMY_DIFFUSION_REQUEST_ID,

@@ -1,28 +1,55 @@
 # Cosmos3-Nano
 
-> Text-to-image, text-to-video, and image-to-video serving
+> Text-to-image, text-to-video, image-to-video, and video-to-video serving
 
 ## Summary
 
 - Vendor: NVIDIA
 - Model: `nvidia/Cosmos3-Nano`
-- Task: Text-to-image (T2I), text-to-video (T2V), and image-to-video (I2V) generation, with optional synchronized audio (video + sound)
+- Task: Text-to-image (T2I), text-to-video (T2V), image-to-video (I2V), and video-to-video (V2V) generation, with optional synchronized audio (video + sound), action policy
 - Mode: Online serving with the OpenAI-compatible image/video APIs, plus offline generation via the `Omni` API
 - Maintainer: Community
 
 ## When to use this recipe
 
 Use this recipe to deploy `nvidia/Cosmos3-Nano` for image and video generation.
-A single pipeline class (`Cosmos3OmniDiffusersPipeline`) serves all three modes;
-the mode is selected per request:
+A single pipeline class (`Cosmos3OmniDiffusersPipeline`) serves these modes; the
+mode is selected per request:
 
 - **T2I** — `POST /v1/images/generations` (or a prompt carrying `modalities=["image"]`).
-- **T2V** — `POST /v1/videos/sync` with `num_frames > 1` and no reference image.
+- **T2V** — `POST /v1/videos/sync` with `num_frames > 1` and no reference image/video.
 - **I2V** — `POST /v1/videos/sync` with a reference image (`input_reference` file
   upload, or `image_reference` JSON).
+- **V2V** — `POST /v1/videos/sync` with a reference video (`input_reference`
+  video upload, or `video_reference` JSON). Cosmos3 conditions on selected
+  reference-video latent frames; use `extra_params.condition_frame_indexes_vision`
+  and `extra_params.condition_video_keep` to choose which prefix/tail frames guide
+  generation.
 - **T2VS / I2VS** — add `generate_sound=true` (and optional `sound_duration`) to a
   T2V/I2V `/v1/videos/sync` request to also generate synchronized audio, muxed into
   the mp4 as AAC 48 kHz stereo. See the official model card's "Video + Audio" examples.
+- **Action** — pass `extra_params={"action_mode": ...}` to drive Physical-AI tasks:
+  - `forward_dynamics` — given a first frame or video **and** an action trajectory,
+    roll out the resulting video. Synchronous: `POST /v1/videos/sync`.
+  - `policy` — given a first frame or video and a language instruction,
+    **predict** the action trajectory (and a rollout video). Use the async
+    `POST /v1/videos` endpoint and read the predicted action from the top-level
+    `action` field.
+  - `inverse_dynamics` — given a video, **recover** the action trajectory. Use
+    the async `POST /v1/videos` endpoint and read the recovered action from
+    the top-level `action` field
+    (`{data, shape, dtype, raw_action_dim, domain_id}`).
+
+  Action requests also take `domain_name` (e.g. `av`, `bridge_orig_lerobot`,
+  `droid_lerobot`, `agibotworld`, …; or a numeric `domain_id`), `raw_action_dim`,
+  and `action_chunk_size` (must equal `num_frames` or `num_frames - 1`). For
+  `forward_dynamics` also pass the `action` array. The dedicated policy checkpoint
+  **`nvidia/Cosmos3-Nano-Policy-DROID`** is served the same way
+  (`domain_name=droid_lerobot`).
+
+  Action requests can use `input_reference` or `video_reference` for video input.
+  `policy` and `forward_dynamics` can also use an image reference; `inverse_dynamics`
+  requires a video reference.
 
 ## References
 
@@ -125,6 +152,36 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -F "input_reference=@/path/to/reference.jpg;type=image/jpeg" \
   -o cosmos3_i2v.mp4
 
+# Video-to-video -> /v1/videos/sync with an uploaded reference video.
+# By default Cosmos3 conditions on latent indexes [0, 1]. For the default
+# temporal VAE stride this decodes only the first 5 input frames.
+# The model works best when the prompt describes the actual situation happening in the video.
+# Generic prompts may create sub-standard generations.
+curl -sS -X POST http://localhost:8000/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Nano" \
+  -F "prompt=Continue the same scene with smooth natural motion and consistent subjects." \
+  -F "negative_prompt=blurry, distorted, low quality, jittery, deformed" \
+  -F "size=1280x720" -F "num_frames=189" -F "fps=24" \
+  -F "num_inference_steps=35" -F "guidance_scale=6.0" \
+  -F "max_sequence_length=4096" -F "flow_shift=10.0" \
+  -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":true,"condition_frame_indexes_vision":[0,1],"condition_video_keep":"first"}' \
+  -F "seed=2222" \
+  -F "input_reference=@/path/to/reference.mp4;type=video/mp4" \
+  -o cosmos3_v2v.mp4
+
+# V2V can also use a JSON-safe URL/data-URL video reference. Do not combine
+# video_reference with input_reference or image_reference.
+curl -sS -X POST http://localhost:8000/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Nano" \
+  -F "prompt=Continue the same scene with smooth natural motion and consistent subjects." \
+  -F "size=1280x720" -F "num_frames=189" -F "fps=24" \
+  -F "num_inference_steps=35" -F "guidance_scale=6.0" \
+  -F "max_sequence_length=4096" -F "flow_shift=10.0" \
+  -F 'extra_params={"condition_frame_indexes_vision":[0,1],"condition_video_keep":"last"}' \
+  -F 'video_reference={"video_url":"https://example.com/reference.mp4"}' \
+  -o cosmos3_v2v_from_url.mp4
 
 # Text-to-video-with-sound
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
@@ -144,6 +201,50 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -F "sound_duration=7.875" \
   -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":true}' \
   -o cosmos3_t2v_with_sound.mp4
+
+# Action — forward dynamics (first frame + action trajectory -> rollout video).
+# Synchronous; `action` is a JSON array shaped [action_chunk_size, raw_action_dim].
+curl -sS -X POST http://localhost:8000/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  --form-string "model=nvidia/Cosmos3-Nano" \
+  --form-string "prompt=You are an autonomous vehicle. This video is captured from a first-person perspective." \
+  -F "input_reference=@first_frame.jpg;type=image/jpeg" \
+  -F "size=640x480" -F "num_frames=61" -F "fps=10" \
+  -F "num_inference_steps=30" -F "guidance_scale=1.0" -F "flow_shift=5.0" \
+  --form-string "extra_params={\"action_mode\":\"forward_dynamics\",\"domain_name\":\"av\",\"raw_action_dim\":9,\"action_chunk_size\":60,\"action\":$(cat action.json)}" \
+  -F "seed=0" \
+  -o cosmos3_forward_dynamics.mp4
+
+# Action — policy (first frame + instruction -> predicted action trajectory + video).
+# Asynchronous: POST returns a job id; poll, then read the predicted action from
+# the top-level `action` field ({data, shape, dtype, raw_action_dim, domain_id}).
+VIDEO_ID=$(curl -sS -X POST http://localhost:8000/v1/videos \
+  -H "Accept: application/json" \
+  --form-string "model=nvidia/Cosmos3-Nano" \
+  --form-string "prompt=Pick up the banana and place it in the bowl." \
+  -F "input_reference=@first_frame.jpg;type=image/jpeg" \
+  -F "size=640x480" -F "num_frames=17" -F "fps=5" \
+  -F "num_inference_steps=30" -F "guidance_scale=1.0" -F "flow_shift=5.0" \
+  --form-string 'extra_params={"action_mode":"policy","domain_name":"bridge_orig_lerobot","raw_action_dim":10,"action_chunk_size":16}' \
+  -F "seed=0" | jq -r '.id')
+# poll until status == completed, then:
+curl -sS "http://localhost:8000/v1/videos/$VIDEO_ID" | jq '.action | {shape, dtype, raw_action_dim, domain_id}'
+curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_policy.mp4
+
+# Action — inverse dynamics (video -> recovered action trajectory).
+# Asynchronous: use the job metadata to read the recovered action.
+VIDEO_ID=$(curl -sS -X POST http://localhost:8000/v1/videos \
+  -H "Accept: application/json" \
+  --form-string "model=nvidia/Cosmos3-Nano" \
+  --form-string "prompt=Recover the robot action trajectory from this clip." \
+  -F "input_reference=@motion_clip.mp4;type=video/mp4" \
+  -F "size=640x480" -F "num_frames=17" -F "fps=5" \
+  -F "num_inference_steps=30" -F "guidance_scale=1.0" -F "flow_shift=5.0" \
+  --form-string 'extra_params={"action_mode":"inverse_dynamics","domain_name":"bridge_orig_lerobot","raw_action_dim":10,"action_chunk_size":16}' \
+  -F "seed=0" | jq -r '.id')
+# poll until status == completed, then:
+curl -sS "http://localhost:8000/v1/videos/$VIDEO_ID" | jq '.action | {shape, dtype, raw_action_dim, domain_id}'
+curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_inverse_dynamics.mp4
 ```
 
 #### Notes
@@ -152,6 +253,7 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   - T2I 1024² — 10 / 25 / 50 steps → ~0.4 / 0.7 / **1.3 s**
   - T2V 1280×720 @ 35 steps — 25 / 49 / 93 / **189** frames → ~7 / 15 / 33 / **~93 s**
   - I2V 1280×720, 189 frames @ 35 steps → ~**99 s**
+  - Action 640×480 @ 30 steps — forward-dynamics 61f ~**4 s**, policy 17f ~**1–3 s**.
   - Guardrails-on overhead: ~8% on T2I, negligible on video.
 - **Memory:** transformer ~17 GiB (bf16); peak ~46 GiB for 720p video on 1 GPU;
   full repo (transformer + Wan VAE + Qwen3-VL vision encoder + audio tokenizer)
@@ -159,22 +261,27 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
 - **Determinism:** identical seed reproduces identical output on the same
   hardware; outputs are not bit-identical across different GPU types.
 - **Supported sizes (per model card):** 256p / 480p / 720p at 16:9, 4:3, 1:1,
-  3:4, 9:16. Defaults: T2I 1024², 50 steps, guidance 7.0; T2V/I2V 1280×720,
-  189 frames, 35 steps, guidance 6.0, `flow_shift=10.0`.
+  3:4, 9:16. Defaults: T2I 1024², 50 steps, guidance 7.0; T2V/I2V/V2V
+  1280×720, 189 frames, 35 steps, guidance 6.0, `flow_shift=10.0`.
 - **Key flags / params:** `--no-guardrails` (server) or
   `extra_params={"guardrails":false}` (per request) toggles safety. The
   per-request flag only takes effect when the server was launched **with**
   guardrails enabled (it cannot re-enable them on a `--no-guardrails` server).
   `use_resolution_template` / `use_duration_template` are off by default and only
   needed when not using upsampled prompts that already encode resolution/duration.
+  For V2V, `condition_frame_indexes_vision` selects the clean conditioned latent
+  frame indexes (default `[0, 1]`), and `condition_video_keep` selects whether the
+  API decodes the first or last needed reference frames (`"first"` by default).
 - **Known limitations:**
   - Guardrails-on requires `cosmos-guardrail` **and** access to the gated
     `nvidia/Cosmos-1.0-Guardrail` repo (accept license + `HF_TOKEN`); otherwise
     the server fails at pipeline build with a gated-repo / safety-checker error.
   - A guardrail-blocked prompt currently returns HTTP 500
     (`"Guardrail blocked prompt"`).
-  - Action (policy / forward- / inverse-dynamics) modalities are not part of
-    this integration yet.
+  - Action `forward_dynamics`, `policy`, and `inverse_dynamics` are supported
+    online. Use async `POST /v1/videos` when you need the predicted/recovered
+    action payload under the top-level `action` field; sync `/v1/videos/sync`
+    returns raw MP4 bytes and does not expose action metadata in the response body.
 
 ### 1x GPU (Offline generation)
 
@@ -238,8 +345,9 @@ python -c "from PIL import Image; im=Image.open('cosmos3_t2i.png'); print('image
 
 - Same `Cosmos3OmniDiffusersPipeline` as online; mode is chosen by
   `prompt["modalities"]` (`["image"]` → T2I, `["video"]` → T2V) plus
-  `num_frames`/`fps`, and `multi_modal_data={"image": ...}` for I2V. For video,
-  frames are returned in `outputs[0].request_output.images` as an
+  `num_frames`/`fps`, `multi_modal_data={"image": ...}` for I2V, and
+  `multi_modal_data={"video": [<PIL frames>]}` or a video tensor/array for V2V.
+  For video, frames are returned in `outputs[0].request_output.images` as an
   `(B, F, H, W, 3)` array.
 - The offline entry must be guarded by `if __name__ == "__main__":` — the engine
   spawns workers with the `spawn` start method.

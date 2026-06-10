@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
+    VideoAction,
     VideoData,
     VideoGenerationRequest,
     VideoGenerationResponse,
@@ -39,11 +40,19 @@ class ReferenceImage:
 
 
 @dataclass
+class ReferenceVideo:
+    """Reference video frames for video-conditioned generation."""
+
+    data: list[Image.Image]
+
+
+@dataclass
 class VideoGenerationArtifacts:
     """Normalized outputs and profiler metadata extracted from one request."""
 
     videos: list[Any]
     audios: list[Any | None]
+    actions: list[VideoAction | None]
     audio_sample_rate: int
     output_fps: int
     stage_durations: dict[str, float]
@@ -94,6 +103,7 @@ class OmniOpenAIServingVideo:
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
+        reference_video: ReferenceVideo | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt, modalities=["video"])
@@ -103,6 +113,12 @@ class OmniOpenAIServingVideo:
         gen_params = self._resolve_default_sampling_params()
 
         input_image = None if reference_image is None else reference_image.data
+        input_video = None if reference_video is None else reference_video.data
+        if input_image is not None and input_video is not None:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="Provide either an image reference or a video reference, not both.",
+            )
         vp = request.resolve_video_params()
         if input_image is not None and vp.width is not None and vp.height is not None:
             target_size = (vp.width, vp.height)
@@ -110,6 +126,8 @@ class OmniOpenAIServingVideo:
                 input_image = input_image.resize(target_size, Image.Resampling.LANCZOS)
         if input_image is not None:
             prompt["multi_modal_data"] = {"image": input_image}
+        elif input_video is not None:
+            prompt["multi_modal_data"] = {"video": input_video}
         if vp.width is not None and vp.height is not None:
             gen_params.width = vp.width
             gen_params.height = vp.height
@@ -162,7 +180,20 @@ class OmniOpenAIServingVideo:
                 )
             # Merge extra_params into extra_args
             gen_params.extra_args.update(request.extra_params)
-            logger.info("Applied extra_params: %s", request.extra_params)
+
+            # Redact the inline ``action`` array (hundreds of floats) when
+            # logging so it doesn't flood the logs; everything else is logged
+            # verbatim.
+            loggable = request.extra_params
+            action_val = loggable.get("action")
+            if action_val is not None:
+                summary = (
+                    f"<{type(action_val).__name__} len={len(action_val)}>"
+                    if hasattr(action_val, "__len__")
+                    else f"<{type(action_val).__name__}>"
+                )
+                loggable = {**loggable, "action": summary}
+            logger.info("Applied extra_params: %s", loggable)
 
         self._apply_lora(request.lora, gen_params)
 
@@ -177,11 +208,13 @@ class OmniOpenAIServingVideo:
         result = await self._run_generation(prompt, gen_params, reference_id)
         videos = self._extract_video_outputs(result)
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
+        actions = self._extract_action_outputs(result, expected_count=len(videos))
         audio_sample_rate = self._resolve_audio_sample_rate(result)
         output_fps = (vp.fps or self._resolve_fps(result) or 24) * self._resolve_video_fps_multiplier(result)
         return VideoGenerationArtifacts(
             videos=videos,
             audios=audios,
+            actions=actions,
             audio_sample_rate=audio_sample_rate,
             output_fps=output_fps,
             stage_durations=self._extract_stage_durations(result),
@@ -194,8 +227,14 @@ class OmniOpenAIServingVideo:
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
+        reference_video: ReferenceVideo | None = None,
     ) -> VideoGenerationResponse:
-        artifacts = await self._run_and_extract(request, reference_id, reference_image=reference_image)
+        artifacts = await self._run_and_extract(
+            request,
+            reference_id,
+            reference_image=reference_image,
+            reference_video=reference_video,
+        )
 
         video_codec_options = {"preset": "ultrafast", "threads": "0"}
         if request.extra_params is not None and isinstance(request.extra_params, dict):
@@ -215,7 +254,8 @@ class OmniOpenAIServingVideo:
                         audio_sample_rate=artifacts.audio_sample_rate,
                         video_codec_options=video_codec_options,
                     )
-                )
+                ),
+                action=artifacts.actions[idx],
             )
             for idx, video in enumerate(artifacts.videos)
         ]
@@ -234,9 +274,15 @@ class OmniOpenAIServingVideo:
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
-    ) -> tuple[bytes, dict[str, float], float]:
+        reference_video: ReferenceVideo | None = None,
+    ) -> tuple[bytes, dict[str, float], float, VideoAction | None]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
-        artifacts = await self._run_and_extract(request, reference_id, reference_image=reference_image)
+        artifacts = await self._run_and_extract(
+            request,
+            reference_id,
+            reference_image=reference_image,
+            reference_video=reference_video,
+        )
         if len(artifacts.videos) > 1:
             logger.warning(
                 "Video request %s generated %d outputs; returning only the first.",
@@ -259,7 +305,7 @@ class OmniOpenAIServingVideo:
         )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
-        return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb
+        return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, artifacts.actions[0]
 
     @staticmethod
     def _resolve_video_fps_multiplier(result: Any) -> int:
@@ -440,6 +486,18 @@ class OmniOpenAIServingVideo:
 
         return 24000
 
+    @classmethod
+    def _extract_action_outputs(cls, result: Any, expected_count: int) -> list[VideoAction | None]:
+        custom_output = cls._extract_custom_output(result)
+        if not custom_output or "action" not in custom_output:
+            return [None] * expected_count
+
+        action_items = cls._split_action_payload(custom_output["action"], expected_count)
+        return [
+            cls._make_video_action(action_item, custom_output) if action_item is not None else None
+            for action_item in action_items
+        ]
+
     @staticmethod
     def _extract_custom_output(result: Any) -> dict[str, Any]:
         custom_output = getattr(result, "custom_output", None)
@@ -457,6 +515,89 @@ class OmniOpenAIServingVideo:
                 custom_output = getattr(request_output, "_custom_output", None)
 
         return custom_output if isinstance(custom_output, dict) else {}
+
+    @classmethod
+    def _split_action_payload(cls, action: Any, expected_count: int) -> list[Any | None]:
+        if expected_count <= 0:
+            return []
+
+        shape = cls._shape_of(action)
+        if len(shape) >= 3:
+            count = min(shape[0], expected_count)
+            actions = [cls._index_action(action, i) for i in range(count)]
+            actions.extend([None] * (expected_count - count))
+            return actions
+
+        return [action] + [None] * (expected_count - 1)
+
+    @classmethod
+    def _make_video_action(cls, action: Any, custom_output: dict[str, Any]) -> VideoAction:
+        data = cls._to_jsonable(action)
+        if not isinstance(data, list):
+            data = [data]
+
+        action_mode = custom_output.get("action_mode")
+        return VideoAction(
+            data=data,
+            shape=cls._shape_of(action),
+            dtype=cls._dtype_of(action),
+            raw_action_dim=cls._coerce_optional_int(custom_output.get("raw_action_dim")),
+            action_mode=str(action_mode) if action_mode is not None else None,
+            domain_id=cls._coerce_optional_int(custom_output.get("domain_id")),
+        )
+
+    @staticmethod
+    def _index_action(action: Any, index: int) -> Any:
+        try:
+            return action[index]
+        except (IndexError, KeyError, TypeError):
+            return None
+
+    @classmethod
+    def _to_jsonable(cls, value: Any) -> Any:
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        if hasattr(value, "tolist"):
+            return cls._to_jsonable(value.tolist())
+        if isinstance(value, (list, tuple)):
+            return [cls._to_jsonable(item) for item in value]
+        if hasattr(value, "item"):
+            try:
+                return value.item()
+            except (TypeError, ValueError):
+                pass
+        return value
+
+    @classmethod
+    def _shape_of(cls, value: Any) -> list[int]:
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            try:
+                return [int(dim) for dim in shape]
+            except (TypeError, ValueError):
+                pass
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return [0]
+            return [len(value)] + cls._shape_of(value[0])
+        return []
+
+    @staticmethod
+    def _dtype_of(value: Any) -> str | None:
+        dtype = getattr(value, "dtype", None)
+        return str(dtype) if dtype is not None else None
+
+    @staticmethod
+    def _coerce_optional_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            value = value.item() if hasattr(value, "item") else value
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _resolve_fps(result: Any) -> int | None:

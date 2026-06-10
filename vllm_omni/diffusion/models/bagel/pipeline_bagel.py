@@ -777,7 +777,9 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
-        self._regen_init_noise_on_device(generation_input, req.sampling_params.seed)
+        # NOTE: For now we disable device specific noise regeneration so that e2e tests can run
+        # on both CUDA and ROCm. Context: https://github.com/vllm-project/vllm-omni/pull/4081
+        # self._regen_init_noise_on_device(generation_input, req.sampling_params.seed)
 
         # text cfg
         generation_input_cfg_text = self.bagel.prepare_vae_latent_cfg(

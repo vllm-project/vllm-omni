@@ -13,12 +13,14 @@ import threading
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
 
+from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.protocol.videos import (
@@ -84,7 +86,8 @@ class BlockingVideoHandler:
         if self.stage_configs is None:
             self.stage_configs = stage_configs
 
-    async def generate_video_bytes(self, request, reference_id, *, reference_image=None):
+    async def generate_video_bytes(self, request, reference_id, *, reference_image=None, reference_video=None):
+        del request, reference_id, reference_image, reference_video
         self.started.set()
         try:
             await asyncio.Future()
@@ -128,6 +131,30 @@ def _make_test_image_data_url(size=(64, 64)) -> str:
     image_bytes = _make_test_image_bytes(size)
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:image/png;base64,{encoded}"
+
+
+def _make_test_video_bytes(size=(32, 24), num_frames=3) -> bytes:
+    width, height = size
+    frames = np.zeros((num_frames, height, width, 3), dtype=np.uint8)
+    for idx in range(num_frames):
+        frames[idx, :, :, 0] = idx * 40
+        frames[idx, :, :, 1] = 128
+        frames[idx, :, :, 2] = 255 - idx * 40
+    return mux_video_audio_bytes(frames, fps=8, video_codec_options={"preset": "ultrafast", "threads": "0"})
+
+
+def _make_test_video_data_url(size=(32, 24), num_frames=3) -> str:
+    encoded = base64.b64encode(_make_test_video_bytes(size, num_frames)).decode("utf-8")
+    return f"data:video/mp4;base64,{encoded}"
+
+
+def _cosmos3_stage_configs():
+    return [
+        SimpleNamespace(
+            stage_type="diffusion",
+            engine_args=SimpleNamespace(model_class_name="Cosmos3OmniDiffusersPipeline"),
+        )
+    ]
 
 
 def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 2.0):
@@ -330,6 +357,104 @@ def test_i2v_video_generation_with_image_reference_form(test_client, mocker: Moc
     input_image = prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (40, 24)
+
+
+def test_v2v_video_generation_form(test_client, mocker: MockerFixture):
+    video_bytes = _make_test_video_bytes((32, 24), num_frames=3)
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "Continue this motion."},
+        files={"input_reference": ("input.mp4", video_bytes, "video/mp4")},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    prompt = engine.captured_prompt
+    assert "multi_modal_data" in prompt
+    assert "video" in prompt["multi_modal_data"]
+    input_video = prompt["multi_modal_data"]["video"]
+    assert len(input_video) == 3
+    assert all(isinstance(frame, Image.Image) for frame in input_video)
+    assert input_video[0].size == (32, 24)
+
+
+def test_v2v_video_generation_with_video_reference_form(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "Continue this motion.",
+            "video_reference": json.dumps({"video_url": _make_test_video_data_url((32, 24), 2)}),
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    input_video = engine.captured_prompt["multi_modal_data"]["video"]
+    assert len(input_video) == 2
+    assert input_video[0].size == (32, 24)
+
+
+def test_decode_video_bytes_can_keep_last_frames():
+    from vllm_omni.entrypoints.openai.video_api_utils import _decode_video_bytes
+
+    frames = _decode_video_bytes(
+        _make_test_video_bytes((32, 24), num_frames=6),
+        source="input_reference",
+        max_frames=2,
+        keep="last",
+    )
+
+    assert len(frames) == 2
+    red_means = [np.asarray(frame)[:, :, 0].mean() for frame in frames]
+    assert red_means[0] > 100
+    assert red_means[1] > red_means[0]
+
+
+def test_cosmos3_reference_video_limit_uses_v2v_condition_frames():
+    request = VideoGenerationRequest(
+        prompt="Continue this motion.",
+        num_frames=189,
+        extra_params={"condition_frame_indexes_vision": [0, 2]},
+    )
+
+    spec = api_server._reference_video_decode_spec(request, _cosmos3_stage_configs())
+    assert spec.max_frames == 9
+    assert spec.keep == "first"
+
+
+def test_cosmos3_reference_video_limit_preserves_action_frames():
+    request = VideoGenerationRequest(
+        prompt="Predict the action.",
+        num_frames=17,
+        extra_params={"action_mode": "inverse_dynamics", "action_chunk_size": 16},
+    )
+
+    assert api_server._reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 17
+
+
+def test_cosmos3_reference_video_limit_caps_condition_frames_to_output_frames():
+    request = VideoGenerationRequest(
+        prompt="Continue this motion.",
+        num_frames=5,
+        extra_params={"condition_frame_indexes_vision": [0, 20]},
+    )
+
+    assert api_server._reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 5
 
 
 def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):
@@ -627,6 +752,115 @@ def test_video_job_persists_profiler_metadata(test_client, mocker: MockerFixture
 
     assert completed["stage_durations"] == {"diffuse": 2.5, "vae.decode": 0.3}
     assert completed["peak_memory_mb"] == 4096.5
+    assert completed["action"] is None
+
+
+def test_video_generation_response_exposes_action_payload(mocker: MockerFixture):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="Cosmos3-8B-UVA",
+    )
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        del prompt, request_id, sampling_params_list
+        import numpy as np
+
+        yield MockVideoResult(
+            [object()],
+            custom_output={
+                "action": np.array([[[1.5, 2.5], [3.5, 4.5]]], dtype=np.float32),
+                "raw_action_dim": 2,
+                "action_mode": "policy",
+                "domain_id": 7,
+            },
+        )
+
+    engine.generate = _generate
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="encoded-video",
+    )
+
+    response = asyncio.run(
+        handler.generate_videos(
+            VideoGenerationRequest(prompt="predict actions"),
+            "action-json",
+        )
+    )
+
+    action = response.data[0].action
+    assert action is not None
+    assert action.data == [[1.5, 2.5], [3.5, 4.5]]
+    assert action.shape == [2, 2]
+    assert action.dtype == "float32"
+    assert action.raw_action_dim == 2
+    assert action.action_mode == "policy"
+    assert action.domain_id == 7
+    assert response.model_dump(mode="json")["data"][0]["action"]["data"] == [[1.5, 2.5], [3.5, 4.5]]
+
+
+def test_video_job_persists_action_metadata(test_client, mocker: MockerFixture):
+    engine = test_client.app.state.openai_serving_video._engine_client
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        import numpy as np
+
+        engine.captured_prompt = prompt
+        engine.captured_sampling_params_list = sampling_params_list
+        yield MockVideoResult(
+            [object()],
+            custom_output={
+                "action": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+                "raw_action_dim": 2,
+                "action_mode": "policy",
+                "domain_id": 7,
+            },
+        )
+
+    engine.generate = _generate
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+
+    response = test_client.post("/v1/videos", data={"prompt": "profile me"})
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    completed = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    expected_action = {
+        "data": [[1.0, 2.0], [3.0, 4.0]],
+        "shape": [2, 2],
+        "dtype": "float32",
+        "raw_action_dim": 2,
+        "action_mode": "policy",
+        "domain_id": 7,
+    }
+    assert completed["action"] == expected_action
+
+    listed = test_client.get("/v1/videos").json()
+    assert listed["data"][0]["action"] == expected_action
+
+
+def test_action_extraction_accepts_unbatched_action():
+    import numpy as np
+
+    result = MockVideoResult(
+        [object()],
+        custom_output={
+            "action": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+            "raw_action_dim": 2,
+            "action_mode": "policy",
+            "domain_id": 7,
+        },
+    )
+
+    actions = OmniOpenAIServingVideo._extract_action_outputs(result, expected_count=1)
+
+    assert actions[0] is not None
+    assert actions[0].data == [[1.0, 2.0], [3.0, 4.0]]
+    assert actions[0].shape == [2, 2]
 
 
 def test_missing_handler_returns_503():
@@ -685,7 +919,20 @@ def test_rejects_input_reference_and_image_reference_together(test_client):
         files={"input_reference": ("input.png", _make_test_image_bytes(), "image/png")},
     )
     assert response.status_code == 400
-    assert "either input_reference or image_reference" in response.json()["detail"].lower()
+    assert "only one of input_reference, image_reference, or video_reference" in response.json()["detail"].lower()
+
+
+def test_rejects_image_reference_and_video_reference_together(test_client):
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "bad refs",
+            "image_reference": '{"image_url": "https://example.com/cat.png"}',
+            "video_reference": '{"video_url": "https://example.com/cat.mp4"}',
+        },
+    )
+    assert response.status_code == 400
+    assert "only one of input_reference, image_reference, or video_reference" in response.json()["detail"].lower()
 
 
 def test_invalid_seconds_returns_422(test_client):
@@ -747,6 +994,18 @@ def test_unsupported_image_reference_file_id_returns_400(test_client):
     assert response.json()["detail"] == "Invalid image_reference: file_id is not supported yet."
 
 
+def test_unsupported_video_reference_file_id_returns_400(test_client):
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "unsupported ref",
+            "video_reference": '{"file_id": "file-123"}',
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid video_reference: file_id is not supported yet."
+
+
 def test_invalid_uploaded_input_reference_returns_400(test_client):
     response = test_client.post(
         "/v1/videos",
@@ -754,7 +1013,7 @@ def test_invalid_uploaded_input_reference_returns_400(test_client):
         files={"input_reference": ("input.png", b"not-an-image", "image/png")},
     )
     assert response.status_code == 400
-    assert response.json()["detail"] == "Invalid input_reference: provided content is not a valid image."
+    assert response.json()["detail"] == "Invalid input_reference: provided content is not a valid image or video."
 
 
 def test_video_request_validation():
@@ -771,6 +1030,8 @@ def test_video_request_validation():
 
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", image_reference={"file_id": "file-1", "image_url": "https://example.com"})
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(prompt="test", video_reference={"file_id": "file-1", "video_url": "https://example.com"})
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", frame_interpolation_exp=0)
     with pytest.raises(ValueError):
@@ -1038,6 +1299,31 @@ def test_sample_solver_forwarded_via_extra_params(test_client, mocker: MockerFix
     assert captured.extra_args["sample_solver"] == "euler"
 
 
+def test_extra_params_allows_inline_action(test_client, mocker: MockerFixture):
+    """Inline ``action`` data is accepted and forwarded verbatim to
+    ``extra_args`` (the supported way to pass forward-dynamics actions)."""
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    action = [[0.1, 0.2], [0.3, 0.4]]
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "forward dynamics inline",
+            "extra_params": json.dumps({"action_mode": "forward_dynamics", "action": action}),
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.extra_args["action"] == action
+    assert captured.extra_args["action_mode"] == "forward_dynamics"
+
+
 # ---------------------------------------------------------------------------
 # Sync endpoint tests (POST /v1/videos/sync)
 # ---------------------------------------------------------------------------
@@ -1131,6 +1417,23 @@ def test_sync_i2v_with_image_reference(test_client, mocker: MockerFixture):
     assert response.content == b"ref-video"
 
 
+def test_sync_v2v_returns_video_bytes(test_client, mocker: MockerFixture):
+    video_bytes = _make_test_video_bytes((32, 24), num_frames=3)
+    _mock_encode_video_bytes(mocker, b"v2v-video-data")
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Continue this motion."},
+        files={"input_reference": ("input.mp4", video_bytes, "video/mp4")},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"v2v-video-data"
+    engine = test_client.app.state.openai_serving_video._engine_client
+    input_video = engine.captured_prompt["multi_modal_data"]["video"]
+    assert len(input_video) == 3
+    assert input_video[0].size == (32, 24)
+
+
 def test_sync_missing_handler_returns_503():
     app = FastAPI()
     app.include_router(router)
@@ -1163,7 +1466,7 @@ def test_sync_rejects_both_references(test_client):
         files={"input_reference": ("input.png", _make_test_image_bytes(), "image/png")},
     )
     assert response.status_code == 400
-    assert "either input_reference or image_reference" in response.json()["detail"].lower()
+    assert "only one of input_reference, image_reference, or video_reference" in response.json()["detail"].lower()
 
 
 def test_sync_generation_error_returns_500(test_client, mocker: MockerFixture):

@@ -99,12 +99,16 @@ class StubCosmos3Transformer(nn.Module):
         sound_gen: bool = False,
         sound_dim: int = 3,
         sound_latent_fps: float = 25.0,
+        action_gen: bool = False,
+        action_dim: int = 4,
     ) -> None:
         super().__init__()
         self.latent_channel_size = latent_channel_size
         self.sound_gen = sound_gen
         self.sound_dim = sound_dim
         self.sound_latent_fps = sound_latent_fps
+        self.action_gen = action_gen
+        self.action_dim = action_dim
         self.cached_kv: Any | None = None
         self.cached_freqs_gen: Any | None = None
         self.calls: list[dict[str, Any]] = []
@@ -139,7 +143,10 @@ class StubCosmos3Transformer(nn.Module):
             marker = torch.tensor([token], dtype=torch.float32)
             self.cached_kv = [(marker, marker + 100)]
             self.cached_freqs_gen = (marker + 200, marker + 300)
+        action_latents = kwargs.get("action_latents")
         outputs: list[torch.Tensor] = [torch.full_like(hidden_states, float(token))]
+        if action_latents is not None:
+            outputs.append(torch.full_like(action_latents, float(token + 20)))
         if sound_latents is not None:
             outputs.append(torch.full_like(sound_latents, float(token + 10)))
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
@@ -344,7 +351,7 @@ def test_pipeline_init_passes_tokenizer_attrs_into_transformer(
     assert pipeline.transformer.audio_proj_out.out_features == 5
 
 
-def test_preprocess_i2v_image_input() -> None:
+def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
 
     preprocess = get_cosmos3_pre_process_func(SimpleNamespace())
@@ -356,6 +363,29 @@ def test_preprocess_i2v_image_input() -> None:
     result = preprocess(i2v)
     assert (result.sampling_params.height, result.sampling_params.width) == (672, 1344)
     assert tuple(result.prompts[0]["additional_information"]["preprocessed_image"].shape[-2:]) == (672, 1344)
+
+    frames = [Image.new("RGB", (8, 4), color) for color in ("red", "green", "blue")]
+    action = SimpleNamespace(
+        prompts=[{"prompt": "Move.", "multi_modal_data": {"video": frames}}],
+        sampling_params=SimpleNamespace(height=16, width=32, extra_args={"action_mode": "forward_dynamics"}),
+    )
+
+    additional = preprocess(action).prompts[0]["additional_information"]
+    assert tuple(additional["preprocessed_image"].shape) == (1, 3, 16, 32)
+    assert tuple(additional["preprocessed_video"].shape) == (1, 3, 3, 16, 32)
+
+    frames = [Image.new("RGB", (8, 4), color) for color in ("red", "green", "blue", "yellow", "purple", "black")]
+    v2v = SimpleNamespace(
+        prompts=[{"prompt": "Continue.", "multi_modal_data": {"video": frames}}],
+        sampling_params=SimpleNamespace(
+            height=16,
+            width=32,
+            extra_args={"condition_frame_indexes_vision": [0, 1], "condition_video_keep": "last"},
+        ),
+    )
+    additional = preprocess(v2v).prompts[0]["additional_information"]
+    assert tuple(additional["preprocessed_video"].shape) == (1, 3, 5, 16, 32)
+    assert additional["condition_frame_indexes_vision"] == [0, 1]
 
 
 def test_postprocess_handles_image_video_audio_and_validation() -> None:
@@ -434,7 +464,7 @@ def test_prompt_formatting_and_checkpoint_key_remap(make_cosmos3_pipeline) -> No
     assert {key: Cosmos3OmniDiffusersPipeline._remap_ckpt_key(key) for key in remaps} == remaps
 
 
-def test_prepare_latents_for_video_image_and_sound(make_cosmos3_pipeline) -> None:
+def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = pipeline._prepare_latents(16, 24, 5, torch.Generator(device="cpu").manual_seed(0))
     assert latents.shape == (1, 2, 2, 2, 3)
@@ -446,6 +476,19 @@ def test_prepare_latents_for_video_image_and_sound(make_cosmos3_pipeline) -> Non
     torch.testing.assert_close(i2v_latents[:, :, 0], torch.full((1, 2, 2, 3), 5.0))
     assert velocity_mask.tolist() == [[[[[0.0]], [[1.0]]]]]
     assert image_latent.shape == (1, 2, 1, 2, 3)
+
+    pipeline._encode_video_tensor = lambda *args, **kwargs: torch.full((1, 2, 3, 2, 3), 6.0)
+    v2v_latents, v2v_velocity_mask, v2v_condition = pipeline._prepare_latents_v2v(
+        torch.zeros(1, 3, 5, 16, 24),
+        16,
+        24,
+        9,
+        torch.Generator(device="cpu").manual_seed(0),
+        [0, 1],
+    )
+    torch.testing.assert_close(v2v_latents[:, :, 0:2], torch.full((1, 2, 2, 2, 3), 6.0))
+    assert v2v_velocity_mask.tolist() == [[[[[0.0]], [[0.0]], [[1.0]]]]]
+    assert v2v_condition.shape == (1, 2, 3, 2, 3)
 
     pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, sound_gen=True, sound_dim=3)
     pipeline._sound_tokenizer = SimpleNamespace(
@@ -463,8 +506,20 @@ def test_prepare_latents_for_video_image_and_sound(make_cosmos3_pipeline) -> Non
     assert (sound_latents.shape, latent_frames) == (torch.Size([1, 3, 6]), 6)
     assert pipeline._decode_sound_latents(torch.zeros(1, 3, 6), target_audio_samples=21).shape == (1, 2, 21)
 
+    pipeline.transformer = pipeline.transformer.__class__(action_gen=True, action_dim=4)
+    action, action_mask, clean, raw_dim = pipeline._prepare_action_latents(
+        mode="forward_dynamics",
+        action_chunk_size=2,
+        raw_action_dim=None,
+        generator=torch.Generator(device="cpu").manual_seed(0),
+        sp=SimpleNamespace(extra_args={"action": [[1.0, 2.0], [3.0, 4.0]]}),
+    )
+    assert raw_dim == 2
+    assert action_mask.tolist() == [[[0.0], [0.0]]]
+    torch.testing.assert_close(action, clean)
 
-def test_diffuse_covers_cfg_i2v_and_sound_steps(make_cosmos3_pipeline) -> None:
+
+def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)
 
@@ -496,20 +551,22 @@ def test_diffuse_covers_cfg_i2v_and_sound_steps(make_cosmos3_pipeline) -> None:
     )
     torch.testing.assert_close(i2v[:, :, 0:1], torch.full((1, 2, 1, 1, 1), 7.0))
 
-    pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, sound_gen=True, sound_dim=3)
-    video_result, sound_result = pipeline.diffuse(
+    pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, action_gen=True, action_dim=4)
+    video_result, action_result = pipeline.diffuse(
         latents=latents,
-        sound_latents=torch.zeros(1, 3, 4),
+        action_latents=torch.zeros(1, 3, 4),
+        action_velocity_mask=torch.ones(1, 3, 1),
+        action_condition_latents=torch.zeros(1, 3, 4),
         timesteps=torch.tensor([7, 3]),
         cond_ids=_ids(2),
         cond_mask=_mask(),
         uncond_ids=_ids(1),
         uncond_mask=_mask(),
         guidance_scale=1.0,
-        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "action_domain_ids": torch.tensor([0])},
     )
     torch.testing.assert_close(video_result, torch.full_like(latents, 4.0))
-    torch.testing.assert_close(sound_result, torch.full((), 24.0).expand_as(sound_result))
+    torch.testing.assert_close(action_result, torch.full((), 44.0).expand_as(action_result))
 
 
 def test_diffuse_keeps_paired_cfg_when_cache_dit_active(make_cosmos3_pipeline) -> None:
@@ -568,6 +625,8 @@ class TestForwardRouting:
         def fake_diffuse(**kwargs):
             captured["diffuse_calls"].append(kwargs)
             outputs = [kwargs["latents"] + len(captured["diffuse_calls"])]
+            if kwargs.get("action_latents") is not None:
+                outputs.append(kwargs["action_latents"] + 3.0)
             if kwargs.get("sound_latents") is not None:
                 outputs.append(kwargs["sound_latents"] + 2.0)
             return outputs[0] if len(outputs) == 1 else tuple(outputs)
@@ -612,7 +671,7 @@ class TestForwardRouting:
         assert captured["flow_shifts"] == expected["flow"]
         assert [call[0] for call in pipeline.scheduler.set_timesteps_calls] == expected["steps"]
 
-    def test_forward_i2v_and_sound_routes(self, make_cosmos3_pipeline) -> None:
+    def test_forward_i2v_sound_and_action_routes(self, make_cosmos3_pipeline) -> None:
         pipeline = make_cosmos3_pipeline()
         captured = self._install_forward_stubs(pipeline)
         image_tensor = torch.zeros(1, 3, 16, 16)
@@ -637,6 +696,34 @@ class TestForwardRouting:
         )
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["noisy_frame_mask"] is velocity_mask
 
+        video_tensor = torch.zeros(1, 3, 5, 16, 16)
+        v2v_condition = torch.full((1, 2, 2, 1, 1), 4.0)
+        v2v_mask = torch.tensor([[[[[0.0]], [[1.0]]]]])
+        pipeline._prepare_latents_v2v = lambda *args, **kwargs: (
+            torch.zeros(1, 2, 2, 1, 1),
+            v2v_mask,
+            v2v_condition,
+        )
+        pipeline.forward(
+            SimpleNamespace(
+                prompts=[
+                    {
+                        "prompt": "continue",
+                        "modalities": ["video"],
+                        "additional_information": {
+                            "preprocessed_video": video_tensor,
+                            "condition_frame_indexes_vision": [0],
+                        },
+                    }
+                ],
+                sampling_params=make_sampling_params(height=16, width=16, num_frames=5),
+            )
+        )
+        assert captured["flow_shifts"][-1] == 10.0
+        assert captured["format"]["negative_prompt"] == ""
+        assert captured["diffuse_calls"][-1]["shared_kwargs"]["noisy_frame_mask"] is v2v_mask
+        assert captured["diffuse_calls"][-1]["condition_latents"] is v2v_condition
+
         pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, sound_gen=True, sound_dim=3)
         sound_latents = torch.zeros(1, 3, 4)
         pipeline._resolve_sound_target_samples = lambda *args: (20, 2.0, 10)
@@ -650,6 +737,31 @@ class TestForwardRouting:
         )
         assert captured["diffuse_calls"][-1]["sound_latents"] is sound_latents
         assert output.output["audio_sample_rate"] == 10
+
+        pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, action_gen=True, action_dim=4)
+        output = pipeline.forward(
+            SimpleNamespace(
+                prompts=[
+                    {
+                        "prompt": "Pick the block.",
+                        "modalities": ["video"],
+                        "additional_information": {"preprocessed_image": image_tensor},
+                    }
+                ],
+                sampling_params=make_sampling_params(
+                    height=16,
+                    width=16,
+                    extra_args={
+                        "action_mode": "policy",
+                        "action_chunk_size": 2,
+                        "raw_action_dim": 2,
+                        "domain_name": "bridge_orig_lerobot",
+                    },
+                ),
+            )
+        )
+        assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
+        assert output.custom_output["action"].shape == (1, 2, 2)
 
     @pytest.mark.parametrize(
         ("prompt", "sampling_params", "message"),

@@ -133,6 +133,7 @@ class StageEngineCoreClientBase(StageClientBase):
             self.stage_id = metadata.stage_id
             self.replica_id = getattr(metadata, "replica_id", 0)
             self.stage_type = metadata.stage_type
+            self.model_stage = metadata.model_stage
             self.is_comprehension = metadata.is_comprehension
             self.requires_multimodal_data = metadata.requires_multimodal_data
             self.engine_input_source = metadata.engine_input_source

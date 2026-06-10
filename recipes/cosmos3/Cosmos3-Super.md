@@ -1,12 +1,12 @@
 # Cosmos3-Super
 
-> Frontier 64B world model: text-to-image, text-to-video, image-to-video (+ optional audio)
+> Frontier 64B world model: text-to-image, text-to-video, image-to-video, video-to-video (+ optional audio)
 
 ## Summary
 
 - Vendor: NVIDIA
 - Model: `nvidia/Cosmos3-Super` (64B; also `Cosmos3-Super-Text2Image`, `Cosmos3-Super-Image2Video`)
-- Task: T2I, T2V, I2V generation, with optional synchronized audio (video + sound)
+- Task: T2I, T2V, I2V, V2V generation, with optional synchronized audio (video + sound)
 - Mode: Online serving with the OpenAI-compatible image/video APIs
 - Maintainer: Community
 
@@ -16,8 +16,8 @@ Use this recipe to deploy the 64B `nvidia/Cosmos3-Super` for the highest-quality
 Cosmos3 generation. It shares the same `Cosmos3OmniDiffusersPipeline` and request
 formats as [Cosmos3-Nano](./Cosmos3-Nano.md) — only the checkpoint size and the
 recommended parallelism differ. Mode is selected per request (T2I →
-`/v1/images/generations`; T2V/I2V → `/v1/videos/sync`; add `generate_sound=true`
-for audio).
+`/v1/images/generations`; T2V/I2V/V2V → `/v1/videos/sync`; add
+`generate_sound=true` for audio).
 
 ## References
 
@@ -62,8 +62,9 @@ disable. `--enable-layerwise-offload` reduces VRAM on smaller GPUs.
 #### Verification
 
 Requests are identical to Nano (see [`Cosmos3-Nano.md`](./Cosmos3-Nano.md) for full
-T2I/T2V/I2V/T2VS curls); official params: `size=1280x720, num_frames=189, fps=24,
-num_inference_steps=35, guidance_scale=6.0, flow_shift=10.0, max_sequence_length=4096`.
+T2I/T2V/I2V/V2V/T2VS curls); official params: `size=1280x720, num_frames=189,
+fps=24, num_inference_steps=35, guidance_scale=6.0, flow_shift=10.0,
+max_sequence_length=4096`.
 
 ```bash
 curl http://localhost:8000/v1/models
@@ -84,6 +85,15 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
   -F "seed=1111" -F "input_reference=@/path/to/reference.jpg;type=image/jpeg" \
   -o cosmos3_super_i2v.mp4
 
+# V2V — add an uploaded reference video. condition_video_keep can be "first" or "last".
+curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Super" -F "prompt=Continue the same scene with smooth natural motion." \
+  -F "size=1280x720" -F "num_frames=189" -F "fps=24" -F "num_inference_steps=35" \
+  -F "guidance_scale=6.0" -F "max_sequence_length=4096" -F "flow_shift=10.0" \
+  -F 'extra_params={"condition_frame_indexes_vision":[0,1],"condition_video_keep":"first"}' \
+  -F "seed=2222" -F "input_reference=@/path/to/reference.mp4;type=video/mp4" \
+  -o cosmos3_super_v2v.mp4
+
 # T2V + sound — add generate_sound/sound_duration (output muxes AAC 48 kHz stereo)
 curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
   -F "model=nvidia/Cosmos3-Super" -F "prompt=A robot arm is cleaning a plate in the kitchen" \
@@ -103,6 +113,12 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
   - T2V + sound (189 frames, 35 steps) → **~198 s**, output muxes **AAC 48 kHz stereo**
   - (NVIDIA's reference: 8×H200 @ 50 steps ≈ 55 s/video; 2×H200 @ 35 steps ≈ 3 min/video.)
 - **Memory:** ~61.5 GiB per GPU when sharded across 2 GPUs (HSDP shard 2); repo ~135 GB on disk.
-- Same generation defaults, supported sizes, and `generate_sound`/`sound_duration`
-  semantics as Nano. Action (policy / forward- / inverse-dynamics) modalities are
-  not part of this integration yet.
+- Same generation defaults, supported sizes, V2V reference-video controls
+  (`condition_frame_indexes_vision`, `condition_video_keep`), and
+  `generate_sound`/`sound_duration`
+  semantics as Nano, including the **action** modality: `forward_dynamics`,
+  `policy`, and `inverse_dynamics` — see the Cosmos3-Nano recipe for the request
+  shapes. Use async `/v1/videos` when you need predicted/recovered action metadata
+  under the top-level `action` field. Verified on the 64B Super under
+  `--cfg-parallel-size 2`: async `policy` returns the predicted action (`[16, 10]`)
+  and the rollout video reliably.

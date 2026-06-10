@@ -26,7 +26,7 @@ from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, Pipe
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
@@ -197,35 +197,64 @@ class Wan22I2VPipeline(
                 )
             )
 
-        # Text encoder
-        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
-        ).to(self.device)
-
         # Image encoder (CLIP) - optional, for Wan2.1-style I2V
         self.has_image_encoder = "image_encoder" in model_index and model_index["image_encoder"][0] is not None
 
-        # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
+        # See ``hub_prefetch.py`` for the transformers v5 subfolder race. The
+        # prefetch MUST run before any ``from_pretrained`` below - previously
+        # the tokenizer / text_encoder were loaded ahead of this call, so they
+        # never benefited from the prefetch and could hit the half-written
+        # cache directly.
         subfolders = ["tokenizer", "text_encoder", "vae"]
         if self.has_image_encoder:
             subfolders.extend(["image_processor", "image_encoder"])
         prefetch_subfolders(model, subfolders, local_files_only=local_files_only)
 
+        # Text encoder
+        self.tokenizer = from_pretrained_with_prefetch(
+            AutoTokenizer.from_pretrained,
+            model,
+            subfolder="tokenizer",
+            prefetch_list=subfolders,
+            local_files_only=local_files_only,
+        )
+        self.text_encoder = from_pretrained_with_prefetch(
+            UMT5EncoderModel.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
+        ).to(self.device)
+
         if self.has_image_encoder:
-            self.image_processor = CLIPImageProcessor.from_pretrained(
-                model, subfolder="image_processor", local_files_only=local_files_only
+            self.image_processor = from_pretrained_with_prefetch(
+                CLIPImageProcessor.from_pretrained,
+                model,
+                subfolder="image_processor",
+                prefetch_list=subfolders,
+                local_files_only=local_files_only,
             )
-            self.image_encoder = CLIPVisionModel.from_pretrained(
-                model, subfolder="image_encoder", torch_dtype=dtype, local_files_only=local_files_only
+            self.image_encoder = from_pretrained_with_prefetch(
+                CLIPVisionModel.from_pretrained,
+                model,
+                subfolder="image_encoder",
+                prefetch_list=subfolders,
+                local_files_only=local_files_only,
+                torch_dtype=dtype,
             ).to(self.device)
         else:
             self.image_processor = None
             self.image_encoder = None
 
         # VAE
-        self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
+        self.vae = from_pretrained_with_prefetch(
+            DistributedAutoencoderKLWan.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         # Transformers (weights loaded via load_weights)
