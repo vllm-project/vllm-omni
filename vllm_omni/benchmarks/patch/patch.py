@@ -16,8 +16,8 @@ from datetime import datetime
 from typing import Any, Literal
 
 import aiohttp
+import numpy as np
 import pybase64 as base64
-from pydub import AudioSegment
 from tqdm.asyncio import tqdm
 from vllm.benchmarks import datasets
 from vllm.benchmarks.datasets import SampleRequest
@@ -653,9 +653,8 @@ async def async_request_openai_chat_omni_completions(
         # Reset per-attempt state so that retries do not mix partial
         # outputs or metrics from previous attempts.
         generated_text = ""
-        generated_audio = None
         # For wav responses, accumulate decoded PCM bytes per chunk
-        # to avoid repeated AudioSegment decode/concat.
+        # to avoid repeated decode/concat.
         wav_pcm_buffer = bytearray()
         wav_audio_params: tuple[int, int, int] | None = None
         wav_inconsistent_chunk_count = 0
@@ -795,30 +794,33 @@ async def async_request_openai_chat_omni_completions(
 
                     output.latency = timestamp - st
                     output.generated_text = generated_text
+                    audio_duration_sec = 0.0
+                    audio_frames = 0
                     if response_format == "wav" and wav_pcm_buffer and wav_audio_params is not None:
                         channels, sample_width, frame_rate = wav_audio_params
-                        generated_audio = AudioSegment(
-                            data=bytes(wav_pcm_buffer),
-                            sample_width=sample_width,
-                            frame_rate=frame_rate,
-                            channels=channels,
-                        )
+                        frame_width = sample_width * channels
+                        if frame_width > 0:
+                            audio_frames = len(wav_pcm_buffer) // frame_width
+                            audio_duration_sec = audio_frames / frame_rate
+                        else:
+                            logger.warning("Audio frame width is zero")
                     elif audio_bytes_buffer:
                         try:
-                            generated_audio = AudioSegment.from_file(
+                            from vllm.multimodal.audio import get_audio_duration
+                            from vllm.multimodal.media.audio import load_audio
+
+                            waveform, sr = load_audio(
                                 io.BytesIO(bytes(audio_bytes_buffer)),
-                                format=response_format,
+                                sr=None,
+                                mono=False,
                             )
+                            audio_duration_sec = get_audio_duration(y=waveform, sr=sr)
+                            audio_frames = int(audio_duration_sec * sr)
                         except Exception as ex:
                             logger.warning("Failed to decode accumulated audio bytes: %s", ex)
-                    if generated_audio is not None:
-                        output.audio_duration = len(generated_audio) / 1000.0
-                        frame_width = generated_audio.frame_width
-                        if frame_width > 0:
-                            output.audio_frames = len(generated_audio.raw_data) // frame_width
-                        else:
-                            output.audio_frames = 0
-                            logger.warning("Audio frame width is zero")
+                    if audio_duration_sec > 0 or audio_frames > 0:
+                        output.audio_duration = audio_duration_sec
+                        output.audio_frames = audio_frames
                         audio_duration = output.audio_duration
                         if audio_duration > 0:
                             output.audio_rtf = audio_generate_time / output.audio_duration
@@ -827,8 +829,29 @@ async def async_request_openai_chat_omni_completions(
                             logger.warning("Audio duration is zero")
                         if _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False):
                             try:
-                                seg = generated_audio.set_frame_rate(24000).set_channels(1).set_sample_width(2)
-                                output.tts_output_pcm_bytes = bytes(seg.raw_data)
+                                if response_format == "wav" and wav_pcm_buffer and wav_audio_params is not None:
+                                    from vllm.multimodal.audio import AudioResampler
+
+                                    pcm_channels, pcm_sw, pcm_rate = wav_audio_params
+                                    pcm = np.frombuffer(
+                                        bytes(wav_pcm_buffer), dtype=np.int16 if pcm_sw == 2 else np.float32
+                                    )
+                                    if pcm_channels > 1:
+                                        pcm = pcm.reshape(-1, pcm_channels).mean(axis=1).astype(pcm.dtype)
+                                    pcm_f32 = pcm.astype(np.float32) / 32767.0 if pcm.dtype == np.int16 else pcm
+                                    if pcm_rate != 24000:
+                                        resampler = AudioResampler(target_sr=24000)
+                                        pcm_f32 = resampler.resample(pcm_f32, orig_sr=pcm_rate)
+                                    output.tts_output_pcm_bytes = (pcm_f32 * 32767).astype(np.int16).tobytes()
+                                elif audio_bytes_buffer:
+                                    from vllm.multimodal.media.audio import load_audio
+
+                                    waveform, _ = load_audio(
+                                        io.BytesIO(bytes(audio_bytes_buffer)),
+                                        sr=24000,
+                                        mono=True,
+                                    )
+                                    output.tts_output_pcm_bytes = (waveform * 32767).astype(np.int16).tobytes()
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
                     output.success = True
