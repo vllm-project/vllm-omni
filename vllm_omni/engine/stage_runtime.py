@@ -479,6 +479,8 @@ class StageRuntime:
             # Local diffusion process spawning must stay on the orchestrator
             # thread. Keep all local diffusion replicas in one sequential group.
             return "inline:diffusion"
+        if replica.launch_mode == "remote":
+            return f"remote:{replica.metadata.stage_id}:{replica.replica_id}"
 
         runtime_cfg = replica.metadata.runtime_cfg or {}
         devices = runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)

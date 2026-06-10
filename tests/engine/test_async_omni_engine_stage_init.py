@@ -409,6 +409,32 @@ def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monk
     }
 
 
+def test_remote_replicas_use_distinct_init_group_keys():
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=123,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+    plan = _make_llm_plan(
+        1,
+        stage_id=1,
+        vllm_config=types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64)),
+        num_replicas=2,
+    )
+
+    for replica in plan.replicas:
+        replica.launch_mode = "remote"
+        replica.metadata.runtime_cfg = None
+
+    assert [runtime._replica_init_group_key(replica) for replica in plan.replicas] == [
+        "remote:1:0",
+        "remote:1:1",
+    ]
+
+
 def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_replica_failure(monkeypatch):
     runtime = StageRuntime(
         stage_configs=[types.SimpleNamespace()],
