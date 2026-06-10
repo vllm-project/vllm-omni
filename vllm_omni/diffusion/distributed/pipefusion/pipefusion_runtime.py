@@ -41,6 +41,8 @@ class PipeFusionRuntime:
         self.split_dim: Literal["height", "temporal"] = "height"
         self.cache_key: Literal["inputs", "inputs_uncond"] = "inputs"
         self.patch_idx_tensor = torch.tensor(0, dtype=torch.int32)
+        self.warmup_cache_timestep: torch.Tensor | None = None
+        self.update_warmup_cache = True
 
     def set_input_parameters(self, latents: torch.Tensor, dtype):
         self._calc_patches_metadata(latents)

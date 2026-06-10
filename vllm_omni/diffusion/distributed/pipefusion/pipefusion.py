@@ -65,6 +65,8 @@ class PipeFusionPipelineMixin(ABC):
             )
 
         if is_pipefusion_initialized():
+            runtime = get_pipefusion_runtime()
+
             init = cls.__dict__.get("__init__")
             if callable(init):
 
@@ -72,7 +74,7 @@ class PipeFusionPipelineMixin(ABC):
                 def wrapped_init(self, *args: Any, **kwargs: Any) -> None:
                     init(self, *args, **kwargs)
                     # Initialize the patch size to transformer's patch size
-                    get_pipefusion_runtime().patch_size = self.transformer_config.patch_size
+                    runtime.patch_size = self.transformer_config.patch_size
 
                 cls.__init__ = wrapped_init
 
@@ -101,13 +103,14 @@ class PipeFusionPipelineMixin(ABC):
                     dtype = bound.arguments["dtype"]
 
                     # PipeFusion: set runtime state input parameters and reset caches
-                    get_pipefusion_runtime().set_input_parameters(latents, dtype)
+                    runtime.set_input_parameters(latents, dtype)
                     self.scheduler.clear_patch_caches()
                     self._reset_pipefusion_caches()
 
-                    warmup_steps = get_pipefusion_runtime().warmup_steps
+                    warmup_steps = runtime.warmup_steps
                     warmup_timesteps = timesteps[:warmup_steps]
                     async_timesteps = timesteps[warmup_steps:] if len(timesteps) > warmup_steps else None
+                    runtime.warmup_cache_timestep = warmup_timesteps[-1]
 
                     # Call standard diffuse for warmup steps
                     bound.arguments["timesteps"] = warmup_timesteps
@@ -132,6 +135,19 @@ class PipeFusionPipelineMixin(ABC):
                     return prepare_model_kwargs(self, None, *args, **kwargs)
 
                 cls.prepare_model_kwargs = wrapped_prepare_model_kwargs
+
+            predict_noise_maybe_with_cfg = getattr(cls, "predict_noise_maybe_with_cfg", None)
+            if callable(predict_noise_maybe_with_cfg):
+
+                @wraps(predict_noise_maybe_with_cfg)
+                def wrapped_predict_noise_maybe_with_cfg(self, *args: Any, **kwargs: Any) -> Any:
+                    # Update the KV cache only during the final warmup step
+                    runtime.update_warmup_cache = not runtime.patch_mode and torch.equal(
+                        self._current_timestep, runtime.warmup_cache_timestep
+                    )
+                    return predict_noise_maybe_with_cfg(self, *args, **kwargs)
+
+                cls.predict_noise_maybe_with_cfg = wrapped_predict_noise_maybe_with_cfg
 
     @staticmethod
     def _configure_pipefusion_run(req: "OmniDiffusionRequest") -> None:
