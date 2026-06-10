@@ -457,6 +457,13 @@ class OmniDiffusionConfig:
 
     enable_kv_async_copy: bool = False
 
+    # KV async prefetch (Phase 3). Opt-in. When enabled (request mode + Branch A
+    # only), the diffusion runner prefetches the next request's AR KV on a
+    # background thread during the current forward, so 2nd+ requests in a deep
+    # queue wait ~0 on receive. Reuses the Phase 2 async H2D path. Defaults
+    # False (no prefetch); set True to enable.
+    enable_kv_async_prefetch: bool = False
+
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None

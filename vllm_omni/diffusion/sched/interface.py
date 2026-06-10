@@ -113,6 +113,9 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
+    # Phase 3: next request to background-prefetch KV for, as a lightweight
+    # ``{"request_id": str, "kv_sender_info": dict|None}`` (None when disabled).
+    prefetch_stub: dict | None = None
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:

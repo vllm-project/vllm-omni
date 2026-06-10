@@ -83,6 +83,20 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Initialize KV cache manager for connector management.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
+        # Phase 3: background KV prefetch is request-mode + Branch A only (no
+        # CFG/SP, which need collectives that can't run off-thread).  Gate here
+        # since this runner knows the parallel config; the manager's _async_prefetch
+        # already reflects od_config.enable_kv_async_prefetch.
+        pc = getattr(od_config, "parallel_config", None)
+        branch_a = (getattr(pc, "cfg_parallel_size", 1) or 1) <= 1 and (
+            getattr(pc, "sequence_parallel_size", 1) or 1
+        ) <= 1
+        self._kv_prefetch_enabled = (
+            bool(getattr(od_config, "enable_kv_async_prefetch", False))
+            and branch_a
+            and self.kv_transfer_manager.config.need_recv_cache
+        )
+
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
         model = getattr(self.pipeline, attr_name, None)
@@ -251,7 +265,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
         )
 
-    def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def execute_model(self, req: OmniDiffusionRequest, prefetch_stub: dict | None = None) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
 
@@ -275,12 +289,26 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            # The manager handles the check for need_recv_cache internally
-            self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                req,
-                cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                target_device=getattr(self.pipeline, "device", None),
-            )
+            target_device = getattr(self.pipeline, "device", None)
+            # Phase 3: consume a KV payload prefetched during the previous
+            # forward; fall back to a synchronous receive on miss (first request,
+            # prefetch disabled, timeout, or non-Branch-A).
+            prefetched = None
+            if self._kv_prefetch_enabled:
+                prefetched, _ = self.kv_transfer_manager.get_loaded_kv(req.request_id)
+            if prefetched is not None:
+                self.kv_transfer_manager.apply_prefetched_kv(req, prefetched, target_device=target_device)
+            else:
+                # The manager handles the check for need_recv_cache internally
+                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                    req,
+                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                    target_device=target_device,
+                )
+
+            # Kick off the next request's prefetch so it overlaps this forward.
+            if self._kv_prefetch_enabled and prefetch_stub is not None:
+                self.kv_transfer_manager.start_load_kv(prefetch_stub)
 
             if req.sampling_params.generator is None and req.sampling_params.seed is not None:
                 if req.sampling_params.generator_device is not None:

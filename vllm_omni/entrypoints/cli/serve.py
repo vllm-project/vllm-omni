@@ -581,6 +581,12 @@ class OmniServeCommand(CLISubcommand):
             help="Overlap the received AR KV pinned-pool -> GPU copy on a dedicated "
             "CUDA stream (diffusion stage only). Off by default (synchronous copy).",
         )
+        omni_config_group.add_argument(
+            "--enable-kv-async-prefetch",
+            action="store_true",
+            help="Prefetch the next request's AR KV on a background thread during the "
+            "current forward (diffusion stage, request mode + Branch A only). Off by default.",
+        )
 
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(

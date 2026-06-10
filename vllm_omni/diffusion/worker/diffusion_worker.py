@@ -352,7 +352,12 @@ class DiffusionWorker:
         else:
             profiler.stop()
 
-    def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
+    def execute_model(
+        self,
+        req: OmniDiffusionRequest,
+        od_config: OmniDiffusionConfig,
+        prefetch_stub: dict | None = None,
+    ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
         if self.lora_manager is not None:
@@ -365,7 +370,7 @@ class DiffusionWorker:
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
-            output = self.model_runner.execute_model(req)
+            output = self.model_runner.execute_model(req, prefetch_stub=prefetch_stub)
         if profiler:
             profiler.step()
         return output
@@ -632,6 +637,12 @@ class DiffusionWorker:
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
+        if self.model_runner is not None:
+            mgr = getattr(self.model_runner, "kv_transfer_manager", None)
+            if mgr is not None:
+                # Cancel any in-flight KV prefetch and stop its executor so no
+                # orphaned background load keeps the process or pinned buffers alive.
+                mgr.shutdown_prefetch()
         destroy_distributed_env()
 
 
@@ -1008,18 +1019,24 @@ class WorkerWrapperBase:
         """
         return self.worker.generate(requests)
 
-    def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
+    def execute_model(
+        self,
+        reqs: list[OmniDiffusionRequest],
+        od_config: OmniDiffusionConfig,
+        prefetch_stub: dict | None = None,
+    ) -> DiffusionOutput:
         """
         Execute a forward pass.
 
         Args:
             reqs: List of diffusion requests
             od_config: OmniDiffusionConfig configuration
+            prefetch_stub: Optional Phase 3 next-request prefetch descriptor.
 
         Returns:
             DiffusionOutput with generated results
         """
-        return self.worker.execute_model(reqs, od_config)
+        return self.worker.execute_model(reqs, od_config, prefetch_stub=prefetch_stub)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""
