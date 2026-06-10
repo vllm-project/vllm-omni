@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 |---|---|---|---|---|---|
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
+| Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | ✓ (`ref_audio` / `speaker_embedding`) | ✓ (PCM stream) | IP labels + structured `instructions` | — |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
@@ -199,6 +200,51 @@ python fish_speech/gradio_demo.py --api-base http://localhost:8091  # if server 
 ### Notes
 - Output: 44.1 kHz mono.
 - Streaming PCM player command must use `-r 44100`.
+
+---
+
+## Ming-omni-tts
+
+Dense 0.5B two-stage TTS served through `/v1/audio/speech`. Ming uses the standard speech endpoint plus structured controls in `instructions`, `voice`, `language`, `ref_audio`, `ref_text`, and `speaker_embedding`.
+
+### Launch
+```bash
+bash examples/online_serving/text_to_speech/ming_tts/run_server.sh
+```
+Equivalent manual command:
+```bash
+vllm-omni serve inclusionAI/Ming-omni-tts-0.5B \
+    --deploy-config vllm_omni/deploy/ming_tts.yaml \
+    --host 0.0.0.0 --port 8091 \
+    --enforce-eager --omni
+```
+
+### Sending requests
+```bash
+python examples/online_serving/text_to_speech/ming_tts/openai_speech_client.py \
+    --text "你好，这是 Ming 在线语音合成测试。"
+```
+
+Structured dialect control:
+```bash
+python examples/online_serving/text_to_speech/ming_tts/openai_speech_client.py \
+    --text "我觉得社会企业同个人都有责任" \
+    --instruction-json '{"方言":"广粤话"}' \
+    --ref-audio /path/to/yue_prompt.wav
+```
+
+Zero-shot cloning:
+```bash
+python examples/online_serving/text_to_speech/ming_tts/openai_speech_client.py \
+    --text "我们的愿景是构建未来服务业的数字化基础设施，为世界带来更多微小而美好的改变。" \
+    --ref-audio /path/to/10002287-00000094.wav \
+    --ref-text "在此奉劝大家别乱打美白针。"
+```
+
+### Notes
+- `run_curl.sh` keeps a small sanity subset; use the Ming README for the broader request cookbook.
+- Online serving is speech-shaped today; music-only `bgm` and text-to-audio `tta` remain offline examples.
+- Full request details live in [`ming_tts/README.md`](ming_tts/README.md).
 
 ---
 
