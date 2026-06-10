@@ -79,6 +79,7 @@ _MOSS_TTS_FULL_MODEL_STAGES = {"moss_tts", "moss_tts_codec"}
 _HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
 _HIGGS_AUDIO_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
+_SONGGEN_TTS_MODEL_STAGES = {"songgen"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -93,6 +94,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _MOSS_TTS_MODEL_STAGES
     | _MOSS_TTS_FULL_MODEL_STAGES
     | _GLM_TTS_MODEL_STAGES
+    | _SONGGEN_TTS_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "fish_tts",
@@ -612,6 +614,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "higgs_audio_v3"
         if model_stage in _GLM_TTS_MODEL_STAGES:
             return "glm_tts"
+        if model_stage in _SONGGEN_TTS_MODEL_STAGES:
+            return "songgen"
         return None
 
     def _get_custom_voice_dir(self) -> str | None:
@@ -1321,6 +1325,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_moss_tts_request(request)
         if self._tts_model_type == "glm_tts":
             return self._validate_glm_tts_request(request)
+        if self._tts_model_type == "songgen":
+            return self._validate_songgen_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _validate_voxcpm2_request(self, request: OpenAICreateSpeechRequest) -> str | None:
@@ -1863,6 +1869,51 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
                 return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
         return None
+
+    def _validate_songgen_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate SongGen request parameters.
+
+        SongGen maps:
+          request.input        -> song lyrics (required)
+          request.instructions -> music style / genre description (optional)
+          request.ref_audio    -> reference voice audio for voice conditioning
+                                  (optional)
+        """
+        if not request.input or not request.input.strip():
+            return "Input (lyrics) cannot be empty for SongGen"
+
+        if request.ref_audio is not None:
+            fmt_err = self._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+
+        return None
+
+    async def _build_songgen_params(self, request: OpenAICreateSpeechRequest) -> dict:
+        """Build additional_information dict for SongGen.
+
+        Returns a dict with keys expected by SongGenForGeneration._create_stream_gen():
+          lyrics            : list[str]  - song lyrics (from request.input)
+          text_description  : list[str]  - style / genre description
+          ref_voice_array   : list[[list[float], int]]  - resolved reference
+                              voice waveform + sample rate (only when ref_audio
+                              is provided)
+
+        The model reads ``ref_voice_array`` (a resolved ``[wav_samples, sr]``
+        pair that it stages to a temp WAV), not a URL. We resolve
+        ``request.ref_audio`` to a waveform here so the server path matches the
+        offline example (``ref_voice_array=[[wav, sr]]``) and the MOSS-TTS
+        ``prompt_audio_array`` convention; emitting ``ref_voice_url`` instead
+        would be silently dropped by the model.
+        """
+        params: dict = {
+            "lyrics": [request.input],
+            "text_description": [request.instructions or ""],
+        }
+        if request.ref_audio is not None:
+            wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+            params["ref_voice_array"] = [[wav_list, sr]]
+        return params
 
     async def _build_higgs_audio_v2_params(self, request: OpenAICreateSpeechRequest):
         """Build prompt_token_ids for higgs_audio_v2 via the upstream processor.
@@ -3006,6 +3057,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     prompt = tokens_input(prompt_token_ids=prompt_token_ids)
                 else:
                     prompt = tokens_input(prompt_token_ids=[1])
+                prompt["additional_information"] = tts_params
+                prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
+            elif self._tts_model_type == "songgen":
+                tts_params = await self._build_songgen_params(request)
+                if sampling_params_list and getattr(sampling_params_list[0], "seed", None) is not None:
+                    tts_params["seed"] = [sampling_params_list[0].seed]
+                prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
                 prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
             else:

@@ -1,0 +1,35 @@
+# SongGen deploy: single-stage AR text-to-song (1.3B).
+# Verified config for 1x H100/A100 80GB.
+#
+# Fields omitted from a stage fall back to StageDeployConfig defaults (see
+# vllm_omni/config/stage_config.py). Notable choices:
+#   * enforce_eager=true  - SongGen uses the upstream generate() call with
+#     trust_remote_code; CUDA graph capture is not wired up.
+#   * gpu_memory_utilization=0.7 - the 1.3B AR model + X-Codec decoder
+#     fit comfortably within 56 GB on an 80 GB GPU.
+#   * max_num_seqs=4 - per-request streaming generators are stored in
+#     self._stream_gens; each request runs independently.
+#   * skip_mm_profiling - SongGen has no multimodal input preprocessing.
+#
+# Prerequisites:
+#   pip install git+https://github.com/LiuZH-19/SongGen.git
+#   # The X-Codec checkpoint is downloaded automatically by SongGenProcessor.
+async_chunk: false
+trust_remote_code: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.7
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    skip_mm_profiling: true
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 1.0
+      top_k: 50
+      max_tokens: 4096
+      seed: 42

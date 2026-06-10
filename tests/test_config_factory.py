@@ -527,6 +527,18 @@ class TestPipelineDiscovery:
         assert pipeline.model_type == "qwen3_omni_moe"
         assert len(pipeline.stages) == 3  # thinker + talker + code2wav
 
+    def test_registry_has_songgen(self):
+        """SongGen's single-stage pipeline is registered and resolvable.
+
+        Without this central entry, ``model_type='songgen'`` raises KeyError and
+        the model cannot be served at all (regression from issue #3388 review).
+        """
+        assert "songgen" in _PIPELINE_REGISTRY
+        pipeline = _PIPELINE_REGISTRY["songgen"]
+        assert pipeline.model_type == "songgen"
+        assert len(pipeline.stages) == 1  # single-stage AR generator
+        assert pipeline.stages[0].final_output_type == "audio"
+
     def test_registry_returns_none_for_unknown(self):
         """Unknown model_types aren't found; ``get()`` returns None."""
         assert "definitely_not_a_real_model" not in _PIPELINE_REGISTRY
