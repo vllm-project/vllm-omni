@@ -258,9 +258,11 @@ class OmniServeCommand(CLISubcommand):
             "--strategy-config",
             type=str,
             default=None,
-            help="Path to a composable-parallel strategy.yaml. Its derived parallel "
-            "sizing is overlaid onto the registry-merged stages before per-stage "
-            "engine args are built (opt-in; ignored on the legacy YAML path).",
+            help="Path to a composable-parallel strategy.yaml. Only applies to "
+            "registry-based models (e.g. qwen2_5_omni): its derived parallel sizing "
+            "is overlaid onto the registry-merged stages before per-stage engine "
+            "args are built. Silently ignored on the legacy stage_configs YAML path "
+            "(a warning is logged if it is passed there).",
         )
         omni_config_group.add_argument(
             "--stage-overrides",

@@ -9,8 +9,16 @@ stage's parallel layout in a runtime-agnostic, data-only form that can be
 translated into concrete engine sizing.
 
 The mesh-axis kinds below enumerate every parallelism dimension the contract can
-describe. Only a subset is translatable today (see ``translator.py``); the rest
-are reserved for future work.
+describe. Only a subset is wired end-to-end today (see ``translator.py``):
+
+* **Wired** (translatable now): ``tp``, ``dp``, ``pp``, ``ep``,
+  ``stage_replica``.
+* **Reserved** (declared in the type system but not yet translatable — the
+  translator raises ``UnsupportedAxisKindError`` for them): ``sp_ulysses``,
+  ``sp_ring``, ``cfg``, ``vae_pp``, ``hsdp``, ``stage_pp``, ``cp``.
+
+Reserved kinds fail fast at translation time rather than silently doing nothing,
+so declaring one is an explicit "not yet" rather than a no-op.
 """
 
 from __future__ import annotations

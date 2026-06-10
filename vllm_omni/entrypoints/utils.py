@@ -369,7 +369,18 @@ def load_stage_configs_from_model(
         # Convert StageConfig objects to OmegaConf for backward compat
         return [stage.to_omegaconf() for stage in stages]
 
-    # Legacy fallback: load from YAML
+    # Legacy fallback: load from YAML. A composable-parallel strategy cannot be
+    # applied here (it overlays onto registry-merged stages), so warn rather than
+    # silently dropping the operator's --strategy-config.
+    if strategy_config_path is not None:
+        logger.warning(
+            "--strategy-config (%s) was provided but model %r resolves via the "
+            "legacy stage_configs YAML path, which does not support "
+            "composable-parallel strategies; the strategy is ignored. Use a "
+            "registry-based model to apply it.",
+            strategy_config_path,
+            model,
+        )
     stage_config_path = resolve_model_config_path(model)
     if stage_config_path is None:
         return []

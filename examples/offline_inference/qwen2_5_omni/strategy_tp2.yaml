@@ -1,0 +1,17 @@
+# Composable-parallel strategy for Qwen2.5-Omni: tensor-parallel the thinker.
+#
+# Shard the thinker stage across 2 GPUs with tensor parallelism (TP=2). TP routing
+# is fixed (broadcast), so no `routing` / load-balancer policy is involved -- this
+# is the simplest axis and a good starting point for the mental model.
+#
+# The strategy sets tensor_parallel_size=2 on the thinker; the deploy YAML just
+# supplies a matching 2-GPU device layout (see deploy_qwen2_5_omni_tp2.yaml).
+#
+# Usage:
+#   python3 end2end.py --query-type text --num-prompts 6 \
+#       --deploy-config deploy_qwen2_5_omni_tp2.yaml \
+#       --strategy-config strategy_tp2.yaml
+strategies:
+  thinker:
+    - axis: tp
+      size: 2

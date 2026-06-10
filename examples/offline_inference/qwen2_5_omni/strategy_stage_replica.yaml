@@ -3,11 +3,13 @@
 # Replicate the thinker stage across 2 independent engines and let the omni
 # StagePool balance requests round-robin across them. The thinker's deploy
 # `devices` entry acts as a per-replica template, so omni expands it to one GPU
-# per replica.
+# per replica. The `routing: round_robin` below auto-derives the StagePool
+# load-balancer policy, so --omni-lb-policy is not needed.
 #
 # Usage:
 #   python3 end2end.py --query-type text --num-prompts 6 \
-#       --strategy-config strategy_stage_replica.yaml --omni-lb-policy round-robin
+#       --deploy-config deploy_qwen2_5_omni_replica.yaml \
+#       --strategy-config strategy_stage_replica.yaml
 strategies:
   thinker:
     - axis: stage_replica
