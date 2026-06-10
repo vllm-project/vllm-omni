@@ -588,15 +588,32 @@ def cosine_similarity_text(text1, text2, n: int = 3):
     return cosine * length_harmony
 
 
-def _merge_base64_audio_to_segment(base64_list: list[str]):
-    from pydub import AudioSegment
+class _AudioBuffer:
+    """Minimal replacement for pydub.AudioSegment used by test helpers."""
 
-    merged = None
+    def __init__(self, data: np.ndarray, sample_rate: int):
+        self.data = data
+        self.sample_rate = sample_rate
+
+    def export(self, buf: io.BytesIO, format: str = "wav"):
+        sf.write(buf, self.data, self.sample_rate, format=format.upper())
+        buf.seek(0)
+
+
+def _merge_base64_audio_to_segment(base64_list: list[str]) -> _AudioBuffer:
+    from vllm.multimodal.media.audio import AudioMediaIO
+
+    io_ = AudioMediaIO()
+    chunks: list[np.ndarray] = []
+    sample_rate: int | None = None
     for b64 in base64_list:
         raw = base64.b64decode(b64.split(",", 1)[-1])
-        seg = AudioSegment.from_file(io.BytesIO(raw))
-        merged = seg if merged is None else merged + seg
-    return merged
+        waveform, sr = io_.load_bytes(raw)
+        if sample_rate is None:
+            sample_rate = int(sr)
+        chunks.append(waveform)
+    merged = np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
+    return _AudioBuffer(merged, sample_rate or 16000)
 
 
 @contextmanager

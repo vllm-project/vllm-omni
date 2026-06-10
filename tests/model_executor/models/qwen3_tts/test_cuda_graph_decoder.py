@@ -478,19 +478,29 @@ def test_compute_capture_sizes(kwargs, expected_in, not_expected):
     "batch,channels,seq_len",
     [(2, 64, 1000), (1, 32, 1), (1, 32, 7), (1, 32, 128), (1, 32, 1024), (1, 32, 4096)],
 )
-def test_snakebeta_triton_vs_eager(batch, channels, seq_len):
-    """Fused Triton SnakeBeta kernel must match eager PyTorch output."""
+@pytest.mark.parametrize(
+    "dtype,atol,rtol",
+    [
+        (torch.float32, 1e-5, 1e-5),
+        (torch.bfloat16, 1e-2, 1e-2),
+        (torch.float16, 1e-3, 1e-3),
+    ],
+    ids=["fp32", "bf16", "fp16"],
+)
+def test_snakebeta_triton_vs_eager(batch, channels, seq_len, dtype, atol, rtol):
+    """Fused Triton SnakeBeta kernel must match eager PyTorch output across dtypes."""
     from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
     if not SnakeBeta._init_triton():
         pytest.skip("Triton not available")
 
     torch.manual_seed(42)
-    snake = SnakeBeta(in_features=channels).to(DEVICE).eval()
-    x = torch.randn(batch, channels, seq_len, device=DEVICE)
+    snake = SnakeBeta(in_features=channels).to(DEVICE).to(dtype).eval()
+    x = torch.randn(batch, channels, seq_len, device=DEVICE, dtype=dtype)
 
     with torch.no_grad():
         eager_out = snake._eager_forward(x)
         triton_out = snake._triton_forward(x)
 
-    torch.testing.assert_close(triton_out, eager_out, atol=1e-5, rtol=1e-5)
+    assert triton_out.dtype == x.dtype
+    torch.testing.assert_close(triton_out, eager_out, atol=atol, rtol=rtol)

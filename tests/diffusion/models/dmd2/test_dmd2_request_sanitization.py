@@ -48,6 +48,7 @@ def _make_request(prompts=None, **sp_kwargs) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         prompts=prompts or [{"prompt": "a cat dancing"}],
         sampling_params=sp,
+        request_id="dmd2-sanitize",
     )
 
 

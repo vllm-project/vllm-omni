@@ -902,6 +902,7 @@ class MingAudioGenerator:
         if self._audio_vae is None:
             return requested_max_steps
 
+        # Transformers >=5.x may expose these config values as 0-d tensors.
         sample_rate = float(self._audio_vae.config.sample_rate)
         vae_patch_size = float(getattr(self._audio_vae.config, "patch_size", 4))
         hop_size = float(getattr(self._audio_vae.decoder, "hop_length", 320))
@@ -1041,7 +1042,7 @@ class MingAudioGenerator:
                 use_cache=True,
             )
         else:
-            past_seen_tokens = past_key_values.get_seq_length()
+            past_seen_tokens = int(past_key_values.get_seq_length())
             cache_position = torch.arange(
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],

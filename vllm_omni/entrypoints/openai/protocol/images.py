@@ -122,6 +122,13 @@ class ImageGenerationRequest(BaseModel):
         le=20.0,
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
+    flow_shift: float | None = Field(
+        default=None, description="Scheduler flow_shift (sigma shift) for flow-matching diffusion models."
+    )
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional model-specific parameters passed directly to the model's extra_args.",
+    )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,
@@ -186,6 +193,10 @@ class ImageEditARDeltaChunk(BaseModel):
     index: int = Field(default=0, description="Completion index for the AR stage output")
     created: int = Field(..., description="Unix timestamp of when the stream was created")
     model: str = Field(..., description="Model used for the image edit request")
+    metrics: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional vLLM-Omni per-stage metrics snapshot for benchmark clients.",
+    )
 
 
 class ImageEditImageChunk(BaseModel):
@@ -198,6 +209,10 @@ class ImageEditImageChunk(BaseModel):
     size: str = Field(..., description="The generated image size")
     created: int = Field(..., description="Unix timestamp of when the stream was created")
     model: str = Field(..., description="Model used for the image edit request")
+    metrics: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional vLLM-Omni per-stage metrics snapshot for benchmark clients.",
+    )
 
 
 class ImageEditStreamError(BaseModel):

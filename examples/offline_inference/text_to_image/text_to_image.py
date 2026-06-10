@@ -307,9 +307,6 @@ def parse_args() -> argparse.Namespace:
         help="Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
     )
     current_omni_platform.pre_register_and_update(parser)
-    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

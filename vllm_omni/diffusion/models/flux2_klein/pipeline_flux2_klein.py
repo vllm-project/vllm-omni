@@ -39,7 +39,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
 )
@@ -213,9 +213,10 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
         # Avoid the transformers v5 multi-worker subfolder race (see
         # ``vllm_omni/diffusion/model_loader/hub_prefetch.py`` for the full
         # analysis; L4 build #1043 hit this on FLUX.2-klein-4B's text_encoder).
+        flux2_subfolders = ["scheduler", "text_encoder", "tokenizer", "vae"]
         prefetch_subfolders(
             model,
-            ["scheduler", "text_encoder", "tokenizer", "vae"],
+            flux2_subfolders,
             local_files_only=local_files_only,
         )
 
@@ -224,9 +225,15 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
             subfolder="scheduler",
             local_files_only=local_files_only,
         )
-        self.text_encoder = Qwen3ForCausalLM.from_pretrained(
+        # ``from_pretrained_with_prefetch`` re-prefetches and retries if a peer
+        # worker left the cache half-written (missing-shard ``OSError`` or the
+        # default-config size-mismatch ``RuntimeError``) instead of crashing
+        # the worker - FLUX.2-klein-4B's sharded text_encoder hit this on #1043.
+        self.text_encoder = from_pretrained_with_prefetch(
+            Qwen3ForCausalLM.from_pretrained,
             model,
             subfolder="text_encoder",
+            prefetch_list=flux2_subfolders,
             local_files_only=local_files_only,
         ).to(self._execution_device)
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
@@ -234,9 +241,11 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
             subfolder="tokenizer",
             local_files_only=local_files_only,
         )
-        self.vae = AutoencoderKLFlux2.from_pretrained(
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKLFlux2.from_pretrained,
             model,
             subfolder="vae",
+            prefetch_list=flux2_subfolders,
             local_files_only=local_files_only,
         ).to(self._execution_device)
 
