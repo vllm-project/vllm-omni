@@ -970,11 +970,14 @@ class HunyuanImage3Pipeline(
         # This implementation can handle sequences with text and image modalities, where text tokens use causal
         # attention and image tokens use full attention.
         bsz, seq_len = inputs_tensor.shape
+        device = inputs_tensor.device
         tokenizer_output = model_kwargs["tokenizer_output"]
         batch_image_slices = [
             tokenizer_output.joint_image_slices[i] + tokenizer_output.gen_image_slices[i] for i in range(bsz)
         ]
-        attention_mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril(diagonal=0).repeat(bsz, 1, 1)
+        attention_mask = (
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril(diagonal=0).repeat(bsz, 1, 1)
+        )
         full_attn_spans: list[list[tuple[int, int]]] = [[] for _ in range(bsz)]
         for i in range(bsz):
             for j, image_slice in enumerate(batch_image_slices[i]):
