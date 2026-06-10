@@ -268,6 +268,28 @@ Before entering specific testing levels, the project establishes two common spec
 1.  ***PR Checklist ([Tests Style](../ci/tests_style.md))***: This template defines the self-check items that must be completed before submitting a code review (Pull Request). It ensures that each code change meets basic requirements such as code style, dependency updates, and documentation synchronization before entering the automated testing pipeline, serving as the first manual line of defense for quality assurance.
 2.  ***CI Failure Explanation ([CI Failures](../ci/failures.md))***: This document archives and explains common failure patterns in the Continuous Integration (CI) pipeline, error log interpretation, and preliminary troubleshooting steps. It helps developers and testers quickly diagnose the causes of automated test failures, improving problem-solving efficiency.
 
+### Test helper environment variables
+
+Some shared helpers under `tests/helpers/` honor optional environment variables for local debugging. These are **not** set in CI by default.
+
+| Variable | Accepted values | Description |
+| -------- | --------------- | ----------- |
+| `VLLM_OMNI_KEEP_REQUEST_MEDIA` | `1`, `true`, `yes` (case-insensitive) | When enabled, temporary WAV files created by `tests.helpers.media.convert_audio_bytes_to_text` are **not** deleted when the pytest process exits. By default, each call writes a unique file under the system temp directory via `tempfile.mkstemp` and registers `atexit` cleanup. Use this when debugging audio output validation (Whisper transcription, keyword checks, text–audio similarity). The saved path is logged as `audio data is saved: <path>`. |
+
+Example (Linux / macOS):
+
+```bash
+export VLLM_OMNI_KEEP_REQUEST_MEDIA=1
+pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -k test_mix_to_text_audio
+```
+
+Example (Windows PowerShell):
+
+```powershell
+$env:VLLM_OMNI_KEEP_REQUEST_MEDIA = "1"
+pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -k test_mix_to_text_audio
+```
+
 ## Chapter 1: L1 & L2 Level Testing - Unit Testing and Basic End-to-End Verification
 
 ### 1.1 Testing Purpose
@@ -519,6 +541,8 @@ L3 level testing executes after code is merged into the main branch. Its core pu
     **Single Request**: The comment clearly states this is a single-request completion test. For concurrent testing, it can be extended to multiple requests using request_num = n.
 
     **Implicit Validation**: The `send_omni_request` and `send_diffusion_request` methods internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model and full_model perform deep validation.
+
+    **Audio output debugging**: Deep validation may transcribe returned audio via `convert_audio_bytes_to_text` (Whisper). If an audio keyword or text–audio similarity assertion fails, set `VLLM_OMNI_KEEP_REQUEST_MEDIA=1` before running pytest to keep the intermediate WAV files for inspection (see [Test helper environment variables](#test-helper-environment-variables)).
 
 -   ***Run Command (L3 merge)***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}.py -m advanced_model --run-level=advanced_model`
 
