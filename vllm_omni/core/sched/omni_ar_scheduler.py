@@ -218,7 +218,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_input_timeouts()
 
         if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+            self.chunk_transfer_adapter.process_pending_chunks(
+                self.waiting, self.running, scheduler_requests=self.requests
+            )
 
         try:
             scheduler_output = super().schedule()
@@ -626,7 +628,34 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
+        # Realign stale ``request.status`` (chunk-transfer-adapter's
+        # ``requests_origin_status`` table doesn't follow the
+        # ``waiting → running`` admit transition; without this, an abort
+        # arriving between admit and the next deque round-trip leaves
+        # the request in ``self.running`` with ``status=WAITING`` and
+        # upstream ``Scheduler.finish_requests`` silently fails to
+        # release the worker's ``input_batch`` slot -- after
+        # ``max_num_seqs`` such aborts new requests hang at
+        # ``chunks=0``). Only the ``async_chunk`` path triggers the
+        # staleness; with ``async_chunk`` disabled this is a cheap O(n)
+        # no-op over an already-aligned set, kept unconditional so the
+        # abort path stays uniform across configurations. See
+        # ``OmniSchedulerMixin._realign_request_status_to_queues`` and
+        # #3774 discussion.
+        self._realign_request_status_to_queues(request_ids)
+
         finished = super().finish_requests(request_ids, finished_status)
+
+        # Defensive post-finish purge: belt-and-suspenders to the
+        # realignment above. Even after realign + ``super()``, corner
+        # cases (mid-transition status, connector cleanups that pop
+        # from ``self.requests`` without unwinding ``self.running``)
+        # can leave already-finished or untracked entries in
+        # ``self.running``. Sweep them now so the worker's
+        # ``input_batch`` slot never pins a freed request and starves
+        # new admissions. See ``OmniSchedulerMixin._purge_finished_from_running``.
+        self._purge_finished_from_running()
+
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is not None:
             for request_id, _ in finished:
