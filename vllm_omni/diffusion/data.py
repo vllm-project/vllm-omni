@@ -904,6 +904,9 @@ class OmniDiffusionConfig:
                 elif self.model_class_name == "LingbotWorldFastPipeline":
                     self.tf_config_dict = get_hf_file_to_dict("config.json", self.model)
                     self.tf_model_config = TransformerConfig.from_dict(self.tf_config_dict)
+                elif self.model_class_name == "CausVidPipeline":
+                    self.tf_config_dict = get_hf_file_to_dict("config.json", self.model)
+                    self.tf_model_config = TransformerConfig.from_dict(self.tf_config_dict)
                 elif architectures and len(architectures) == 1:
                     self.model_class_name = architectures[0]
                 else:
