@@ -12,11 +12,13 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
+from diffusers import AutoencoderKLWan
 from einops import rearrange
 from torch import nn
 from tqdm import tqdm
-from vllm.sequence import IntermediateTensors
+from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -34,6 +36,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportCameraPosInput, SupportImageInput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+from vllm_omni.platforms import current_omni_platform
 
 from .cam_utils import (
     compute_relative_poses,
@@ -44,9 +47,7 @@ from .cam_utils import (
 from .flow_scheduler import LingbotFlowScheduler
 from .fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .state_lingbot_world_fast import LingbotWorldFastState
-from .stream_vae import StreamVAE
-from .t5 import T5EncoderModel
-from .vae2_1 import Wan2_1_VAE
+from .stream_autoencoder_kl_wan import StreamAutoencoderKLWan
 from .wan_fast import WanModelFast
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,19 @@ CONFIG = {
     "vae_checkpoint": "Wan2.1_VAE.pth",
     "fast_noise_checkpoint": "Lingbot-World-Fast",
 }
+
+T5_CONFIG = UMT5Config(
+    vocab_size=256384,
+    d_model=4096,
+    d_kv=64,
+    d_ff=10240,
+    num_heads=64,
+    num_layers=24,
+    relative_attention_num_buckets=32,
+    shared_pos=False,
+    dropout_rate=0.1,
+    is_encoder_decoder=False,
+)
 
 
 def get_lingbot_world_fast_post_process_func(
@@ -101,23 +115,48 @@ class LingbotWorldFastPipeline(
 
         self.state = LingbotWorldFastState()
 
-        checkpoint_path = os.path.dirname(self.od_config.model)
-        assert checkpoint_path is not None, "lingbot_dir is None"
+        model_path = os.path.dirname(self.od_config.model)
+        assert model_path is not None, "lingbot_dir is None"
 
-        self.text_encoder = T5EncoderModel(
-            text_len=od_config.tf_model_config.get("text_len"),
-            dtype=self.target_dtype,
-            device=self.device,
-            checkpoint_path=os.path.join(checkpoint_path, CONFIG["t5_checkpoint"]),
-            tokenizer_path=os.path.join(checkpoint_path, CONFIG["t5_tokenizer"]),
-        )
+        tokenizer_path = os.path.join(model_path, CONFIG["t5_tokenizer"])
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+        t5_checkpoint = os.path.join(model_path, CONFIG["t5_checkpoint"])
+        wan_sd = torch.load(t5_checkpoint, map_location="cpu", weights_only=True)
+        self.text_encoder = UMT5EncoderModel(T5_CONFIG)
+        # The checkpoint is in Wan's naming, not HF's — remap before loading.
+        self.text_encoder.load_state_dict(_wan_t5_to_hf_state_dict(wan_sd), assign=True)
+        self.text_encoder = self.text_encoder.to(device=self.device, dtype=self.target_dtype).eval()
 
         self.vae_stride = od_config.model_config.get("vae_stride", (4, 8, 8))
         self.patch_size = od_config.model_config.get("patch_size", (1, 2, 2))
-        base_vae = Wan2_1_VAE(vae_pth=os.path.join(checkpoint_path, CONFIG["vae_checkpoint"]), device=self.device)
-        self.vae = StreamVAE(base_vae) if od_config.stream_batch else base_vae
 
-        logger.info(f"Creating WanModelFast from {checkpoint_path}")
+        needs_vae = od_config.stream_batch is False or is_pipeline_first_stage()
+        if needs_vae:
+            vae_path = os.path.join(model_path, CONFIG["vae_checkpoint"])
+            vae_sd = torch.load(vae_path, map_location="cpu", weights_only=True)
+            self.vae = AutoencoderKLWan()
+            # The checkpoint is in Wan's naming, not diffusers' — remap before loading.
+            self.vae.load_state_dict(_wan_vae_to_diffusers_state_dict(vae_sd), assign=True)
+            self.vae = self.vae.to(self.device)
+
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(self.vae.device, self.vae.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                1, self.vae.config.z_dim, 1, 1, 1
+            ).to(self.vae.device, self.vae.dtype)
+            self.latents_scale = [latents_mean, latents_std]
+
+            if od_config.stream_batch:
+                self.vae = StreamAutoencoderKLWan(self.vae, self.latents_scale)
+        else:
+            self.vae = None
+            self.latents_scale = None
+
+        logger.info(f"Creating WanModelFast from {model_path}")
 
         self.model = WanModelFast(
             in_dim=od_config.tf_model_config.get("in_dim"),
@@ -131,19 +170,13 @@ class LingbotWorldFastPipeline(
         # get_all_weights() yields nothing and load_weights() runs empty.
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
-                model_or_path=checkpoint_path,
+                model_or_path=model_path,
                 subfolder=CONFIG["fast_noise_checkpoint"],
                 revision=None,
                 prefix="model.",
                 fall_back_to_pt=True,
             ),
         ]
-        # self.model = WanModelFast.from_pretrained(
-        #     checkpoint_path,
-        #     subfolder=CONFIG["fast_noise_checkpoint"],
-        #     torch_dtype=torch.bfloat16,
-        #     control_type=self.control_type,
-        # ).to(self.device)
 
         # Partition transformer across PP ranks (no-op at PP=1).
         self.model.apply_pp_split()
@@ -200,6 +233,7 @@ class LingbotWorldFastPipeline(
                 """This model only supports a single prompt, not a batched request.""",
                 """Please pass in a single prompt object or string, or a single-item list.""",
             )
+
         prompt = req.prompts[0].get("prompt")
         multi_modal_data = req.prompts[0].get("multi_modal_data", {})
 
@@ -238,7 +272,7 @@ class LingbotWorldFastPipeline(
         num_frames = req.sampling_params.num_frames
         # In order to generate something num_frames must be at least 5 since it expects 4*n + 1 as input
         # 25 is the smallest length supported by the model. Smaller values generate tensors with dimension zero/negative
-        num_frames = max(25, num_frames)
+        num_frames = max(13, num_frames)
 
         c2ws = camera.get("poses")
         latent_frames_per_chunk = self.od_config.model_config["latent_frames_per_chunk"]
@@ -306,7 +340,7 @@ class LingbotWorldFastPipeline(
         self.scheduler.set_timesteps(self.num_train_timesteps, shift=CONFIG["sample_shift"])
         timesteps = self.scheduler.timesteps[CONFIG["timesteps_index"]]
 
-        context = self.text_encoder([prompt], self.device)
+        context = self.encode_prompt([prompt], self.device)
         context = [t.to(self.device) for t in context]
 
         dit_cond_dict = None
@@ -361,10 +395,10 @@ class LingbotWorldFastPipeline(
                 ],
                 dim=1,
             ).to(self.device)
-            y = self.vae.encode([pixels])[0]
+            y = self.encode_video([pixels])[0]
         else:
             pixels = torch.zeros(3, 4 * new_lat_f + 1, h, w, device=self.device)
-            y = self.vae.encode([pixels])[0][:, 1:]
+            y = self.encode_video([pixels])[0][:, 1:]
         y = torch.concat([msk, y])
 
         @contextmanager
@@ -483,10 +517,10 @@ class LingbotWorldFastPipeline(
                     k = warmup.shape[1]
                     drop = 4 * k - 3
                     to_decode = torch.cat([warmup, pred_latent_chunks], dim=1)
-                    videos = self.vae.decode([to_decode])
+                    videos = self.decode_video([to_decode])
                     videos = [v[:, drop:] for v in videos]
                 else:
-                    videos = self.vae.decode([pred_latent_chunks])
+                    videos = self.decode_video([pred_latent_chunks])
 
                 self.state.last_decoded_latent = pred_latent_chunks[:, -2:].detach().clone()
 
@@ -506,6 +540,40 @@ class LingbotWorldFastPipeline(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def encode_prompt(self, texts: list[str], device: torch.device):
+        inputs = self.tokenizer(
+            texts,
+            padding=True,
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+        ids = inputs.input_ids.to(device)
+        mask = inputs.attention_mask.to(device)
+        seq_lens = mask.gt(0).sum(dim=1).long()
+        context = self.text_encoder(input_ids=ids, attention_mask=mask).last_hidden_state
+        return [u[:v] for u, v in zip(context, seq_lens)]
+
+    def encode_video(self, videos: list[torch.Tensor]):
+        mean, inv_std = self.latents_scale  # [latents_mean, 1/std], shapes (1, z, 1, 1, 1)
+        out = []
+        for u in videos:
+            # AutoencoderKLWan.encode -> AutoencoderKLOutput; the custom Wan2_1_VAE.encode
+            # returns the deterministic posterior mean (mu, no sampling), so use .mode().
+            mu = self.vae.encode(u.unsqueeze(0)).latent_dist.mode()
+            mu = (mu - mean) * inv_std
+            out.append(mu.float().squeeze(0))
+        return out
+
+    def decode_video(self, zs: list[torch.Tensor]):
+        mean, inv_std = self.latents_scale
+        out = []
+        for u in zs:
+            z = u.unsqueeze(0) / inv_std + mean
+            sample = self.vae.decode(z, return_dict=False)[0]
+            out.append(sample.float().clamp_(-1, 1).squeeze(0))
+        return out
+
     # ------------------------------------------------------------------
     # micro-step execution
     # ------------------------------------------------------------------
@@ -516,7 +584,7 @@ class LingbotWorldFastPipeline(
         **kwargs: Any,
     ) -> torch.Tensor | IntermediateTensors:
         """Single transformer forward; returns IntermediateTensors on non-last PP stages."""
-        with torch.amp.autocast("cuda", dtype=self.target_dtype):
+        with torch.amp.autocast(current_omni_platform.device_type, dtype=self.target_dtype):
             result = self.model(**kwargs, intermediate_tensors=intermediate_tensors)
         if isinstance(result, IntermediateTensors):
             return result
@@ -637,7 +705,7 @@ class LingbotWorldFastPipeline(
         denoise_timesteps = self.scheduler.timesteps[ts_idx].to(self.device)
 
         # Text + camera Plucker
-        context_list = self.text_encoder([prompt], self.device)
+        context_list = self.encode_prompt([prompt], self.device)
         context_list = [c.to(self.device) for c in context_list]
 
         Ks_raw = torch.from_numpy(camera.get("intrinsics"))
@@ -1032,3 +1100,158 @@ class LingbotWorldFastPipeline(
             self.state.advance(state.extra["new_lat_f"])
 
         return DiffusionOutput(output=videos[0])
+
+
+def _wan_t5_to_hf_state_dict(sd: dict) -> dict:
+    """Remap the Wan ``models_t5_umt5-xxl-enc-bf16.pth`` checkpoint (saved from the
+    custom ``T5Encoder`` in ``t5.py``) to the key naming expected by HF's
+    ``UMT5EncoderModel``. Same weights, different module names."""
+    block_map = {
+        "norm1.weight": "layer.0.layer_norm.weight",
+        "attn.q.weight": "layer.0.SelfAttention.q.weight",
+        "attn.k.weight": "layer.0.SelfAttention.k.weight",
+        "attn.v.weight": "layer.0.SelfAttention.v.weight",
+        "attn.o.weight": "layer.0.SelfAttention.o.weight",
+        "pos_embedding.embedding.weight": "layer.0.SelfAttention.relative_attention_bias.weight",
+        "norm2.weight": "layer.1.layer_norm.weight",
+        "ffn.gate.0.weight": "layer.1.DenseReluDense.wi_0.weight",
+        "ffn.fc1.weight": "layer.1.DenseReluDense.wi_1.weight",
+        "ffn.fc2.weight": "layer.1.DenseReluDense.wo.weight",
+    }
+    out = {}
+    for k, v in sd.items():
+        if k == "token_embedding.weight":
+            out["shared.weight"] = v
+            out["encoder.embed_tokens.weight"] = v
+        elif k == "norm.weight":
+            out["encoder.final_layer_norm.weight"] = v
+        elif k.startswith("blocks."):
+            _, idx, rest = k.split(".", 2)
+            mapped = block_map.get(rest)
+            if mapped is None:
+                raise KeyError(f"Unmapped Wan T5 key: {k}")
+            out[f"encoder.block.{idx}.{mapped}"] = v
+        else:
+            raise KeyError(f"Unmapped Wan T5 key: {k}")
+    return out
+
+
+def _wan_vae_to_diffusers_state_dict(sd: dict) -> dict:
+    """Remap the original ``Wan2.1_VAE.pth`` checkpoint (custom ``Wan2_1_VAE`` naming)
+    to the key naming expected by diffusers' ``AutoencoderKLWan``. Same weights,
+    different module names. Ported from diffusers'
+    ``scripts/convert_wan_to_diffusers.py::convert_vae``."""
+    middle_key_mapping = {}
+    for enc_dec in ("encoder", "decoder"):
+        for src_idx, dst_idx in ((0, 0), (2, 1)):
+            base = f"{enc_dec}.mid_block.resnets.{dst_idx}"
+            middle_key_mapping.update(
+                {
+                    f"{enc_dec}.middle.{src_idx}.residual.0.gamma": f"{base}.norm1.gamma",
+                    f"{enc_dec}.middle.{src_idx}.residual.2.bias": f"{base}.conv1.bias",
+                    f"{enc_dec}.middle.{src_idx}.residual.2.weight": f"{base}.conv1.weight",
+                    f"{enc_dec}.middle.{src_idx}.residual.3.gamma": f"{base}.norm2.gamma",
+                    f"{enc_dec}.middle.{src_idx}.residual.6.bias": f"{base}.conv2.bias",
+                    f"{enc_dec}.middle.{src_idx}.residual.6.weight": f"{base}.conv2.weight",
+                }
+            )
+
+    attention_mapping = {}
+    head_mapping = {}
+    for enc_dec in ("encoder", "decoder"):
+        attention_mapping.update(
+            {
+                f"{enc_dec}.middle.1.norm.gamma": f"{enc_dec}.mid_block.attentions.0.norm.gamma",
+                f"{enc_dec}.middle.1.to_qkv.weight": f"{enc_dec}.mid_block.attentions.0.to_qkv.weight",
+                f"{enc_dec}.middle.1.to_qkv.bias": f"{enc_dec}.mid_block.attentions.0.to_qkv.bias",
+                f"{enc_dec}.middle.1.proj.weight": f"{enc_dec}.mid_block.attentions.0.proj.weight",
+                f"{enc_dec}.middle.1.proj.bias": f"{enc_dec}.mid_block.attentions.0.proj.bias",
+            }
+        )
+        head_mapping.update(
+            {
+                f"{enc_dec}.head.0.gamma": f"{enc_dec}.norm_out.gamma",
+                f"{enc_dec}.head.2.bias": f"{enc_dec}.conv_out.bias",
+                f"{enc_dec}.head.2.weight": f"{enc_dec}.conv_out.weight",
+            }
+        )
+
+    quant_mapping = {
+        "conv1.weight": "quant_conv.weight",
+        "conv1.bias": "quant_conv.bias",
+        "conv2.weight": "post_quant_conv.weight",
+        "conv2.bias": "post_quant_conv.bias",
+    }
+
+    residual_renames = {
+        ".residual.0.gamma": ".norm1.gamma",
+        ".residual.2.bias": ".conv1.bias",
+        ".residual.2.weight": ".conv1.weight",
+        ".residual.3.gamma": ".norm2.gamma",
+        ".residual.6.bias": ".conv2.bias",
+        ".residual.6.weight": ".conv2.weight",
+    }
+
+    out = {}
+    for key, value in sd.items():
+        if key in middle_key_mapping:
+            out[middle_key_mapping[key]] = value
+        elif key in attention_mapping:
+            out[attention_mapping[key]] = value
+        elif key in head_mapping:
+            out[head_mapping[key]] = value
+        elif key in quant_mapping:
+            out[quant_mapping[key]] = value
+        elif key in ("encoder.conv1.weight", "encoder.conv1.bias", "decoder.conv1.weight", "decoder.conv1.bias"):
+            out[key.replace(".conv1.", ".conv_in.")] = value
+        elif key.startswith("encoder.downsamples."):
+            new_key = key.replace("encoder.downsamples.", "encoder.down_blocks.")
+            for src, dst in residual_renames.items():
+                if src in new_key:
+                    new_key = new_key.replace(src, dst)
+                    break
+            else:
+                new_key = new_key.replace(".shortcut.", ".conv_shortcut.")
+            out[new_key] = value
+        elif key.startswith("decoder.upsamples."):
+            block_idx = int(key.split(".")[2])
+            if "residual" in key:
+                grouping = {
+                    **dict.fromkeys((0, 1, 2), 0),
+                    **dict.fromkeys((4, 5, 6), 1),
+                    **dict.fromkeys((8, 9, 10), 2),
+                    **dict.fromkeys((12, 13, 14), 3),
+                }
+                if block_idx not in grouping:
+                    out[key] = value
+                    continue
+                new_block_idx = grouping[block_idx]
+                resnet_idx = block_idx - [0, 4, 8, 12][new_block_idx]
+                new_key = key
+                for src, dst in residual_renames.items():
+                    if src in key:
+                        new_key = f"decoder.up_blocks.{new_block_idx}.resnets.{resnet_idx}{dst}"
+                        break
+                out[new_key] = value
+            elif ".shortcut." in key:
+                if block_idx == 4:
+                    new_key = key.replace(".shortcut.", ".resnets.0.conv_shortcut.")
+                    new_key = new_key.replace("decoder.upsamples.4", "decoder.up_blocks.1")
+                else:
+                    new_key = key.replace("decoder.upsamples.", "decoder.up_blocks.")
+                    new_key = new_key.replace(".shortcut.", ".conv_shortcut.")
+                out[new_key] = value
+            elif ".resample." in key or ".time_conv." in key:
+                upsampler = {3: 0, 7: 1, 11: 2}.get(block_idx)
+                if upsampler is not None:
+                    new_key = key.replace(
+                        f"decoder.upsamples.{block_idx}", f"decoder.up_blocks.{upsampler}.upsamplers.0"
+                    )
+                else:
+                    new_key = key.replace("decoder.upsamples.", "decoder.up_blocks.")
+                out[new_key] = value
+            else:
+                out[key.replace("decoder.upsamples.", "decoder.up_blocks.")] = value
+        else:
+            out[key] = value
+    return out
