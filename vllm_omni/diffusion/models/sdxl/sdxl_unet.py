@@ -611,6 +611,15 @@ class SDXLUNet2DConditionModel(nn.Module):
     _repeated_blocks = ["SDXLBasicTransformerBlock", "SDXLResnetBlock2D"]
     _sp_plan = _build_sdxl_sp_plan()
 
+    @staticmethod
+    def _is_shardable_block(name: str, module) -> bool:
+        """Match transformer blocks and ResNet blocks for HSDP sharding."""
+        if not name.split(".")[-1].isdigit():
+            return False
+        return "transformer_blocks" in name or "resnets" in name
+
+    _hsdp_shard_conditions = [_is_shardable_block]
+
     def __init__(self, *, od_config: OmniDiffusionConfig):
         super().__init__()
         self.od_config = od_config
