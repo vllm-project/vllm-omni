@@ -35,7 +35,11 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
-        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingDenseConfig
+        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
+            BailingMoeConfig,
+            MingDenseConfig,
+            MingMoeConfig,
+        )
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
@@ -57,6 +61,8 @@ def _register_omni_hf_configs() -> None:
 
     for model_type, config_cls in [
         ("dense", MingDenseConfig),
+        ("bailingmm", MingMoeConfig),
+        ("bailing_moe", BailingMoeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
