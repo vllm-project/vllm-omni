@@ -573,7 +573,9 @@ class HunyuanImage3Pipeline(
         cond_vit_image_embeds = []
         for batch_idx, image in enumerate(cond_vit_images):
             cur_kwargs = {k: v[batch_idx] for k, v in vit_kwargs.items()}
-            image_embed = self.vision_model(image, **cur_kwargs).last_hidden_state
+            # Siglip2VisionTransformer now returns a plain tensor (B, max_patches,
+            # hidden_size) after the vLLM-layers refactor, not an HF-style output.
+            image_embed = self.vision_model(image, **cur_kwargs)
             image_embed = self.vision_aligner(image_embed)
             n, seq_len, dim = image_embed.shape
             image_embed = image_embed.reshape(n * seq_len, dim)
@@ -624,7 +626,7 @@ class HunyuanImage3Pipeline(
             rope_image_info.append(list(zip(image_slices, image_shapes)))
         return rope_image_info
 
-    def vae_encode(self, image, cfg_factor=1):
+    def vae_encode(self, image, cfg_factor=1, generator=None):
         config = self.vae.config
 
         if image.ndim == 3:
@@ -639,11 +641,7 @@ class HunyuanImage3Pipeline(
             if isinstance(vae_encode_result, torch.Tensor):
                 latents = vae_encode_result
             else:
-                # Match HunyuanImage-3's cond encode path: sample the
-                # posterior, but use a fixed generator so repeated online
-                # requests are deterministic.
-                _cond_vae_gen = torch.Generator(device=image.device).manual_seed(0)
-                latents = vae_encode_result.latent_dist.sample(_cond_vae_gen)
+                latents = vae_encode_result.latent_dist.sample(generator)
             if hasattr(config, "shift_factor") and config.shift_factor:
                 latents.sub_(config.shift_factor)
             if hasattr(config, "scaling_factor") and config.scaling_factor:
@@ -666,14 +664,17 @@ class HunyuanImage3Pipeline(
         self,
         batch_cond_image_info_list: list[list[JointImageInfo]],
         cfg_factor: int = 1,
+        generator=None,
     ):
         # VAE encode one by one, as we assume cond images have different sizes
         batch_cond_vae_images, batch_cond_t, batch_cond_vit_images = [], [], []
-        for cond_image_info_list in batch_cond_image_info_list:
+        for batch_idx, cond_image_info_list in enumerate(batch_cond_image_info_list):
             cond_vae_image_list, cond_t_list, cond_vit_image_list = [], [], []
+            cond_generator = generator[batch_idx] if isinstance(generator, list) else generator
             for image_info in cond_image_info_list:
                 cond_t_, cond_vae_image_ = self.vae_encode(
                     image_info.vae_image_info.image_tensor.to(self.device),
+                    generator=cond_generator,
                 )
                 cond_vit_image_list.append(image_info.vision_image_info.image_tensor)
                 cond_vae_image_list.append(cond_vae_image_.squeeze(0))
@@ -863,9 +864,11 @@ class HunyuanImage3Pipeline(
         output, sections = out["output"], out["sections"]
 
         # 4. Encode conditional images
-        if batch_cond_image_info is not None and len(batch_cond_image_info[0]) > 0:
+        # Skip encoding if AR KV reuse is enabled
+        has_ar_kv = kwargs.get("ar_kv_data")
+        if batch_cond_image_info is not None and len(batch_cond_image_info[0]) > 0 and not has_ar_kv:
             cond_vae_images, cond_timestep, cond_vit_images = self._encode_cond_image(
-                batch_cond_image_info, cfg_factor[mode]
+                batch_cond_image_info, cfg_factor[mode], generator=generator
             )
             vit_kwargs = {"spatial_shapes": [], "attention_mask": []}
             for cond_image_info in batch_cond_image_info:
@@ -1389,18 +1392,23 @@ class HunyuanImage3Pipeline(
         **kwargs,
     ) -> DiffusionOutput:
         extra_args = getattr(getattr(req, "sampling_params", None), "extra_args", {}) or {}
+        bot_task = extra_args.get("bot_task")
         use_system_prompt = extra_args.get("use_system_prompt")
         system_prompt = extra_args.get("system_prompt")
-        # Fall back to per-prompt use_system_prompt forwarded by ar2diffusion
+        # Fall back to per-prompt prompt kwargs forwarded by ar2diffusion
         if req.prompts:
             first_prompt = req.prompts[0]
             if isinstance(first_prompt, dict):
+                if bot_task is None:
+                    bot_task = first_prompt.get("bot_task")
                 if use_system_prompt is None:
                     use_system_prompt = first_prompt.get("use_system_prompt")
                 if system_prompt is None:
                     system_prompt = first_prompt.get("system_prompt")
+        if isinstance(bot_task, str) and bot_task.lower() == "none":
+            bot_task = None
         if use_system_prompt is not None:
-            system_prompt = get_system_prompt(use_system_prompt, "image", system_prompt)
+            system_prompt = get_system_prompt(use_system_prompt, bot_task or "image", system_prompt)
             system_prompt = system_prompt.strip() if system_prompt is not None else ""
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
 
@@ -1447,6 +1455,18 @@ class HunyuanImage3Pipeline(
         # ---- AR KV Reuse: extract injected KV from request ----
         ar_kv_kwargs = self._extract_ar_kv_from_request(req)
 
+        tokenizer_bot_task = bot_task
+        if tokenizer_bot_task == "think_recaption":
+            tokenizer_bot_task = "think"
+        elif tokenizer_bot_task == "vanilla":
+            tokenizer_bot_task = "image"
+        supported_bot_tasks = {"auto", "image", "think", "recaption", "img_ratio"}
+        if tokenizer_bot_task is not None and tokenizer_bot_task not in supported_bot_tasks:
+            raise ValueError(
+                f"Unsupported HunyuanImage3 single-stage bot_task: {tokenizer_bot_task!r}. "
+                f"Supported values are: {sorted(supported_bot_tasks)}."
+            )
+
         model_inputs = self.prepare_model_inputs(
             prompt=prompt,
             cot_text=cot_text,
@@ -1457,6 +1477,8 @@ class HunyuanImage3Pipeline(
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             batch_cond_image_info=batch_cond_image_info,
+            bot_task=tokenizer_bot_task or "auto",
+            **ar_kv_kwargs,
         )
 
         model_inputs.update(ar_kv_kwargs)

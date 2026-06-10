@@ -156,7 +156,7 @@ class FakeAsyncOmni:
         self.captured_prompt = None
         self._images = images or [Image.new("RGB", (64, 64), color="green")]
 
-    async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
         if sampling_params_list is not None:
             self.captured_sampling_params_list = sampling_params_list
         else:
@@ -254,7 +254,7 @@ def async_omni_test_client():
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             if sampling_params_list is not None:
                 self.captured_sampling_params_list = sampling_params_list
             else:
@@ -318,7 +318,7 @@ def async_omni_rgba_test_client():
             self._images = [Image.new("RGBA", (64, 64), color=(0, 255, 0, 128))]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             if sampling_params_list is not None:
                 self.captured_sampling_params_list = sampling_params_list
             else:
@@ -382,7 +382,7 @@ def async_omni_stage_configs_only_client():
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             if sampling_params_list is not None:
                 self.captured_sampling_params_list = sampling_params_list
             else:
@@ -442,7 +442,7 @@ def streaming_image_edit_client():
             self.captured_prompt = None
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             self.captured_prompt = prompt
             self.captured_sampling_params_list = sampling_params_list or [sampling_params]
             assert self.captured_sampling_params_list[0].output_kind == RequestOutputKind.DELTA
@@ -584,6 +584,7 @@ def test_generate_single_image(test_client):
     img_bytes = base64.b64decode(data["data"][0]["b64_json"])
     img = Image.open(io.BytesIO(img_bytes))
     assert img.size == (64, 64)  # Our mock returns 64x64 images
+    assert test_client.app.state.engine_client.captured_prompt["modalities"] == ["image"]
 
 
 def test_generate_images_async_omni_sampling_params(async_omni_test_client):
@@ -695,7 +696,7 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             self.captured_sampling_params_list = (
                 sampling_params_list if sampling_params_list is not None else [sampling_params]
             )
@@ -814,7 +815,9 @@ def test_image_edits_streaming_returns_ar_delta_then_image(streaming_image_edit_
 
 
 def test_image_edits_streaming_ar_delta_chunks_include_index(streaming_image_edit_client):
-    async def generate_multi_output_delta(prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate_multi_output_delta(
+        prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs
+    ):
         yield MockStageResult(stage_id=0, final_output_type="text", texts=["first", "second"])
         yield MockStageResult(
             stage_id=1,
@@ -842,7 +845,7 @@ def test_image_edits_streaming_ar_delta_chunks_include_index(streaming_image_edi
 
 
 def test_image_edits_streaming_errors_without_final_image(streaming_image_edit_client):
-    async def generate_without_image(prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate_without_image(prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
         yield MockStageResult(stage_id=0, final_output_type="text", text="recap")
 
     streaming_image_edit_client.app.state.engine_client.generate = generate_without_image
@@ -865,7 +868,7 @@ def test_image_edits_streaming_errors_without_final_image(streaming_image_edit_c
 
 
 def test_image_edits_streaming_errors_on_empty_final_image(streaming_image_edit_client):
-    async def generate_empty_image(prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate_empty_image(prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
         yield MockStageResult(stage_id=0, final_output_type="text", text="recap")
         yield MockStageResult(stage_id=1, final_output_type="image", images=[])
 
@@ -1009,6 +1012,42 @@ def test_with_custom_parameters(test_client):
         },
     )
     assert response.status_code == 200
+
+
+def test_flow_shift_forwarded_to_extra_args(test_client):
+    """flow_shift must reach the diffusion sampling params via extra_args.
+
+    Regression: ``ImageGenerationRequest`` had no ``flow_shift`` field and the
+    single-stage handler never forwarded it, so a request like
+    ``{"flow_shift": 10.0}`` was silently dropped and Cosmos3 T2I always ran at
+    its hardcoded per-mode default shift. The pipeline reads
+    ``extra_args["flow_shift"]`` (via ``_get_sp_param``), so it must land there.
+    """
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a robot in a lab",
+            "size": "960x960",
+            "num_inference_steps": 50,
+            "guidance_scale": 4.0,
+            "flow_shift": 10.0,
+        },
+    )
+    assert response.status_code == 200
+    captured = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert captured.extra_args["flow_shift"] == 10.0
+
+
+def test_flow_shift_absent_when_not_requested(test_client):
+    """Omitting flow_shift must not inject an override, so the pipeline keeps
+    its per-mode default (e.g. Cosmos3 T2I shift=3.0)."""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a tree", "size": "1024x1024"},
+    )
+    assert response.status_code == 200
+    captured = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert "flow_shift" not in (captured.extra_args or {})
 
 
 def test_invalid_size(test_client):

@@ -19,8 +19,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 NUM_TOKENS = 8
 HIDDEN_DIM = 16
 NUM_TIMESTEPS = 5
-# generate_image uses timesteps[:-1], so actual steps = NUM_TIMESTEPS - 1
-EXPECTED_STEPS = NUM_TIMESTEPS - 1
+# generate_image samples (num_timesteps + 1) points then drops the last, matching
+# upstream lance: see Bagel.generate_image in bagel_transformer.py.
+EXPECTED_STEPS = NUM_TIMESTEPS
 
 
 def _make_mock_bagel(mocker: MockerFixture):
@@ -56,10 +57,7 @@ def _make_generate_args(num_tokens=NUM_TOKENS, hidden_dim=HIDDEN_DIM, cfg=False)
         packed_vae_token_indexes=torch.arange(2, seq_len, dtype=torch.long),
         packed_seqlens=torch.tensor([seq_len], dtype=torch.int),
         packed_position_ids=torch.arange(seq_len, dtype=torch.long),
-        packed_indexes=torch.arange(seq_len, dtype=torch.long),
         past_key_values=NaiveCache(1),
-        key_values_lens=torch.tensor([0], dtype=torch.int),
-        packed_key_value_indexes=torch.zeros(0, dtype=torch.long),
         num_timesteps=NUM_TIMESTEPS,
         timestep_shift=1.0,
         cfg_text_scale=1.0,
@@ -68,11 +66,8 @@ def _make_generate_args(num_tokens=NUM_TOKENS, hidden_dim=HIDDEN_DIM, cfg=False)
     if cfg:
         base |= dict(
             cfg_text_scale=4.0,
-            cfg_text_packed_query_indexes=torch.arange(seq_len, dtype=torch.long),
             cfg_text_packed_position_ids=torch.arange(seq_len, dtype=torch.long),
             cfg_text_past_key_values=NaiveCache(1),
-            cfg_text_key_values_lens=torch.tensor([0], dtype=torch.int),
-            cfg_text_packed_key_value_indexes=torch.zeros(0, dtype=torch.long),
         )
     return base
 
@@ -184,7 +179,7 @@ class TestTrajectoryRecording:
         bagel, args = bagel_and_args
 
         # Recompute the expected timestep schedule (mirrors generate_image logic)
-        ts = torch.linspace(1, 0, args["num_timesteps"])
+        ts = torch.linspace(1, 0, args["num_timesteps"] + 1)
         shift = args.get("timestep_shift", 1.0)
         ts = shift * ts / (1 + (shift - 1) * ts)
         expected_timesteps = ts[:-1]  # last element is dropped
@@ -202,7 +197,7 @@ class TestTrajectoryRecording:
         bagel, args = bagel_and_args
 
         # Compute the number of denoising steps the same way generate_image does
-        ts = torch.linspace(1, 0, args["num_timesteps"])
+        ts = torch.linspace(1, 0, args["num_timesteps"] + 1)
         shift = args.get("timestep_shift", 1.0)
         ts = shift * ts / (1 + (shift - 1) * ts)
         num_steps = len(ts) - 1  # timesteps = ts[:-1]

@@ -22,13 +22,14 @@ export PYTHONPATH=<transformers_modules_path>:$PYTHONPATH
 export HF_MODULES_CACHE=<transformers_modules_path>
 ```
 
-Run from repository root:
+Run from repository root. The 3-stage pipeline is resolved automatically from
+the model type (`vllm_omni/deploy/dynin_omni.yaml`), so no config path is
+required. Pass `--deploy-config` only to override the defaults:
 
 ```bash
 vllm-omni serve snu-aidas/Dynin-Omni \
   --omni \
-  --port 8091 \
-  --stage-configs-path "$(pwd)/vllm_omni/model_executor/stage_configs/dynin_omni.yaml"
+  --port 8091
 ```
 
 If `vllm-omni` is not in PATH, run:
@@ -36,8 +37,7 @@ If `vllm-omni` is not in PATH, run:
 ```bash
 PYTHONPATH="$(pwd)" python -m vllm_omni.entrypoints.cli.main serve snu-aidas/Dynin-Omni \
   --omni \
-  --port 8091 \
-  --stage-configs-path "$(pwd)/vllm_omni/model_executor/stage_configs/dynin_omni.yaml"
+  --port 8091
 ```
 
 Wait until the server logs show both `All stages initialized successfully` and

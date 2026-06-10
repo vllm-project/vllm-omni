@@ -2,29 +2,29 @@
 The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
-We currently only support using the "openai-chat-omni" backend.
+We currently only support using the "openai-chat-omni" and "openai-image-edits-omni" backend.
 
 ## Basic Parameter Description
 You can use `vllm bench serve --omni --help=all` to get descriptions of all parameters. The commonly used parameters are described below:
-- `--omni`  
+- `--omni`
   Enable Omni (multimodal) mode, supporting multimodal inputs and outputs such as images, videos, and audio.
 
-- `--backend`  
+- `--backend`
   Specify the backend adapter as openai-chat-omni, using OpenAI Chat compatible API behavior as the protocol. Currently only openai-chat-omni is supported.
 
-- `--model`  
+- `--model`
   The model identifier to load, filled according to the models supported by vLLM-Omni.
 
-- `--endpoint`  
+- `--endpoint`
   The API endpoint exposed externally, to which clients send their requests.
 
-- `--dataset-name`  
+- `--dataset-name`
   The name of the dataset used; random-mm indicates generating random multimodal inputs (images, videos, audio).
 
-- `--num-prompts`  
+- `--num-prompts`
   The total number of requests to send, an integer.
 
-- `--max-concurrency`  
+- `--max-concurrency`
   "Maximum number of concurrent requests. This can be used "
         "to help simulate an environment where a higher level component "
         "is enforcing a maximum number of concurrent requests. While the "
@@ -34,69 +34,73 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
         "actual request rate may be lower than specified with --request-rate, "
         "if the server is not processing requests fast enough to keep up."
 
-- `--request-rate`  
+- `--request-rate`
   "Number of requests per second. If this is inf, "
         "then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process or gamma distribution "
         "to synthesize the request arrival times."
 
-- `--ignore-eos`  
+- `--ignore-eos`
   "Set ignore_eos flag when sending the benchmark request."
 
-- `--metric-percentiles`  
+- `--metric-percentiles`
   Comma-separated list of percentiles for selected metrics. "
         "To report 25-th, 50-th, and 75-th percentiles, use \"25,50,75\". "
         "Default value is \"99\"."
         "Use \"--percentile-metrics\" to select metrics.
 
-- `--percentile-metrics`  
+- `--percentile-metrics`
         "Comma-separated list of selected metrics to report percentiles."
                     "This argument specifies the metrics to report percentiles."
-                    'Allowed metric names are "ttft", "tpot", "itl", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
+                    'Allowed metric names are "ttft", "tpot", "itl", "ttfc", "tpoc", "icl", '
+                    '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
 
-- `--save-result`  
+- `-print-stage`
+Print per-stage benchmark metrics for --omni serving when stage metrics are returned by the server. Disabled by default.
+
+- `--save-result`
 Specify to save benchmark results to a json file
 
-- `--save-detailed`  
+- `--save-detailed`
 "When saving the results, whether to include per request "
         "information such as response, error, ttfs, tpots, etc."
 
-- `--result-dir`  
+- `--result-dir`
  "Specify directory to save benchmark json results."
         "If not specified, results are saved in the current directory."
 
-- `--result-filename`  
+- `--result-filename`
 "Specify the filename to save benchmark json results."
         "If not specified, results will be saved in "
         "{label}-{args.request_rate}qps-{base_model_id}-{current_dt}.json"
 
-- `--random-prefix-len`  
+- `--random-prefix-len`
   Number of fixed prefix tokens before the random context in a request.
   The total input length is the sum of random-prefix-len and a random
   context length sampled from [input_len * (1 - range_ratio),
   input_len * (1 + range_ratio)].Only the random and random-mm modes
   support this parameter.
 
-- `--random-input-len`  
+- `--random-input-len`
   Number of input tokens per request.Only the random and random-mm modes support this parameter.
 
-- `--random-output-len`  
+- `--random-output-len`
   Number of output tokens per request.Only the random and random-mm modes support this parameter.
 
-- `--random-range-ratio`  
+- `--random-range-ratio`
   Range ratio for sampling input/output length,
   used only for random sampling. Must be in the range [0, 1) to define
   a symmetric sampling range
   [length * (1 - range_ratio), length * (1 + range_ratio)].
   Only the random and random-mm modes support this parameter.
 
-- `--random-mm-base-items-per-request`  
+- `--random-mm-base-items-per-request`
   Base number of multimodal items per request for random-mm.
   Actual per-request count is sampled around this base using
   --random-mm-num-mm-items-range-ratio.
   Only the random-mm mode supports this parameter.
 
-- `--random-mm-limit-mm-per-prompt`  
+- `--random-mm-limit-mm-per-prompt`
   Per-modality hard caps for items attached per request, e.g.
   '{"image": 3, "video": 1, "audio": 1}'. The sampled per-request item
   count is clamped to the sum of these limits. When a modality
@@ -104,7 +108,7 @@ Specify to save benchmark results to a json file
   renormalized.
   Only the random-mm mode supports this parameter.
 
-- `--random-mm-num-mm-items-range-ratio`  
+- `--random-mm-num-mm-items-range-ratio`
   Range ratio r in [0, 1] for sampling items per request.
   We sample uniformly from the closed integer range
   [floor(n*(1-r)), ceil(n*(1+r))]
@@ -115,7 +119,7 @@ Specify to save benchmark results to a json file
   An error is raised if the computed min exceeds the max.
   Only the random-mm mode supports this parameter.
 
-- `--random-mm-bucket-config`  
+- `--random-mm-bucket-config`
   The bucket config is a dictionary mapping a multimodal item
   sampling configuration to a probability.
   Currently allows for 3 modalities: audio, images and videos.
@@ -276,7 +280,9 @@ Generate synthetic image、video、audio inputs alongside random text prompts to
 
 Notes:
 
-- Works only with online benchmark via the OpenAI backend (`--backend openai-chat-omni`) and endpoint `/v1/chat/completions`.
+- Works only with online benchmark via:
+  - the OpenAI chat backend (`--backend openai-chat-omni`) and endpoint `/v1/chat/completions`.
+  - the OpenAI edit image backend (`--backend openai-image-edits-omni`) and endpoint `/v1/images/edits`.
 
 Start the server (example):
 
@@ -356,4 +362,106 @@ How sampling works:
 - If a modality (e.g., image) reaches its limit from `--random-mm-limit-mm-per-prompt`, all buckets of that modality are excluded and the remaining bucket probabilities are renormalized before continuing.
 This should be seen as an edge case, and if this behavior can be avoided by setting `--random-mm-limit-mm-per-prompt` to a large number. Note that this might result in errors due to engine config `--limit-mm-per-prompt`.
 - The resulting request contains synthetic image data in `multi_modal_data` (OpenAI Chat format). When `random-mm` is used with the OpenAI Chat backend, prompts remain text and MM content is attached via `multi_modal_data`.
+</details>
+
+### Multi-Stage Benchmark
+
+<details class="admonition abstract" markdown="1">
+<summary>Show more</summary>
+
+Start the server (change the port and model):
+
+```bash
+vllm serve --omni --port 29999 --model ~/Qwen3-Omni-30B-A3B-Instruct
+```
+
+Then run the benchmarking script (remember to add the flag `--print-stage`):
+```bash
+vllm bench serve --omni \
+  --dataset-name random \
+  --port 29999 \
+  --max-concurrency 1 \
+  --num-warmups 2 \
+  --model ~/Qwen3-Omni-30B-A3B-Instruct \
+  --endpoint /v1/chat/completions \
+  --backend openai-chat-omni \
+  --num-prompts 3 \
+  --random-input-len 2500 \
+  --ignore-eos \
+  --percentile-metrics ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,ttfc,tpoc,icl \
+  --random-output-len 900 \
+  --extra_body '{"modalities": ["text","audio"]}' \
+  --print-stage
+```
+
+Besides the "Serving Benchmark Result", there will be "Stage Benchmark Result" below:
+```text
+============= Stage Benchmark Result =============
+=============== Stage 0 (thinker) ================
+-------------------Stage Timing-------------------
+Mean stage_gen_time (ms):                18243.16
+Median stage_gen_time (ms):              18220.83
+P99 stage_gen_time (ms):                 18296.75
+================== Text Result ===================
+Stage generated tokens:                  2700
+-----------Serving Time to First Token------------
+Mean Serving TTFT (ms):                  816.31
+Median Serving TTFT (ms):                818.94
+P99 Serving TTFT (ms):                   829.76
+-----Time per Output Token (excl. 1st token)------
+Mean TPOP (ms):                          19.41
+Median TPOP (ms):                        19.40
+P99 TPOP (ms):                           19.47
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           19.41
+Median ITL (ms):                         19.12
+P99 ITL (ms):                            23.58
+================ Stage 1 (talker) ================
+-------------------Stage Timing-------------------
+Mean stage_gen_time (ms):                18849.64
+Median stage_gen_time (ms):              13641.15
+P99 stage_gen_time (ms):                 33655.58
+============= Internal Stream Result =============
+-----------Serving Time to First Chunk------------
+Mean Serving TTFC (ms):                  1029.14
+Median Serving TTFC (ms):                1027.98
+P99 Serving TTFC (ms):                   1032.59
+-----Time per Output Chunk (excl. 1st chunk)------
+Mean TPOP (ms):                          17.53
+Median TPOP (ms):                        18.70
+P99 TPOP (ms):                           18.88
+---------------Inter-chunk Latency----------------
+Mean ICL (ms):                           16.27
+Median ICL (ms):                         18.19
+P99 ICL (ms):                            25.86
+=============== Stage 2 (code2wav) ===============
+-------------------Stage Timing-------------------
+Mean stage_gen_time (ms):                18860.74
+Median stage_gen_time (ms):              13655.84
+P99 stage_gen_time (ms):                 33659.79
+================== Audio Result ==================
+Stage audio duration generated(s):       260.11
+Stage audio frames generated:            6242730
+-----------Serving Time to First Packet-----------
+Mean Serving AUDIO_TTFP (ms):            1366.16
+Median Serving AUDIO_TTFP (ms):          1367.20
+P99 Serving AUDIO_TTFP (ms):             1368.26
+-----------------Real Time Factor-----------------
+Mean AUDIO_RTF:                          0.24
+Median AUDIO_RTF:                        0.26
+P99 AUDIO_RTF:                           0.27
+```
+Explanation:
+- stage_gen_time: Time from submitting a request to a specific stage to that stage finishing generation.
+
+- Serving TTFC (Time to First Chunk): Time from the HTTP request being accepted by the serving frontend to
+  the stage producing its first non-empty output chunk. Keep the name TTFT in text stage, TTFP in audio stage
+  for easier mapping.
+
+- TPOP (Time per Output Chunk): Average time from the first output chunk to stage completion, divided by the
+  number of remaining output chunks. The TPOP abbreviation follows Qwen3.5-Omni Technical Report.
+
+- ICL (Inter-Chunk Latency): Time between two consecutive output chunks produced by the same stage. Keep the
+  name ITL in text stage for easier mapping.
+
 </details>

@@ -52,6 +52,7 @@ class InlineStageDiffusionClient(StageClientBase):
         self.replica_id = metadata.replica_id
         self.final_output = metadata.final_output
         self.final_output_type = metadata.final_output_type
+        self.model_stage = getattr(metadata, "model_stage", None)
         self.default_sampling_params = metadata.default_sampling_params
         self.requires_multimodal_data = metadata.requires_multimodal_data
         self.custom_process_input_func = metadata.custom_process_input_func
@@ -128,7 +129,6 @@ class InlineStageDiffusionClient(StageClientBase):
             request = OmniDiffusionRequest(
                 prompts=[prompt],
                 sampling_params=sampling_params,
-                request_ids=[request_id],
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
             )
@@ -187,7 +187,6 @@ class InlineStageDiffusionClient(StageClientBase):
             request = OmniDiffusionRequest(
                 prompts=prompts,
                 sampling_params=sampling_params,
-                request_ids=[f"{request_id}-{i}" for i in range(len(prompts))],
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
             )

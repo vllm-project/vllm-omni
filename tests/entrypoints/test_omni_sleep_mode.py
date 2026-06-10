@@ -532,7 +532,10 @@ async def test_pure_diffusion_scenario(tp_size: int):
     try:
         await engine.sleep(level=1)
         await engine.wake_up()
-        async for _ in engine.generate("test", sampling_params=SamplingParams()):
+        async for _ in engine.generate(
+            "test",
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256),
+        ):
             pass
         logger.info("Pure diffusion OK (TP=%s)", tp_size)
     finally:

@@ -157,6 +157,75 @@ def test_update_no_multimodal():
         assert torch.all(slot_states == new_states)
 
 
+def test_update_uses_precomputed_hidden_states_cpu():
+    """Precomputed CPU staging should be the only hidden-state cache source."""
+    cache = get_omni_pcache()
+
+    num_tokens_unpadded = 8
+    slot_offset = 8
+    slot_mapping = torch.arange(slot_offset, slot_offset + num_tokens_unpadded)
+    hidden_states = torch.zeros((num_tokens_unpadded, HIDDEN_SIZE), dtype=DTYPE)
+    hidden_states_cpu = torch.rand((num_tokens_unpadded, HIDDEN_SIZE), dtype=DTYPE)
+
+    cache.update_omni_tensor_prefix_cache(
+        hidden_states=hidden_states,
+        hidden_states_cpu=hidden_states_cpu,
+        multimodal_outputs=None,
+        num_tokens_unpadded=num_tokens_unpadded,
+        slot_mapping=slot_mapping,
+    )
+
+    hs_rows = cache.hidden_states_cache.view(NUM_BLOCKS * BLOCK_SIZE, HIDDEN_SIZE)
+    for slot_idx, new_states in zip(slot_mapping, hidden_states_cpu):
+        slot_states = hs_rows[slot_idx]
+        assert torch.all(slot_states == new_states)
+
+
+@pytest.mark.parametrize(
+    "hidden_states_cpu",
+    [
+        torch.rand((4, HIDDEN_SIZE), dtype=DTYPE),
+        torch.rand((8, HIDDEN_SIZE), dtype=OTHER_DTYPE),
+        torch.rand((8, HIDDEN_SIZE + 1), dtype=DTYPE),
+        torch.rand((HIDDEN_SIZE, 8), dtype=DTYPE).t(),
+    ],
+)
+def test_update_rejects_invalid_hidden_states_cpu(hidden_states_cpu):
+    cache = get_omni_pcache()
+
+    num_tokens_unpadded = 8
+    slot_mapping = torch.arange(num_tokens_unpadded)
+    hidden_states = torch.rand((num_tokens_unpadded, HIDDEN_SIZE), dtype=DTYPE)
+
+    with pytest.raises(RuntimeError):
+        cache.update_omni_tensor_prefix_cache(
+            hidden_states=hidden_states,
+            hidden_states_cpu=hidden_states_cpu,
+            multimodal_outputs=None,
+            num_tokens_unpadded=num_tokens_unpadded,
+            slot_mapping=slot_mapping,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_update_rejects_gpu_hidden_states_cpu():
+    cache = get_omni_pcache()
+
+    num_tokens_unpadded = 8
+    slot_mapping = torch.arange(num_tokens_unpadded)
+    hidden_states = torch.rand((num_tokens_unpadded, HIDDEN_SIZE), dtype=DTYPE)
+    hidden_states_cpu = torch.rand((num_tokens_unpadded, HIDDEN_SIZE), dtype=DTYPE, device="cuda")
+
+    with pytest.raises(RuntimeError):
+        cache.update_omni_tensor_prefix_cache(
+            hidden_states=hidden_states,
+            hidden_states_cpu=hidden_states_cpu,
+            multimodal_outputs=None,
+            num_tokens_unpadded=num_tokens_unpadded,
+            slot_mapping=slot_mapping,
+        )
+
+
 @pytest.mark.parametrize(
     "feat_dims",
     [
@@ -357,6 +426,76 @@ def test_get_merged_hidden_states(num_tokens_padded, mocker):
     # Next, ensure that the cache miss case only has the new states
     assert req2_merged_states.shape == torch.Size([num_new_toks_req2, HIDDEN_SIZE])
     assert torch.all(req2_merged_states == req2_new_states)
+
+
+def test_get_merged_hidden_states_uses_precomputed_hidden_states_cpu(mocker):
+    cache = get_omni_pcache()
+
+    orig_num_tokens_unpadded = 8
+    slot_offset = 8
+    orig_slot_mapping = torch.arange(slot_offset, slot_offset + orig_num_tokens_unpadded)
+    orig_hidden_states = torch.rand((orig_num_tokens_unpadded, HIDDEN_SIZE), dtype=DTYPE)
+
+    cache.update_omni_tensor_prefix_cache(
+        hidden_states=orig_hidden_states,
+        multimodal_outputs=None,
+        num_tokens_unpadded=orig_num_tokens_unpadded,
+        slot_mapping=orig_slot_mapping,
+    )
+
+    num_new_toks_req1 = 3
+    num_new_toks_req2 = 2
+    cache.add_prefix_cached_new_req_id("req1")
+    num_scheduled_tokens = {
+        "req1": num_new_toks_req1,
+        "req2": num_new_toks_req2,
+    }
+    new_hidden_states = torch.zeros(
+        (num_new_toks_req1 + num_new_toks_req2, HIDDEN_SIZE),
+        dtype=DTYPE,
+    )
+    hidden_states_cpu = torch.rand_like(new_hidden_states)
+    req1_new_states = hidden_states_cpu[:num_new_toks_req1]
+    req2_new_states = hidden_states_cpu[-num_new_toks_req2:]
+    input_batch = MockInputBatch(num_computed_tokens_cpu=torch.Tensor([orig_num_tokens_unpadded, 0]))
+
+    mocker.patch(
+        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_cached_block_ids",
+        new=fake_get_cached_block_ids,
+    )
+    merged_states = cache.get_merged_hidden_states(
+        query_start_loc=[0, num_new_toks_req1],
+        input_batch=input_batch,
+        hidden_states=new_hidden_states,
+        hidden_states_cpu=hidden_states_cpu,
+        num_scheduled_tokens=num_scheduled_tokens,
+    )
+
+    assert torch.all(merged_states["req1"][:orig_num_tokens_unpadded] == orig_hidden_states)
+    assert torch.all(merged_states["req1"][-num_new_toks_req1:] == req1_new_states)
+    assert torch.all(merged_states["req2"] == req2_new_states)
+
+
+def test_get_merged_hidden_states_rejects_short_hidden_states_cpu(mocker):
+    cache = get_omni_pcache()
+    num_scheduled_tokens = {
+        "req1": 3,
+        "req2": 2,
+    }
+    input_batch = MockInputBatch(num_computed_tokens_cpu=torch.Tensor([0, 0]))
+
+    mocker.patch(
+        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_cached_block_ids",
+        new=fake_get_cached_block_ids,
+    )
+    with pytest.raises(RuntimeError):
+        cache.get_merged_hidden_states(
+            query_start_loc=[0, 3],
+            input_batch=input_batch,
+            hidden_states=torch.rand((5, HIDDEN_SIZE), dtype=DTYPE),
+            hidden_states_cpu=torch.rand((4, HIDDEN_SIZE), dtype=DTYPE),
+            num_scheduled_tokens=num_scheduled_tokens,
+        )
 
 
 @pytest.mark.parametrize("num_tokens_padded", [None, 16])

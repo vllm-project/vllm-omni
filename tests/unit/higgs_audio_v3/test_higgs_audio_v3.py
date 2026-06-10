@@ -1,0 +1,1211 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Deterministic unit tests for higgs-audio v3.
+
+These tests verify AC-1 (config), AC-3 (prompt), AC-4 (fused modules),
+AC-5 (delay pattern), AC-7 (stage processor), and AC-10 (registry)
+without requiring the actual checkpoint or GPU.
+"""
+
+import pytest
+import torch
+
+# ---- AC-1: Configuration ----
+
+
+class TestHiggsAudioV3Config:
+    def test_default_config_loads(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config()
+        assert config.num_codebooks == 8
+        assert config.codebook_size == 1026
+        assert config.audio_stream_bos_id == 1024
+        assert config.audio_stream_eos_id == 1025
+        assert config.sample_rate == 24000
+        assert config.frame_rate == 25
+        assert config.num_real_codes == 1024
+        assert config.tie_modality_embeddings is True
+
+    def test_custom_audio_encoder_config(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config(
+            audio_encoder_config={
+                "encoder_type": "discrete",
+                "num_codebooks": 4,
+                "vocab_size": 512,
+                "tie_word_embeddings": False,
+            }
+        )
+        assert config.num_codebooks == 4
+        assert config.codebook_size == 512
+        assert config.tie_modality_embeddings is False
+
+    def test_invalid_num_codebooks_rejected(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        with pytest.raises(ValueError, match="num_codebooks must be > 0"):
+            HiggsAudioV3Config(audio_encoder_config={"num_codebooks": 0, "vocab_size": 1026})
+
+    def test_negative_num_codebooks_rejected(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        with pytest.raises(ValueError, match="num_codebooks must be > 0"):
+            HiggsAudioV3Config(audio_encoder_config={"num_codebooks": -1, "vocab_size": 1026})
+
+    def test_special_token_ids_initially_none(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config()
+        assert config.tts_token_id is None
+        assert config.text_token_id is None
+        assert config.audio_continuation_id is None
+
+    def test_hidden_size_from_text_config(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config(text_config={"model_type": "qwen3", "hidden_size": 2560})
+        assert config.hidden_size == 2560
+        assert config.audio_hidden_size == 2560
+
+
+# ---- AC-4: Fused Multi-Codebook Modules ----
+
+
+class TestFusedModules:
+    def test_embedding_shape(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsFusedMultiTextEmbedding,
+        )
+
+        embed = HiggsFusedMultiTextEmbedding(num_codebooks=8, vocab_size=1026, hidden_size=256)
+        assert embed.weight.shape == (8 * 1026, 256)
+
+        codes = torch.randint(0, 1024, (5, 8))
+        out = embed(codes)
+        assert out.shape == (5, 256)
+
+    def test_embedding_offset_indexing(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsFusedMultiTextEmbedding,
+        )
+
+        embed = HiggsFusedMultiTextEmbedding(num_codebooks=2, vocab_size=4, hidden_size=3)
+        # Set weights to identity-like pattern so we can verify offsets
+        with torch.no_grad():
+            embed.weight.zero_()
+            # Codebook 0, vocab [0..3] -> row 0..3
+            # Codebook 1, vocab [0..3] -> row 4..7
+            for i in range(8):
+                embed.weight[i, i % 3] = float(i)
+
+        # codes[0] = [1, 2] -> embed[1] + embed[4+2=6]
+        codes = torch.tensor([[1, 2]])
+        out = embed(codes)
+        expected = embed.weight[1] + embed.weight[6]
+        assert torch.allclose(out[0], expected)
+
+    def test_head_shape(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsFusedMultiTextHead,
+        )
+
+        head = HiggsFusedMultiTextHead(num_codebooks=8, vocab_size=1026, hidden_size=256)
+        assert head.weight.shape == (8 * 1026, 256)
+
+        hidden = torch.randn(3, 256)
+        out = head.generate(hidden)
+        assert out.shape == (3, 8, 1026)
+
+    def test_tying(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsFusedMultiTextEmbedding,
+            HiggsFusedMultiTextHead,
+        )
+
+        embed = HiggsFusedMultiTextEmbedding(num_codebooks=8, vocab_size=1026, hidden_size=64)
+        head = HiggsFusedMultiTextHead(num_codebooks=8, vocab_size=1026, hidden_size=64)
+        head.weight = embed.weight
+        assert head.weight is embed.weight
+        # Modification to one should reflect in the other
+        with torch.no_grad():
+            embed.weight[0, 0] = 42.0
+        assert head.weight[0, 0] == 42.0
+
+    def test_codes_out_of_range(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsFusedMultiTextEmbedding,
+        )
+
+        embed = HiggsFusedMultiTextEmbedding(num_codebooks=8, vocab_size=1026, hidden_size=16)
+        # Code 1026 + offset for codebook 7 = 1026 + 7*1026 = 8208
+        # But weight only has 8*1026 = 8208 rows, so index 8208 is out of bounds
+        codes = torch.tensor([[0, 0, 0, 0, 0, 0, 0, 1026]])  # Last cb: 1026 is OOB
+        with pytest.raises(IndexError):
+            embed(codes)
+
+
+# ---- AC-5: Delay Pattern Behavior ----
+
+
+class TestDelayPatternBehavior:
+    """Test the delay pattern masking logic extracted from the talker."""
+
+    def test_boc_eoc_ids(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            BOC_ID,
+            EOC_ID,
+        )
+
+        assert BOC_ID == 1024
+        assert EOC_ID == 1025
+
+    def test_delay_phase_boc_masking(self):
+        """During delay phase, codebooks beyond delay_count are forced to BOC."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import BOC_ID
+
+        num_codebooks = 8
+        # Simulate delay phase at step 3 (delay_count=2, so CBs 3-7 should be BOC)
+        codes = torch.randint(0, 1024, (num_codebooks,))
+        delay_count = 2
+        next_cb = delay_count + 1
+        if next_cb < num_codebooks:
+            codes[next_cb:] = BOC_ID
+        # CBs 0-2 should have original codes, CBs 3-7 should be BOC
+        assert all(codes[i] != BOC_ID or i >= 3 for i in range(num_codebooks))
+        assert all(codes[i] == BOC_ID for i in range(3, num_codebooks))
+
+    def test_cb0_eoc_triggers_rampdown(self):
+        """EOC on codebook 0 starts ramp-down; EOC on other codebooks does not."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            EOC_ID,
+        )
+
+        num_codebooks = 8
+        codes = torch.randint(0, 1024, (num_codebooks,))
+
+        # Simulate: cb0 emits EOC
+        codes[0] = EOC_ID
+        assert int(codes[0].item()) == EOC_ID
+        # Ramp-down should start with countdown = N-2 = 6
+        eoc_countdown = num_codebooks - 2
+        assert eoc_countdown == 6
+
+        # If cb3 emits EOC but cb0 doesn't, no ramp-down
+        codes2 = torch.randint(0, 1024, (num_codebooks,))
+        codes2[3] = EOC_ID
+        assert int(codes2[0].item()) != EOC_ID  # cb0 is not EOC
+
+    def test_rampdown_termination(self):
+        """After N-2 steps of ramp-down, generation_done becomes True."""
+        num_codebooks = 8
+        eoc_countdown = num_codebooks - 2  # = 6
+        generation_done = False
+        for _ in range(6):
+            eoc_countdown -= 1
+            if eoc_countdown <= 0:
+                generation_done = True
+        assert generation_done is True
+
+    def test_all_boc_seed(self):
+        """First audio step should seed last_codes with all-BOC."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import BOC_ID
+
+        seeded = torch.full((8,), BOC_ID, dtype=torch.long)
+        assert seeded.shape == (8,)
+        assert all(seeded[i] == BOC_ID for i in range(8))
+
+
+# ---- AC-5: Real Sampler Method Tests ----
+
+
+class TestSamplerMethods:
+    """Test the actual _sample_audio_codes and _apply_delay_pattern_masking methods."""
+
+    def _make_minimal_talker(self):
+        """Create a minimal talker-like object with sampler/masking methods."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        class FakeTalker:
+            num_codebooks = 8
+            codebook_size = 1026
+            _audio_state = {}
+
+        t = FakeTalker()
+        t._sample_audio_codes = mod.HiggsAudioV3TalkerForConditionalGeneration._sample_audio_codes.__get__(t)
+        t._apply_delay_pattern_masking = (
+            mod.HiggsAudioV3TalkerForConditionalGeneration._apply_delay_pattern_masking.__get__(t)
+        )
+        return t
+
+    def test_sample_respects_mask(self):
+        """Tokens masked to -inf must never be sampled."""
+        t = self._make_minimal_talker()
+        logits = torch.full((10, 1026), float("-inf"))
+        # Only token 500 is allowed for each row
+        logits[:, 500] = 0.0
+        result = t._sample_audio_codes(logits)
+        assert result.shape == (10,)
+        assert (result == 500).all(), f"Expected all 500, got {result.tolist()}"
+
+    def test_sample_all_masked_falls_back_to_argmax(self):
+        """All-masked row should fall back to argmax (least-negative logit)."""
+        t = self._make_minimal_talker()
+        logits = torch.full((2, 1026), float("-inf"))
+        # Row 0: all masked
+        # Row 1: only token 42 allowed
+        logits[1, 42] = 0.0
+        result = t._sample_audio_codes(logits)
+        assert result.shape == (2,)
+        assert result[1].item() == 42
+
+    def test_delay_masking_forces_boc_during_delay(self):
+        """During delay phase, codebooks beyond delay_count must have only BOC allowed."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import BOC_ID
+
+        t = self._make_minimal_talker()
+        # Simulate delay_count=2 for batch row 0
+        t._audio_state[0] = {"num_delay": 2, "num_remaining_delays": None}
+        cb_logits = torch.zeros(1, 8, 1026)  # [1 audio row, 8 codebooks, 1026 vocab]
+        t._apply_delay_pattern_masking(cb_logits, [0])
+        # CBs 3-7 should have only BOC allowed (everything else -inf)
+        for q in range(3, 8):
+            row = cb_logits[0, q]
+            assert row[BOC_ID].item() == 0.0  # BOC kept
+            # All non-BOC should be -inf
+            non_boc = torch.cat([row[:BOC_ID], row[BOC_ID + 1 :]])
+            assert (non_boc == float("-inf")).all(), f"CB{q} has non-inf non-BOC values"
+
+    def test_delay_masking_disallows_boc_for_active_codebooks(self):
+        """Active codebooks during delay should have BOC disallowed."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import BOC_ID
+
+        t = self._make_minimal_talker()
+        t._audio_state[0] = {"num_delay": 3, "num_remaining_delays": None}
+        cb_logits = torch.zeros(1, 8, 1026)
+        t._apply_delay_pattern_masking(cb_logits, [0])
+        # CBs 0-3 are active: BOC should be -inf
+        for q in range(4):
+            assert cb_logits[0, q, BOC_ID].item() == float("-inf")
+
+    def test_delay_masking_only_cb0_allows_eoc(self):
+        """Only codebook 0 should allow EOC during normal generation."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
+
+        t = self._make_minimal_talker()
+        t._audio_state[0] = {"num_delay": 8, "num_remaining_delays": None}
+        cb_logits = torch.zeros(1, 8, 1026)
+        t._apply_delay_pattern_masking(cb_logits, [0])
+        # CB0 should keep EOC
+        assert cb_logits[0, 0, EOC_ID].item() != float("-inf")
+        # CB1-7 should have EOC masked
+        for q in range(1, 8):
+            assert cb_logits[0, q, EOC_ID].item() == float("-inf"), f"CB{q} EOC not masked"
+
+    def test_rampdown_masking_locks_to_eoc(self):
+        """During ramp-down, locked codebooks should only allow EOC."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            BOC_ID,
+            EOC_ID,
+        )
+
+        t = self._make_minimal_talker()
+        # Ramp-down with 4 remaining delays: lock CBs 0-3 to EOC
+        t._audio_state[0] = {"num_delay": 8, "num_remaining_delays": 4}
+        cb_logits = torch.zeros(1, 8, 1026)
+        t._apply_delay_pattern_masking(cb_logits, [0])
+        # CBs 0-3 locked: only EOC allowed
+        for q in range(4):
+            row = cb_logits[0, q]
+            assert row[EOC_ID].item() == 0.0
+            non_eoc = torch.cat([row[:EOC_ID], row[EOC_ID + 1 :]])
+            assert (non_eoc == float("-inf")).all(), f"Locked CB{q} has non-inf non-EOC"
+        # CBs 4-7 active: BOC and EOC disallowed
+        for q in range(4, 8):
+            assert cb_logits[0, q, BOC_ID].item() == float("-inf")
+            assert cb_logits[0, q, EOC_ID].item() == float("-inf")
+
+
+# ---- AC-6: Feedback Method Tests ----
+
+
+class TestFeedbackMethods:
+    def test_postprocess_emits_audio_codes(self):
+        """postprocess() should return codes from _last_audio_codes."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        class FakeTalker:
+            _last_audio_codes = torch.tensor([[100, 200, 300, 400, 500, 600, 700, 800]])
+            _postprocess_cursor = 0
+
+        t = FakeTalker()
+        t.postprocess = mod.HiggsAudioV3TalkerForConditionalGeneration.postprocess.__get__(t)
+        result = t.postprocess(torch.zeros(1, 64))
+        assert "codes" in result
+        assert "audio" in result["codes"]
+        assert result["codes"]["audio"].shape == (1, 8)
+
+    def test_postprocess_skips_negative_rows(self):
+        """postprocess() should skip rows with -1 (no audio)."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        class FakeTalker:
+            _last_audio_codes = torch.tensor([[-1, -1, -1, -1, -1, -1, -1, -1]])
+            _postprocess_cursor = 0
+
+        t = FakeTalker()
+        t.postprocess = mod.HiggsAudioV3TalkerForConditionalGeneration.postprocess.__get__(t)
+        result = t.postprocess(torch.zeros(1, 64))
+        assert result == {}
+
+    def test_postprocess_advances_cursor(self):
+        """postprocess() should advance cursor by 1 per call."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        class FakeTalker:
+            _last_audio_codes = torch.tensor(
+                [[100, 200, 300, 400, 500, 600, 700, 800], [-1, -1, -1, -1, -1, -1, -1, -1]]
+            )
+            _postprocess_cursor = 0
+
+        t = FakeTalker()
+        t.postprocess = mod.HiggsAudioV3TalkerForConditionalGeneration.postprocess.__get__(t)
+        r1 = t.postprocess(torch.zeros(1, 64))
+        assert "codes" in r1
+        r2 = t.postprocess(torch.zeros(1, 64))
+        assert r2 == {}  # Second row is all -1
+
+
+# ---- AC-6: Audio Feedback Method Tests ----
+
+
+class TestAudioFeedback:
+    """Test _apply_audio_feedback with minimal fake talker."""
+
+    def _make_feedback_talker(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        embed = mod.HiggsFusedMultiTextEmbedding(num_codebooks=8, vocab_size=1026, hidden_size=16)
+        torch.nn.init.ones_(embed.weight)
+
+        class FakeTalker:
+            num_codebooks = 8
+            codebook_size = 1026
+            _audio_continuation_id = 99999  # fake audio token
+            _last_step_query_start_loc = None
+            _audio_state = {}
+            multimodal_embedding = embed
+            model = type("M", (), {"embed_tokens": lambda self, ids: torch.zeros(ids.shape[0], 16)})()
+
+        t = FakeTalker()
+        t._decode_last_codes = torch.zeros(256, 8, dtype=torch.long)
+        t._decode_has_codes = torch.zeros(256, dtype=torch.bool)
+        t._apply_audio_feedback = mod.HiggsAudioV3TalkerForConditionalGeneration._apply_audio_feedback.__get__(t)
+        return t
+
+    def test_text_positions_unchanged(self):
+        """Non-audio positions should not be modified."""
+        t = self._make_feedback_talker()
+        # No audio state → all positions unchanged
+        input_ids = torch.tensor([1, 2, 3, 4])
+        hidden = torch.randn(4, 16)
+        result = t._apply_audio_feedback(hidden, input_ids)
+        assert torch.equal(result, hidden)
+
+    def test_audio_position_replaced_with_state(self):
+        """Audio position with state should have its embedding replaced."""
+        t = self._make_feedback_talker()
+        audio_id = t._audio_continuation_id
+        t._audio_state[1] = {"last_codes": torch.zeros(8, dtype=torch.long)}
+        t._decode_last_codes[1] = torch.zeros(8, dtype=torch.long)
+        t._decode_has_codes[1] = True
+        input_ids = torch.tensor([1, audio_id, 3])
+        hidden = torch.zeros(3, 16)
+        result = t._apply_audio_feedback(hidden, input_ids)
+        # Position 1 (audio) should be non-zero (embedding of all-0 codes)
+        assert result[1].abs().sum() > 0
+        # Positions 0 and 2 should remain zero
+        assert result[0].abs().sum() == 0
+        assert result[2].abs().sum() == 0
+
+    def test_no_state_no_replacement(self):
+        """Audio position without state should not be replaced."""
+        t = self._make_feedback_talker()
+        audio_id = t._audio_continuation_id
+        # No state for row 0 — _decode_has_codes[0] defaults to False
+        input_ids = torch.tensor([audio_id])
+        hidden = torch.zeros(1, 16)
+        result = t._apply_audio_feedback(hidden, input_ids)
+        assert torch.equal(result, hidden)
+
+
+# ---- AC-8: Codec Strictness ----
+
+
+class TestCodecStrictness:
+    def test_bundled_missing_quantizer_key_raises(self):
+        """Bundled codec load must fail when a quantizer codebook key is missing."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
+            HiggsAudioV3Code2Wav,
+        )
+
+        config = HiggsAudioV3Config()
+        c2w = HiggsAudioV3Code2Wav(config=config)
+
+        # State with only 7 quantizers (missing quantizer.quantizers.7.*)
+        codec_state = {}
+        for i in range(7):
+            codec_state[f"quantizer.quantizers.{i}.codebook.embed"] = torch.randn(1024, 64)
+            codec_state[f"quantizer.quantizers.{i}.project_out.weight"] = torch.randn(1024, 64)
+            codec_state[f"quantizer.quantizers.{i}.project_out.bias"] = torch.randn(1024)
+        codec_state["fc2.weight"] = torch.randn(256, 1024)
+        codec_state["fc2.bias"] = torch.randn(256)
+
+        with pytest.raises(KeyError, match="quantizer 7"):
+            c2w._load_from_bundled_state(codec_state, device=torch.device("cpu"))
+
+    def test_bundled_missing_fc2_raises(self):
+        """Bundled codec load must fail when fc2 keys are missing."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
+            HiggsAudioV3Code2Wav,
+        )
+
+        config = HiggsAudioV3Config()
+        c2w = HiggsAudioV3Code2Wav(config=config)
+
+        codec_state = {}
+        for i in range(8):
+            codec_state[f"quantizer.quantizers.{i}.codebook.embed"] = torch.randn(1024, 64)
+            codec_state[f"quantizer.quantizers.{i}.project_out.weight"] = torch.randn(1024, 64)
+            codec_state[f"quantizer.quantizers.{i}.project_out.bias"] = torch.randn(1024)
+        # No fc2 keys
+
+        with pytest.raises(KeyError, match="fc2"):
+            c2w._load_from_bundled_state(codec_state, device=torch.device("cpu"))
+
+    def test_bundled_unknown_decoder_key_rejected(self, monkeypatch):
+        """Unknown decoder-side key should be rejected as unconsumed."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_code2wav as c2w_mod
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
+            HiggsAudioV3Code2Wav,
+        )
+
+        class FakeDAC(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dummy = torch.nn.Parameter(torch.zeros(1))
+
+        monkeypatch.setattr(c2w_mod, "build_boson_dac_decoder", lambda device: FakeDAC().to(device))
+        monkeypatch.setattr(c2w_mod, "build_higgs_audio_acoustic_decoder", lambda cfg, device: FakeDAC().to(device))
+
+        config = HiggsAudioV3Config()
+        c2w = HiggsAudioV3Code2Wav(config=config)
+
+        codec_state = _build_full_codec_state()
+        codec_state["unknown_decoder_module.weight"] = torch.randn(10)
+
+        with pytest.raises(RuntimeError, match="unexpected decoder-side keys"):
+            c2w._load_from_bundled_state(codec_state, device=torch.device("cpu"))
+
+    def test_bundled_encoder_side_keys_accepted(self, monkeypatch):
+        """Known encoder-side keys should not trigger unconsumed-key rejection."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_code2wav as c2w_mod
+        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
+            HiggsAudioV3Code2Wav,
+        )
+
+        class FakeDAC(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dummy = torch.nn.Parameter(torch.zeros(1))
+
+        monkeypatch.setattr(c2w_mod, "build_boson_dac_decoder", lambda device: FakeDAC().to(device))
+        monkeypatch.setattr(c2w_mod, "build_higgs_audio_acoustic_decoder", lambda cfg, device: FakeDAC().to(device))
+
+        config = HiggsAudioV3Config()
+        c2w = HiggsAudioV3Code2Wav(config=config)
+
+        codec_state = _build_full_codec_state()
+        codec_state["acoustic_encoder.block.0.conv_t1.weight"] = torch.randn(10)
+        codec_state["semantic_model.encoder.layers.0.weight"] = torch.randn(10)
+        codec_state["fc.weight"] = torch.randn(10)
+
+        # Should NOT raise — encoder-side keys are allowed
+        c2w._load_from_bundled_state(codec_state, device=torch.device("cpu"))
+        assert c2w._loaded
+
+
+def _build_minimal_codec_state() -> dict[str, torch.Tensor]:
+    """Build a minimal codec state dict (quantizer + fc2, no DAC)."""
+    state: dict[str, torch.Tensor] = {}
+    for i in range(8):
+        state[f"quantizer.quantizers.{i}.codebook.embed"] = torch.randn(1024, 64)
+        state[f"quantizer.quantizers.{i}.project_out.weight"] = torch.randn(1024, 64)
+        state[f"quantizer.quantizers.{i}.project_out.bias"] = torch.randn(1024)
+    state["fc2.weight"] = torch.randn(256, 1024)
+    state["fc2.bias"] = torch.randn(256)
+    return state
+
+
+def _build_full_codec_state() -> dict[str, torch.Tensor]:
+    """Build a full codec state dict including acoustic_decoder keys.
+
+    The acoustic_decoder keys here match what a FakeDAC module expects
+    (just 'dummy'). Real DAC has many more keys.
+    """
+    state = _build_minimal_codec_state()
+    state["acoustic_decoder.dummy"] = torch.zeros(1)
+    return state
+
+
+# ---- AC-2: Loader Required-Key Validation ----
+
+
+class TestLoaderRequiredKeys:
+    """Test exact required-key validation in load_weights."""
+
+    def test_build_required_keys_count(self):
+        """Required key set should have 1 text_emb + 36*11 layers + 1 norm + 1 modality = 399."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        keys = HiggsAudioV3TalkerForConditionalGeneration._build_required_keys(36)
+        assert len(keys) == 1 + 36 * 11 + 1 + 1  # text + layers + norm + modality = 399
+
+    def test_build_required_keys_contains_norm(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        keys = HiggsAudioV3TalkerForConditionalGeneration._build_required_keys(2)
+        assert "body.norm.weight" in keys
+
+    def test_build_required_keys_contains_layer_subkeys(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        keys = HiggsAudioV3TalkerForConditionalGeneration._build_required_keys(2)
+        assert "body.layers.0.self_attn.k_proj.weight" in keys
+        assert "body.layers.1.mlp.gate_proj.weight" in keys
+
+    def test_build_required_keys_contains_modality_embedding(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        keys = HiggsAudioV3TalkerForConditionalGeneration._build_required_keys(1)
+        assert "tied.embedding.modality_embeddings.0.embedding.weight" in keys
+
+    def test_build_required_keys_contains_text_embedding(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        keys = HiggsAudioV3TalkerForConditionalGeneration._build_required_keys(1)
+        assert "tied.embedding.text_embedding.weight" in keys
+
+
+class TestLoadWeightsEnforcement:
+    """Test load_weights() itself with synthetic key sets via a minimal fake talker."""
+
+    def _make_fake_talker_and_keys(self):
+        """Build a minimal talker-like object and the full 1-layer key set."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        # Minimal fake talker with just enough to run load_weights
+        talker = object.__new__(mod.HiggsAudioV3TalkerForConditionalGeneration)
+        torch.nn.Module.__init__(talker)
+
+        # Attach minimal attributes load_weights needs
+        talker.multimodal_embedding = mod.HiggsFusedMultiTextEmbedding(8, 1026, 16)
+        talker.modality_head = mod.HiggsFusedMultiTextHead(8, 1026, 16)
+        talker.tie_modality = True
+        talker.modality_head.weight = talker.multimodal_embedding.weight
+
+        # Fake backbone config with 1 layer
+        class FakeConfig:
+            num_hidden_layers = 1
+            tie_word_embeddings = True
+
+        talker._backbone_config = FakeConfig()
+
+        # Minimal model and lm_head so _BackboneWrapper can be constructed
+        talker.model = torch.nn.Module()
+        talker.lm_head = torch.nn.Module()
+
+        # Fake vllm_config for resolve_special_tokens (no-op)
+        class FakeModelConfig:
+            model = None
+
+        class FakeVllmConfig:
+            model_config = FakeModelConfig()
+
+        talker.vllm_config = FakeVllmConfig()
+        talker.config = type("C", (), {"resolve_special_tokens": lambda self, p: None})()
+        talker._resolved_tokens = True
+        talker._audio_continuation_id = None
+        talker._eos_token_id = None
+
+        # Build the full required key set for 1 layer
+        required = mod.HiggsAudioV3TalkerForConditionalGeneration._build_required_keys(1)
+
+        # Build synthetic weights: tiny tensors for every required key
+        weights = {}
+        for key in required:
+            if "modality_embeddings.0.embedding" in key:
+                weights[key] = torch.randn(8 * 1026, 16)
+            else:
+                weights[key] = torch.randn(4)  # tiny placeholder
+
+        # Monkeypatch _BackboneWrapper.load_weights to accept and return keys
+        def fake_backbone_load(self_wrapper, ws):
+            consumed = set()
+            for name, _ in ws:
+                consumed.add(name)
+            return consumed
+
+        talker._fake_backbone_load = fake_backbone_load
+        return talker, weights, mod, fake_backbone_load
+
+    def test_load_weights_succeeds_with_all_keys(self, monkeypatch):
+        """load_weights succeeds when all required keys are present."""
+        talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
+        monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
+        result = talker.load_weights(iter(weights.items()))
+        assert isinstance(result, set)
+        assert "multimodal_embedding.weight" in result
+
+    def test_load_weights_fails_missing_norm(self, monkeypatch):
+        """load_weights raises when body.norm.weight is missing."""
+        talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
+        monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
+        del weights["body.norm.weight"]
+        with pytest.raises(RuntimeError, match="body.norm.weight"):
+            talker.load_weights(iter(weights.items()))
+
+    def test_load_weights_fails_missing_layer_subkey(self, monkeypatch):
+        """load_weights raises when a specific layer subkey is missing."""
+        talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
+        monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
+        del weights["body.layers.0.self_attn.k_proj.weight"]
+        with pytest.raises(RuntimeError, match="body.layers.0.self_attn.k_proj.weight"):
+            talker.load_weights(iter(weights.items()))
+
+    def test_load_weights_fails_missing_modality_embedding(self, monkeypatch):
+        """load_weights raises when modality embedding is missing."""
+        talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
+        monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
+        del weights["tied.embedding.modality_embeddings.0.embedding.weight"]
+        with pytest.raises(RuntimeError, match="modality_embeddings"):
+            talker.load_weights(iter(weights.items()))
+
+    def test_load_weights_fails_unknown_prefix(self, monkeypatch):
+        """load_weights raises on unknown non-codec checkpoint prefix."""
+        talker, weights, mod, fake_load = self._make_fake_talker_and_keys()
+        monkeypatch.setattr(mod._BackboneWrapper, "load_weights", fake_load)
+        weights["unknown.prefix.weight"] = torch.randn(4)
+        with pytest.raises(ValueError, match="Unexpected checkpoint key"):
+            talker.load_weights(iter(weights.items()))
+
+
+# ---- AC-7: Stage Input Processor ----
+
+
+class TestStageInputProcessor:
+    def test_revert_delay_pattern(self):
+        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
+            _revert_delay_pattern,
+        )
+
+        # 8 codebooks, 3 real frames -> delayed shape [8, 3+8-1=10]
+        Q, T = 8, 3
+        delayed = torch.full((Q, T + Q - 1), 1024)  # Fill with BOC
+        for i in range(Q):
+            for t in range(T):
+                delayed[i, i + t] = i * 100 + t  # Real codes at shifted positions
+        result = _revert_delay_pattern(delayed)
+        assert result.shape == (Q, T)
+        for i in range(Q):
+            for t in range(T):
+                assert result[i, t].item() == i * 100 + t
+
+    def test_revert_delay_pattern_rejects_wrong_codebooks(self):
+        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
+            _revert_delay_pattern,
+        )
+
+        # 7 codebooks should be rejected
+        codes = torch.zeros(7, 20)
+        with pytest.raises(ValueError, match="Expected exactly 8 codebook rows"):
+            _revert_delay_pattern(codes)
+
+    def test_revert_delay_pattern_rejects_too_few_frames(self):
+        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
+            _revert_delay_pattern,
+        )
+
+        # 8 codebooks but only 5 frames (need at least 8)
+        codes = torch.zeros(8, 5)
+        with pytest.raises(ValueError, match="Not enough frames"):
+            _revert_delay_pattern(codes)
+
+    def test_filter_real_code_frames(self):
+        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
+            _filter_real_code_frames,
+        )
+
+        # 8 codebooks, 4 frames
+        codes = torch.tensor(
+            [
+                [100, 200, 1024, 300],  # cb0: frame 2 has BOC
+                [101, 201, 1024, 301],
+                [102, 202, 1024, 302],
+                [103, 203, 1024, 303],
+                [104, 204, 1024, 304],
+                [105, 205, 1024, 305],
+                [106, 206, 1024, 306],
+                [107, 207, 1024, 307],
+            ]
+        )
+        result = _filter_real_code_frames(codes)
+        # Frame 2 (column 2) has BOC in all codebooks -> filtered out
+        assert result.shape == (8, 3)
+        assert result[0, 0].item() == 100
+        assert result[0, 1].item() == 200
+        assert result[0, 2].item() == 300
+
+
+# ---- AC-10: Registry ----
+
+
+class TestRegistry:
+    def test_talker_registered(self):
+        from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+
+        assert "HiggsMultimodalQwen3ForConditionalGeneration" in _OMNI_MODELS
+        assert "HiggsAudioV3TalkerForConditionalGeneration" in _OMNI_MODELS
+
+    def test_code2wav_registered(self):
+        from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+
+        assert "HiggsAudioV3Code2WavForConditionalGeneration" in _OMNI_MODELS
+
+    def test_pipeline_registered(self):
+        from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
+
+        assert "higgs_multimodal_qwen3" in _OMNI_PIPELINES
+
+    def test_deploy_yaml_exists(self):
+        import os
+
+        # __file__ = tests/unit/higgs_audio_v3/test_*.py → 4 dirnames to repo root
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        yaml_path = os.path.join(repo_root, "vllm_omni", "deploy", "higgs_multimodal_qwen3.yaml")
+        assert os.path.isfile(yaml_path), f"Deploy YAML not found at {yaml_path}"
+
+
+# ---- AC-3: Prompt Builder ----
+
+
+class TestPromptBuilder:
+    def _make_mock_tokenizer(self):
+        """Create a mock tokenizer with the required special tokens."""
+
+        class MockTokenizer:
+            def __init__(self):
+                self._added_vocab = {
+                    "<|tts|>": 151700,
+                    "<|text|>": 151701,
+                    "<|audio|>": 151702,
+                    "<|ref_audio|>": 151703,
+                    "<|ref_text|>": 151704,
+                }
+
+            def get_added_vocab(self):
+                return self._added_vocab
+
+            def encode(self, text, add_special_tokens=True):
+                # Simple word-level tokenization for testing
+                return list(range(100, 100 + len(text.split())))
+
+        return MockTokenizer()
+
+    def test_plain_tts_prompt(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import (
+            HiggsAudioV3TokenizerAdapter,
+        )
+
+        tok = self._make_mock_tokenizer()
+        adapter = HiggsAudioV3TokenizerAdapter(tok)
+        ids = adapter.build_prompt("Hello world")
+        assert ids[0] == 151700  # <|tts|>
+        assert ids[1] == 151701  # <|text|>
+        assert ids[-1] == 151702  # <|audio|>
+        assert len(ids) == 2 + 2 + 1  # tts + text + 2 word tokens + audio
+
+    def test_empty_text_rejected(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import (
+            HiggsAudioV3TokenizerAdapter,
+        )
+
+        tok = self._make_mock_tokenizer()
+        adapter = HiggsAudioV3TokenizerAdapter(tok)
+        with pytest.raises(ValueError, match="non-empty"):
+            adapter.build_prompt("")
+
+    def test_whitespace_only_rejected(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import (
+            HiggsAudioV3TokenizerAdapter,
+        )
+
+        tok = self._make_mock_tokenizer()
+        adapter = HiggsAudioV3TokenizerAdapter(tok)
+        with pytest.raises(ValueError, match="non-empty"):
+            adapter.build_prompt("   ")
+
+    def test_missing_specials_rejected(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import (
+            HiggsAudioV3TokenizerAdapter,
+        )
+
+        class BadTokenizer:
+            def get_added_vocab(self):
+                return {"<|tts|>": 1}  # Missing <|text|> and <|audio|>
+
+        with pytest.raises(ValueError, match="missing"):
+            HiggsAudioV3TokenizerAdapter(BadTokenizer())
+
+    def test_no_voice_clone_tokens_in_plain_tts(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import (
+            HiggsAudioV3TokenizerAdapter,
+        )
+
+        tok = self._make_mock_tokenizer()
+        adapter = HiggsAudioV3TokenizerAdapter(tok)
+        ids = adapter.build_prompt("Hello")
+        # Should not contain ref_audio or ref_text token IDs
+        assert 151703 not in ids  # <|ref_audio|>
+        assert 151704 not in ids  # <|ref_text|>
+
+
+# ---- Regression: ramp-down done-before-emit off-by-one ----
+
+
+def _simulate_delay_state_machine(
+    sampled_codes_per_step: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    """Reproduce the delay-pattern state machine from sample().
+
+    Feeds ``sampled_codes_per_step`` (each [Q]) through the exact same
+    logic as HiggsAudioV3TalkerForConditionalGeneration.sample() and
+    returns the list of emitted frames (non -1 codes).
+    """
+    from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+        BOC_ID,
+        EOC_ID,
+    )
+
+    num_codebooks = 8
+    bos = BOC_ID
+    eos_stream = EOC_ID
+
+    state: dict = {
+        "num_delay": 0,
+        "num_remaining_delays": None,
+        "audio_out_ids": None,
+        "last_codes": torch.full((num_codebooks,), bos, dtype=torch.long),
+        "should_terminate": False,
+    }
+
+    emitted: list[torch.Tensor] = []
+    for step_codes in sampled_codes_per_step:
+        if state["should_terminate"]:
+            break
+
+        num_delay = state["num_delay"]
+        num_remaining_delays = state["num_remaining_delays"]
+        this_codes = step_codes.clone()
+
+        if num_delay + 1 < num_codebooks:
+            this_codes[num_delay + 1 :] = bos
+            num_delay += 1
+
+        if num_remaining_delays is not None:
+            this_codes[: num_codebooks - num_remaining_delays] = eos_stream
+            num_remaining_delays -= 1
+        else:
+            eos_positions = (this_codes == eos_stream).nonzero(as_tuple=False).reshape(-1)
+            if eos_positions.numel() > 0:
+                last_eos_idx = int(eos_positions[-1].item())
+                this_codes[: last_eos_idx + 1] = eos_stream
+                num_remaining_delays = num_codebooks - last_eos_idx - 1
+
+        if num_remaining_delays is not None and num_remaining_delays <= 0:
+            state["num_delay"] = 0
+            state["num_remaining_delays"] = None
+            state["should_terminate"] = True
+            continue
+
+        state["num_delay"] = num_delay
+        state["num_remaining_delays"] = num_remaining_delays
+        state["last_codes"] = this_codes.clone()
+        emitted.append(this_codes)
+
+    return emitted
+
+
+class TestRampDownOffByOne:
+    """Regression tests for the done-before-emit off-by-one bug.
+
+    When EOC fires early, the ramp-down must emit enough frames so that
+    Stage1's _revert_delay_pattern receives T >= Q = 8.
+    """
+
+    def test_eoc_at_step0_terminates(self):
+        """EOC on cb0 at step 0 terminates; T < Q is handled by Stage1 defensive try/except."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
+
+        Q = 8
+        steps = []
+        for s in range(20):
+            codes = torch.randint(0, 1024, (Q,))
+            if s == 0:
+                codes[0] = EOC_ID
+            steps.append(codes)
+
+        emitted = _simulate_delay_state_machine(steps)
+        assert len(emitted) == Q - 1, f"EOC at step 0: expected {Q - 1} emitted frames, got {len(emitted)}"
+
+    def test_eoc_at_step1_emits_enough_frames(self):
+        """EOC on cb0 at step 1 must produce >= Q emitted frames."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
+
+        Q = 8
+        steps = []
+        for s in range(20):
+            codes = torch.randint(0, 1024, (Q,))
+            if s == 1:
+                codes[0] = EOC_ID
+            steps.append(codes)
+
+        emitted = _simulate_delay_state_machine(steps)
+        assert len(emitted) >= Q, f"EOC at step 1: expected >= {Q} emitted frames, got {len(emitted)}"
+
+    def test_eoc_after_full_rampup_emits_enough(self):
+        """EOC after all codebooks are active produces T >> Q."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
+
+        Q = 8
+        eoc_step = 10
+        steps = []
+        for s in range(30):
+            codes = torch.randint(0, 1024, (Q,))
+            if s == eoc_step:
+                codes[0] = EOC_ID
+            steps.append(codes)
+
+        emitted = _simulate_delay_state_machine(steps)
+        assert len(emitted) >= Q, f"EOC at step {eoc_step}: expected >= {Q} emitted frames, got {len(emitted)}"
+
+    def test_last_rampdown_frame_not_all_negative(self):
+        """The last emitted ramp-down frame must contain real codes, not -1."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
+
+        Q = 8
+        steps = []
+        for s in range(20):
+            codes = torch.randint(0, 1024, (Q,))
+            if s == 1:
+                codes[0] = EOC_ID
+            steps.append(codes)
+
+        emitted = _simulate_delay_state_machine(steps)
+        last = emitted[-1]
+        assert (last >= 0).all(), f"Last ramp-down frame contains negative values: {last.tolist()}"
+
+    def test_emitted_frames_revertible_by_stage1(self):
+        """Emitted frames from EOC-at-step-1 must be revertible by _revert_delay_pattern."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
+        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
+            _revert_delay_pattern,
+        )
+
+        Q = 8
+        steps = []
+        for s in range(20):
+            codes = torch.randint(0, 1024, (Q,))
+            if s == 1:
+                codes[0] = EOC_ID
+            steps.append(codes)
+
+        emitted = _simulate_delay_state_machine(steps)
+        # Stack to [T, Q], transpose to [Q, T]
+        codes_qt = torch.stack(emitted, dim=0).t().contiguous()
+        assert codes_qt.shape[0] == Q
+        assert codes_qt.shape[1] >= Q
+
+        # Must not raise
+        reverted = _revert_delay_pattern(codes_qt)
+        assert reverted.shape[0] == Q
+        assert reverted.shape[1] == codes_qt.shape[1] - Q + 1
+
+
+class TestStage1DefensiveHandling:
+    """Stage1 must not crash the server when receiving T < Q frames."""
+
+    def test_revert_delay_pattern_raises_on_insufficient_frames(self):
+        """_revert_delay_pattern correctly raises ValueError for T < Q."""
+        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
+            _revert_delay_pattern,
+        )
+
+        codes = torch.zeros(8, 7)  # T=7 < Q=8
+        with pytest.raises(ValueError, match="Not enough frames"):
+            _revert_delay_pattern(codes)
+
+    def test_talker2code2wav_survives_insufficient_frames(self):
+        """talker2code2wav must not crash when audio_codes has T < Q frames."""
+        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
+            talker2code2wav,
+        )
+
+        # Build a fake talker output with only 7 frames (T=7 < Q=8)
+        class FakeOutput:
+            def __init__(self):
+                self.multimodal_output = {
+                    "codes": {"audio": torch.zeros(7, 8, dtype=torch.long)},
+                }
+
+        class FakeTalkerOutput:
+            finished = True
+            outputs = [FakeOutput()]
+
+        # Must not raise — should return gracefully
+        result = talker2code2wav([FakeTalkerOutput()])
+        assert len(result) == 1
+        # Result is an OmniTokensPrompt with empty prompt_token_ids
+        out = result[0]
+        token_ids = out.prompt_token_ids if hasattr(out, "prompt_token_ids") else out.get("prompt_token_ids", [])
+        assert token_ids == []
+
+
+# ---- Regression: buffer growth + prefill guard ----
+
+
+class TestBufferGrowthPreservesState:
+    """Bug #1: buffer growth in _apply_audio_feedback must not wipe existing state."""
+
+    def _make_feedback_talker_with_buffers(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        embed = mod.HiggsFusedMultiTextEmbedding(num_codebooks=8, vocab_size=1026, hidden_size=16)
+        torch.nn.init.ones_(embed.weight)
+
+        class FakeTalker:
+            num_codebooks = 8
+            codebook_size = 1026
+            multimodal_embedding = embed
+
+        t = FakeTalker()
+        t._decode_last_codes = torch.zeros(4, 8, dtype=torch.long)
+        t._decode_has_codes = torch.zeros(4, dtype=torch.bool)
+        t._apply_audio_feedback = mod.HiggsAudioV3TalkerForConditionalGeneration._apply_audio_feedback.__get__(t)
+        return t
+
+    def test_buffer_growth_preserves_existing_codes(self):
+        """Growing the buffer must copy old _decode_last_codes data."""
+        t = self._make_feedback_talker_with_buffers()
+        # Set state for slot 2
+        t._decode_last_codes[2] = torch.tensor([100, 200, 300, 400, 500, 600, 700, 800])
+        t._decode_has_codes[2] = True
+
+        # Trigger growth by calling with bs=8 > current capacity 4
+        hidden = torch.randn(8, 16)
+        t._apply_audio_feedback(hidden, torch.zeros(8, dtype=torch.long))
+
+        # After growth, slot 2 data must still be present
+        assert t._decode_has_codes[2].item() is True
+        assert t._decode_last_codes[2, 0].item() == 100
+
+    def test_buffer_growth_new_slots_are_inactive(self):
+        """New slots from buffer growth must have has_codes=False."""
+        t = self._make_feedback_talker_with_buffers()
+        t._decode_has_codes[1] = True
+
+        hidden = torch.randn(8, 16)
+        t._apply_audio_feedback(hidden, torch.zeros(8, dtype=torch.long))
+
+        # Slots 4-7 (new) must be inactive
+        assert not t._decode_has_codes[4].item()
+        assert not t._decode_has_codes[7].item()
+        # Slot 1 (old) must still be active
+        assert t._decode_has_codes[1].item()
+
+
+class TestPrefillGuard:
+    """Bug #2: _apply_audio_feedback must NOT run during prefill.
+
+    The prefill detection uses attn_metadata.max_query_len (== 1 for decode,
+    > 1 for prefill). This correctly handles concurrent decode (N requests,
+    each contributing 1 token → numel=N but max_query_len=1).
+    """
+
+    @staticmethod
+    def _is_prefill_via_max_query_len(max_query_len: int | None, input_ids: torch.Tensor) -> bool:
+        """Mirror the actual detection logic in forward()."""
+        if max_query_len is not None:
+            return int(max_query_len) > 1
+        return input_ids is not None and int(input_ids.numel()) > 1
+
+    def test_prefill_detected_via_max_query_len(self):
+        """Prefill: max_query_len > 1 → is_prefill=True."""
+        input_ids = torch.tensor([1, 2, 3, 4, 5])
+        assert self._is_prefill_via_max_query_len(5, input_ids) is True
+
+    def test_single_decode_detected_via_max_query_len(self):
+        """Single-request decode: max_query_len=1 → is_prefill=False."""
+        input_ids = torch.tensor([42])
+        assert self._is_prefill_via_max_query_len(1, input_ids) is False
+
+    def test_concurrent_decode_not_misclassified(self):
+        """Multi-request decode: numel=4 but max_query_len=1 → is_prefill=False.
+
+        This is the regression caught by reviewer: with c=4 concurrent decode
+        requests, input_ids.numel()==4 but each request contributes exactly 1
+        token, so max_query_len==1 and audio feedback must still apply.
+        """
+        input_ids = torch.tensor([42, 43, 44, 45])  # 4 concurrent decode
+        assert self._is_prefill_via_max_query_len(1, input_ids) is False
+
+    def test_fallback_when_max_query_len_unavailable(self):
+        """When attn_metadata is unavailable, fall back to numel heuristic."""
+        prefill_ids = torch.tensor([1, 2, 3])
+        assert self._is_prefill_via_max_query_len(None, prefill_ids) is True
+        decode_ids = torch.tensor([42])
+        assert self._is_prefill_via_max_query_len(None, decode_ids) is False

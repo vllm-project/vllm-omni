@@ -214,3 +214,34 @@ def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
             pass
 
     return sum_user_len + assistant_len
+
+
+def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], request: Any) -> None:
+    """Update a downstream streaming request prompt from connector payload ids.
+
+    Async-chunk downstream stages are prewarmed before the real Talker prompt is
+    known. When a Thinker payload carries ``ids.prompt``, this helper:
+
+    * Preserves ``num_computed_tokens`` (the scheduler token watermark).
+    * Moves already-computed output tokens into ``prompt_token_ids``.
+    * Appends a new placeholder prompt slice sized from the upstream ids.
+    * Refreshes block hashes so the scheduler allocates KV slots for the
+      extended prompt without discarding prior computed state.
+    """
+    ids = payload_data.get("ids", {})
+    prompt_token_ids = ids.get("prompt", None)
+    if not prompt_token_ids:
+        return
+    num_computed_tokens = request.num_computed_tokens
+    kept_output_tokens = request._all_token_ids[request.num_prompt_tokens : num_computed_tokens]
+    del request._all_token_ids[num_computed_tokens:]
+    request._output_token_ids.clear()
+    assert request.prompt_token_ids is not None
+    # Extend prompt with kept output tokens.
+    request.prompt_token_ids.extend(kept_output_tokens)
+    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+    new_prompt = [0] * next_prompt_len
+    request._all_token_ids.extend(new_prompt or ())
+    request.prompt_token_ids.extend(new_prompt or ())
+    request.update_block_hashes()
+    request.num_prompt_tokens = len(request.prompt_token_ids)
