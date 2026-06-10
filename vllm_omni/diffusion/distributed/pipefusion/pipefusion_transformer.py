@@ -230,7 +230,8 @@ class PipeFusionSelfAttentionMixin(ABC):
 
             return full_k, full_v
         else:
-            self._set_kv_cache(runtime.cache_key, key, value)
+            if runtime.update_warmup_cache:
+                self._set_kv_cache(runtime.cache_key, key, value)
             return key, value
 
 
