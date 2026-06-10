@@ -174,9 +174,13 @@ that benefits from PipeFusion overlap.
 
 ### When to Use
 
+PipeFusion trades communication bottlenecks for memory bandwidth overhead (due to repeated KV-cache reads).
+Choose PipeFusion when inter-GPU communication is the primary performance cost, and consider alternative distributed
+strategies otherwise.
+
 **Good for:**
 
-- Supported large video diffusion pipelines with Pipeline Parallelism enabled
+- Supported large diffusion pipelines with Pipeline Parallelism enabled
 - Multi-GPU setups where plain PP has noticeable pipeline bubbles
 - Images and shorter videos, where repeated KV-cache reads are less likely to become a memory bottleneck
 - PP combined with CFG-Parallel on supported models
