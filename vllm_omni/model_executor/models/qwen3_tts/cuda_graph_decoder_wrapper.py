@@ -7,7 +7,6 @@ This module provides CUDA Graph acceleration for the speech tokenizer decoder,
 reducing kernel launch overhead during inference.
 """
 
-import bisect
 import os
 import time
 from collections import Counter
@@ -226,11 +225,9 @@ class CUDAGraphDecoderWrapper:
         return sorted(sizes)
 
     def _get_padded_size(self, actual_size: int) -> int | None:
-        # bisect_left over the pre-sorted _bucket_sizes is O(log n) vs the linear scan;
-        # this matters because _decode invokes it on every per-chunk replay.
-        idx = bisect.bisect_left(self._bucket_sizes, actual_size)
-        if idx < len(self._bucket_sizes):
-            return self._bucket_sizes[idx]
+        for size in self._bucket_sizes:
+            if actual_size <= size:
+                return size
         return None
 
     def _get_capture_shapes(self) -> list[tuple[int, int]]:
