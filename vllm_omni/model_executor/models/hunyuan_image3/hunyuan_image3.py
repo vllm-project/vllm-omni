@@ -1457,6 +1457,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     HunyuanImage3Inputs: TypeAlias = HunyuanImage3PixelInputs
 
     prefer_model_sampler = True
+    logitsprocs_need_output_token_ids = True
 
     # Siglip2 ViT supports data-parallel encoding (mm_encoder_tp_mode="data"):
     # weights are replicated and the image batch is sharded across TP ranks.
