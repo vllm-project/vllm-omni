@@ -410,6 +410,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         self._fish_speech_tokenizer = None
         self._covo_audio_tokenizer = None
+        # Cached per process: the CosyVoice3 Qwen tokenizer + resolved model
+        # path used for dynamic-token sizing. Without this, every request
+        # re-ran snapshot_download + reloaded the tokenizer (~100 ms on the
+        # TTFP critical path) in _apply_cosyvoice3_dynamic_tokens.
+        self._cosyvoice3_tokenizer = None
 
         self._is_cosyvoice3 = (
             self._tts_stage is not None
@@ -2658,16 +2663,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         sampling_params_list = copy.deepcopy(sampling_params_list)
         hf_cfg = self.model_config.hf_config
-        model_path = self.engine_client.model_config.model
-        if not os.path.isdir(model_path):
-            from huggingface_hub import snapshot_download
+        # Build the Qwen tokenizer once per process (resolving the model dir via
+        # snapshot_download at most once) and reuse it across requests.
+        tokenizer = self._cosyvoice3_tokenizer
+        if tokenizer is None:
+            model_path = self.engine_client.model_config.model
+            if not os.path.isdir(model_path):
+                from huggingface_hub import snapshot_download
 
-            model_path = snapshot_download(model_path)
-        tokenizer = get_qwen_tokenizer(
-            token_path=os.path.join(model_path, hf_cfg.qwen_pretrain_path),
-            skip_special_tokens=hf_cfg.skip_special_tokens,
-            version=hf_cfg.version,
-        )
+                model_path = snapshot_download(model_path)
+            tokenizer = get_qwen_tokenizer(
+                token_path=os.path.join(model_path, hf_cfg.qwen_pretrain_path),
+                skip_special_tokens=hf_cfg.skip_special_tokens,
+                version=hf_cfg.version,
+            )
+            self._cosyvoice3_tokenizer = tokenizer
         _, text_token_len = extract_text_token(
             request.input,
             tokenizer,
@@ -2869,6 +2879,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request, ref_audio_data=ref_audio_data, has_inline_ref_audio=has_inline_ref_audio
             )
             tts_params = {}
+            # Fish Speech resolves conditioning entirely from raw request fields
+            # (text / ref_audio / ref_text rebuilt into inputs_embeds); unlike
+            # uploaded-voice models it has no resolved tts_params to fold in, so
+            # the salt is derived from the request alone.
+            prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
         elif self._tts_model_type == "omnivoice":
             if not request.input or not request.input.strip():
                 raise ValueError("Input text cannot be empty")

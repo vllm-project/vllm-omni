@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Iterable
 from typing import Any
 
 from vllm.logger import init_logger
@@ -156,3 +157,122 @@ class OmniSchedulerMixin:
             return None
         self._last_stats_time = now
         return super().make_stats(*args, **kwargs)
+
+    def _realign_request_status_to_queues(
+        self,
+        request_ids: str | Iterable[str] | None,
+    ) -> None:
+        """Realign ``request.status`` to actual queue membership.
+
+        ``OmniChunkTransferAdapter._process_chunk_queue`` stamps
+        ``requests_origin_status[req.id] = WAITING`` (or ``RUNNING``) when
+        first parking a request in a chunk-transfer deque. On the next
+        tick, when the chunk arrives, ``_process_chunk_queue`` sets
+        ``request.status = target_status`` and continues, but
+        ``requests_origin_status`` is left at its first-park value -- no
+        hook updates it on the ``waiting → running`` admit transition
+        that ``super().schedule()`` later performs. The table stays
+        stale until the request makes another deque round-trip.
+
+        If an abort lands in the gap between admit and the next deque
+        round-trip, ``chunk_transfer_adapter.finish_requests`` reads the
+        stale ``WAITING`` from ``requests_origin_status``, stomps it
+        onto ``request.status``, and the upstream
+        ``Scheduler.finish_requests`` else branch silently fails to
+        remove from ``self.running`` -- the request stays alive in
+        ``self.running`` and the worker's ``input_batch`` slot leaks.
+        After ``max_num_seqs`` such aborts every new request hangs at
+        ``chunks=0`` until the client times out.
+
+        Realign here: if a request lives in ``self.running`` but its
+        status is not ``RUNNING``, set it to ``RUNNING``; symmetrically
+        flip ``RUNNING → WAITING`` when the request is actually in
+        ``self.waiting``. This is a localized safety net for
+        ``requests_origin_status`` staleness on the admit transition;
+        it does not touch the adapter's invariants and is complementary
+        to the chunk-transfer-adapter deque purge that already runs
+        inside ``process_pending_chunks`` / ``restore_queues``.
+
+        Note on scope: only the ``async_chunk`` path actually triggers
+        the ``requests_origin_status`` staleness this helper repairs.
+        When ``async_chunk`` is disabled, no chunk-transfer round-trip
+        occurs between admit and finish, so the realignment walk is a
+        cheap O(n) no-op over an already-aligned set. The call is kept
+        unconditional in ``finish_requests`` to (a) keep the abort path
+        uniform and (b) defend any future configuration that re-enables
+        chunk transfer from rediscovering the same regression.
+
+        See https://github.com/vllm-project/vllm-omni/pull/3774 and the
+        residual-hang reproduction discussed in that PR.
+        """
+        # Mirror the upstream Scheduler.finish_requests resolution of
+        # ``request_ids`` so realignment touches exactly the set that
+        # ``super().finish_requests`` will then walk.
+        if isinstance(request_ids, str):
+            ids_to_align: Iterable[str] = (request_ids,)
+        elif request_ids is None:
+            ids_to_align = list(self.requests.keys())
+        else:
+            ids_to_align = list(request_ids)
+
+        if not ids_to_align:
+            return
+
+        running_ids = {r.request_id for r in self.running}
+        waiting_ids = {r.request_id for r in self.waiting}
+
+        for rid in ids_to_align:
+            req = self.requests.get(rid)
+            if req is None or req.is_finished():
+                continue
+            if rid in running_ids and req.status != RequestStatus.RUNNING:
+                req.status = RequestStatus.RUNNING
+            elif rid in waiting_ids and req.status == RequestStatus.RUNNING:
+                req.status = RequestStatus.WAITING
+
+    def _purge_finished_from_running(self) -> None:
+        """Defensive post-finish sweep of ``self.running``.
+
+        Belt-and-suspenders to ``_realign_request_status_to_queues``:
+        even after status realignment lets upstream
+        ``Scheduler.finish_requests`` pick the right removal branch,
+        a future regression or an unexpected ``status`` mid-transition
+        could still leave already-finished entries in ``self.running``.
+        Sweeping here guarantees the worker's ``input_batch`` slot is
+        not pinned by a freed request.
+
+        Complementary to ``_realign_request_status_to_queues``: realign
+        is preventive (fix ``status`` before ``super().finish_requests``
+        so the right branch fires); this purge is defensive (sweep the
+        residue after ``super().finish_requests`` so any stale entries
+        are reclaimed).
+
+        Scope of the predicate. ``is_finished()`` covers entries the
+        upstream ``finish_requests`` already drained from ``self.requests``
+        but failed to remove from ``self.running``; the
+        ``request_id not in self.requests`` arm catches the same surface
+        from a different angle and is the post-cleanup mirror of the
+        deque purge ``_purge_untracked_chunk_requests`` already runs at
+        the chunk-transfer-adapter layer. It does **not** by itself make
+        arbitrary direct deletions of ``self.requests`` safe -- callers
+        that pop ``self.requests`` outside the standard finish path
+        still have to go through ``_free_request`` (or equivalent) for
+        block / connector / coordinator cleanup. This sweep only
+        reclaims the ``self.running`` slot reference.
+
+        In-place via ``self.running[:] = ...`` for minor consistency
+        with idiomatic vLLM scheduler mutation; upstream
+        ``Scheduler.finish_requests`` itself rebinds ``self.running``,
+        so list identity across the whole call is not preserved -- the
+        slice form is just to avoid an extra rebind inside this helper.
+
+        Assumes the upstream V1 invariant that scheduler ticks are
+        serialized on a single thread; in-place mutation here is no more
+        racy than the rest of the scheduler under that assumption.
+
+        See https://github.com/vllm-project/vllm-omni/pull/3774
+        discussion.
+        """
+        if not self.running:
+            return
+        self.running[:] = [req for req in self.running if not req.is_finished() and req.request_id in self.requests]
