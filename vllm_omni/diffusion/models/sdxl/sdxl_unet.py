@@ -17,6 +17,10 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
 
 logger = init_logger(__name__)
 
@@ -179,6 +183,7 @@ class SDXLCrossAttention(nn.Module):
             softmax_scale=1.0 / math.sqrt(attention_head_dim),
             role="cross",
             prefix=prefix,
+            skip_sequence_parallel=True,
         )
 
 
@@ -569,8 +574,42 @@ class SDXLCrossAttnUpBlock2D(nn.Module):
         return hidden_states
 
 
+def _build_sdxl_sp_plan() -> dict:
+    """Build _sp_plan for all attention modules in the SDXL UNet.
+
+    Shards hidden_states at the first transformer block input and gathers
+    at proj_out for each SDXLTransformer2DModel instance.
+    """
+    plan: dict = {}
+    attn_paths = [
+        # down_blocks[1]: 2 attention modules
+        "down_blocks.1.attentions.0",
+        "down_blocks.1.attentions.1",
+        # down_blocks[2]: 2 attention modules
+        "down_blocks.2.attentions.0",
+        "down_blocks.2.attentions.1",
+        # mid_block: 1 attention module
+        "mid_block.attentions.0",
+        # up_blocks[0]: 3 attention modules
+        "up_blocks.0.attentions.0",
+        "up_blocks.0.attentions.1",
+        "up_blocks.0.attentions.2",
+        # up_blocks[1]: 3 attention modules
+        "up_blocks.1.attentions.0",
+        "up_blocks.1.attentions.1",
+        "up_blocks.1.attentions.2",
+    ]
+    for path in attn_paths:
+        plan[f"{path}.transformer_blocks.0"] = {
+            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
+        }
+        plan[f"{path}.proj_out"] = SequenceParallelOutput(gather_dim=1, expected_dims=3)
+    return plan
+
+
 class SDXLUNet2DConditionModel(nn.Module):
     _repeated_blocks = ["SDXLBasicTransformerBlock", "SDXLResnetBlock2D"]
+    _sp_plan = _build_sdxl_sp_plan()
 
     def __init__(self, *, od_config: OmniDiffusionConfig):
         super().__init__()
