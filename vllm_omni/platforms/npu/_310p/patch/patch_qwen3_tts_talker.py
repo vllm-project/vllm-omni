@@ -17,26 +17,25 @@ from vllm_omni.platforms.npu._310p.qwen3_tts_runtime import (
     patch_module_bfloat16,
 )
 
-TARGET_MODULE = "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker"
-
+_PATCHED = False
 _original_load_weights: Callable[..., Any] | None = None
 
 
-def is_ready(module: Any) -> bool:
-    return hasattr(module, "Qwen3TTSTalkerForConditionalGeneration")
-
-
-def apply(module: Any) -> None:
+def apply_patch() -> None:
+    global _PATCHED
     global _original_load_weights
 
-    if _original_load_weights is not None:
+    if _PATCHED:
         return
+
+    from vllm_omni.model_executor.models.qwen3_tts import qwen3_tts_talker as module
 
     patch_module_bfloat16(module)
     cls = module.Qwen3TTSTalkerForConditionalGeneration
     _original_load_weights = cls.load_weights
     cls._encode_ref_audio_batch = _encode_ref_audio_batch_310p
     cls.load_weights = _load_weights_310p
+    _PATCHED = True
 
 
 def _encode_ref_audio_batch_310p(

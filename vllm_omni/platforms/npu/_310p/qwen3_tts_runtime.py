@@ -5,7 +5,14 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
+
+_QWEN3_TTS_ARCHS = {
+    "Qwen3TTSTalkerForConditionalGeneration",
+    "Qwen3TTSCode2Wav",
+}
 
 
 class ModuleTorchDtypeProxy:
@@ -38,6 +45,16 @@ def audio_frontend_runtime(_device: torch.device) -> tuple[torch.device, torch.d
     return torch.device("cpu"), torch.float32
 
 
+def is_qwen3_tts_model(model_config: Any) -> bool:
+    return getattr(model_config, "model_arch", None) in _QWEN3_TTS_ARCHS
+
+
+def use_qwen3_tts_310p_path(model_config: Any) -> bool:
+    from vllm_omni.platforms.npu._310p import is_310p
+
+    return is_310p() and is_qwen3_tts_model(model_config)
+
+
 def aligned_code_predictor_seq_len(num_code_groups: int) -> int:
     """Include the text step, then align the flash-attention token axis to 16."""
     return _align_up(int(num_code_groups) + 1, 16)
@@ -47,10 +64,11 @@ def build_code_predictor_attention_mask(device: torch.device, max_seq_len: int):
     """Reuse vLLM-Ascend's 310P mask builder for code predictor attention."""
     from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
 
-    original_max_seqlen = AttentionMaskBuilder310.max_seqlen
-    builder = AttentionMaskBuilder310(device, int(max_seq_len))
+    builder = object.__new__(AttentionMaskBuilder310)
     builder.max_seqlen = int(max_seq_len)
-    AttentionMaskBuilder310.max_seqlen = original_max_seqlen
+    builder.causal_attn_mask_cache = None
+    builder.non_causal_attn_mask_cache = None
+    builder.device = device
     return builder
 
 

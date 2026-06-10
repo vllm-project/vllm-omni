@@ -16,24 +16,23 @@ from vllm_omni.platforms.npu._310p.qwen3_tts_runtime import (
     runtime_dtype,
 )
 
-TARGET_MODULE = "vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder"
-
+_PATCHED = False
 _prompt_builder_module: Any | None = None
 
 
-def is_ready(module: Any) -> bool:
-    return hasattr(module, "Qwen3TTSPromptEmbedsBuilder")
-
-
-def apply(module: Any) -> None:
+def apply_patch() -> None:
+    global _PATCHED
     global _prompt_builder_module
 
-    if _prompt_builder_module is not None:
+    if _PATCHED:
         return
+
+    from vllm_omni.model_executor.models.qwen3_tts import prompt_embeds_builder as module
 
     _prompt_builder_module = module
     patch_module_bfloat16(module)
     module.Qwen3TTSPromptEmbedsBuilder.extract_speaker_embedding = _extract_speaker_embedding_310p
+    _PATCHED = True
 
 
 def _extract_speaker_embedding_310p(self, wav: np.ndarray, sr: int) -> torch.Tensor:

@@ -9,27 +9,20 @@ from collections.abc import Callable
 from typing import Any
 
 from vllm_omni.platforms.npu._310p import disable_jit_compile
+from vllm_omni.platforms.npu._310p.qwen3_tts_runtime import use_qwen3_tts_310p_path
 
-TARGET_MODULE = "vllm_omni.platforms.npu.worker.base"
-
-_QWEN3_TTS_ARCHS = {
-    "Qwen3TTSTalkerForConditionalGeneration",
-    "Qwen3TTSCode2Wav",
-}
 _original_init_device: Callable[..., Any] | None = None
 
 
-def is_ready(module: Any) -> bool:
-    return hasattr(module, "OmniNPUWorkerBase")
-
-
-def apply(module: Any) -> None:
+def apply_patch() -> None:
     global _original_init_device
 
     if _original_init_device is not None:
         return
 
-    cls = module.OmniNPUWorkerBase
+    from vllm_omni.platforms.npu.worker import base as worker_base
+
+    cls = worker_base.OmniNPUWorkerBase
     _original_init_device = cls._init_device
     cls._init_device = _init_device_310p_qwen3_tts
 
@@ -47,4 +40,4 @@ def _init_device_310p_qwen3_tts(self):
 
 def _is_qwen3_tts_worker(worker: Any) -> bool:
     model_config = getattr(getattr(worker, "vllm_config", None), "model_config", None)
-    return getattr(model_config, "model_arch", None) in _QWEN3_TTS_ARCHS
+    return use_qwen3_tts_310p_path(model_config)

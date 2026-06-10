@@ -16,8 +16,7 @@ from vllm_omni.platforms.npu._310p.qwen3_tts_runtime import (
     forward_code_predictor_attention,
 )
 
-TARGET_MODULE = "vllm_omni.model_executor.models.common.qwen3_code_predictor"
-
+_PATCHED = False
 _code_predictor: Any | None = None
 _original_attention_init: Callable[..., Any] | None = None
 _original_decoder_forward: Callable[..., Any] | None = None
@@ -25,26 +24,18 @@ _original_base_init: Callable[..., Any] | None = None
 _original_base_forward: Callable[..., Any] | None = None
 
 
-def is_ready(module: Any) -> bool:
-    return all(
-        hasattr(module, name)
-        for name in (
-            "CodePredictorAttention",
-            "CodePredictorBaseModel",
-            "CodePredictorDecoderLayer",
-        )
-    )
-
-
-def apply(module: Any) -> None:
+def apply_patch() -> None:
+    global _PATCHED
     global _code_predictor
     global _original_attention_init
     global _original_decoder_forward
     global _original_base_init
     global _original_base_forward
 
-    if _code_predictor is not None:
+    if _PATCHED:
         return
+
+    from vllm_omni.model_executor.models.common import qwen3_code_predictor as module
 
     _code_predictor = module
     _original_attention_init = module.CodePredictorAttention.__init__
@@ -58,6 +49,7 @@ def apply(module: Any) -> None:
     module.CodePredictorBaseModel.__init__ = _base_init_310p
     module.CodePredictorBaseModel._get_310p_attention_mask_builder = _get_attention_mask_builder_310p
     module.CodePredictorBaseModel.forward = _base_forward_310p
+    _PATCHED = True
 
 
 def _attention_init_310p(self, *args, **kwargs) -> None:

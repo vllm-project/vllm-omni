@@ -22,6 +22,7 @@ from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu._310p import is_310p
+from vllm_omni.platforms.npu._310p.qwen3_tts_runtime import use_qwen3_tts_310p_path
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 logger = init_logger(__name__)
@@ -35,6 +36,10 @@ else:
 
 class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
     def load_model(self, *args, **kwargs) -> None:
+        if use_qwen3_tts_310p_path(self.model_config):
+            from vllm_omni.platforms.npu._310p.patch import apply_qwen3_tts_model_patches
+
+            apply_qwen3_tts_model_patches()
         NPUModelRunner.load_model(self, *args, **kwargs)
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.
