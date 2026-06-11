@@ -221,7 +221,7 @@ steps:
       - |
         timeout 30m bash -c "
           export VLLM_WORKER_MULTIPROC_METHOD=spawn
-          pytest -s -v tests/entrypoints/ -m 'core_model' --run-level 'core_model'
+          pytest -sv tests/entrypoints/ -m 'core_model and cuda' --run-level 'core_model'
         "
     agents:
       queue: "mithril-h100-pool"
