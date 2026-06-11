@@ -63,6 +63,7 @@ th {
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-VoiceDesign | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-Base | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
+| `MingTTSForConditionalGeneration` | Ming-omni-tts dense 0.5B | `inclusionAI/Ming-omni-tts-0.5B` | ✅︎ | | | |
 | `GLMTTSForConditionalGeneration` | GLM-TTS | `zai-org/GLM-TTS` | ✅︎ | | | |
 | `MossTTSNanoForCausalLM` | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✅︎ | | | |
 | `MossTTSDelayModel` | MOSS-TTS, MOSS-TTSD, MOSS-SoundEffect, MOSS-VoiceGenerator | `OpenMOSS-Team/MOSS-VoiceGenerator` | ✅︎ | | | |

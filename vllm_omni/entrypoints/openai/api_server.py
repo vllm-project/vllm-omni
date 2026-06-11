@@ -425,6 +425,15 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
+    # In vllm-omni's multi-process architecture, create_engine_config() runs
+    # in the subprocess (StageEngineCoreProc), not in the API server process.
+    # Propagate reasoning_parser from CLI args into structured_outputs_config
+    # here so that OmniOpenAIServingChat receives the correct value.
+    # (Upstream vLLM does this in EngineArgs.create_engine_config().)
+    if hasattr(args, "reasoning_parser") and args.reasoning_parser:
+        if not args.structured_outputs_config.reasoning_parser:
+            args.structured_outputs_config.reasoning_parser = args.reasoning_parser
+
     # Load logging config for uvicorn if specified
     log_config = get_uvicorn_log_config(args)
     if log_config is not None:

@@ -1128,6 +1128,19 @@ class StageConfigFactory:
                             continue
                     return cls._create_from_registry(registered.model_type, cli_overrides, deploy_config_path)
 
+        # An explicit deploy config can select a pipeline when the model's HF
+        # metadata is too generic for registry auto-detection.
+        if deploy_config_path is not None:
+            deploy_path = Path(deploy_config_path)
+            if deploy_path.exists():
+                deploy_config = load_deploy_config(deploy_path)
+                if deploy_config.pipeline in _PIPELINE_REGISTRY:
+                    return cls._create_from_registry(
+                        deploy_config.pipeline,
+                        cli_overrides,
+                        deploy_config_path,
+                    )
+
         # Not in the pipeline registry — let the caller fall back to the
         # legacy ``stage_configs/*.yaml`` path (resolve_model_config_path).
         return None

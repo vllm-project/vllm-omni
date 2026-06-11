@@ -35,6 +35,7 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingDenseConfig
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
@@ -55,6 +56,7 @@ def _register_omni_hf_configs() -> None:
         _CONFIG_REGISTRY = None
 
     for model_type, config_cls in [
+        ("dense", MingDenseConfig),
         ("qwen3_tts", Qwen3TTSConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
@@ -81,6 +83,9 @@ def register_omni_models_to_vllm():
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
         if arch not in supported_archs:
             ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+
+    # Register omni-specific reasoning parsers (e.g., step_audio).
+    import vllm_omni.reasoning  # noqa: F401
 
 
 @dataclass
