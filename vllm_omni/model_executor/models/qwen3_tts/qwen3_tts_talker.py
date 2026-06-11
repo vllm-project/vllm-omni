@@ -23,7 +23,6 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.platforms.npu._310p.qwen3_tts_runtime import audio_frontend_runtime, runtime_dtype
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
@@ -401,6 +400,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             torch.zeros(1, int(self.talker_config.hidden_size), dtype=model_dtype),
             persistent=False,
         )
+        self._embedding_dtype = torch.bfloat16
 
         tokenizer_config = Qwen3TTSTokenizerV2Config.from_pretrained(
             self.model_path,
@@ -410,12 +410,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             tokenizer_config.encoder_config,
         )
         self.encoder.eval()
-        init_device = self.vllm_config.device_config.device
-        encoder_device, encoder_dtype = audio_frontend_runtime(init_device)
-        if encoder_device == init_device:
-            self.encoder.to(dtype=encoder_dtype)
-        else:
-            self.encoder.to(device=encoder_device, dtype=encoder_dtype)
+        self.encoder.to(dtype=torch.bfloat16)
         self._encoder_valid_num_quantizers = int(tokenizer_config.encoder_valid_num_quantizers)
         self._encoder_downsample_rate = int(tokenizer_config.encode_downsample_rate)
 
@@ -648,7 +643,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # :meth:`_init_runtime_buffers`. Materialize once on the right
         # device/dtype and reuse for both the prefill placeholder padding
         # and the decode text-step fallback below.
-        dtype = runtime_dtype(input_ids.device)
+        dtype = self._embedding_dtype
         tts_pad_embed = self._tts_pad_embed.to(device=input_ids.device, dtype=dtype).reshape(1, -1)
 
         if is_prefill:
@@ -791,7 +786,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
 
         device = input_ids_flat.device
-        dtype = runtime_dtype(device)
+        dtype = self._embedding_dtype
         # Request-independent constant (see :meth:`_init_runtime_buffers`) —
         # compute once for the batch instead of fetching it per request from
         # ``info_dict["embed"]["tts_pad"]``.
@@ -917,8 +912,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             sampling_rate=target_sr,
             return_tensors="pt",
         )
-        encoder_device, encoder_dtype = audio_frontend_runtime(device)
-        inputs = inputs.to(encoder_device).to(encoder_dtype)
+        inputs = inputs.to(device).to(torch.bfloat16)
 
         input_values = inputs["input_values"].squeeze(1)
         padding_mask = inputs["padding_mask"].squeeze(1)
@@ -995,8 +989,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 loaded.add(name)
 
         device = self.vllm_config.device_config.device
-        encoder_device, encoder_dtype = audio_frontend_runtime(device)
-        self.encoder.to(device=encoder_device, dtype=encoder_dtype)
+        self.encoder.to(device=device, dtype=torch.bfloat16)
 
         self._init_runtime_buffers()
 
@@ -1052,7 +1045,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         bsz = int(input_ids.shape[0])
         q = int(self.talker_config.num_code_groups)
         dev = input_embeds.device
-        dtype = runtime_dtype(dev)
+        dtype = self._embedding_dtype
 
         input_ids = input_ids.reshape(bsz, 1).to(dtype=torch.long, device=dev)
         last_id_hidden = input_embeds.reshape(bsz, 1, -1).to(dtype=dtype, device=dev)

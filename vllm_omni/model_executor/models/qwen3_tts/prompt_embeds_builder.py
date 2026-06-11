@@ -38,7 +38,6 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 
-from vllm_omni.platforms.npu._310p.qwen3_tts_runtime import audio_frontend_runtime, runtime_dtype
 from vllm_omni.utils.audio import mel_filter_bank
 
 if TYPE_CHECKING:
@@ -330,6 +329,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         self._tts_pad_embed_buffer = tts_pad_embed
         self._encode_ref_audio_batch_fn = encode_ref_audio_batch
         self._speaker_cache = speaker_cache
+        self._embedding_dtype = torch.bfloat16
 
         self._text_tokenizer: Any | None = None
 
@@ -599,9 +599,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         if isinstance(ref_code, torch.Tensor):
             entry["ref_code"] = ref_code.detach().to("cpu", dtype=torch.long).contiguous()
         if isinstance(ref_spk_embedding, torch.Tensor):
-            entry["ref_spk_embedding"] = (
-                ref_spk_embedding.detach().to("cpu", dtype=runtime_dtype(ref_spk_embedding.device)).reshape(-1)
-            )
+            entry["ref_spk_embedding"] = ref_spk_embedding.detach().to("cpu", dtype=self._embedding_dtype).reshape(-1)
         if not entry:
             return
         self._ref_audio_artifact_cache[cache_key] = entry
@@ -616,12 +614,11 @@ class Qwen3TTSPromptEmbedsBuilder:
         # CUDA. Ensure the speaker encoder is on the same device/dtype as the
         # main model before running it.
         dev = self._device()
-        frontend_device, frontend_dtype = audio_frontend_runtime(dev)
-        output_dtype = runtime_dtype(dev)
+        dtype = self._embedding_dtype
         try:
             spk_param = next(self._speaker_encoder.parameters())
-            if spk_param.device != frontend_device or spk_param.dtype != frontend_dtype:
-                self._speaker_encoder.to(device=frontend_device, dtype=frontend_dtype)
+            if spk_param.device != dev or spk_param.dtype != dtype:
+                self._speaker_encoder.to(device=dev, dtype=dtype)
         except StopIteration:
             pass
 
@@ -635,7 +632,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         # Follow official implementation: mel_spectrogram expects 24kHz. Move
         # the waveform first so STFT/mel computation stays on the model device
         # instead of materializing a CPU mel tensor and copying it per request.
-        wav_tensor = torch.from_numpy(wav).to(device=frontend_device, dtype=torch.float32).unsqueeze(0)
+        wav_tensor = torch.from_numpy(wav).to(device=dev, dtype=torch.float32).unsqueeze(0)
         mels = mel_spectrogram(
             wav_tensor,
             n_fft=1024,
@@ -646,8 +643,8 @@ class Qwen3TTSPromptEmbedsBuilder:
             fmin=0,
             fmax=12000,
         ).transpose(1, 2)
-        spk = self._speaker_encoder(mels.to(dtype=frontend_dtype))[0]
-        return spk.to(device=dev, dtype=output_dtype)
+        spk = self._speaker_encoder(mels.to(dtype=dtype))[0]
+        return spk.to(dtype=dtype)
 
     def encode_ref_audio_batch(
         self,
@@ -1192,7 +1189,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             # NOTE: Do NOT use _as_singleton here — the embedding may be a plain
             # float list (from API via msgspec IPC) that _as_singleton would
             # destructively unwrap to a single scalar.
-            speaker_dtype = runtime_dtype(input_ids.device)
+            speaker_dtype = self._embedding_dtype
             spk = None
             if voice_clone_prompt is not None:
                 spk = voice_clone_prompt.get("ref_spk_embedding")
