@@ -13,8 +13,10 @@ Streaming is supported via the VoxCPM-style generator pattern:
   - compute_logits() emits EOS only when the last chunk has been yielded,
     telling the AR scheduler to finish the request.
 
-Weight loading deliberately happens inside load_weights() -- NOT __init__ --
-so that vLLM initialises distributed state before any CUDA allocations occur.
+The AR LM and audio tokenizer are constructed eagerly in __init__ so that
+``load_format: dummy`` works (DummyModelLoader skips ``load_weights``) and
+to avoid OOM from vLLM's post-init KV-cache profiling. Mirrors qwen3_tts
+(PR #3117).
 """
 
 from __future__ import annotations
@@ -140,9 +142,72 @@ class MossTTSNanoForGeneration(nn.Module):
         self.config = vllm_config.model_config.hf_config
         self.model_path: str = vllm_config.model_config.model
 
-        self._lm: nn.Module | None = None
-        self._audio_tokenizer: nn.Module | None = None
-        self._device: torch.device | None = None
+        # Eager construction (not in load_weights) -- see module docstring.
+        _patch_torchaudio_load()
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._device: torch.device = device
+
+        if device.type == "cuda" and torch.cuda.is_bf16_supported():
+            tts_dtype = torch.bfloat16
+        elif device.type == "cuda":
+            tts_dtype = torch.float16
+        else:
+            tts_dtype = torch.float32
+
+        logger.info("Loading MOSS-TTS-Nano LM from %s (dtype=%s)", self.model_path, tts_dtype)
+        from transformers import AutoModelForCausalLM
+
+        lm = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            trust_remote_code=True,
+            torch_dtype=tts_dtype,
+        )
+        if device.type == "cuda":
+            try:
+                import flash_attn  # noqa: F401
+
+                lm._set_attention_implementation("flash_attention_2")
+                logger.info("MOSS-TTS-Nano using flash_attention_2")
+            except ImportError:
+                lm._set_attention_implementation("sdpa")
+                logger.info("MOSS-TTS-Nano using sdpa (flash_attn not installed)")
+        lm.to(device=device)
+        lm.eval()
+
+        # ``trust_remote_code`` custom RoPE classes that register
+        # ``inv_freq`` with ``persistent=False`` and aren't in
+        # ``ROPE_INIT_FUNCTIONS`` come out of ``from_pretrained``'s
+        # post-init chain holding garbage (~ -1.7e38 / 9.9e33). The
+        # very first text-LM forward then emits NaN logits.
+        # See vllm_omni.model_executor.models.utils.reinit_rotary_inv_freq
+        # for the full mechanism and reproduction.
+        n_fixed = reinit_rotary_inv_freq(lm, base=10000.0)
+        if n_fixed > 0:
+            logger.info("MOSS-TTS-Nano: re-initialised %d rotary_emb.inv_freq buffers", n_fixed)
+
+        self._lm: nn.Module = lm
+        logger.info("MOSS-TTS-Nano LM loaded on %s", device)
+
+        codec_path: str = getattr(
+            self.config,
+            "audio_tokenizer_pretrained_name_or_path",
+            "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano",
+        )
+        logger.info("Loading MOSS-Audio-Tokenizer-Nano from %s", codec_path)
+        from transformers import AutoModel
+
+        audio_tokenizer = AutoModel.from_pretrained(
+            codec_path,
+            trust_remote_code=True,
+            torch_dtype=torch.float32,
+        )
+        audio_tokenizer.to(device=device)
+        audio_tokenizer.eval()
+        self._audio_tokenizer: nn.Module = audio_tokenizer
+        logger.info("MOSS-Audio-Tokenizer-Nano loaded on %s", device)
+
+        # Kept for API compat; vLLM worker init is single-threaded.
         self._lock = threading.Lock()
 
         # Per-request streaming generators (VoxCPM pattern).
@@ -158,82 +223,12 @@ class MossTTSNanoForGeneration(nn.Module):
     # ------------------------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        with self._lock:
-            if self._lm is not None:
-                return None
-            _patch_torchaudio_load()
-
-            try:
-                device = next(self.parameters()).device
-            except StopIteration:
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self._device = device
-
-            if device.type == "cuda" and torch.cuda.is_bf16_supported():
-                tts_dtype = torch.bfloat16
-            elif device.type == "cuda":
-                tts_dtype = torch.float16
-            else:
-                tts_dtype = torch.float32
-
-            logger.info("Loading MOSS-TTS-Nano LM from %s (dtype=%s)", self.model_path, tts_dtype)
-            from transformers import AutoModelForCausalLM
-
-            lm = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                trust_remote_code=True,
-                torch_dtype=tts_dtype,
-            )
-            if device.type == "cuda":
-                try:
-                    import flash_attn  # noqa: F401
-
-                    lm._set_attention_implementation("flash_attention_2")
-                    logger.info("MOSS-TTS-Nano using flash_attention_2")
-                except ImportError:
-                    lm._set_attention_implementation("sdpa")
-                    logger.info("MOSS-TTS-Nano using sdpa (flash_attn not installed)")
-            lm.to(device=device)
-            lm.eval()
-
-            # ``trust_remote_code`` custom RoPE classes that register
-            # ``inv_freq`` with ``persistent=False`` and aren't in
-            # ``ROPE_INIT_FUNCTIONS`` come out of ``from_pretrained``'s
-            # post-init chain holding garbage (~ -1.7e38 / 9.9e33). The
-            # very first text-LM forward then emits NaN logits.
-            # See vllm_omni.model_executor.models.utils.reinit_rotary_inv_freq
-            # for the full mechanism and reproduction.
-            n_fixed = reinit_rotary_inv_freq(lm, base=10000.0)
-            if n_fixed > 0:
-                logger.info("MOSS-TTS-Nano: re-initialised %d rotary_emb.inv_freq buffers", n_fixed)
-
-            self._lm = lm
-            logger.info("MOSS-TTS-Nano LM loaded on %s", device)
-
-            codec_path: str = getattr(
-                self.config,
-                "audio_tokenizer_pretrained_name_or_path",
-                "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano",
-            )
-            logger.info("Loading MOSS-Audio-Tokenizer-Nano from %s", codec_path)
-            from transformers import AutoModel
-
-            audio_tokenizer = AutoModel.from_pretrained(
-                codec_path,
-                trust_remote_code=True,
-                torch_dtype=torch.float32,
-            )
-            audio_tokenizer.to(device=device)
-            audio_tokenizer.eval()
-            self._audio_tokenizer = audio_tokenizer
-            logger.info("MOSS-Audio-Tokenizer-Nano loaded on %s", device)
-
-        # MOSS-TTS-Nano loads weights inline via from_pretrained() above;
-        # vLLM's weight-loading protocol still requires us to exhaust the
-        # iterator so the underlying stream is closed cleanly.
+        # Weights are populated in __init__ via from_pretrained; drain the
+        # iterator and report all params as loaded. Not called under
+        # load_format=dummy (DummyModelLoader randomises params in place).
         for _ in weights:
             pass
-        return None
+        return {name for name, _ in self.named_parameters()}
 
     # ------------------------------------------------------------------
     # Dummy run support
@@ -400,13 +395,6 @@ class MossTTSNanoForGeneration(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        if self._lm is None or self._audio_tokenizer is None:
-            # load_weights() loads the real LM from HuggingFace.  When
-            # load_format=dummy the vllm DummyModelLoader skips calling
-            # model.load_weights(), so we do it lazily on first forward.
-            # Must happen before _make_dummy_hidden so self._device is set.
-            self.load_weights([])
-
         sr = getattr(self.config, "audio_tokenizer_sample_rate", 48000)
         sr_tensor = torch.tensor(sr, dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32)

@@ -206,7 +206,34 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
+      - label: "TTS · Ming-Omni-TTS Test"
+        timeout_in_minutes: 20
+        commands:
+          - |
+            timeout 20m bash -c "
+              export VLLM_LOGGING_LEVEL=DEBUG
+              pytest -s -v tests/e2e/online_serving/test_ming_tts.py tests/e2e/offline_inference/test_ming_tts.py -m 'advanced_model and cuda' --run-level 'advanced_model'
+            "
+        agents:
+          queue: "gpu_1_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
       - label: "TTS · Voxtral-TTS Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/test_voxtral_tts.py
+          - tests/e2e/online_serving/test_voxtral_tts.py
+          - vllm_omni/model_executor/models/voxtral_tts/
+          - vllm_omni/model_executor/stage_input_processors/voxtral_tts.py
+          - vllm_omni/deploy/voxtral_tts.yaml
         timeout_in_minutes: 20
         commands:
           - |
@@ -249,6 +276,12 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "TTS · GLM-TTS Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_glm_tts.py
+          - tests/e2e/offline_inference/test_glm_tts.py
+          - vllm_omni/model_executor/models/glm_tts/
+          - vllm_omni/model_executor/stage_input_processors/glm_tts.py
+          - vllm_omni/deploy/glm_tts.yaml
         timeout_in_minutes: 20
         commands:
           - |
@@ -291,6 +324,12 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "Omni · Qwen3-Omni Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/test_qwen3_omni.py
+          - tests/e2e/online_serving/test_qwen3_omni.py
+          - vllm_omni/model_executor/models/qwen3_omni/
+          - vllm_omni/model_executor/stage_input_processors/qwen3_omni.py
+          - vllm_omni/deploy/qwen3_omni_moe.yaml
         timeout_in_minutes: 30
         commands:
           - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni.py -m 'advanced_model and cuda' --run-level 'advanced_model'
@@ -329,6 +368,11 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "Omni · Mimo Audio Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_mimo_audio.py
+          - vllm_omni/model_executor/models/mimo_audio/
+          - vllm_omni/model_executor/stage_input_processors/mimo_audio.py
+          - vllm_omni/deploy/mimo_audio.yaml
         timeout_in_minutes: 30
         commands:
           - pytest -s -v tests/e2e/online_serving/test_mimo_audio.py -m 'advanced_model and cuda' --run-level 'advanced_model'
@@ -366,37 +410,14 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-      - label: "Omni · VoxCPM2 Test"
-        timeout_in_minutes: 20
-        commands:
-          - |
-            timeout 20m bash -c "
-              export VLLM_LOGGING_LEVEL=DEBUG
-              export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              pytest -s -v tests/e2e/offline_inference/test_voxcpm2.py -m 'advanced_model and cuda' --run-level 'advanced_model'
-            "
-        agents:
-          queue: "gpu_1_queue"
-        plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              shm-size: "8gb"
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-                - "HF_TOKEN"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
-
-      - label: "TTS · VoxCPM2 Online Test"
+      - label: "TTS · VoxCPM2 Test"
         timeout_in_minutes: 30
         commands:
           - |
             timeout 30m bash -c "
               export VLLM_LOGGING_LEVEL=DEBUG
               export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              pytest -s -v tests/e2e/online_serving/test_voxcpm2_tts.py -m 'advanced_model and cuda' --run-level 'advanced_model'
+              pytest -s -v tests/e2e/offline_inference/test_voxcpm2_tts.py tests/e2e/online_serving/test_voxcpm2_tts.py -m 'advanced_model and cuda' --run-level 'advanced_model'
             "
         agents:
           queue: "gpu_1_queue"
@@ -438,6 +459,9 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "Diffusion · Qwen Image Edit Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen_image_edit.py
+          - vllm_omni/diffusion/models/qwen_image/
         timeout_in_minutes: 20
         commands:
           - pytest -s -v tests/e2e/online_serving/test_qwen_image_edit.py -m 'advanced_model and cuda' --run-level 'advanced_model'
@@ -476,6 +500,9 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "Diffusion · Longcat Image Edit Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_longcat_image_edit.py
+          - vllm_omni/diffusion/models/longcat_image/
         timeout_in_minutes: 20
         commands:
           - pytest -s -v tests/e2e/online_serving/test_longcat_image_edit.py -m 'advanced_model and cuda' --run-level 'advanced_model'
@@ -514,6 +541,9 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "Diffusion · Longcat Image Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_longcat_image.py
+          - vllm_omni/diffusion/models/longcat_image/
         timeout_in_minutes: 20
         commands:
           - pytest -s -v tests/e2e/online_serving/test_longcat_image.py -m 'advanced_model and cuda' --run-level 'advanced_model'
@@ -552,6 +582,13 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "Diffusion · Bagel Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/test_bagel.py
+          - tests/e2e/online_serving/test_bagel.py
+          - vllm_omni/model_executor/models/bagel/
+          - vllm_omni/diffusion/models/bagel/
+          - vllm_omni/model_executor/stage_input_processors/bagel.py
+          - vllm_omni/deploy/bagel.yaml
         timeout_in_minutes: 20
         commands:
           - pytest -s -v tests/e2e/offline_inference/test_bagel.py tests/e2e/online_serving/test_bagel.py -m 'advanced_model and cuda' --run-level 'advanced_model'
@@ -591,6 +628,9 @@ steps:
 
 
       - label: "Diffusion · Qwen Image Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen_image.py
+          - vllm_omni/diffusion/models/qwen_image/
         commands:
           - |
             timeout 40m bash -c '
@@ -632,6 +672,9 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "Diffusion · Qwen Image Layered Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen_image_layered.py
+          - vllm_omni/diffusion/models/qwen_image/
         commands:
           - |
             timeout 40m bash -c "
@@ -673,6 +716,10 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "Diffusion · Wan22 Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/test_wan22_t2v.py
+          - tests/e2e/online_serving/test_wan22_t2v.py
+          - vllm_omni/diffusion/models/wan2_2/
         commands:
           - |
             timeout 40m bash -c "
@@ -714,6 +761,9 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "Diffusion · HunyuanVideo 1.5 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_hunyuan_video_15.py
+          - vllm_omni/diffusion/models/hunyuan_video/
         timeout_in_minutes: 40
         commands:
           - |
@@ -789,6 +839,9 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "Diffusion · SD3 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_sd3.py
+          - vllm_omni/diffusion/models/sd3/
         timeout_in_minutes: 45
         commands:
           - |

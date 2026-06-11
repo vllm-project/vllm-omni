@@ -1,14 +1,14 @@
 # Document 1: Buildkite loads only this block on first parse. The next step resolves docs-only skip-ci
 # from git diff, then uploads document 2. When docs-only skip applies, image-build still runs for the nightly
-# exception in upload_pipeline_with_skip_ci.sh (nightly-test label or main NIGHTLY=1); otherwise upload-nightly
+# exception in upload_pipeline.py (nightly-test label or main NIGHTLY=1); otherwise upload-nightly
 # can be skipped together with test-ready/test-merge. Weekly uploads also depend on image-build.
 
-# Document 2: appended after `---`; same file, read by upload_pipeline_with_skip_ci.sh (not evaluated as a second pipeline by Buildkite). Child uploads include test-ready.yml, test-merge.yml, test-nightly.yml, and test-weekly.yml.
+# Document 2: appended after `---`; same file, read by upload_pipeline.py (not evaluated as a second pipeline by Buildkite). Child uploads include test-ready.yml, test-merge.yml, test-nightly.yml, and test-weekly.yml.
 steps:
   - label: ":github: Resolve skip-ci & upload pipeline"
     key: upload-ci-pipeline
     commands:
-      - "bash .buildkite/scripts/upload_pipeline_with_skip_ci.sh"
+      - "python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/pipeline.yml"
     agents:
       queue: "cpu_queue_premerge"
 
@@ -31,7 +31,7 @@ steps:
     key: upload-ready-pipeline
     if: __UPLOAD_READY_IF__
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-ready.yml
+      - python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/test-ready.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -41,7 +41,7 @@ steps:
     key: upload-merge-pipeline
     if: __UPLOAD_MERGE_IF__
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-merge.yml
+      - python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/test-merge.yml
     agents:
       queue: "cpu_queue_premerge"
 

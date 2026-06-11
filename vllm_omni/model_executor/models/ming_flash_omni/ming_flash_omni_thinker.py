@@ -697,6 +697,9 @@ class MingFlashOmniThinkerForConditionalGeneration(
             f"image_gen_scales={list(self.query_tokens_dict.keys())}"
         )
 
+    def get_language_model(self):
+        return self.language_model
+
     def _load_image_gen_query_tokens(self, model_path: str) -> None:
         """Load learnable query tokens used for image generation.
 

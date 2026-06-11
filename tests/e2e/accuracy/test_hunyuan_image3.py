@@ -29,7 +29,46 @@ from tests.e2e.accuracy.helpers import (
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner, OmniServer
-from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens, resolve_stop_token_ids
+from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    build_prompt_tokens,
+    resolve_stop_token_ids,
+)
+
+# CoT structural markers that MUST appear in AR output text.
+# The AR trajectory under think_recaption mode is:
+#   <think> ... </think> <recaption> ... <relation_1> ... </relation_1>
+#   <relation_2> ... </relation_2> </recaption>
+# Test deploy config sets include_stop_str_in_output=True and
+# skip_special_tokens=False, so ALL opening and closing markers
+# should be present in the detokenized text.
+_THINK_CLOSE = "</" + "think>"  # avoid Python slash-t-as-TAB pitfall
+_COT_REQUIRED_MARKERS = (
+    "<recaption>",
+    "</recaption>",
+    "<relation_1>",
+    "</relation_1>",
+    "<relation_2>",
+    "</relation_2>",
+    _THINK_CLOSE,
+)
+
+
+def _assert_cot_structural_markers(cot_text: str, label: str) -> None:
+    """Assert that the AR CoT output contains all required structural tags.
+
+    Guards against regressions where detokenizer stop-token stripping
+    or truncation logic loses CoT content.  Under the test deploy config
+    (include_stop_str_in_output=True, skip_special_tokens=False),
+    ALL markers should be present in the detokenized text.
+    """
+    missing = [m for m in _COT_REQUIRED_MARKERS if m not in cot_text]
+    assert not missing, (
+        f"[{label}] CoT text missing required structural markers: {missing}. "
+        f"This typically indicates that stop-token stripping or "
+        f"_truncate_at_cot_end truncation removed CoT content. "
+        f"CoT text length={len(cot_text)}, first 100 chars: {repr(cot_text[:100])}"
+    )
+
 
 os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
 
@@ -129,6 +168,7 @@ _DEPLOY_CONFIG = {
                 "stop_token_ids": [128025],
                 "detokenize": True,
                 "skip_special_tokens": False,
+                "include_stop_str_in_output": True,
             },
         },
         {
@@ -400,6 +440,8 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path, accuracy_
     ]
     print("[ONLINE] " + tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
 
+    _assert_cot_structural_markers(online_cot, "ONLINE")
+
     assert cot_results["cot_semantic_sim"] >= THRESHOLDS["cot_semantic_sim"], (
         f"[ONLINE] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} below threshold {THRESHOLDS['cot_semantic_sim']}"
     )
@@ -507,6 +549,8 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path, accuracy_assets_
     ]
 
     print(tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
+
+    _assert_cot_structural_markers(omni_cot, "OFFLINE")
 
     assert cot_results["cot_semantic_sim"] >= THRESHOLDS["cot_semantic_sim"], (
         f"COT semantic similarity {cot_results['cot_semantic_sim']:.4f} is below threshold {THRESHOLDS['cot_semantic_sim']}"

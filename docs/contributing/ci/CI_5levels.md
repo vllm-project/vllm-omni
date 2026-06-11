@@ -268,6 +268,101 @@ Before entering specific testing levels, the project establishes two common spec
 1.  ***PR Checklist ([Tests Style](../ci/tests_style.md))***: This template defines the self-check items that must be completed before submitting a code review (Pull Request). It ensures that each code change meets basic requirements such as code style, dependency updates, and documentation synchronization before entering the automated testing pipeline, serving as the first manual line of defense for quality assurance.
 2.  ***CI Failure Explanation ([CI Failures](../ci/failures.md))***: This document archives and explains common failure patterns in the Continuous Integration (CI) pipeline, error log interpretation, and preliminary troubleshooting steps. It helps developers and testers quickly diagnose the causes of automated test failures, improving problem-solving efficiency.
 
+<<<<<<< ready
+## Notes
+### Diff-aware Buildkite uploads (`source_file_dependencies`)
+
+L2 (`.buildkite/test-ready.yml`) and L3 (`.buildkite/test-merge.yml`) pipelines can **skip unrelated GPU jobs at upload time** based on the PR diff. This is implemented by `.buildkite/scripts/upload_pipeline.py`, which filters steps before calling `buildkite-agent pipeline upload`.
+
+#### What `source_file_dependencies` is
+
+- A **uploader-only** YAML key on a Buildkite step or group. **Buildkite does not understand it**; `upload_pipeline.py` always **removes** it from the YAML that is uploaded.
+- A list of path **prefixes** (directories or individual files). If **any** changed file in the diff equals a prefix or starts with `prefix/`, the step is kept; otherwise the step (or entire group) is **omitted** from the uploaded pipeline.
+
+#### When filtering runs
+
+| Build context | Changed files used for matching |
+| --- | --- |
+| Pull request | `git diff --name-only origin/<base>...<BUILDKITE_COMMIT>` |
+| `main` branch push | `git diff --name-only <commit>^..<commit>` |
+| Other (e.g. local dry-run, non-PR branch) | Diff cannot be resolved → **no filtering**; all steps are uploaded and `source_file_dependencies` is still stripped |
+
+Docs-only PRs are handled earlier in bootstrap (`pipeline.yml`) via skip-ci logic; `source_file_dependencies` applies only to the **uploaded** L2/L3 test pipelines.
+
+#### Where it is configured
+
+| Level | Pipeline file | Upload entry |
+| --- | --- | --- |
+| L2 | `.buildkite/test-ready.yml` | `upload_pipeline.py --upload .buildkite/test-ready.yml` (from `pipeline.yml`) |
+| L3 | `.buildkite/test-merge.yml` | `upload_pipeline.py --upload .buildkite/test-merge.yml` (from `pipeline.yml`) |
+
+Steps **without** `source_file_dependencies` are always uploaded (subject to the usual label conditions: `ready` for L2, `merge-test` for L3).
+
+#### Current skip policy (L2 / L3)
+
+To balance CI cost and coverage:
+
+- **Always run** (no `source_file_dependencies`): baseline groups such as Simple Test, Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints (L2), LoRA / Entrypoints (L3), and **all E2E jobs on L4 docker queues** (`gpu_1_queue`, `gpu_4_queue`).
+- **Diff-gated** (`source_file_dependencies` set): **H100 E2E jobs only** (`queue: mithril-h100-pool` under the E2E Test group)—typically the model’s pytest file(s) plus related `vllm_omni/` model, deploy, and stage paths.
+
+Adding a new expensive H100 E2E step: list the test file(s) and the smallest set of source prefixes that should trigger it. Prefer **per-step** deps on leaf jobs rather than a broad group-level list unless every child shares the same paths.
+
+#### YAML example
+
+```yaml
+      - label: "Diffusion · Qwen Image Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen_image.py
+          - vllm_omni/diffusion/models/qwen_image/
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' ...
+        agents:
+          queue: "mithril-h100-pool"
+```
+
+A **group** may also define `source_file_dependencies`; nested steps inherit filtering as a unit—the whole group is dropped if no prefix matches.
+
+#### Local dry-run
+
+```bash
+# Render filtered YAML to stdout (no upload)
+python3 .buildkite/scripts/upload_pipeline.py .buildkite/test-ready.yml
+
+# Confirm uploader-only keys are stripped
+python3 .buildkite/scripts/upload_pipeline.py .buildkite/test-merge.yml | grep source_file_dependencies
+# (no output expected)
+```
+
+On a PR build, Buildkite logs from `upload_pipeline.py` include lines such as `skip '…' (no changes under …)` for omitted steps.
+
+#### Related
+
+- Implementation: `.buildkite/scripts/upload_pipeline.py`
+- L2/L3 diff skip does **not** replace label-based triggers (`ready`, `merge-test`); it only reduces which steps appear **after** the pipeline is already scheduled.
+=======
+### Test helper environment variables
+
+Some shared helpers under `tests/helpers/` honor optional environment variables for local debugging. These are **not** set in CI by default.
+
+| Variable | Accepted values | Description |
+| -------- | --------------- | ----------- |
+| `VLLM_OMNI_KEEP_REQUEST_MEDIA` | `1`, `true`, `yes` (case-insensitive) | When enabled, temporary WAV files created by `tests.helpers.media.convert_audio_bytes_to_text` are **not** deleted when the pytest process exits. By default, each call writes a unique file under the system temp directory via `tempfile.mkstemp` and registers `atexit` cleanup. Use this when debugging audio output validation (Whisper transcription, keyword checks, text–audio similarity). The saved path is logged as `audio data is saved: <path>`. |
+
+Example (Linux / macOS):
+
+```bash
+export VLLM_OMNI_KEEP_REQUEST_MEDIA=1
+pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -k test_mix_to_text_audio
+```
+
+Example (Windows PowerShell):
+
+```powershell
+$env:VLLM_OMNI_KEEP_REQUEST_MEDIA = "1"
+pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -k test_mix_to_text_audio
+```
+>>>>>>> main
+
 ## Chapter 1: L1 & L2 Level Testing - Unit Testing and Basic End-to-End Verification
 
 ### 1.1 Testing Purpose
@@ -302,6 +397,7 @@ A clear directory structure is key to managing test cases efficiently.
 ### 1.4 Execution Method and Example
 
 -   ***Trigger Timing***: **`PR with ready label`**. That is, when a developer adds a "ready for review" or similar label to a PR on platforms like GitHub, L1 and L2 tests are automatically triggered.
+-   ***Diff-aware step skipping***: On L2, expensive **H100 E2E** jobs may be omitted at pipeline upload when the PR diff does not touch their [`source_file_dependencies`](#diff-aware-buildkite-uploads-source_file_dependencies) paths; L4 docker jobs and non-E2E steps still run. See [Diff-aware Buildkite uploads](#diff-aware-buildkite-uploads-source_file_dependencies).
 -   ***Execution Environment***: L1 uses ***CPU*** environment; L2 requires ***GPU*** environment.
 -   ***Script Example***:
 
@@ -404,7 +500,8 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
 ### 2.4 Execution Method and Example
 
--   ***Trigger Timing***: **`PR Merged`**. Automatically triggered after code review is approved and merged into the main branch.
+-   ***Trigger Timing***: **`PR Merged`**. Automatically triggered after code review is approved and merged into the main branch (typically via `merge-test` label on the PR before merge).
+-   ***Diff-aware step skipping***: Same [`source_file_dependencies`](#diff-aware-buildkite-uploads-source_file_dependencies) mechanism as L2—only **H100 E2E** steps are diff-gated; L4 docker E2E and other L3 groups always upload. See [Diff-aware Buildkite uploads](#diff-aware-buildkite-uploads-source_file_dependencies).
 -   ***Execution Environment***: ***GPU*** servers.
 -   ***Script Example***:
 
@@ -519,6 +616,8 @@ L3 level testing executes after code is merged into the main branch. Its core pu
     **Single Request**: The comment clearly states this is a single-request completion test. For concurrent testing, it can be extended to multiple requests using request_num = n.
 
     **Implicit Validation**: The `send_omni_request` and `send_diffusion_request` methods internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model and full_model perform deep validation.
+
+    **Audio output debugging**: Deep validation may transcribe returned audio via `convert_audio_bytes_to_text` (Whisper). If an audio keyword or text–audio similarity assertion fails, set `VLLM_OMNI_KEEP_REQUEST_MEDIA=1` before running pytest to keep the intermediate WAV files for inspection (see [Test helper environment variables](#test-helper-environment-variables)).
 
 -   ***Run Command (L3 merge)***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}.py -m advanced_model --run-level=advanced_model`
 
