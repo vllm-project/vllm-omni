@@ -10,6 +10,7 @@
                 "dataset_name": "random",
                 "backend": "openai-audio-speech",
                 "endpoint": "/v1/audio/speech",
+                "trust_remote_code": true,
                 "duration_sec": 86400,
                 "max_concurrency": 2,
                 "num_prompts_per_batch": 50,
