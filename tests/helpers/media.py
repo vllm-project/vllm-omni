@@ -1,5 +1,6 @@
 """Synthetic media generation and media/text utilities for tests."""
 
+import atexit
 import base64
 import concurrent.futures
 import gc
@@ -14,7 +15,6 @@ import re
 import subprocess
 import tempfile
 import time
-import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -683,7 +683,10 @@ def convert_audio_file_to_text(output_path: str) -> str:
 
 
 def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
-    output_path = f"./test_{uuid.uuid4().hex}.wav"
+    output_fd, output_path = tempfile.mkstemp(prefix="test_", suffix=".wav")
+    os.close(output_fd)
+    if os.environ.get("VLLM_OMNI_KEEP_REQUEST_MEDIA", "").lower() not in ("1", "true", "yes"):
+        atexit.register(Path(output_path).unlink, missing_ok=True)
     data, samplerate = sf.read(io.BytesIO(raw_bytes))
     sf.write(output_path, data, samplerate, format="WAV", subtype="PCM_16")
     print(f"audio data is saved: {output_path}")

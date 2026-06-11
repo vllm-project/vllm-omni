@@ -7,6 +7,43 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator, model_vali
 _MAX_EMBEDDING_DIM = 8192
 
 
+def _normalize_ref_audio_value(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        items = []
+        for item in value:
+            if not isinstance(item, str):
+                raise TypeError("'ref_audio' list entries must be strings")
+            items.append(item)
+        if not items:
+            raise ValueError("'ref_audio' list cannot be empty")
+        return items
+    raise TypeError("'ref_audio' must be a string or list of strings")
+
+
+def _normalize_speaker_embedding_value(value):
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("'speaker_embedding' must be a list of numbers or list of embedding vectors")
+    if not value:
+        return []
+
+    first = value[0]
+    if isinstance(first, (list, tuple)):
+        embeddings = []
+        for item in value:
+            if not isinstance(item, (list, tuple)):
+                raise TypeError("'speaker_embedding' must not mix flat and nested values")
+            embeddings.append([float(x) for x in item])
+        return embeddings
+
+    return [float(x) for x in value]
+
+
 class OpenAICreateSpeechRequest(BaseModel):
     input: str
     model: str | None = None
@@ -46,7 +83,7 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Language code (e.g., 'Chinese', 'English', 'Auto')",
     )
-    ref_audio: str | None = Field(
+    ref_audio: str | list[str] | None = Field(
         default=None,
         description="Reference audio for voice cloning (Base task). URL, base64, or file URI.",
     )
@@ -73,7 +110,7 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Use speaker embedding only without in-context learning (Base task)",
     )
-    speaker_embedding: list[float] | None = Field(
+    speaker_embedding: list[float] | list[list[float]] | None = Field(
         default=None,
         max_length=_MAX_EMBEDDING_DIM,
         description="Pre-computed speaker embedding vector (1024-dim for 0.6B, "
@@ -108,10 +145,29 @@ class OpenAICreateSpeechRequest(BaseModel):
             raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
         return v
 
+    @field_validator("ref_audio", mode="before")
+    @classmethod
+    def normalize_ref_audio(cls, v):
+        return _normalize_ref_audio_value(v)
+
     @field_validator("speaker_embedding")
     @classmethod
-    def validate_speaker_embedding(cls, v: list[float] | None) -> list[float] | None:
-        if v is not None and not all(math.isfinite(x) for x in v):
+    def validate_speaker_embedding(
+        cls, v: list[float] | list[list[float]] | None
+    ) -> list[float] | list[list[float]] | None:
+        v = _normalize_speaker_embedding_value(v)
+        if v is None:
+            return None
+        if not v:
+            return []
+        if isinstance(v[0], list):
+            for item in v:
+                if not item:
+                    raise ValueError("'speaker_embedding' nested vectors must be non-empty")
+                if not all(math.isfinite(x) for x in item):
+                    raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
+            return v
+        if not all(math.isfinite(x) for x in v):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
         return v
 
@@ -210,7 +266,7 @@ class OpenAICreateSpeechRequest(BaseModel):
     @model_validator(mode="after")
     def validate_embedding_constraints(self) -> "OpenAICreateSpeechRequest":
         if self.speaker_embedding is not None:
-            if self.ref_audio is not None:
+            if self.ref_audio is not None and not isinstance(self.ref_audio, list):
                 raise ValueError("'speaker_embedding' and 'ref_audio' are mutually exclusive")
         return self
 
