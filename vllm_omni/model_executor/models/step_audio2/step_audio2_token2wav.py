@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-import librosa
+import librosa  # noqa: TID251
 import numpy as np
 import onnxruntime
 import s3tokenizer
@@ -491,8 +491,8 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         self.config = vllm_config.model_config.hf_config
 
         model_path = getattr(self.config, "token2wav_path", None)
+        model_name_or_path = vllm_config.model_config.model
         if model_path is None:
-            model_name_or_path = vllm_config.model_config.model
             # Resolve HF repo names to local cache path
             if not os.path.isdir(model_name_or_path):
                 from huggingface_hub import snapshot_download

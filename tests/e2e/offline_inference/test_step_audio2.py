@@ -16,8 +16,8 @@ import numpy as np
 import pytest
 import torch
 
-from .conftest import OmniRunner
-from .utils import create_new_process_for_each_test
+from tests.helpers.process import create_new_process_for_each_test
+from tests.helpers.runtime import OmniRunner
 
 models = ["stepfun-ai/Step-Audio-2-mini"]
 

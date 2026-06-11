@@ -128,8 +128,7 @@ def thinker2token2wav_async_chunk(
 
 
 def thinker2token2wav(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
     requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
@@ -146,8 +145,7 @@ def thinker2token2wav(
     - Audio tokens: 151696 - 158257 (vocab size 6562)
 
     Args:
-        stage_list: List of stage objects
-        engine_input_source: Source stage IDs (typically [0] for thinker)
+        source_outputs: Resolved list of upstream (thinker) engine outputs
         prompt: Original prompt data (unused for Token2Wav in default-voice mode)
         requires_multimodal_data: Whether multimodal data is required
 
@@ -155,37 +153,15 @@ def thinker2token2wav(
         List of OmniTokensPrompt for token2wav stage
 
     """
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
+    if not source_outputs:
+        raise ValueError("source_outputs cannot be empty")
 
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-
-    thinker_outputs = stage_list[source_stage_id].engine_outputs
+    thinker_outputs = source_outputs
     token2wav_inputs = []
 
-    # Get StepAudio2 config from stage (with defaults as fallback)
-    def _get_config_value(config, attr_name: str, default_value):
-        """Get value from config, fallback to default if not present"""
-        if config is None:
-            return default_value
-        return getattr(config, attr_name, default_value)
-
-    # Try to get config from source stage
-    source_stage = stage_list[source_stage_id]
-    config = None
-    if hasattr(source_stage, "model") and hasattr(source_stage.model, "config"):
-        config = source_stage.model.config
-    elif hasattr(source_stage, "config"):
-        config = source_stage.config
-
-    # Get token configuration from config (with defaults from constants)
-    audio_start = _get_config_value(config, "audio_start", DEFAULT_TOKEN_CONFIG.audio_start)
-    audio_eos = _get_config_value(config, "audio_eos", DEFAULT_TOKEN_CONFIG.audio_eos)  # Relative to audio start
+    # Token configuration uses the fixed Step-Audio2 model constants.
+    audio_start = DEFAULT_TOKEN_CONFIG.audio_start
+    audio_eos = DEFAULT_TOKEN_CONFIG.audio_eos  # Relative to audio start
 
     # Process each thinker output
     for i, thinker_output in enumerate(thinker_outputs):

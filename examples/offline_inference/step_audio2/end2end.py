@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-import librosa
+import librosa  # noqa: TID251
 import numpy as np
 import soundfile as sf
 import torch

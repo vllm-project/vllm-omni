@@ -48,7 +48,11 @@ def test_step_audio2_token2wav_sync_path_not_misdetected_by_empty_runtime_info(m
     )
 
     audio = out.multimodal_outputs["model_outputs"]
-    assert isinstance(audio, torch.Tensor)
+    # sync path returns the full waveform wrapped in a single-element list,
+    # same contract as the async-chunk path (see tests below)
+    assert isinstance(audio, list)
+    assert len(audio) == 1
+    assert isinstance(audio[0], torch.Tensor)
     assert model._stream_states == []
 
 

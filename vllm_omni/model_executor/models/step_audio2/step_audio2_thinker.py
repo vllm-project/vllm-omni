@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, TypedDict
 
-import librosa
+import librosa  # noqa: TID251
 import numpy as np
 import torch
 import torch.nn as nn
