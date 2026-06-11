@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from tests.helpers import skip_if_gated_repo_inaccessible  # noqa: F401  (used once SA3 weights are public)
+from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.assertions import assert_audio_valid
 from tests.helpers.mark import hardware_test
 from vllm_omni import Omni
@@ -35,6 +35,15 @@ _MODEL_REPO = os.environ.get("STABLE_AUDIO_3_TEST_MODEL", "stabilityai/stable-au
 _SAMPLE_RATE = 44100
 _SHORT_CLIP_DURATION_S = 2.0
 _LONG_CLIP_DURATION_S = 60.0  # SA3-distinctive: validates variable-length latents at scale
+
+
+@pytest.fixture(autouse=True)
+def _skip_if_sa3_repo_gated() -> None:
+    # When STABLE_AUDIO_3_TEST_MODEL is the gated HF repo id (not a locally
+    # prepared directory), skip cleanly if it is inaccessible to the current
+    # HF_TOKEN, instead of erroring at engine init.
+    if not os.path.isdir(_MODEL_REPO):
+        skip_if_gated_repo_inaccessible(_MODEL_REPO)
 
 
 def _generate_short_sa3_clip(

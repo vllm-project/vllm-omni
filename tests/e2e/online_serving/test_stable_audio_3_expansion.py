@@ -15,10 +15,20 @@ import os
 
 import pytest
 
+from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
 _MODEL = os.environ.get("STABLE_AUDIO_3_TEST_MODEL", "stabilityai/stable-audio-3-medium")
+
+
+@pytest.fixture(autouse=True)
+def _skip_if_sa3_repo_gated() -> None:
+    # Skip cleanly when STABLE_AUDIO_3_TEST_MODEL is the gated HF repo id
+    # (not a locally prepared directory) and the current HF_TOKEN lacks access.
+    if not os.path.isdir(_MODEL):
+        skip_if_gated_repo_inaccessible(_MODEL)
+
 
 _PARAMS = [
     pytest.param(
