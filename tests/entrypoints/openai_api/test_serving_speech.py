@@ -31,6 +31,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     CreateAudio,
     OpenAICreateSpeechRequest,
     SpeechBatchItem,
+    StreamingSpeechSessionConfig,
 )
 from vllm_omni.entrypoints.openai.serving_speech import (
     _TTS_LANGUAGES,
@@ -1235,6 +1236,49 @@ class TestTTSMethods:
         assert params["language"] == ["English"]
         assert params["task_type"] == ["CustomVoice"]
 
+    def test_build_tts_params_base_non_streaming_mode_true(self, speech_server):
+        """Base task should pass through an explicit non_streaming_mode override."""
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="reference",
+            non_streaming_mode=True,
+        )
+
+        params = speech_server._build_tts_params(req)
+
+        assert params["task_type"] == ["Base"]
+        assert params["non_streaming_mode"] == [True]
+
+    def test_build_tts_params_base_omits_non_streaming_mode_by_default(self, speech_server):
+        """Base task should keep using the model default when no override is sent."""
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="reference",
+        )
+
+        params = speech_server._build_tts_params(req)
+
+        assert params["task_type"] == ["Base"]
+        assert "non_streaming_mode" not in params
+
+    def test_build_tts_params_explicit_non_streaming_mode_overrides_voicedesign_default(self, speech_server):
+        """Explicit false should not be replaced by the VoiceDesign fallback."""
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="VoiceDesign",
+            instructions="warm and calm",
+            non_streaming_mode=False,
+        )
+
+        params = speech_server._build_tts_params(req)
+
+        assert params["task_type"] == ["VoiceDesign"]
+        assert params["non_streaming_mode"] == [False]
+
     def test_load_supported_speakers(self, mocker: MockerFixture):
         """Test _load_supported_speakers."""
         mock_engine_client = mocker.MagicMock()
@@ -2023,6 +2067,34 @@ class TestMergeBatchItem:
         assert merged.task_type == "CustomVoice"
         assert merged.max_new_tokens == 512
 
+    def test_non_streaming_mode_batch_default_used(self):
+        """Batch-level non_streaming_mode should be used when item doesn't specify one."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi")],
+            non_streaming_mode=True,
+        )
+
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+
+        assert merged.non_streaming_mode is True
+
+    def test_non_streaming_mode_item_override_wins(self):
+        """Per-item false should override a true batch-level default."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi", non_streaming_mode=False)],
+            non_streaming_mode=True,
+        )
+
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+
+        assert merged.non_streaming_mode is False
+
+
+def test_streaming_speech_session_config_accepts_non_streaming_mode():
+    config = StreamingSpeechSessionConfig(non_streaming_mode=True)
+
+    assert config.non_streaming_mode is True
+
 
 class TestAsyncOmniSupportedTasks:
     """Test that AsyncOmni reports correct supported tasks based on output modalities."""
@@ -2810,6 +2882,52 @@ class TestTTSAsyncOffloading:
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
+
+    def test_prepare_speech_generation_qwen3_voicedesign_non_streaming_mode_false(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        """VoiceDesign explicit false should reach the model prompt additional_information."""
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            task_type="VoiceDesign",
+            instructions="warm and calm",
+            non_streaming_mode=False,
+        )
+        _request_id, _generator, tts_params = asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        assert tts_params["task_type"] == ["VoiceDesign"]
+        assert tts_params["non_streaming_mode"] == [False]
+        prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
+        assert prompt["additional_information"] is tts_params
+        assert prompt["additional_information"]["non_streaming_mode"] == [False]
+
+    def test_prepare_speech_generation_qwen3_base_non_streaming_mode_true(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        """Base explicit true should reach the model prompt additional_information."""
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.0] * 48000, 24000))
+        qwen3_tts_server._get_resolved_ref_audio_artifact_key = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="reference transcript",
+            non_streaming_mode=True,
+        )
+        _request_id, _generator, tts_params = asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        assert tts_params["task_type"] == ["Base"]
+        assert tts_params["ref_text"] == ["reference transcript"]
+        assert tts_params["non_streaming_mode"] == [True]
+        prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
+        assert prompt["additional_information"] is tts_params
+        assert prompt["additional_information"]["non_streaming_mode"] == [True]
 
     def test_qwen3_repeated_ref_audio_hot_path_sends_cache_key_without_waveform(self, qwen3_tts_server):
         """After a ref artifact is marked ready, repeated requests avoid ref_audio payload IPC."""

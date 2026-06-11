@@ -2815,9 +2815,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if request.initial_codec_chunk_frames is not None:
             params["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
 
-        # VoiceDesign requires non_streaming_mode (match offline script behaviour).
-        # CustomVoice and Base rely on the model default (True and False respectively).
-        if params["task_type"][0] == "VoiceDesign":
+        if request.non_streaming_mode is not None:
+            params["non_streaming_mode"] = [request.non_streaming_mode]
+        # Preserve the legacy VoiceDesign fallback when the request omits an
+        # explicit override. CustomVoice and Base rely on model defaults
+        # (True and False respectively).
+        elif params["task_type"][0] == "VoiceDesign":
             params["non_streaming_mode"] = [True]
 
         return params
@@ -3974,6 +3977,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             x_vector_only_mode=_pick("x_vector_only_mode"),
             max_new_tokens=_pick("max_new_tokens"),
             initial_codec_chunk_frames=_pick("initial_codec_chunk_frames"),
+            non_streaming_mode=_pick("non_streaming_mode"),
         )
 
     async def create_speech_batch(
