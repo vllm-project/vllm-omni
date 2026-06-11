@@ -118,17 +118,13 @@ Only specific types of PRs will be reviewed. The PR title is prefixed appropriat
 
 ### Pre-Check Before Submitting
 
-Before submitting a PR, run the precheck-pr skill with code agent for a self-review against project conventions:
-
-```
-/precheck-pr
-```
+Before submitting a PR, run the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) with the code agent for a self-review against project conventions:
 
 The skill offers two modes:
 - **Quick (~3 min):** catches showstoppers — PR title format, missing benchmark claims, rebase status
 - **Full (~10 min):** thorough maintainer-grade review — dead code scan, copy-paste detection, import hygiene
 
-The precheck covers five PR types: Bug Fix, Performance, New Model, Diffusion Model, and General. Each type has a tailored checklist that validates evidence quality (repro steps, A/B benchmarks, registry entries, etc.). See the skill in `.claude/skills/precheck-pr/` for the full checklist.
+The precheck covers five PR types: Bug Fix, Performance, New Model, Diffusion Model, and General. Each type has a tailored checklist that validates evidence quality (repro steps, A/B benchmarks, registry entries, etc.). See the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) for the full checklist.
 
 ### Local Test
 Please run the L1 and L2 test cases locally first and attach the results before contacting us to add the "ready" label. Please refer to the [test instructions](./ci/test_guide.md) for running the test cases.
