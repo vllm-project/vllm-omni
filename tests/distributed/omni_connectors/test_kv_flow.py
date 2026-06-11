@@ -186,6 +186,108 @@ def test_from_bytes_uses_explicit_layer_index_descriptor():
     assert torch.equal(data["layer_blocks"]["key_cache"][0], key_tensor)
 
 
+def test_to_bytes_wire_format_matches_legacy_join():
+    """The staging-buffer fast path must be byte-identical to the legacy
+    per-layer ``.cpu().numpy().tobytes()`` + ``b"".join`` layout so old and
+    new senders/receivers interoperate."""
+    kv_data = KVCacheTransferData(
+        request_id="req-golden",
+        layer_blocks={
+            "key_cache": [
+                torch.arange(24, dtype=torch.float32).reshape(2, 3, 4),
+                None,
+                torch.arange(12, dtype=torch.bfloat16).reshape(3, 4),
+            ],
+            "value_cache": [
+                torch.arange(24, dtype=torch.float16).reshape(2, 3, 4),
+                torch.arange(6, dtype=torch.int64).reshape(2, 3),
+                None,
+            ],
+        },
+        block_ids=[0, 2],
+        metadata={"seq_len": 6},
+    )
+
+    payload = kv_data.to_bytes()
+
+    tensors_desc, chunks, _, _ = kv_data._build_tensors_desc()
+    legacy_chunks = [flat.cpu().numpy().tobytes() for flat in chunks]
+    legacy_payload = b"".join([kv_data._build_header_bytes(tensors_desc)] + legacy_chunks)
+    assert payload == legacy_payload
+
+    data = KVCacheTransferData.from_bytes(payload)
+    assert torch.equal(data["layer_blocks"]["key_cache"][0], kv_data.layer_blocks["key_cache"][0])
+    assert torch.equal(data["layer_blocks"]["key_cache"][2], kv_data.layer_blocks["key_cache"][2])
+    assert data["layer_blocks"]["key_cache"][1] is None
+    assert torch.equal(data["layer_blocks"]["value_cache"][1], kv_data.layer_blocks["value_cache"][1])
+    assert data["layer_blocks"]["value_cache"][2] is None
+
+
+def test_to_bytes_handles_noncontiguous_sources():
+    contiguous = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    payload = KVCacheTransferData(
+        request_id="req-nc",
+        layer_blocks={"key_cache": [contiguous.t()], "value_cache": [None]},
+        block_ids=[0],
+        metadata={},
+    ).to_bytes()
+
+    data = KVCacheTransferData.from_bytes(payload)
+    assert torch.equal(data["layer_blocks"]["key_cache"][0], contiguous.t())
+
+
+def test_to_bytes_empty_payload_is_header_only():
+    payload = KVCacheTransferData(
+        request_id="req-empty",
+        layer_blocks={"key_cache": [None], "value_cache": [None]},
+        block_ids=[],
+        metadata={},
+    ).to_bytes()
+
+    header_len = struct.unpack(">I", payload[:4])[0]
+    assert len(payload) == 4 + header_len
+
+    data = KVCacheTransferData.from_bytes(payload)
+    assert data["layer_blocks"]["key_cache"] == [None]
+    assert data["layer_blocks"]["value_cache"] == [None]
+
+
+def test_to_bytes_reuses_staging_buffer():
+    pool = kv_transfer_manager_module._HOST_STAGING_POOL
+    pool._buf = None  # reset shared pool state for determinism
+
+    kv_data = KVCacheTransferData(
+        request_id="req-reuse",
+        layer_blocks={"key_cache": [torch.randn(4, 8)], "value_cache": [torch.randn(4, 8)]},
+        block_ids=[0],
+        metadata={},
+    )
+
+    first = kv_data.to_bytes()
+    pooled = pool._buf
+    assert pooled is not None
+    pooled_ptr = pooled.data_ptr()
+
+    second = kv_data.to_bytes()
+    assert second == first
+    assert pool._buf is not None
+    assert pool._buf.data_ptr() == pooled_ptr  # same buffer was reused
+
+
+def test_staging_pool_concurrent_borrowers_fall_back_to_fresh_allocation():
+    pool = kv_transfer_manager_module._HostStagingPool()
+
+    buf_a, pinned_a = pool.take(64, pinned=False)
+    buf_b, pinned_b = pool.take(128, pinned=False)
+    assert buf_a.data_ptr() != buf_b.data_ptr()
+
+    pool.give_back(buf_a, pinned=pinned_a)
+    pool.give_back(buf_b, pinned=pinned_b)
+    # Pool keeps the larger buffer for future borrowers.
+    assert pool._buf is not None
+    assert pool._buf.numel() == 128
+
+
 def test_update_sender_info_uses_configured_source_stage():
     config = OmniKVCacheConfig(
         connector_config={"type": "mock"},

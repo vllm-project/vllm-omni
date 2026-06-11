@@ -4,6 +4,7 @@
 
 import json
 import struct
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -61,6 +62,50 @@ _SAFE_TORCH_DTYPES = {
 }
 
 
+class _HostStagingPool:
+    """Process-wide reusable host staging buffer for KV-cache serialization.
+
+    ``KVCacheTransferData.to_bytes`` borrows the buffer for one serialization
+    and returns it afterwards; a concurrent borrower simply gets a fresh
+    allocation, so reuse is an optimization, never a correctness dependency.
+    The pooled buffer grows to the largest payload seen and is pinned when
+    CUDA sources are involved, so D2H copies can run asynchronously on the
+    copy engine instead of one synchronous pageable transfer per layer.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._buf: torch.Tensor | None = None
+        self._pinned = False
+
+    def take(self, nbytes: int, *, pinned: bool) -> tuple[torch.Tensor, bool]:
+        """Borrow a host uint8 buffer of at least *nbytes*.
+
+        Returns ``(buffer, is_pinned)``. A pinned pooled buffer satisfies an
+        unpinned request; the reverse allocates fresh pinned memory.
+        """
+        with self._lock:
+            buf, buf_pinned = self._buf, self._pinned
+            self._buf = None
+        if buf is not None and buf.numel() >= nbytes and (buf_pinned or not pinned):
+            return buf, buf_pinned
+        if pinned:
+            try:
+                return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True), True
+            except RuntimeError as e:
+                logger.warning("Pinned staging allocation failed (%s); falling back to pageable memory", e)
+        return torch.empty(nbytes, dtype=torch.uint8), False
+
+    def give_back(self, buf: torch.Tensor, *, pinned: bool) -> None:
+        """Return a borrowed buffer; the pool keeps the best one it sees."""
+        with self._lock:
+            if self._buf is None or (pinned, buf.numel()) > (self._pinned, self._buf.numel()):
+                self._buf, self._pinned = buf, pinned
+
+
+_HOST_STAGING_POOL = _HostStagingPool()
+
+
 @dataclass
 class OmniKVCacheConfig:
     """Configuration for OmniKVTransferManager."""
@@ -90,14 +135,15 @@ class KVCacheTransferData:
         """Convert to dictionary for serialization."""
         return asdict(self)
 
-    def _build_tensors_desc(self, *, cpu: bool) -> tuple[list[dict[str, Any]], list, int, torch.device | None]:
+    def _build_tensors_desc(self) -> tuple[list[dict[str, Any]], list[torch.Tensor], int, torch.device | None]:
         """Iterate layer blocks and build tensor descriptors + data chunks.
 
         Returns ``(tensors_desc, chunks, total_bytes, device)``.
-        *chunks* contains ``bytes`` when *cpu* is True, flat uint8 GPU tensors otherwise.
+        *chunks* are flat uint8 views (zero-copy for contiguous sources) on
+        their original devices; *device* is the first non-CPU device seen.
         """
         tensors_desc: list[dict[str, Any]] = []
-        chunks: list = []
+        chunks: list[torch.Tensor] = []
         data_offset = 0
         device = None
 
@@ -107,9 +153,7 @@ class KVCacheTransferData:
                     tensors_desc.append({"n": f"{cache_name}_{layer_idx}", "x": True})
                     continue
                 t = tensor.detach().contiguous()
-                if cpu:
-                    t = t.cpu()
-                elif device is None and getattr(t.device, "type", "cpu") != "cpu":
+                if device is None and getattr(t.device, "type", "cpu") != "cpu":
                     device = t.device
                 nbytes = t.numel() * t.element_size()
                 tensors_desc.append(
@@ -122,7 +166,7 @@ class KVCacheTransferData:
                         "b": nbytes,
                     }
                 )
-                chunks.append(t.view(torch.uint8).numpy().tobytes() if cpu else t.view(torch.uint8).flatten())
+                chunks.append(t.view(torch.uint8).flatten())
                 data_offset += nbytes
 
         return tensors_desc, chunks, data_offset, device
@@ -141,13 +185,59 @@ class KVCacheTransferData:
         return struct.pack(">I", len(header)) + header
 
     def to_bytes(self) -> bytes:
-        """Convert to compact binary format for fast transfer."""
-        tensors_desc, chunks, _, _ = self._build_tensors_desc(cpu=True)
-        return b"".join([self._build_header_bytes(tensors_desc)] + chunks)
+        """Convert to compact binary format for fast transfer.
+
+        Header and all layer payloads are packed into one borrowed host
+        staging buffer (pinned when sources live on CUDA) using batched
+        ``non_blocking`` D2H copies and a single stream sync per source
+        device. This replaces the previous per-layer synchronous pageable
+        ``.cpu()`` + ``.tobytes()`` + ``b"".join`` pipeline, which stalled
+        the caller once per layer and held two extra full-payload host
+        copies alive. The wire format is unchanged (see ``from_bytes``).
+        """
+        tensors_desc, chunks, data_nbytes, device = self._build_tensors_desc()
+        header = self._build_header_bytes(tensors_desc)
+        total = len(header) + data_nbytes
+
+        want_pinned = device is not None and device.type == "cuda"
+        staging, is_pinned = _HOST_STAGING_POOL.take(total, pinned=want_pinned)
+        async_devices: set[torch.device] = set()
+        try:
+            staging[: len(header)] = torch.frombuffer(bytearray(header), dtype=torch.uint8)
+            pos = len(header)
+            for flat in chunks:
+                n = flat.numel()
+                if n > 0:
+                    if flat.device.type == "cuda" and is_pinned:
+                        staging[pos : pos + n].copy_(flat, non_blocking=True)
+                        async_devices.add(flat.device)
+                    else:
+                        # Synchronous copy: CPU/other-device sources, or the
+                        # pinned allocation fell back to pageable memory
+                        # (non_blocking D2H is only safe into pinned memory).
+                        staging[pos : pos + n].copy_(flat)
+                pos += n
+            for dev in async_devices:
+                # Async copies were enqueued on each source device's current
+                # stream; staging must be fully populated before the bytes
+                # materialization below reads it.
+                torch.cuda.current_stream(dev).synchronize()
+            return staging[:total].numpy().tobytes()
+        except Exception:
+            # Drain in-flight async copies before the buffer is returned to
+            # the pool, so a later borrower cannot race a pending DMA write.
+            for dev in async_devices:
+                try:
+                    torch.cuda.current_stream(dev).synchronize()
+                except Exception:
+                    pass
+            raise
+        finally:
+            _HOST_STAGING_POOL.give_back(staging, pinned=is_pinned)
 
     def to_gpu_tensor(self) -> torch.Tensor:
         """Convert to a packed device tensor for raw-data connectors."""
-        tensors_desc, chunks, data_offset, device = self._build_tensors_desc(cpu=False)
+        tensors_desc, chunks, data_offset, device = self._build_tensors_desc()
         if device is None:
             raise RuntimeError("No device tensors found, use to_bytes() instead")
         header_prefix = self._build_header_bytes(tensors_desc)
