@@ -163,6 +163,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return output_token_ids
 
     def _sampling_metadata_for_model_sampler(self, sampling_metadata):
+        if getattr(self.model, "skips_model_sampler_output_token_history", False):
+            return sampling_metadata
         output_token_ids = self._build_model_sampler_output_token_ids()
         if output_token_ids == sampling_metadata.output_token_ids:
             return sampling_metadata
@@ -568,7 +570,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
-
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(

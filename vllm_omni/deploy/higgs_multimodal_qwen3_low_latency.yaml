@@ -1,10 +1,15 @@
-# Higgs-audio v3 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
+# Higgs-audio v3 deploy, low-latency profile.
 #
-# Auto-discovered default for model_type=higgs_multimodal_qwen3. This file is
-# the high-throughput profile and intentionally keeps Stage 0 enforce_eager=true
-# so the Higgs-specific local MLP CUDA graph path remains active. For low
-# concurrency latency-sensitive serving, use
-# higgs_multimodal_qwen3_low_latency.yaml explicitly.
+# Use this profile for low-concurrency serving (for example c1-c4) where Stage 0
+# decode launch overhead dominates. Stage 0 enables vLLM FULL_DECODE_ONLY CUDA
+# graph through YAML configuration:
+#
+#   enforce_eager: false
+#   compilation_config.cudagraph_mode: FULL_DECODE_ONLY
+#
+# This is not controlled by an environment variable. The Higgs talker disables
+# its local MLP CUDA graph automatically when the external decode graph is active,
+# because the two graph paths are mutually exclusive.
 #
 # Plain TTS only (no voice cloning). async_chunk streams codec chunks from
 # Stage 0 to Stage 1 as they are produced (TTFA approaches one AR loop's
@@ -37,16 +42,15 @@ stages:
   - stage_id: 0
     max_num_seqs: 16
     gpu_memory_utilization: 0.6
-    enforce_eager: true
+    enforce_eager: false
     attention_backend: FLASHINFER
     trust_remote_code: true
-    # Stage-0 prefix caching is on by default. The talker's HS opt-out and
-    # deferred ``codes.audio`` mm-output write (see higgs_audio_v3_talker.py)
-    # keep per-step bookkeeping negligible; any shared text prefix across
-    # concurrent requests is a net throughput win. Stage 1 (codec decoder)
-    # has no KV cache and stays disabled.
     enable_prefix_caching: true
     async_scheduling: false
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16]
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_num_of_warmups: 1
     max_num_batched_tokens: 4096
     max_model_len: 8192
     devices: "0"
