@@ -1,6 +1,6 @@
 # vLLM-Omni Benchmark CLI Guide
 
-The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
+The `vllm bench serve --omni` command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
 
@@ -12,6 +12,14 @@ output has arrived. This includes retryable multimodal cache misses reported
 inside an HTTP 200 SSE stream. Other server errors and partial responses remain
 failed requests. Request latency and time to first output include failed
 attempts and retry delays.
+
+Currently these endpoints are available for `vllm bench serve --omni`: 
+ Endpoint | Example models
+ - | -
+ /v1/chat/completions | Qwen3-Omni-30B-A3B-Instruct<br>BAGEL-7B-MoT<br>...
+ /v1/images/edits | HunyuanImage-3.0-Instruct<br>...
+
+ More endpoints are on the way.
 
 ## Basic Parameter Description
 
@@ -1357,19 +1365,16 @@ Mean AUDIO_RTF:                          0.24
 Median AUDIO_RTF:                        0.26
 P99 AUDIO_RTF:                           0.27
 ```
-
-Explanation:
+Additional explanation of stage wise metrics:
 
 - stage_gen_time: Time from submitting a request to a specific stage to that stage finishing generation.
 
-- Serving TTFC (Time to First Chunk): Time from the HTTP request being accepted by the serving frontend to
-  the stage producing its first non-empty output chunk. Keep the name TTFT in text stage, TTFP in audio stage
-  for easier mapping.
+- Serving TTFC (Time to First Chunk): Time from the HTTP request being accepted by the serving frontend to the stage producing its first non-empty output chunk. Keep the name TTFT in text stage, TTFP in audio stage for easier mapping.
 
-- TPOP (Time per Output Chunk): Average time from the first output chunk to stage completion, divided by the
-  number of remaining output chunks. The TPOP abbreviation follows Qwen3.5-Omni Technical Report.
+- TPOP (Time per Output Chunk): Average time from the first output chunk to stage completion, divided by the number of remaining output chunks. The TPOP abbreviation follows Qwen3.5-Omni Technical Report.
 
-- ICL (Inter-Chunk Latency): Time between two consecutive output chunks produced by the same stage. Keep the
-  name ITL in text stage for easier mapping.
+- ICL (Inter-Chunk Latency): Time between two consecutive output chunks produced by the same stage. Keep the name ITL in text stage for easier mapping.
+
+- AUDIO_RTF (Real-Time Factor): `stage_gen_time / audio_duration`
 
 </details>
