@@ -627,7 +627,55 @@ def get_deploy_config_path(rel_path: str) -> str:
     return str(_DEPLOY_DIR / rel_path)
 
 
+def _stage_load_format_paths(stage_config_path: str) -> tuple[str, str, list[int]]:
+    """Return ``(stage_key, load_format_field_path, stage_ids)`` for a deploy YAML."""
+    with open(stage_config_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    new_schema_stages = cfg.get("stages")
+    stage_key = "stages" if new_schema_stages is not None else "stage_args"
+    load_format_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
+    stage_entries = cfg.get(stage_key, [])
+    stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
+    return stage_key, load_format_path, stage_ids
+
+
+def _add_dummy_load_format(
+    stage_config_path: str | None,
+    run_level: str,
+) -> str | None:
+    """For ``core_model`` runs, patch every stage in the deploy YAML to ``load_format: dummy``."""
+    if run_level != "core_model" or stage_config_path is None:
+        return stage_config_path
+    stage_key, load_format_path, stage_ids = _stage_load_format_paths(stage_config_path)
+    return modify_stage_config(
+        stage_config_path,
+        updates={stage_key: {stage_id: {load_format_path: "dummy"} for stage_id in stage_ids}},
+    )
+
+
+def _delete_dummy_load_format(
+    stage_config_path: str | None,
+    run_level: str,
+) -> str | None:
+    """For ``advanced_model`` / ``full_model``, strip ``load_format: dummy`` so real weights load."""
+    if run_level not in {"advanced_model", "full_model"} or stage_config_path is None:
+        return stage_config_path
+    stage_key, load_format_path, stage_ids = _stage_load_format_paths(stage_config_path)
+    return modify_stage_config(
+        stage_config_path,
+        deletes={stage_key: {stage_id: [load_format_path] for stage_id in stage_ids}},
+    )
+
+
+def stage_config_path_for_run_level(stage_config_path: str | None, run_level: str) -> str | None:
+    """Apply run-level deploy YAML tweaks for weight loading (dummy vs real)."""
+    if run_level in {"advanced_model", "full_model"}:
+        return _delete_dummy_load_format(stage_config_path, run_level)
+    return _add_dummy_load_format(stage_config_path, run_level)
+
+
 __all__ = [
-    "modify_stage_config",
     "get_deploy_config_path",
+    "modify_stage_config",
+    "stage_config_path_for_run_level",
 ]
