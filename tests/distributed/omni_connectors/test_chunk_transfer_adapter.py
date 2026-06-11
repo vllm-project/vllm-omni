@@ -677,6 +677,80 @@ def test_finish_requests_removes_zombies_from_chunk_waiting_deques(build_adapter
     assert "req-zombie" not in adapter.finished_requests
 
 
+def test_finish_requests_enqueues_connector_cleanup_for_aborts(build_adapter):
+    """Aborting a live request must sweep its connector-side resources
+    (e.g. unconsumed SHM segments — see the /dev/shm leak in
+    vllm-project/vllm-omni C1). The sweep is enqueued on the save queue —
+    not run inline — so it executes on the save thread strictly after any
+    ``put()`` already queued for the same request.
+    """
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-abort", RequestStatus.RUNNING, external_req_id="ext-abort")
+    adapter.put_req_chunk["ext-abort"] = 3
+    adapter.request_payload["ext-abort"] = object()
+
+    adapter.finish_requests(["req-abort"], RequestStatus.FINISHED_ABORTED, {"req-abort": request})
+
+    tasks = list(adapter._pending_save_reqs)
+    assert len(tasks) == 1
+    assert tasks[0]["connector_cleanup"] is True
+    assert tasks[0]["external_req_id"] == "ext-abort"
+
+    adapter._send_single_request(tasks[0])
+    connector.cleanup.assert_called_once_with("ext-abort")
+    assert "ext-abort" not in adapter.put_req_chunk
+    assert "ext-abort" not in adapter.request_payload
+
+
+def test_finish_requests_connector_cleanup_ordered_after_queued_saves(build_adapter):
+    """FIFO guarantee: a save enqueued before the abort must be processed
+    before the connector sweep, otherwise the late chunk would be written
+    after its segment sweep and leak.
+    """
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-fifo", RequestStatus.RUNNING, external_req_id="ext-fifo")
+    adapter.save_async(pooling_output=None, request=request)
+
+    adapter.finish_requests(["req-fifo"], RequestStatus.FINISHED_ABORTED, {"req-fifo": request})
+
+    kinds = ["cleanup" if task.get("connector_cleanup") else "save" for task in adapter._pending_save_reqs]
+    assert kinds == ["save", "cleanup"]
+
+
+def test_finish_requests_skips_connector_cleanup_for_finished_or_unknown(build_adapter):
+    """A request that already finished naturally may have an unconsumed
+    terminal chunk downstream; its segments must NOT be swept, or the next
+    stage waits for its finish marker forever. Unknown ids are skipped too.
+    """
+    adapter, _ = build_adapter(stage_id=1)
+    finished = _req("req-done", RequestStatus.FINISHED_STOPPED, external_req_id="ext-done")
+
+    adapter.finish_requests(
+        ["req-done", "req-ghost"],
+        RequestStatus.FINISHED_ABORTED,
+        {"req-done": finished},
+    )
+
+    assert len(adapter._pending_save_reqs) == 0
+
+
+def test_terminal_send_does_not_sweep_connector_state(build_adapter):
+    """Natural finish: the terminal chunk just sent must stay readable for
+    the downstream consumer — ``connector.cleanup`` must not run on this
+    path (only sender-side dict state is reclaimed).
+    """
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-nat", RequestStatus.FINISHED_STOPPED, external_req_id="ext-nat")
+
+    adapter._send_single_request(
+        {"pooling_output": None, "request": request, "is_finished": True, "is_segment_finished": True}
+    )
+
+    assert connector.put.called
+    connector.cleanup.assert_not_called()
+    assert "ext-nat" not in adapter.put_req_chunk
+
+
 def test_restore_queues_skips_requests_missing_from_scheduler_requests(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     zombie = _req("req-zombie", RequestStatus.WAITING_FOR_CHUNK)

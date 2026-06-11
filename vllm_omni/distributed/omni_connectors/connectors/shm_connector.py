@@ -83,20 +83,23 @@ class SharedMemoryConnector(OmniConnectorBase):
             return False, 0, None
 
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict):
-        obj = None
+        consumed = False
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
                 data_bytes = shm_read_bytes(shm_handle)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
+            # shm_read_bytes unlinked the segment, so the lock file must go
+            # with it even if deserialization fails or yields a falsy object;
+            # no retry can succeed once the segment is gone.
+            consumed = True
             obj = self.deserialize_obj(data_bytes)
             return obj, int(shm_handle.get("size", 0))
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
         finally:
-            # If data has been received, delete lock_file.
-            if obj and os.path.exists(lock_file):
+            if consumed and os.path.exists(lock_file):
                 os.remove(lock_file)
 
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
@@ -166,9 +169,10 @@ class SharedMemoryConnector(OmniConnectorBase):
         If ``get()`` was never called, we unlink it here so /dev/shm
         doesn't leak.
         """
+        # Snapshot: put() may add keys from another thread mid-iteration.
         stale = [
             k
-            for k in self._pending_keys
+            for k in list(self._pending_keys)
             if k == request_id or k.startswith(request_id + "_") or k.endswith("_" + request_id)
         ]
         for key in stale:

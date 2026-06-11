@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for SharedMemoryConnector focusing on TP / CFG / metadata fallback."""
 
+import os
+
 import pytest
 
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import (
@@ -182,3 +184,37 @@ class TestCleanup:
         assert len(connector._pending_keys) == 3
         connector.close()
         assert len(connector._pending_keys) == 0
+
+    def test_cleanup_sweeps_chunk_keys_and_lock_files(self, connector):
+        """Abort sweep: chunk-style keys ``{ext_req_id}_{stage}_{chunk}`` are
+        matched by external-request-id prefix; both the SHM segments and
+        their lock files must be removed, leaving other requests untouched.
+        """
+        for chunk in range(2):
+            ok, _, _ = connector.put("s0", "s1", f"req-c1_0_{chunk}", {"chunk": chunk})
+            assert ok
+        ok, _, _ = connector.put("s0", "s1", "other-req_0_0", {"keep": True})
+        assert ok
+
+        connector.cleanup("req-c1")
+
+        for chunk in range(2):
+            assert connector.get("s0", "s1", f"req-c1_0_{chunk}", metadata=None) is None
+            assert not os.path.exists(f"/dev/shm/shm_req-c1_0_{chunk}_lockfile.lock")
+        assert not any(k.startswith("req-c1_") for k in connector._pending_keys)
+
+        result = connector.get("s0", "s1", "other-req_0_0", metadata=None)
+        assert result is not None
+        assert result[0] == {"keep": True}
+
+    def test_get_removes_lock_file_even_for_falsy_payload(self, connector):
+        """The lock file must be tied to segment consumption, not payload
+        truthiness — an empty-dict payload previously leaked its lock file.
+        """
+        ok, _, _ = connector.put("s0", "s1", "falsy_key_1", {})
+        assert ok
+
+        result = connector.get("s0", "s1", "falsy_key_1", metadata=None)
+        assert result is not None
+        assert result[0] == {}
+        assert not os.path.exists("/dev/shm/shm_falsy_key_1_lockfile.lock")
