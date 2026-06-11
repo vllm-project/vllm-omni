@@ -84,6 +84,9 @@ def register_omni_models_to_vllm():
         if arch not in supported_archs:
             ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
 
+    # Register omni-specific reasoning parsers (e.g., step_audio).
+    import vllm_omni.reasoning  # noqa: F401
+
 
 @dataclass
 class OmniEngineArgs(EngineArgs):
