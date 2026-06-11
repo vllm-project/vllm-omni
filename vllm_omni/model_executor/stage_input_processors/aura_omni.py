@@ -180,9 +180,9 @@ def asr2aura(
         source_multi_modal_data = src_prompt.get("multi_modal_data") or {}
         if isinstance(source_multi_modal_data, dict):
             multi_modal_data.update(source_multi_modal_data)
-        aura_multi_modal_data = additional_info.get("aura_multi_modal_data") or {}
-        if isinstance(aura_multi_modal_data, dict):
-            multi_modal_data.update(aura_multi_modal_data)
+        deferred_multi_modal_data = additional_info.get("deferred_multi_modal_data") or {}
+        if isinstance(deferred_multi_modal_data, dict):
+            multi_modal_data.update(deferred_multi_modal_data)
         multi_modal_data = _vision_multimodal_data(multi_modal_data)
 
         next_input: dict[str, Any] = {
@@ -194,13 +194,6 @@ def asr2aura(
             next_input["mm_processor_kwargs"] = src_prompt.get("mm_processor_kwargs")
         next_inputs.append(next_input)
     return next_inputs
-
-
-def _estimate_tts_prompt_len(text: str) -> int:
-    # Fallback path when token ids are unavailable. This mirrors the structured
-    # prompt-length formula using character count as an approximation of token
-    # count for the assistant segment.
-    return _estimate_tts_prompt_len_from_token_ids([0] * max(0, len(text)))
 
 
 def _estimate_ref_code_len_from_ref_audio(ref_audio: Any) -> int | None:
@@ -333,44 +326,44 @@ def aura2tts(
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
         task_type = _first_value(additional_info.get("tts_task_type"), "Base")
-        assistant_token_ids = _qwen3_tts_assistant_token_ids_from_aura(source_output)
+        language = _first_value(additional_info.get("tts_language"), "English")
+        instruct = _first_value(additional_info.get("tts_instruct"), "")
+        x_vector_only_mode = _first_bool(additional_info.get("tts_x_vector_only_mode"), False)
+        non_streaming_mode_raw = _first_value(additional_info.get("tts_non_streaming_mode"), None)
+        non_streaming_mode = non_streaming_mode_raw if isinstance(non_streaming_mode_raw, bool) else None
+        ref_code_len_raw = _first_value(additional_info.get("tts_ref_code_length"), None)
+        ref_code_len = int(ref_code_len_raw) if isinstance(ref_code_len_raw, int) else None
+        if task_type == "Base" and not x_vector_only_mode and ref_code_len is None:
+            ref_audio_for_len = _first_value(
+                additional_info.get("tts_ref_audio"),
+                default_qwen3_tts_ref_audio_path(),
+            )
+            ref_code_len = _estimate_ref_code_len_from_ref_audio(ref_audio_for_len)
+
+        assistant_token_ids_for_len = _qwen3_tts_assistant_token_ids_from_aura(source_output)
+        pass_token_ids = _first_bool(additional_info.get("tts_pass_token_ids"), False)
         tts_info = {
             "task_type": [task_type],
-            "language": [_first_value(additional_info.get("tts_language"), "Chinese")],
-            "instruct": [_first_value(additional_info.get("tts_instruct"), "")],
+            "language": [language],
+            "instruct": [instruct],
             "max_new_tokens": [int(_first_value(additional_info.get("tts_max_new_tokens"), 2048))],
         }
-        if assistant_token_ids:
-            tts_info[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids]
-            language = _first_value(additional_info.get("tts_language"), "Chinese")
-            instruct = _first_value(additional_info.get("tts_instruct"), "")
-            x_vector_only_mode = _first_bool(additional_info.get("tts_x_vector_only_mode"), False)
-            non_streaming_mode_raw = _first_value(additional_info.get("tts_non_streaming_mode"), None)
-            non_streaming_mode = non_streaming_mode_raw if isinstance(non_streaming_mode_raw, bool) else None
-            ref_code_len_raw = _first_value(additional_info.get("tts_ref_code_length"), None)
-            ref_code_len = int(ref_code_len_raw) if isinstance(ref_code_len_raw, int) else None
-            if task_type == "Base" and not x_vector_only_mode and ref_code_len is None:
-                ref_audio_for_len = _first_value(
-                    additional_info.get("tts_ref_audio"),
-                    default_qwen3_tts_ref_audio_path(),
-                )
-                ref_code_len = _estimate_ref_code_len_from_ref_audio(ref_audio_for_len)
-            if ref_code_len is not None:
-                tts_info["ref_code_length"] = [int(ref_code_len)]
-            prompt_len = _estimate_tts_prompt_len_from_token_ids(
-                assistant_token_ids,
-                task_type=str(task_type),
-                language=str(language),
-                instruct=str(instruct),
-                x_vector_only_mode=x_vector_only_mode,
-                non_streaming_mode=non_streaming_mode,
-                ref_code_len=ref_code_len,
-            )
+        if pass_token_ids and assistant_token_ids_for_len:
+            tts_info[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids_for_len]
         else:
-            # Defensive fallback for synthetic outputs or legacy callers that do
-            # not populate cumulative_token_ids.
             tts_info["text"] = [text]
-            prompt_len = _estimate_tts_prompt_len(text)
+        if ref_code_len is not None:
+            tts_info["ref_code_length"] = [int(ref_code_len)]
+        prompt_len = _estimate_tts_prompt_len_from_token_ids(
+            assistant_token_ids_for_len if assistant_token_ids_for_len else [0] * max(0, len(text)),
+            task_type=str(task_type),
+            language=str(language),
+            instruct=str(instruct),
+            x_vector_only_mode=x_vector_only_mode,
+            non_streaming_mode=non_streaming_mode,
+            ref_code_len=ref_code_len,
+        )
+
         if task_type == "Base":
             ref_audio = _first_value(additional_info.get("tts_ref_audio"), DEFAULT_QWEN3_TTS_REF_AUDIO)
             ref_text = _first_value(additional_info.get("tts_ref_text"), DEFAULT_QWEN3_TTS_REF_TEXT)

@@ -124,6 +124,10 @@ from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 logger = init_logger(__name__)
 
 
+async def _identity_async(value: Any) -> Any:
+    return value
+
+
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     """OpenAI-compatible chat serving for both LLM and Diffusion models.
 
@@ -656,9 +660,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
 
-        aura_multi_modal_data: dict[str, Any] | None = None
-        if self._is_aura_omni_pipeline():
-            messages, aura_multi_modal_data = await self._strip_aura_videos_for_asr(
+        deferred_multi_modal_data: dict[str, Any] | None = None
+        if self._needs_multistage_multimodal_split():
+            messages, deferred_multi_modal_data = await self._prepare_multistage_multimodal_inputs(
                 messages,
                 request,
             )
@@ -713,10 +717,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 engine_prompt["additional_information"] = {}
             engine_prompt["additional_information"].update(additional_information)
 
-        if aura_multi_modal_data:
+        if deferred_multi_modal_data:
             if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
                 engine_prompt["additional_information"] = {}
-            engine_prompt["additional_information"]["aura_multi_modal_data"] = aura_multi_modal_data
+            engine_prompt["additional_information"]["deferred_multi_modal_data"] = deferred_multi_modal_data
 
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
@@ -743,22 +747,55 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return conversation, [engine_prompt]
 
-    def _is_aura_omni_pipeline(self) -> bool:
-        stage_names: set[str] = set()
-        for stage in getattr(self.engine_client, "stage_configs", []) or []:
-            engine_args = getattr(stage, "engine_args", None)
-            model_stage = getattr(engine_args, "model_stage", None) or getattr(stage, "model_stage", None)
-            if model_stage:
-                stage_names.add(str(model_stage))
-        return {"asr", "aura", "code2wav"}.issubset(stage_names)
+    def _needs_multistage_multimodal_split(self) -> bool:
+        return bool(self._deferred_multimodal_modalities())
 
-    async def _strip_aura_videos_for_asr(
+    def _deferred_multimodal_modalities(self) -> set[str]:
+        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        if len(stage_configs) < 2:
+            return set()
+
+        first_stage_modalities = self._stage_input_modalities(stage_configs[0])
+        if not first_stage_modalities:
+            return set()
+
+        downstream_modalities: set[str] = set()
+        for stage in stage_configs[1:]:
+            downstream_modalities.update(self._stage_input_modalities(stage))
+        return downstream_modalities - first_stage_modalities
+
+    @staticmethod
+    def _stage_input_modalities(stage: Any) -> set[str]:
+        engine_args = getattr(stage, "engine_args", None)
+        explicit = (
+            getattr(stage, "input_modalities", None)
+            or getattr(stage, "modalities", None)
+            or getattr(engine_args, "input_modalities", None)
+            or getattr(engine_args, "modalities", None)
+        )
+        if explicit:
+            return {str(modality) for modality in as_list(explicit)}
+
+        model_stage = str(getattr(engine_args, "model_stage", None) or getattr(stage, "model_stage", "")).lower()
+        if model_stage in {"asr", "stt"} or model_stage.endswith("_asr"):
+            return {"audio"}
+        if any(name in model_stage for name in ("vision", "vl", "aura")):
+            return {"image", "video"}
+        if any(name in model_stage for name in ("tts", "talker", "code2wav")):
+            return set()
+
+        if getattr(stage, "requires_multimodal_data", False):
+            return {"audio", "image", "video"}
+        return set()
+
+    async def _prepare_multistage_multimodal_inputs(
         self,
         messages: list[ChatCompletionMessageParam],
         request: ChatLikeRequest | ResponsesRequest,
     ) -> tuple[list[ChatCompletionMessageParam], dict[str, Any] | None]:
-        """Keep videos for AURA while hiding them from the ASR stage renderer."""
-        video_urls: list[str] = []
+        """Hide modalities unsupported by stage 0 and stash them for downstream stages."""
+        deferred_modalities = self._deferred_multimodal_modalities()
+        deferred_parts: dict[str, list[Any]] = {modality: [] for modality in deferred_modalities}
         stripped_messages: list[ChatCompletionMessageParam] = []
 
         for message in messages:
@@ -770,12 +807,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             stripped_content: list[Any] = []
             changed = False
             for part in content:
-                if isinstance(part, dict) and part.get("type") == "video_url":
-                    video_url = part.get("video_url")
-                    if isinstance(video_url, dict):
-                        video_url = video_url.get("url")
-                    if isinstance(video_url, str) and video_url:
-                        video_urls.append(video_url)
+                modality, payload = self._deferred_multimodal_part(part, deferred_modalities)
+                if modality is not None:
+                    if payload is not None:
+                        deferred_parts.setdefault(modality, []).append(payload)
                     changed = True
                     continue
                 stripped_content.append(part)
@@ -787,7 +822,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 stripped_messages.append(message)
 
-        if not video_urls:
+        deferred_parts = {modality: parts for modality, parts in deferred_parts.items() if parts}
+        if not deferred_parts:
             return messages, None
 
         media_connector = MediaConnector(
@@ -795,8 +831,64 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             allowed_local_media_path=getattr(self.model_config, "allowed_local_media_path", "") or "",
             allowed_media_domains=getattr(self.model_config, "allowed_media_domains", None),
         )
-        videos = await asyncio.gather(*(media_connector.fetch_video_async(url) for url in video_urls))
-        return stripped_messages, {"video": list(videos)}
+        multi_modal_data: dict[str, Any] = {}
+        for modality, parts in deferred_parts.items():
+            multi_modal_data[modality] = await self._materialize_deferred_multimodal_parts(
+                media_connector,
+                modality,
+                parts,
+            )
+        return stripped_messages, multi_modal_data
+
+    @staticmethod
+    def _deferred_multimodal_part(part: Any, deferred_modalities: set[str]) -> tuple[str | None, Any | None]:
+        if not isinstance(part, dict):
+            return None, None
+        part_type = part.get("type")
+        if part_type in {"video_url", "video"} and "video" in deferred_modalities:
+            video = part.get("video_url", part.get("video"))
+            if isinstance(video, dict):
+                video = video.get("url")
+            return "video", video
+        if part_type in {"image_url", "image_pil", "image"} and "image" in deferred_modalities:
+            image = part.get("image_pil", part.get("image_url", part.get("image")))
+            if isinstance(image, dict):
+                image = image.get("url")
+            return "image", image
+        if part_type in {"audio_url", "input_audio", "audio"} and "audio" in deferred_modalities:
+            audio = part.get("audio_url", part.get("input_audio", part.get("audio")))
+            if isinstance(audio, dict):
+                audio = audio.get("url") or audio.get("data")
+            return "audio", audio
+        return None, None
+
+    @staticmethod
+    async def _materialize_deferred_multimodal_parts(
+        media_connector: MediaConnector,
+        modality: str,
+        parts: list[Any],
+    ) -> list[Any]:
+        if modality == "video":
+            return list(await asyncio.gather(*(media_connector.fetch_video_async(part) for part in parts)))
+        if modality == "image":
+            fetch_image = getattr(media_connector, "fetch_image_async", None)
+            if fetch_image is None:
+                return parts
+            return list(
+                await asyncio.gather(
+                    *(fetch_image(part) if isinstance(part, str) else _identity_async(part) for part in parts)
+                )
+            )
+        if modality == "audio":
+            fetch_audio = getattr(media_connector, "fetch_audio_async", None)
+            if fetch_audio is None:
+                return parts
+            return list(
+                await asyncio.gather(
+                    *(fetch_audio(part) if isinstance(part, str) else _identity_async(part) for part in parts)
+                )
+            )
+        return parts
 
     async def _inject_audio_from_video_urls(
         self,

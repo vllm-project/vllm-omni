@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for multistage diffusion generation input construction."""
+"""Regression tests for multistage generation input construction."""
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -91,6 +92,46 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[1].lora_request is None
     assert engine.default_sampling_params_list[2].resolution == 640
     assert engine.default_sampling_params_list[2].lora_request is None
+
+
+def test_prepare_multistage_multimodal_inputs_defers_downstream_modalities(serving_chat):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    image_payload = object()
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(model_stage="asr", requires_multimodal_data=True),
+            SimpleNamespace(model_stage="aura", requires_multimodal_data=True),
+        ]
+    )
+    serving_chat.model_config = SimpleNamespace(
+        allowed_local_media_path="",
+        allowed_media_domains=None,
+    )
+    request = SimpleNamespace(media_io_kwargs=None)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,abc"}},
+                {"type": "image_pil", "image_pil": image_payload},
+                {"type": "text", "text": "What changed?"},
+            ],
+        }
+    ]
+
+    stripped_messages, deferred_data = asyncio.run(
+        OmniOpenAIServingChat._prepare_multistage_multimodal_inputs(
+            serving_chat,
+            messages,
+            request,
+        )
+    )
+
+    assert deferred_data == {"image": [image_payload]}
+    stripped_content = stripped_messages[0]["content"]
+    assert {"type": "image_pil", "image_pil": image_payload} not in stripped_content
+    assert {"type": "text", "text": "What changed?"} in stripped_content
 
 
 def test_build_multistage_generation_inputs_multi_image_emits_n_img_placeholders(serving_chat):

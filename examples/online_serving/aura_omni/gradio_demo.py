@@ -150,6 +150,7 @@ def build_interface(client: OpenAI, model: str):
         tts_ref_audio: str,
         tts_ref_text: str,
         tts_x_vector_only_mode: bool,
+        tts_pass_token_ids: bool,
     ):
         audio_url = _audio_to_data_url(audio_file)
         video_url = _video_to_data_url(video_file)
@@ -168,6 +169,7 @@ def build_interface(client: OpenAI, model: str):
             "aura_system_prompt": aura_system_prompt,
             "tts_task_type": tts_task_type,
             "tts_instruct": tts_instruct,
+            "tts_pass_token_ids": bool(tts_pass_token_ids),
         }
         if tts_task_type == "CustomVoice":
             additional_information.update(
@@ -233,6 +235,10 @@ def build_interface(client: OpenAI, model: str):
             aura_system_prompt = gr.Textbox(label="AURA system prompt", value=default_system, lines=4)
             tts_task_type = gr.Radio(choices=["Base", "CustomVoice"], value="Base", label="TTS task type")
             tts_instruct = gr.Textbox(label="TTS instruction", value="")
+            tts_pass_token_ids = gr.Checkbox(
+                label="Pass AURA token ids directly to TTS",
+                value=False,
+            )
 
             with gr.Group(visible=False) as customvoice_config_group:
                 tts_language = gr.Dropdown(
@@ -280,6 +286,7 @@ def build_interface(client: OpenAI, model: str):
                 tts_ref_audio,
                 tts_ref_text,
                 tts_x_vector_only_mode,
+                tts_pass_token_ids,
             ],
             outputs=[text_output, audio_output],
         )

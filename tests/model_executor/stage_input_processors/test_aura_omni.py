@@ -10,7 +10,6 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     DEFAULT_QWEN3_TTS_REF_AUDIO,
-    DEFAULT_QWEN3_TTS_REF_TEXT,
     SILENT_TEXT,
     asr2aura,
     aura2tts,
@@ -52,11 +51,11 @@ def test_asr2aura_drops_audio_before_qwen3_vl_stage():
     assert "<|video_pad|>" in next_input["prompt"]
 
 
-def test_asr2aura_reads_video_stashed_for_downstream_aura_stage():
+def test_asr2aura_reads_video_stashed_for_downstream_stage():
     prompt = {
         "multi_modal_data": {"audio": ("wave", 16000)},
         "additional_information": {
-            "aura_multi_modal_data": {"video": ["frame-0", "frame-1"]},
+            "deferred_multi_modal_data": {"video": ["frame-0", "frame-1"]},
         },
     }
 
@@ -87,14 +86,12 @@ def test_aura2tts_builds_qwen3_tts_prompt_information():
     [tts_input] = aura2tts([_source_output("Hello.")], prompt=[prompt])
 
     assert len(tts_input["prompt_token_ids"]) >= 32
-    assert "text" not in tts_input["additional_information"]
-    assert tts_input["additional_information"][PRECOMPUTED_TEXT_IDS_KEY] == [
-        [151644, 77091, 198, 1, 2, 3, 151645, 198, 151644, 77091, 198]
-    ]
+    assert tts_input["additional_information"]["text"] == ["Hello."]
+    assert PRECOMPUTED_TEXT_IDS_KEY not in tts_input["additional_information"]
     assert tts_input["additional_information"]["task_type"] == ["Base"]
     assert tts_input["additional_information"]["language"] == ["Chinese"]
     assert tts_input["additional_information"]["ref_audio"] == [DEFAULT_QWEN3_TTS_REF_AUDIO]
-    assert tts_input["additional_information"]["ref_text"] == [DEFAULT_QWEN3_TTS_REF_TEXT]
+    assert tts_input["additional_information"]["ref_text"] == ["Reference transcript sample."]
     assert tts_input["additional_information"]["x_vector_only_mode"] == [False]
     assert tts_input["additional_information"]["instruct"] == ["Calm voice."]
 
@@ -143,10 +140,11 @@ def test_aura2tts_supports_custom_voice_mode():
     assert "ref_audio" not in tts_input["additional_information"]
 
 
-def test_aura2tts_passes_aura_token_ids_to_qwen3_tts_by_default():
+def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
     prompt = {
         "additional_information": {
             "tts_ref_text": ["Reference transcript sample."],
+            "tts_pass_token_ids": [True],
         }
     }
 

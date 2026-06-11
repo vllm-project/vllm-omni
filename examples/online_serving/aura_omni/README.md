@@ -49,6 +49,7 @@ Expected request shape:
   - `tts_ref_audio`
   - `tts_ref_text`
   - `tts_x_vector_only_mode`
+  - `tts_pass_token_ids`
 
 If AURA emits `<|silent|>`, the `aura2tts` processor returns no TTS request, so
 the TTS stages are skipped for that turn.
@@ -91,6 +92,13 @@ python examples/online_serving/aura_omni/openai_chat_completion_client.py \
   --tts-ref-text "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 ```
 
+Enable AURA token-id passthrough explicitly:
+
+```bash
+python examples/online_serving/aura_omni/openai_chat_completion_client.py \
+  --tts-pass-token-ids
+```
+
 CustomVoice mode requires stages 2 and 3 in `aura_omni.yaml` to point at a
 Qwen3-TTS CustomVoice checkpoint:
 
@@ -100,8 +108,10 @@ python examples/online_serving/aura_omni/openai_chat_completion_client.py \
   --tts-speaker Vivian
 ```
 
-AURA responses are passed to Qwen3-TTS as AURA-generated token ids by default,
-so Qwen3-TTS does not re-tokenize the response text.
+By default, AURA responses are passed to Qwen3-TTS as text. Set
+`tts_pass_token_ids=true` to pass AURA-generated assistant token ids directly
+to Qwen3-TTS instead. The processor still uses AURA token ids, when available,
+to estimate the Talker prompt length in the default text path.
 
 ## Curl
 
@@ -114,6 +124,7 @@ Set `PORT`, `MODEL`, or `OUTPUT_DIR` to override defaults:
 
 ```bash
 PORT=8666 MODEL=aura_omni bash run_curl_multimodal_generation.sh
+TTS_PASS_TOKEN_IDS=true PORT=8666 MODEL=aura_omni bash run_curl_multimodal_generation.sh
 ```
 
 ## Gradio

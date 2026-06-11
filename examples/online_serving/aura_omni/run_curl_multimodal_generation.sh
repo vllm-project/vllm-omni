@@ -4,6 +4,7 @@ set -euo pipefail
 PORT="${PORT:-8091}"
 MODEL="${MODEL:-aura_omni}"
 OUTPUT_DIR="${OUTPUT_DIR:-output_aura_omni_online}"
+TTS_PASS_TOKEN_IDS="${TTS_PASS_TOKEN_IDS:-false}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_OMNI_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 CLONE_REF_AUDIO="${VLLM_OMNI_ROOT}/tests/assets/qwen3_tts/clone_2.wav"
@@ -30,7 +31,8 @@ request_body=$(cat <<EOF
     "tts_ref_text": "${CLONE_REF_TEXT}",
     "tts_language": "English",
     "tts_speaker": "Vivian",
-    "tts_instruct": ""
+    "tts_instruct": "",
+    "tts_pass_token_ids": ${TTS_PASS_TOKEN_IDS}
   },
   "messages": [{
     "role": "user",

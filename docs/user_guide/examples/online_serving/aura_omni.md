@@ -51,6 +51,15 @@ VRAM each stage can reserve. Start with this split for a single GPU:
   checkpoint for stages 2 and 3 in `aura_omni.yaml`, then pass
   `tts_task_type=CustomVoice` and `tts_speaker`.
 
-AURA responses are passed to Qwen3-TTS as generated token ids. The
-pipeline trims AURA response boundary tokens and passes the resulting assistant
-template ids directly into Qwen3-TTS instead of re-tokenizing response text.
+By default, AURA responses are passed to Qwen3-TTS as text. Set
+`additional_information.tts_pass_token_ids=true` to pass AURA-generated
+assistant token ids directly instead. Even when token passthrough is disabled,
+the stage processor uses AURA token ids when available to estimate the Talker
+prefill length, so scheduling does not rely on raw character length.
+
+The example client exposes this as:
+
+```bash
+python examples/online_serving/aura_omni/openai_chat_completion_client.py \
+  --tts-pass-token-ids
+```

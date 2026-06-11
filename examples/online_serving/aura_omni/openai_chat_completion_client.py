@@ -139,6 +139,7 @@ def main(args) -> None:
                 "tts_ref_audio": args.tts_ref_audio,
                 "tts_ref_text": args.tts_ref_text,
                 "tts_x_vector_only_mode": args.tts_x_vector_only_mode,
+                "tts_pass_token_ids": args.tts_pass_token_ids,
             },
         },
         timeout=args.timeout,
@@ -184,6 +185,11 @@ def parse_args():
         "--tts-x-vector-only-mode",
         action="store_true",
         help="Use speaker embedding only for Base mode (disable ICL ref_text conditioning).",
+    )
+    parser.add_argument(
+        "--tts-pass-token-ids",
+        action="store_true",
+        help="Pass AURA-generated assistant token ids directly to Qwen3-TTS. Defaults to sending text.",
     )
     parser.add_argument("--timeout", type=float, default=600.0)
     return parser.parse_args()
