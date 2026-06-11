@@ -123,9 +123,6 @@ class MiniMindOmniTalkerEmbedding(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3 or x.shape[1] != self.num_layers:
-            raise ValueError(f"audio code ids must have shape [batch, {self.num_layers}, seq], got {tuple(x.shape)}")
-
         base_out = self.base(x)
         adapted = [base_out[:, i, :, :] + adapter(x[:, i, :]) for i, adapter in enumerate(self.adapters)]
         return torch.stack(adapted, dim=0).mean(dim=0)
@@ -156,6 +153,15 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("hidden_states", "last"),
         }
+
+        # init mask layers
+        layer_ids = torch.arange(self.num_code_layers)
+        step_ids = torch.arange(self.num_code_layers + 1) - 1  # [-1, 0, ..., num_code_layers-1]
+        self.register_buffer(
+            "_code_layer_masks",
+            step_ids.unsqueeze(-1) >= layer_ids.unsqueeze(0),  # [num_code_layers+1, num_code_layers]
+            persistent=False,
+        )
 
         self.layers = nn.ModuleList(
             [
@@ -560,22 +566,25 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         if hidden_states.numel() == 0:
             return {}
 
+        request_id = kwargs.get("request_id")
+        is_prefill = bool(kwargs.get("_omni_is_prefill", False))
         update: dict[str, Any] = {"hidden_states": {"last": hidden_states[-1:].detach()}}
-        if bool(kwargs.get("_omni_is_prefill", False)):
+        if is_prefill:
             return update
 
         codes = kwargs.get("codes", {}) if isinstance(kwargs, dict) else {}
+        audio_raw = codes.get("audio") if isinstance(codes, dict) else None
         current = self._normalise_audio_code_rows(
-            codes.get("audio") if isinstance(codes, dict) else None,
+            audio_raw,
         )
         if current is None:
             return update
 
+        history_raw = codes.get("history") if isinstance(codes, dict) else None
         history = self._normalise_audio_code_rows(
-            codes.get("history") if isinstance(codes, dict) else None,
+            history_raw,
             device=current.device,
         )
-        request_id = kwargs.get("request_id")
         rows = current if history is None else torch.cat((history, current), dim=0)
         if isinstance(request_id, str) and current[-1, -1].item() == self.audio_stop_token:
             self._stop_pending_by_req[request_id] = True
@@ -600,12 +609,14 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
                 codes = info.get("codes", {})
                 if not isinstance(codes, dict):
                     continue
-                current = self._normalise_audio_code_rows(codes.get("audio"))
+                audio_raw = codes.get("audio")
+                history_raw = codes.get("history")
+                current = self._normalise_audio_code_rows(audio_raw)
                 if current is None:
                     continue
                 meta = info.get("meta", {})
                 emitted = int(meta.get("emitted_audio_frames", 0)) if isinstance(meta, dict) else 0
-                frames = self._ready_diagonal_audio_frames(codes.get("history"), current, emitted)
+                frames = self._ready_diagonal_audio_frames(history_raw, current, emitted)
                 if frames is not None and frames.numel() > 0:
                     audio_codes_list.append(frames)
         if not audio_codes_list:

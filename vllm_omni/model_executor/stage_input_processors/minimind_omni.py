@@ -158,20 +158,30 @@ def talker2code2wav(
     code2wav_inputs: list[OmniTokensPrompt] = []
 
     for talker_output in source_outputs:
+        request_id = getattr(talker_output, "request_id", None)
         output = talker_output.outputs[0]
         mm: OmniPayload = getattr(output, "multimodal_output", None) or {}
         codes = mm.get("codes", {}) if isinstance(mm, dict) else {}
         audio_codes = codes.get("audio") if isinstance(codes, dict) else None
-        if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
-            continue
+        if not isinstance(audio_codes, torch.Tensor):
+            raise TypeError(
+                "MiniMind talker2code2wav expected multimodal_output['codes']['audio'] "
+                f"to be a tensor for request {request_id!r}, got {type(audio_codes).__name__}."
+            )
+        if audio_codes.numel() == 0:
+            raise ValueError(f"MiniMind talker2code2wav received empty audio codes for request {request_id!r}.")
         audio_codes = audio_codes.to(torch.long)
         if audio_codes.ndim != 2:
             raise ValueError(
-                f"MiniMind talker audio codes must have shape [frames, codebooks], got {tuple(audio_codes.shape)}"
+                "MiniMind talker audio codes must have shape [frames, codebooks], "
+                f"got {tuple(audio_codes.shape)} for request {request_id!r}."
             )
         num_code_layers = int(audio_codes.shape[-1])
         if num_code_layers <= 0:
-            continue
+            raise ValueError(
+                "MiniMind talker audio codes must contain at least one codebook layer, "
+                f"got {num_code_layers} for request {request_id!r}."
+            )
 
         # Mimi expects codebook-major [codebooks, frames] flattened for Code2Wav.
         codec_codes = audio_codes.transpose(0, 1).cpu().contiguous().reshape(-1).tolist()

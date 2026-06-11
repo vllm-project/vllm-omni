@@ -10,7 +10,7 @@ stages:
     max_num_batched_tokens: 4096
     max_num_seqs: 1
     gpu_memory_utilization: 0.35
-    enforce_eager: true
+    enforce_eager: false
     devices: "0"
     default_sampling_params:
       temperature: 0.0
@@ -23,7 +23,7 @@ stages:
     max_num_batched_tokens: 4096
     max_num_seqs: 1
     gpu_memory_utilization: 0.35
-    enforce_eager: true
+    enforce_eager: false
     devices: "0"
     default_sampling_params:
       temperature: 0.2
@@ -36,7 +36,7 @@ stages:
     max_num_batched_tokens: 32768
     max_num_seqs: 1
     gpu_memory_utilization: 0.15
-    enforce_eager: true
+    enforce_eager: false
     async_scheduling: false
     devices: "0"
     default_sampling_params:
