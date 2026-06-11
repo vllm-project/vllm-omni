@@ -29,15 +29,23 @@ _KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {"lora
 
 def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey | None:
     """Build a batch-compatibility key from the request's sampling params."""
-    if len(request.prompts) != 1:
-        return None
-
     sampling = request.sampling_params
     lora_request = getattr(sampling, "lora_request", None)
     return SamplingParamsKey(
         lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
         **{name: getattr(sampling, name) for name in _KEY_FIELD_NAMES},
     )
+
+
+def get_request_sample_count(request: OmniDiffusionRequest) -> int:
+    """Return the number of latent rows a request contributes to a step batch."""
+    prompt_count = max(1, len(request.prompts))
+    num_outputs = getattr(request.sampling_params, "num_outputs_per_prompt", 1)
+    try:
+        num_outputs = max(1, int(num_outputs))
+    except (TypeError, ValueError):
+        num_outputs = 1
+    return prompt_count * num_outputs
 
 
 class _BaseScheduler(SchedulerInterface):
@@ -91,13 +99,15 @@ class _BaseScheduler(SchedulerInterface):
                 scheduled_cached_request_ids.append(request_id)
 
         # Second, schedule WAITING requests while capacity remains.
-        while self._waiting and len(self._running) < self.max_num_running_reqs:
+        while self._waiting and self._has_running_capacity():
             request_id = self._waiting[0]
             state = self._request_states.get(request_id)
             if state is None:
                 self._waiting.popleft()
                 continue
             if not self._can_schedule_waiting(state):
+                break
+            if not self._has_capacity_for(state):
                 break
 
             self._waiting.popleft()
@@ -231,6 +241,7 @@ class _BaseScheduler(SchedulerInterface):
             request_id=request_id,
             req=request,
             sampling_params_key=get_sampling_params_key(request),
+            sample_count=get_request_sample_count(request),
         )
 
     def _can_schedule_waiting(self, state: DiffusionRequestState) -> bool:
@@ -239,6 +250,22 @@ class _BaseScheduler(SchedulerInterface):
 
         current_key = self._current_sampling_params_key()
         return current_key is not None and current_key == state.sampling_params_key
+
+    def _running_sample_count(self) -> int:
+        total = 0
+        for request_id in self._running:
+            state = self._request_states.get(request_id)
+            if state is not None and not state.is_finished():
+                total += max(1, int(state.sample_count))
+        return total
+
+    def _has_running_capacity(self) -> bool:
+        return not self._running or self._running_sample_count() < self.max_num_running_reqs
+
+    def _has_capacity_for(self, state: DiffusionRequestState) -> bool:
+        if not self._running:
+            return True
+        return self._running_sample_count() + max(1, int(state.sample_count)) <= self.max_num_running_reqs
 
     def _current_sampling_params_key(self) -> SamplingParamsKey | None:
         if self._running_sampling_params_key is not None or not self._running:

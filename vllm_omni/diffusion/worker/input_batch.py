@@ -470,6 +470,34 @@ def _prepare_image_latents(
     )
 
 
+def _state_num_rows(state: DiffusionRequestState) -> int:
+    latents = _require_state_latents(state, for_field="row metadata")
+    return int(latents.shape[0])
+
+
+def _expand_state_metadata_rows(
+    state: DiffusionRequestState,
+    values: Sequence,
+    *,
+    attr_name: str,
+) -> list:
+    rows = _state_num_rows(state)
+    if len(values) == 0:
+        if attr_name == "img_shapes":
+            return [[]] * rows
+        raise ValueError(f"{attr_name} for request {state.request_id} is empty.")
+    if len(values) == rows:
+        return list(values)
+    if len(values) == 1:
+        return [values[0]] * rows
+    if rows % len(values) == 0:
+        repeat = rows // len(values)
+        return [value for value in values for _ in range(repeat)]
+    raise ValueError(
+        f"{attr_name} for request {state.request_id} has {len(values)} entries but request contributes {rows} rows."
+    )
+
+
 def _prepare_seq_lens(
     states: Sequence[DiffusionRequestState],
     attr_name: str,
@@ -479,7 +507,19 @@ def _prepare_seq_lens(
         return None
     if any(value is None for value in values):
         raise ValueError(f"Mixed {attr_name} in batch.")
-    return [int(value[0]) for value in values if value is not None]
+
+    seq_lens: list[int] = []
+    for state, value in zip(states, values, strict=True):
+        assert value is not None
+        seq_lens.extend(
+            int(item)
+            for item in _expand_state_metadata_rows(
+                state,
+                value,
+                attr_name=attr_name,
+            )
+        )
+    return seq_lens
 
 
 def _prepare_img_shapes(states: Sequence[DiffusionRequestState]) -> list | None:
@@ -488,7 +528,18 @@ def _prepare_img_shapes(states: Sequence[DiffusionRequestState]) -> list | None:
         return None
     if any(value is None for value in values):
         raise ValueError("Mixed img_shapes in batch.")
-    return [value[0] if value else [] for value in values if value is not None]
+
+    img_shapes: list = []
+    for state, value in zip(states, values, strict=True):
+        assert value is not None
+        img_shapes.extend(
+            _expand_state_metadata_rows(
+                state,
+                value,
+                attr_name="img_shapes",
+            )
+        )
+    return img_shapes
 
 
 def _prepare_prompt_embeds(

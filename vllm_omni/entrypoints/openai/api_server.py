@@ -152,6 +152,101 @@ MAX_UINT32_SEED = 2**32 - 1
 profiler_router = APIRouter()
 
 
+def _normalize_image_generation_prompts(prompt: str | list[str]) -> list[str]:
+    if isinstance(prompt, str):
+        return [prompt]
+    if not prompt:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="prompt list must contain at least one item.",
+        )
+    return prompt
+
+
+def _normalize_image_generation_negative_prompts(
+    negative_prompt: str | list[str] | None,
+    *,
+    prompt_count: int,
+) -> list[str | None]:
+    if negative_prompt is None:
+        return [None] * prompt_count
+    if isinstance(negative_prompt, str):
+        return [negative_prompt] * prompt_count
+    if len(negative_prompt) != prompt_count:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(
+                f"negative_prompt list length must match prompt list length ({len(negative_prompt)} != {prompt_count})."
+            ),
+        )
+    return list(negative_prompt)
+
+
+def _normalize_image_generation_seed(
+    seed: int | list[int] | None,
+    *,
+    prompt_count: int,
+    num_outputs_per_prompt: int,
+) -> int | tuple[int, ...] | None:
+    if seed is None:
+        return seed
+
+    sample_count = prompt_count * num_outputs_per_prompt
+    if isinstance(seed, int):
+        if prompt_count == 1:
+            return seed
+        return tuple(seed for _ in range(sample_count))
+
+    if not seed:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="seed list must contain at least one item.",
+        )
+
+    if len(seed) == prompt_count:
+        return tuple(item for item in seed for _ in range(num_outputs_per_prompt))
+    if len(seed) == sample_count:
+        return tuple(seed)
+
+    raise HTTPException(
+        status_code=HTTPStatus.BAD_REQUEST.value,
+        detail=(
+            "seed list length must match prompt list length "
+            f"or total sample count ({len(seed)} != {prompt_count} or {sample_count})."
+        ),
+    )
+
+
+def _build_image_generation_prompt_payload(
+    request: ImageGenerationRequest,
+    *,
+    width: int | None,
+    height: int | None,
+) -> OmniTextPrompt | list[OmniTextPrompt]:
+    prompt_texts = _normalize_image_generation_prompts(request.prompt)
+    negative_prompts = _normalize_image_generation_negative_prompts(
+        request.negative_prompt,
+        prompt_count=len(prompt_texts),
+    )
+
+    prompts: list[OmniTextPrompt] = []
+    for prompt_text, negative_prompt in zip(prompt_texts, negative_prompts, strict=True):
+        prompt: OmniTextPrompt = {"prompt": prompt_text}
+        if negative_prompt is not None:
+            prompt["negative_prompt"] = negative_prompt
+        if width is not None and height is not None:
+            prompt["mm_processor_kwargs"] = {
+                "target_h": height,
+                "target_w": width,
+            }
+            # Backward-compatible fallback for processors reading top-level fields.
+            prompt["height"] = height
+            prompt["width"] = width
+        prompts.append(prompt)
+
+    return prompts[0] if len(prompts) == 1 else prompts
+
+
 def _load_model_chat_template_json(model: str) -> str | None:
     """Load a model-level chat_template.json from a local path or HF cache.
 
@@ -1644,6 +1739,16 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # Unify request construction for any multi-stage pipeline to avoid
         # divergence between /v1/images and /v1/chat/completions.
         if len(stage_configs) > 1:
+            if isinstance(request.prompt, list):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="Batched image prompts are only supported for single-stage diffusion pipelines.",
+                )
+            if isinstance(request.seed, list):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="Batched image seeds are only supported for single-stage diffusion pipelines.",
+                )
             chat_handler = getattr(raw_request.app.state, "openai_serving_chat", None)
             if chat_handler is None:
                 logger.warning("openai_serving_chat is not initialized for multi-stage /v1/images/generations")
@@ -1664,7 +1769,11 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 _check_max_generated_image_size(app_state_args, width, height)
                 extra_body["size"] = request.size
             if request.negative_prompt is not None:
-                extra_body["negative_prompt"] = request.negative_prompt
+                negative_prompts = _normalize_image_generation_negative_prompts(
+                    request.negative_prompt,
+                    prompt_count=1,
+                )
+                extra_body["negative_prompt"] = negative_prompts[0]
             if request.num_inference_steps is not None:
                 extra_body["num_inference_steps"] = request.num_inference_steps
             if request.guidance_scale is not None:
@@ -1705,10 +1814,6 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
             return ImageGenerationResponse(created=int(time.time()), data=image_data)
 
-        # Build params - pass through user values directly
-        prompt: OmniTextPrompt = {"prompt": request.prompt, "modalities": ["image"]}
-        if request.negative_prompt is not None:
-            prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
         extra_args = dict(request.extra_params or {})
         if request.use_system_prompt is not None:
@@ -1734,18 +1839,15 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         else:
             size_str = "model default"
 
-        # Keep AR stage target grid in sync with requested output size.
-        # GLM-Image consumes target_h/target_w via mm_processor_kwargs.
-        if width is not None and height is not None:
-            prompt["mm_processor_kwargs"] = {
-                "target_h": height,
-                "target_w": width,
-            }
-            # Backward-compatible fallback for processors reading top-level fields.
-            prompt["height"] = height
-            prompt["width"] = width
         app_state_args = getattr(raw_request.app.state, "args", None)
         _check_max_generated_image_size(app_state_args, width, height)
+        prompt = _build_image_generation_prompt_payload(request, width=width, height=height)
+        prompt_count = len(prompt) if isinstance(prompt, list) else 1
+        effective_seed = _normalize_image_generation_seed(
+            request.seed,
+            prompt_count=prompt_count,
+            num_outputs_per_prompt=request.n,
+        )
 
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
@@ -1759,7 +1861,9 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
         _update_if_not_none(
-            gen_params, "seed", request.seed if request.seed is not None else random.randint(0, MAX_UINT32_SEED)
+            gen_params,
+            "seed",
+            effective_seed if effective_seed is not None else random.randint(0, MAX_UINT32_SEED),
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
         _update_if_not_none(gen_params, "layers", request.layers)
@@ -1767,9 +1871,14 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         request_id = f"img_gen-{random_uuid()}"
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
 
-        logger.debug(f"Generating {request.n} image(s) {size_str}")
+        logger.debug(
+            "Generating %d image(s) from %d prompt(s) %s",
+            prompt_count * request.n,
+            prompt_count,
+            size_str,
+        )
 
-        # Generate images using AsyncOmni (multi-stage mode)
+        # Generate images using AsyncOmni.
         result = await _generate_with_async_omni(
             engine_client=engine_client,
             gen_params=gen_params,

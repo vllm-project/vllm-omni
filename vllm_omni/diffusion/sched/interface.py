@@ -73,6 +73,7 @@ class DiffusionRequestState:
     request_id: str
     req: OmniDiffusionRequest
     sampling_params_key: SamplingParamsKey | None = None
+    sample_count: int = 1
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
 

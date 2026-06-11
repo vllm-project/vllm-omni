@@ -186,7 +186,8 @@ def mock_async_diffusion(mocker: MockerFixture):
             n = kwargs["sampling_params_list"][0].num_outputs_per_prompt
             self.captured_sampling_params_list = kwargs["sampling_params_list"]
             self.captured_prompt = kwargs["prompt"]
-            images = [Image.new("RGB", (64, 64), color="blue") for _ in range(n)]
+            prompt_count = len(kwargs["prompt"]) if isinstance(kwargs["prompt"], list) else 1
+            images = [Image.new("RGB", (64, 64), color="blue") for _ in range(prompt_count * n)]
             yield MockGenerationResult(images)
 
     return MockAsyncDiffusion()
@@ -585,6 +586,85 @@ def test_generate_single_image(test_client):
     img = Image.open(io.BytesIO(img_bytes))
     assert img.size == (64, 64)  # Our mock returns 64x64 images
     assert test_client.app.state.engine_client.captured_prompt["modalities"] == ["image"]
+
+
+def test_generate_images_batch_prompts_single_stage(test_client):
+    """Single-stage diffusion accepts a list of prompts as one batched request."""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": ["a cat", "a dog"],
+            "negative_prompt": ["blurry", "low quality"],
+            "seed": [200, 201],
+            "n": 2,
+            "size": "512x512",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["data"]) == 4
+
+    engine = test_client.app.state.engine_client
+    assert isinstance(engine.captured_prompt, list)
+    assert engine.captured_prompt == [
+        {
+            "prompt": "a cat",
+            "negative_prompt": "blurry",
+            "mm_processor_kwargs": {"target_h": 512, "target_w": 512},
+            "height": 512,
+            "width": 512,
+        },
+        {
+            "prompt": "a dog",
+            "negative_prompt": "low quality",
+            "mm_processor_kwargs": {"target_h": 512, "target_w": 512},
+            "height": 512,
+            "width": 512,
+        },
+    ]
+    assert engine.captured_sampling_params_list[0].num_outputs_per_prompt == 2
+    assert engine.captured_sampling_params_list[0].height == 512
+    assert engine.captured_sampling_params_list[0].width == 512
+    assert engine.captured_sampling_params_list[0].seed == (200, 200, 201, 201)
+
+
+def test_generate_images_batch_prompts_rejects_mismatched_negative_prompt(test_client):
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": ["a cat", "a dog"],
+            "negative_prompt": ["blurry"],
+        },
+    )
+    assert response.status_code == 400
+    assert "negative_prompt list length" in response.json()["detail"]
+
+
+def test_generate_images_batch_prompts_broadcasts_int_seed(test_client):
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": ["a cat", "a dog"],
+            "seed": 200,
+        },
+    )
+    assert response.status_code == 200
+
+    engine = test_client.app.state.engine_client
+    assert engine.captured_sampling_params_list[0].seed == (200, 200)
+
+
+def test_generate_images_batch_prompts_rejects_mismatched_seed(test_client):
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": ["a cat", "a dog"],
+            "seed": [200, 201, 202],
+            "n": 2,
+        },
+    )
+    assert response.status_code == 400
+    assert "seed list length" in response.json()["detail"]
 
 
 def test_generate_images_async_omni_sampling_params(async_omni_test_client):

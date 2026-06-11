@@ -31,7 +31,7 @@ class ImageGenerationRequest(BaseModel):
     """
 
     # Required fields
-    prompt: str = Field(..., description="Text description of the desired image(s)")
+    prompt: str | list[str] = Field(..., description="Text description(s) of the desired image(s)")
     bot_task: str | None = Field(
         None,
         description="Task mode for the model (e.g., 'cot' enables chain-of-thought generation). "
@@ -85,7 +85,13 @@ class ImageGenerationRequest(BaseModel):
         return validate_layered_layers(v)
 
     # vllm-omni extensions for diffusion control
-    negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the image")
+    negative_prompt: str | list[str] | None = Field(
+        default=None,
+        description=(
+            "Text describing what to avoid in the image. When prompt is a list, "
+            "a string is shared by all prompts and a list is matched item-by-item."
+        ),
+    )
     system_prompt: str | None = Field(
         default=None, description="Custom system prompt. Used when --use_system_prompt is custom"
     )
@@ -122,6 +128,13 @@ class ImageGenerationRequest(BaseModel):
         le=20.0,
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
+    seed: int | list[int] | None = Field(
+        default=None,
+        description=(
+            "Random seed for reproducibility. When prompt is a list, an integer is broadcast "
+            "to each prompt and a list is matched item-by-item."
+        ),
+    )
     flow_shift: float | None = Field(
         default=None, description="Scheduler flow_shift (sigma shift) for flow-matching diffusion models."
     )
@@ -129,7 +142,6 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Optional model-specific parameters passed directly to the model's extra_args.",
     )
-    seed: int | None = Field(default=None, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,
         description="Device for the seeded torch.Generator (e.g. 'cpu', 'cuda'). Defaults to the runner's device.",

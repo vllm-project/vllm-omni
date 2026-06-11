@@ -64,9 +64,10 @@ def _make_step_request(
     num_inference_steps: int = 4,
     step_index: int | None = None,
     sampling_params: OmniDiffusionSamplingParams | None = None,
+    prompts: list[str] | None = None,
 ) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
-        prompts=[f"prompt_{req_id}"],
+        prompts=prompts if prompts is not None else [f"prompt_{req_id}"],
         sampling_params=sampling_params
         or OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
@@ -193,6 +194,29 @@ class TestGetSamplingParamsKey:
         a = get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
         b = get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
         assert a == b
+
+    def test_multi_prompt_request_keeps_sampling_key(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        single = self._make(lora_int_id=None)
+        multi = OmniDiffusionRequest(
+            prompts=["prompt-a", "prompt-b"],
+            sampling_params=single.sampling_params,
+            request_id="req-multi",
+        )
+
+        assert get_sampling_params_key(multi) == get_sampling_params_key(single)
+
+    def test_sample_count_includes_prompts_and_outputs(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_request_sample_count
+
+        req = OmniDiffusionRequest(
+            prompts=["prompt-a", "prompt-b"],
+            sampling_params=OmniDiffusionSamplingParams(num_outputs_per_prompt=3),
+            request_id="req-samples",
+        )
+
+        assert get_request_sample_count(req) == 6
 
 
 class TestRequestScheduler:
@@ -733,6 +757,67 @@ class TestStepScheduler:
 
         assert _new_ids(sched_output) == [req_a, req_b]
         assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 0
+
+    def test_step_batch_counts_multi_prompt_request_as_samples(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+
+        req_multi = scheduler.add_request(
+            _make_step_request(
+                "multi",
+                prompts=["prompt_multi_a", "prompt_multi_b"],
+            )
+        )
+        req_single = scheduler.add_request(_make_step_request("single"))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_multi, req_single]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 0
+        assert scheduler.get_request_state(req_multi).sample_count == 2
+        assert scheduler.get_request_state(req_single).sample_count == 1
+
+    def test_step_batch_respects_sample_capacity_for_multi_prompt_requests(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+
+        req_a = scheduler.add_request(
+            _make_step_request(
+                "a",
+                prompts=["prompt_a0", "prompt_a1"],
+            )
+        )
+        req_b = scheduler.add_request(
+            _make_step_request(
+                "b",
+                prompts=["prompt_b0", "prompt_b1"],
+            )
+        )
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_a]
+        assert req_b not in _new_ids(sched_output)
+        assert sched_output.num_running_reqs == 1
+        assert sched_output.num_waiting_reqs == 1
+
+    def test_over_capacity_multi_prompt_request_can_run_alone(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+
+        req_id = scheduler.add_request(
+            _make_step_request(
+                "oversized",
+                prompts=["prompt_0", "prompt_1"],
+            )
+        )
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_id]
+        assert sched_output.num_running_reqs == 1
         assert sched_output.num_waiting_reqs == 0
 
     def test_step_batch_allows_different_num_inference_steps(self) -> None:

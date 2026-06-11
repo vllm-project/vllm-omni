@@ -83,6 +83,25 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
+    def _seeded_generator_device(self, sampling_params) -> torch.device | str:
+        if sampling_params.generator_device is not None:
+            return sampling_params.generator_device
+        if self.device.type == "cpu":
+            return "cpu"
+        return self.device
+
+    def _set_seeded_generator(self, sampling_params) -> None:
+        if sampling_params.generator is not None or sampling_params.seed is None:
+            return
+
+        gen_device = self._seeded_generator_device(sampling_params)
+        seed = sampling_params.seed
+        if isinstance(seed, (list, tuple)):
+            sampling_params.generator = [torch.Generator(device=gen_device).manual_seed(int(item)) for item in seed]
+            return
+
+        sampling_params.generator = torch.Generator(device=gen_device).manual_seed(seed)
+
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
         model = getattr(self.pipeline, attr_name, None)
@@ -281,14 +300,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 target_device=getattr(self.pipeline, "device", None),
             )
 
-            if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-                if req.sampling_params.generator_device is not None:
-                    gen_device = req.sampling_params.generator_device
-                elif self.device.type == "cpu":
-                    gen_device = "cpu"
-                else:
-                    gen_device = self.device
-                req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
+            self._set_seeded_generator(req.sampling_params)
 
             # Refresh cache context if needed
             if (
@@ -395,14 +407,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         for state in states:
             if state.request_id in new_request_ids:
                 # set generator
-                if state.sampling.generator is None and state.sampling.seed is not None:
-                    if state.sampling.generator_device is not None:
-                        gen_device = state.sampling.generator_device
-                    elif self.device.type == "cpu":
-                        gen_device = "cpu"
-                    else:
-                        gen_device = self.device
-                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+                self._set_seeded_generator(state.sampling)
                 # encode
                 self.pipeline.prepare_encode(state)
 

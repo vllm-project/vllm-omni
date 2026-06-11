@@ -66,6 +66,21 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     return runner
 
 
+@pytest.mark.cpu
+def test_set_seeded_generator_accepts_seed_sequence():
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    sampling_params = SimpleNamespace(
+        generator=None,
+        seed=(200, 201),
+        generator_device="cpu",
+    )
+
+    DiffusionModelRunner._set_seeded_generator(runner, sampling_params)
+
+    assert isinstance(sampling_params.generator, list)
+    assert [generator.initial_seed() for generator in sampling_params.generator] == [200, 201]
+
+
 @pytest.mark.core_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypatch):

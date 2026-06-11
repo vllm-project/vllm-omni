@@ -88,8 +88,11 @@ key also covers LoRA identity (`lora_int_id`, `lora_scale`), so requests
 targeting different adapters or scales run in separate batches and the
 worker can activate exactly one adapter per step.
 
-The current batching unit is one `OmniDiffusionRequest`. Requests with
-multiple prompts do not participate in batching today.
+The scheduler admits whole `OmniDiffusionRequest` objects, but capacity is
+accounted in sample rows: `len(prompts) * num_outputs_per_prompt`. This lets a
+single request containing multiple prompts participate in the same step-wise
+batching path as separate single-prompt requests, while still respecting
+`max_num_seqs` as the maximum active sample count.
 
 ## Runner
 
@@ -136,7 +139,9 @@ batch packing.
 - Only native pipelines that already support `step_execution=True`.
 - Request-mode diffusion still clamps `max_num_seqs` back to `1`.
 - Only homogeneous batches keyed by `SamplingParamsKey` are supported.
-- Multi-prompt requests are not batched.
+- Multi-prompt requests are admitted as whole requests and counted by sample
+  rows; the scheduler does not split one multi-prompt request across separate
+  batches.
 - `cache_backend`, KV transfer, and other request-mode extras are not wired
   into the batched step-wise path yet.
 - Future work can relax the current same-shape restriction with richer

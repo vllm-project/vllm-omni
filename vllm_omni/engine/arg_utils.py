@@ -182,6 +182,7 @@ class OmniEngineArgs(EngineArgs):
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
+    step_execution: bool = False
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:
@@ -488,6 +489,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "stage_configs_path",  # orch: load legacy YAML; engine: may reference for validation
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
+        "step_execution",  # orch: CLI/deploy routing; engine: diffusion scheduler mode
     }
 )
 
