@@ -14,6 +14,7 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 0
+      decode_cudagraph_capture_sizes: [4, 8, 16, 25, 32, 50, 64, 100, 128, 200, 256]
 
 stages:
   - stage_id: 0
@@ -38,7 +39,7 @@ stages:
   - stage_id: 1
     max_num_seqs: 1
     gpu_memory_utilization: 0.12
-    enforce_eager: true
+    enforce_eager: false
     enable_prefix_caching: false
     async_scheduling: true
     # Talker can emit up to max_tokens=4096 frames × n_vq=32 = 131072 codec
