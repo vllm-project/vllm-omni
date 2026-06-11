@@ -408,7 +408,10 @@ def create_app(api_base: str):
                 await resp.aclose()
                 await client.aclose()
 
-        return StreamingResponse(relay(), media_type="application/octet-stream")
+        # Use audio/pcm to bypass browerss (e.g. Chromium) MIME type sniffing, which
+        # buffers application/octet-stream responses before delivering to fetch().body.getReader()
+        # inflating TTFP to total_ms.
+        return StreamingResponse(relay(), media_type="audio/pcm")
 
     # ── Gradio UI ────────────────────────────────────────────────
     voices = fetch_voices(api_base)
