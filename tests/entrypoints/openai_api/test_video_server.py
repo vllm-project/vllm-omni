@@ -86,8 +86,10 @@ class BlockingVideoHandler:
         if self.stage_configs is None:
             self.stage_configs = stage_configs
 
-    async def generate_video_bytes(self, request, reference_id, *, reference_image=None, reference_video=None):
-        del request, reference_id, reference_image, reference_video
+    async def generate_video_bytes(
+        self, request, reference_id, *, reference_image=None, reference_video=None, reference_audio=None
+    ):
+        del request, reference_id, reference_image, reference_video, reference_audio
         self.started.set()
         try:
             await asyncio.Future()
@@ -455,6 +457,41 @@ def test_cosmos3_reference_video_limit_caps_condition_frames_to_output_frames():
     )
 
     assert api_server._reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 5
+
+
+def test_s2v_video_generation_with_audio_reference_form(test_client, mocker: MockerFixture):
+    """Speech-to-video: image + audio_reference (base64 data URL) passes audio path to multi_modal_data."""
+    audio_bytes = b"\xff\xfb\x90\x00" * 50
+    audio_b64 = base64.b64encode(audio_bytes).decode()
+    audio_ref = json.dumps({"audio_url": f"data:audio/mp3;base64,{audio_b64}"})
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A person singing",
+            "audio_reference": audio_ref,
+            "width": "832",
+            "height": "480",
+        },
+        files={"input_reference": ("face.png", _make_test_image_bytes((64, 64)), "image/png")},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    prompt = engine.captured_prompt
+    assert "multi_modal_data" in prompt
+    assert "image" in prompt["multi_modal_data"]
+    assert "audio" in prompt["multi_modal_data"]
+    audio_path = prompt["multi_modal_data"]["audio"]
+    assert isinstance(audio_path, str)
+    assert audio_path.endswith(".mp3")
 
 
 def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):
