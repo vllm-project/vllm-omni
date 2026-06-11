@@ -17,7 +17,7 @@ checkpoint instead of the original `Qwen/Qwen-Image`. `Qwen-Image-2512` is a
 drop-in updated checkpoint that runs on the **same** `QwenImagePipeline`, so the
 serving path, flags, and clients are identical to
 [`Qwen-Image.md`](./Qwen-Image.md) — only the model id changes. Pick this recipe
-to validate the normal online-serving path on a single 80 GB A100, or to run the
+to validate the normal online-serving path on a single 80 GB A800, or to run the
 validated 2-GPU ModelOpt mixed FP8/NVFP4 quantized variant on B200.
 
 ## Difference from Qwen-Image
@@ -51,21 +51,24 @@ The only change is the **model id**: swap `Qwen/Qwen-Image` for
 
 ## Hardware Support
 
-This recipe documents a single-GPU BF16 serving configuration and a validated
-2-GPU ModelOpt mixed FP8/NVFP4 configuration. Extend it with more hardware
-sections as community validation lands.
+This recipe documents a single-GPU BF16 serving configuration on A800 and a
+validated 2-GPU ModelOpt mixed FP8/NVFP4 configuration on B200. Extend it with
+more hardware sections as community validation lands.
 
 ## GPU
 
-### 1x A100 80GB
+### 1x A800-SXM4-80GB
 
 #### Environment
 
 - OS: Linux
-- Python: 3.10+
-- Driver / runtime: NVIDIA CUDA environment with an A100 80 GB GPU
-- vLLM version: Match the repository requirements for your checkout
-- vLLM-Omni version or commit: Use the commit you are deploying from
+- Python: 3.12.13
+- PyTorch: 2.11.0+cu130
+- CUDA runtime: 13.0 (driver 580.126.09)
+- GPU: NVIDIA A800-SXM4-80GB (81920 MiB)
+- vLLM: 0.22.0
+- Transformers: 5.8.1
+- vLLM-Omni: v0.22.0rc1-70-ge91efc24
 
 #### Command
 
@@ -150,9 +153,28 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
 Run that once against `--max-num-seqs 1`, then rerun it against `--max-num-seqs 8`
 and compare the output JSON or terminal metrics.
 
+#### Benchmark
+
+The numbers below are loaded-once request-level measurements, not an HTTP
+concurrency benchmark. The model is loaded once, warmup requests are run,
+then 100 sequential requests are measured.
+
+```text
+Hardware: 1x A800-SXM4-80GB
+Requests: 100
+Concurrency: 1
+Resolution: 1024x1024
+Denoising steps: 20
+```
+
+| Config | Mean | P95 | P99 | Peak VRAM |
+| --- | ---: | ---: | ---: | ---: |
+| BF16 | 7.669s | 7.736s | 7.748s | 58,979 MiB |
+
 #### Notes
 
-- Memory usage: keep headroom for first-request compile and image decode overhead.
+- Memory usage: BF16 peak VRAM ~59 GiB on A800, leaving ~22 GiB headroom for
+  compile overhead and image decode.
 - Key flags: `--step-execution` enables the step-wise runtime; `--max-num-seqs`
   controls how many compatible requests may stay active together.
 - Keep `--max-num-seqs 1` when you want the more conservative path, when traffic
@@ -222,8 +244,8 @@ Check that:
 
 - The server responds on `http://localhost:8091/health`.
 - The response contains one generated image.
-- Logs show CUTLASS selection for ModelOpt FP8 / mixed-precision linear layers
-  instead of falling back to the default automatic backend choice.
+- Logs show CUTLASS selection for ModelOpt FP8 / mixed-precision linear
+  layers instead of falling back to the default automatic backend choice.
 
 #### Benchmark
 
@@ -262,7 +284,6 @@ CUTLASS was the fastest validated backend for this checkpoint.
 - Use `--linear-backend cutlass` to select the validated quantized linear
   backend from the CLI.
 - `--force-cutlass-fp8` keeps ModelOpt FP8 layers on the CUTLASS FP8 path.
-- The benchmark table intentionally reports concurrency-1 request-level data; do
-  not compare it directly with an online HTTP concurrency benchmark.
-- The single-GPU BF16 section has no validated benchmark numbers yet; the
-  numbers in this table are for the quantized 2-GPU configuration only.
+- The benchmark table intentionally reports Qwen-Image-2512 as
+  concurrency-1 request-level data; do not compare it directly with an online
+  HTTP concurrency benchmark.
