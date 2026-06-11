@@ -29,6 +29,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         self.stage_id = config.get("stage_id", -1)
         self.device = config.get("device", "cuda:0")
         self.threshold = int(config.get("shm_threshold_bytes", 65536))
+        self.inline_small_payloads = bool(config.get("inline_small_payloads", False))
         self._pending_keys: set[str] = set()
         self._metrics = {
             "puts": 0,
@@ -53,9 +54,11 @@ class SharedMemoryConnector(OmniConnectorBase):
             payload = self.serialize_obj(data)
             size = len(payload)
 
-            # Currently, we always use SHM.
-            if True:
-                # Use Shared Memory
+            # The legacy async-chunk adapter transfers only the connector key
+            # across stages; it cannot deliver inline metadata to the receiver.
+            # Keep key-addressed SHM as the default and only inline payloads
+            # when the caller explicitly enables the metadata-aware path.
+            if size >= self.threshold or not self.inline_small_payloads:
                 lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
                 with open(lock_file, "wb+") as lockf:
                     fcntl.flock(lockf, fcntl.LOCK_EX)
@@ -67,9 +70,8 @@ class SharedMemoryConnector(OmniConnectorBase):
                 self._pending_keys.add(put_key)
                 self._metrics["shm_writes"] += 1
             else:
-                # Inline - pass bytes directly to avoid double serialization of the object
-                # We already serialized it to check size, so we pass the bytes.
-                # The Queue will pickle these bytes (fast), avoiding re-serializing the complex object.
+                # Inline small payloads to avoid the mmap + file-lock overhead
+                # that dominates codec chunk transfers.
                 metadata = {"inline_bytes": payload, "size": size}
                 self._metrics["inline_writes"] += 1
 

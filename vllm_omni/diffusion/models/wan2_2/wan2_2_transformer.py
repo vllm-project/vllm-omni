@@ -69,8 +69,7 @@ class DistributedRMSNorm(nn.Module):
         local_count = x.shape[-1]
 
         if tp_size > 1:
-            global_sum_sq = local_sum_sq.clone()
-            tensor_model_parallel_all_reduce(global_sum_sq)
+            global_sum_sq = tensor_model_parallel_all_reduce(local_sum_sq)
             global_count = local_count * tp_size
         else:
             global_sum_sq = local_sum_sq

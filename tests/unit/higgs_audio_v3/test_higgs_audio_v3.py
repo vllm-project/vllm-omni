@@ -6,6 +6,10 @@ AC-5 (delay pattern), AC-7 (stage processor), and AC-10 (registry)
 without requiring the actual checkpoint or GPU.
 """
 
+import asyncio
+import time
+from collections import OrderedDict
+
 import pytest
 import torch
 
@@ -232,7 +236,7 @@ class TestDelayPatternBehavior:
 
 
 class TestSamplerMethods:
-    """Test the actual _sample_audio_codes and _apply_delay_pattern_masking methods."""
+    """Test the actual sampler and batched delay masking methods."""
 
     def _make_minimal_talker(self):
         """Create a minimal talker-like object with sampler/masking methods."""
@@ -241,18 +245,65 @@ class TestSamplerMethods:
         class FakeTalker:
             num_codebooks = 8
             codebook_size = 1026
-            _audio_state = {}
 
         t = FakeTalker()
         t._sample_audio_codes = mod.HiggsAudioV3TalkerForConditionalGeneration._sample_audio_codes.__get__(t)
-        t._apply_delay_pattern_masking = (
-            mod.HiggsAudioV3TalkerForConditionalGeneration._apply_delay_pattern_masking.__get__(t)
+        return t
+
+    def _make_batched_sampler_talker(self, num_rows=4):
+        """Create a fake talker with GPU-resident sampler state helpers."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        class FakeTalker:
+            num_codebooks = 8
+            codebook_size = 1026
+
+        t = FakeTalker()
+        t._decode_last_codes = torch.arange(num_rows * t.num_codebooks, dtype=torch.long).view(
+            num_rows, t.num_codebooks
         )
+        t._decode_has_codes = torch.tensor([True, False, True, True])[:num_rows].clone()
+        t._decode_delay_count = torch.tensor([0, 2, 7, 4], dtype=torch.int32)[:num_rows].clone()
+        t._decode_eoc_countdown = torch.tensor([-1, -1, 3, 1], dtype=torch.int32)[:num_rows].clone()
+        t._decode_generation_done = torch.tensor([False, False, False, True])[:num_rows].clone()
+        t._decode_active_audio_count = 0
+        t._codebook_index_cache = {}
+        t._row_index_cache = {}
+        t._boc_frame_cache = {}
+        t._last_audio_codes_buffer = None
+        t._last_audio_host_staging = None
+        t._last_audio_gpu_staging = None
+        t._last_audio_staging_event = None
+        t._audio_staging_events = []
+        t._audio_staging_event_cursor = 0
+        t._last_audio_codes = None
+        t._last_audio_code_valid = []
+        t._postprocess_cursor = 0
+        t._postprocess_audio_rows = 0
+        t._postprocess_audio_active_rows = 0
+
+        cls = mod.HiggsAudioV3TalkerForConditionalGeneration
+        for name in (
+            "_sample_audio_codes",
+            "_ensure_decode_state_capacity",
+            "_get_row_indices",
+            "_get_codebook_indices",
+            "_get_boc_frames",
+            "_get_audio_codes_buffer",
+            "_get_audio_gpu_staging_buffer",
+            "_get_audio_host_staging_buffer",
+            "_apply_delay_pattern_masking_batched",
+            "_update_delay_state_batched",
+            "_prefill_row_mask",
+            "_audio_seed_mask_from_step_input",
+        ):
+            setattr(t, name, getattr(cls, name).__get__(t))
+        t._device_cache_key = cls._device_cache_key
         return t
 
     def test_sample_respects_mask(self):
         """Tokens masked to -inf must never be sampled."""
-        t = self._make_minimal_talker()
+        t = self._make_batched_sampler_talker(num_rows=1)
         logits = torch.full((10, 1026), float("-inf"))
         # Only token 500 is allowed for each row
         logits[:, 500] = 0.0
@@ -262,7 +313,7 @@ class TestSamplerMethods:
 
     def test_sample_all_masked_falls_back_to_argmax(self):
         """All-masked row should fall back to argmax (least-negative logit)."""
-        t = self._make_minimal_talker()
+        t = self._make_batched_sampler_talker(num_rows=1)
         logits = torch.full((2, 1026), float("-inf"))
         # Row 0: all masked
         # Row 1: only token 42 allowed
@@ -275,11 +326,13 @@ class TestSamplerMethods:
         """During delay phase, codebooks beyond delay_count must have only BOC allowed."""
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import BOC_ID
 
-        t = self._make_minimal_talker()
+        t = self._make_batched_sampler_talker(num_rows=1)
         # Simulate delay_count=2 for batch row 0
-        t._audio_state[0] = {"num_delay": 2, "num_remaining_delays": None}
+        t._ensure_decode_state_capacity(1, torch.device("cpu"))
+        t._decode_delay_count[0] = 2
+        t._decode_eoc_countdown[0] = -1
         cb_logits = torch.zeros(1, 8, 1026)  # [1 audio row, 8 codebooks, 1026 vocab]
-        t._apply_delay_pattern_masking(cb_logits, [0])
+        t._apply_delay_pattern_masking_batched(cb_logits, torch.tensor([0], dtype=torch.long))
         # CBs 3-7 should have only BOC allowed (everything else -inf)
         for q in range(3, 8):
             row = cb_logits[0, q]
@@ -292,10 +345,12 @@ class TestSamplerMethods:
         """Active codebooks during delay should have BOC disallowed."""
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import BOC_ID
 
-        t = self._make_minimal_talker()
-        t._audio_state[0] = {"num_delay": 3, "num_remaining_delays": None}
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t._ensure_decode_state_capacity(1, torch.device("cpu"))
+        t._decode_delay_count[0] = 3
+        t._decode_eoc_countdown[0] = -1
         cb_logits = torch.zeros(1, 8, 1026)
-        t._apply_delay_pattern_masking(cb_logits, [0])
+        t._apply_delay_pattern_masking_batched(cb_logits, torch.tensor([0], dtype=torch.long))
         # CBs 0-3 are active: BOC should be -inf
         for q in range(4):
             assert cb_logits[0, q, BOC_ID].item() == float("-inf")
@@ -304,10 +359,12 @@ class TestSamplerMethods:
         """Only codebook 0 should allow EOC during normal generation."""
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
 
-        t = self._make_minimal_talker()
-        t._audio_state[0] = {"num_delay": 8, "num_remaining_delays": None}
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t._ensure_decode_state_capacity(1, torch.device("cpu"))
+        t._decode_delay_count[0] = 8
+        t._decode_eoc_countdown[0] = -1
         cb_logits = torch.zeros(1, 8, 1026)
-        t._apply_delay_pattern_masking(cb_logits, [0])
+        t._apply_delay_pattern_masking_batched(cb_logits, torch.tensor([0], dtype=torch.long))
         # CB0 should keep EOC
         assert cb_logits[0, 0, EOC_ID].item() != float("-inf")
         # CB1-7 should have EOC masked
@@ -321,11 +378,13 @@ class TestSamplerMethods:
             EOC_ID,
         )
 
-        t = self._make_minimal_talker()
+        t = self._make_batched_sampler_talker(num_rows=1)
         # Ramp-down with 4 remaining delays: lock CBs 0-3 to EOC
-        t._audio_state[0] = {"num_delay": 8, "num_remaining_delays": 4}
+        t._ensure_decode_state_capacity(1, torch.device("cpu"))
+        t._decode_delay_count[0] = 8
+        t._decode_eoc_countdown[0] = 4
         cb_logits = torch.zeros(1, 8, 1026)
-        t._apply_delay_pattern_masking(cb_logits, [0])
+        t._apply_delay_pattern_masking_batched(cb_logits, torch.tensor([0], dtype=torch.long))
         # CBs 0-3 locked: only EOC allowed
         for q in range(4):
             row = cb_logits[0, q]
@@ -336,6 +395,195 @@ class TestSamplerMethods:
         for q in range(4, 8):
             assert cb_logits[0, q, BOC_ID].item() == float("-inf")
             assert cb_logits[0, q, EOC_ID].item() == float("-inf")
+
+    def test_batched_delay_masking_all_rows_matches_sparse_path(self):
+        """The all-row fast path must preserve sparse path masking semantics."""
+        torch.manual_seed(0)
+        sparse = self._make_batched_sampler_talker()
+        all_rows = self._make_batched_sampler_talker()
+        rows = torch.arange(4, dtype=torch.long)
+        logits_sparse = torch.randn(4, 8, 1026)
+        logits_all_rows = logits_sparse.clone()
+
+        sparse._apply_delay_pattern_masking_batched(logits_sparse, rows, all_rows=False)
+        all_rows._apply_delay_pattern_masking_batched(logits_all_rows, rows, all_rows=True)
+
+        assert torch.equal(logits_all_rows, logits_sparse)
+
+    def test_delay_state_update_all_rows_matches_sparse_path(self):
+        """The all-row fast path must update state and staging like index_copy_."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            EOC_ID,
+        )
+
+        sparse = self._make_batched_sampler_talker()
+        all_rows = self._make_batched_sampler_talker()
+        rows = torch.arange(4, dtype=torch.long)
+        codes = torch.tensor(
+            [
+                [10, 11, 12, 13, 14, 15, 16, 17],
+                [20, 21, 22, 23, 24, 25, 26, 27],
+                [30, 31, EOC_ID, 33, 34, 35, 36, 37],
+                [40, 41, 42, 43, 44, 45, 46, 47],
+            ],
+            dtype=torch.long,
+        )
+        code_row_mask = torch.tensor([True, False, True, True])
+
+        sparse._update_delay_state_batched(
+            codes.clone(), rows, 4, torch.device("cpu"), code_row_mask=code_row_mask, all_rows=False
+        )
+        all_rows._update_delay_state_batched(
+            codes.clone(), rows, 4, torch.device("cpu"), code_row_mask=code_row_mask, all_rows=True
+        )
+
+        assert torch.equal(all_rows._decode_delay_count, sparse._decode_delay_count)
+        assert torch.equal(all_rows._decode_eoc_countdown, sparse._decode_eoc_countdown)
+        assert torch.equal(all_rows._decode_generation_done, sparse._decode_generation_done)
+        assert torch.equal(all_rows._decode_last_codes, sparse._decode_last_codes)
+        assert torch.equal(all_rows._decode_has_codes, sparse._decode_has_codes)
+        assert all_rows._last_audio_codes is None
+        assert sparse._last_audio_codes is None
+        assert torch.equal(all_rows._last_audio_host_staging, sparse._last_audio_host_staging)
+
+    def test_direct_audio_sampler_does_not_override_done_tokens(self):
+        """Done rows are represented directly in GPU sampled tokens."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t._resolve_token_ids = lambda: None
+        t._audio_continuation_id = 99999
+        t._eos_token_id = 151671
+        t._last_logits_hidden = torch.zeros(2, 16)
+        t._last_step_input_ids = torch.tensor([99999, 99999])
+        t._last_step_query_start_loc = None
+        t._decode_has_codes = torch.tensor([True, True])
+        t._decode_generation_done = torch.tensor([False, True])
+        t._decode_delay_count = torch.zeros(2, dtype=torch.long)
+        t._decode_eoc_countdown = torch.full((2,), -1, dtype=torch.long)
+        t._fast_audio_direct_rows = 2
+        t._last_audio_done_flags = None
+        t._fast_audio_sampler_gpu_fallback_reason = lambda **kwargs: None
+        t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(2, 8, 1026)
+        t._apply_delay_pattern_masking_batched = lambda cb_logits, audio_rows, all_rows=False: None
+        t._sample_audio_codes = lambda logits_2d: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
+        t._update_delay_state_batched = lambda *args, **kwargs: None
+        t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
+
+        sampler_output = t.sample(torch.zeros(2, 200000), sampling_metadata=object())
+
+        assert not getattr(
+            mod.HiggsAudioV3TalkerForConditionalGeneration, "supports_sampled_token_ids_cpu_override", False
+        )
+        assert sampler_output.sampled_token_ids.tolist() == [[99999], [151671]]
+
+    def test_direct_audio_sampler_uses_gpu_tokens_for_active_rows(self):
+        """Direct audio sampling leaves scheduler-visible tokens to the GPU tensor."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t._resolve_token_ids = lambda: None
+        t._audio_continuation_id = 99999
+        t._eos_token_id = 151671
+        t._last_logits_hidden = torch.zeros(2, 16)
+        t._last_step_input_ids = torch.tensor([99999, 99999])
+        t._last_step_query_start_loc = None
+        t._decode_has_codes = torch.tensor([True, True])
+        t._decode_generation_done = torch.tensor([False, False])
+        t._decode_delay_count = torch.zeros(2, dtype=torch.long)
+        t._decode_eoc_countdown = torch.full((2,), -1, dtype=torch.long)
+        t._fast_audio_direct_rows = 2
+        t._last_audio_done_flags = [0, 0]
+        t._fast_audio_sampler_gpu_fallback_reason = lambda **kwargs: None
+        t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(2, 8, 1026)
+        t._apply_delay_pattern_masking_batched = lambda cb_logits, audio_rows, all_rows=False: None
+        t._sample_audio_codes = lambda logits_2d: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
+        t._update_delay_state_batched = lambda *args, **kwargs: None
+        t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
+
+        sampler_output = t.sample(torch.zeros(2, 200000), sampling_metadata=object())
+
+        assert sampler_output.sampled_token_ids.tolist() == [[99999], [99999]]
+
+    def test_terminal_rampdown_frame_is_emitted_before_done(self):
+        """The final ramp-down frame must be emitted, not replaced by a done marker."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
+
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t._decode_delay_count[0] = 8
+        t._decode_eoc_countdown[0] = 1
+        t._decode_generation_done[0] = False
+        t._decode_has_codes[0] = True
+        codes = torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]], dtype=torch.long)
+
+        t._update_delay_state_batched(
+            codes,
+            torch.tensor([0], dtype=torch.long),
+            1,
+            torch.device("cpu"),
+            code_row_mask=torch.tensor([True]),
+            all_rows=True,
+        )
+
+        staged = t._last_audio_host_staging[0]
+        assert staged[t.num_codebooks].item() == 1  # valid
+        assert staged[t.num_codebooks + 1].item() == 1  # done
+        assert not (staged[: t.num_codebooks] == -1).any()
+        assert staged[: t.num_codebooks - 1].eq(EOC_ID).all()
+        assert t._decode_generation_done[0].item() is True
+        assert t._decode_has_codes[0].item() is False
+
+    def test_decode_state_growth_preserves_inflight_rows(self):
+        """Growing decode buffers must copy old rows and initialize new rows inactive."""
+        t = self._make_batched_sampler_talker(num_rows=2)
+        old_codes = t._decode_last_codes.clone()
+        old_has = t._decode_has_codes.clone()
+        old_delay = t._decode_delay_count.clone()
+        old_rem = t._decode_eoc_countdown.clone()
+        old_done = t._decode_generation_done.clone()
+
+        t._ensure_decode_state_capacity(5, torch.device("cpu"))
+
+        assert t._decode_last_codes.shape[0] >= 5
+        assert torch.equal(t._decode_last_codes[:2], old_codes)
+        assert torch.equal(t._decode_has_codes[:2], old_has)
+        assert torch.equal(t._decode_delay_count[:2], old_delay)
+        assert torch.equal(t._decode_eoc_countdown[:2], old_rem)
+        assert torch.equal(t._decode_generation_done[:2], old_done)
+        assert not t._decode_has_codes[2:5].any()
+        assert not t._decode_generation_done[2:5].any()
+        assert t._decode_eoc_countdown[2:5].eq(-1).all()
+
+    def test_mixed_batch_prefill_mask_targets_request_rows(self):
+        """Mixed prefill/decode must reset only prefill request rows."""
+        t = self._make_batched_sampler_talker(num_rows=3)
+        t._last_step_query_start_loc = torch.tensor([0, 1, 4, 5])
+
+        mask = t._prefill_row_mask(3, torch.device("cpu"))
+
+        assert torch.equal(mask, torch.tensor([False, True, False]))
+
+    def test_mixed_batch_seed_mask_maps_token_tails_to_request_rows(self):
+        """Seed detection should return one flag per request, not per token."""
+        t = self._make_batched_sampler_talker(num_rows=3)
+        t._audio_continuation_id = 99999
+        t._last_step_query_start_loc = torch.tensor([0, 1, 4, 5])
+        t._last_step_input_ids = torch.tensor([99999, 11, 12, 13, 99999])
+
+        mask = t._audio_seed_mask_from_step_input(3, torch.device("cpu"))
+
+        assert torch.equal(mask, torch.tensor([True, False, True]))
+
+    def test_mixed_batch_seed_mask_allows_prefill_tail_audio_token(self):
+        """A prefill span ending in <|audio|> starts audio-code generation."""
+        t = self._make_batched_sampler_talker(num_rows=3)
+        t._audio_continuation_id = 99999
+        t._last_step_query_start_loc = torch.tensor([0, 1, 4, 5])
+        t._last_step_input_ids = torch.tensor([99999, 11, 12, 99999, 99999])
+
+        mask = t._audio_seed_mask_from_step_input(3, torch.device("cpu"))
+
+        assert torch.equal(mask, torch.tensor([True, True, True]))
 
 
 # ---- AC-6: Feedback Method Tests ----
@@ -348,10 +596,14 @@ class TestFeedbackMethods:
 
         class FakeTalker:
             _last_audio_codes = torch.tensor([[100, 200, 300, 400, 500, 600, 700, 800]])
+            _last_audio_code_valid = [True]
+            _last_audio_host_staging = None
+            _last_audio_staging_event = None
             _postprocess_cursor = 0
 
         t = FakeTalker()
         t.postprocess = mod.HiggsAudioV3TalkerForConditionalGeneration.postprocess.__get__(t)
+        t._postprocess_impl = mod.HiggsAudioV3TalkerForConditionalGeneration._postprocess_impl.__get__(t)
         result = t.postprocess(torch.zeros(1, 64))
         assert "codes" in result
         assert "audio" in result["codes"]
@@ -363,10 +615,14 @@ class TestFeedbackMethods:
 
         class FakeTalker:
             _last_audio_codes = torch.tensor([[-1, -1, -1, -1, -1, -1, -1, -1]])
+            _last_audio_code_valid = [False]
+            _last_audio_host_staging = None
+            _last_audio_staging_event = None
             _postprocess_cursor = 0
 
         t = FakeTalker()
         t.postprocess = mod.HiggsAudioV3TalkerForConditionalGeneration.postprocess.__get__(t)
+        t._postprocess_impl = mod.HiggsAudioV3TalkerForConditionalGeneration._postprocess_impl.__get__(t)
         result = t.postprocess(torch.zeros(1, 64))
         assert result == {}
 
@@ -378,10 +634,14 @@ class TestFeedbackMethods:
             _last_audio_codes = torch.tensor(
                 [[100, 200, 300, 400, 500, 600, 700, 800], [-1, -1, -1, -1, -1, -1, -1, -1]]
             )
+            _last_audio_code_valid = [True, False]
+            _last_audio_host_staging = None
+            _last_audio_staging_event = None
             _postprocess_cursor = 0
 
         t = FakeTalker()
         t.postprocess = mod.HiggsAudioV3TalkerForConditionalGeneration.postprocess.__get__(t)
+        t._postprocess_impl = mod.HiggsAudioV3TalkerForConditionalGeneration._postprocess_impl.__get__(t)
         r1 = t.postprocess(torch.zeros(1, 64))
         assert "codes" in r1
         r2 = t.postprocess(torch.zeros(1, 64))
@@ -405,14 +665,23 @@ class TestAudioFeedback:
             codebook_size = 1026
             _audio_continuation_id = 99999  # fake audio token
             _last_step_query_start_loc = None
-            _audio_state = {}
+            _decode_active_audio_count = 0
+            _decode_last_codes = torch.zeros(4, 8, dtype=torch.long)
+            _decode_has_codes = torch.zeros(4, dtype=torch.bool)
+            _use_external_decode_cudagraph = False
             multimodal_embedding = embed
             model = type("M", (), {"embed_tokens": lambda self, ids: torch.zeros(ids.shape[0], 16)})()
 
         t = FakeTalker()
-        t._decode_last_codes = torch.zeros(256, 8, dtype=torch.long)
-        t._decode_has_codes = torch.zeros(256, dtype=torch.bool)
         t._apply_audio_feedback = mod.HiggsAudioV3TalkerForConditionalGeneration._apply_audio_feedback.__get__(t)
+        t._is_single_token_decode_step = (
+            mod.HiggsAudioV3TalkerForConditionalGeneration._is_single_token_decode_step.__get__(t)
+        )
+        t._step_request_count = mod.HiggsAudioV3TalkerForConditionalGeneration._step_request_count.__get__(t)
+        t._decode_request_token_positions = (
+            mod.HiggsAudioV3TalkerForConditionalGeneration._decode_request_token_positions.__get__(t)
+        )
+        t._ensure_decode_state_capacity = lambda min_bs, device: None
         return t
 
     def test_text_positions_unchanged(self):
@@ -428,9 +697,11 @@ class TestAudioFeedback:
         """Audio position with state should have its embedding replaced."""
         t = self._make_feedback_talker()
         audio_id = t._audio_continuation_id
-        t._audio_state[1] = {"last_codes": torch.zeros(8, dtype=torch.long)}
         t._decode_last_codes[1] = torch.zeros(8, dtype=torch.long)
         t._decode_has_codes[1] = True
+        t._decode_active_audio_count = 1
+        t._ensure_decode_state_capacity = lambda min_bs, device: None
+        t._last_step_query_start_loc = torch.tensor([0, 1, 2, 3])
         input_ids = torch.tensor([1, audio_id, 3])
         hidden = torch.zeros(3, 16)
         result = t._apply_audio_feedback(hidden, input_ids)
@@ -444,11 +715,79 @@ class TestAudioFeedback:
         """Audio position without state should not be replaced."""
         t = self._make_feedback_talker()
         audio_id = t._audio_continuation_id
-        # No state for row 0 — _decode_has_codes[0] defaults to False
+        # No state for row 0
         input_ids = torch.tensor([audio_id])
         hidden = torch.zeros(1, 16)
         result = t._apply_audio_feedback(hidden, input_ids)
         assert torch.equal(result, hidden)
+
+    def test_prefill_span_does_not_receive_audio_feedback(self):
+        """A prefill span can have numel == hidden rows but must not be treated as decode."""
+        t = self._make_feedback_talker()
+        t._last_step_input_ids = torch.tensor([1, 2, 3, 4])
+        t._last_step_query_start_loc = torch.tensor([0, 4])
+        t._decode_last_codes[0] = torch.zeros(8, dtype=torch.long)
+        t._decode_has_codes[0] = True
+        t._decode_active_audio_count = 1
+        hidden = torch.zeros(4, 16)
+
+        result = t._apply_audio_feedback(hidden, t._last_step_input_ids)
+
+        assert torch.equal(result, hidden)
+
+    def test_multi_request_decode_receives_audio_feedback(self):
+        """Concurrent decode has numel > 1 but each request span is exactly one token."""
+        t = self._make_feedback_talker()
+        t._last_step_input_ids = torch.tensor([10, 11, 12, 13])
+        t._last_step_query_start_loc = torch.tensor([0, 1, 2, 3, 4])
+        t._decode_last_codes[2] = torch.zeros(8, dtype=torch.long)
+        t._decode_has_codes[2] = True
+        t._decode_active_audio_count = 1
+        hidden = torch.zeros(4, 16)
+
+        result = t._apply_audio_feedback(hidden, t._last_step_input_ids)
+
+        assert result[2].abs().sum() > 0
+        assert result[0].abs().sum() == 0
+        assert result[1].abs().sum() == 0
+        assert result[3].abs().sum() == 0
+
+    def test_external_decode_graph_capture_keeps_feedback_ops_without_query_start_loc(self):
+        """FULL_DECODE capture has no request qsl but still needs dense decode feedback ops."""
+        t = self._make_feedback_talker()
+        t._use_external_decode_cudagraph = True
+        t._last_step_input_ids = torch.tensor([10, 11, 12, 13])
+        t._last_step_query_start_loc = None
+        t._decode_last_codes[2] = torch.zeros(8, dtype=torch.long)
+        t._decode_has_codes[2] = True
+        hidden = torch.zeros(4, 16)
+
+        result = t._apply_audio_feedback(hidden, t._last_step_input_ids)
+
+        assert result[2].abs().sum() > 0
+        assert result[0].abs().sum() == 0
+        assert result[1].abs().sum() == 0
+        assert result[3].abs().sum() == 0
+
+    def test_mixed_prefill_decode_receives_feedback_only_on_decode_rows(self):
+        """Mixed batches should skip prefill spans but keep audio feedback for decode spans."""
+        t = self._make_feedback_talker()
+        t._last_step_input_ids = torch.tensor([99999, 21, 22, 23, 99999])
+        t._last_step_query_start_loc = torch.tensor([0, 1, 4, 5])
+        t._decode_last_codes[0] = torch.zeros(8, dtype=torch.long)
+        t._decode_last_codes[2] = torch.zeros(8, dtype=torch.long)
+        t._decode_has_codes[0] = True
+        t._decode_has_codes[2] = True
+        t._decode_active_audio_count = 2
+        hidden = torch.zeros(5, 16)
+
+        result = t._apply_audio_feedback(hidden, t._last_step_input_ids)
+
+        assert result[0].abs().sum() > 0
+        assert result[4].abs().sum() > 0
+        assert result[1].abs().sum() == 0
+        assert result[2].abs().sum() == 0
+        assert result[3].abs().sum() == 0
 
 
 # ---- AC-8: Codec Strictness ----
@@ -775,6 +1114,23 @@ class TestStageInputProcessor:
         with pytest.raises(ValueError, match="Not enough frames"):
             _revert_delay_pattern(codes)
 
+    def test_talker2code2wav_skips_too_few_frames_without_crashing(self):
+        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
+            talker2code2wav,
+        )
+
+        class Output:
+            multimodal_output = {"codes": {"audio": torch.zeros(5, 8, dtype=torch.long)}}
+
+        class TalkerOutput:
+            finished = True
+            outputs = [Output()]
+
+        result = talker2code2wav([TalkerOutput()])
+
+        assert len(result) == 1
+        assert result[0]["prompt_token_ids"] == []
+
     def test_filter_real_code_frames(self):
         from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
             _filter_real_code_frames,
@@ -826,8 +1182,14 @@ class TestRegistry:
 
         # __file__ = tests/unit/higgs_audio_v3/test_*.py → 4 dirnames to repo root
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-        yaml_path = os.path.join(repo_root, "vllm_omni", "deploy", "higgs_multimodal_qwen3.yaml")
-        assert os.path.isfile(yaml_path), f"Deploy YAML not found at {yaml_path}"
+        deploy_dir = os.path.join(repo_root, "vllm_omni", "deploy")
+        for name in (
+            "higgs_multimodal_qwen3.yaml",
+            "higgs_multimodal_qwen3_high_throughput.yaml",
+            "higgs_multimodal_qwen3_low_latency.yaml",
+        ):
+            yaml_path = os.path.join(deploy_dir, name)
+            assert os.path.isfile(yaml_path), f"Deploy YAML not found at {yaml_path}"
 
 
 # ---- AC-3: Prompt Builder ----
@@ -914,298 +1276,89 @@ class TestPromptBuilder:
         assert 151704 not in ids  # <|ref_text|>
 
 
-# ---- Regression: ramp-down done-before-emit off-by-one ----
+class TestVoiceCloneReferenceCache:
+    def test_audio_tokenizer_dir_env_accepts_parent_or_subdir(self, tmp_path, monkeypatch):
+        from vllm_omni.model_executor.models.higgs_audio_v2 import higgs_audio_v2_tokenizer as tok
 
+        parent = tmp_path / "OmniVoice"
+        subdir = parent / "audio_tokenizer"
+        subdir.mkdir(parents=True)
+        (subdir / "config.json").write_text("{}", encoding="utf-8")
 
-def _simulate_delay_state_machine(
-    sampled_codes_per_step: list[torch.Tensor],
-) -> list[torch.Tensor]:
-    """Reproduce the delay-pattern state machine from sample().
+        monkeypatch.setenv("HIGGS_AUDIO_TOKENIZER_PATH", str(parent))
+        assert tok._resolve_audio_tokenizer_dir() == str(subdir)
 
-    Feeds ``sampled_codes_per_step`` (each [Q]) through the exact same
-    logic as HiggsAudioV3TalkerForConditionalGeneration.sample() and
-    returns the list of emitted frames (non -1 codes).
-    """
-    from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
-        BOC_ID,
-        EOC_ID,
-    )
+        monkeypatch.setenv("HIGGS_AUDIO_TOKENIZER_PATH", str(subdir))
+        assert tok._resolve_audio_tokenizer_dir() == str(subdir)
 
-    num_codebooks = 8
-    bos = BOC_ID
-    eos_stream = EOC_ID
+    def test_higgs_v3_ref_code_cache_returns_clone(self):
+        from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
-    state: dict = {
-        "num_delay": 0,
-        "num_remaining_delays": None,
-        "audio_out_ids": None,
-        "last_codes": torch.full((num_codebooks,), bos, dtype=torch.long),
-        "should_terminate": False,
-    }
+        serving = object.__new__(OmniOpenAIServingSpeech)
+        serving._higgs_audio_v3_ref_code_cache = OrderedDict()
+        serving._higgs_audio_v3_ref_code_cache_bytes = 0
+        serving._higgs_audio_v3_ref_code_inflight = {}
 
-    emitted: list[torch.Tensor] = []
-    for step_codes in sampled_codes_per_step:
-        if state["should_terminate"]:
-            break
+        codes = torch.arange(16, dtype=torch.long).reshape(2, 8)
+        serving._put_higgs_audio_v3_ref_codes("ref-a", codes)
 
-        num_delay = state["num_delay"]
-        num_remaining_delays = state["num_remaining_delays"]
-        this_codes = step_codes.clone()
+        cached = serving._get_higgs_audio_v3_ref_codes("ref-a")
+        assert cached is not None
+        cached.fill_(0)
 
-        if num_delay + 1 < num_codebooks:
-            this_codes[num_delay + 1 :] = bos
-            num_delay += 1
+        cached_again = serving._get_higgs_audio_v3_ref_codes("ref-a")
+        assert cached_again is not None
+        assert torch.equal(cached_again, codes)
 
-        if num_remaining_delays is not None:
-            this_codes[: num_codebooks - num_remaining_delays] = eos_stream
-            num_remaining_delays -= 1
-        else:
-            eos_positions = (this_codes == eos_stream).nonzero(as_tuple=False).reshape(-1)
-            if eos_positions.numel() > 0:
-                last_eos_idx = int(eos_positions[-1].item())
-                this_codes[: last_eos_idx + 1] = eos_stream
-                num_remaining_delays = num_codebooks - last_eos_idx - 1
+    def test_higgs_v3_ref_code_inflight_deduplicates_concurrent_encode(self):
+        from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
-        if num_remaining_delays is not None and num_remaining_delays <= 0:
-            state["num_delay"] = 0
-            state["num_remaining_delays"] = None
-            state["should_terminate"] = True
-            continue
+        serving = object.__new__(OmniOpenAIServingSpeech)
+        serving._higgs_audio_v3_ref_code_cache = OrderedDict()
+        serving._higgs_audio_v3_ref_code_cache_bytes = 0
+        serving._higgs_audio_v3_ref_code_inflight = {}
+        calls = 0
 
-        state["num_delay"] = num_delay
-        state["num_remaining_delays"] = num_remaining_delays
-        state["last_codes"] = this_codes.clone()
-        emitted.append(this_codes)
+        def encode_reference_audio(_wav, _sr):
+            nonlocal calls
+            calls += 1
+            time.sleep(0.05)
+            return torch.arange(16, dtype=torch.long).reshape(2, 8)
 
-    return emitted
+        def apply_delay_pattern(codes):
+            return codes + 1
 
+        async def run():
+            return await asyncio.gather(
+                *[
+                    serving._resolve_higgs_audio_v3_ref_codes(
+                        "ref-a",
+                        object(),
+                        24000,
+                        encode_reference_audio,
+                        apply_delay_pattern,
+                    )
+                    for _ in range(3)
+                ]
+            )
 
-class TestRampDownOffByOne:
-    """Regression tests for the done-before-emit off-by-one bug.
+        results = asyncio.run(run())
+        assert calls == 1
+        assert sum(int(inflight_wait) for _, _, inflight_wait in results) == 2
+        for codes, cache_hit, _ in results:
+            assert cache_hit is False
+            assert torch.equal(codes, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)
 
-    When EOC fires early, the ramp-down must emit enough frames so that
-    Stage1's _revert_delay_pattern receives T >= Q = 8.
-    """
-
-    def test_eoc_at_step0_terminates(self):
-        """EOC on cb0 at step 0 terminates; T < Q is handled by Stage1 defensive try/except."""
-        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
-
-        Q = 8
-        steps = []
-        for s in range(20):
-            codes = torch.randint(0, 1024, (Q,))
-            if s == 0:
-                codes[0] = EOC_ID
-            steps.append(codes)
-
-        emitted = _simulate_delay_state_machine(steps)
-        assert len(emitted) == Q - 1, f"EOC at step 0: expected {Q - 1} emitted frames, got {len(emitted)}"
-
-    def test_eoc_at_step1_emits_enough_frames(self):
-        """EOC on cb0 at step 1 must produce >= Q emitted frames."""
-        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
-
-        Q = 8
-        steps = []
-        for s in range(20):
-            codes = torch.randint(0, 1024, (Q,))
-            if s == 1:
-                codes[0] = EOC_ID
-            steps.append(codes)
-
-        emitted = _simulate_delay_state_machine(steps)
-        assert len(emitted) >= Q, f"EOC at step 1: expected >= {Q} emitted frames, got {len(emitted)}"
-
-    def test_eoc_after_full_rampup_emits_enough(self):
-        """EOC after all codebooks are active produces T >> Q."""
-        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
-
-        Q = 8
-        eoc_step = 10
-        steps = []
-        for s in range(30):
-            codes = torch.randint(0, 1024, (Q,))
-            if s == eoc_step:
-                codes[0] = EOC_ID
-            steps.append(codes)
-
-        emitted = _simulate_delay_state_machine(steps)
-        assert len(emitted) >= Q, f"EOC at step {eoc_step}: expected >= {Q} emitted frames, got {len(emitted)}"
-
-    def test_last_rampdown_frame_not_all_negative(self):
-        """The last emitted ramp-down frame must contain real codes, not -1."""
-        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
-
-        Q = 8
-        steps = []
-        for s in range(20):
-            codes = torch.randint(0, 1024, (Q,))
-            if s == 1:
-                codes[0] = EOC_ID
-            steps.append(codes)
-
-        emitted = _simulate_delay_state_machine(steps)
-        last = emitted[-1]
-        assert (last >= 0).all(), f"Last ramp-down frame contains negative values: {last.tolist()}"
-
-    def test_emitted_frames_revertible_by_stage1(self):
-        """Emitted frames from EOC-at-step-1 must be revertible by _revert_delay_pattern."""
-        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
-        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
-            _revert_delay_pattern,
+        cached, cache_hit, inflight_wait = asyncio.run(
+            serving._resolve_higgs_audio_v3_ref_codes(
+                "ref-a",
+                object(),
+                24000,
+                encode_reference_audio,
+                apply_delay_pattern,
+            )
         )
-
-        Q = 8
-        steps = []
-        for s in range(20):
-            codes = torch.randint(0, 1024, (Q,))
-            if s == 1:
-                codes[0] = EOC_ID
-            steps.append(codes)
-
-        emitted = _simulate_delay_state_machine(steps)
-        # Stack to [T, Q], transpose to [Q, T]
-        codes_qt = torch.stack(emitted, dim=0).t().contiguous()
-        assert codes_qt.shape[0] == Q
-        assert codes_qt.shape[1] >= Q
-
-        # Must not raise
-        reverted = _revert_delay_pattern(codes_qt)
-        assert reverted.shape[0] == Q
-        assert reverted.shape[1] == codes_qt.shape[1] - Q + 1
-
-
-class TestStage1DefensiveHandling:
-    """Stage1 must not crash the server when receiving T < Q frames."""
-
-    def test_revert_delay_pattern_raises_on_insufficient_frames(self):
-        """_revert_delay_pattern correctly raises ValueError for T < Q."""
-        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
-            _revert_delay_pattern,
-        )
-
-        codes = torch.zeros(8, 7)  # T=7 < Q=8
-        with pytest.raises(ValueError, match="Not enough frames"):
-            _revert_delay_pattern(codes)
-
-    def test_talker2code2wav_survives_insufficient_frames(self):
-        """talker2code2wav must not crash when audio_codes has T < Q frames."""
-        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
-            talker2code2wav,
-        )
-
-        # Build a fake talker output with only 7 frames (T=7 < Q=8)
-        class FakeOutput:
-            def __init__(self):
-                self.multimodal_output = {
-                    "codes": {"audio": torch.zeros(7, 8, dtype=torch.long)},
-                }
-
-        class FakeTalkerOutput:
-            finished = True
-            outputs = [FakeOutput()]
-
-        # Must not raise — should return gracefully
-        result = talker2code2wav([FakeTalkerOutput()])
-        assert len(result) == 1
-        # Result is an OmniTokensPrompt with empty prompt_token_ids
-        out = result[0]
-        token_ids = out.prompt_token_ids if hasattr(out, "prompt_token_ids") else out.get("prompt_token_ids", [])
-        assert token_ids == []
-
-
-# ---- Regression: buffer growth + prefill guard ----
-
-
-class TestBufferGrowthPreservesState:
-    """Bug #1: buffer growth in _apply_audio_feedback must not wipe existing state."""
-
-    def _make_feedback_talker_with_buffers(self):
-        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
-
-        embed = mod.HiggsFusedMultiTextEmbedding(num_codebooks=8, vocab_size=1026, hidden_size=16)
-        torch.nn.init.ones_(embed.weight)
-
-        class FakeTalker:
-            num_codebooks = 8
-            codebook_size = 1026
-            multimodal_embedding = embed
-
-        t = FakeTalker()
-        t._decode_last_codes = torch.zeros(4, 8, dtype=torch.long)
-        t._decode_has_codes = torch.zeros(4, dtype=torch.bool)
-        t._apply_audio_feedback = mod.HiggsAudioV3TalkerForConditionalGeneration._apply_audio_feedback.__get__(t)
-        return t
-
-    def test_buffer_growth_preserves_existing_codes(self):
-        """Growing the buffer must copy old _decode_last_codes data."""
-        t = self._make_feedback_talker_with_buffers()
-        # Set state for slot 2
-        t._decode_last_codes[2] = torch.tensor([100, 200, 300, 400, 500, 600, 700, 800])
-        t._decode_has_codes[2] = True
-
-        # Trigger growth by calling with bs=8 > current capacity 4
-        hidden = torch.randn(8, 16)
-        t._apply_audio_feedback(hidden, torch.zeros(8, dtype=torch.long))
-
-        # After growth, slot 2 data must still be present
-        assert t._decode_has_codes[2].item() is True
-        assert t._decode_last_codes[2, 0].item() == 100
-
-    def test_buffer_growth_new_slots_are_inactive(self):
-        """New slots from buffer growth must have has_codes=False."""
-        t = self._make_feedback_talker_with_buffers()
-        t._decode_has_codes[1] = True
-
-        hidden = torch.randn(8, 16)
-        t._apply_audio_feedback(hidden, torch.zeros(8, dtype=torch.long))
-
-        # Slots 4-7 (new) must be inactive
-        assert not t._decode_has_codes[4].item()
-        assert not t._decode_has_codes[7].item()
-        # Slot 1 (old) must still be active
-        assert t._decode_has_codes[1].item()
-
-
-class TestPrefillGuard:
-    """Bug #2: _apply_audio_feedback must NOT run during prefill.
-
-    The prefill detection uses attn_metadata.max_query_len (== 1 for decode,
-    > 1 for prefill). This correctly handles concurrent decode (N requests,
-    each contributing 1 token → numel=N but max_query_len=1).
-    """
-
-    @staticmethod
-    def _is_prefill_via_max_query_len(max_query_len: int | None, input_ids: torch.Tensor) -> bool:
-        """Mirror the actual detection logic in forward()."""
-        if max_query_len is not None:
-            return int(max_query_len) > 1
-        return input_ids is not None and int(input_ids.numel()) > 1
-
-    def test_prefill_detected_via_max_query_len(self):
-        """Prefill: max_query_len > 1 → is_prefill=True."""
-        input_ids = torch.tensor([1, 2, 3, 4, 5])
-        assert self._is_prefill_via_max_query_len(5, input_ids) is True
-
-    def test_single_decode_detected_via_max_query_len(self):
-        """Single-request decode: max_query_len=1 → is_prefill=False."""
-        input_ids = torch.tensor([42])
-        assert self._is_prefill_via_max_query_len(1, input_ids) is False
-
-    def test_concurrent_decode_not_misclassified(self):
-        """Multi-request decode: numel=4 but max_query_len=1 → is_prefill=False.
-
-        This is the regression caught by reviewer: with c=4 concurrent decode
-        requests, input_ids.numel()==4 but each request contributes exactly 1
-        token, so max_query_len==1 and audio feedback must still apply.
-        """
-        input_ids = torch.tensor([42, 43, 44, 45])  # 4 concurrent decode
-        assert self._is_prefill_via_max_query_len(1, input_ids) is False
-
-    def test_fallback_when_max_query_len_unavailable(self):
-        """When attn_metadata is unavailable, fall back to numel heuristic."""
-        prefill_ids = torch.tensor([1, 2, 3])
-        assert self._is_prefill_via_max_query_len(None, prefill_ids) is True
-        decode_ids = torch.tensor([42])
-        assert self._is_prefill_via_max_query_len(None, decode_ids) is False
+        assert calls == 1
+        assert cache_hit is True
+        assert inflight_wait is False
+        assert torch.equal(cached, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)

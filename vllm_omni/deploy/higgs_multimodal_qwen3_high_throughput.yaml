@@ -1,10 +1,9 @@
-# Higgs-audio v3 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
+# Higgs-audio v3 deploy, high-throughput profile.
 #
-# Auto-discovered default for model_type=higgs_multimodal_qwen3. This file is
-# the high-throughput profile and intentionally keeps Stage 0 enforce_eager=true
-# so the Higgs-specific local MLP CUDA graph path remains active. For low
-# concurrency latency-sensitive serving, use
-# higgs_multimodal_qwen3_low_latency.yaml explicitly.
+# This is the default production profile for medium/high concurrency serving.
+# Stage 0 keeps enforce_eager=true so Higgs' local MLP CUDA graph remains active.
+# Do not enable vLLM FULL_DECODE graph here: it replaces the local MLP graph
+# path instead of stacking on top of it.
 #
 # Plain TTS only (no voice cloning). async_chunk streams codec chunks from
 # Stage 0 to Stage 1 as they are produced (TTFA approaches one AR loop's
@@ -35,7 +34,7 @@ connectors:
 
 stages:
   - stage_id: 0
-    max_num_seqs: 16
+    max_num_seqs: 64
     gpu_memory_utilization: 0.6
     enforce_eager: true
     attention_backend: FLASHINFER
