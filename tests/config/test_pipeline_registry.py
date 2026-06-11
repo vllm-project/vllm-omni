@@ -64,6 +64,7 @@ class TestLazyLoading:
         prev_level = target_logger.level
         target_logger.setLevel(logging.ERROR)
         try:
+            monkeypatch.setattr(_PIPELINE_REGISTRY, "_loaded", {})
             monkeypatch.setattr(
                 _PIPELINE_REGISTRY,
                 "_lazy_map",
