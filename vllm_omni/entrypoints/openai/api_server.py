@@ -142,6 +142,7 @@ from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url, decode_input_reference
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -1812,6 +1813,9 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniClientError as e:
+        logger.info("Client error during image generation: %s", e)
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -2167,6 +2171,9 @@ async def edit_images(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniClientError as e:
+        logger.info("Client error during image edit: %s", e)
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -2667,6 +2674,9 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
         message = str(exc.detail) if exc.detail else str(exc)
         return VideoError(code=exc.status_code, message=message)
 
+    if isinstance(exc, OmniClientError):
+        return VideoError(code=exc.status_code, message=exc.message)
+
     if isinstance(exc, (EngineGenerateError, EngineDeadError)):
         err = create_error_response(exc)
         return VideoError(code=err.error.code, message=err.error.message)
@@ -3021,6 +3031,9 @@ async def create_video_sync(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniClientError as exc:
+        logger.info("Client error during sync video generation: %s", exc)
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     except Exception as exc:
         logger.exception("Sync video generation failed for request_id=%s", request_id)
         raise HTTPException(
