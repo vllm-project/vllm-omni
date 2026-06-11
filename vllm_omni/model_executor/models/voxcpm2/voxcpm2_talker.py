@@ -824,7 +824,7 @@ def _optimized_solve_euler_with_noise(
             t = t - dt
             if step < len(t_span) - 1:
                 dt = t - t_span[step + 1]
-    return x
+    return x.clone()
 
 
 # ===================================================================
