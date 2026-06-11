@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -19,7 +20,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
+from transformers import AutoConfig, AutoModelForImageTextToText, Qwen2Tokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -36,6 +37,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.models.utils import create_transformers_model
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -273,11 +275,17 @@ class QwenImagePipeline(
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=None,
+                prefix="text_encoder.",
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
                 subfolder="transformer",
                 revision=None,
                 prefix="transformer.",
                 fall_back_to_pt=True,
-            )
+            ),
         ]
 
         self.device = get_local_device()
@@ -296,32 +304,42 @@ class QwenImagePipeline(
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
+        # Build the text encoder empty (meta device) and stream its weights via
+        # the loader so vLLM online quantization (e.g. FP8) applies to its
+        # linears, mirroring the Z-Image pattern (#1338).
+        # AutoModelForImageTextToText.from_config() instantiates the same
+        # Qwen2.5-VL model the from_pretrained path used.
+        text_encoder_config = AutoConfig.from_pretrained(
+            model, subfolder="text_encoder", local_files_only=local_files_only
+        )
+
+        def _drop_vision_tower(text_encoder: nn.Module) -> None:
+            # Qwen2.5-VL ships a vision tower that text-to-image does not use.
+            # Drop it on the meta device (before parameter materialization) so
+            # its parameters are never quantized nor allocated on any device.
+            # Handle both transformers layouts: newer puts visual under .model,
+            # older puts it directly on the model.
+            visual_owner = None
+            if hasattr(text_encoder, "model") and hasattr(text_encoder.model, "visual"):
+                visual_owner = text_encoder.model
+            elif hasattr(text_encoder, "visual"):
+                visual_owner = text_encoder
+            if visual_owner is not None:
+                del visual_owner.visual
+            else:
+                logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
+
+        self.text_encoder = create_transformers_model(
+            AutoModelForImageTextToText,
+            od_config,
+            hf_config=text_encoder_config,
+            prune_fn=_drop_vision_tower,
+            prefix="text_encoder",
+        ).to(self.device)
         # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
         # half-written cache (missing-shard ``OSError`` *and* the default
         # -config size-mismatch ``RuntimeError`` that ``retry_on_missing_shard``
         # could not recover) instead of crashing the worker.
-        self.text_encoder = from_pretrained_with_prefetch(
-            Qwen2_5_VLForConditionalGeneration.from_pretrained,
-            model,
-            subfolder="text_encoder",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
-        )
-        # Qwen2.5-VL ships a vision tower that text-to-image does not use.
-        # Drop it while the model is still on CPU, before moving to GPU, so
-        # the vision tower never consumes GPU memory. Handle both transformers
-        # layouts: newer puts visual under .model, older puts it directly on
-        # the model.
-        visual_owner = None
-        if hasattr(self.text_encoder, "model") and hasattr(self.text_encoder.model, "visual"):
-            visual_owner = self.text_encoder.model
-        elif hasattr(self.text_encoder, "visual"):
-            visual_owner = self.text_encoder
-        if visual_owner is not None:
-            del visual_owner.visual
-        else:
-            logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
-        self.text_encoder = self.text_encoder.to(self.device)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLQwenImage.from_pretrained,
             model,
@@ -1068,7 +1086,36 @@ class QwenImagePipeline(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded_weights = loader.load_weights(self._remap_text_encoder_weights(weights))
+        # Record components loaded by diffusers submodules to satisfy the
+        # loader's strict coverage check.
+        loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
+        loaded_weights |= {f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()}
+        return loaded_weights
+
+    @staticmethod
+    def _remap_text_encoder_weights(
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        # The text_encoder is built from config and streamed through
+        # AutoWeightsLoader, which -- unlike transformers' from_pretrained --
+        # does not apply the model's checkpoint key remapping. Qwen2.5-VL ships
+        # a legacy-flat checkpoint (``model.layers.*``, ``model.norm``,
+        # ``model.embed_tokens``, ``visual.*``) while the in-memory
+        # Qwen2_5_VLModel nests the language model under
+        # ``model.language_model.*`` and the vision tower under
+        # ``model.visual.*``. Replay that remap here and drop the vision tower
+        # (deleted from the module) whether it is stored flat or nested.
+        prefix = "text_encoder."
+        for name, tensor in weights:
+            if not name.startswith(prefix):
+                yield name, tensor
+                continue
+            sub = name[len(prefix) :]
+            if sub.startswith("visual.") or sub.startswith("model.visual."):
+                continue
+            sub = re.sub(r"^model\.(?!language_model\.|visual\.)", "model.language_model.", sub)
+            yield prefix + sub, tensor
 
 
 class QwenImageDMD2Pipeline(DMD2PipelineMixin, QwenImagePipeline):

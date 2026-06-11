@@ -1160,7 +1160,13 @@ class AsyncOmniEngine:
                             kwargs.get("diffusion_attention_config"),
                             attention_backend=kwargs.get("diffusion_attention_backend"),
                         )
+                # Honor the diffusion-specific kwarg, falling back to the generic
+                # ``quantization_config`` kwarg so ``Omni(quantization_config=...)``
+                # (incl. per-component dicts like {"text_encoder": {"method": "fp8"}})
+                # actually reaches the diffusion worker instead of being dropped.
                 quantization_config = kwargs.get("diffusion_quantization_config")
+                if quantization_config is None:
+                    quantization_config = kwargs.get("quantization_config")
                 if quantization_config is not None:
                     if (
                         not hasattr(cfg.engine_args, "quantization_config")
