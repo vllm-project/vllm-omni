@@ -23,7 +23,7 @@ Other hardware is welcome as community validation lands.
 
 ## CUDA
 
-### 1x H100 80GB - TTS
+### 1x H100 80GB
 
 #### Environment
 
@@ -120,7 +120,7 @@ jq -n \
 
 ## ROCm
 
-### 1x AMD `gfx942`
+### 1x AMD MI300X
 
 #### Environment
 
