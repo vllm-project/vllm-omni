@@ -27,6 +27,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.platforms import current_platform
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
@@ -1419,8 +1420,8 @@ class Cosmos3VFMTransformer(nn.Module):
         # For I2V: only add to noisy tokens, not conditioned ones.
         # Conditioned frames are clean context and should not receive
         # the diffusion timestep signal.
-        with torch.autocast("cuda", enabled=True, dtype=torch.float32):
-            time_embed = self.time_embedder(timestep * self.timestep_scale)
+        with torch.autocast(current_platform.device_type, enabled=False):
+            time_embed = self.time_embedder((timestep * self.timestep_scale).float())
         time_embed = time_embed.to(hidden_states.dtype)
 
         if noisy_frame_mask is not None:
