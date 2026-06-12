@@ -8,7 +8,8 @@ without requiring the actual checkpoint or GPU.
 
 import asyncio
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -1155,6 +1156,31 @@ class TestStageInputProcessor:
         assert result[0, 0].item() == 100
         assert result[0, 1].item() == 200
         assert result[0, 2].item() == 300
+
+    def test_async_chunk_accepts_multimodal_output_keyword(self):
+        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
+            talker2code2wav_async_chunk,
+        )
+
+        request_id = "req-higgs"
+        transfer_manager = SimpleNamespace(
+            code_prompt_token_ids=defaultdict(list),
+            connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 1, "codec_right_holdback_frames": 0}}),
+        )
+        request = SimpleNamespace(external_req_id=request_id, is_finished=lambda: False)
+
+        result = None
+        for step in range(8):
+            result = talker2code2wav_async_chunk(
+                transfer_manager=transfer_manager,
+                multimodal_output={"codes": {"audio": torch.full((1, 8), step, dtype=torch.long)}},
+                request=request,
+                is_finished=False,
+            )
+
+        assert result is not None
+        assert result.codes is not None
+        assert result.codes.audio.numel() > 0
 
 
 # ---- AC-10: Registry ----

@@ -481,12 +481,32 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
             if "text" in modalities:
                 transcript = (response.audio_content or "").strip()
                 text_output = (response.text_content or "").strip()
-                similarity = cosine_similarity_text(
-                    transcript.lower(),
-                    text_output.lower(),
-                )
-                print(f"similarity is: {similarity}")
-                assert similarity > similarity_threshold, "The audio content is not same as the text"
+                # For very short outputs (e.g. one-word answers), n-gram cosine
+                # similarity with length penalty is unreliable because Whisper
+                # may hallucinate extra context around the short utterance.  Use
+                # a containment check instead: the shorter text must appear in
+                # the longer one (after preprocessing removes punctuation).
+                _SHORT_TEXT_THRESHOLD = 15
+                if len(text_output) <= _SHORT_TEXT_THRESHOLD or len(transcript) <= _SHORT_TEXT_THRESHOLD:
+                    shorter = text_output.lower() if len(text_output) <= len(transcript) else transcript.lower()
+                    longer = transcript.lower() if len(text_output) <= len(transcript) else text_output.lower()
+                    import re as _re
+
+                    shorter_clean = _re.sub(r"[^\w\s]", "", shorter).strip()
+                    longer_clean = _re.sub(r"[^\w\s]", "", longer).strip()
+                    assert shorter_clean and (shorter_clean in longer_clean), (
+                        f"The audio content is not same as the text "
+                        f"(short-text containment check failed: "
+                        f"text={text_output!r}, transcript={transcript!r})"
+                    )
+                    print(f"short-text containment check passed: {shorter_clean!r} in {longer_clean!r}")
+                else:
+                    similarity = cosine_similarity_text(
+                        transcript.lower(),
+                        text_output.lower(),
+                    )
+                    print(f"similarity is: {similarity}")
+                    assert similarity > similarity_threshold, "The audio content is not same as the text"
             if audio_ref_text:
                 audio_similarity = cosine_similarity_text(
                     response.audio_content.lower(),
