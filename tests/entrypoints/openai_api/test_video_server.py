@@ -13,12 +13,14 @@ import threading
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
 
+from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.protocol.videos import (
@@ -29,6 +31,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
+from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -84,7 +87,10 @@ class BlockingVideoHandler:
         if self.stage_configs is None:
             self.stage_configs = stage_configs
 
-    async def generate_video_bytes(self, request, reference_id, *, reference_image=None):
+    async def generate_video_bytes(
+        self, request, reference_id, *, reference_image=None, reference_video=None, reference_audio=None
+    ):
+        del request, reference_id, reference_image, reference_video, reference_audio
         self.started.set()
         try:
             await asyncio.Future()
@@ -128,6 +134,30 @@ def _make_test_image_data_url(size=(64, 64)) -> str:
     image_bytes = _make_test_image_bytes(size)
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:image/png;base64,{encoded}"
+
+
+def _make_test_video_bytes(size=(32, 24), num_frames=3) -> bytes:
+    width, height = size
+    frames = np.zeros((num_frames, height, width, 3), dtype=np.uint8)
+    for idx in range(num_frames):
+        frames[idx, :, :, 0] = idx * 40
+        frames[idx, :, :, 1] = 128
+        frames[idx, :, :, 2] = 255 - idx * 40
+    return mux_video_audio_bytes(frames, fps=8, video_codec_options={"preset": "ultrafast", "threads": "0"})
+
+
+def _make_test_video_data_url(size=(32, 24), num_frames=3) -> str:
+    encoded = base64.b64encode(_make_test_video_bytes(size, num_frames)).decode("utf-8")
+    return f"data:video/mp4;base64,{encoded}"
+
+
+def _cosmos3_stage_configs():
+    return [
+        SimpleNamespace(
+            stage_type="diffusion",
+            engine_args=SimpleNamespace(model_class_name="Cosmos3OmniDiffusersPipeline"),
+        )
+    ]
 
 
 def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 2.0):
@@ -330,6 +360,139 @@ def test_i2v_video_generation_with_image_reference_form(test_client, mocker: Moc
     input_image = prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (40, 24)
+
+
+def test_v2v_video_generation_form(test_client, mocker: MockerFixture):
+    video_bytes = _make_test_video_bytes((32, 24), num_frames=3)
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "Continue this motion."},
+        files={"input_reference": ("input.mp4", video_bytes, "video/mp4")},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    prompt = engine.captured_prompt
+    assert "multi_modal_data" in prompt
+    assert "video" in prompt["multi_modal_data"]
+    input_video = prompt["multi_modal_data"]["video"]
+    assert len(input_video) == 3
+    assert all(isinstance(frame, Image.Image) for frame in input_video)
+    assert input_video[0].size == (32, 24)
+
+
+def test_v2v_video_generation_with_video_reference_form(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "Continue this motion.",
+            "video_reference": json.dumps({"video_url": _make_test_video_data_url((32, 24), 2)}),
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    input_video = engine.captured_prompt["multi_modal_data"]["video"]
+    assert len(input_video) == 2
+    assert input_video[0].size == (32, 24)
+
+
+def test_decode_video_bytes_can_keep_last_frames():
+    from vllm_omni.entrypoints.openai.video_api_utils import _decode_video_bytes
+
+    frames = _decode_video_bytes(
+        _make_test_video_bytes((32, 24), num_frames=6),
+        source="input_reference",
+        max_frames=2,
+        keep="last",
+    )
+
+    assert len(frames) == 2
+    red_means = [np.asarray(frame)[:, :, 0].mean() for frame in frames]
+    assert red_means[0] > 100
+    assert red_means[1] > red_means[0]
+
+
+def test_cosmos3_reference_video_limit_uses_v2v_condition_frames():
+    request = VideoGenerationRequest(
+        prompt="Continue this motion.",
+        num_frames=189,
+        extra_params={"condition_frame_indexes_vision": [0, 2]},
+    )
+
+    spec = api_server._reference_video_decode_spec(request, _cosmos3_stage_configs())
+    assert spec.max_frames == 9
+    assert spec.keep == "first"
+
+
+def test_cosmos3_reference_video_limit_preserves_action_frames():
+    request = VideoGenerationRequest(
+        prompt="Predict the action.",
+        num_frames=17,
+        extra_params={"action_mode": "inverse_dynamics", "action_chunk_size": 16},
+    )
+
+    assert api_server._reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 17
+
+
+def test_cosmos3_reference_video_limit_caps_condition_frames_to_output_frames():
+    request = VideoGenerationRequest(
+        prompt="Continue this motion.",
+        num_frames=5,
+        extra_params={"condition_frame_indexes_vision": [0, 20]},
+    )
+
+    assert api_server._reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 5
+
+
+def test_s2v_video_generation_with_audio_reference_form(test_client, mocker: MockerFixture):
+    """Speech-to-video: image + audio_reference (base64 data URL) passes audio path to multi_modal_data."""
+    audio_bytes = b"\xff\xfb\x90\x00" * 50
+    audio_b64 = base64.b64encode(audio_bytes).decode()
+    audio_ref = json.dumps({"audio_url": f"data:audio/mp3;base64,{audio_b64}"})
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A person singing",
+            "audio_reference": audio_ref,
+            "width": "832",
+            "height": "480",
+        },
+        files={"input_reference": ("face.png", _make_test_image_bytes((64, 64)), "image/png")},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    prompt = engine.captured_prompt
+    assert "multi_modal_data" in prompt
+    assert "image" in prompt["multi_modal_data"]
+    assert "audio" in prompt["multi_modal_data"]
+    audio_path = prompt["multi_modal_data"]["audio"]
+    assert isinstance(audio_path, str)
+    assert audio_path.endswith(".mp3")
 
 
 def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):
@@ -794,7 +957,20 @@ def test_rejects_input_reference_and_image_reference_together(test_client):
         files={"input_reference": ("input.png", _make_test_image_bytes(), "image/png")},
     )
     assert response.status_code == 400
-    assert "either input_reference or image_reference" in response.json()["detail"].lower()
+    assert "only one of input_reference, image_reference, or video_reference" in response.json()["detail"].lower()
+
+
+def test_rejects_image_reference_and_video_reference_together(test_client):
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "bad refs",
+            "image_reference": '{"image_url": "https://example.com/cat.png"}',
+            "video_reference": '{"video_url": "https://example.com/cat.mp4"}',
+        },
+    )
+    assert response.status_code == 400
+    assert "only one of input_reference, image_reference, or video_reference" in response.json()["detail"].lower()
 
 
 def test_invalid_seconds_returns_422(test_client):
@@ -844,6 +1020,25 @@ def test_invalid_lora_returns_400(test_client):
     assert "lora object" in failed["error"]["message"].lower()
 
 
+def test_async_guardrail_error_returns_400_on_retrieve(test_client, mocker: MockerFixture):
+    mocker.patch.object(
+        OmniOpenAIServingVideo,
+        "generate_video_bytes",
+        side_effect=GuardrailViolationError("Input was blocked by Cosmos3 guardrails."),
+    )
+    response = test_client.post("/v1/videos", data={"prompt": "blocked prompt"})
+    assert response.status_code == 200
+
+    video_id = response.json()["id"]
+    failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
+    assert failed["error"]["code"] == 400
+    assert failed["error"]["message"] == "Input was blocked by Cosmos3 guardrails."
+
+    retrieve = test_client.get(f"/v1/videos/{video_id}")
+    assert retrieve.status_code == 400
+    assert retrieve.json()["error"]["code"] == 400
+
+
 def test_unsupported_image_reference_file_id_returns_400(test_client):
     response = test_client.post(
         "/v1/videos",
@@ -856,6 +1051,18 @@ def test_unsupported_image_reference_file_id_returns_400(test_client):
     assert response.json()["detail"] == "Invalid image_reference: file_id is not supported yet."
 
 
+def test_unsupported_video_reference_file_id_returns_400(test_client):
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "unsupported ref",
+            "video_reference": '{"file_id": "file-123"}',
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid video_reference: file_id is not supported yet."
+
+
 def test_invalid_uploaded_input_reference_returns_400(test_client):
     response = test_client.post(
         "/v1/videos",
@@ -863,7 +1070,7 @@ def test_invalid_uploaded_input_reference_returns_400(test_client):
         files={"input_reference": ("input.png", b"not-an-image", "image/png")},
     )
     assert response.status_code == 400
-    assert response.json()["detail"] == "Invalid input_reference: provided content is not a valid image."
+    assert response.json()["detail"] == "Invalid input_reference: provided content is not a valid image or video."
 
 
 def test_video_request_validation():
@@ -880,6 +1087,8 @@ def test_video_request_validation():
 
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", image_reference={"file_id": "file-1", "image_url": "https://example.com"})
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(prompt="test", video_reference={"file_id": "file-1", "video_url": "https://example.com"})
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", frame_interpolation_exp=0)
     with pytest.raises(ValueError):
@@ -1265,6 +1474,23 @@ def test_sync_i2v_with_image_reference(test_client, mocker: MockerFixture):
     assert response.content == b"ref-video"
 
 
+def test_sync_v2v_returns_video_bytes(test_client, mocker: MockerFixture):
+    video_bytes = _make_test_video_bytes((32, 24), num_frames=3)
+    _mock_encode_video_bytes(mocker, b"v2v-video-data")
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Continue this motion."},
+        files={"input_reference": ("input.mp4", video_bytes, "video/mp4")},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"v2v-video-data"
+    engine = test_client.app.state.openai_serving_video._engine_client
+    input_video = engine.captured_prompt["multi_modal_data"]["video"]
+    assert len(input_video) == 3
+    assert input_video[0].size == (32, 24)
+
+
 def test_sync_missing_handler_returns_503():
     app = FastAPI()
     app.include_router(router)
@@ -1297,7 +1523,7 @@ def test_sync_rejects_both_references(test_client):
         files={"input_reference": ("input.png", _make_test_image_bytes(), "image/png")},
     )
     assert response.status_code == 400
-    assert "either input_reference or image_reference" in response.json()["detail"].lower()
+    assert "only one of input_reference, image_reference, or video_reference" in response.json()["detail"].lower()
 
 
 def test_sync_generation_error_returns_500(test_client, mocker: MockerFixture):
@@ -1313,6 +1539,20 @@ def test_sync_generation_error_returns_500(test_client, mocker: MockerFixture):
     )
     assert response.status_code == 500
     assert "GPU exploded" in response.json()["detail"]
+
+
+def test_sync_guardrail_error_returns_400(test_client, mocker: MockerFixture):
+    mocker.patch.object(
+        OmniOpenAIServingVideo,
+        "generate_video_bytes",
+        side_effect=GuardrailViolationError("Input was blocked by Cosmos3 guardrails."),
+    )
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "blocked prompt"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Input was blocked by Cosmos3 guardrails."
 
 
 def test_sync_does_not_create_store_entry(test_client, mocker: MockerFixture):

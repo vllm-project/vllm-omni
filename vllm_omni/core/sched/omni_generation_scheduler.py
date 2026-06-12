@@ -87,7 +87,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._consume_pending_connector_output(model_mode="generation")
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+            self.chunk_transfer_adapter.process_pending_chunks(
+                self.waiting, self.running, scheduler_requests=self.requests
+            )
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled
@@ -364,7 +366,23 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
+        # See ``OmniSchedulerMixin._realign_request_status_to_queues`` --
+        # closes the residual hang on the
+        # ``waiting → running → abort-before-next-deque-round-trip`` race
+        # surfaced by #3774's reproduction matrix. Only the
+        # ``async_chunk`` path actually triggers the staleness; with
+        # ``async_chunk`` disabled this is a cheap O(n) no-op, kept
+        # unconditional so the abort path stays uniform.
+        self._realign_request_status_to_queues(request_ids)
+
         finished = super().finish_requests(request_ids, finished_status)
+
+        # See ``OmniSchedulerMixin._purge_finished_from_running`` --
+        # defensive belt-and-suspenders sweep paired with the realign
+        # above. Closes residual ``self.running`` slot leaks if any
+        # corner case slips past upstream's status-driven removal.
+        self._purge_finished_from_running()
+
         if self.input_coordinator is not None:
             for request_id, _ in finished:
                 self._free_input_coordinator_request(request_id)

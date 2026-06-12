@@ -360,6 +360,10 @@ class OmniRequestState(RequestState):
         else:
             base_output.cumulative_token_ids = list(token_ids)
 
+        # Attach cumulative_text only at the final step for inter-stage use.
+        if finish_reason is not None and hasattr(self.detokenizer, "output_text"):
+            base_output.cumulative_text = self.detokenizer.output_text
+
         try:
             if self.mm_accumulated and not self.mm_accumulated.is_empty:
                 # Snapshot: copy current tensors/metadata so drain doesn't
@@ -376,6 +380,8 @@ class OmniRequestState(RequestState):
                     **kwargs,
                 )
                 output.cumulative_token_ids = base_output.cumulative_token_ids
+                if hasattr(base_output, "cumulative_text"):
+                    output.cumulative_text = base_output.cumulative_text
 
                 # DELTA mode: drain modality keys (e.g. audio) so the next
                 # step only sees freshly accumulated data for those keys.

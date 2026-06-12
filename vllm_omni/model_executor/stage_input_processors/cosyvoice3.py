@@ -17,6 +17,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.cosyvoice3.utils import unpad_prompt_conditioning
 
 logger = init_logger(__name__)
 
@@ -193,7 +194,8 @@ def talker2code2wav_async_chunk(
                 info = _decode_additional_information(getattr(request, "additional_information", None))
                 info_embed = info.get("embed", {}) if isinstance(info, dict) else {}
                 prompt_payload = {}
-                for key in ("speech_token", "speech_feat", "embedding"):
+                cond_keys = ("speech_token", "speech_feat", "embedding", "speech_token_len")
+                for key in cond_keys:
                     value = _to_cpu_tensor(info_embed.get(key))
                     if value is not None:
                         prompt_payload[key] = value
@@ -201,12 +203,24 @@ def talker2code2wav_async_chunk(
                     mm_embed = multimodal_output.get("embed", {})
                     if not isinstance(mm_embed, Mapping):
                         mm_embed = multimodal_output
-                    for key in ("speech_token", "speech_feat", "embedding"):
+                    for key in cond_keys:
                         if key in prompt_payload:
                             continue
                         value = _to_cpu_tensor(mm_embed.get(key))
                         if value is not None:
                             prompt_payload[key] = value
+                # Drop any right-padding carried from batched talker emission so
+                # the chunk-routing math (prompt_token_len) and the conditioning
+                # sent to code2wav use the true prompt length.
+                if "speech_token" in prompt_payload:
+                    st_unpad, sf_unpad = unpad_prompt_conditioning(
+                        prompt_payload.get("speech_token"),
+                        prompt_payload.get("speech_feat"),
+                        prompt_payload.pop("speech_token_len", None),
+                    )
+                    prompt_payload["speech_token"] = st_unpad
+                    if sf_unpad is not None:
+                        prompt_payload["speech_feat"] = sf_unpad
                 prompt_token = prompt_payload.get("speech_token")
                 prompt_token_len = (
                     int(prompt_token.shape[1])

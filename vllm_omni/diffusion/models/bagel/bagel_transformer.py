@@ -1749,12 +1749,12 @@ class Bagel(nn.Module):
                 trajectory_latents.append(x_t.clone())
             for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-            if frame_condition_token_indexes is not None:
-                # Cond positions stay at t=0 (clean signal).  Matches upstream
-                # PR #33 lance.py line 1605:
-                #     timestep[current_vae_mse_indexes_local_in_vae] = t
-                # (cond positions remain at the ``torch.zeros`` init value).
-                timestep[frame_condition_token_indexes] = 0.0
+                if frame_condition_token_indexes is not None:
+                    # Cond positions stay at t=0 (clean signal).  Matches upstream
+                    # PR #33 lance.py line 1605:
+                    #     timestep[current_vae_mse_indexes_local_in_vae] = t
+                    # (cond positions remain at the ``torch.zeros`` init value).
+                    timestep[frame_condition_token_indexes] = 0.0
                 in_cfg_window = t > cfg_interval[0] and t <= cfg_interval[1]
                 cfg_text_scale_ = cfg_text_scale if in_cfg_window else 1.0
                 cfg_img_scale_ = cfg_img_scale if in_cfg_window else 1.0
@@ -1818,12 +1818,12 @@ class Bagel(nn.Module):
                 trajectory_latents.append(x_t.clone())
             for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-            if frame_condition_token_indexes is not None:
-                # Cond positions stay at t=0 (clean signal).  Matches upstream
-                # PR #33 lance.py line 1605:
-                #     timestep[current_vae_mse_indexes_local_in_vae] = t
-                # (cond positions remain at the ``torch.zeros`` init value).
-                timestep[frame_condition_token_indexes] = 0.0
+                if frame_condition_token_indexes is not None:
+                    # Cond positions stay at t=0 (clean signal).  Matches upstream
+                    # PR #33 lance.py line 1605:
+                    #     timestep[current_vae_mse_indexes_local_in_vae] = t
+                    # (cond positions remain at the ``torch.zeros`` init value).
+                    timestep[frame_condition_token_indexes] = 0.0
                 v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,

@@ -1473,6 +1473,8 @@ class OpenAIClientHandler:
 
         - ``send_frames``: optional ``str`` or sequence of ``str`` raw WebSocket text frames (omit when the server
           speaks first, e.g. ``/v1/realtime`` rejection path).
+        - ``ws_skip_types``: optional event ``type`` strings to ignore while waiting for the first matching frame
+          (e.g. ``["session.created"]`` on ``/v1/realtime``).
         - ``timeout``: seconds to wait for the first inbound text frame (default ``120``).
         - ``ws_max_size``: passed through as ``max_size`` to :func:`websockets.connect` when the key is present.
         """
@@ -1486,6 +1488,7 @@ class OpenAIClientHandler:
 
         timeout = float(cfg.get("timeout", 120.0))
         uri = self._build_ws_url(path)
+        skip_types = set(cfg.get("ws_skip_types") or [])
 
         connect_kw: dict[str, Any] = {}
         if "ws_max_size" in cfg:
@@ -1497,16 +1500,19 @@ class OpenAIClientHandler:
             async with websockets.connect(uri, **connect_kw) as ws:
                 for frame in frames:
                     await ws.send(frame)
-                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                if not isinstance(raw, str):
-                    raise AssertionError(f"Expected JSON text frame from {uri}, got {type(raw).__name__}")
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise AssertionError(f"Expected JSON text frame from {uri}, body={raw[:500]!r}") from exc
-                if not isinstance(data, dict):
-                    raise AssertionError(f"Expected JSON object from {uri}, got {type(data).__name__}")
-                return WebSocketJsonResponse(json_body=data)
+                while True:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                    if not isinstance(raw, str):
+                        raise AssertionError(f"Expected JSON text frame from {uri}, got {type(raw).__name__}")
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        raise AssertionError(f"Expected JSON text frame from {uri}, body={raw[:500]!r}") from exc
+                    if not isinstance(data, dict):
+                        raise AssertionError(f"Expected JSON object from {uri}, got {type(data).__name__}")
+                    if skip_types and data.get("type") in skip_types:
+                        continue
+                    return WebSocketJsonResponse(json_body=data)
 
         resp = asyncio.run(_recv_first_json_object())
         _run_ws_expectations_from_request_config(cfg, resp)
@@ -1767,7 +1773,16 @@ class OpenAIClientHandler:
         # Qwen3-TTS custom fields, forwarded via extra_body.
         extra_body: dict[str, Any] = {}
         # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
-        for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens", "seed"):
+        for key in (
+            "task_type",
+            "ref_text",
+            "ref_audio",
+            "language",
+            "max_new_tokens",
+            "seed",
+            "instructions",
+            "speed",
+        ):
             if key in request_config:
                 extra_body[key] = request_config[key]
 

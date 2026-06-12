@@ -73,6 +73,8 @@ class UnregisterRemoteReplicaMessage(EngineQueueMessage, kw_only=True):
 class ErrorMessage(EngineQueueMessage, kw_only=True):
     type: Literal["error"] = "error"
     error: str
+    status_code: int | None = None
+    error_type: str | None = None
     fatal: bool = False
     request_id: str | None = None
     stage_id: int | None = None
