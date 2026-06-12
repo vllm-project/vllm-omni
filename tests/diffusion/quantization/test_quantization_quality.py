@@ -538,7 +538,7 @@ def test_quantization_quality(config: QualityTestConfig, request: pytest.Fixture
     if quantization is None:
         omni_qt = Omni(model=config.quantized_ref())
     else:
-        omni_qt = Omni(model=config.quantized_ref(), quantization_config=quantization)
+        omni_qt = Omni(model=config.quantized_ref(), diffusion_quantization_config=quantization)
 
     quant_out, qt_mem = generate_fn(omni_qt, config)
     omni_qt.shutdown()
