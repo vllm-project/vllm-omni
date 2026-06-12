@@ -11,10 +11,12 @@ Public API:
 * :func:`build_forced_aligner_config` — CLI args -> ``ForcedAlignerConfig``
   (``None`` means the feature is off).
 * :func:`align` — returns ``list[WordTimestamp]`` on success, ``[]`` for
-  silence / no aligned tokens, ``None`` on failure. It never raises (any
-  load or decode error is caught and returned as ``None``); the streaming
-  layer maps ``None`` to JSON ``timestamps: null`` and always keeps audio
-  flowing. ``None`` vs ``[]`` lets clients tell "failed" from "no speech".
+  silence / no aligned tokens, ``None`` on a per-request decode failure
+  (the streaming layer maps ``None`` to JSON ``timestamps: null`` and keeps
+  audio flowing; ``None`` vs ``[]`` lets clients tell "failed" from "no
+  speech"). Raises :class:`ForcedAlignerLoadError` if the model/config can't
+  be loaded, so callers report that once instead of degrading every request.
+  Calls serialize on an internal lock (the offline LLM isn't thread-safe).
 """
 
 from __future__ import annotations
@@ -104,10 +106,22 @@ def build_forced_aligner_config(args: Any) -> ForcedAlignerConfig | None:
     return ForcedAlignerConfig(**{k: v for k, v in config_data.items() if k in allowed})
 
 
+class ForcedAlignerLoadError(RuntimeError):
+    """The aligner model/config could not be loaded (permanent until restart).
+
+    Distinguished from a per-request alignment failure so the streaming layer
+    can report a clear reason once rather than degrading every request to
+    ``timestamps: null``.
+    """
+
+
 # --- Singleton state ---
-# A single LLM serves the whole API server. The lock guards the lazy
-# constructor; once `_llm` is set, callers can read it lock-free.
+# A single LLM serves the whole API server. ``_lock`` guards the lazy
+# constructor; ``_encode_lock`` serializes ``encode`` because the offline
+# ``vllm.LLM`` is a sync batch interface that is not safe to call from multiple
+# threads at once (concurrent WebSocket sessions otherwise race the engine).
 _lock = threading.Lock()
+_encode_lock = asyncio.Lock()
 _llm: Any = None
 _classify_num: int | None = None
 _timestamp_token_id: int | None = None
@@ -138,13 +152,28 @@ async def align(
 
     Returns:
         List of :class:`WordTimestamp` on success (possibly empty for
-        silence / no aligned tokens), ``None`` if alignment failed.
+        silence / no aligned tokens), ``None`` on a per-request alignment
+        failure (decode error).
+
+    Raises:
+        ForcedAlignerLoadError: the model/config could not be loaded. This is
+            permanent until restart, so callers surface it once instead of
+            degrading every request to ``None``.
+
+    Calls serialize on ``_encode_lock``: the offline ``vllm.LLM.encode`` is a
+    sync batch interface and is not safe to run from multiple threads at once.
     """
-    try:
-        return await asyncio.to_thread(_align_sync, audio, text, sample_rate, config, language)
-    except Exception:  # noqa: BLE001
-        logger.exception("Forced aligner failed for text=%r", text)
-        return None
+    async with _encode_lock:
+        try:
+            await asyncio.to_thread(_ensure_loaded, config)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Forced aligner failed to load")
+            raise ForcedAlignerLoadError(str(exc)) from exc
+        try:
+            return await asyncio.to_thread(_align_sync, audio, text, sample_rate, config, language)
+        except Exception:  # noqa: BLE001
+            logger.exception("Forced aligner failed for text=%r", text)
+            return None
 
 
 def _align_sync(
@@ -224,9 +253,7 @@ def _ensure_loaded(config: ForcedAlignerConfig) -> None:
             return  # raced; another caller did the load
 
         # Lazy import: vllm pulls torch + CUDA, which we want to avoid at
-        # module import time. The aligner runs in-process, sharing the API
-        # server's visible device with the TTS stages.
-        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        # module import time.
         from vllm import LLM
 
         logger.info(
@@ -249,7 +276,20 @@ def _ensure_loaded(config: ForcedAlignerConfig) -> None:
             llm_kwargs["max_model_len"] = config.max_model_len
         llm_kwargs.update(config.extra_llm_kwargs)
 
-        llm = LLM(**llm_kwargs)
+        # Force the aligner engine in-process: in multiprocessing mode the
+        # token_classify ``pooling_output`` fails to round-trip over the
+        # engine-core IPC on current vLLM. Hard-set (not setdefault) so a
+        # globally exported ``=1`` can't push it into a subprocess; save/restore
+        # to avoid leaking the override to anything built later in this process.
+        prev_mp = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING")
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        try:
+            llm = LLM(**llm_kwargs)
+        finally:
+            if prev_mp is None:
+                os.environ.pop("VLLM_ENABLE_V1_MULTIPROCESSING", None)
+            else:
+                os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = prev_mp
 
         thinker_config = getattr(llm.llm_engine.model_config.hf_config, "thinker_config", None)
         if thinker_config is None or not hasattr(thinker_config, "classify_num"):
@@ -351,10 +391,13 @@ def _decode_timestamps(
     # pair ordered and stops one bad bin from corrupting neighbours.
     marker_ms = _processor.fix_timestamp([int(round(int(b) * bin_size_ms)) for b in bin_idx])
 
+    # The aligner can emit a final bin slightly past the real audio length;
+    # clamp so a word never reports an end beyond the sentence audio.
+    duration_ms = int(round(audio_duration_ms))
     out: list[WordTimestamp] = []
     for i, word in enumerate(words):
-        start_ms = marker_ms[i * 2]
-        end_ms = max(marker_ms[i * 2 + 1], start_ms)
+        start_ms = min(marker_ms[i * 2], duration_ms)
+        end_ms = min(max(marker_ms[i * 2 + 1], start_ms), duration_ms)
         out.append(WordTimestamp(word=word, start_ms=start_ms, end_ms=end_ms))
     return out
 

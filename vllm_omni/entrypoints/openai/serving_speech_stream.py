@@ -46,6 +46,7 @@ from vllm_omni.entrypoints.openai.text_splitter import (
     SPLIT_SENTENCE,
     SentenceSplitter,
 )
+from vllm_omni.utils.forced_aligner import ForcedAlignerLoadError
 from vllm_omni.utils.forced_aligner import align as forced_align
 
 logger = init_logger(__name__)
@@ -385,13 +386,19 @@ class OmniStreamingSpeechHandler:
                 await send_chunk(chunk, chunk_sample_rate, None, chunk_start_ms, chunk_end_ms)
 
         # Single alignment pass over the full sentence, then emit timestamps.
-        timestamps_payload = await self._align_sentence(
-            audio=bytes(sentence_audio),
-            text=sentence_text,
-            sample_rate=sample_rate,
-            config=aligner_config,
-            language=language,
-        )
+        # A load/config failure is permanent, so surface the reason once; audio
+        # has already streamed, so the trailing frame still carries null.
+        try:
+            timestamps_payload = await self._align_sentence(
+                audio=bytes(sentence_audio),
+                text=sentence_text,
+                sample_rate=sample_rate,
+                config=aligner_config,
+                language=language,
+            )
+        except ForcedAlignerLoadError as exc:
+            await self._send_error(websocket, f"forced aligner unavailable: {exc}")
+            timestamps_payload = None
         sentence_end_ms = int(round((len(sentence_audio) / 2 / sample_rate) * 1000.0))
         await send_chunk(b"", sample_rate, timestamps_payload, 0, sentence_end_ms)
 
