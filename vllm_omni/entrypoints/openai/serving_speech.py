@@ -405,9 +405,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def __init__(self, *args, **kwargs):
         self.model_name = kwargs.pop("model_name", None)
-        # Forced aligner config (issue #3631). ``None`` keeps the
-        # default-off path; the streaming handler also checks this and
-        # rejects ``word_timestamps=true`` requests with a clear error.
         self.forced_aligner_config: Any | None = kwargs.pop("forced_aligner_config", None)
         super().__init__(*args, **kwargs)
         self._init_speaker_storage()

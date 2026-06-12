@@ -17,27 +17,14 @@ Protocol:
         {"type": "session.done", "total_sentences": N}
         {"type": "error", "message": "..."}
 
-    Server -> Client (when word_timestamps=true, issue #3631):
-        {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm",
-         "word_timestamps": true}
-        {"type": "audio.chunk", "sentence_index": 0, "chunk_id": 0,
-         "sample_rate": 24000,
-         "audio_b64": "<base64 PCM>",
-         "timestamps": [{"word": "...", "start_ms": ..., "end_ms": ...}, ...] | null}
-        {"type": "audio.done", "sentence_index": 0}
+    Server -> Client (when word_timestamps=true):
+        {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm"}
+        {"type": "audio.chunk", "sentence_index": 0, "chunk_id": 0, "audio_b64": "<base64 PCM>", "timestamps": null}
         ...
-
-    Notes on the timestamps path (sentence-level, issue #3631):
-      - Audio chunks stream in real-time, each carrying ``timestamps: null``.
-        The server buffers the sentence audio and, once generation finishes,
-        runs the forced aligner once on the whole sentence. It then emits a
-        final ``audio.chunk`` frame (empty ``audio_b64``) whose ``timestamps``
-        array holds the complete word-level alignment. Offsets are
-        sentence-relative.
-      - timestamps: []   -> aligner ran successfully but produced no
-                            tokens (silence / empty sentence).
-      - timestamps: null -> aligner failed (decode error, timeout, model
-                            unavailable). Audio is always sent regardless.
+        {"type": "audio.chunk", "audio_b64": "", "timestamps": [{"word", "start_ms", "end_ms"}, ...]}
+        {"type": "audio.done", "sentence_index": 0}
+        # Audio is JSON base64 PCM (not binary). A trailing empty-audio chunk carries the
+        # full sentence-relative alignment. timestamps: list = aligned, [] = silence, null = failed.
 """
 
 import asyncio
@@ -235,9 +222,7 @@ class OmniStreamingSpeechHandler:
         """Generate audio for a single sentence and send it over WebSocket."""
         response_format = config.response_format or "wav"
 
-        # Word-timestamps preconditions (issue #3631). Reject early so
-        # the client gets a clear server-side reason rather than a
-        # silent fallback or weird mode interaction.
+        # Reject unmet word-timestamps preconditions early with a clear reason.
         if config.word_timestamps:
             if self._speech_service.forced_aligner_config is None:
                 await self._send_error(
@@ -347,22 +332,11 @@ class OmniStreamingSpeechHandler:
     ) -> int:
         """Stream PCM as JSON ``audio.chunk`` frames, aligned per sentence.
 
-        Flow (sentence-level, issue #3631): forward each PCM chunk to the
-        client as soon as it is produced (so audio stays real-time, each
-        frame carries ``timestamps: null``), while buffering the sentence
-        audio in memory. Once generation finishes, run the forced aligner
-        exactly once on the whole sentence and emit a final ``audio.chunk``
-        frame (empty audio) carrying the complete word-level timestamps.
-
-        This trades first-timestamp latency (timestamps arrive only after the
-        sentence completes) for a stable, single-pass alignment that avoids
-        the jitter and re-alignment cost of prefix-incremental decoding. A
-        low-latency incremental variant can layer on top later.
-
-        Failure handling preserves the contract that audio always flows:
-        an alignment failure surfaces as ``timestamps: null``;
-        the empty-tokens case (silence) surfaces as ``timestamps: []`` so
-        clients can tell the two apart.
+        Forward each PCM chunk live (``timestamps: null``) while buffering the
+        sentence audio, then run the forced aligner once over the whole
+        sentence and emit a final empty-audio ``audio.chunk`` with the word
+        timestamps. On aligner failure timestamps is ``null``; for silence it
+        is ``[]`` (audio always flows regardless).
         """
         aligner_config = self._speech_service.forced_aligner_config
         assert aligner_config is not None  # gated by the precondition check
@@ -432,12 +406,10 @@ class OmniStreamingSpeechHandler:
         config,
         language: str | None = None,
     ) -> list[dict] | None:
-        """Align a whole sentence and return monotonic word timestamps.
+        """Align a whole sentence into monotonic word timestamps.
 
-        Returns ``None`` when the aligner fails (clients render this as
-        "timestamps unavailable"); an empty list means the aligner ran but
-        produced no tokens. ``language`` is forwarded to the aligner's word
-        segmentation (see :func:`forced_align`).
+        Returns ``None`` on aligner failure, ``[]`` when it ran but produced
+        no tokens. ``language`` is forwarded to word segmentation.
         """
         aligned = await forced_align(
             audio=audio,
@@ -451,14 +423,11 @@ class OmniStreamingSpeechHandler:
 
         timestamps_payload: list[dict] = []
         for ts in aligned:
+            # Clamp so intervals stay non-overlapping and end_ms >= start_ms,
+            # even if the aligner emits a word behind the previous one.
             start_ms = ts.start_ms
-            # Keep timestamps non-overlapping even if the aligner emits a
-            # word whose start dips below the previous word's end.
             if timestamps_payload and start_ms < timestamps_payload[-1]["end_ms"]:
                 start_ms = timestamps_payload[-1]["end_ms"]
-            # After clamping the start, the end may now precede it (the aligner
-            # can emit an interval fully behind the previous word). Clamp the
-            # end up too so the frame never carries end_ms < start_ms.
             end_ms = max(ts.end_ms, start_ms)
             timestamps_payload.append(
                 {

@@ -9,7 +9,7 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Qwen3 forced-aligner text/timestamp processor (issue #3631).
+"""Qwen3 forced-aligner text/timestamp processor.
 
 This is the model-specific half of upstream's ``Qwen3ForceAlignProcessor``:
 it turns text into the aligner's word units and prompt, repairs the predicted

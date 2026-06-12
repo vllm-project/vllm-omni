@@ -1,4 +1,4 @@
-"""Gradio demo for streaming TTS word-level timestamps (issue #3631).
+"""Gradio demo for streaming TTS word-level timestamps.
 
 Connects to the WebSocket endpoint ``/v1/audio/speech/stream`` with
 ``word_timestamps: true`` and visualizes the alignment: each sentence's
@@ -7,7 +7,7 @@ inline word spans, the current word highlighting as ``audio.currentTime``
 crosses each ``start_ms``.
 
 A "Stop (barge-in)" button cuts playback and reports the last-spoken word,
-demonstrating the voice-agent barge-in use case from issue #3631.
+demonstrating the voice-agent barge-in use case.
 
 Timestamps are sentence-level: audio streams in real time, then the forced
 aligner runs once per sentence and the complete word timestamps arrive in a

@@ -531,8 +531,7 @@ python qwen3_tts/word_timestamps_demo.py --api-base http://localhost:8091
 Each sentence's audio plays in an `<audio>` element while its text is rendered
 as inline word spans; the current word highlights as `audio.currentTime`
 crosses each `start_ms`. The **Stop (barge-in)** button cuts playback and
-reports the last-spoken word — the voice-agent barge-in case from
-[#3631](https://github.com/vllm-project/vllm-omni/issues/3631).
+reports the last-spoken word, useful for the voice-agent barge-in case.
 
 ### Gradio demos
 ```bash

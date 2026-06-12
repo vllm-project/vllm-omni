@@ -44,27 +44,6 @@ def _normalize_speaker_embedding_value(value):
     return [float(x) for x in value]
 
 
-class WordTimestamp(BaseModel):
-    """One aligned word emitted alongside a streaming TTS audio chunk.
-
-    Time offsets are millisecond-resolution from the start of the
-    parent sentence (not from the start of the session). For CJK input
-    the streaming layer keeps character granularity by default; clients
-    that prefer word-level grouping should join consecutive entries
-    themselves.
-    """
-
-    word: str = Field(description="Aligned token (word for spaced languages, character for CJK).")
-    start_ms: int = Field(ge=0, description="Start offset within the sentence, milliseconds.")
-    end_ms: int = Field(ge=0, description="End offset within the sentence, milliseconds (>= start_ms).")
-
-    @model_validator(mode="after")
-    def _validate_range(self) -> "WordTimestamp":
-        if self.end_ms < self.start_ms:
-            raise ValueError(f"end_ms ({self.end_ms}) must be >= start_ms ({self.start_ms})")
-        return self
-
-
 class OpenAICreateSpeechRequest(BaseModel):
     input: str
     model: str | None = None

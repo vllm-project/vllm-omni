@@ -1,53 +1,19 @@
-# Reference deployment knobs for Qwen/Qwen3-ForcedAligner-0.6B running
-# alongside a TTS pipeline (issue #3631).
+# Reference deploy knobs for Qwen/Qwen3-ForcedAligner-0.6B, the shared forced
+# aligner for streaming TTS word timestamps. Pass with --forced-aligner-config;
+# --forced-aligner overrides the model path without editing this file.
 #
-# Pass this file with --forced-aligner-config to enable the feature and
-# configure the shared forced aligner. Use --forced-aligner to override the
-# model path without editing this YAML.
-#
-# vLLM runs the aligner as:
-#     LLM(
-#         model="Qwen/Qwen3-ForcedAligner-0.6B",
-#         runner="pooling",
-#         hf_overrides={
-#             "architectures": ["Qwen3ASRForcedAlignerForTokenClassification"]
-#         },
-#         ...
-#     )
-# and requests use pooling_task="token_classify".
+# Run as LLM(runner="pooling") with pooling_task="token_classify". Prompt tokens,
+# chat template and word segmentation are Qwen-specific and live in
+# qwen3_force_align_processor (not configurable here).
 
 forced_aligner:
-  # Aligner checkpoint. Override with --forced-aligner for local paths.
   model: Qwen/Qwen3-ForcedAligner-0.6B
-
-  # vLLM runner and HF architecture override for Qwen3 forced aligner.
   runner: pooling
   architecture: Qwen3ASRForcedAlignerForTokenClassification
   pooling_task: token_classify
-  # Note: the prompt tokens (audio placeholder, <timestamp> marker) are not
-  # configurable here — they are baked into qwen3_force_align_processor
-  # alongside the Qwen-specific chat template and word segmentation.
-  #
-  # Word segmentation: the built-in port handles space-delimited and
-  # Chinese-mixed text exactly; install `vllm-omni[forced-aligner]`
-  # (pulls qwen-asr) for faithful Japanese/Korean tokenisation. The language
-  # is taken per-request from the streaming session config ("language" field;
-  # default auto -> space path).
 
-  # GPU memory cap for the aligner LLM. The aligner runs in the API
-  # server process, so by default it carves into the same GPU (cuda:0)
-  # as the TTS workers. Set conservatively for the smallest deployment
-  # target (24 GB consumer cards); raise on H100-class boxes.
-  # Override with --forced-aligner-gpu-memory-utilization.
   gpu_memory_utilization: 0.30
 
-  # FP16 for compute, BF16 also fine on Hopper. The classifier head
-  # uses model dtype (not head_dtype) so this choice flows through.
   dtype: bfloat16
-
-  # Aligner sees one prompt at a time (one request -> one chunk -> one
-  # forward) so a tight max_model_len is enough.
   max_model_len: 4096
-
-  # Required for tokenizers shipped with code in the repo.
   trust_remote_code: true

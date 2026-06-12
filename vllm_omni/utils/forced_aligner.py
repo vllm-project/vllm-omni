@@ -1,42 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Shared forced aligner utility for streaming TTS word timestamps (issue #3631).
+"""Shared forced aligner for streaming TTS word timestamps.
 
-Hosts a single in-process ``vllm.LLM(runner="pooling")`` running upstream's
-:class:`vllm.model_executor.models.qwen3_asr_forced_aligner.\
-Qwen3ASRForcedAlignerForTokenClassification`. The whole TTS frontend
-shares one instance — the aligner is always the slowest path in the
-audio request, so a single GPU-resident model is enough.
+Hosts one in-process ``vllm.LLM(runner="pooling")`` (upstream's
+``Qwen3ASRForcedAlignerForTokenClassification``), shared by the whole TTS
+frontend and lazy-loaded on first use. ``llm.encode`` is sync/blocking, so
+:func:`align` wraps it in ``asyncio.to_thread`` to keep the event loop free.
 
-Public API
-----------
-* :func:`build_forced_aligner_config` — projects CLI args into a
-  ``ForcedAlignerConfig | None``. ``None`` means "feature off".
-* :func:`align` — async wrapper around ``llm.encode``; lazy-loads the
-  underlying ``vllm.LLM`` on first call. Returns ``list[WordTimestamp]``
-  on success, ``[]`` for silence/no aligned tokens, ``None`` when
-  alignment failed (the streaming layer maps this to JSON
-  ``timestamps: null`` and keeps audio flowing).
-
-Why a single shared utility, not a subprocess
----------------------------------------------
-* The model card says ``LLM(runner="pooling")`` is the canonical
-  interface; we just consume it.
-* ``llm.encode`` is sync + blocking. We wrap it in ``asyncio.to_thread``
-  so the event loop stays responsive without spawning a process.
-* PR-2 (later, optional) can move the aligner into the vllm-omni stage
-  pipeline; the public surface here stays the same.
-
-Failure semantics
------------------
-* On startup failure (model not found, OOM): the first call to
-  :func:`align` raises; the streaming layer catches and degrades to
-  ``timestamps: null`` for that request, then disables alignment for
-  the rest of it. Subsequent requests retry from scratch.
-* On per-request failure (decoding error, model spit out empty result):
-  ``align`` returns ``None`` (failure) or ``[]`` (silence). The two are
-  intentionally distinguishable so clients can tell "no speech" from
-  "alignment failed".
+Public API:
+* :func:`build_forced_aligner_config` — CLI args -> ``ForcedAlignerConfig``
+  (``None`` means the feature is off).
+* :func:`align` — returns ``list[WordTimestamp]`` on success, ``[]`` for
+  silence / no aligned tokens, ``None`` on failure. It never raises (any
+  load or decode error is caught and returned as ``None``); the streaming
+  layer maps ``None`` to JSON ``timestamps: null`` and always keeps audio
+  flowing. ``None`` vs ``[]`` lets clients tell "failed" from "no speech".
 """
 
 from __future__ import annotations
@@ -62,9 +40,8 @@ _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "deploy" / "qwen3_t
 
 @dataclass(frozen=True, slots=True)
 class WordTimestamp:
-    """Internal alignment record. Converted to the pydantic
-    :class:`vllm_omni.entrypoints.openai.protocol.audio.WordTimestamp`
-    at the HTTP/WebSocket boundary.
+    """Internal alignment record. Serialized to a plain JSON object
+    (``{"word", "start_ms", "end_ms"}``) at the WebSocket boundary.
     """
 
     word: str

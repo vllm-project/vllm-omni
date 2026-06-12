@@ -169,7 +169,7 @@ class OmniEngineArgs(EngineArgs):
             )
         except argparse.ArgumentError:
             pass
-        # Forced aligner / word timestamps (issue #3631). Single flag;
+        # Forced aligner / word timestamps. Single flag;
         # passing a model path enables the feature, omitting disables.
         try:
             parser.add_argument(
