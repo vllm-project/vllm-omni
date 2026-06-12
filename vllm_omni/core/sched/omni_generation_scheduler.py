@@ -562,10 +562,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
-                num_cached = request.num_cached_tokens
-                if num_cached < 0:
-                    logger.warning("Negative num_cached_tokens (%d) for request %s, clamping to 0", num_cached, req_id)
-                    num_cached = 0
                 outputs[request.client_index].append(
                     OmniEngineCoreOutput(
                         request_id=req_id,

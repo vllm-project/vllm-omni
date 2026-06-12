@@ -742,7 +742,6 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
         status=RequestStatus.RUNNING,
         is_finished=lambda: False,
         num_computed_tokens=10,
-        num_cached_tokens=0,
         num_prompt_tokens=10,
         prompt_token_ids=list(range(10)),
         num_output_placeholders=0,

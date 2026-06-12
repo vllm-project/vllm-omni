@@ -869,84 +869,44 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
     @staticmethod
     def _resolve_req_hidden_states(
-        hidden_states_cpu: torch.Tensor,
+        hidden_states_cpu: torch.Tensor | None,
         combined_hidden_states: dict[str, torch.Tensor] | None,
         rid: str,
         start: int,
         end: int,
-    ):
+    ) -> torch.Tensor | None:
         if combined_hidden_states is not None:
             # We always have all request IDs for prefix cache, even for
             # partial cache misses, so this should never happen.
             if rid not in combined_hidden_states:
                 raise RuntimeError("Request IDs in the batch are missing from the merged states!")
             return combined_hidden_states[rid]
-        # Prefix caching is disabled
+        # Prefix caching is disabled. hidden_states_cpu may legitimately be
+        # None (e.g. sparse audio output or no scheduled hidden payload);
+        # callers must omit the "hidden" key in that case.
+        if hidden_states_cpu is None:
+            return None
         return hidden_states_cpu[start:end]
 
     def _build_multimodal_outputs(
         self,
-        req_ids: list[str],
-        req_id_to_index: dict[str, int],
-        hidden_states_cpu: torch.Tensor,
-        num_scheduled_tokens_np: np.ndarray,
-        combined_hidden_states: dict[str, torch.Tensor] | None,
-        combined_multimodal_outputs: dict[str, dict[str, object]] | None,
-        mm_cpu: dict[str, object],
-        seq_len: int,
-    ) -> list[dict[str, object]] | None:
-        """Build per-request multimodal output payloads (dedicated channel)."""
+        per_req_payloads: list[dict[str, object]] | None,
+    ) -> list[dict[str, torch.Tensor]] | None:
+        """Build per-request multimodal output payloads (dedicated channel).
+
+        Reuses the per-request payloads assembled by the pooler-payload loop
+        in sample_tokens() (which already handles prefix-cache merging,
+        sparse audio output, and partial downstream batches) so the wire
+        channel stays consistent with the full-payload accumulation path.
+        Enforces the tensor-only invariant required by msgspec: scalars and
+        lists are wrapped into tensors, and anything that cannot be safely
+        converted is dropped.
+        """
         if self.vllm_config.model_config.engine_output_type == "text":
             return None
-
-        query_start_loc_cpu = self.query_start_loc.cpu
-        if callable(query_start_loc_cpu):
-            query_start_loc_cpu = query_start_loc_cpu()
-
-        results: list[dict[str, object]] = []
-        for rid in req_ids:
-            idx = req_id_to_index[rid]
-            start = int(query_start_loc_cpu[idx])
-            sched = int(num_scheduled_tokens_np[idx])
-            end = start + sched
-
-            req_hidden_states = self._resolve_req_hidden_states(
-                hidden_states_cpu,
-                combined_hidden_states,
-                rid,
-                start,
-                end,
-            )
-            payload: dict[str, object] = {"hidden": req_hidden_states}
-
-            mm_payload: dict[str, object] = {}
-            if combined_multimodal_outputs or mm_cpu:
-                if combined_multimodal_outputs:
-                    for mm_key in combined_multimodal_outputs.keys():
-                        value = combined_multimodal_outputs[mm_key][rid]
-                        if isinstance(value, list):
-                            mm_payload[mm_key] = value[idx] if idx < len(value) else value[0]
-                        else:
-                            mm_payload[mm_key] = value
-                else:
-                    for mm_key, mm_val in mm_cpu.items():
-                        mm_payload[mm_key] = to_payload_element(
-                            element=mm_val,
-                            idx=idx,
-                            start=start,
-                            end=end,
-                            pass_lists_through=False,
-                            seq_len=seq_len,
-                        )
-                payload.update(mm_payload)
-            # Flatten nested dicts to dotted keys so multimodal_outputs
-            # stays dict[str, torch.Tensor] for msgspec serialization.
-            flat = flatten_payload(payload)
-            # Enforce tensor-only invariant on the wire: wrap scalars/lists
-            # into tensors so msgspec can reconstruct them, and drop
-            # anything that cannot be safely converted.
-            results.append(_ensure_tensor_values(flat))
-        return results
+        if per_req_payloads is None:
+            return None
+        return [_ensure_tensor_values(payload) if payload else {} for payload in per_req_payloads]
 
     @torch.inference_mode()
     def sample_tokens(
@@ -1214,7 +1174,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                             start,
                             end,
                         )
-                    payload["hidden"] = req_hidden_states
+                    if req_hidden_states is not None:
+                        payload["hidden"] = req_hidden_states
 
                 mm_payload: dict[str, object] = {}
                 if combined_multimodal_outputs or mm_cpu:
@@ -1267,16 +1228,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 if req_state is not None and pooler_output[i]:
                     self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
 
-        multimodal_outputs = self._build_multimodal_outputs(
-            req_ids=req_ids_output_copy,
-            req_id_to_index=req_id_to_index_output_copy,
-            hidden_states_cpu=hidden_states_cpu,
-            num_scheduled_tokens_np=num_scheduled_tokens_np,
-            combined_hidden_states=combined_hidden_states,
-            combined_multimodal_outputs=combined_multimodal_outputs,
-            mm_cpu=mm_cpu,
-            seq_len=seq_len,
-        )
+        multimodal_outputs = self._build_multimodal_outputs(pooler_output)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_lists = None
             if self.routed_experts_initialized:
