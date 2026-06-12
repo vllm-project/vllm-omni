@@ -1,12 +1,7 @@
-# HunyuanImage-3.0-Instruct deploy: AR (stage 0) + DiT (stage 1)
-# with AR-to-DiT KV reuse, plus async KV H2D copy enabled on the DiT stage.
+# HunyuanImage-3.0 deploy: AR (stage 0) + DiT (stage 1)
+# with AR-to-DiT KV reuse, plus async KV H2D copy and background prefetch.
 #
-# Same topology as hunyuan_image_3_moe.yaml. The only difference is the DiT
-# stage (stage 1) sets `enable_kv_async_copy: true`: the received AR KV
-# pinned-pool -> GPU copy runs on a dedicated CUDA stream and overlaps
-# host-side setup before forward instead of blocking the main thread (~51ms).
-# Stage 1 is the one that receives KV (need_recv_cache + input_connectors),
-# so it is where the flag has effect.
+#  The DiT stage (stage 1) sets both `enable_kv_async_copy: true`  and `enable_kv_async_prefetch: true` .
 #
 # The base CUDA layout uses 2 GPUs for AR and 2 GPUs for DiT.
 pipeline: hunyuan_image_3_moe
@@ -76,9 +71,8 @@ stages:
     enforce_eager: true
     devices: "2,3"
     distributed_executor_backend: "mp"
-    # DiT receives AR KV (need_recv_cache below): overlap its pinned-pool -> GPU
-    # copy on a dedicated stream. Platform overrides inherit this from the base.
     enable_kv_async_copy: true
+    enable_kv_async_prefetch: true
     omni_kv_config:
       need_recv_cache: true
     parallel_config:
