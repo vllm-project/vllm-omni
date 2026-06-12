@@ -45,10 +45,10 @@ class StorageBaseManager(Generic[K], ABC):
     async def delete(self, *args, **kwargs) -> bool:
         pass
 
-    def start(self, *args, **kwargs):
+    async def start(self, *args, **kwargs) -> None:
         pass
 
-    def stop(self, *args, **kwargs):
+    async def stop(self, *args, **kwargs) -> None:
         pass
 
     @abstractmethod
@@ -144,7 +144,7 @@ class LocalStorageTTLManager(LocalStorageManager):
                 if entry.stat(follow_symlinks=False).st_mtime < cutoff:
                     expired.append(entry.path)
             except FileNotFoundError:
-                pass
+                logger.debug("TTL sweep skipped %s; file removed during scan", entry.path)
             except OSError:
                 logger.warning("TTL sweep failed to inspect %s", entry.path, exc_info=True)
 
@@ -160,7 +160,7 @@ class LocalStorageTTLManager(LocalStorageManager):
                     await asyncio.to_thread(os.remove, path)
                     deleted += 1
             except FileNotFoundError:
-                pass
+                logger.debug("TTL sweep skipped %s; file already removed", path)
             except OSError:
                 logger.warning("TTL sweep failed to delete expired file %s", path, exc_info=True)
 
@@ -175,7 +175,7 @@ class LocalStorageTTLManager(LocalStorageManager):
                 logger.exception("TTL sweep failed for storage path %s", self.storage_path)
             await asyncio.sleep(self._sweep_interval_seconds)
 
-    def start(self) -> None:
+    async def start(self) -> None:
         if self._sweeper_task is None or self._sweeper_task.done():
             self._sweeper_task = asyncio.create_task(self._sweep_loop())
 

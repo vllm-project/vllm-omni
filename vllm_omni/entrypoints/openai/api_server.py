@@ -459,7 +459,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         await omni_init_app_state(engine_client, app.state, args)
 
         # Start background processes
-        STORAGE_MANAGER.start()
+        await STORAGE_MANAGER.start()
 
         # Conditionally register profiler endpoints based on stage YAML configs
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
