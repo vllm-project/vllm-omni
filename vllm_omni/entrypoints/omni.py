@@ -25,7 +25,7 @@ logger = init_logger(__name__)
 class Omni(OmniBase):
     """Synchronous entrypoint for offline generation."""
 
-    def _set_final_only_for_llm_stages(
+    def _maybe_force_final_only_for_llm_stages(
         self,
         sampling_params_list: Sequence[OmniSamplingParams],
     ) -> list[OmniSamplingParams]:
@@ -112,7 +112,7 @@ class Omni(OmniBase):
         use_tqdm: bool | Callable[..., tqdm] = True,
     ) -> Generator[OmniRequestOutput, None, None]:
         try:
-            sampling_params_list = self._set_final_only_for_llm_stages(sampling_params_list)
+            sampling_params_list = self._maybe_force_final_only_for_llm_stages(sampling_params_list)
 
             if isinstance(prompts, str) or not isinstance(prompts, Sequence):
                 request_prompts: list[OmniPromptType] = [prompts]
