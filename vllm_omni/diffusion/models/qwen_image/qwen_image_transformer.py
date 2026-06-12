@@ -43,7 +43,6 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
-from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
@@ -538,8 +537,8 @@ class QwenImageCrossAttention(nn.Module):
         self.query_num_heads = self.to_qkv.num_heads
         self.kv_num_heads = self.to_qkv.num_kv_heads
 
-        self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q = nn.RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = nn.RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
         self.inner_dim = out_dim if out_dim is not None else head_dim * self.total_num_heads
 
@@ -576,8 +575,8 @@ class QwenImageCrossAttention(nn.Module):
             prefix=_join_prefix(prefix, "to_out"),
         )
 
-        self.norm_added_q = RMSNorm(head_dim, eps=eps)
-        self.norm_added_k = RMSNorm(head_dim, eps=eps)
+        self.norm_added_q = nn.RMSNorm(head_dim, eps=eps)
+        self.norm_added_k = nn.RMSNorm(head_dim, eps=eps)
 
         self.attn = Attention(
             num_heads=self.query_num_heads,
@@ -992,7 +991,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
             quant_config=quant_config,
         )
 
-        self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
+        self.txt_norm = nn.RMSNorm(joint_attention_dim, eps=1e-6)
 
         # Entry projections (image/text) are kept full precision —
         # small sensitive layers at the network boundary (see #2728).

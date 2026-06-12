@@ -9,6 +9,8 @@ Coverage:
 - Ulysses-SP
 - Ring-Attention
 - Layerwise Offloading
+- Hybrid Sharded Data Parallel
+- Tensor Parallelism + VAE Patch Parallelism
 
 assert_diffusion_response validates successful generation and the expected
 512x512 resolution.
@@ -38,12 +40,28 @@ BAGEL_HSDP_2_DEPLOY = modify_stage_config(
     BAGEL_CI_DEPLOY,
     updates={"stages": {0: {"devices": "0"}, 1: {"devices": "0,1"}}},
 )
+BAGEL_TP_VAE_PP_2_DEPLOY = modify_stage_config(
+    BAGEL_CI_DEPLOY,
+    updates={
+        "stages": {
+            0: {"devices": "0"},
+            1: {
+                "devices": "0,1",
+                "parallel_config": {
+                    "tensor_parallel_size": 2,
+                    "vae_patch_parallel_size": 2,
+                },
+            },
+        },
+    },
+)
 
 
 def _get_diffusion_feature_cases(model: str):
     """Return L4 diffusion feature cases for Bagel.
     TeaCache, Cache-DiT, CFG-Parallel,
-    Ulysses-SP, Ring-Attention, Layerwise Offloading.
+    Ulysses-SP, Ring-Attention, Layerwise Offloading,
+    Hybrid Sharded Data Parallel, Tensor Parallelism, VAE Patch Parallelism.
     """
 
     return [
@@ -135,6 +153,15 @@ def _get_diffusion_feature_cases(model: str):
             id="parallel_hsdp_2",
             marks=HSDP_2_FEATURE_MARKS,
         ),
+        # Tensor Parallelism (TP) + VAE Patch Parallelism (size=2)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                stage_config_path=BAGEL_TP_VAE_PP_2_DEPLOY,
+            ),
+            id="tp_vae_patch_parallel_2",
+            marks=PARALLEL_2_FEATURE_MARKS,
+        ),
     ]
 
 
@@ -157,6 +184,7 @@ def test_bagel(
     - Ring-Attention (degree=2)
     - Layerwise Offloading
     - Hybrid Sharded Data Parallel (size=2)
+    - Tensor Parallelism (TP) + VAE Patch Parallelism (size=2)
 
     Validation is delegated to assert_diffusion_response in tests/helpers/assertions.py,
     which checks output dimensions and basic correctness.

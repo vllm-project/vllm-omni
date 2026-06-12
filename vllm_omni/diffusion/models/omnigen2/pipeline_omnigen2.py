@@ -32,6 +32,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
     OmniGen2RotaryPosEmbed,
@@ -673,23 +674,40 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
             )
         ]
 
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the whole component set before any from_pretrained.
+        omnigen2_subfolders = ["scheduler", "vae", "mllm", "processor"]
+        prefetch_subfolders(model, omnigen2_subfolders, local_files_only=local_files_only)
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKL.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=omnigen2_subfolders,
+            local_files_only=local_files_only,
+        ).to(self.device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, OmniGen2Transformer2DModel)
         self.transformer = OmniGen2Transformer2DModel(
             **transformer_kwargs,
             quant_config=od_config.quantization_config,
         )
-        self.mllm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model, subfolder="mllm", local_files_only=local_files_only
+        self.mllm = from_pretrained_with_prefetch(
+            Qwen2_5_VLForConditionalGeneration.from_pretrained,
+            model,
+            subfolder="mllm",
+            prefetch_list=omnigen2_subfolders,
+            local_files_only=local_files_only,
         ).to(self.device)
-        self.processor = Qwen2_5_VLProcessor.from_pretrained(
-            model, subfolder="processor", local_files_only=local_files_only
+        self.processor = from_pretrained_with_prefetch(
+            Qwen2_5_VLProcessor.from_pretrained,
+            model,
+            subfolder="processor",
+            prefetch_list=omnigen2_subfolders,
+            local_files_only=local_files_only,
         )
         self.vae_scale_factor = (
             2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8

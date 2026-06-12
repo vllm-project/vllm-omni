@@ -640,38 +640,6 @@ def test_initialize_llm_replica_passes_stage_init_timeout_to_complete_stage_hand
     assert captured_timeout == 302
 
 
-def test_async_omni_engine_reads_tokenizer_from_engine_args(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
-
-    class DummyThread:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def start(self):
-            pass
-
-        def is_alive(self):
-            return False
-
-    fake_engine_args = types.SimpleNamespace(
-        _explicit_fields=frozenset({"tokenizer"}),
-        explicit_kwargs=lambda: {"tokenizer": "/tokenizer/from-engine-args"},
-    )
-
-    monkeypatch.setattr(engine_mod.threading, "Thread", DummyThread)
-    monkeypatch.setattr(
-        AsyncOmniEngine,
-        "_resolve_stage_configs",
-        lambda self, model, kwargs: ("dummy-config", [types.SimpleNamespace(engine_args={})]),
-    )
-    monkeypatch.setattr(AsyncOmniEngine, "_wait_for_orchestrator_init", lambda *_, **__: None)
-
-    engine = AsyncOmniEngine("dummy-model", engine_args=fake_engine_args)
-
-    assert engine.tokenizer == "/tokenizer/from-engine-args"
-    engine.shutdown()
-
-
 def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_path):
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 

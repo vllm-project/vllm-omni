@@ -29,6 +29,7 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     parse_size,
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -156,7 +157,7 @@ class FakeAsyncOmni:
         self.captured_prompt = None
         self._images = images or [Image.new("RGB", (64, 64), color="green")]
 
-    async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
         if sampling_params_list is not None:
             self.captured_sampling_params_list = sampling_params_list
         else:
@@ -254,7 +255,7 @@ def async_omni_test_client():
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             if sampling_params_list is not None:
                 self.captured_sampling_params_list = sampling_params_list
             else:
@@ -318,7 +319,7 @@ def async_omni_rgba_test_client():
             self._images = [Image.new("RGBA", (64, 64), color=(0, 255, 0, 128))]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             if sampling_params_list is not None:
                 self.captured_sampling_params_list = sampling_params_list
             else:
@@ -382,7 +383,7 @@ def async_omni_stage_configs_only_client():
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             if sampling_params_list is not None:
                 self.captured_sampling_params_list = sampling_params_list
             else:
@@ -442,7 +443,7 @@ def streaming_image_edit_client():
             self.captured_prompt = None
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             self.captured_prompt = prompt
             self.captured_sampling_params_list = sampling_params_list or [sampling_params]
             assert self.captured_sampling_params_list[0].output_kind == RequestOutputKind.DELTA
@@ -587,6 +588,24 @@ def test_generate_single_image(test_client):
     assert test_client.app.state.engine_client.captured_prompt["modalities"] == ["image"]
 
 
+def test_generate_images_guardrail_error_returns_400(test_client, mock_async_diffusion):
+    async def blocked_generate(**kwargs):
+        raise GuardrailViolationError("Input was blocked by Cosmos3 guardrails.")
+        yield MockGenerationResult([])  # pragma: no cover
+
+    mock_async_diffusion.generate = blocked_generate
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "blocked prompt",
+            "n": 1,
+            "size": "1024x1024",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Input was blocked by Cosmos3 guardrails."
+
+
 def test_generate_images_async_omni_sampling_params(async_omni_test_client):
     """Test AsyncOmni path uses per-stage sampling params."""
     response = async_omni_test_client.post(
@@ -696,7 +715,7 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             self.captured_sampling_params_list = (
                 sampling_params_list if sampling_params_list is not None else [sampling_params]
             )
@@ -815,7 +834,9 @@ def test_image_edits_streaming_returns_ar_delta_then_image(streaming_image_edit_
 
 
 def test_image_edits_streaming_ar_delta_chunks_include_index(streaming_image_edit_client):
-    async def generate_multi_output_delta(prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate_multi_output_delta(
+        prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs
+    ):
         yield MockStageResult(stage_id=0, final_output_type="text", texts=["first", "second"])
         yield MockStageResult(
             stage_id=1,
@@ -843,7 +864,7 @@ def test_image_edits_streaming_ar_delta_chunks_include_index(streaming_image_edi
 
 
 def test_image_edits_streaming_errors_without_final_image(streaming_image_edit_client):
-    async def generate_without_image(prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate_without_image(prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
         yield MockStageResult(stage_id=0, final_output_type="text", text="recap")
 
     streaming_image_edit_client.app.state.engine_client.generate = generate_without_image
@@ -866,7 +887,7 @@ def test_image_edits_streaming_errors_without_final_image(streaming_image_edit_c
 
 
 def test_image_edits_streaming_errors_on_empty_final_image(streaming_image_edit_client):
-    async def generate_empty_image(prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate_empty_image(prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
         yield MockStageResult(stage_id=0, final_output_type="text", text="recap")
         yield MockStageResult(stage_id=1, final_output_type="image", images=[])
 
@@ -887,6 +908,31 @@ def test_image_edits_streaming_errors_on_empty_final_image(streaming_image_edit_
     assert payloads[1]["object"] == "error"
     assert "empty final image" in payloads[1]["error"]["message"]
     assert payloads[2] == "[DONE]"
+
+
+def test_image_edits_streaming_guardrail_error_uses_400(streaming_image_edit_client):
+    async def generate_guardrail_error(prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
+        raise GuardrailViolationError("Input was blocked by Cosmos3 guardrails.")
+        yield MockStageResult(stage_id=1, final_output_type="image", images=[])  # pragma: no cover
+
+    streaming_image_edit_client.app.state.engine_client.generate = generate_guardrail_error
+    img_bytes = make_test_image_bytes((16, 16))
+    response = streaming_image_edit_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "blocked prompt",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _parse_sse_payloads(response.text)
+    assert payloads[0]["object"] == "error"
+    assert payloads[0]["error"]["message"] == "Input was blocked by Cosmos3 guardrails."
+    assert payloads[0]["error"]["type"] == "BadRequestError"
+    assert payloads[0]["error"]["code"] == 400
+    assert payloads[1] == "[DONE]"
 
 
 def test_image_edits_streaming_rejects_single_stage(test_client):

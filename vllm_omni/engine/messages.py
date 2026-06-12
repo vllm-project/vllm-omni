@@ -24,7 +24,9 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     sampling_params_list: list[OmniSamplingParams]
     final_stage_id: int
     preprocess_ms: float
+    request_timestamp: float
     enqueue_ts: float
+    final_output_stage_ids: list[int] | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -71,6 +73,8 @@ class UnregisterRemoteReplicaMessage(EngineQueueMessage, kw_only=True):
 class ErrorMessage(EngineQueueMessage, kw_only=True):
     type: Literal["error"] = "error"
     error: str
+    status_code: int | None = None
+    error_type: str | None = None
     fatal: bool = False
     request_id: str | None = None
     stage_id: int | None = None

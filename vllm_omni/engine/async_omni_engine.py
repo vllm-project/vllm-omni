@@ -21,7 +21,7 @@ import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import Any, Literal, cast
 
 import janus
 import torch
@@ -113,9 +113,6 @@ from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.platforms import current_omni_platform
 
-if TYPE_CHECKING:
-    from vllm_omni.engine.arg_utils import OmniEngineArgs
-
 logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
@@ -126,6 +123,7 @@ class StageRuntimeInfo:
     final_output: bool
     final_output_type: FinalOutputModalityType | None
     stage_type: str
+    model_stage: str | None = None
 
 
 # ============================================================================
@@ -269,16 +267,17 @@ class AsyncOmniEngine:
     def __init__(
         self,
         model: str,
-        engine_args: OmniEngineArgs | None = None,
         stage_init_timeout: int = 300,
         init_timeout: int = 600,
         diffusion_batch_size: int = 1,
         single_stage_mode: bool = False,
         transfer_emitter: Any = None,
         log_stats: bool = False,
+        tokenizer: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.model = model
+        self.tokenizer = tokenizer
         self.diffusion_batch_size = diffusion_batch_size
         startup_timeout = int(init_timeout)
         # Forwarded into Orchestrator so its _forward_to_next_stage path can
@@ -293,22 +292,6 @@ class AsyncOmniEngine:
         self._log_stats = log_stats
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
-
-        # Merge tracked engine_args fields into kwargs; explicit kwargs take priority.
-        if engine_args is not None:
-            if not hasattr(engine_args, "_explicit_fields"):
-                raise TypeError(
-                    "engine_args=OmniEngineArgs(...) is ambiguous under "
-                    "sentinel-default precedence. Use "
-                    "OmniEngineArgs.create(**explicit) or pass explicit kwargs "
-                    "directly."
-                )
-            ea_dict = engine_args.explicit_kwargs()
-            # Remove model since it is passed as a positional arg already.
-            ea_dict.pop("model", None)
-            kwargs = {**ea_dict, **kwargs}
-
-        self.tokenizer: str | None = kwargs.get("tokenizer")
 
         # ------------------------------------------------------------------ #
         # Single-stage mode detection                                        #
@@ -1265,6 +1248,7 @@ class AsyncOmniEngine:
                     final_output=first_client.final_output,
                     final_output_type=first_client.final_output_type,
                     stage_type=first_client.stage_type,
+                    model_stage=getattr(first_client, "model_stage", None),
                 )
             )
 
@@ -1379,6 +1363,7 @@ class AsyncOmniEngine:
 
         async def _run_orchestrator() -> None:
             self._initialize_stages(stage_init_timeout)
+
             pd_config = self._detect_pd_config()
             coordinator_pub_address: str | None = None
             load_balancer_factory: Callable[[], LoadBalancer] | None = None
@@ -1634,6 +1619,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         lora_request: Any = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -1646,6 +1632,7 @@ class AsyncOmniEngine:
         message_type: Literal["add_request", "streaming_update"] = "add_request",
     ) -> StageSubmissionMessage:
         """Build an add_request message after stage-0 preprocessing."""
+        request_timestamp = float(arrival_time) if arrival_time is not None else time.time()
         effective_sampling_params_list: list[OmniSamplingParams] = (
             list(cast(Sequence[OmniSamplingParams], sampling_params_list))
             if sampling_params_list is not None
@@ -1731,7 +1718,9 @@ class AsyncOmniEngine:
             output_prompt_text=output_prompt_text,
             sampling_params_list=effective_sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=list(final_output_stage_ids) if final_output_stage_ids is not None else None,
             preprocess_ms=_preprocess_ms,
+            request_timestamp=request_timestamp,
             enqueue_ts=time.perf_counter(),
         )
 
@@ -2072,7 +2061,6 @@ class AsyncOmniEngine:
         stage_configs_path = kwargs.get("stage_configs_path", None)
         deploy_config_path = kwargs.pop("deploy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
-        kwargs.pop("_cli_explicit_keys", None)
         explicit_stage_configs = kwargs.pop("stage_configs", None)
         if explicit_stage_configs is not None:
             logger.warning(
@@ -2205,6 +2193,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         lora_request: Any = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -2228,6 +2217,7 @@ class AsyncOmniEngine:
             prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
@@ -2255,6 +2245,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         lora_request: Any = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -2272,6 +2263,7 @@ class AsyncOmniEngine:
             prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
@@ -2289,6 +2281,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         *,
         resumable: bool = True,
@@ -2300,6 +2293,7 @@ class AsyncOmniEngine:
             prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             resumable=resumable,
             message_type="streaming_update",
@@ -2313,6 +2307,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         *,
         resumable: bool = True,
@@ -2324,6 +2319,7 @@ class AsyncOmniEngine:
             prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             resumable=resumable,
         )

@@ -34,6 +34,7 @@ from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusio
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
+from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -96,6 +97,8 @@ def _move_tensor_tree_to_cpu(value: object) -> object:
 
 
 def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
+    """Get num_frames for the dummy warmup run. Returns 0 to skip warmup."""
+
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
         return int(getattr(model_cls, "dummy_run_num_frames"))
@@ -229,6 +232,12 @@ class DiffusionEngine:
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
+            if is_client_error_status(output.error_status_code):
+                raise client_error_from_metadata(
+                    output.error,
+                    status_code=output.error_status_code,
+                    error_type=output.error_type,
+                )
             raise RuntimeError(output.error)
         logger.debug("Generation completed successfully.")
 
@@ -266,8 +275,10 @@ class DiffusionEngine:
         custom_output = output.custom_output or {}
         model_audio_sample_rate = None
         model_fps = None
+        action_payload = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
+            action_payload = outputs.get("actions")
             custom_output.update(outputs.get("custom_output") or {})
             model_audio_sample_rate = outputs.get("audio_sample_rate")
             model_fps = outputs.get("fps")
@@ -361,6 +372,8 @@ class DiffusionEngine:
                     mm_output["audio_sample_rate"] = model_audio_sample_rate
                 if model_fps is not None:
                     mm_output["fps"] = model_fps
+                if action_payload is not None:
+                    mm_output["actions"] = action_payload
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -430,6 +443,18 @@ class DiffusionEngine:
                         mm_output["audio_sample_rate"] = model_audio_sample_rate
                     if model_fps is not None:
                         mm_output["fps"] = model_fps
+                    if action_payload is not None:
+                        sliced_actions = action_payload
+                        if isinstance(action_payload, (list, tuple)):
+                            sliced_actions = action_payload[start_idx:end_idx]
+                            if len(sliced_actions) == 1:
+                                sliced_actions = sliced_actions[0]
+                        elif hasattr(action_payload, "shape") and getattr(action_payload, "shape", None) is not None:
+                            if len(action_payload.shape) > 0 and action_payload.shape[0] >= end_idx:
+                                sliced_actions = action_payload[start_idx:end_idx]
+                                if num_outputs == 1:
+                                    sliced_actions = sliced_actions[0]
+                        mm_output["actions"] = sliced_actions
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
@@ -489,7 +514,7 @@ class DiffusionEngine:
                             request_id=request_id,
                             step_index=None,
                             finished=True,
-                            result=DiffusionOutput(error=str(exc)),
+                            result=DiffusionOutput.from_exception(exc),
                         )
                         for request_id in sched_output.scheduled_request_ids
                     ]
@@ -646,7 +671,7 @@ class DiffusionEngine:
                         request_id=request_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput(error=str(exc)),
+                        result=DiffusionOutput.from_exception(exc),
                     )
 
                 self._process_aborts_queue()
@@ -706,6 +731,9 @@ class DiffusionEngine:
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
         num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
+        if num_frames <= 0:
+            logger.info("Skipping dummy warmup run (num_frames=0)")
+            return
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_id=DUMMY_DIFFUSION_REQUEST_ID,

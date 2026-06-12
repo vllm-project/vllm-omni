@@ -536,6 +536,10 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
     _vae_modules: ClassVar[list[str]] = []
     _resident_modules: ClassVar[list[str]] = ["fm_modules"]
 
+    # Top-level module(s) the diffusion LoRA manager scans (both MoT branches).
+    # TODO: promote to a shared LoRA contract/mixin instead of per-pipeline opt-in.
+    _lora_components: ClassVar[list[str]] = ["language_model"]
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         self.od_config = od_config
@@ -1454,6 +1458,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
+        self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
