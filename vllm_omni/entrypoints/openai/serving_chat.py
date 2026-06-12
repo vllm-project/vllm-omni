@@ -12,8 +12,16 @@ from typing import Any, Final, cast
 import jinja2
 import torch
 from fastapi import Request
+from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
 from PIL import Image
 from pydantic import TypeAdapter
+from vllm.entrypoints.chat_utils import (
+    ChatCompletionMessageParam,
+    ChatTemplateContentFormatOption,
+    ConversationMessage,
+    get_history_tool_calls_cnt,
+    make_tool_call_id,
+)
 
 from vllm_omni.diffusion.diffusion_engine import get_extra_body_params, get_extra_output_params
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -32,14 +40,6 @@ except ImportError:
     soundfile = None
 
 
-from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
-from vllm.entrypoints.chat_utils import (
-    ChatCompletionMessageParam,
-    ChatTemplateContentFormatOption,
-    ConversationMessage,
-    get_history_tool_calls_cnt,
-    make_tool_call_id,
-)
 from vllm.entrypoints.launcher import terminate_if_errored
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -113,6 +113,7 @@ from vllm_omni.entrypoints.openai.utils import (
     resolve_diffusion_od_config,
     validate_requested_speaker,
 )
+from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
@@ -652,19 +653,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         )
 
         tok_params = request.build_tok_params(self.model_config)
+        mm_config = self.model_config.multimodal_config
         chat_params = request.build_chat_params(
             default_template,
             default_template_content_format,
-        ).with_defaults(default_template_kwargs)
-
-        # OMNI: When use_audio_in_video=True, the qwen2_5_omni_thinker mm
-        # processor asserts that audio items are present alongside video items
-        # (inside render_chat_async).  We must inject audio_url items into the
-        # messages BEFORE calling render_chat_async so the mm processor can
-        # count them correctly during tokenisation.
-        mm_proc_kw = getattr(request, "mm_processor_kwargs", None) or {}
-        if mm_proc_kw.get("use_audio_in_video", False):
-            messages = await self._inject_audio_from_video_urls(messages)
+        ).with_defaults(
+            default_template_kwargs,
+            default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
+            default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
+        )
 
         (conversation,), (engine_prompt,) = await renderer.render_chat_async(
             [messages],
@@ -734,95 +731,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             engine_prompt["additional_information"]["instruction"] = instructions.strip()
 
         return conversation, [engine_prompt]
-
-    async def _inject_audio_from_video_urls(
-        self,
-        messages: list[ChatCompletionMessageParam],
-    ) -> list[ChatCompletionMessageParam]:
-        """Pre-extract audio from video URLs and inject as audio_url content items.
-
-        When use_audio_in_video=True, the qwen2_5_omni_thinker multimodal
-        processor requires that the number of audio items equals the number of
-        video items (it subtracts mm_counts["video"] from mm_counts["audio"]).
-        The client only sends video_url items; this method adds the matching
-        audio_url items on the server side before the renderer processes them.
-        """
-        import io
-
-        from vllm_omni.entrypoints.chat_utils import extract_audio_from_video_async
-
-        new_messages: list[ChatCompletionMessageParam] = []
-        for msg in messages:
-            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
-            if not isinstance(content, list):
-                new_messages.append(msg)
-                continue
-
-            video_urls = [
-                part.get("video_url", {}).get("url")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "video_url" and part.get("video_url", {}).get("url")
-            ]
-
-            if not video_urls:
-                new_messages.append(msg)
-                continue
-
-            audios = await asyncio.gather(*(extract_audio_from_video_async(u) for u in video_urls))
-
-            audio_items: list[dict] = []
-            for audio_array, sample_rate in audios:
-                buf = io.BytesIO()
-                if soundfile is not None:
-                    soundfile.write(buf, audio_array, samplerate=int(sample_rate), format="WAV")
-                else:
-                    import struct
-
-                    import numpy as np
-
-                    audio_np = np.asarray(audio_array, dtype=np.float32)
-                    sr = int(sample_rate)
-                    num_channels = 1
-                    bits_per_sample = 32
-                    num_frames = len(audio_np)
-                    data_size = num_frames * num_channels * (bits_per_sample // 8)
-                    # Write minimal RIFF/WAV header
-                    buf.write(b"RIFF")
-                    buf.write(struct.pack("<I", 36 + data_size))
-                    buf.write(b"WAVE")
-                    buf.write(b"fmt ")
-                    buf.write(
-                        struct.pack(
-                            "<IHHIIHH",
-                            16,
-                            3,
-                            num_channels,
-                            sr,
-                            sr * num_channels * (bits_per_sample // 8),
-                            num_channels * (bits_per_sample // 8),
-                            bits_per_sample,
-                        )
-                    )
-                    buf.write(b"data")
-                    buf.write(struct.pack("<I", data_size))
-                    buf.write(audio_np.tobytes())
-
-                audio_b64 = base64.b64encode(buf.getvalue()).decode()
-                audio_items.append(
-                    {
-                        "type": "audio_url",
-                        "audio_url": {"url": f"data:audio/wav;base64,{audio_b64}"},
-                    }
-                )
-
-            new_content = list(content) + audio_items
-            if isinstance(msg, dict):
-                new_msg = {**msg, "content": new_content}
-            else:
-                new_msg = msg.model_copy(update={"content": new_content})
-            new_messages.append(new_msg)
-
-        return new_messages
 
     def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[Any]:
         """Convert request dicts to stage-typed sampling params objects.
@@ -2599,6 +2507,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             mm_processor_kwargs["target_h"] = height
         if width is not None:
             mm_processor_kwargs["target_w"] = width
+        if seed is not None and engine_prompt_data is not None:
+            mm_processor_kwargs["vae_generator_seed"] = int(seed)
         if mm_processor_kwargs:
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
         if engine_prompt_data is not None:
@@ -2960,6 +2870,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     "[OmniOpenAIServingChat] Engine dead during streaming image edit, "
                     "but cannot terminate server (no raw_request context)."
                 )
+        except OmniClientError as exc:
+            logger.info("Client error during streaming image edit: %s", exc)
+            chunk = ImageEditStreamError(
+                created=created,
+                model=model,
+                error={
+                    "message": exc.message,
+                    "type": exc.error_type,
+                    "code": exc.status_code,
+                },
+            )
+            yield f"data: {chunk.model_dump_json()}\n\n"
         except Exception as exc:
             logger.exception("Streaming image edit failed: %s", exc)
             chunk = ImageEditStreamError(
@@ -3356,6 +3278,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             return response
 
+        except OmniClientError as e:
+            logger.info("Client error during diffusion chat completion: %s", e)
+            return self._create_error_response(
+                e.message,
+                err_type=e.error_type,
+                status_code=e.status_code,
+            )
         except Exception as e:
             logger.exception("Diffusion chat completion failed: %s", e)
             return self._create_error_response(

@@ -22,7 +22,8 @@ from .spk_embedding import SpkembExtractor
 from .talker_module import resample
 
 if TYPE_CHECKING:
-    from .audio_vae import AudioVAE
+    from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
+
     from .talker_module import Aggregator
 
 logger = init_logger(__name__)

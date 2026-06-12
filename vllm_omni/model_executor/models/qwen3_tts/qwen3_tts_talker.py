@@ -368,6 +368,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
 
         # Constant logit mask: allow only codec ids [1, codebook_vocab_size) plus codec EOS.
+        # Register the *disallowed* form so compute_logits doesn't recompute ~mask per step.
         vocab = int(self.talker_config.vocab_size)
         codec_mask = torch.zeros((vocab,), dtype=torch.bool)
         lo, hi = 1, min(self._codebook_vocab_size, vocab)
@@ -375,7 +376,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             codec_mask[lo:hi] = True
         if 0 <= self._codec_eos_token_id < vocab:
             codec_mask[self._codec_eos_token_id] = True
-        self.register_buffer("_codec_allowed_mask", codec_mask, persistent=False)
+        self.register_buffer("_codec_disallowed_mask", ~codec_mask, persistent=False)
 
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
@@ -399,6 +400,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             torch.zeros(1, int(self.talker_config.hidden_size), dtype=model_dtype),
             persistent=False,
         )
+        self._embedding_dtype = torch.bfloat16
 
         tokenizer_config = Qwen3TTSTokenizerV2Config.from_pretrained(
             self.model_path,
@@ -513,7 +515,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             return None
 
         # Mask out invalid codec ids using the pre-built constant buffer.
-        logits = logits.masked_fill(~self._codec_allowed_mask, float("-inf"))
+        logits = logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
 
         if self._eos_logit_bias != 0.0:
             eos_id = self._codec_eos_token_id
@@ -641,7 +643,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # :meth:`_init_runtime_buffers`. Materialize once on the right
         # device/dtype and reuse for both the prefill placeholder padding
         # and the decode text-step fallback below.
-        tts_pad_embed = self._tts_pad_embed.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+        dtype = self._embedding_dtype
+        tts_pad_embed = self._tts_pad_embed.to(device=input_ids.device, dtype=dtype).reshape(1, -1)
 
         if is_prefill:
             # Prefill (prompt embeddings)
@@ -688,7 +691,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 pad_n = int(span_len - int(take.shape[0]))
                 pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
                 take = torch.cat([take, pad_rows], dim=0)
-            prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
+            prompt_embeds = take.to(device=input_ids.device, dtype=dtype)
             info_update["meta"]["talker_prefill_offset"] = int(offset + span_len)
 
             # When inputs_embeds is set, token ids are ignored by the model but must stay in-vocab for vLLM bookkeeping.
@@ -718,7 +721,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     tail[text_offset : text_offset + 1]
                     .to(
                         device=input_ids.device,
-                        dtype=torch.bfloat16,
+                        dtype=dtype,
                     )
                     .reshape(1, -1)
                 )
@@ -743,14 +746,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         last_hidden = hs.get("last")
         if isinstance(last_hidden, torch.Tensor):
-            past_hidden = last_hidden.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+            past_hidden = last_hidden.to(device=input_ids.device, dtype=dtype).reshape(1, -1)
         else:
             # Defensive: EOS step row is zeroed by the invalid-layer-0 mask and filtered downstream.
             past_hidden = torch.zeros_like(text_step)
 
         # Use OmniGPUModelRunner talker_mtp fast-path for residual codebooks and per-step inputs_embeds update.
         last_id_hidden = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).to(
-            device=input_ids.device, dtype=torch.bfloat16
+            device=input_ids.device, dtype=dtype
         )
         inputs_embeds_out = last_id_hidden.reshape(1, -1)
 
@@ -783,7 +786,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
 
         device = input_ids_flat.device
-        dtype = torch.bfloat16
+        dtype = self._embedding_dtype
         # Request-independent constant (see :meth:`_init_runtime_buffers`) —
         # compute once for the batch instead of fetching it per request from
         # ``info_dict["embed"]["tts_pad"]``.
@@ -1042,11 +1045,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         bsz = int(input_ids.shape[0])
         q = int(self.talker_config.num_code_groups)
         dev = input_embeds.device
+        dtype = self._embedding_dtype
 
         input_ids = input_ids.reshape(bsz, 1).to(dtype=torch.long, device=dev)
-        last_id_hidden = input_embeds.reshape(bsz, 1, -1).to(dtype=torch.bfloat16, device=dev)
-        past_hidden = last_talker_hidden.reshape(bsz, 1, -1).to(dtype=torch.bfloat16, device=dev)
-        text_step = text_step.reshape(bsz, 1, -1).to(dtype=torch.bfloat16, device=dev)
+        last_id_hidden = input_embeds.reshape(bsz, 1, -1).to(dtype=dtype, device=dev)
+        past_hidden = last_talker_hidden.reshape(bsz, 1, -1).to(dtype=dtype, device=dev)
+        text_step = text_step.reshape(bsz, 1, -1).to(dtype=dtype, device=dev)
 
         # Residual predictor runs fixed-length (Q-1) steps via the vLLM-native code_predictor.
         max_steps = q - 1

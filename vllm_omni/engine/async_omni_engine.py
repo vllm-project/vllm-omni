@@ -1363,6 +1363,7 @@ class AsyncOmniEngine:
 
         async def _run_orchestrator() -> None:
             self._initialize_stages(stage_init_timeout)
+
             pd_config = self._detect_pd_config()
             coordinator_pub_address: str | None = None
             load_balancer_factory: Callable[[], LoadBalancer] | None = None
@@ -1479,7 +1480,7 @@ class AsyncOmniEngine:
             return
 
         mm_data = prompt.get("multi_modal_data")
-        if not isinstance(mm_data, dict) or not mm_data:
+        if not isinstance(mm_data, Mapping) or not mm_data:
             return
 
         from vllm.multimodal.hasher import MultiModalHasher

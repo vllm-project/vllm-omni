@@ -6,6 +6,13 @@
 {% set docker_image_amd = "rocm/vllm-omni:$BUILDKITE_COMMIT" %}
 {% set default_working_dir = "/app/vllm-omni" %}
 
+{% if env %}
+env:
+{% for name in env %}
+  {{ name }}: "{{ env[name] }}"
+{% endfor %}
+{% endif %}
+steps:
   - group: "AMD Tests"
     depends_on: ~
     steps:
@@ -31,8 +38,15 @@
         agents:
           queue: amd-cpu
 
-    {% for step in steps %}
-    {% if step.mirror_hardwares and mirror_hw in step.mirror_hardwares %}
+{% for step_group in steps %}
+{% if step_group.group %}
+  - group: "{{ step_group.group }}"
+{% if step_group.depends_on %}
+    depends_on: {{ step_group.depends_on }}
+{% endif %}
+    steps:
+{% for step in step_group.steps %}
+{% if step.mirror_hardwares and mirror_hw in step.mirror_hardwares %}
       - label: "{{ step.agent_pool }}: {{ step.label }}"
         depends_on: amd-build
         agents:
@@ -46,8 +60,23 @@
         command: bash .buildkite/scripts/hardware_ci/run-amd-test.sh
         env:
           DOCKER_BUILDKIT: "1"
+{% if step.env %}
+{% for name in step.env %}
+          {{ name }}: "{{ step.env[name] }}"
+{% endfor %}
+{% endif %}
           TEST_COMMAND: |-
             (command rocm-smi || true) && cd {{ (step.working_dir or default_working_dir) | safe }}
+{% if env %}
+{% for name in env %}
+            export {{ name }}="{{ env[name] }}"
+{% endfor %}
+{% endif %}
+{% if step.env %}
+{% for name in step.env %}
+            export {{ name }}="{{ step.env[name] }}"
+{% endfor %}
+{% endif %}
 {% if "mi250" in step.agent_pool %}
             python3 -m pip uninstall -y amd-aiter
 {% endif %}
@@ -61,5 +90,52 @@
         {% else %}
         soft_fail: true
         {% endif%}
+{% endif %}
+{% endfor %}
+{% elif step_group.mirror_hardwares and mirror_hw in step_group.mirror_hardwares %}
+{% set step = step_group %}
+  - label: "{{ step.agent_pool }}: {{ step.label }}"
+    depends_on: amd-build
+    agents:
+      {% if step.agent_pool %}
+      queue: amd_{{ step.agent_pool }}
+      {% else %}
+      queue: amd_mi325_1
+      {% endif %}
+{% set cmd_body = (step.command or (step.commands | join("\n"))) | trim %}
+{% set indented_cmd = cmd_body | replace("\n", "\n        ") %}
+    command: bash .buildkite/scripts/hardware_ci/run-amd-test.sh
+    env:
+      DOCKER_BUILDKIT: "1"
+{% if step.env %}
+{% for name in step.env %}
+      {{ name }}: "{{ step.env[name] }}"
+{% endfor %}
+{% endif %}
+      TEST_COMMAND: |-
+        (command rocm-smi || true) && cd {{ (step.working_dir or default_working_dir) | safe }}
+{% if env %}
+{% for name in env %}
+        export {{ name }}="{{ env[name] }}"
+{% endfor %}
+{% endif %}
+{% if step.env %}
+{% for name in step.env %}
+        export {{ name }}="{{ step.env[name] }}"
+{% endfor %}
+{% endif %}
+{% if "mi250" in step.agent_pool %}
+        python3 -m pip uninstall -y amd-aiter
+{% endif %}
+        {{ indented_cmd | safe }}
+    priority: 100
+    {% if step.timeout_in_minutes %}
+    timeout_in_minutes: {{ step.timeout_in_minutes }}
     {% endif %}
-    {% endfor %}
+    {% if step.grade and step.grade == "Blocking" %}
+    soft_fail: false
+    {% else %}
+    soft_fail: true
+    {% endif%}
+{% endif %}
+{% endfor %}

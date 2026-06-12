@@ -101,6 +101,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.mimo_audio.pipeline",
         "MIMO_AUDIO_PIPELINE",
     ),
+    "ming_tts": (
+        "vllm_omni.model_executor.models.ming_tts.pipeline",
+        "MING_TTS_PIPELINE",
+    ),
     "voxtral_tts": (
         "vllm_omni.model_executor.models.voxtral_tts.pipeline",
         "VOXTRAL_TTS_PIPELINE",
@@ -148,6 +152,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "higgs_audio_v2": (
         "vllm_omni.model_executor.models.higgs_audio_v2.pipeline",
         "HIGGS_AUDIO_V2_PIPELINE",
+    ),
+    "higgs_multimodal_qwen3": (
+        "vllm_omni.model_executor.models.higgs_audio_v3.pipeline",
+        "HIGGS_AUDIO_V3_PIPELINE",
     ),
     "dynin_omni": (
         "vllm_omni.model_executor.models.dynin_omni.pipeline",
