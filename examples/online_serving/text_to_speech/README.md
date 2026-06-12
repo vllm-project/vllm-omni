@@ -523,6 +523,17 @@ python qwen3_tts/streaming_speech_client.py \
 The client writes one PCM file per sentence and a matching
 `sentence_XXX_timestamps.json` sidecar.
 
+To *see* the alignment instead of reading a JSON sidecar, run the
+word-timestamp Gradio demo (server must be launched with `--forced-aligner`):
+```bash
+python qwen3_tts/word_timestamps_demo.py --api-base http://localhost:8091
+```
+Each sentence's audio plays in an `<audio>` element while its text is rendered
+as inline word spans; the current word highlights as `audio.currentTime`
+crosses each `start_ms`. The **Stop (barge-in)** button cuts playback and
+reports the last-spoken word — the voice-agent barge-in case from
+[#3631](https://github.com/vllm-project/vllm-omni/issues/3631).
+
 ### Gradio demos
 ```bash
 ./qwen3_tts/run_gradio_demo.sh                              # CustomVoice (default)
