@@ -73,7 +73,6 @@ def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-@pytest.mark.skip(reason="#4335")
 def test_response_format_001(omni_server, openai_client) -> None:
     """
     Test voice-clone non-stream PCM output via OpenAI API.
@@ -92,5 +91,6 @@ def test_response_format_001(omni_server, openai_client) -> None:
         "voice": "default",
         "ref_audio": REF_AUDIO_URL,
         "min_audio_bytes": _MIN_AUDIO_BYTES,
+        "min_hnr_db": 0.0,
     }
     openai_client.send_audio_speech_request(request_config)
