@@ -10,6 +10,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
@@ -20,6 +21,8 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     WanTransformer3DModel,
     WanTransformerBlock,
 )
+
+logger = init_logger(__name__)
 
 
 class VaceWanTransformerBlock(WanTransformerBlock):
@@ -232,6 +235,21 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                 device=hidden_states.device,
             )
             hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+        elif (
+            parallel_config is not None
+            and not parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            logger.warning_once(
+                "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
+                "Padding tokens are not masked from attention (mask_sp_padding=False), "
+                "which avoids the varlen attention path but may produce minor numerical differences. "
+                "Set parallel_config.mask_sp_padding=True to restore strict masking.",
+                ctx.sp_padding_size,
+                ctx.sp_original_seq_len,
+                sp_size,
+            )
 
         # VACE: embed context and run conditioning blocks
         vace_hints = None
