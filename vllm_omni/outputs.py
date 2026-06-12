@@ -107,6 +107,15 @@ class OmniRequestOutput:
     error_status_code: int | None = None
     error_type: str | None = None
 
+    # Forward-compat shim for vLLM 0.21 OpenAI serving:
+    # ``completion/serving.py`` unconditionally reads
+    # ``final_res_batch[0].prompt_routed_experts``; missing attribute raises
+    # AttributeError and bombs the response. Default to None; OmniRequestOutput
+    # doesn't participate in MoE expert routing.
+    # (``kv_transfer_params`` is already exposed as a property delegating
+    # to ``request_output``; don't shadow it.)
+    prompt_routed_experts: Any = None
+
     @classmethod
     def from_error(
         cls,
