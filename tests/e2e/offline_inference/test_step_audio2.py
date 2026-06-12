@@ -16,7 +16,6 @@ import numpy as np
 import pytest
 import torch
 
-from tests.helpers.process import create_new_process_for_each_test
 from tests.helpers.runtime import OmniRunner
 
 models = ["stepfun-ai/Step-Audio-2-mini"]
@@ -236,9 +235,8 @@ def test_has_audio_output():
     assert StepAudio2ThinkerForConditionalGeneration.has_audio_output(with_audio)
 
 
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.parametrize("test_config", test_params)
-@create_new_process_for_each_test()
 def test_audio_to_text_and_audio(step_audio2_runner: type[StepAudio2OmniRunner], test_config: tuple[str, str]) -> None:
     """Test processing audio input and generating text + audio output."""
     model, stage_config_path = test_config
@@ -260,8 +258,8 @@ def test_audio_to_text_and_audio(step_audio2_runner: type[StepAudio2OmniRunner],
                 break
 
         assert text_output is not None
-        assert len(text_output.request_output) > 0
-        text_content = text_output.request_output[0].outputs[0].text
+        assert text_output.request_output is not None
+        text_content = text_output.request_output.outputs[0].text
         assert text_content is not None
         assert len(text_content.strip()) > 0
 
@@ -272,15 +270,14 @@ def test_audio_to_text_and_audio(step_audio2_runner: type[StepAudio2OmniRunner],
                 break
 
         if audio_output is not None:
-            assert len(audio_output.request_output) > 0
-            audio_tensor = audio_output.request_output[0].outputs[0].multimodal_output.get("audio")
+            assert audio_output.request_output is not None
+            audio_tensor = audio_output.request_output.outputs[0].multimodal_output.get("audio")
             if audio_tensor is not None:
                 assert audio_tensor.numel() > 0
 
 
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.parametrize("test_config", test_params)
-@create_new_process_for_each_test()
 def test_text_only_input(step_audio2_runner: type[StepAudio2OmniRunner], test_config: tuple[str, str]) -> None:
     """Test processing text-only input (no audio)."""
     model, stage_config_path = test_config
@@ -300,7 +297,7 @@ def test_text_only_input(step_audio2_runner: type[StepAudio2OmniRunner], test_co
                 break
 
         assert text_output is not None
-        assert len(text_output.request_output) > 0
-        text_content = text_output.request_output[0].outputs[0].text
+        assert text_output.request_output is not None
+        text_content = text_output.request_output.outputs[0].text
         assert text_content is not None
         assert len(text_content.strip()) > 0
