@@ -303,10 +303,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             # consume a KV payload prefetched during the previous forward;
             # fall back to a synchronous receive on miss.
             prefetched = None
+            kv_recv_t0 = time.perf_counter()
             if self._kv_prefetch_enabled:
                 prefetched, _ = self.kv_transfer_manager.get_loaded_kv(req.request_id)
             if prefetched is not None:
                 self.kv_transfer_manager.apply_prefetched_kv(req, prefetched, target_device=target_device)
+                kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
+                logger.debug("KV prefetch HIT for %s, apply=%.1fms", req.request_id, kv_recv_ms)
             else:
                 # The manager handles the check for need_recv_cache internally
                 self.kv_transfer_manager.receive_multi_kv_cache_distributed(
@@ -314,6 +317,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
                     target_device=target_device,
                 )
+                kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
+                logger.debug("KV prefetch MISS for %s, sync_recv=%.1fms", req.request_id, kv_recv_ms)
 
             # Kick off the next request's prefetch so it overlaps this forward.
             if self._kv_prefetch_enabled and prefetch_stub is not None:
