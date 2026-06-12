@@ -25,6 +25,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
+    # Maximum size (bytes) for a single SHM segment in tensor streaming.
+    # If not set, uses 90% of available /dev/shm space.
+    "VLLM_SHM_MAX_SEGMENT_SIZE": lambda: int(os.environ.get("VLLM_SHM_MAX_SEGMENT_SIZE", "0"))
+    if "VLLM_SHM_MAX_SEGMENT_SIZE" in os.environ
+    else None,
 }
 
 

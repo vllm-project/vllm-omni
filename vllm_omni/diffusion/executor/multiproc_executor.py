@@ -82,8 +82,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
 
+        # Create ACK queue for backpressure control
+        self._ack_mq = self._init_ack_queue()
+        ack_handle = self._ack_mq.export_handle()
+
         # Launch workers
-        processes, result_handle = self._launch_workers(broadcast_handle, self.wake_events)
+        processes, result_handle = self._launch_workers(broadcast_handle, self.wake_events, ack_handle)
         self._result_mq = self._init_result_queue(result_handle)
         self._processes = processes
 
@@ -110,30 +114,21 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return None
         return MessageQueue.create_from_handle(result_handle, 0)
 
+    def _init_ack_queue(self) -> MessageQueue:
+        """Create a dedicated ACK queue for backpressure control."""
+        return MessageQueue(
+            n_reader=1,
+            n_local_reader=1,
+            local_reader_ranks=[0],
+        )
+
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("DiffusionExecutor is closed.")
         if self._result_mq is None:
             raise RuntimeError("Result queue not initialized")
 
-    def _dequeue_one_with_failure_polling(self, deadline: float | None, method: str) -> Any:
-        """Block until one result message, polling ``is_failed`` between chunk timeouts."""
-        while True:
-            if deadline is None:
-                chunk_timeout = _DEQUEUE_TIMEOUT_S
-            else:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(f"RPC call to {method} timed out.")
-                chunk_timeout = min(_DEQUEUE_TIMEOUT_S, remaining)
-            try:
-                return self._result_mq.dequeue(timeout=chunk_timeout)
-            except (TimeoutError, zmq.error.Again):
-                if self.is_failed:
-                    raise EngineDeadError()
-                continue
-
-    def _launch_workers(self, broadcast_handle, wake_events):
+    def _launch_workers(self, broadcast_handle, wake_events, ack_handle):
         od_config = self.od_config
         logger.info("Starting server...")
 
@@ -159,6 +154,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     od_config,
                     writer,
                     broadcast_handle,
+                    ack_handle,
                     wake_events[i],
                     worker_extension_cls,
                     custom_pipeline_args,
@@ -270,12 +266,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         try:
             self._broadcast_mq.enqueue(rpc_request)
-            response = self._result_mq.dequeue()
 
-            try:
-                unpack_diffusion_output_shm(response)
-            except Exception as e:
-                logger.warning("SHM unpack failed (data may already be inline): %s", e)
+            response = unpack_diffusion_output_shm(self._result_mq, self._ack_mq, is_failed_fn=lambda: self.is_failed)
 
             if isinstance(response, dict) and response.get("status") == "error":
                 raise RuntimeError(
@@ -379,19 +371,21 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
             responses = []
             for _ in range(num_responses):
-                response = self._dequeue_one_with_failure_polling(deadline, method)
-
                 try:
-                    unpack_diffusion_output_shm(response)
-                except Exception as e:
-                    logger.warning("SHM unpack failed (data may already be inline): %s", e)
-
-                # Check if response indicates an error
-                if isinstance(response, dict) and response.get("status") == "error":
-                    raise RuntimeError(
-                        f"Worker failed with error '{response.get('error')}', "
-                        "please check the stack trace above for the root cause"
+                    dequeue_timeout = None if deadline is None else max(0, deadline - time.monotonic())
+                    response = unpack_diffusion_output_shm(
+                        self._result_mq, self._ack_mq, timeout=dequeue_timeout, is_failed_fn=lambda: self.is_failed
                     )
+
+                    if isinstance(response, dict) and response.get("status") == "error":
+                        raise RuntimeError(
+                            f"Worker failed with error '{response.get('error')}', "
+                            "please check the stack trace above for the root cause"
+                        )
+                except zmq.error.Again as e:
+                    raise TimeoutError(f"RPC call to {method} timed out.") from e
+                except TimeoutError as e:
+                    raise TimeoutError(f"RPC call to {method} timed out.") from e
 
                 responses.append(response)
 
@@ -416,5 +410,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         finally:
             self._broadcast_mq = None
             self._result_mq = None
+            self._ack_mq = None
             self.resources = None
             self._processes = []

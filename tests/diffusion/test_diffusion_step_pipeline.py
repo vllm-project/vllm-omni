@@ -26,10 +26,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
-from vllm_omni.diffusion.ipc import (
-    pack_diffusion_output_shm,
-    unpack_diffusion_output_shm,
-)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import StepScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -771,21 +767,6 @@ class TestEngine:
 
         assert output.output is None
         assert output.error == "Diffusion execution finished without a final output."
-
-
-@pytest.mark.cpu
-class TestIPC:
-    def test_pack_unpack_runner_output_shm(self):
-        tensor = torch.zeros(300_000, dtype=torch.float32)
-        output = RunnerOutput(request_id="req-1", finished=True, result=DiffusionOutput(output=tensor))
-
-        packed = pack_diffusion_output_shm(output)
-        assert isinstance(packed.result.output, dict)
-        assert packed.result.output["__tensor_shm__"] is True
-
-        unpacked = unpack_diffusion_output_shm(packed)
-        assert isinstance(unpacked.result.output, torch.Tensor)
-        torch.testing.assert_close(unpacked.result.output, tensor)
 
 
 @pytest.mark.cpu
