@@ -37,6 +37,14 @@ Usage:
         --text-file texts.txt \\
         --num-requests 100 --concurrency 1 4 \\
         --result-dir results/
+
+    # Benchmark with dummy (random) weights: skips loading the checkpoint and
+    # decodes a fixed --max-new-tokens steps per request (stop token dropped,
+    # EOS ignored), useful for measuring kernel/engine throughput in isolation.
+    python benchmark_qwen3_tts_talker.py \\
+        --model /path/to/checkpoint \\
+        --load-format dummy \\
+        --num-requests 50 --max-new-tokens 512
 """
 
 import os
@@ -97,6 +105,7 @@ def _build_talker_only_stage_config(
     enforce_eager: bool = False,
     max_new_tokens: int = 2048,
     distributed_executor_backend: str = "mp",
+    load_format: str | None = None,
 ) -> dict:
     """Build a single-stage YAML dict containing only the NV AR talker."""
     engine_args: dict[str, Any] = {
@@ -116,7 +125,10 @@ def _build_talker_only_stage_config(
         "distributed_executor_backend": distributed_executor_backend,
         "max_num_batched_tokens": max_num_batched_tokens,
         "max_model_len": max_model_len,
+        "compilation_config": {"cudagraph_mode": "PIECEWISE"},
     }
+    if load_format is not None:
+        engine_args["load_format"] = load_format
 
     if profile:
         engine_args["profiler_config"] = {
@@ -125,6 +137,24 @@ def _build_talker_only_stage_config(
             "torch_profiler_with_stack": with_stack,
             "torch_profiler_record_shapes": record_shapes,
         }
+
+    # With dummy (random) weights the talker emits the audio-EOS stop token at
+    # random steps, so requests would finish early at random lengths. To force
+    # every request to run the full, fixed number of decode steps we drop the
+    # stop token and set ``ignore_eos`` so only ``max_tokens`` ends the request,
+    # giving exactly ``max_new_tokens`` steps per request.
+    is_dummy = load_format == "dummy"
+    default_sampling_params: dict[str, Any] = {
+        "temperature": 0.9,
+        "top_k": 50,
+        "max_tokens": max_new_tokens,
+        "seed": 42,
+        "detokenize": False,
+        "repetition_penalty": 1.05,
+        "stop_token_ids": [] if is_dummy else [2150],
+    }
+    if is_dummy:
+        default_sampling_params["ignore_eos"] = True
 
     cfg = {
         "stage_args": [
@@ -136,15 +166,7 @@ def _build_talker_only_stage_config(
                 "final_output_type": "audio",
                 "runtime": {"devices": "0"},
                 "engine_args": engine_args,
-                "default_sampling_params": {
-                    "temperature": 0.9,
-                    "top_k": 50,
-                    "max_tokens": max_new_tokens,
-                    "seed": 42,
-                    "detokenize": False,
-                    "repetition_penalty": 1.05,
-                    "stop_token_ids": [2150],
-                },
+                "default_sampling_params": default_sampling_params,
             }
         ],
     }
@@ -563,7 +585,13 @@ async def main(args):
         enforce_eager=args.enforce_eager,
         max_new_tokens=args.max_new_tokens,
         distributed_executor_backend=args.distributed_executor_backend,
+        load_format=args.load_format,
     )
+    if args.load_format == "dummy":
+        logger.info(
+            "Dummy weights: dropping stop token and ignoring EOS; every request runs exactly %d steps",
+            args.max_new_tokens,
+        )
     tmp_config_path = _write_temp_stage_config(stage_cfg)
 
     try:
@@ -669,6 +697,21 @@ async def main(args):
             bench.config_name = args.config_name
             all_bench_results.append(asdict(bench))
 
+        # ── Summary across concurrency levels ─────────────────────────────
+        W = 56
+        print(f"\n{'=' * W}")
+        print(f"{'Summary':^{W}}")
+        print(f"{'=' * W}")
+        for s in all_bench_results:
+            print(
+                f"concurrency={s['concurrency']}:  "
+                f"req/s {s['request_throughput']:.2f},  "
+                f"tok/s {s['token_throughput']:.1f},  "
+                f"ttft {s['mean_ttft_ms']:.1f}ms,  "
+                f"itl {s['mean_itl_ms']:.1f}ms"
+            )
+        print(f"{'=' * W}\n")
+
         # ── Save results ──────────────────────────────────────────────────
         if args.result_dir:
             result_dir = Path(args.result_dir)
@@ -753,6 +796,15 @@ def parse_args():
 
     engine = parser.add_argument_group("engine")
     engine.add_argument("--gpu-memory-utilization", type=float, default=0.5)
+    engine.add_argument(
+        "--load-format",
+        type=str,
+        default=None,
+        choices=["auto", "dummy", "safetensors", "pt"],
+        help="Weight loading strategy ('dummy' = random weights, skip "
+        "checkpoint). With 'dummy' the stop token is dropped and EOS is "
+        "ignored so every request decodes exactly --max-new-tokens steps.",
+    )
     engine.add_argument("--max-model-len", type=int, default=4096)
     engine.add_argument("--max-num-batched-tokens", type=int, default=4096)
     engine.add_argument("--enforce-eager", action="store_true")
