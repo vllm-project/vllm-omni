@@ -801,7 +801,7 @@ class WorkerProc:
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
-                        self.return_result(DiffusionOutput(error=str(e)))
+                        self.return_result(DiffusionOutput.from_exception(e))
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)
@@ -817,7 +817,7 @@ class WorkerProc:
                         f"Error executing forward in event loop: {e}",
                         exc_info=True,
                     )
-                    output = DiffusionOutput(error=str(e))
+                    output = DiffusionOutput.from_exception(e)
 
                 try:
                     self.return_result(output)

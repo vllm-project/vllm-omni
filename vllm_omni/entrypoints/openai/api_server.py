@@ -126,7 +126,12 @@ from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServin
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
-from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage, ReferenceVideo
+from vllm_omni.entrypoints.openai.serving_video import (
+    OmniOpenAIServingVideo,
+    ReferenceAudio,
+    ReferenceImage,
+    ReferenceVideo,
+)
 from vllm_omni.entrypoints.openai.serving_video_stream import OmniStreamingVideoHandler
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
@@ -135,8 +140,9 @@ from vllm_omni.entrypoints.openai.stage_params import (
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
-from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
+from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url, decode_input_reference
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -424,6 +430,15 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         from vllm.reasoning import ReasoningParserManager
 
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
+
+    # In vllm-omni's multi-process architecture, create_engine_config() runs
+    # in the subprocess (StageEngineCoreProc), not in the API server process.
+    # Propagate reasoning_parser from CLI args into structured_outputs_config
+    # here so that OmniOpenAIServingChat receives the correct value.
+    # (Upstream vLLM does this in EngineArgs.create_engine_config().)
+    if hasattr(args, "reasoning_parser") and args.reasoning_parser:
+        if not args.structured_outputs_config.reasoning_parser:
+            args.structured_outputs_config.reasoning_parser = args.reasoning_parser
 
     # Load logging config for uvicorn if specified
     log_config = get_uvicorn_log_config(args)
@@ -1798,6 +1813,9 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniClientError as e:
+        logger.info("Client error during image generation: %s", e)
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -2153,6 +2171,9 @@ async def edit_images(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniClientError as e:
+        logger.info("Client error during image edit: %s", e)
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -2653,6 +2674,9 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
         message = str(exc.detail) if exc.detail else str(exc)
         return VideoError(code=exc.status_code, message=message)
 
+    if isinstance(exc, OmniClientError):
+        return VideoError(code=exc.status_code, message=exc.message)
+
     if isinstance(exc, (EngineGenerateError, EngineDeadError)):
         err = create_error_response(exc)
         return VideoError(code=err.error.code, message=err.error.message)
@@ -2677,6 +2701,7 @@ async def _run_video_generation_job(
     video_id: str,
     reference_image: ReferenceImage | None = None,
     reference_video: ReferenceVideo | None = None,
+    reference_audio: ReferenceAudio | None = None,
     app_state: Any | None = None,
 ) -> None:
     job = await VIDEO_STORE.get(video_id)
@@ -2693,6 +2718,7 @@ async def _run_video_generation_job(
             video_id,
             reference_image=reference_image,
             reference_video=reference_video,
+            reference_audio=reference_audio,
         )
 
         file_name = f"{video_id}.{job.file_extension}"
@@ -2749,9 +2775,12 @@ async def _run_video_generation_job(
         _cleanup_video(video_id, output_path)
         await VIDEO_STORE.pop(video_id)
         raise
+    finally:
+        if reference_audio is not None and os.path.exists(reference_audio.path):
+            os.unlink(reference_audio.path)
 
 
-VIDEO_SYNC_TIMEOUT_S = 600.0
+VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
 
 
 async def _parse_video_form(
@@ -2760,6 +2789,7 @@ async def _parse_video_form(
     input_reference: UploadFile | None = File(default=None),
     image_reference: str | None = Form(default=None),
     video_reference: str | None = Form(default=None),
+    audio_reference: str | None = Form(default=None),
     model: str | None = Form(default=None),
     seconds: SecondStr | None = Form(default=None),
     size: SizeStr | None = Form(default=None),
@@ -2784,7 +2814,14 @@ async def _parse_video_form(
     frame_interpolation_model_path: str | None = Form(default=None),
     lora: str | None = Form(default=None),
     extra_params: str | None = Form(default=None),
-) -> tuple[VideoGenerationRequest, "OmniOpenAIServingVideo", str, ReferenceImage | None, ReferenceVideo | None]:
+) -> tuple[
+    VideoGenerationRequest,
+    "OmniOpenAIServingVideo",
+    str,
+    ReferenceImage | None,
+    ReferenceVideo | None,
+    ReferenceAudio | None,
+]:
     """FastAPI dependency that parses video form data, validates inputs,
     resolves the handler, and decodes any reference image.
 
@@ -2793,6 +2830,7 @@ async def _parse_video_form(
     input_reference_bytes = await input_reference.read() if input_reference is not None else None
     parsed_image_reference = _parse_form_json(image_reference)
     parsed_video_reference = _parse_form_json(video_reference)
+    parsed_audio_reference = _parse_form_json(audio_reference)
 
     provided_references = sum(
         item is not None for item in (parsed_image_reference, parsed_video_reference, input_reference_bytes)
@@ -2810,6 +2848,7 @@ async def _parse_video_form(
         "size": size,
         "image_reference": parsed_image_reference,
         "video_reference": parsed_video_reference,
+        "audio_reference": parsed_audio_reference,
         "user": user,
         "width": width,
         "height": height,
@@ -2884,7 +2923,16 @@ async def _parse_video_form(
 
     reference_image = ReferenceImage(data=media_data) if isinstance(media_data, Image.Image) else None
     reference_video = ReferenceVideo(data=media_data) if isinstance(media_data, list) else None
-    return request, handler, effective_model_name, reference_image, reference_video
+
+    reference_audio: ReferenceAudio | None = None
+    if request.audio_reference is not None:
+        try:
+            audio_path = await decode_audio_url(request.audio_reference.audio_url)
+        except InvalidInputReferenceError as exc:
+            raise HTTPException(400, detail=str(exc)) from exc
+        reference_audio = ReferenceAudio(path=audio_path)
+
+    return request, handler, effective_model_name, reference_image, reference_video, reference_audio
 
 
 @router.post(
@@ -2904,6 +2952,7 @@ async def create_video(
         str,
         ReferenceImage | None,
         ReferenceVideo | None,
+        ReferenceAudio | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
@@ -2911,7 +2960,7 @@ async def create_video(
     Accepts multipart form-data (see ``_parse_video_form`` for parameters),
     persists a queued job record, and starts generation in the background.
     """
-    request, handler, effective_model_name, reference_image, reference_video = ctx
+    request, handler, effective_model_name, reference_image, reference_video, reference_audio = ctx
     ref = video_response_from_request(effective_model_name, request)
     await VIDEO_STORE.upsert(ref.id, ref)
     task = asyncio.create_task(
@@ -2921,6 +2970,7 @@ async def create_video(
             ref.id,
             reference_image,
             reference_video,
+            reference_audio,
             app_state=raw_request.app.state,
         )
     )
@@ -2945,6 +2995,7 @@ async def create_video_sync(
         str,
         ReferenceImage | None,
         ReferenceVideo | None,
+        ReferenceAudio | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
@@ -2956,7 +3007,7 @@ async def create_video_sync(
     Metadata is returned via response headers ``X-Request-Id``,
     ``X-Model``, and ``X-Inference-Time-S``.
     """
-    request, handler, effective_model_name, reference_image, reference_video = ctx
+    request, handler, effective_model_name, reference_image, reference_video, reference_audio = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
@@ -2967,6 +3018,7 @@ async def create_video_sync(
                 request_id,
                 reference_image=reference_image,
                 reference_video=reference_video,
+                reference_audio=reference_audio,
             ),
             timeout=VIDEO_SYNC_TIMEOUT_S,
         )
@@ -2979,12 +3031,18 @@ async def create_video_sync(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniClientError as exc:
+        logger.info("Client error during sync video generation: %s", exc)
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     except Exception as exc:
         logger.exception("Sync video generation failed for request_id=%s", request_id)
         raise HTTPException(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
+    finally:
+        if reference_audio is not None and os.path.exists(reference_audio.path):
+            os.unlink(reference_audio.path)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(

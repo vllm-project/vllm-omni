@@ -11,7 +11,10 @@ import contextlib
 import os
 import signal
 from typing import Any
+import msgspec
+import zmq
 
+import vllm.v1.engine.core as _vllm_engine_core_module
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
@@ -27,7 +30,8 @@ from vllm.v1.engine.utils import (
     SignalCallback,
 )
 
-from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
+from vllm_omni.distributed.omni_coordinator import create_stage_coord_client, OmniCoordClientForStage
+from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.stage_init_utils import set_death_signal
 
 logger = init_logger(__name__)
@@ -77,6 +81,20 @@ class StageEngineCoreProc(EngineCoreProc):
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
 
+        # Register vllm-omni reasoning parsers (e.g. step_audio) in this
+        # subprocess so they are available when the engine core resolves
+        # ``--reasoning-parser``.  The main process already registered them
+        # at import time, but the forked subprocess starts with a fresh
+        # ReasoningParserManager.
+        try:
+            import vllm_omni.reasoning  # noqa: F401
+        except ImportError:
+            logger.warning(
+                "Failed to import vllm_omni.reasoning in subprocess; "
+                "custom reasoning parsers (e.g. step_audio) will not be "
+                "available."
+            )
+
         engine_core: StageEngineCoreProc | None = None
         coord_client = None
         try:
@@ -95,6 +113,18 @@ class StageEngineCoreProc(EngineCoreProc):
             # Setting this env var allows the same graceful fallback to work.
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
             os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
+
+            # Patch the decoder type so process_input_sockets (started
+            # during __init__) decodes OmniEngineCoreRequest (which
+            # carries additional_information) instead of the base
+            # EngineCoreRequest.  Must happen BEFORE __init__ because
+            # the IO thread creates MsgpackDecoder(EngineCoreRequest)
+            # during __init__.
+            _vllm_engine_core_module.EngineCoreRequest = OmniEngineCoreRequest
+            logger.debug(
+                "[StageEngineCoreProc] Patched EngineCoreRequest -> OmniEngineCoreRequest: %s",
+                _vllm_engine_core_module.EngineCoreRequest,
+            )
 
             engine_core = StageEngineCoreProc(
                 *args,

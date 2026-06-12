@@ -44,9 +44,6 @@ steps:
     depends_on: upload-merge-pipeline
     steps:
       - label: "Diffusion · LoRA Test"
-        source_file_dependencies:
-          - tests/diffusion/lora/
-          - vllm_omni/diffusion/lora/
         timeout_in_minutes: 30
         commands:
           - pytest -sv tests/diffusion/lora/ -m 'advanced_model and cuda' --run-level "advanced_model"
@@ -64,9 +61,6 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Distributed Test"
-    source_file_dependencies:
-      - tests/distributed/
-      - vllm_omni/distributed/
     timeout_in_minutes: 60
     commands:
       - |
@@ -111,9 +105,6 @@ steps:
 
   - group: ":card_index_dividers: Entrypoints Test"
     depends_on: upload-merge-pipeline
-    source_file_dependencies:
-      - tests/entrypoints/
-      - vllm_omni/entrypoints/
     steps:
       - label: "Entrypoint Test with H100"
         timeout_in_minutes: 60
@@ -158,7 +149,7 @@ steps:
         commands:
           - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and L4" --run-level "advanced_model"
         agents:
-          queue: "gpu_4_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+          queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:
           - docker#v5.2.0:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
@@ -180,7 +171,6 @@ steps:
           - vllm_omni/model_executor/models/qwen3_tts/
           - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
           - vllm_omni/deploy/qwen3_tts.yaml
-          - vllm_omni/model_executor/stage_configs/qwen3_tts_uniproc.yaml
         commands:
           - |
             timeout 20m bash -c "
@@ -189,7 +179,7 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py tests/e2e/offline_inference/test_qwen3_tts_customvoice.py -m 'advanced_model and cuda' --run-level 'advanced_model'
             "
         agents:
-          queue: "gpu_4_queue"
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
           - docker#v5.2.0:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
@@ -216,7 +206,7 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py tests/e2e/offline_inference/test_qwen3_tts_base.py -m 'advanced_model and cuda' --run-level 'advanced_model'
             "
         agents:
-          queue: "gpu_4_queue"
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
           - docker#v5.2.0:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
@@ -229,6 +219,12 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "TTS · Ming-Omni-TTS Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_ming_tts.py
+          - tests/e2e/offline_inference/test_ming_tts.py
+          - vllm_omni/model_executor/models/ming_tts/
+          - vllm_omni/model_executor/stage_input_processors/ming_tts.py
+          - vllm_omni/deploy/ming_tts.yaml
         timeout_in_minutes: 20
         commands:
           - |

@@ -31,7 +31,7 @@ steps:
     key: upload-ready-pipeline
     if: __UPLOAD_READY_IF__
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-ready.yml
+      - python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/test-ready.yml
     agents:
       queue: "cpu_queue_premerge"
 

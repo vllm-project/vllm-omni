@@ -1,6 +1,7 @@
 """E2E test for VoxCPM2 native AR offline inference."""
 
 import os
+from collections.abc import Mapping
 
 import pytest
 import torch
@@ -23,7 +24,7 @@ def voxcpm2_engine():
 
 def _extract_audio(multimodal_output: dict) -> torch.Tensor:
     """Extract the final complete audio tensor from multimodal output."""
-    assert isinstance(multimodal_output, dict), f"Expected dict, got {type(multimodal_output)}"
+    assert isinstance(multimodal_output, (dict, Mapping)), f"Expected dict/Mapping, got {type(multimodal_output)}"
 
     # Output processor accumulates per-step audio chunks under "audio".
     audio = multimodal_output.get("audio")

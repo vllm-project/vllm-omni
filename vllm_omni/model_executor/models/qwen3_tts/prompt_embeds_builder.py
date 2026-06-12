@@ -329,6 +329,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         self._tts_pad_embed_buffer = tts_pad_embed
         self._encode_ref_audio_batch_fn = encode_ref_audio_batch
         self._speaker_cache = speaker_cache
+        self._embedding_dtype = torch.bfloat16
 
         self._text_tokenizer: Any | None = None
 
@@ -598,7 +599,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         if isinstance(ref_code, torch.Tensor):
             entry["ref_code"] = ref_code.detach().to("cpu", dtype=torch.long).contiguous()
         if isinstance(ref_spk_embedding, torch.Tensor):
-            entry["ref_spk_embedding"] = ref_spk_embedding.detach().to("cpu", dtype=torch.bfloat16).reshape(-1)
+            entry["ref_spk_embedding"] = ref_spk_embedding.detach().to("cpu", dtype=self._embedding_dtype).reshape(-1)
         if not entry:
             return
         self._ref_audio_artifact_cache[cache_key] = entry
@@ -613,10 +614,11 @@ class Qwen3TTSPromptEmbedsBuilder:
         # CUDA. Ensure the speaker encoder is on the same device/dtype as the
         # main model before running it.
         dev = self._device()
+        dtype = self._embedding_dtype
         try:
             spk_param = next(self._speaker_encoder.parameters())
-            if spk_param.device != dev or spk_param.dtype != torch.bfloat16:
-                self._speaker_encoder.to(device=dev, dtype=torch.bfloat16)
+            if spk_param.device != dev or spk_param.dtype != dtype:
+                self._speaker_encoder.to(device=dev, dtype=dtype)
         except StopIteration:
             pass
 
@@ -641,8 +643,8 @@ class Qwen3TTSPromptEmbedsBuilder:
             fmin=0,
             fmax=12000,
         ).transpose(1, 2)
-        spk = self._speaker_encoder(mels.to(dtype=torch.bfloat16))[0]
-        return spk.to(dtype=torch.bfloat16)
+        spk = self._speaker_encoder(mels.to(dtype=dtype))[0]
+        return spk.to(dtype=dtype)
 
     def encode_ref_audio_batch(
         self,
@@ -1187,17 +1189,18 @@ class Qwen3TTSPromptEmbedsBuilder:
             # NOTE: Do NOT use _as_singleton here — the embedding may be a plain
             # float list (from API via msgspec IPC) that _as_singleton would
             # destructively unwrap to a single scalar.
+            speaker_dtype = self._embedding_dtype
             spk = None
             if voice_clone_prompt is not None:
                 spk = voice_clone_prompt.get("ref_spk_embedding")
             if isinstance(spk, torch.Tensor):
-                speaker_embed = spk.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
+                speaker_embed = spk.to(device=input_ids.device, dtype=speaker_dtype).view(1, 1, -1)
             elif isinstance(spk, (list, np.ndarray)):
-                speaker_embed = torch.tensor(spk, dtype=torch.bfloat16, device=input_ids.device).view(1, 1, -1)
+                speaker_embed = torch.tensor(spk, dtype=speaker_dtype, device=input_ids.device).view(1, 1, -1)
             elif cached_artifacts is not None and isinstance(cached_artifacts.get("ref_spk_embedding"), torch.Tensor):
                 speaker_embed = (
                     cached_artifacts["ref_spk_embedding"]
-                    .to(device=input_ids.device, dtype=torch.bfloat16)
+                    .to(device=input_ids.device, dtype=speaker_dtype)
                     .view(1, 1, -1)
                 )
             elif artifact_only:

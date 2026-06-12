@@ -131,6 +131,38 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
 
 
+def test_forward_gathers_gen_tokens_before_unpatchify(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    class RecordingGather(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, hidden_gen: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
+            return hidden_gen
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    gather = RecordingGather()
+    model.gen_sp_gather = gather
+
+    output = model(
+        hidden_states=torch.zeros(1, 2, 1, 2, 2),
+        timestep=torch.tensor([1.0]),
+        text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        video_shape=(1, 2, 2),
+        fps=24.0,
+    )
+
+    assert gather.calls == 1
+    assert tuple(output.shape) == (1, 2, 1, 2, 2)
+
+
 def test_sound_and_action_modules_follow_config() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 

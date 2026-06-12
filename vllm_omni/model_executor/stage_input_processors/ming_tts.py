@@ -167,10 +167,11 @@ def _build_chunk_observability(
 
 def llm2audio_vae_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any] | None,
+    multimodal_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
+    pooling_output = multimodal_output
     request_id = request.external_req_id
     chunk_id = int(transfer_manager.put_req_chunk[request_id])
     finished = bool(is_finished or request.is_finished())
