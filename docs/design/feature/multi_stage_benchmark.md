@@ -4,7 +4,7 @@ This section describes additional benchmark design for multi stage models.
 
 ## Overview
 
-The `vllm bench serve --omni` command prints basic benchmark metrics with overall calculations. With adding `--print-stage` parameter, stage wise benchmark data will also be printed.
+The `vllm bench serve --omni` command prints basic benchmark metrics with overall calculations. With adding `--print-stage` parameter, stage wise benchmark data will also be printed. This feature helps you track the performances of each stage, especially internal stages like talker in Qwen3-Omni. As these internal stages will not send outputs to the client, it is not as simple as stages with outputs for clients to track performances directly from the response.
 
 For Qwen3-Omni: these results will be printed after end-to-end benchmark data:
 <pre>
@@ -28,9 +28,11 @@ For HunyuanImage-3.0, stage wise metrics will be like:
 ==================================================
 </pre>
 
+The name of stages are fetched from `StagePipelineConfig.model_stage`, which are usually defined in `vllm_omni/model_executor/modes/YOUR_MODEL/pipeline.py`.
+
 ## General design for stage local metrics
-- `stage_gen_time`: Time from submitting a request to a specific stage (which is collected as `stage_submit_ts[stage_id]`) to that stage finishing generation (which is collected when `build_stage_metrics` is called), which is the basic latency metric for stages. 
-- Generalized serving time to first output (TTFT) for streaming stages: Time from the __HTTP request being accepted by the serving frontend__ (to ignore the network latency which is measured by end-to-end benchmark, which is collected when `serve_http` is called) to the stage producing its first __non-empty__ (to measure the time till users can get the result) output.
+- stage_gen_time: Time from submitting a request to a specific stage (which is collected as `OrchestratorRequestState.stage_submit_ts[stage_id]`) to that stage finishing generation (which is collected when `StagePool.build_stage_metrics()` is called), which is the basic latency metric for stages.
+- Generalized serving time to first output (TTFT) for streaming stages: Time from the __HTTP request being accepted by the serving frontend__ (to ignore the network latency which is measured by end-to-end benchmark, which is collected when `serve_http()` is called) to the stage producing its first __non-empty__ (to measure the time till users can get the result) output.
 - Generalized Time-per-output-token (TPOT) and Inter-token-latency (ITL) for more types of streaming stages besides text output stage. Qwen3.5-Omni begins to use generalized abbreviations like TPOP.
 
 ## Special design for different output type stages
