@@ -12,6 +12,7 @@ signature pattern as glm_image.ar2diffusion.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
 
@@ -208,7 +209,7 @@ def ar2diffusion(
         # Forward multimodal output from AR (if any)
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
             mm_output = ar_output.multimodal_output
-            if isinstance(mm_output, dict):
+            if isinstance(mm_output, Mapping):
                 diffusion_input["extra"]["ar_multimodal_output"] = mm_output
 
         # Forward sampling params

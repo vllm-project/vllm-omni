@@ -1480,7 +1480,7 @@ class AsyncOmniEngine:
             return
 
         mm_data = prompt.get("multi_modal_data")
-        if not isinstance(mm_data, dict) or not mm_data:
+        if not isinstance(mm_data, Mapping) or not mm_data:
             return
 
         from vllm.multimodal.hasher import MultiModalHasher
