@@ -257,7 +257,10 @@ window.wtGenerate = function(payload) {{
         let msg;
         try {{ msg = JSON.parse(ev.data); }} catch (e) {{ return; }}
         if (msg.type === 'audio.start') {{
-            sentences[msg.sentence_index] = {{ index: msg.sentence_index, text: msg.sentence_text || '', chunks: [], timestamps: null }};
+            sentences[msg.sentence_index] = {{
+                index: msg.sentence_index, text: msg.sentence_text || '',
+                chunks: [], timestamps: null
+            }};
         }} else if (msg.type === 'audio.chunk') {{
             const s = sentences[msg.sentence_index];
             if (!s) return;
@@ -375,7 +378,7 @@ def create_app(api_base: str) -> FastAPI:
                 generate_btn = gr.Button("Generate + Align", variant="primary", size="lg")
 
             with gr.Column(scale=2):
-                player_html = gr.HTML(value=PLAYER_HTML)
+                gr.HTML(value=PLAYER_HTML)
 
         hidden_payload = gr.Textbox(visible=False, elem_id="wt-payload")
 

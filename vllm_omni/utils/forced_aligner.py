@@ -354,7 +354,8 @@ def _decode_timestamps(
     expected = len(words) * 2
     if len(timestamp_positions) != expected:
         logger.warning(
-            "Got %d timestamp positions but text has %d words (expected %d start/end markers); returning empty alignment.",
+            "Got %d timestamp positions but text has %d words (expected %d start/end markers); "
+            "returning empty alignment.",
             len(timestamp_positions),
             len(words),
             expected,
