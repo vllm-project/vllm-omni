@@ -205,20 +205,6 @@ class OmniEngineArgs(EngineArgs):
             )
         except argparse.ArgumentError:
             pass
-        try:
-            parser.add_argument(
-                "--forced-aligner-device",
-                type=str,
-                default=None,
-                help=(
-                    "Pin the forced aligner LLM to a specific GPU, given as a "
-                    "physical device index (e.g. '7'). The card must be visible "
-                    "to the API server process. Omit to share the server's "
-                    "default visible device (cuda:0) with the TTS stages."
-                ),
-            )
-        except argparse.ArgumentError:
-            pass
         return parser
 
     omni_master_address: str | None = None
@@ -241,7 +227,6 @@ class OmniEngineArgs(EngineArgs):
     forced_aligner: str | None = None
     forced_aligner_config: str | None = None
     forced_aligner_gpu_memory_utilization: float | None = None
-    forced_aligner_device: str | None = None
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:

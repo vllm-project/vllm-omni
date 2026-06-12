@@ -41,12 +41,6 @@ forced_aligner:
   # Override with --forced-aligner-gpu-memory-utilization.
   gpu_memory_utilization: 0.30
 
-  # Optional: pin the aligner to a dedicated GPU (physical device index,
-  # e.g. "7") so it does not compete with the TTS stages for memory.
-  # The card must be visible to the API server process. Override with
-  # --forced-aligner-device. Leave unset to share cuda:0 with the TTS stages.
-  # device: "7"
-
   # FP16 for compute, BF16 also fine on Hopper. The classifier head
   # uses model dtype (not head_dtype) so this choice flows through.
   dtype: bfloat16

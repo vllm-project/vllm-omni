@@ -102,7 +102,6 @@ def main(args: Any) -> None:
     omni_kwargs = vars(args).copy()
     for key in (
         "forced_aligner",
-        "forced_aligner_device",
         "text",
         "language",
         "speaker",
@@ -163,12 +162,6 @@ def parse_args() -> Any:
         type=float,
         default=None,
         help="Optional gpu_memory_utilization override for the forced aligner",
-    )
-    parser.add_argument(
-        "--forced-aligner-device",
-        default=None,
-        help="Optional physical GPU index to pin the aligner to (e.g. '5'), so "
-        "it runs on a separate card from the TTS stages.",
     )
     parser.add_argument("--stage-configs-path", default=None, help="Qwen3-TTS deploy YAML")
     parser.add_argument("--text", default="Hello world.", help="Text to synthesize and align")

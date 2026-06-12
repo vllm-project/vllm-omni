@@ -91,9 +91,6 @@ class ForcedAlignerConfig:
     dtype: str | None = None
     max_model_len: int | None = None
     trust_remote_code: bool | None = None
-    # Physical GPU index (as a string, e.g. "7") to pin the aligner LLM to.
-    # None shares the server's default visible device (cuda:0).
-    device: str | None = None
     extra_llm_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
@@ -123,9 +120,6 @@ def build_forced_aligner_config(args: Any) -> ForcedAlignerConfig | None:
     gpu_mem = getattr(args, "forced_aligner_gpu_memory_utilization", None)
     if gpu_mem is not None:
         config_data["gpu_memory_utilization"] = float(gpu_mem)
-    device = getattr(args, "forced_aligner_device", None)
-    if device is not None:
-        config_data["device"] = str(device)
     model = config_data.get("model")
     if not model:
         return None
@@ -252,21 +246,10 @@ def _ensure_loaded(config: ForcedAlignerConfig) -> None:
         if _llm is not None:
             return  # raced; another caller did the load
 
-        # Lazy import: vllm pulls torch + CUDA, which we want to avoid
-        # at module import time.
-        #
-        # Multiprocessing mode depends on whether we pin a GPU:
-        #   * No device pin: run the engine in-process (lighter, no extra
-        #     subprocess) sharing the API server's default visible device.
-        #   * Device pin: force a spawned engine subprocess. The API server
-        #     process has already initialized its own CUDA context, so an
-        #     in-process LLM can no longer be redirected to another card.
-        #     A fresh subprocess reads CUDA_VISIBLE_DEVICES at startup and
-        #     binds cleanly to the requested GPU.
-        if config.device is not None:
-            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
-        else:
-            os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        # Lazy import: vllm pulls torch + CUDA, which we want to avoid at
+        # module import time. The aligner runs in-process, sharing the API
+        # server's visible device with the TTS stages.
+        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         from vllm import LLM
 
         logger.info(
@@ -289,24 +272,7 @@ def _ensure_loaded(config: ForcedAlignerConfig) -> None:
             llm_kwargs["max_model_len"] = config.max_model_len
         llm_kwargs.update(config.extra_llm_kwargs)
 
-        # Pin the aligner to a specific GPU by scoping CUDA_VISIBLE_DEVICES
-        # around construction. The engine subprocess (forced above) reads this
-        # env var once at startup and binds its CUDA context to the requested
-        # card. ``torch.cuda.set_device`` does not work for this: vLLM
-        # initializes the device itself and ignores it.
-        prev_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if config.device is not None:
-            pinned = config.device.strip().removeprefix("cuda:")
-            os.environ["CUDA_VISIBLE_DEVICES"] = pinned
-            logger.info("Pinning forced aligner to CUDA_VISIBLE_DEVICES=%s", pinned)
-        try:
-            llm = LLM(**llm_kwargs)
-        finally:
-            if config.device is not None:
-                if prev_visible is None:
-                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-                else:
-                    os.environ["CUDA_VISIBLE_DEVICES"] = prev_visible
+        llm = LLM(**llm_kwargs)
 
         thinker_config = getattr(llm.llm_engine.model_config.hf_config, "thinker_config", None)
         if thinker_config is None or not hasattr(thinker_config, "classify_num"):

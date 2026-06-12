@@ -140,38 +140,3 @@ def test_build_config_from_cli_model_uses_default_yaml():
     assert out.model == "local-aligner"
     assert out.runner == "pooling"
     assert out.architecture == "Qwen3ASRForcedAlignerForTokenClassification"
-
-
-def test_build_config_cli_device_override():
-    args = type(
-        "Args",
-        (),
-        {
-            "forced_aligner": "local-aligner",
-            "forced_aligner_config": None,
-            "forced_aligner_gpu_memory_utilization": None,
-            "forced_aligner_device": "7",
-        },
-    )()
-
-    out = forced_aligner.build_forced_aligner_config(args)
-
-    assert out is not None
-    assert out.device == "7"
-
-
-def test_build_config_device_defaults_to_none():
-    args = type(
-        "Args",
-        (),
-        {
-            "forced_aligner": "local-aligner",
-            "forced_aligner_config": None,
-            "forced_aligner_gpu_memory_utilization": None,
-        },
-    )()
-
-    out = forced_aligner.build_forced_aligner_config(args)
-
-    assert out is not None
-    assert out.device is None
