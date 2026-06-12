@@ -185,8 +185,7 @@ def segment_words(text: str, language: str | None = None) -> list[str]:
             return list(word_list)
         except Exception:  # noqa: BLE001
             logger.warning(
-                "Official Qwen3ForceAlignProcessor failed for language=%r; "
-                "falling back to built-in segmentation.",
+                "Official Qwen3ForceAlignProcessor failed for language=%r; falling back to built-in segmentation.",
                 lang,
                 exc_info=True,
             )

@@ -283,8 +283,7 @@ def _ensure_loaded(config: ForcedAlignerConfig) -> None:
         timestamp_segment_time_ms = getattr(llm.llm_engine.model_config.hf_config, "timestamp_segment_time", None)
         if timestamp_segment_time_ms is None:
             raise RuntimeError(
-                "Loaded aligner has no timestamp_segment_time; "
-                "expected a Qwen3ASR forced aligner checkpoint."
+                "Loaded aligner has no timestamp_segment_time; expected a Qwen3ASR forced aligner checkpoint."
             )
 
         tokenizer = llm.get_tokenizer()

@@ -28,13 +28,12 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 import numpy as np
 import soundfile as sf
 import torch
+from end2end import _estimate_prompt_len
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import Omni
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.utils.forced_aligner import align, build_forced_aligner_config
-
-from end2end import _estimate_prompt_len
 
 
 def _default_stage_config() -> str:

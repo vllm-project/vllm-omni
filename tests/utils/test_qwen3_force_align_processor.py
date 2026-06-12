@@ -2,7 +2,6 @@ import pytest
 
 from vllm_omni.utils import qwen3_force_align_processor as processor
 
-
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
