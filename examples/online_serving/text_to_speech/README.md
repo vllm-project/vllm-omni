@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 |---|---|---|---|---|---|
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
+| IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✓ (`ref_audio` required) | — | emotion params (`emo_audio`, `emo_text`, `emo_vector`) | — |
 | Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | ✓ (`ref_audio` / `speaker_embedding`) | ✓ (PCM stream) | IP labels + structured `instructions` | — |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
@@ -132,6 +133,39 @@ bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
 - Output: 24 kHz mono WAV via HiFT vocoder.
 - `ref_audio` + `ref_text` are **required** together on every request. Reference audio should be 3-10 seconds.
 - Voice cloning feature extraction (WhisperVQ, CampPlus, mel) runs on the model side — no external dependency on the serving layer.
+
+---
+
+## IndexTTS-2
+
+2-stage TTS (GPT AR + S2Mel CFM DiT + BigVGAN) at 22.05 kHz. Every request requires `ref_audio` for voice cloning. Supports emotion conditioning via `emo_audio`, `emo_text`, or `emo_vector` passed in `extra_params`.
+
+### Launch
+```bash
+vllm serve IndexTeam/IndexTTS-2 --omni --port 8092
+# or:
+bash examples/online_serving/text_to_speech/indextts2/run_server.sh
+```
+
+### Sending requests
+```bash
+# Voice cloning (ref_audio required)
+python examples/online_serving/text_to_speech/indextts2/speech_client.py \
+    --text "你好，世界！" \
+    --ref-audio /path/to/reference.wav
+
+# With emotion audio
+python examples/online_serving/text_to_speech/indextts2/speech_client.py \
+    --text "今天心情很好！" \
+    --ref-audio /path/to/ref.wav \
+    --emo-audio /path/to/happy.wav
+```
+
+### Notes
+- Output: 22.05 kHz mono WAV.
+- `ref_audio` is **required** on every request — IndexTTS-2 does not support text-only synthesis.
+- Emotion params (`emo_audio`, `emo_text`, `emo_vector`, `emo_alpha`, `use_emo_text`, `use_random`) are passed via the `extra_params` field.
+- Deploy config: `vllm_omni/deploy/indextts2.yaml` (auto-loaded).
 
 ---
 

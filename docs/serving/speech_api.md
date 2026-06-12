@@ -7,6 +7,8 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
 
+- **IndexTTS-2** (`IndexTeam/IndexTTS-2`) -- 2-stage AR + S2Mel CFM DiT + BigVGAN. Voice cloning via `ref_audio` (required). Emotion control via `extra_params`. Output: 22.05 kHz.
+
 See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, and MOSS-TTS-Nano.
 
 !!! tip "Deployment recipes"
@@ -643,6 +645,12 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | Model | Description |
 |-------|-------------|
 | `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
+
+### IndexTTS-2
+
+| Model | Description |
+|-------|-------------|
+| `IndexTeam/IndexTTS-2` | 2-stage voice cloning TTS (22.05 kHz). Requires `ref_audio` on every request. Emotion conditioning via `extra_params`: `emo_audio`, `emo_text`, `emo_vector` (8-dim), `emo_alpha`, `use_emo_text`, `use_random`. |
 
 ### MOSS-TTS-Nano
 
