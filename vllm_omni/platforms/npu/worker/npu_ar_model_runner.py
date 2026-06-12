@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from copy import copy, deepcopy
 from typing import Any, NamedTuple
 
@@ -163,7 +164,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
         num_tokens_padded: int,
     ):
         if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
-            if multimodal_outputs is not None and not isinstance(multimodal_outputs, dict):
+            if multimodal_outputs is not None and not isinstance(multimodal_outputs, Mapping):
                 logger.warning_once(
                     "prefix caching expects mm outputs to be a dict, but got %s",
                     type(multimodal_outputs),
@@ -639,7 +640,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             if multimodal_outputs is not None:
                 keys_or_type = (
                     list(multimodal_outputs.keys())
-                    if isinstance(multimodal_outputs, dict)
+                    if isinstance(multimodal_outputs, Mapping)
                     else type(multimodal_outputs)
                 )
                 logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
