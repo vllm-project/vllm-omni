@@ -196,9 +196,7 @@ def _main() -> None:
 
         # omni.generate accepts a list of prompts — it submits them all
         # before polling outputs, creating pipeline overlap.
-        all_outputs = list(
-            omni.generate(prompts=formatted_prompts, sampling_params_list=params_list, use_tqdm=True)
-        )
+        all_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list, use_tqdm=True))
         t_wall_end = time.perf_counter()
 
         # Map outputs back to request indices.  Outputs arrive in
@@ -213,8 +211,8 @@ def _main() -> None:
             )
 
         print(f"\n  Pipeline wall time: {t_wall_end - t_wall_start:.2f}s for {total} requests")
-        print(f"  Per-request e2e is not individually measurable in pipeline mode.")
-        print(f"  Check process logs for KV prefetch HIT/MISS lines.")
+        print("  Per-request e2e is not individually measurable in pipeline mode.")
+        print("  Check process logs for KV prefetch HIT/MISS lines.")
 
     omni.shutdown()
 
@@ -236,7 +234,7 @@ def _main() -> None:
             print(f"    {e['label']}: img={'ok' if e['img_saved'] else 'none'}")
         print("\n  In pipeline mode, per-request e2e is not individually measurable.")
         print("  Check the process log output for lines matching 'KV prefetch HIT/MISS'.")
-        print(f"  Expected: request 0 = MISS, requests 1+ = HIT (when prefetch enabled).")
+        print("  Expected: request 0 = MISS, requests 1+ = HIT (when prefetch enabled).")
     else:
         e2e_times = [e["elapsed_s"] for e in measured]
         print("\n  Per-request end-to-end latency:")
