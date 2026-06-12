@@ -4,6 +4,7 @@
 from collections import defaultdict
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
@@ -13,6 +14,8 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
 from vllm_omni.model_executor.stage_input_processors.step_audio2 import (
     thinker2token2wav_async_chunk,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _req(external_req_id: str, *, prompt_token_ids: list[int], all_token_ids: list[int], finished: bool):

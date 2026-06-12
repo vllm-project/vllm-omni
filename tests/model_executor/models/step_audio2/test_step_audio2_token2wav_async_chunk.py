@@ -6,9 +6,22 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import (
-    StepAudio2Token2WavForConditionalGeneration,
-)
+# Token2Wav imports the optional `step-audio2` extras (flashcosyvoice / s3tokenizer
+# / hyperpyyaml) at module load. Skip instead of erroring at collection time on CI
+# images that do not install them (e.g. the CPU core_model runner); a genuine
+# import error (e.g. vLLM API drift) still surfaces. See
+# examples/offline_inference/step_audio2/README.md.
+try:
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import (
+        StepAudio2Token2WavForConditionalGeneration,
+    )
+except ModuleNotFoundError as exc:
+    pytest.skip(
+        f"Step-Audio2 Token2Wav extras not installed ({exc.name})",
+        allow_module_level=True,
+    )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyModelConfig:
