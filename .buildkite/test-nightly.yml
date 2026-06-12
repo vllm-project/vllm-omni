@@ -1465,7 +1465,7 @@ steps:
     key: nightly-testcase-statistics
     timeout_in_minutes: 120
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+    if: build.env("NIGHTLY") == "1"
     commands:
       - python tools/nightly/buildkite_testcase_statistics.py -o tests/dfx/perf/results/buildkite_testcase_statistics.html
       - buildkite-agent artifact upload "tests/dfx/perf/results/*.html"
