@@ -5,7 +5,6 @@ E2E Online tests for Qwen3-TTS model with text input and audio output.
 
 These tests verify the /v1/audio/speech endpoint works correctly with
 actual model inference, not mocks.
-debug for test
 """
 
 import os

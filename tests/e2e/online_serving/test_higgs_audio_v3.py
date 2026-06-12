@@ -180,7 +180,6 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
     These tests check the *serving surface* - the validator accepts the
     payload, the engine produces audio, and the WAV has non-trivial size.
     They do not assert audio quality (out of scope for CI).
-    debug for test
     """
 
     @pytest.mark.core_model
