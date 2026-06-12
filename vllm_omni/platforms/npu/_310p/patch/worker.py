@@ -16,7 +16,7 @@ from vllm_omni.platforms.npu._310p import disable_jit_compile
 from vllm_omni.platforms.npu.worker import base as worker_base
 
 
-class OmniNPUWorkerBase310P(worker_base.OmniNPUWorkerBase):
+class _OmniNPUWorkerBase310P(worker_base.OmniNPUWorkerBase):
     def _init_device(self):
         device = super()._init_device()
         disable_jit_compile()
@@ -24,4 +24,4 @@ class OmniNPUWorkerBase310P(worker_base.OmniNPUWorkerBase):
 
 
 def apply_patch() -> None:
-    worker_base.OmniNPUWorkerBase = OmniNPUWorkerBase310P
+    worker_base.OmniNPUWorkerBase = _OmniNPUWorkerBase310P

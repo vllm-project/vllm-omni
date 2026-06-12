@@ -241,7 +241,7 @@ def test_worker_patch_replaces_base_and_runs_disable_jit(monkeypatch: pytest.Mon
     module = _load_source_module("vllm_omni_test_310p_worker_patch", path)
     module.apply_patch()
 
-    assert fake_worker_base.OmniNPUWorkerBase is module.OmniNPUWorkerBase310P
+    assert fake_worker_base.OmniNPUWorkerBase is module._OmniNPUWorkerBase310P
     assert fake_worker_base.OmniNPUWorkerBase()._init_device() == "npu:0"
     assert calls == ["parent", "disable_jit"]
 
@@ -251,17 +251,17 @@ def test_qwen3_tts_patch_replaces_target_classes(monkeypatch: pytest.MonkeyPatch
 
     module.apply_talker_patches()
 
-    assert fake_talker.Qwen3TTSTalkerForConditionalGeneration is module.Qwen3TTSTalker310P
-    assert fake_talker.Qwen3TTSPromptEmbedsBuilder is module.Qwen3TTSPromptEmbedsBuilder310P
-    assert fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder is module.Qwen3TTSPromptEmbedsBuilder310P
-    assert fake_code_predictor.CodePredictorAttention is module.Qwen3CodePredictorAttention310P
-    assert fake_code_predictor.CodePredictorDecoderLayer is module.Qwen3CodePredictorDecoderLayer310P
-    assert fake_code_predictor.CodePredictorBaseModel is module.Qwen3CodePredictorBaseModel310P
+    assert fake_talker.Qwen3TTSTalkerForConditionalGeneration is module._Qwen3TTSTalker310P
+    assert fake_talker.Qwen3TTSPromptEmbedsBuilder is module._Qwen3TTSPromptEmbedsBuilder310P
+    assert fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder is module._Qwen3TTSPromptEmbedsBuilder310P
+    assert fake_code_predictor.CodePredictorAttention is module._Qwen3CodePredictorAttention310P
+    assert fake_code_predictor.CodePredictorDecoderLayer is module._Qwen3CodePredictorDecoderLayer310P
+    assert fake_code_predictor.CodePredictorBaseModel is module._Qwen3CodePredictorBaseModel310P
 
 
 def test_qwen3_tts_talker_patch_uses_fp16_runtime_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
     module, _ = _load_qwen3_tts_patch(monkeypatch)
-    talker = module.Qwen3TTSTalker310P(vllm_config=object())
+    talker = module._Qwen3TTSTalker310P(vllm_config=object())
 
     assert talker._embedding_dtype is torch.float16
     assert talker._prompt_builder._embedding_dtype is torch.float16
@@ -296,7 +296,7 @@ def test_qwen3_tts_prompt_patch_runs_stft_frontend_on_cpu(monkeypatch: pytest.Mo
             return (torch.ones(4, dtype=mels.dtype),)
 
     monkeypatch.setattr(module.prompt_embeds_builder, "mel_spectrogram", fake_mel_spectrogram)
-    builder = object.__new__(module.Qwen3TTSPromptEmbedsBuilder310P)
+    builder = object.__new__(module._Qwen3TTSPromptEmbedsBuilder310P)
     builder._device = lambda: torch.device("cpu")
     builder._embedding_dtype = torch.float16
     builder._speaker_encoder = FakeSpeakerEncoder()
@@ -324,7 +324,7 @@ def test_qwen3_tts_mimi_codebook_quantize_uses_cpu_fp32_cdist(monkeypatch: pytes
         return real_cdist(x1, x2, p=p)
 
     monkeypatch.setattr(torch, "cdist", fake_cdist)
-    codebook = object.__new__(module.MimiEuclideanCodebook310P)
+    codebook = object.__new__(module._MimiEuclideanCodebook310P)
     codebook._embed = torch.tensor([[0.0, 0.0], [2.0, 0.0]], dtype=torch.float16)
 
     indices = codebook.quantize(torch.tensor([[0.1, 0.0], [1.8, 0.0]], dtype=torch.float16))

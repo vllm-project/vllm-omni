@@ -17,7 +17,7 @@ _RUNTIME_DTYPE = torch.float16
 _CPU_DEVICE = torch.device("cpu")
 
 
-class MimiEuclideanCodebook310P(modeling_mimi.MimiEuclideanCodebook):
+class _MimiEuclideanCodebook310P(modeling_mimi.MimiEuclideanCodebook):
     def quantize(self, hidden_states):
         # 310P does not support torch.cdist on NPU.
         device = hidden_states.device
@@ -27,7 +27,7 @@ class MimiEuclideanCodebook310P(modeling_mimi.MimiEuclideanCodebook):
         return dists.argmin(dim=-1).to(device=device)
 
 
-class Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneration):
+class _Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneration):
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._embedding_dtype = _RUNTIME_DTYPE
@@ -68,7 +68,7 @@ class Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneration
         ]
 
 
-class Qwen3TTSPromptEmbedsBuilder310P(prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder):
+class _Qwen3TTSPromptEmbedsBuilder310P(prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder):
     def extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
         dev = self._device()
         dtype = self._embedding_dtype
@@ -100,7 +100,7 @@ class Qwen3TTSPromptEmbedsBuilder310P(prompt_embeds_builder.Qwen3TTSPromptEmbeds
         return spk.to(dtype=dtype)
 
 
-class Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttention):
+class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttention):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._buffers.pop("_fusion_causal_mask", None)
@@ -159,7 +159,7 @@ class Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttentio
         return self.o_proj(attn_out.to(output_dtype).transpose(1, 2).reshape(bsz, seq_len, -1))
 
 
-class Qwen3CodePredictorDecoderLayer310P(qwen3_code_predictor.CodePredictorDecoderLayer):
+class _Qwen3CodePredictorDecoderLayer310P(qwen3_code_predictor.CodePredictorDecoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -176,7 +176,7 @@ class Qwen3CodePredictorDecoderLayer310P(qwen3_code_predictor.CodePredictorDecod
         return residual + self.mlp(hidden_states)
 
 
-class Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseModel):
+class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseModel):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._attention_mask_310p = None
@@ -218,10 +218,10 @@ class Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseMode
 
 
 def apply_talker_patches() -> None:
-    modeling_mimi.MimiEuclideanCodebook = MimiEuclideanCodebook310P
-    qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneration = Qwen3TTSTalker310P
-    qwen3_tts_talker.Qwen3TTSPromptEmbedsBuilder = Qwen3TTSPromptEmbedsBuilder310P
-    prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder = Qwen3TTSPromptEmbedsBuilder310P
-    qwen3_code_predictor.CodePredictorAttention = Qwen3CodePredictorAttention310P
-    qwen3_code_predictor.CodePredictorDecoderLayer = Qwen3CodePredictorDecoderLayer310P
-    qwen3_code_predictor.CodePredictorBaseModel = Qwen3CodePredictorBaseModel310P
+    modeling_mimi.MimiEuclideanCodebook = _MimiEuclideanCodebook310P
+    qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneration = _Qwen3TTSTalker310P
+    qwen3_tts_talker.Qwen3TTSPromptEmbedsBuilder = _Qwen3TTSPromptEmbedsBuilder310P
+    prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder = _Qwen3TTSPromptEmbedsBuilder310P
+    qwen3_code_predictor.CodePredictorAttention = _Qwen3CodePredictorAttention310P
+    qwen3_code_predictor.CodePredictorDecoderLayer = _Qwen3CodePredictorDecoderLayer310P
+    qwen3_code_predictor.CodePredictorBaseModel = _Qwen3CodePredictorBaseModel310P
