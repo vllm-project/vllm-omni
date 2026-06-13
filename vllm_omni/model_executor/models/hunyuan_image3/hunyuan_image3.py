@@ -1567,7 +1567,10 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self._end_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_32>")
         ratio_33 = tokenizer.convert_tokens_to_ids("<img_ratio_33>")
         ratio_36 = tokenizer.convert_tokens_to_ids("<img_ratio_36>")
-        self._ratio_other_slices = [(ratio_33, ratio_36 + 1)]
+        # Some tokenizers (e.g. HunyuanImage-3.0-Instruct) do not define the
+        # extended <img_ratio_33..36> tokens; skip the slice when absent instead
+        # of crashing on ratio_36 + 1.
+        self._ratio_other_slices = [(ratio_33, ratio_36 + 1)] if ratio_36 is not None else []
         # Build the full set of ratio token IDs for use as stop tokens.
         self._all_ratio_ids = set(range(self._start_ratio_id, self._end_ratio_id + 1))
         for s, e in self._ratio_other_slices:
