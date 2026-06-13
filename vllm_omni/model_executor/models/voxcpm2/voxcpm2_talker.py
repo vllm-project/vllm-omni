@@ -283,7 +283,8 @@ def _encode_raw_audio(
         pad = (padding_size, 0) if padding_mode == "left" else (0, padding_size)
         audio = torch.nn.functional.pad(audio, pad)
 
-    feat = tts.audio_vae.encode(audio.to(tts.device), encode_sr).cpu()
+    vae_device = next(tts.audio_vae.parameters()).device
+    feat = tts.audio_vae.encode(audio.to(vae_device), encode_sr).cpu()
     return feat.view(tts.audio_vae.latent_dim, -1, tts.patch_size).permute(1, 2, 0)
 
 

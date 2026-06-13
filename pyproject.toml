@@ -281,6 +281,7 @@ extend-ignore-identifiers-re = [
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
     ".*[Nn][Dd]3.*",
+    ".*updator.*",
     "byt5.*",
 ]
 extend-ignore-re = [

@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -35,8 +36,8 @@ def generator2tokenizer(
     return tokenizer_inputs
 
 
-def _extract_last_frame(pooling_output: OmniPayload) -> torch.Tensor | None:
-    audio = pooling_output.get("audio")
+def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torch.Tensor | None:
+    audio = multimodal_output.get("audio")
     if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
         return None
     return audio.flatten()
@@ -44,20 +45,20 @@ def _extract_last_frame(pooling_output: OmniPayload) -> torch.Tensor | None:
 
 def generator2tokenizer_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload,
+    multimodal_output: OmniPayload | dict[str, Any],
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
 
-    if isinstance(pooling_output, dict):
-        frame = _extract_last_frame(pooling_output)
+    if isinstance(multimodal_output, Mapping):
+        frame = _extract_last_frame(multimodal_output)
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
     elif not finished:
-        # Some steps may not produce pooling_output. Only flush on finish.
+        # Some steps may not produce multimodal_output. Only flush on finish.
         return None
 
     connector = getattr(transfer_manager, "connector", None)

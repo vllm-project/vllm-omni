@@ -130,6 +130,14 @@ class DiffusionParallelConfig:
     use_hsdp: bool = False
     """Enable Hybrid Sharded Data Parallel (HSDP) for model weight sharding."""
 
+    mask_sp_padding: bool = False
+    """If True, generate a boolean attention mask for zero-padded SP tokens
+    when sequence length is not divisible by the SP world size. The mask
+    routes attention through the varlen path (unpad→kernel→repad), which is
+    correct but carries additional overhead. When False (default), padding
+    tokens are left unmasked; since _shard_with_auto_pad always pads with
+    zeros, their contribution to attention output is negligible."""
+
     hsdp_shard_size: int = -1
     """Number of GPUs to shard weights across within each replica group. -1 means auto-calculate."""
 
