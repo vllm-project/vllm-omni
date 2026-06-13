@@ -78,6 +78,21 @@ def parse_args():
     parser.add_argument("--init-timeout", type=int, default=300, help="Initialization timeout in seconds.")
     parser.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")
     parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable the diffusion pipeline stage profiler (logs vae/diffuse/text_encoder timings). "
+        "Combine with the per-request 'KV recv timing' logs to break down receive latency.",
+    )
+    parser.add_argument(
+        "--profiler-config",
+        type=parse_profiler_config,
+        default=None,
+        help="JSON profiler config for full torch/cuda profiling, for example "
+        '\'{"profiler":"torch","torch_profiler_dir":"./perf","torch_profiler_record_shapes":true}\'. '
+        "When set, generate() is wrapped in omni.start_profile()/stop_profile() and operator-level "
+        "trace.json files are written to torch_profiler_dir (viewable in perfetto/chrome).",
+    )
+    parser.add_argument(
         "--diffusion-kv-cache-dtype",
         type=str,
         default=None,
@@ -108,6 +123,17 @@ def parse_args():
     )
 
     return parser.parse_args()
+
+
+def parse_profiler_config(value: str) -> dict:
+    """Parse a JSON string into a profiler_config mapping (torch/cuda profiling)."""
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+    return config
 
 
 def parse_additional_config(raw_value: str | None) -> dict | None:
@@ -158,8 +184,11 @@ def main():
         "diffusion_kv_cache_dtype": args.diffusion_kv_cache_dtype,
         "diffusion_kv_cache_skip_steps": args.diffusion_kv_cache_skip_steps,
         "diffusion_kv_cache_skip_layers": args.diffusion_kv_cache_skip_layers,
+        "enable_diffusion_pipeline_profiler": args.profile,
     }
 
+    if args.profiler_config is not None:
+        omni_kwargs["profiler_config"] = args.profiler_config
     if additional_config is not None:
         omni_kwargs["additional_config"] = additional_config
     if deploy_config is not None:
@@ -281,7 +310,14 @@ def main():
     print(f"  Prompts: {prompts}")
     print(f"{'=' * 60}\n")
 
+    profiler_enabled = args.profiler_config is not None
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
+        omni.start_profile()
     omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
+    if profiler_enabled:
+        print("[Profiler] Stopping profiler and writing traces...")
+        omni.stop_profile()
     img_idx = 0
     for req_output in omni_outputs:
         ro = getattr(req_output, "request_output", None)

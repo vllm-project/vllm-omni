@@ -1077,6 +1077,10 @@ class OmniKVTransferManager:
         pending_pairs = list(recv_key_pairs)
         received_payloads: dict[str, tuple[dict[str, Any], int]] = {}
         pending_release_buffers: list[Any] = []
+        # Latency breakdown points, reported per optimization scenario at the end.
+        recv_perf_start = time.perf_counter()
+        t_get_ms = 0.0
+        t_deser_ms = 0.0
 
         logger.info(
             "Wait for KV cache for request %s from stage %s to %s via %s key(s)...",
@@ -1101,18 +1105,21 @@ class OmniKVTransferManager:
                             "source_port": self._sender_base_zmq_port + from_rank * KV_RANK_PORT_STRIDE,
                         }
 
+                    _get_t0 = time.perf_counter()
                     result = self.connector.get(
                         from_stage=from_stage,
                         to_stage=to_stage,
                         get_key=get_key,
                         metadata=rank_metadata,
                     )
+                    t_get_ms += (time.perf_counter() - _get_t0) * 1000.0
                     if not result:
                         continue
 
                     raw_data, size = result
                     managed_buffer = None
 
+                    _deser_t0 = time.perf_counter()
                     if hasattr(raw_data, "tensor") and hasattr(raw_data, "release"):
                         managed_buffer = raw_data
                         try:
@@ -1139,6 +1146,7 @@ class OmniKVTransferManager:
                             data = KVCacheTransferData.from_bytes(raw_data.numpy().tobytes())
                     else:
                         data = raw_data
+                    t_deser_ms += (time.perf_counter() - _deser_t0) * 1000.0
 
                     received_payloads[get_key] = (data, size)
                     pending_pairs.remove((get_key, from_rank))
@@ -1165,6 +1173,22 @@ class OmniKVTransferManager:
                         and target_device.type != "cpu"
                         and needs_buffer_detach
                     )
+                    # Label the active latency scenario for the breakdown log:
+                    #   async_h2d  -> opt2 (enable_kv_async_copy): copy enqueued
+                    #                 on a side stream, real H2D paid at forward.
+                    #   sync_h2d   -> opt1 only: blocking pinned-pool -> GPU copy
+                    #                 (also detaches the pool buffer).
+                    #   cpu_clone  -> CPU target / no device move: explicit clone
+                    #                 to detach before pool release.
+                    if gpu_async:
+                        detach_path = "async_h2d(opt2)"
+                    elif target_device is not None and target_device.type != "cpu":
+                        detach_path = "sync_h2d(opt1)"
+                    elif needs_buffer_detach:
+                        detach_path = "cpu_clone"
+                    else:
+                        detach_path = "noop"
+                    _detach_t0 = time.perf_counter()
                     try:
                         if isinstance(data, dict) and "layer_blocks" in data:
                             layer_blocks = data["layer_blocks"]
@@ -1214,9 +1238,17 @@ class OmniKVTransferManager:
                                     logger.exception("Failed to release KV pool buffer")
                             pending_release_buffers.clear()
 
+                    detach_ms = (time.perf_counter() - _detach_t0) * 1000.0
+                    total_ms = (time.perf_counter() - recv_perf_start) * 1000.0
                     logger.info(
-                        "Successfully received KV cache for %s, %s bytes across %s key(s), wait=%.3fs, link=%.1fms",
+                        "KV recv timing for %s: total=%.1fms | get=%.1fms deser=%.1fms "
+                        "detach=%.1fms[%s] | %s bytes across %s key(s), wait=%.3fs, link=%.1fms",
                         request_id,
+                        total_ms,
+                        t_get_ms,
+                        t_deser_ms,
+                        detach_ms,
+                        detach_path,
                         total_size,
                         len(recv_key_pairs),
                         elapsed,
