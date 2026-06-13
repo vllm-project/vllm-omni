@@ -154,7 +154,9 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
 
         # Initialize transformer from HF config to keep architecture aligned with checkpoint.
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, StableAudioDiTModel)
-        self.transformer = StableAudioDiTModel(od_config=od_config, **transformer_kwargs)
+        self.transformer = StableAudioDiTModel(
+            od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
+        )
 
         # Load scheduler
         self.scheduler = StableAudioSchedulerWrapper(

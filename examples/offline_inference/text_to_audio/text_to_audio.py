@@ -93,6 +93,15 @@ def parse_args() -> argparse.Namespace:
         help="Sample rate for output audio (Stable Audio uses 44100 Hz).",
     )
     parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8"],
+        help="Quantization method for the DiT transformer. "
+        "'fp8' quantizes attention projections only; FFN and conditioning projections stay BF16. "
+        "Requires Ada/Hopper GPU (SM89+). Default: None (BF16).",
+    )
+    parser.add_argument(
         "--cache-backend",
         type=str,
         default=None,
@@ -219,6 +228,7 @@ def main():
     print(f"  Audio length: {args.audio_length}s")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Guidance scale: {args.guidance_scale}")
+    print(f"  Quantization: {args.quantization if args.quantization else 'None'}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
     print(f"  ModelWise Offload: {'Enabled' if args.enable_cpu_offload else 'None'}")
     print(f"  LayerWise Offload: {'Enabled' if args.enable_layerwise_offload else 'None'}")
@@ -239,6 +249,7 @@ def main():
     omni = Omni(
         model=args.model,
         parallel_config=parallel_config,
+        quantization=args.quantization,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
