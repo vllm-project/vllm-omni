@@ -53,6 +53,32 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    # Step-Audio2 models
+    "StepAudio2ForCausalLM": (
+        "step_audio2",
+        "step_audio2",
+        "StepAudio2ForConditionalGeneration",
+    ),
+    "StepAudio2ForConditionalGeneration": (
+        "step_audio2",
+        "step_audio2",
+        "StepAudio2ForConditionalGeneration",
+    ),
+    "StepAudio2ThinkerForConditionalGeneration": (
+        "step_audio2",
+        "step_audio2_thinker",
+        "StepAudio2ThinkerForConditionalGeneration",
+    ),
+    "StepAudio2Token2WavModel": (
+        "step_audio2",
+        "step_audio2_token2wav",
+        "StepAudio2Token2WavForConditionalGeneration",
+    ),
+    "StepAudio2Token2WavForConditionalGeneration": (
+        "step_audio2",
+        "step_audio2_token2wav",
+        "StepAudio2Token2WavForConditionalGeneration",
+    ),
     "CosyVoice3Model": (
         "cosyvoice3",
         "cosyvoice3",
