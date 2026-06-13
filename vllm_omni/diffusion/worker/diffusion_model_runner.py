@@ -80,7 +80,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, DiffusionRequestState] = {}
 
-        # Initialize KV cache manager for connector management
+        # Initialize KV cache manager for connector management.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
     def _compile_transformer(self, attr_name: str) -> None:
@@ -322,6 +322,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if is_primary:
                 current_omni_platform.reset_peak_memory_stats()
+
+            # Make the compute stream wait for the async KV H2D copy, if any.
+            self.kv_transfer_manager.wait_kv_copy()
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):

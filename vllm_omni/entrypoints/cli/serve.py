@@ -575,6 +575,12 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable layerwise (blockwise) offloading on DiT modules.",
         )
+        omni_config_group.add_argument(
+            "--enable-kv-async-copy",
+            action="store_true",
+            help="Overlap the received AR KV pinned-pool -> GPU copy on a dedicated "
+            "CUDA stream (diffusion stage only). Off by default (synchronous copy).",
+        )
 
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(

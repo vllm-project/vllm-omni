@@ -449,6 +449,7 @@ class OrchestratorArgs:
     num_weight_load_threads: int = 4
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
+    enable_kv_async_copy: bool = False
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None

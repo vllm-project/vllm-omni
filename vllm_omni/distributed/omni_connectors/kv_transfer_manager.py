@@ -290,7 +290,7 @@ class OmniKVTransferManager:
     - KV cache receiving with timeout
     """
 
-    def __init__(self, config: OmniKVCacheConfig):
+    def __init__(self, config: OmniKVCacheConfig, *, async_kv_copy: bool = False):
         self.config = config
         self._connector = None
 
@@ -336,6 +336,11 @@ class OmniKVTransferManager:
         self._sender_base_host: str | None = None
         self._sender_base_zmq_port: int | None = None
 
+        self._kv_copy_stream: torch.cuda.Stream | None = None
+        self._kv_copy_event: torch.cuda.Event | None = None
+        self._kv_inflight_buffers: list[Any] = []
+        self._async_kv_copy = async_kv_copy
+
         if config.need_send_cache and config.connector_config:
             try:
                 _ = self.connector
@@ -348,10 +353,10 @@ class OmniKVTransferManager:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def _create(cls, cfg: dict | None) -> "OmniKVTransferManager":
+    def _create(cls, cfg: dict | None, *, async_kv_copy: bool = False) -> "OmniKVTransferManager":
         """Create manager from raw config dict."""
         if not cfg or not isinstance(cfg, dict):
-            return cls(OmniKVCacheConfig())
+            return cls(OmniKVCacheConfig(), async_kv_copy=async_kv_copy)
 
         rank_mapping = cfg.get("rank_mapping", {})
         if not isinstance(rank_mapping, dict):
@@ -369,13 +374,21 @@ class OmniKVTransferManager:
                 recv_timeout=cfg.get("recv_timeout", 30.0),
                 from_tp=int(rank_mapping.get("from_tp", 1)),
                 to_tp=int(rank_mapping.get("to_tp", 1)),
-            )
+            ),
+            async_kv_copy=async_kv_copy,
         )
 
     @classmethod
     def from_od_config(cls, config: Any) -> "OmniKVTransferManager":
-        """Create from model or OmniDiffusion config."""
-        return cls._create(getattr(config, "omni_kv_config", None))
+        """Create from model or OmniDiffusion config.
+
+        Only this path may opt into the async H2D copy: the diffusion runner
+        waits via wait_kv_copy() before forward.
+        """
+        return cls._create(
+            getattr(config, "omni_kv_config", None),
+            async_kv_copy=bool(getattr(config, "enable_kv_async_copy", False)),
+        )
 
     from_model_config = from_od_config
 
@@ -501,19 +514,6 @@ class OmniKVTransferManager:
                 sender_info,
             )
         return None
-
-    @staticmethod
-    def _clone_received_payload_tensors(data: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(data, dict) or "layer_blocks" not in data:
-            return data
-
-        layer_blocks = data["layer_blocks"]
-        for cache_name in ("key_cache", "value_cache"):
-            cache_list = layer_blocks.get(cache_name, [])
-            for idx, tensor in enumerate(cache_list):
-                if isinstance(tensor, torch.Tensor):
-                    cache_list[idx] = tensor.clone()
-        return data
 
     def _slice_transfer_data_for_target(self, kv_data: KVCacheTransferData, target_rank: int) -> KVCacheTransferData:
         """Pre-slice sender payload for one target rank when sender TP < receiver TP."""
@@ -984,6 +984,48 @@ class OmniKVTransferManager:
 
         return False, 0, None
 
+    def _get_kv_copy_stream(self) -> "torch.cuda.Stream | None":
+        """Lazily create the dedicated H2D copy stream (CUDA only)."""
+        if not torch.cuda.is_available():
+            return None
+        if self._kv_copy_stream is None:
+            self._kv_copy_stream = torch.cuda.Stream()
+        return self._kv_copy_stream
+
+    def _drain_inflight_buffers(self) -> None:
+        """Release source buffers whose async H2D copy has completed.
+
+        Runs when the next request's KV handling starts; the previous forward
+        has run by then, so the event sync is effectively free.
+        """
+        if not self._kv_inflight_buffers:
+            return
+        if self._kv_copy_event is not None:
+            try:
+                self._kv_copy_event.synchronize()
+            except Exception:
+                logger.exception("Failed to synchronize KV copy event")
+            self._kv_copy_event = None
+        for buf in self._kv_inflight_buffers:
+            # Pool buffers expose release(); pinned keep-alive refs just need
+            # the reference dropped on clear().
+            release = getattr(buf, "release", None)
+            if callable(release):
+                try:
+                    release()
+                except Exception:
+                    logger.exception("Failed to release in-flight KV pool buffer")
+        self._kv_inflight_buffers.clear()
+
+    def wait_kv_copy(self) -> None:
+        """Make the compute stream wait for the pending KV H2D copy.
+
+        Call right before forward.  GPU-side ordering only; does not block the CPU.
+        """
+        if self._kv_copy_event is None or self._kv_copy_stream is None:
+            return
+        torch.cuda.current_stream().wait_stream(self._kv_copy_stream)
+
     @torch.inference_mode()
     def receive_kv_cache_for_request(
         self,
@@ -1001,6 +1043,9 @@ class OmniKVTransferManager:
         Returns:
             Tuple of (data dict, size) if successful, (None, 0) otherwise
         """
+        # Release the previous request's async-copy sources before this receive.
+        self._drain_inflight_buffers()
+
         # Check if we should receive KV cache based on config
         if not self.config.need_recv_cache:
             logger.debug("Skip receiving KV cache for %s (need_recv_cache=False)", request_id)
@@ -1031,6 +1076,7 @@ class OmniKVTransferManager:
         )
         pending_pairs = list(recv_key_pairs)
         received_payloads: dict[str, tuple[dict[str, Any], int]] = {}
+        pending_release_buffers: list[Any] = []
 
         logger.info(
             "Wait for KV cache for request %s from stage %s to %s via %s key(s)...",
@@ -1077,8 +1123,7 @@ class OmniKVTransferManager:
                                 managed_buffer = None
                             else:
                                 data = KVCacheTransferData.from_bytes(memoryview(buf_tensor.numpy()))
-                                data = self._clone_received_payload_tensors(data)
-                                raw_data.release()
+                                pending_release_buffers.append(raw_data)
                                 managed_buffer = None
                         except Exception as e:
                             logger.error("Failed to deserialize KV cache from ManagedBuffer: %s", e)
@@ -1110,20 +1155,64 @@ class OmniKVTransferManager:
                         data = merge_received_rank_shards(ordered_payloads, merger=self.kv_payload_merger)
                     data = slice_received_rank_shard(data, topo, slicer=self.kv_payload_slicer)
 
+                    needs_buffer_detach = bool(pending_release_buffers)
+                    copy_stream = self._get_kv_copy_stream()
+                    # Async H2D pays off only for pinned-pool source + GPU target.
+                    gpu_async = (
+                        self._async_kv_copy
+                        and copy_stream is not None
+                        and target_device is not None
+                        and target_device.type != "cpu"
+                        and needs_buffer_detach
+                    )
                     try:
                         if isinstance(data, dict) and "layer_blocks" in data:
                             layer_blocks = data["layer_blocks"]
-                            for cache_list in [
+                            cache_lists = [
                                 layer_blocks.get("key_cache", []),
                                 layer_blocks.get("value_cache", []),
-                            ]:
-                                for i, tensor in enumerate(cache_list):
-                                    if not isinstance(tensor, torch.Tensor):
-                                        continue
-                                    if target_device is not None and tensor.device != target_device:
-                                        cache_list[i] = tensor.to(target_device).contiguous()
+                            ]
+                            if gpu_async:
+                                # Copies run on a dedicated stream; forward waits
+                                # via wait_kv_copy(), pool release is deferred to
+                                # the next drain.
+                                with torch.cuda.stream(copy_stream):
+                                    for cache_list in cache_lists:
+                                        for i, tensor in enumerate(cache_list):
+                                            if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
+                                                cache_list[i] = tensor.to(target_device, non_blocking=True).contiguous()
+                                self._kv_copy_event = copy_stream.record_event()
+                                self._kv_inflight_buffers.extend(pending_release_buffers)
+                                pending_release_buffers.clear()
+                            else:
+                                for cache_list in cache_lists:
+                                    for i, tensor in enumerate(cache_list):
+                                        if not isinstance(tensor, torch.Tensor):
+                                            continue
+                                        if target_device is not None and tensor.device != target_device:
+                                            cache_list[i] = tensor.to(target_device).contiguous()
+                                        elif needs_buffer_detach:
+                                            # No .to() to detach from the pool, so copy
+                                            # out before release.
+                                            cache_list[i] = tensor.clone()
                     except Exception:
-                        logger.exception("Failed to move KV cache tensors to target device")
+                        logger.exception(
+                            "Failed to detach/move KV cache tensors for %s; discarding payload", request_id
+                        )
+                        return None, 0
+                    finally:
+                        # Release the pool now on the sync path and the gpu_async
+                        # error path; the gpu_async success path already moved its
+                        # buffers to _kv_inflight_buffers.
+                        if pending_release_buffers:
+                            if gpu_async and copy_stream is not None:
+                                copy_stream.synchronize()
+                            for buf in pending_release_buffers:
+                                try:
+                                    buf.release()
+                                except Exception:
+                                    logger.exception("Failed to release KV pool buffer")
+                            pending_release_buffers.clear()
 
                     logger.info(
                         "Successfully received KV cache for %s, %s bytes across %s key(s), wait=%.3fs, link=%.1fms",
@@ -1145,6 +1234,12 @@ class OmniKVTransferManager:
         except Exception:
             logger.exception("Error receiving KV cache for %s", request_id)
             return None, 0
+        finally:
+            for buf in pending_release_buffers:
+                try:
+                    buf.release()
+                except Exception:
+                    pass
 
     def apply_kv_cache_to_request(self, req: Any, data: dict[str, Any]) -> None:
         """Apply received KV cache data to a request object.
