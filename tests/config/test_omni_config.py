@@ -143,22 +143,14 @@ def test_from_registry_dispatches_async_chunk_processors_without_mutating_topolo
     pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
 
     async_config = VllmOmniConfig.from_registry("qwen3_tts")
-    assert async_config.stage_by_id(0).custom_process_next_stage_input_func.endswith(
-        "talker2code2wav_async_chunk"
-    )
+    assert async_config.stage_by_id(0).custom_process_next_stage_input_func.endswith("talker2code2wav_async_chunk")
     assert async_config.stage_by_id(1).custom_process_input_func is None
 
     sync_config = VllmOmniConfig.from_registry("qwen3_tts", cli_overrides={"async_chunk": False})
-    assert sync_config.stage_by_id(0).custom_process_next_stage_input_func.endswith(
-        "talker2code2wav_full_payload"
-    )
-    assert sync_config.stage_by_id(1).custom_process_input_func.endswith(
-        "talker2code2wav_token_only"
-    )
+    assert sync_config.stage_by_id(0).custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
+    assert sync_config.stage_by_id(1).custom_process_input_func.endswith("talker2code2wav_token_only")
 
-    assert pipeline.get_stage(0).custom_process_next_stage_input_func.endswith(
-        "talker2code2wav_full_payload"
-    )
+    assert pipeline.get_stage(0).custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
     assert pipeline.get_stage(1).custom_process_input_func is None
 
 

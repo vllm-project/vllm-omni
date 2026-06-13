@@ -20,17 +20,16 @@ from pydantic import ConfigDict, Field
 from vllm.config.utils import config
 
 from vllm_omni.config.stage_config import (
+    _DEPLOY_DIR,
+    _PIPELINE_REGISTRY,
     DeployConfig,
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
     StagePipelineConfig,
     StageType,
-    _DEPLOY_DIR,
-    _PIPELINE_REGISTRY,
     load_deploy_config,
 )
-
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
@@ -174,9 +173,7 @@ def _platform_stage_overrides(
         return overrides, runtime_cfg.get("devices"), runtime_cfg.get("env")
 
     overrides = {
-        key: _copy_value(value)
-        for key, value in stage_data.items()
-        if key not in ("stage_id", "devices", "env")
+        key: _copy_value(value) for key, value in stage_data.items() if key not in ("stage_id", "devices", "env")
     }
     return overrides, stage_data.get("devices"), stage_data.get("env")
 
