@@ -34,6 +34,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -1419,8 +1420,8 @@ class Cosmos3VFMTransformer(nn.Module):
         # For I2V: only add to noisy tokens, not conditioned ones.
         # Conditioned frames are clean context and should not receive
         # the diffusion timestep signal.
-        with torch.autocast("cuda", enabled=True, dtype=torch.float32):
-            time_embed = self.time_embedder(timestep * self.timestep_scale)
+        with torch.autocast(current_omni_platform.device_type, enabled=False):
+            time_embed = self.time_embedder((timestep * self.timestep_scale).float())
         time_embed = time_embed.to(hidden_states.dtype)
 
         if noisy_frame_mask is not None:
@@ -1519,7 +1520,7 @@ class Cosmos3VFMTransformer(nn.Module):
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
 
-            hidden_gen = self.gen_sp_gather(hidden_gen)
+        hidden_gen = self.gen_sp_gather(hidden_gen)
 
         # Final norm and project back to latent space
         hidden_gen = self.norm_moe_gen(hidden_gen)

@@ -81,7 +81,7 @@ def test_multimodal_payload_and_completion_output():
     assert p is not None
     assert "waveform" in p.tensors and torch.equal(p.primary_tensor, data["waveform"])
     assert p.metadata["sample_rate"] == 16000
-    assert not p.is_empty and len(p) == 1
+    assert not p.is_empty and len(p) == 2  # 1 tensor + 1 metadata
 
     # None/empty returns None
     assert MultimodalPayload.from_dict(None) is None
@@ -125,7 +125,7 @@ def test_output_modality_printed_examples(capsys):
     print(f"    tensors keys : {list(p.tensors.keys())}")
     print(f"    primary_tensor: shape={p.primary_tensor.shape}, dtype={p.primary_tensor.dtype}")
     print(f"    metadata      : {p.metadata}")
-    print(f"    is_empty={p.is_empty}, len={len(p)}")
+    print(f"    is_empty={p.is_empty}, len={len(p)}")  # len = tensors + metadata
     print(f"  from_dict(None) -> {MultimodalPayload.from_dict(None)}")
     print(f"  from_dict({{}})   -> {MultimodalPayload.from_dict({})}")
 

@@ -81,7 +81,7 @@ class DefaultAdapter:
 
         loader = DiffusersPipelineLoader(LoadConfig(), od_config=od_config)
         # load_model will handle dtypes / device placement, put in .eval() mode
-        return loader.load_model(od_config=od_config, load_device=device)
+        return loader.load_model(load_device=device)
 
     @staticmethod
     def get_transformer(pipeline: Any) -> tuple[Any, str]:

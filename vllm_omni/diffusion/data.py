@@ -21,6 +21,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
+from vllm_omni.errors import client_error_metadata
 from vllm_omni.quantization import build_quant_config
 
 if TYPE_CHECKING:
@@ -128,6 +129,14 @@ class DiffusionParallelConfig:
 
     use_hsdp: bool = False
     """Enable Hybrid Sharded Data Parallel (HSDP) for model weight sharding."""
+
+    mask_sp_padding: bool = False
+    """If True, generate a boolean attention mask for zero-padded SP tokens
+    when sequence length is not divisible by the SP world size. The mask
+    routes attention through the varlen path (unpad→kernel→repad), which is
+    correct but carries additional overhead. When False (default), padding
+    tokens are left unmasked; since _shard_with_auto_pad always pads with
+    zeros, their contribution to attention output is negligible."""
 
     hsdp_shard_size: int = -1
     """Number of GPUs to shard weights across within each replica group. -1 means auto-calculate."""
@@ -610,9 +619,6 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
-    # sleep mode
-    enable_sleep_mode: bool = False
-
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
@@ -1065,6 +1071,8 @@ class DiffusionOutput:
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
     error: str | None = None
+    error_status_code: int | None = None
+    error_type: str | None = None
     aborted: bool = False
     abort_message: str | None = None
 
@@ -1104,6 +1112,15 @@ class DiffusionOutput:
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
         if self.custom_output:
             self.custom_output = {k: _maybe_to_cpu(v) for k, v in self.custom_output.items()}
+
+    @classmethod
+    def from_exception(cls, exc: BaseException) -> "DiffusionOutput":
+        status_code, error_type = client_error_metadata(exc)
+        return cls(
+            error=str(exc),
+            error_status_code=status_code,
+            error_type=error_type,
+        )
 
 
 class DiffusionRequestAbortedError(RuntimeError):

@@ -1,5 +1,6 @@
 """Synthetic media generation and media/text utilities for tests."""
 
+import atexit
 import base64
 import concurrent.futures
 import gc
@@ -14,7 +15,6 @@ import re
 import subprocess
 import tempfile
 import time
-import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -588,15 +588,32 @@ def cosine_similarity_text(text1, text2, n: int = 3):
     return cosine * length_harmony
 
 
-def _merge_base64_audio_to_segment(base64_list: list[str]):
-    from pydub import AudioSegment
+class _AudioBuffer:
+    """Minimal replacement for pydub.AudioSegment used by test helpers."""
 
-    merged = None
+    def __init__(self, data: np.ndarray, sample_rate: int):
+        self.data = data
+        self.sample_rate = sample_rate
+
+    def export(self, buf: io.BytesIO, format: str = "wav"):
+        sf.write(buf, self.data, self.sample_rate, format=format.upper())
+        buf.seek(0)
+
+
+def _merge_base64_audio_to_segment(base64_list: list[str]) -> _AudioBuffer:
+    from vllm.multimodal.media.audio import AudioMediaIO
+
+    io_ = AudioMediaIO()
+    chunks: list[np.ndarray] = []
+    sample_rate: int | None = None
     for b64 in base64_list:
         raw = base64.b64decode(b64.split(",", 1)[-1])
-        seg = AudioSegment.from_file(io.BytesIO(raw))
-        merged = seg if merged is None else merged + seg
-    return merged
+        waveform, sr = io_.load_bytes(raw)
+        if sample_rate is None:
+            sample_rate = int(sr)
+        chunks.append(waveform)
+    merged = np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
+    return _AudioBuffer(merged, sample_rate or 16000)
 
 
 @contextmanager
@@ -666,7 +683,10 @@ def convert_audio_file_to_text(output_path: str) -> str:
 
 
 def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
-    output_path = f"./test_{uuid.uuid4().hex}.wav"
+    output_fd, output_path = tempfile.mkstemp(prefix="test_", suffix=".wav")
+    os.close(output_fd)
+    if os.environ.get("VLLM_OMNI_KEEP_REQUEST_MEDIA", "").lower() not in ("1", "true", "yes"):
+        atexit.register(Path(output_path).unlink, missing_ok=True)
     data, samplerate = sf.read(io.BytesIO(raw_bytes))
     sf.write(output_path, data, samplerate, format="WAV", subtype="PCM_16")
     print(f"audio data is saved: {output_path}")

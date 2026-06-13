@@ -14,7 +14,7 @@ steps:
     depends_on: image-build
     key: upload-ready-pipeline
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-ready.yml
+      - python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/test-ready.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -23,7 +23,7 @@ steps:
     depends_on: image-build
     key: upload-merge-pipeline
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-merge.yml
+      - python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/test-merge.yml
     agents:
       queue: "cpu_queue_premerge"
 
