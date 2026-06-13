@@ -520,9 +520,25 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
     """Validate speech API results from :class:`~tests.helpers.runtime.OmniResponse`.
 
-    Success path only. Use :meth:`OpenAIClientHandler.send_audio_speech_http_request` with ``err_code`` /
-    ``err_message`` for expected HTTP errors.
+    When ``request_config`` carries ``status_code`` and/or ``err_message``, the
+    request is expected to be rejected: assert it failed and that the HTTP status
+    / error text match. Otherwise the normal success-path checks run.
     """
+    expected_status = request_config.get("status_code")
+    expected_err = request_config.get("err_message")
+    if expected_status is not None or expected_err is not None:
+        assert not response.success, "Expected an error response, but the request succeeded."
+        if expected_status is not None:
+            allowed = expected_status if isinstance(expected_status, (list, tuple)) else (expected_status,)
+            assert response.status_code in allowed, f"Expected HTTP status in {allowed}, got {response.status_code}"
+        if expected_err is not None:
+            alternatives = expected_err if isinstance(expected_err, (list, tuple)) else (expected_err,)
+            error_text = response.error_message or ""
+            assert any(alt in error_text for alt in alternatives), (
+                f"Expected one of {alternatives} in error text, got: {error_text!r}"
+            )
+        return
+
     assert response.success, "The request failed."
 
     # Optional floor on decoded audio size (models with very short clips may use a lower value).
