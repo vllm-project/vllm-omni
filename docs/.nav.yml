@@ -20,6 +20,7 @@ nav:
       - GLM-Image Multistage End-to-End Inference: user_guide/examples/offline_inference/glm_image.md
       - Helios Video Generation: user_guide/examples/offline_inference/helios.md
       - HunyuanImage-3.0 Image-to-Text Inference: user_guide/examples/offline_inference/hunyuan_image3.md
+      - Ideogram4 Text-to-Image: user_guide/examples/offline_inference/ideogram4.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
       - InternVLA-A1: user_guide/examples/offline_inference/internvla_a1.md
@@ -37,6 +38,7 @@ nav:
       - vLLM-Omni Helm Chart: user_guide/examples/online_serving/chart-helm.md
       - Diffusers Backend Adapter: user_guide/examples/online_serving/diffusers_pipeline_adapter.md
       - GLM-Image Online Serving: user_guide/examples/online_serving/glm_image.md
+      - Ideogram4 Online Serving: user_guide/examples/online_serving/ideogram4.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
       - Online serving Example of vLLM-Omni for MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md

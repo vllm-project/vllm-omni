@@ -274,6 +274,11 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
     """
     method = _normalize_method_name(method)
 
+    if method == "bitsandbytes":
+        # HF BitsAndBytesConfig.to_dict() includes private mirror fields that
+        # are not accepted by vLLM's BitsAndBytesConfig constructor.
+        kwargs = {k: v for k, v in kwargs.items() if k not in {"_load_in_4bit", "_load_in_8bit"}}
+
     if method in _OVERRIDES:
         return _OVERRIDES[method](**kwargs)
 
