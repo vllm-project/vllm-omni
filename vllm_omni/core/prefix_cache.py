@@ -79,7 +79,7 @@ class OmniTensorPrefixCache:
         #     work has been done for ~one forward step, so the sync is
         #     near-zero wall-clock.
         self._async_initialized: bool = False
-        self._async_copy_stream: "torch.cuda.Stream | None" = None
+        self._async_copy_stream: torch.cuda.Stream | None = None
         self._pending_write: _PendingAsyncWrite | None = None
 
     def maybe_init_missing_mm_cache_keys(self, multimodal_outputs: dict, seq_len: int):
@@ -200,9 +200,7 @@ class OmniTensorPrefixCache:
         skip = skip_mm_cache_keys or set()
         cacheable_mm_keys: list[str] = []
         if multimodal_outputs_gpu:
-            self.maybe_init_missing_mm_cache_keys(
-                multimodal_outputs_gpu, seq_len=num_tokens_padded
-            )
+            self.maybe_init_missing_mm_cache_keys(multimodal_outputs_gpu, seq_len=num_tokens_padded)
             for k in self.mm_cache_keys:
                 if k in skip:
                     continue
@@ -234,19 +232,13 @@ class OmniTensorPrefixCache:
             # ``index_copy_`` is deferred to ``_consume_pending_write``
             # so we avoid launching an extra GPU kernel here that would
             # contend the driver mutex with the compute stream.
-            slots_cpu = slot_mapping_gpu[:num_tokens_unpadded].to(
-                "cpu", non_blocking=True
-            )
+            slots_cpu = slot_mapping_gpu[:num_tokens_unpadded].to("cpu", non_blocking=True)
             hidden_cpu: torch.Tensor | None = None
             if hidden_states_gpu is not None:
-                hidden_cpu = hidden_states_gpu[:num_tokens_unpadded].to(
-                    "cpu", non_blocking=True
-                )
+                hidden_cpu = hidden_states_gpu[:num_tokens_unpadded].to("cpu", non_blocking=True)
             mm_cpu: dict[str, torch.Tensor] = {}
             for k in cacheable_mm_keys:
-                mm_cpu[k] = multimodal_outputs_gpu[k][:num_tokens_unpadded].to(
-                    "cpu", non_blocking=True
-                )
+                mm_cpu[k] = multimodal_outputs_gpu[k][:num_tokens_unpadded].to("cpu", non_blocking=True)
 
             event = torch.cuda.Event()
             event.record()

@@ -722,23 +722,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # ``mm_outputs_cache`` happens in ``drain_ready_async_writes``
             # at the top of subsequent execute_model() calls.
             if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
-                hs_for_cache = (
-                    hidden_states if self._model_needs_full_prefix_hidden_states() else None
-                )
+                hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
                 # Some models (e.g. qwen3-tts-talker) opt out of full-hidden-state
                 # prefix caching but the downstream pooler payload path still
                 # needs a CPU hidden-states view. Materialize it synchronously
                 # in that case; the legacy behavior is preserved.
                 if hs_for_cache is None:
-                    hidden_states_cpu = (
-                        hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
-                    )
+                    hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
                 slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
                 self.omni_prefix_cache.schedule_async_write(
                     hidden_states_gpu=hs_for_cache,
-                    multimodal_outputs_gpu=(
-                        flatten_payload(multimodal_outputs) if multimodal_outputs else None
-                    ),
+                    multimodal_outputs_gpu=(flatten_payload(multimodal_outputs) if multimodal_outputs else None),
                     slot_mapping_gpu=slot_mapping_gpu,
                     num_tokens_unpadded=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
