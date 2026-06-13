@@ -93,7 +93,7 @@ SA3 ships three SAME variants (Small Music / Small SFX / Medium). Selecting one 
 | `stable-audio-3-small-music` | CPU-targeted | Quality lower; use only when no GPU |
 | `stable-audio-3-small-sfx` | CPU-targeted | Quality lower; use only when no GPU |
 
-Medium requires **Flash Attention 2** at runtime.
+Medium runs without **Flash Attention 2** -- the PyTorch SDPA / flex-attention fallback works end to end. Flash Attention 2 is recommended for better performance but not required.
 
 ## Implementation notes
 
