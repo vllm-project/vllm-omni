@@ -34,7 +34,6 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http, terminate_if_errored
-from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
 from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
@@ -56,10 +55,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.openai.orca_metrics import metrics_header
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
-from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
-from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
 from vllm.entrypoints.pooling.pooling.serving import ServingPooling
@@ -71,18 +67,22 @@ from vllm.entrypoints.serve.disagg.serving import ServingTokens
 from vllm.entrypoints.serve.instrumentator.basic import base
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
+from vllm.entrypoints.serve.utils.api_utils import (
+    load_aware_call,
+    process_lora_modules,
+    validate_json_request,
+    with_cancellation,
+)
+from vllm.entrypoints.serve.utils.error_response import create_error_response
+from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
 )
 from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
-)
-from vllm.entrypoints.utils import (
-    create_error_response,
-    load_aware_call,
-    process_lora_modules,
-    with_cancellation,
 )
 from vllm.logger import init_logger
 from vllm.tasks import POOLING_TASKS
