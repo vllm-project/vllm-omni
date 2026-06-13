@@ -68,6 +68,7 @@ stages:
     enforce_eager: true
     devices: "2,3"
     distributed_executor_backend: "mp"
+    enable_kv_async_copy: true
     omni_kv_config:
       need_recv_cache: true
     parallel_config:
