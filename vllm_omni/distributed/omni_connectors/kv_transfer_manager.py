@@ -1404,6 +1404,7 @@ class OmniKVTransferManager:
                                 self._kv_inflight_buffers.extend(pending_release_buffers)
                                 pending_release_buffers.clear()
                             else:
+                                # prefetch path / sync path
                                 for cache_list in cache_lists:
                                     for i, tensor in enumerate(cache_list):
                                         if not isinstance(tensor, torch.Tensor):
@@ -1416,7 +1417,10 @@ class OmniKVTransferManager:
                                             # copy pinned for a later async H2D.
                                             cache_list[i] = self._to_owned_pinned(tensor) if pin else tensor.clone()
                     except Exception:
-                        logger.exception("Failed to move KV cache tensors to target device")
+                        logger.exception(
+                            "Failed to detach/move KV cache tensors for %s; discarding payload", request_id
+                        )
+                        return None, 0
                     finally:
                         # Release the pool now on the sync path and the gpu_async
                         # error path; the gpu_async success path already moved its
