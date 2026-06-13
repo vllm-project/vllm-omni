@@ -35,8 +35,8 @@ from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
-from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
+from vllm_omni.diffusion.io_support import supports_audio_output
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.stage_diffusion_proc import (
     complete_diffusion_handshake,

@@ -550,7 +550,7 @@ class TestDiffusionEngine:
             request_id="req-batch",
         )
 
-        mocker.patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False)
+        mocker.patch("vllm_omni.diffusion.output_formatter.supports_audio_output", return_value=False)
         outputs = await engine.step(request)
 
         assert len(outputs) == 2
