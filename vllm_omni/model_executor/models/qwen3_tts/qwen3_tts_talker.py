@@ -538,10 +538,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
         audio_codes_list: list[torch.Tensor] = []
         ref_code_len_list: list[torch.Tensor] = []
-        ref_code_tensor: torch.Tensor | None = None
+        ref_code_list: list[torch.Tensor] = []
+        has_ref_code = False
         codec_streaming_list: list[torch.Tensor] = []
         for info in info_dicts:
             if not isinstance(info, dict):
+                ref_code_list.append(torch.empty(0, dtype=torch.long))
                 continue
             codes = info.get("codes", {})
             meta = info.get("meta", {})
@@ -555,7 +557,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     )
             ref_code = codes.get("ref")
             if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-                ref_code_tensor = ref_code
+                ref_code_list.append(ref_code)
+                has_ref_code = True
+            else:
+                ref_code_list.append(torch.empty(0, dtype=torch.long))
             ref_len = meta.get("ref_code_len")
             if ref_len is None:
                 continue
@@ -585,8 +590,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         mm: OmniPayload = {"codes": {"audio": audio_codes}}
         if ref_code_len_list:
             mm.setdefault("meta", {})["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
-        if ref_code_tensor is not None:
-            mm.setdefault("codes", {})["ref"] = [ref_code_tensor]
+        if has_ref_code:
+            # Batch-aligned, one entry per request: ``to_payload_element``
+            # indexes ``element[idx]`` per request, and a shorter list would
+            # silently broadcast one request's reference codes to the others.
+            mm.setdefault("codes", {})["ref"] = ref_code_list
         if codec_streaming_list:
             mm.setdefault("meta", {})["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
