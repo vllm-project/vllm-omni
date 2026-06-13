@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -128,6 +129,14 @@ class MiniMindOmniTalkerEmbedding(nn.Module):
         return torch.stack(adapted, dim=0).mean(dim=0)
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"talker.": ""})
 
@@ -145,6 +154,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         self.audio_spk_token = int(talker_config.audio_spk_token)
         self.audio_vocab_size = int(talker_config.audio_vocab_size)
         self.num_code_layers = int(talker_config.num_code_layers)
+        self.max_steps_after_last_thinker_token = int(config.talker_max_steps_after_last_thinker_token)
         self.has_preprocess = True
         self.has_postprocess = True
         self.have_multimodal_outputs = True
@@ -313,8 +323,9 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         info_dict: dict[str, Any],
         span_len: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, bool, int, int]:
+    ) -> tuple[torch.Tensor, bool, int, int, int]:
         bridge = self._get_raw_bridge_states(info_dict, device)
+        bridge_len = int(bridge.shape[0])
         if bridge.shape[0] < span_len:
             raise ValueError(f"bridge hidden states length {bridge.shape[0]} is shorter than scheduled span {span_len}")
 
@@ -334,7 +345,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         # the matching thinker bridge row, not on bridge[-1] for every step.
         start = max(0, min(num_computed, max(0, bridge.shape[0] - span_len)))
         end = start + span_len
-        return bridge[start:end], is_prefill, prompt_len, num_computed
+        return bridge[start:end], is_prefill, prompt_len, num_computed, bridge_len
 
     def _make_inputs_embeds(
         self,
@@ -384,7 +395,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         span_len = int(input_ids.shape[0])
-        bridge_states, is_prefill, prompt_len, num_computed = self._select_bridge_states(
+        bridge_states, is_prefill, prompt_len, num_computed, bridge_len = self._select_bridge_states(
             info_dict, span_len, input_ids.device
         )
         spk_emb = info_dict.get("spk_emb")
@@ -410,6 +421,15 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
             )
             if not is_prefill:
                 self._pending_audio_steps.append(max(0, num_computed - prompt_len) - 1)
+                request_id = info_dict.get("request_id")
+                steps_after_last_thinker = max(0, num_computed - bridge_len + 1)
+                if (
+                    isinstance(request_id, str)
+                    and self.max_steps_after_last_thinker_token >= 0
+                    and num_computed >= bridge_len
+                    and steps_after_last_thinker >= self.max_steps_after_last_thinker_token
+                ):
+                    self._stop_pending_by_req[request_id] = True
         else:
             update.setdefault("codes", {})["audio"] = torch.full(
                 (span_len, self.num_code_layers),

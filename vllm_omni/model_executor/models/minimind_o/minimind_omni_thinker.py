@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from torch import nn
 from transformers import BatchFeature, PreTrainedModel, SiglipImageProcessor, SiglipVisionModel
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheConfig
 from vllm.config.multimodal import BaseDummyOptions
@@ -261,6 +262,14 @@ class MiniMindBlock(nn.Module):
         return hidden_states
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class MiniMindModel(nn.Module):
     def __init__(
         self,
