@@ -31,6 +31,7 @@ from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.metrics.perf import estimate_dit_perf_stats
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
@@ -283,6 +284,31 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
         )
 
+    def _enable_dit_mfu_metrics(self) -> bool:
+        observability_config = getattr(self.vllm_config, "observability_config", None)
+        return bool(getattr(observability_config, "enable_mfu_metrics", False))
+
+    def _attach_dit_perf_stats(self, req: OmniDiffusionRequest, output: DiffusionOutput) -> None:
+        if not self._enable_dit_mfu_metrics():
+            return
+        if getattr(output, "error", None) or getattr(output, "perf_stats", None) is not None:
+            return
+
+        get_dit_forward_stats = getattr(self.pipeline, "get_dit_forward_stats", None)
+        if get_dit_forward_stats is None:
+            return
+
+        try:
+            dit_forward_stats = get_dit_forward_stats(req, output)
+        except Exception:
+            logger.warning("Failed to collect DiT MFU stats from diffusion pipeline", exc_info=True)
+            return
+
+        if dit_forward_stats is None:
+            return
+
+        output.perf_stats = estimate_dit_perf_stats(dit_forward_stats)
+
     def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
@@ -376,12 +402,26 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary:
                 current_omni_platform.reset_peak_memory_stats()
 
-            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-                with record_function("pipeline_forward"):
-                    output = self.pipeline.forward(req)
+            collect_dit_mfu_stats = self._enable_dit_mfu_metrics()
+            missing = object()
+            previous_collect_flag = getattr(self.pipeline, "collect_dit_mfu_stats", missing)
+            # Lightweight runner-pipeline protocol: when enabled, the pipeline
+            # may cache runtime shape stats for get_dit_forward_stats().
+            setattr(self.pipeline, "collect_dit_mfu_stats", collect_dit_mfu_stats)
+            try:
+                with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                    with record_function("pipeline_forward"):
+                        output = self.pipeline.forward(req)
+            finally:
+                if previous_collect_flag is missing:
+                    delattr(self.pipeline, "collect_dit_mfu_stats")
+                else:
+                    setattr(self.pipeline, "collect_dit_mfu_stats", previous_collect_flag)
 
             if is_primary:
                 self._record_peak_memory(output)
+
+            self._attach_dit_perf_stats(req, output)
 
             # Log prompt-embed cache activity (hits/misses accumulate across requests).
             if is_primary and self.prompt_embed_cache is not None:

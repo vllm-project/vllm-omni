@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from prometheus_client import CollectorRegistry, generate_latest
+from vllm.v1.metrics.perf import PerfStats
 
 from vllm_omni.metrics.stat_logger import (
     _ENGINE_INDEX_MAP,
@@ -366,6 +369,67 @@ class TestOmniPrometheusStatLogger:
 
         assert dict(_ENGINE_INDEX_MAP) == srm
         assert 99 not in _ENGINE_INDEX_MAP  # old entry was cleared
+
+    def test_record_perf_stats_observes_existing_perf_metrics_when_enabled(self):
+        class _FakePerfMetricsProm:
+            def __init__(self):
+                self.calls = []
+
+            def observe(self, perf_stats, engine_idx=0):
+                self.calls.append((perf_stats, engine_idx))
+
+        sl = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+        sl.vllm_config = SimpleNamespace(
+            observability_config=SimpleNamespace(enable_mfu_metrics=True),
+        )
+        sl.perf_metrics_prom = _FakePerfMetricsProm()
+        perf_stats = PerfStats(num_flops_per_gpu=123)
+
+        sl.record_perf_stats(perf_stats, engine_idx=2)
+
+        assert sl.perf_metrics_prom.calls == [(perf_stats, 2)]
+
+    def test_record_perf_stats_skips_existing_perf_metrics_when_disabled(self):
+        class _FakePerfMetricsProm:
+            def observe(self, *_args, **_kwargs):
+                raise AssertionError("disabled MFU metrics must not observe perf stats")
+
+        sl = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+        sl.vllm_config = SimpleNamespace(
+            observability_config=SimpleNamespace(enable_mfu_metrics=False),
+        )
+        sl.perf_metrics_prom = _FakePerfMetricsProm()
+
+        sl.record_perf_stats(PerfStats(num_flops_per_gpu=123), engine_idx=2)
+
+    def test_record_perf_stats_exports_estimated_flops_with_stage_replica_labels(self, registry):
+        class _RegistryCounter(_RelabelCounter):
+            def __init__(self, *args, **kwargs):
+                kwargs["registry"] = registry
+                super().__init__(*args, **kwargs)
+
+        class _RegistryPerfMetricsProm(_OmniPerfMetricsProm):
+            _counter_cls = _RegistryCounter
+
+        perf_metrics_prom = _RegistryPerfMetricsProm(
+            vllm_config=SimpleNamespace(),
+            labelnames=["model_name", "engine"],
+            per_engine_labelvalues={2: ["flux", "diffusion", "0"]},
+        )
+        sl = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+        sl.vllm_config = SimpleNamespace(
+            observability_config=SimpleNamespace(enable_mfu_metrics=True),
+        )
+        sl.perf_metrics_prom = perf_metrics_prom
+
+        sl.record_perf_stats(PerfStats(num_flops_per_gpu=123), engine_idx=2)
+
+        out = generate_latest(registry).decode()
+        assert "vllm:estimated_flops_per_gpu_total" in out
+        assert 'vllm:estimated_flops_per_gpu_total{model_name="flux",replica="0",stage="diffusion"} 123.0' in out
+        assert 'vllm:estimated_read_bytes_per_gpu_total{model_name="flux",replica="0",stage="diffusion"} 0.0' in out
+        assert 'vllm:estimated_write_bytes_per_gpu_total{model_name="flux",replica="0",stage="diffusion"} 0.0' in out
+        assert "engine=" not in out
 
 
 # ---------------------------------------------------------------------------

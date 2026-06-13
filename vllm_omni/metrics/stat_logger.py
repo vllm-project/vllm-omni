@@ -24,7 +24,7 @@ from prometheus_client import Counter, Gauge, Histogram
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorProm
 from vllm.v1.metrics.loggers import PrometheusStatLogger
-from vllm.v1.metrics.perf import PerfMetricsProm
+from vllm.v1.metrics.perf import PerfMetricsProm, PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingProm
 
 # Process-wide translation table written by OmniPrometheusStatLogger at init.
@@ -241,3 +241,10 @@ class OmniPrometheusStatLogger(PrometheusStatLogger):
             stage, replica = self._stage_replica_map[idx]
             rewritten[idx] = [model_name, stage, replica]
         self._omni_per_engine_labelvalues = rewritten
+
+    def record_perf_stats(self, perf_stats: PerfStats, engine_idx: int = 0) -> None:
+        """Record diffusion-side PerfStats through the upstream MFU collector."""
+        observability_config = getattr(self.vllm_config, "observability_config", None)
+        if not getattr(observability_config, "enable_mfu_metrics", False):
+            return
+        self.perf_metrics_prom.observe(perf_stats, engine_idx)

@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.v1.metrics.perf import PerfStats
 
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
@@ -1185,6 +1186,9 @@ class DiffusionOutput:
 
     # memory usage info
     peak_memory_mb: float = 0.0
+
+    # Optional upstream vLLM MFU stats produced by diffusion / DiT execution.
+    perf_stats: PerfStats | None = None
 
     # When True, move all tensor fields (including tensors inside
     # ``custom_output``) to CPU at construction time. Useful when the output

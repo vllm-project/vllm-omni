@@ -14,6 +14,7 @@ import janus
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
+from vllm.v1.metrics.perf import PerfStats
 
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -1179,3 +1180,39 @@ def test_orchestrator_does_not_re_introduce_global_stats_throttle() -> None:
         "raw_outputs.scheduler_stats being non-None — the per-scheduler 1Hz "
         "throttle in OmniSchedulerMixin.make_stats() is the only gate needed."
     )
+
+
+def test_orchestrator_records_diffusion_perf_stats_with_stage_replica_engine_idx() -> None:
+    class _FakeStatLogger:
+        def __init__(self):
+            self.calls = []
+
+        def record_perf_stats(self, perf_stats, engine_idx=0):
+            self.calls.append((perf_stats, engine_idx))
+
+    perf_stats = PerfStats(num_flops_per_gpu=123)
+    output = OmniRequestOutput.from_diffusion(
+        request_id="req-diff",
+        images=[],
+        perf_stats=perf_stats,
+    )
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator._stat_logger = _FakeStatLogger()
+    orchestrator._stage_replica_to_engine_idx = {(1, 2): 7}
+
+    Orchestrator._record_diffusion_perf_stats(orchestrator, 1, 2, output)
+
+    assert orchestrator._stat_logger.calls == [(perf_stats, 7)]
+
+
+def test_orchestrator_skips_diffusion_perf_stats_when_output_has_none() -> None:
+    class _FakeStatLogger:
+        def record_perf_stats(self, *_args, **_kwargs):
+            raise AssertionError("diffusion output without perf_stats must not record")
+
+    output = OmniRequestOutput.from_diffusion(request_id="req-diff", images=[])
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator._stat_logger = _FakeStatLogger()
+    orchestrator._stage_replica_to_engine_idx = {(1, 2): 7}
+
+    Orchestrator._record_diffusion_perf_stats(orchestrator, 1, 2, output)

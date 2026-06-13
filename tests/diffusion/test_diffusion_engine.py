@@ -11,8 +11,10 @@ from typing import Any
 
 import pytest
 import torch
+from vllm.v1.metrics.perf import PerfStats
 
-from vllm_omni.diffusion.diffusion_engine import _move_tensor_tree_to_cpu
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, _move_tensor_tree_to_cpu
 
 
 @dataclass
@@ -121,6 +123,38 @@ def test_move_tensor_tree_returns_non_tensor_values_unchanged() -> None:
     assert moved is value
 
 
+@pytest.mark.asyncio
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+async def test_step_attaches_batch_perf_stats_to_one_output_for_multi_prompt() -> None:
+    engine = object.__new__(DiffusionEngine)
+
+    async def _check_and_start_background_loop():
+        return None
+
+    engine._check_and_start_background_loop = _check_and_start_background_loop
+    engine.pre_process_func = None
+    engine.post_process_func = None
+    engine._post_process_accepts_sampling_params = False
+    engine.od_config = SimpleNamespace(enable_cpu_offload=False, model_class_name="FluxPipeline")
+    perf_stats = PerfStats(num_flops_per_gpu=123)
+
+    async def _async_add_req_and_wait_for_response(_request):
+        return DiffusionOutput(output=["image-a", "image-b"], perf_stats=perf_stats)
+
+    engine.async_add_req_and_wait_for_response = _async_add_req_and_wait_for_response
+    request = SimpleNamespace(
+        request_id="req",
+        prompts=["prompt-a", "prompt-b"],
+        sampling_params=SimpleNamespace(num_outputs_per_prompt=1, resolution=512),
+    )
+
+    outputs = await DiffusionEngine.step(engine, request)
+
+    assert [out.perf_stats for out in outputs] == [perf_stats, None]
+
+
 @pytest.mark.diffusion
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -146,6 +180,7 @@ async def test_async_add_req_and_wait_for_response():
 
     engine = object.__new__(DiffusionEngine)
     engine.scheduler = MockScheduler()
+    engine.od_config = SimpleNamespace(streaming_output=False)
     engine._out_queue = {}
     engine.abort_queue: queue.Queue[str] = queue.Queue()
     engine._rpc_queue = queue.Queue()

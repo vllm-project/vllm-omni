@@ -211,6 +211,7 @@ def _format_single_prompt_output(
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
                 finished=finished,
+                perf_stats=diffusion_output.perf_stats,
             ),
         ]
 
@@ -237,6 +238,7 @@ def _format_single_prompt_output(
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
                 finished=finished,
+                perf_stats=diffusion_output.perf_stats,
             ),
         ]
 
@@ -256,6 +258,7 @@ def _format_single_prompt_output(
             stage_durations=diffusion_output.stage_durations,
             peak_memory_mb=diffusion_output.peak_memory_mb,
             finished=finished,
+            perf_stats=diffusion_output.perf_stats,
         ),
     ]
 
@@ -275,7 +278,8 @@ def _format_multi_prompt_outputs(
     output_idx = 0
     request_id = request.request_id
 
-    for prompt in request.prompts:
+    for prompt_idx, prompt in enumerate(request.prompts):
+        perf_stats = diffusion_output.perf_stats if prompt_idx == 0 else None
         num_outputs = request.sampling_params.num_outputs_per_prompt
         start_idx = output_idx
         end_idx = start_idx + num_outputs
@@ -311,6 +315,7 @@ def _format_multi_prompt_outputs(
                     stage_durations=diffusion_output.stage_durations,
                     peak_memory_mb=diffusion_output.peak_memory_mb,
                     finished=finished,
+                    perf_stats=perf_stats,
                 ),
             )
             continue
@@ -351,6 +356,7 @@ def _format_multi_prompt_outputs(
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
                 finished=finished,
+                perf_stats=perf_stats,
             ),
         )
 
