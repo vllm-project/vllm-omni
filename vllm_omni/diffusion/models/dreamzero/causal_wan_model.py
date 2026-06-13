@@ -490,9 +490,8 @@ class CausalWanSelfAttention(nn.Module):
         # correct without GQA. total_num_kv_heads defaults to total_num_heads
         # here; fail loud if a future checkpoint introduces GQA so the equal
         # split does not silently misalign k/v.
-        assert self.qkv.total_num_kv_heads == self.qkv.total_num_heads, (
-            "Self-attn QKV fusion requires no GQA (total_num_kv_heads == total_num_heads)."
-        )
+        if self.qkv.total_num_kv_heads != self.qkv.total_num_heads:
+            raise ValueError("Self-attn QKV fusion requires no GQA (total_num_kv_heads == total_num_heads).")
         self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
         self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
