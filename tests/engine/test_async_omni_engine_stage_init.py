@@ -680,6 +680,32 @@ def test_build_engine_args_keeps_stage_owned_tokenizer_subdir(tmp_path):
     assert engine_args["tokenizer"] == os.path.join(str(tmp_path), "tokenizer")
 
 
+def test_build_engine_args_dict_does_not_mutate_stage_engine_args():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    engine_args = {
+        "tensor_parallel_size": None,
+        "async_chunk": True,
+    }
+    original_engine_args = dict(engine_args)
+    stage_cfg = types.SimpleNamespace(
+        stage_id=1,
+        stage_type="llm",
+        engine_args=engine_args,
+        default_sampling_params={},
+    )
+
+    engine_args_dict = build_engine_args_dict(
+        stage_cfg,
+        model="dummy-model",
+        stage_connector_spec={"connector": "shared_memory"},
+    )
+
+    assert "tensor_parallel_size" not in engine_args_dict
+    assert engine_args_dict["stage_connector_spec"] == {"connector": "shared_memory"}
+    assert stage_cfg.engine_args == original_engine_args
+
+
 def test_build_stage0_input_processor_uses_omni_input_preprocessor(monkeypatch):
     import vllm_omni.engine.stage_init_utils as init_mod
 
