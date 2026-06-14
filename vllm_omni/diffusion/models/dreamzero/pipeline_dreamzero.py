@@ -49,6 +49,7 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
 )
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
@@ -363,12 +364,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         latents: tuple[torch.Tensor, torch.Tensor],
         do_true_cfg: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Post-step sync: .contiguous() + cuda.synchronize()"""
+        """Post-step sync: .contiguous() + platform synchronize."""
         latents = tuple(t.contiguous() for t in latents)
         if do_true_cfg and get_classifier_free_guidance_world_size() > 1:
-            device = next((t.device for t in latents if t.is_cuda), None)
-            if device is not None:
-                torch.cuda.current_stream(device).synchronize()
+            current_omni_platform.synchronize()
         return latents
 
     # -----------------------------------------------------------------------
