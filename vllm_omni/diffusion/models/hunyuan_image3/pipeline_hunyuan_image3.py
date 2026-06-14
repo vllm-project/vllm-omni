@@ -718,8 +718,7 @@ class HunyuanImage3Pipeline(
             return cos, sin
         if cos.shape[0] != 1:
             raise ValueError(
-                "RoPE batch size mismatch: "
-                f"got {cos.shape[0]} RoPE rows for {target_batch_size} token rows."
+                f"RoPE batch size mismatch: got {cos.shape[0]} RoPE rows for {target_batch_size} token rows."
             )
         repeat_shape = [target_batch_size] + [1] * (cos.ndim - 1)
         return cos.repeat(*repeat_shape), sin.repeat(*repeat_shape)
