@@ -6,9 +6,14 @@ from collections.abc import Generator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import gguf
 import numpy as np
 import torch
+from vllm.utils.import_utils import PlaceholderModule
+
+try:
+    import gguf
+except ImportError:
+    gguf = PlaceholderModule("gguf")  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig

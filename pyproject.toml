@@ -97,6 +97,11 @@ quack = [
     "quack-kernels>=0.3.11",
 ]
 
+# Optional GGUF runtime support is provided out-of-tree by vllm-gguf-plugin.
+gguf = [
+    "vllm-gguf-plugin>=0.0.2",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",

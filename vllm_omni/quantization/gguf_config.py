@@ -7,18 +7,43 @@ Uses dequant+GEMM instead of the fused kernel path (which expects 2D inputs).
 
 from __future__ import annotations
 
-import gguf
+from typing import NoReturn
+
 import torch
-from vllm import _custom_ops as ops
-from vllm.model_executor.layers.quantization.gguf import (
-    UNQUANTIZED_TYPES,
-    GGUFConfig,
-    GGUFLinearMethod,
-    LinearBase,
-    QuantizeMethodBase,
-    UnquantizedLinearMethod,
-    is_layer_skipped_gguf,
-)
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.utils.import_utils import PlaceholderModule
+
+try:
+    import gguf
+    from vllm_gguf_plugin import ops
+    from vllm_gguf_plugin.quantization import (
+        UNQUANTIZED_TYPES,
+        GGUFConfig,
+        GGUFLinearMethod,
+        is_layer_skipped_gguf,
+    )
+
+    IS_GGUF_AVAILABLE = True
+except ImportError:
+    IS_GGUF_AVAILABLE = False
+    gguf = PlaceholderModule("gguf")  # type: ignore[assignment]
+    gguf_plugin = PlaceholderModule("vllm_gguf_plugin")
+    ops = gguf_plugin.placeholder_attr("ops")  # type: ignore[assignment]
+    UNQUANTIZED_TYPES = set()
+    GGUFConfig = object  # type: ignore[assignment]
+    GGUFLinearMethod = object  # type: ignore[assignment]
+
+    def is_layer_skipped_gguf(*args, **kwargs) -> bool:
+        raise_missing_gguf_plugin()
+
+
+def raise_missing_gguf_plugin() -> NoReturn:
+    if not IS_GGUF_AVAILABLE:
+        raise ImportError(
+            "GGUF support requires the optional vllm-gguf-plugin dependency. "
+            "Install vllm-omni[gguf] or install vllm-gguf-plugin."
+        )
 
 
 def dequant_gemm_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
@@ -68,6 +93,8 @@ class DiffusionGGUFConfig(GGUFConfig):
         gguf_model: str | None = None,
         unquantized_modules: list[str] | None = None,
     ) -> None:
+        if not IS_GGUF_AVAILABLE:
+            raise_missing_gguf_plugin()
         super().__init__(unquantized_modules=unquantized_modules or [])
         self.gguf_model = gguf_model
 
