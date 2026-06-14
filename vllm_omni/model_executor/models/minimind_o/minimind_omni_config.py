@@ -262,7 +262,7 @@ class MiniMindOmniConfig(PretrainedConfig):
         thinker_post_eos_pad_token_id: int = 0,
         thinker_post_eos_enter_token_id: int = 201,
         thinker_internal_stop_token_id: int = 17,
-        talker_max_steps_after_last_thinker_token: int = 64,
+        talker_max_steps_after_last_thinker_token: int = 192,
         **kwargs: Any,
     ) -> None:
         text_defaults = {

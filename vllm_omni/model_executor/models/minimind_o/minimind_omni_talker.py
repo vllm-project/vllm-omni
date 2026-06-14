@@ -161,6 +161,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         self.mtp_hidden_size = int(talker_config.hidden_size)
         self.talker_mtp_output_key = ("codes", "audio")
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
+            ("hidden_states", "bridge"),
             ("hidden_states", "last"),
         }
 
@@ -302,29 +303,23 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         audio_ids[:, 0, :] = input_ids.to(dtype=torch.long).clamp(min=0, max=self.audio_vocab_size - 1)
         return audio_ids
 
-    def _get_raw_bridge_states(self, info_dict: dict[str, Any], device: torch.device) -> torch.Tensor:
-        hidden_info = info_dict.get("hidden_states", {}) if isinstance(info_dict, dict) else {}
-        bridge = hidden_info.get("bridge")
-        if bridge is None:
-            bridge = hidden_info.get("output")
-        if bridge is None:
-            bridge = hidden_info.get("prefill")
-        if bridge is None:
-            raise ValueError("MiniMind talker requires thinker bridge hidden states in additional_information.")
-        if isinstance(bridge, list):
-            bridge = bridge[0]
-        bridge = bridge.to(device=device, dtype=self.text_scale.dtype)
-        if bridge.ndim == 3:
-            bridge = bridge.reshape(-1, bridge.shape[-1])
-        return bridge
-
     def _select_bridge_states(
         self,
         info_dict: dict[str, Any],
         span_len: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, bool, int, int, int]:
-        bridge = self._get_raw_bridge_states(info_dict, device)
+        hidden_info = info_dict.get("hidden_states", {}) if isinstance(info_dict, dict) else {}
+        bridge = hidden_info.get("bridge") if isinstance(hidden_info, dict) else None
+        if not isinstance(bridge, torch.Tensor):
+            raise ValueError("MiniMind talker requires hidden_states.bridge tensor in additional_information.")
+
+        target_dtype = self.text_scale.dtype
+        if bridge.device != device or bridge.dtype != target_dtype:
+            bridge = bridge.to(device=device, dtype=target_dtype, non_blocking=True)
+            hidden_info["bridge"] = bridge
+        if bridge.ndim == 3:
+            bridge = bridge.reshape(-1, bridge.shape[-1])
         bridge_len = int(bridge.shape[0])
         if bridge.shape[0] < span_len:
             raise ValueError(f"bridge hidden states length {bridge.shape[0]} is shorter than scheduled span {span_len}")
@@ -367,26 +362,32 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         codec_part = self.codec_proj(talker_emb.reshape(-1, talker_emb.shape[-1]))
         return text_part * self.text_scale + codec_part * self.audio_scale
 
-    def _sample_codebook_logits(
+    def _sample_codebook_logits_batch(
         self,
-        logits: torch.Tensor,
+        logits_by_layer: list[torch.Tensor],
         *,
         do_sample: bool = True,
         temperature: float = 0.2,
         top_k: int = 50,
     ) -> torch.Tensor:
-        # Match upstream HF behavior: codebook heads may emit special tokens
-        # such as pad/stop/spk (>= 2048), so sample over the full audio vocab.
-        logits = logits.float()
+        if not logits_by_layer:
+            return torch.empty((0, 0), dtype=torch.long, device=self.text_scale.device)
+
+        logits = torch.stack(logits_by_layer, dim=0)
+        num_layers, batch, vocab = logits.shape
+        flat = logits.reshape(num_layers * batch, vocab).float()
         if not do_sample:
-            return logits.argmax(dim=-1)
-        temperature = max(float(temperature), 1e-5)
-        logits = logits / temperature
-        if top_k > 0 and top_k < logits.shape[-1]:
-            top_val, top_idx = logits.topk(top_k, dim=-1)
-            sample = torch.multinomial(torch.softmax(top_val, dim=-1), 1).squeeze(-1)
-            return top_idx.gather(-1, sample.unsqueeze(-1)).squeeze(-1)
-        return torch.multinomial(torch.softmax(logits, dim=-1), 1).squeeze(-1)
+            sampled = flat.argmax(dim=-1)
+        else:
+            temperature = max(float(temperature), 1e-5)
+            flat = flat / temperature
+            if top_k > 0 and top_k < vocab:
+                top_val, top_idx = flat.topk(top_k, dim=-1)
+                sample = torch.multinomial(torch.softmax(top_val, dim=-1), 1)
+                sampled = top_idx.gather(-1, sample).squeeze(-1)
+            else:
+                sampled = torch.multinomial(torch.softmax(flat, dim=-1), 1).squeeze(-1)
+        return sampled.reshape(num_layers, batch).transpose(0, 1).contiguous()
 
     def preprocess(
         self,
@@ -510,26 +511,24 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         batch = int(input_ids.shape[0])
         hidden = last_talker_hidden.reshape(batch, -1).to(device=input_embeds.device, dtype=input_embeds.dtype)
         logits_by_layer = self.lm_head(hidden)
-        codes = []
+
         layer0 = input_ids.reshape(batch).to(device=input_embeds.device, dtype=torch.long)
-        codes.append(layer0)
-        for logits in logits_by_layer[1:]:
-            codes.append(
-                self._sample_codebook_logits(
-                    logits,
-                    do_sample=True if do_sample is None else bool(do_sample),
-                    temperature=0.2 if temperature is None else float(temperature),
-                    top_k=50 if top_k is None else int(top_k),
-                )
-            )
-        audio_codes = torch.stack(codes, dim=-1).to(dtype=torch.long)
+        residual_codes = self._sample_codebook_logits_batch(
+            logits_by_layer[1:],
+            do_sample=True if do_sample is None else bool(do_sample),
+            temperature=0.2 if temperature is None else float(temperature),
+            top_k=50 if top_k is None else int(top_k),
+        )
+        audio_codes = torch.cat((layer0.unsqueeze(-1), residual_codes), dim=-1)
+
         pending_steps = self._pending_audio_steps[:batch]
         del self._pending_audio_steps[:batch]
         if len(pending_steps) == batch:
-            audio_steps = torch.tensor(pending_steps, device=audio_codes.device, dtype=torch.long)
-            layer_ids = torch.arange(self.num_code_layers, device=audio_codes.device, dtype=torch.long)
-            active = audio_steps.unsqueeze(-1) >= layer_ids.unsqueeze(0)
-            audio_codes = torch.where(active, audio_codes, torch.full_like(audio_codes, self.audio_pad_token))
+            mask_idx = torch.tensor(pending_steps, device=audio_codes.device, dtype=torch.long).add_(1)
+            mask_idx.clamp_(0, self.num_code_layers)
+            active = self._code_layer_masks.index_select(0, mask_idx).to(device=audio_codes.device)
+            audio_codes = audio_codes.masked_fill(~active, self.audio_pad_token)
+
         code_embeds = self.codec_proj(self.embed_tokens(audio_codes.unsqueeze(-1)).reshape(batch, -1))
         next_embeds = (
             code_embeds * self.audio_scale

@@ -19,40 +19,15 @@ def _as_list(value: Any) -> list[int]:
     return list(value)
 
 
-def _payload_keys(mm: Any) -> tuple[list[str], list[str]]:
-    if not isinstance(mm, dict):
-        return [], []
-    hidden = mm.get("hidden_states", {})
-    hidden_keys = sorted(hidden.keys()) if isinstance(hidden, dict) else []
-    return sorted(str(key) for key in mm.keys()), hidden_keys
-
-
-def _has_explicit_bridge(mm: Any) -> bool:
-    if not isinstance(mm, dict):
-        return False
-    hidden = mm.get("hidden_states", {})
-    if isinstance(hidden, dict) and hidden.get("bridge") is not None:
-        return True
-    return mm.get("hidden_states.bridge") is not None
-
-
-def _multimodal_output_for_talker(thinker_output: Any, output: Any) -> OmniPayload:
+def _multimodal_output_for_talker(thinker_output: Any, output: Any) -> dict[str, Any]:
+    del thinker_output
     completion_mm = getattr(output, "multimodal_output", None)
-    request_mm = getattr(thinker_output, "multimodal_output", None)
-    completion_keys, completion_hidden_keys = _payload_keys(completion_mm)
-    request_keys, request_hidden_keys = _payload_keys(request_mm)
-
-    if _has_explicit_bridge(completion_mm):
+    if isinstance(completion_mm, dict):
         return completion_mm
-
-    raise RuntimeError(
-        "MiniMind thinker2talker expected explicit bridge in completion multimodal_output. "
-        f"completion_keys={completion_keys}; completion_hidden_keys={completion_hidden_keys}; "
-        f"request_keys={request_keys}; request_hidden_keys={request_hidden_keys}"
-    )
+    raise RuntimeError("MiniMind thinker2talker expected completion multimodal_output to be a dict.")
 
 
-def _pick_bridge(mm: OmniPayload, expected_len: int) -> torch.Tensor:
+def _pick_bridge(mm: dict[str, Any], expected_len: int) -> torch.Tensor:
     hidden = mm.get("hidden_states", {}) if isinstance(mm, dict) else {}
     bridge = hidden.get("bridge") if isinstance(hidden, dict) else None
     if bridge is None and isinstance(mm, dict):
@@ -81,25 +56,16 @@ def _align_ids_to_bridge(
     output_token_ids: list[int],
     bridge_len: int,
 ) -> tuple[list[int], list[int], list[int]]:
-    if bridge_len <= 0:
-        all_text_ids = prompt_token_ids + output_token_ids
-        return prompt_token_ids, output_token_ids, all_text_ids
-
     all_text_ids = prompt_token_ids + output_token_ids
-    if len(all_text_ids) == bridge_len:
+    if bridge_len <= 0 or len(all_text_ids) <= bridge_len:
         return prompt_token_ids, output_token_ids, all_text_ids
 
-    if len(all_text_ids) < bridge_len:
-        return prompt_token_ids, output_token_ids, all_text_ids
+    if len(prompt_token_ids) > bridge_len:
+        prompt_token_ids = prompt_token_ids[-bridge_len:]
+        return prompt_token_ids, [], prompt_token_ids
 
-    if len(prompt_token_ids) <= bridge_len:
-        output_budget = max(0, bridge_len - len(prompt_token_ids))
-        output_token_ids = output_token_ids[:output_budget]
-        all_text_ids = prompt_token_ids + output_token_ids
-        return prompt_token_ids, output_token_ids, all_text_ids
-
-    prompt_token_ids = prompt_token_ids[-bridge_len:]
-    return prompt_token_ids, [], prompt_token_ids
+    output_token_ids = output_token_ids[: bridge_len - len(prompt_token_ids)]
+    return prompt_token_ids, output_token_ids, prompt_token_ids + output_token_ids
 
 
 def thinker2talker(
@@ -160,7 +126,7 @@ def talker2code2wav(
     for talker_output in source_outputs:
         request_id = getattr(talker_output, "request_id", None)
         output = talker_output.outputs[0]
-        mm: OmniPayload = getattr(output, "multimodal_output", None) or {}
+        mm: dict[str, Any] = getattr(output, "multimodal_output", None) or {}
         codes = mm.get("codes", {}) if isinstance(mm, dict) else {}
         audio_codes = codes.get("audio") if isinstance(codes, dict) else None
         if not isinstance(audio_codes, torch.Tensor):
