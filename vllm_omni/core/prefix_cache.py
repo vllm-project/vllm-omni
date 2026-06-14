@@ -28,7 +28,6 @@ class _PendingAsyncWrite:
     slots_cpu: torch.Tensor
     hidden_cpu: torch.Tensor | None
     mm_cpu: dict[str, torch.Tensor] = field(default_factory=dict)
-    discarded: bool = False
 
 
 class OmniTensorPrefixCache:
@@ -142,8 +141,6 @@ class OmniTensorPrefixCache:
     #                          non-blocking D2H + records a CUDA event
     #   drain_ready_async_writes : non-blocking poll, applies any writes
     #                              whose D2H has completed
-    #   drain_all_blocking   : forces completion of all pending writes
-    #                          (used at shutdown / tests / before final reads)
     # =====================================================================
 
     def _ensure_async_resources(self) -> None:
@@ -266,17 +263,6 @@ class OmniTensorPrefixCache:
         self._consume_pending_write()
         return 1
 
-    def drain_all_blocking(self) -> int:
-        """Force-wait the in-flight write and apply it. Blocking.
-
-        Used at shutdown / tests / profiler-stop boundaries to guarantee
-        cache freshness.
-        """
-        if self._pending_write is None:
-            return 0
-        self._consume_pending_write()
-        return 1
-
     def _consume_pending_write(self) -> None:
         """Synchronize on the pending event and scatter the CPU tensors
         into the destination caches. Drops state on completion.
@@ -285,8 +271,6 @@ class OmniTensorPrefixCache:
         if entry is None:
             return
         self._pending_write = None
-        if entry.discarded:
-            return
         entry.event.synchronize()
         n = entry.num_tokens
         if n <= 0:
