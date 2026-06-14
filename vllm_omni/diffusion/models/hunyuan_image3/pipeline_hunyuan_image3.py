@@ -1886,11 +1886,12 @@ class HunyuanImage3Pipeline(
         model_inputs.update(ar_kv_kwargs)
 
         outputs = self._generate(**model_inputs, **kwargs)
+        output_samples = outputs.samples if hasattr(outputs, "samples") else outputs[0]
         custom_output = {}
         if any(t is not None for t in cot_text_list):
             custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
         return DiffusionOutput(
-            output=outputs[0],
+            output=output_samples,
             custom_output=custom_output,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
