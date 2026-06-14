@@ -218,7 +218,7 @@ def merge_mixfusion_chunks(chunks: torch.Tensor, plan: MixFusionPlan) -> list[to
 
 def synchronize(device: torch.device) -> None:
     if device.type == "cuda":
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
 
 def time_ms(fn: Callable[[], object], device: torch.device, warmup: int, iters: int) -> float:
@@ -236,10 +236,10 @@ def time_ms(fn: Callable[[], object], device: torch.device, warmup: int, iters: 
 def peak_memory_mb(device: torch.device, fn: Callable[[], object]) -> float | None:
     if device.type != "cuda":
         return None
-    torch.cuda.reset_peak_memory_stats(device)
+    torch.accelerator.reset_peak_memory_stats()
     fn()
     synchronize(device)
-    return torch.cuda.max_memory_allocated(device) / 1024 / 1024
+    return torch.accelerator.max_memory_allocated() / 1024 / 1024
 
 
 def attention_work(seq_lens: list[int]) -> dict[str, int]:
