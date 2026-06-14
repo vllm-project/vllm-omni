@@ -43,7 +43,7 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             sampling_constraints={
                 "detokenize": True,
-                "stop_token_ids": [8294],
+                "stop_token_ids": [8292, 8294],
             },
         ),
         StagePipelineConfig(

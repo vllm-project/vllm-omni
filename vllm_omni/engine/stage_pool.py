@@ -23,6 +23,8 @@ from vllm_omni.engine.stage_client import (
     StagePoolDiffusionClient,
     StagePoolLLMClient,
 )
+from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
@@ -1020,7 +1022,29 @@ class StagePool:
         outputs = await client.get_output_async()
         if not outputs.outputs:
             return None
+        self._rehydrate_pooling_output_payloads(outputs)
         return outputs
+
+    @staticmethod
+    def _rehydrate_pooling_output_payloads(outputs: EngineCoreOutputs) -> None:
+        """Restore dict-shaped pooling_output from its bytes carrier (MR V2).
+
+        vLLM 0.23 decodes EngineCoreOutput.pooling_output as a torch.Tensor, so MR
+        V2 runners ship the per-request dict handoff via ``pooling_output_payload``
+        with ``pooling_output=None``. Decode it back here so downstream stage-input
+        processors see ``pooling_output`` exactly as on vLLM <= 0.22.
+        """
+        for eco in outputs.outputs:
+            payload = getattr(eco, "pooling_output_payload", None)
+            if payload is None:
+                continue
+            if getattr(eco, "pooling_output", None) is None:
+                # deserialize_* returns the nested OmniPayload form; the producer
+                # serialized a flat (dotted-key) pooler dict, and downstream
+                # consumers (e.g. talker2code2wav_full_payload) read flat keys like
+                # "codes.audio". Re-flatten to restore the exact on-wire shape.
+                eco.pooling_output = flatten_payload(deserialize_additional_information(payload))
+            eco.pooling_output_payload = None
 
     async def process_llm_raw_outputs(
         self,

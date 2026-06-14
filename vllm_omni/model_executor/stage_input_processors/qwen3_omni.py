@@ -800,6 +800,14 @@ def thinker2talker_token_only(
 # =========================
 
 
+def _eof_payload(transfer_manager: Any) -> OmniPayloadStruct:
+    """Return an EOF marker payload when the request is finished with no codes."""
+    return {
+        "codes": {"audio": []},
+        "meta": {"left_context_size": 0, "finished": torch.tensor(True)},
+    }
+
+
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: OmniPayload | dict[str, Any],
@@ -810,18 +818,28 @@ def talker2code2wav_async_chunk(
     Multimodal output version.
     """
     if not isinstance(multimodal_output, Mapping):
+        if is_finished:
+            return _eof_payload(transfer_manager)
         return None
     talker_codes = multimodal_output.get("codes", {})
     if not isinstance(talker_codes, dict):
+        if is_finished:
+            return _eof_payload(transfer_manager)
         return None
     code_predictor_codes = talker_codes.get("audio")
     if code_predictor_codes is None:
+        if is_finished:
+            return _eof_payload(transfer_manager)
         return None
 
     if code_predictor_codes.numel() == 0:
+        if is_finished:
+            return _eof_payload(transfer_manager)
         return None
 
     if not code_predictor_codes.any():
+        if is_finished:
+            return _eof_payload(transfer_manager)
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -839,6 +857,8 @@ def talker2code2wav_async_chunk(
     first_codebook = int(code_predictor_codes[0, 0].item())
     if first_codebook in stop_token_ids:
         logger.debug("skip stop-token codec frame: first_codebook=%s", first_codebook)
+        if is_finished:
+            return _eof_payload(transfer_manager)
         return None
 
     request_id = request.external_req_id

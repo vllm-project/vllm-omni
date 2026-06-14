@@ -320,6 +320,12 @@ class Qwen3OmniMoeForConditionalGeneration(
         self,
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec] | None = None,
+        # V1 runner passes the full multimodal RoPE inputs explicitly, while
+        # vLLM 0.20 calls this method with only input_tokens/mm_features.
+        hf_config: object | None = None,
+        image_grid_thw: list[list[int]] | torch.Tensor | None = None,
+        video_grid_thw: list[list[int]] | torch.Tensor | None = None,
+        second_per_grid_ts: list[float] | None = None,
         **kwargs: object,
     ) -> tuple[torch.Tensor, int]:
         if self.model_stage == "thinker":

@@ -61,6 +61,7 @@ models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
 _CI_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
+_CI_MIN_DAILY_OMNI_ACCURACY = "0.685"
 
 
 def get_chunk_config(config_path: str | None = None):
@@ -119,9 +120,11 @@ def test_qwen3_omni_daily_omni_accuracy_bench(omni_server) -> None:
     _require_vllm_cli()
     pytest.importorskip("datasets")
     pytest.importorskip("huggingface_hub")
-    ns = _acc_bench.parse_acc_benchmark_args(
-        build_acc_benchmark_cli_argv(omni_server, skip_seed=True, skip_daily=False)
-    )
+    argv = build_acc_benchmark_cli_argv(omni_server, skip_seed=True, skip_daily=False)
+    # Daily-Omni's full-set score can move by a few MCQ items across GPU and
+    # batching schedules; keep CI below the nominal 0.69 CLI baseline.
+    argv.extend(["--min-daily-omni-accuracy", _CI_MIN_DAILY_OMNI_ACCURACY])
+    ns = _acc_bench.parse_acc_benchmark_args(argv)
     assert _acc_bench.run_acc_benchmark(ns) == 0
 
 

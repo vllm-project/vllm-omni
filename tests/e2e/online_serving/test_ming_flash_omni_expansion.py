@@ -26,6 +26,12 @@ _SKIP_NEED_4_H100_NOT_CI = pytest.mark.skip(
     reason="Requires 4x H100 GPUs; skipped in CI for now.",
 )
 
+pytestmark = [pytest.mark.omni, pytest.mark.full_model]
+
+_SKIP_NEED_4_H100_NOT_CI = pytest.mark.skip(
+    reason="Requires 4x H100 GPUs; skipped in CI for now.",
+)
+
 models = ["Jonathan1909/Ming-flash-omni-2.0"]
 
 # Use thinker-only topology to test text outputs
