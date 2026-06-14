@@ -189,7 +189,9 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.cfg_parallel_size != 1:
         raise ValueError("This MixFusion benchmark requires --cfg-parallel-size 1.")
     if args.ulysses_degree != 1 or args.ring_degree != 1:
-        raise ValueError("This MixFusion benchmark requires sequence parallel disabled: --ulysses-degree 1 --ring-degree 1.")
+        raise ValueError(
+            "This MixFusion benchmark requires sequence parallel disabled: --ulysses-degree 1 --ring-degree 1."
+        )
     if len(set(sizes)) == 1:
         raise ValueError("All requested image sizes are identical; use at least two resolutions to exercise MixFusion.")
 
@@ -307,7 +309,8 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "independent runs each prompt as a separate diffusion request with seed+i.",
                 "mixfusion_batch runs all prompts in one OmniDiffusionRequest with seed as the base seed.",
                 "This measures the real loaded Hunyuan DiT path, including tokenizer, RoPE, scheduler, DiT, and VAE.",
-                "It intentionally bypasses online stepwise scheduling; online mixed-resolution request batching still needs Hunyuan stepwise support.",
+                "It intentionally bypasses online stepwise scheduling; online mixed-resolution request batching still "
+                "needs Hunyuan stepwise support.",
             ],
         }
     finally:
