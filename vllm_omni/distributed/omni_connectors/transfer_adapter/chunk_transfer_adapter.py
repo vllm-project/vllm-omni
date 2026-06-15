@@ -789,9 +789,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 continue
             if req_id in self.requests_origin_status:
                 request.status = self.requests_origin_status.pop(req_id)
-            aborted_external_ids.add(
-                getattr(request, "external_req_id", None) or self.request_ids_mapping.get(req_id, req_id)
-            )
+            aborted_external_ids.add(request.external_req_id or self.request_ids_mapping.get(req_id, req_id))
 
         request_ids = set(request_ids)
 
