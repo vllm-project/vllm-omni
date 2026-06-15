@@ -374,6 +374,11 @@ class DiffusionEngine:
                     mm_output["fps"] = model_fps
                 if action_payload is not None:
                     mm_output["actions"] = action_payload
+                # Merge any extra tensor data from custom_output into
+                # multimodal_output so pipelines that produce non-image
+                # outputs (e.g. 3D reconstruction) can use the same path.
+                if custom_output:
+                    mm_output.update(custom_output)
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
