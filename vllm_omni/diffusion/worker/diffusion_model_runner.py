@@ -224,12 +224,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return None
         return self.prompt_embed_cache.stats()
 
-    def _record_peak_memory(self, output: DiffusionOutput) -> None:
-        """Record peak GPU memory for the current forward pass into output.
+    def _sample_peak_memory_mb(self) -> float:
+        """Return peak GPU memory for the current forward pass in MB.
 
-        Must be called immediately after pipeline.forward(), with
+        Must be called immediately after the measured forward/step work, with
         reset_peak_memory_stats() called just before it, so the measurement
-        reflects this request only and not the global historical maximum.
+        reflects the current execution slice and not the global historical
+        maximum.
 
         Uses max_memory_reserved (CUDA memory pool high-water mark) rather than
         max_memory_allocated so that allocator fragmentation is also visible.
@@ -238,7 +239,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         peak_reserved_bytes = current_omni_platform.max_memory_reserved()
         peak_allocated_bytes = current_omni_platform.max_memory_allocated()
 
-        output.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        peak_memory_mb = peak_reserved_bytes / (1024**2)
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
         peak_allocated_gb = peak_allocated_bytes / (1024**3)
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
@@ -250,6 +251,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             pool_overhead_gb,
             pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
         )
+        return peak_memory_mb
+
+    def _record_peak_memory(self, output: DiffusionOutput) -> None:
+        """Record peak GPU memory for the current forward pass into output."""
+        output.peak_memory_mb = self._sample_peak_memory_mb()
 
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """
@@ -565,6 +571,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             states, new_request_ids = self._update_states(scheduler_output)
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
             attn_metadata = self._prepare_attn_metadata(input_batch)
+            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            if is_primary:
+                current_omni_platform.reset_peak_memory_stats()
 
             with set_forward_context(
                 vllm_config=self.vllm_config,
@@ -628,6 +637,22 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         raise ValueError(
                             f"Stepwise noise_pred consumed {offset} rows, "
                             f"but batched noise_pred has {noise_pred.shape[0]} rows."
+                        )
+
+                if is_primary:
+                    batch_peak_memory_mb = self._sample_peak_memory_mb()
+                    states_by_id = {state.request_id: state for state in states}
+                    for state in states:
+                        state.peak_memory_mb = max(state.peak_memory_mb, batch_peak_memory_mb)
+                    for runner_output in runner_output_list:
+                        if runner_output.result is None:
+                            continue
+                        state = states_by_id.get(runner_output.request_id)
+                        if state is None:
+                            continue
+                        runner_output.result.peak_memory_mb = max(
+                            runner_output.result.peak_memory_mb,
+                            state.peak_memory_mb,
                         )
 
                 self._update_states_after(states, input_batch, pipeline_interrupted)

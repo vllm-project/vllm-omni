@@ -73,6 +73,9 @@ class DiffusionRequestState:
     # For example: Wan condition tensors / masks, or Bagel KV contexts.
     extra: dict[str, Any] = field(default_factory=dict)
 
+    # Peak device memory observed while this request is active in step mode.
+    peak_memory_mb: float = 0.0
+
     # ── Properties ──
 
     @property
