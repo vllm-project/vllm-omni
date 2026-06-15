@@ -33,10 +33,20 @@ from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
-from vllm_omni.diffusion.layers.norm import RMSNorm
+from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+class RMSNorm(_VllmRMSNorm):
+    """Cosmos3-local RMSNorm that uses the FP32 native implementation."""
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
 
 
 def _get_ulysses_state() -> tuple[int, int, dist.ProcessGroup | None]:
@@ -539,8 +549,8 @@ class Cosmos3CausalAttention(nn.Module):
         v = self.to_v(hidden_states).view(B, S, self.num_kv_heads_local, self.head_dim)
 
         # Per-head QK norm
-        q = F.rms_norm(q, (q.shape[-1],), self.norm_q.weight, self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (k.shape[-1],), self.norm_k.weight, self.norm_k.variance_epsilon)
+        q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, eps=self.norm_q.variance_epsilon)
+        k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
 
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
@@ -704,8 +714,8 @@ class Cosmos3CrossAttention(nn.Module):
         v = self.to_v(hidden_states).view(B, S_gen, self.num_kv_heads_local, self.head_dim)
 
         # Per-head QK norm
-        q = F.rms_norm(q, (q.shape[-1],), self.norm_q.weight, self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (k.shape[-1],), self.norm_k.weight, self.norm_k.variance_epsilon)
+        q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, eps=self.norm_q.variance_epsilon)
+        k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
 
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
@@ -1446,7 +1456,8 @@ class Cosmos3VFMTransformer(nn.Module):
                         "Cosmos3 action_noisy_mask must have shape [B, T_action, 1], "
                         f"got {tuple(action_noisy_mask.shape)}."
                     )
-                hidden_action = hidden_action + time_embed.unsqueeze(1) * action_noisy_mask.to(hidden_action.dtype)
+                action_noisy_mask = action_noisy_mask.to(dtype=hidden_action.dtype, device=hidden_action.device)
+                hidden_action = hidden_action + time_embed.unsqueeze(1) * action_noisy_mask
 
         if hidden_sound is not None:
             hidden_sound = hidden_sound + time_embed.unsqueeze(1)

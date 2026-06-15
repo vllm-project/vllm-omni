@@ -27,6 +27,7 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
+    get_diffusion_action_post_process_func,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
 )
@@ -82,6 +83,15 @@ def supports_audio_output(model_class_name: str) -> bool:
     if model_cls is None:
         return False
     return bool(getattr(model_cls, "support_audio_output", False))
+
+
+def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
+    if func is None:
+        return False
+    parameters = inspect.signature(func).parameters
+    return parameter_name in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
 def _move_tensor_tree_to_cpu(value: object) -> object:
@@ -149,12 +159,16 @@ class DiffusionEngine:
         self.od_config = od_config
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
+        self.action_post_process_func = get_diffusion_action_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
         # Cache whether the model-specific postprocess accepts request-level
         # sampling params so step() can support both legacy and extended hooks.
-        self._post_process_accepts_sampling_params = bool(
-            self.post_process_func is not None
-            and "sampling_params" in inspect.signature(self.post_process_func).parameters
+        self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
+        self._action_post_process_accepts_sampling_params = _func_accepts_parameter(
+            self.action_post_process_func, "sampling_params"
+        )
+        self._action_post_process_accepts_custom_output = _func_accepts_parameter(
+            self.action_post_process_func, "custom_output"
         )
 
         executor_class = DiffusionExecutor.get_class(od_config)
@@ -261,8 +275,14 @@ class DiffusionEngine:
         if self.od_config.enable_cpu_offload:
             output_data = _move_tensor_tree_to_cpu(output_data)
 
+        custom_output = output.custom_output or {}
+        action_payload = None
+        action_only_output = bool(custom_output.get("action_only_output"))
+
         postprocess_start_time = time.perf_counter()
-        if self.post_process_func is not None:
+        if action_only_output:
+            outputs = []
+        elif self.post_process_func is not None:
             # Some video pipelines need request-level controls during
             # postprocess (for example worker-side frame interpolation).
             if self._post_process_accepts_sampling_params:
@@ -272,10 +292,8 @@ class DiffusionEngine:
         else:
             outputs = output_data
         audio_payload = None
-        custom_output = output.custom_output or {}
         model_audio_sample_rate = None
         model_fps = None
-        action_payload = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
             action_payload = outputs.get("actions")
@@ -283,6 +301,19 @@ class DiffusionEngine:
             model_audio_sample_rate = outputs.get("audio_sample_rate")
             model_fps = outputs.get("fps")
             outputs = outputs.get("video", outputs)
+        if action_payload is None:
+            action_payload = custom_output.get("actions")
+        action_post_process_func = getattr(self, "action_post_process_func", None)
+        if action_payload is None and action_post_process_func is not None:
+            raw_action_payload = custom_output.get("action", action_payload)
+            if raw_action_payload is not None:
+                action_kwargs: dict[str, Any] = {}
+                if getattr(self, "_action_post_process_accepts_custom_output", False):
+                    action_kwargs["custom_output"] = custom_output
+                if getattr(self, "_action_post_process_accepts_sampling_params", False):
+                    action_kwargs["sampling_params"] = request.sampling_params
+                action_payload = action_post_process_func(raw_action_payload, **action_kwargs)
+                custom_output["actions"] = action_payload
         postprocess_time = time.perf_counter() - postprocess_start_time
         logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
 
