@@ -2,15 +2,14 @@
 # Same two-stage pipeline as the dense ming_tts.yaml; the Stage-0 backbone is the
 # 16.8B-A3B bailing_moe MoE (~31GB bf16).
 #
-# pipeline: required — HF config reports model_type="bailingmm" with no matching
-# registry/architecture, so auto-detection falls through. This key routes the
-# deploy-config probe in StageConfigFactory.create_from_model to "ming_tts".
+# pipeline: HF config reports model_type="bailingmm", which is not a registry key,
+# already declared by MING_TTS_MOE_PIPELINE for auto-detection.
 #
 # NOTE: ~31GB bf16 + the tiny audio VAE fit one 80GB+ GPU, so both stages colocate
 # on GPU0 (Stage-0 0.60 util ≈ 58GB + Stage-1 0.25 util ≈ 24GB ≈ 0.85, fits 97GB
 # H20). For smaller cards raise Stage-0 tensor_parallel_size or split the stages
 # onto separate devices. Multi-request batching is not yet validated (max_num_seqs: 1).
-pipeline: ming_tts
+pipeline: ming_tts_moe
 async_chunk: true
 # The MoE ships a custom tokenizer (tokenization_bailing.BailingTokenizer) that
 # must be executed to load. The model config still resolves to the registered
