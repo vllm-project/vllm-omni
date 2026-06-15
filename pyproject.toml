@@ -264,6 +264,11 @@ filterwarnings = [
     "ignore:.*does not have '__bases__' attribute.*:UserWarning",
 ]
 
+[tool.typos.files]
+# f5_vocab.txt is a vendored F5-TTS pinyin token table; its entries (ba, fo, mian, ...)
+# are not English and must not be "corrected".
+extend-exclude = ["vllm_omni/diffusion/models/audio_omni/f5_vocab.txt"]
+
 [tool.typos.default]
 extend-ignore-identifiers-re = [
     ".*_thw",

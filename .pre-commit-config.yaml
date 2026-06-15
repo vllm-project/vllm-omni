@@ -10,11 +10,16 @@ repos:
         args: ["--unsafe"]
         exclude: "examples/online_serving/chart-helm/templates/"
       - id: debug-statements
+      # f5_vocab.txt is a vendored F5-TTS token table (token<->id map; index 0 is a
+      # literal space). Whitespace/EOF fixers would corrupt the mapping — exclude it.
       - id: end-of-file-fixer
+        exclude: "vllm_omni/diffusion/models/audio_omni/f5_vocab\\.txt"
       - id: mixed-line-ending
         args: ["--fix=lf"]
+        exclude: "vllm_omni/diffusion/models/audio_omni/f5_vocab\\.txt"
       - id: trailing-whitespace
         args: ["--markdown-linebreak-ext=md"]
+        exclude: "vllm_omni/diffusion/models/audio_omni/f5_vocab\\.txt"
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.14.10

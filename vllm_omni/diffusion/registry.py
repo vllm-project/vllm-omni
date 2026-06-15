@@ -241,6 +241,11 @@ _DIFFUSION_MODELS = {
         "pipeline_audiox",
         "AudioXPipeline",
     ),
+    "AudioOmniPipeline": (
+        "audio_omni",
+        "pipeline_audio_omni",
+        "AudioOmniPipeline",
+    ),
     "HunyuanVideo15Pipeline": (
         "hunyuan_video",
         "pipeline_hunyuan_video_1_5",
@@ -303,6 +308,7 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AudioXPipeline",
+    "AudioOmniPipeline",
 }
 
 
@@ -480,6 +486,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "AudioXPipeline": "get_audiox_post_process_func",
+    "AudioOmniPipeline": "get_audio_omni_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
