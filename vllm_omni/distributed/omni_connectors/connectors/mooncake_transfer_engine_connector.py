@@ -114,6 +114,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._listener_ready = threading.Event()
         self._local_buffers: dict[str, Any] = {}
         self._local_buffers_lock = threading.Lock()
+        self._put_lock = threading.Lock()
         self._req_local = threading.local()
         self._worker_local = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
@@ -382,6 +383,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         put_key = self._make_key(put_key, from_stage, to_stage)
 
+        # Serialize concurrent put() calls on the same connector to prevent
+        # races in the alloc -> copy -> store-metadata flow at the Mooncake
+        # C++ engine level.
+        with self._put_lock:
+            return self._put_impl(put_key, data)
+
+    def _put_impl(self, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
+        """Internal put implementation, called under _put_lock."""
         try:
             src_addr = 0
             size = 0

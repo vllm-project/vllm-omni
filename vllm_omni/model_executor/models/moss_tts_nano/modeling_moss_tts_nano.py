@@ -34,7 +34,10 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.model_executor.models.utils import reinit_rotary_inv_freq
+from vllm_omni.model_executor.models.utils import (
+    reinit_rotary_inv_freq,
+    transformers_keys_to_ignore_compat,
+)
 
 logger = init_logger(__name__)
 
@@ -193,7 +196,10 @@ class MossTTSNanoForGeneration(nn.Module):
         logger.info("Loading MOSS-TTS-Nano LM from %s (dtype=%s)", self.model_path, tts_dtype)
         from transformers import AutoModelForCausalLM
 
-        with _hf_load_without_tp_warmup():
+        # Two orthogonal trust_remote_code transformers fixes:
+        #  - _hf_load_without_tp_warmup: tp_plan=None warmup crash (transformers 5.8.x)
+        #  - transformers_keys_to_ignore_compat: keys list-vs-set (transformers 5.9)
+        with _hf_load_without_tp_warmup(), transformers_keys_to_ignore_compat():
             lm = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 trust_remote_code=True,
@@ -233,7 +239,10 @@ class MossTTSNanoForGeneration(nn.Module):
         logger.info("Loading MOSS-Audio-Tokenizer-Nano from %s", codec_path)
         from transformers import AutoModel
 
-        with _hf_load_without_tp_warmup():
+        # Two orthogonal trust_remote_code transformers fixes:
+        #  - _hf_load_without_tp_warmup: tp_plan=None warmup crash (transformers 5.8.x)
+        #  - transformers_keys_to_ignore_compat: keys list-vs-set (transformers 5.9)
+        with _hf_load_without_tp_warmup(), transformers_keys_to_ignore_compat():
             audio_tokenizer = AutoModel.from_pretrained(
                 codec_path,
                 trust_remote_code=True,
