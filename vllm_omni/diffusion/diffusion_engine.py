@@ -707,7 +707,7 @@ class DiffusionEngine:
     def _dummy_run(self):
         """A dummy run to warm up the model."""
         # PipeFusion requires two sampling steps: one for the sync branch and one for the async branch.
-        num_inference_steps = 1 if getattr(self.od_config.parallel_config, "enable_pipefusion", False) else 2
+        num_inference_steps = 1 if not getattr(self.od_config.parallel_config, "enable_pipefusion", False) else 2
         height = 512
         width = 512
         prompt: OmniTextPrompt = {"prompt": "dummy run"}
