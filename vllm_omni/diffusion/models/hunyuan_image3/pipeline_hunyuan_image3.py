@@ -987,7 +987,7 @@ class HunyuanImage3Pipeline(
         timestep_scatter_src = self.timestep_emb(t.reshape(-1)).reshape(batch_size, -1, n_embd)
         x.scatter_(
             dim=1,
-            index=timestep_scatter_index.unsqueeze(-1).repeat(1, 1, n_embd),
+            index=timestep_scatter_index.to(x.device).unsqueeze(-1).repeat(1, 1, n_embd),
             src=timestep_scatter_src,
         )
 
@@ -1370,7 +1370,7 @@ class HunyuanImage3Pipeline(
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             image_mask=to_device(output.gen_image_mask, device),
-            gen_timestep_scatter_index=to_device(output.gen_timestep_scatter_index, device),
+            gen_timestep_scatter_index=output.gen_timestep_scatter_index,
             cond_vae_images=to_device(cond_vae_images, device),
             cond_timestep=to_device(cond_timestep, device),
             cond_vae_image_mask=to_device(output.cond_vae_image_mask, device),
