@@ -56,7 +56,7 @@ def _call(tm, rid, *, n_frames, finished=False, req_ic=None):
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(n_frames)]
     return talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.zeros((0,))}},
+        multimodal_output={"codes": {"audio": torch.zeros((0,))}},
         request=_req(rid, finished=finished, initial_codec_chunk_frames=req_ic),
         is_finished=finished,
     )
@@ -66,7 +66,7 @@ def test_empty_returns_none():
     tm = _tm()
     p = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.zeros((0,))}},
+        multimodal_output={"codes": {"audio": torch.zeros((0,))}},
         request=_req("r", finished=False),
     )
     assert p is None
@@ -76,7 +76,7 @@ def test_eof_marker_when_finished_empty():
     tm = _tm()
     p = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output=None,
+        multimodal_output=None,
         request=_req("r", finished=True),
         is_finished=True,
     )
@@ -89,7 +89,7 @@ def test_flush_on_finish():
     tm.code_prompt_token_ids["r"] = [_FRAME[:] for _ in range(24)]
     p = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output=None,
+        multimodal_output=None,
         request=_req("r", finished=True),
         is_finished=True,
     )
@@ -262,7 +262,7 @@ def test_first_streaming_chunk_prepends_ref_code_context():
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+        multimodal_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
@@ -286,7 +286,7 @@ def test_followup_ref_code_context_is_sent_as_metadata_handle():
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+        multimodal_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
@@ -319,7 +319,7 @@ def test_streaming_ref_code_context_is_bounded_for_batchable_shapes():
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+        multimodal_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
         request=_req(rid, finished=False),
         is_finished=False,
     )
@@ -338,7 +338,7 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
 
     first_payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]]), "ref": ref_code}},
+        multimodal_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]]), "ref": ref_code}},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
@@ -348,14 +348,14 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
     for _ in range(8):
         talker2code2wav_async_chunk(
             transfer_manager=tm,
-            pooling_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]])}},
+            multimodal_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]])}},
             request=_req(rid, finished=False, initial_codec_chunk_frames=10),
             is_finished=False,
         )
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]])}},
+        multimodal_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]])}},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )

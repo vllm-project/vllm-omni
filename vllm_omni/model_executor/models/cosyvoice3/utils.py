@@ -215,6 +215,44 @@ def extract_spk_embedding(prompt_wav, campplus_session, device):
     return embedding
 
 
+def unpad_prompt_conditioning(speech_token, speech_feat, speech_token_len):
+    """Drop right-padding from per-request prompt conditioning.
+
+    The talker emits ``speech_token`` ``[1, T]`` possibly right-padded to the
+    batch max, plus the true ``speech_token_len``; ``speech_feat`` is at the 2:1
+    mel:token ratio (``[1, 2T, F]``). This trims both to the real length. Called
+    in the (eager) code2wav stage where a host read of the length is allowed.
+    Returns ``(speech_token, speech_feat)`` unchanged when length is unavailable.
+    """
+    if not isinstance(speech_token, torch.Tensor) or speech_token_len is None:
+        return speech_token, speech_feat
+    try:
+        token_len = int(torch.as_tensor(speech_token_len).reshape(-1)[0].item())
+    except (RuntimeError, ValueError, IndexError):
+        return speech_token, speech_feat
+    if token_len <= 0 or speech_token.dim() < 2:
+        return speech_token, speech_feat
+    token_len = min(token_len, int(speech_token.shape[1]))
+    speech_token = speech_token[:, :token_len]
+    if isinstance(speech_feat, torch.Tensor) and speech_feat.dim() >= 2:
+        speech_feat = speech_feat[:, : 2 * token_len]
+    return speech_token, speech_feat
+
+
+def extract_spk_embedding_trt(prompt_wav, campplus_trt, device):
+    """TensorRT counterpart of ``extract_spk_embedding``.
+
+    Identical fbank front-end; the campplus forward runs on a prebuilt
+    TensorRT engine (GPU) instead of the CPU ONNX-Runtime session. Returns the
+    same ``[1, 192]`` embedding tensor on ``device``.
+    """
+    speech = load_wav(prompt_wav, 16000)
+    feat = kaldi.fbank(speech, num_mel_bins=80, dither=0, sample_frequency=16000)
+    feat = feat - feat.mean(dim=0, keepdim=True)
+    embedding = campplus_trt(feat)
+    return embedding.to(device)
+
+
 def extract_text_token(text, tokenizer, allowed_special):
     text_token = tokenizer.encode(text, allowed_special=allowed_special)
     text_token = torch.tensor([text_token], dtype=torch.int32)

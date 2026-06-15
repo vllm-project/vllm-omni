@@ -17,6 +17,7 @@ list of supported architectures across all modalities, see
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
 | GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
+| Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | 2 (AR + audio VAE) | ✓ | ✓ | style / IP / dialect / TTA / podcast | 44.1 kHz |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
@@ -156,6 +157,46 @@ Streaming requires `async_chunk: true` in the stage config.
 ### Notes
 - Output: 44.1 kHz mono WAV.
 - DAC codec weights (`codec.pth`) are loaded lazily from the model directory.
+
+---
+
+## Ming-omni-tts
+
+Dense 0.5B two-stage TTS pipeline (`AR + flow` + audio VAE) at 44.1 kHz. The example covers style, IP voice, music-only generation, text-to-audio events, emotion, dialect, zero-shot cloning, podcast, speech+BGM, and speech+environment-sound cases.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
+    --case style \
+    --deploy-config vllm_omni/deploy/ming_tts.yaml \
+    --enforce-eager
+```
+
+### Voice cloning
+```bash
+python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
+    --case zero_shot \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "在此奉劝大家别乱打美白针。" \
+    --deploy-config vllm_omni/deploy/ming_tts.yaml \
+    --enforce-eager
+```
+
+### Streaming
+```bash
+python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
+    --case basic \
+    --ref-audio /path/to/reference.wav \
+    --streaming \
+    --deploy-config vllm_omni/deploy/ming_tts.yaml \
+    --enforce-eager
+```
+
+### Notes
+- `style`, `ip`, `bgm`, and `tta` do not require reference audio.
+- Reference-audio cases use `--ref-audio`; `zero_shot` also requires `--ref-text`.
+- `podcast` uses multiple references via `--ref-audio-paths`.
+- Full case details live in [`ming_tts/README.md`](ming_tts/README.md).
 
 ---
 

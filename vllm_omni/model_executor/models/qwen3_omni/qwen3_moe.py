@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import MoERunner
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3_moe import (
@@ -149,14 +149,14 @@ class Qwen3MoeForCausalLM(_BaseQwen3MoeForCausalLM):
         # Set MoE hyperparameters for individual experts
         self.expert_weights = []
 
-        self.moe_layers: list[FusedMoE] = []
+        self.moe_layers: list[MoERunner] = []
         example_layer = None
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
 
             assert isinstance(layer, Qwen3MoeDecoderLayer)
-            if isinstance(layer.mlp, FusedMoE):
+            if isinstance(layer.mlp, MoERunner):
                 example_layer = layer.mlp
                 self.moe_layers.append(layer.mlp)
 

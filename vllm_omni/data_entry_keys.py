@@ -128,6 +128,7 @@ class EmbeddingsStruct(_StructBase):
     voice: torch.Tensor | None = None
     speech_feat: torch.Tensor | None = None
     speech_token: torch.Tensor | None = None
+    speech_token_len: torch.Tensor | None = None
     embedding: torch.Tensor | None = None
     thinker_reply: torch.Tensor | None = None
 

@@ -198,19 +198,78 @@ def test_video_chat_stream_invalid_requests(
 # WS /v1/realtime
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Resolved in ``test_realtime_invalid_requests`` (skip ``session.created`` handshake).
+_REALTIME_WS_MODEL_MISMATCH = object()
+_REALTIME_WS_INVALID_AUDIO_APPEND = object()
+
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize(
+    "send_frames_spec, ws_error_code, err_message",
+    [
+        pytest.param("{not-json", "invalid_json", "Invalid JSON", id="invalid_json"),
+        pytest.param(
+            json.dumps({"type": "session.update"}),
+            "invalid_event",
+            ("model", "Missing required field"),
+            id="session_update_missing_model",
+        ),
+        pytest.param(
+            _REALTIME_WS_MODEL_MISMATCH,
+            "model_not_found",
+            ("model", "does not exist"),
+            id="session_update_model_mismatch",
+        ),
+        pytest.param(
+            json.dumps({"type": "input_audio_buffer.commit", "final": False}),
+            "model_not_validated",
+            ("session.update", "validate the model"),
+            id="commit_without_model_validation",
+        ),
+        pytest.param(
+            json.dumps({"type": "unknown.event"}),
+            "unknown_event",
+            "Unknown event type",
+            id="unknown_event_type",
+        ),
+        pytest.param(
+            _REALTIME_WS_INVALID_AUDIO_APPEND,
+            "invalid_audio",
+            "Invalid audio data",
+            id="invalid_audio_append",
+        ),
+    ],
+)
 @pytest.mark.parametrize("omni_server", _QWEN3_OMNI_SERVER, indirect=True)
-def test_realtime_rejected_when_async_chunk_enabled(
+def test_realtime_invalid_requests(
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,
+    send_frames_spec: Any,
+    ws_error_code: str,
+    err_message: str | tuple[str, ...],
 ) -> None:
+    if send_frames_spec is _REALTIME_WS_MODEL_MISMATCH:
+        send_frames = json.dumps(
+            {
+                "type": "session.update",
+                "model": "this-model-is-not-served-on-this-instance",
+            }
+        )
+    elif send_frames_spec is _REALTIME_WS_INVALID_AUDIO_APPEND:
+        send_frames = [
+            json.dumps({"type": "session.update", "model": omni_server.model}),
+            json.dumps({"type": "input_audio_buffer.append", "audio": "not-valid-base64!!!"}),
+        ]
+    else:
+        send_frames = send_frames_spec
     openai_client.send_realtime_ws_request(
         {
+            "send_frames": send_frames,
             "timeout": 120,
             "ws_max_size": None,
+            "ws_skip_types": ["session.created"],
             "ws_json_type": "error",
-            "ws_error_code": "unsupported",
-            "err_message": "async_chunk",
+            "ws_error_code": ws_error_code,
+            "err_message": err_message,
         }
     )
