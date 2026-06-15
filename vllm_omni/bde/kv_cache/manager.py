@@ -19,6 +19,7 @@ from vllm_omni.bde.kv_cache.chunk_window import ChunkWindowSpec
 from vllm_omni.bde.kv_cache.config import BDEKVConfig
 from vllm_omni.bde.kv_cache.pool import build_kv_manager, compute_num_blocks
 from vllm_omni.bde.kv_cache.slot_mapping import chunk_slot_mapping, resident_block_ids
+from vllm_omni.bde.kv_cache.gather import allocate_kv_pool, pool_gather_window, pool_write_chunk
 
 
 class BDEKVCache:
@@ -40,6 +41,7 @@ class BDEKVCache:
         block_size: int,
         max_model_len: int,
         available_bytes: int,
+        device: torch.device | None = None,
     ) -> None:
         if not config.enable:
             raise ValueError("BDEKVCache built with a disabled BDEKVConfig")
@@ -73,6 +75,19 @@ class BDEKVCache:
         self.num_blocks = num_blocks
         self.null_block_id = self.manager.block_pool.null_block.block_id
         self._adapters: dict[str, BDERequestAdapter] = {}
+
+        # Allocate the per-layer paged K/V pools on the given device.
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.dtype = dtype
+        self.device = device or torch.device("cpu")
+        self._k_pools: list[torch.Tensor] = []
+        self._v_pools: list[torch.Tensor] = []
+        if device is not None:
+            self._k_pools, self._v_pools = allocate_kv_pool(
+                num_blocks, block_size, num_layers, num_kv_heads, head_size, dtype, device
+            )
 
     # -- request lifecycle ---------------------------------------------------
 
@@ -124,3 +139,37 @@ class BDEKVCache:
     def commit_chunk(self, adapter: BDERequestAdapter) -> None:
         """Advance after the chunk's K/V is written. Once per chunk, not per step."""
         adapter.on_chunk_committed()
+
+    # -- pool-backed K/V access (Step 4 — gather / write) --------------------
+
+    def write_chunk_kv(
+        self,
+        layer_index: int,
+        new_k: torch.Tensor,
+        new_v: torch.Tensor,
+        adapter: BDERequestAdapter,
+    ) -> None:
+        """Write one layer's committed-chunk K/V into the pool."""
+        slots = self.chunk_write_slots(adapter)
+        pool_write_chunk(
+            self._k_pools[layer_index],
+            self._v_pools[layer_index],
+            new_k,
+            new_v,
+            slots,
+        )
+
+    def gather_window(self, layer_index: int, adapter: BDERequestAdapter) -> torch.Tensor:
+        """Gather the resident-window K/V for one layer.
+
+        Returns a ``(2, 1, window, n_heads, head_dim)`` tensor — the format
+        DreamZero's existing attention expects as its ``kv_cache`` argument.
+        """
+        window_ids = self.window_block_ids(adapter)
+        return pool_gather_window(
+            self._k_pools[layer_index],
+            self._v_pools[layer_index],
+            window_ids,
+            self.block_size,
+            self.spec.sliding_window,
+        )
