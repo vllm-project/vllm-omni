@@ -1,5 +1,6 @@
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -123,8 +124,8 @@ def talker2code2wav(
     return code2wav_inputs
 
 
-def _extract_last_frame(pooling_output: OmniPayload) -> torch.Tensor | None:
-    audio_codes = pooling_output.get("codes", {}).get("audio")
+def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torch.Tensor | None:
+    audio_codes = multimodal_output.get("codes", {}).get("audio")
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
     if audio_codes.ndim == 2:
@@ -139,7 +140,7 @@ def _extract_last_frame(pooling_output: OmniPayload) -> torch.Tensor | None:
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload | None,
+    multimodal_output: OmniPayload | dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -150,12 +151,12 @@ def talker2code2wav_async_chunk(
         request_payload = {}
         transfer_manager.request_payload = request_payload
 
-    if isinstance(pooling_output, dict):
-        frame = _extract_last_frame(pooling_output)
+    if isinstance(multimodal_output, Mapping):
+        frame = _extract_last_frame(multimodal_output)
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
-        ref_code = pooling_output.get("codes", {}).get("ref")
+        ref_code = multimodal_output.get("codes", {}).get("ref")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
     elif not finished:

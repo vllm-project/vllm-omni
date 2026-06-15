@@ -1,4 +1,4 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from functools import cached_property
 from pathlib import Path
@@ -220,7 +220,7 @@ class VoxtralTTSForConditionalGeneration(
 
     def tts_postprocess(self, hidden_states: torch.Tensor, multimodal_outputs: object, **info_dict: object | None):
         update_dict = {}
-        if isinstance(multimodal_outputs, dict) and "audio" in multimodal_outputs:
+        if isinstance(multimodal_outputs, Mapping) and "audio" in multimodal_outputs:
             assert self.post_process_idx < len(multimodal_outputs["audio"]), (
                 f"Expect {self.post_process_idx=} < {len(multimodal_outputs['audio'])=}"
             )

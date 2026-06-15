@@ -186,6 +186,53 @@ async def decode_video_url(
     raise InvalidInputReferenceError("Invalid video_reference.video_url: must be an http(s) URL or data URL.")
 
 
+async def decode_audio_url(audio_url: str) -> str:
+    """Decode an audio URL or data-URL to a temporary file path."""
+    import tempfile
+
+    audio_bytes: bytes | None = None
+
+    if audio_url.startswith("data:audio"):
+        _, b64_data = audio_url.split(",", 1)
+        try:
+            audio_bytes = base64.b64decode(b64_data)
+        except (binascii.Error, ValueError) as exc:
+            raise InvalidInputReferenceError(
+                "Invalid audio_reference.audio_url: audio data is not valid base64."
+            ) from exc
+    elif audio_url.startswith(("http://", "https://")):
+        async with httpx.AsyncClient(timeout=60) as client:
+            try:
+                response = await client.get(audio_url)
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise InvalidInputReferenceError(
+                    "Invalid audio_reference.audio_url: failed to download audio."
+                ) from exc
+        audio_bytes = response.content
+    else:
+        raise InvalidInputReferenceError("Invalid audio_reference.audio_url: must be an http(s) URL or data URL.")
+
+    if not audio_bytes:
+        raise InvalidInputReferenceError("Invalid audio_reference: audio data is empty.")
+
+    suffix = ".wav"
+    if audio_url.startswith("data:audio/"):
+        mime = audio_url.split(";")[0].removeprefix("data:")
+        ext = mime.split("/")[-1]
+        if ext in ("mpeg", "mp3"):
+            suffix = ".mp3"
+        elif ext == "wav":
+            suffix = ".wav"
+        elif ext.isalnum() and len(ext) <= 8:
+            suffix = f".{ext}"
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(audio_bytes)
+    tmp.close()
+    return tmp.name
+
+
 async def decode_input_reference(
     image_reference: ImageReference | None,
     video_reference: VideoReference | None,
