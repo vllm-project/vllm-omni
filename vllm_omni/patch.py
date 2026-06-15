@@ -269,3 +269,78 @@ def _patch_fp8_use_quack_fused_bias():
 
 
 _patch_fp8_use_quack_fused_bias()
+
+
+# =============================================================================
+# Patch prometheus-fastapi-instrumentator route walk to tolerate path-less
+# routes (FastAPI >= 0.137)
+# =============================================================================
+# WHY: FastAPI >= 0.137 stores lazy `_IncludedRouter` objects in `app.routes`;
+# these are `BaseRoute` subclasses with no `.path` attribute. The instrumentator
+# (prometheus-fastapi-instrumentator <= 8.0.0) reads `route.path` unconditionally
+# in `_get_route_name`, so every request raises `AttributeError` in the metrics
+# middleware and the server returns 500 (e.g. `/health` never goes ready and the
+# engine looks hung at startup). Omni reuses upstream vLLM's `build_app`, which
+# wires this instrumentator via `register_instrumentator_api_routers`, so omni
+# servers are hit by this whenever fastapi >= 0.137 and the installed vLLM lacks
+# the upstream fix.
+#
+# WHAT: Replace `prometheus_fastapi_instrumentator.routing._get_route_name` with
+# a version that skips path-less routes. This only affects the per-request metric
+# handler label, not request routing. Idempotent and a no-op on older FastAPI.
+#
+# FORWARD COMPAT:
+#   * vLLM upgrade — once the installed vLLM carries the upstream fix, vLLM's own
+#     patch (in `metrics.py`, applied at `build_app()` time) runs *after* this one
+#     and re-replaces the same function with an equivalent implementation. Both are
+#     idempotent and logically identical, so this patch simply becomes redundant,
+#     never conflicting.
+#   * instrumentator upgrade — guarded to versions <= 8.0.0 (those that read
+#     `route.path` unconditionally). A newer release is trusted to handle path-less
+#     routes itself, so we skip patching and defer to it.
+#
+# REMOVAL: Remove this patch once the installed vLLM carries the upstream fix, or
+# the pinned instrumentator is > 8.0.0 with the issue resolved.
+# Track: https://github.com/vllm-project/vllm/pull/45629
+def _patch_instrumentator_route_walk():
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        from packaging.version import Version
+        from prometheus_fastapi_instrumentator import routing as _pfi_routing
+        from starlette.routing import Match, Mount
+        from starlette.types import Scope
+    except ImportError:
+        return
+
+    # Only versions <= 8.0.0 read `route.path` unconditionally. Newer releases
+    # are expected to handle path-less routes themselves, so defer to them rather
+    # than overwriting a corrected implementation with ours (its `_get_route_name`
+    # signature may also have changed). Patch defensively if the version is
+    # unknown.
+    try:
+        if Version(_pkg_version("prometheus-fastapi-instrumentator")) > Version("8.0.0"):
+            return
+    except Exception:  # noqa: BLE001
+        pass
+
+    def _get_route_name(scope: Scope, routes, route_name=None):
+        for route in routes:
+            if getattr(route, "path", None) is None:
+                continue
+            match, child_scope = route.matches(scope)
+            if match == Match.FULL:
+                route_name = route.path
+                child_scope = {**scope, **child_scope}
+                if isinstance(route, Mount) and route.routes:
+                    child = _get_route_name(child_scope, route.routes, route_name)
+                    route_name = None if child is None else route_name + child
+                return route_name
+            elif match == Match.PARTIAL and route_name is None:
+                route_name = route.path
+        return None
+
+    _pfi_routing._get_route_name = _get_route_name
+
+
+_patch_instrumentator_route_walk()
