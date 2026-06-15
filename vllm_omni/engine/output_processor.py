@@ -87,9 +87,33 @@ def _cat_tensors(
     return torch.cat(tensors, dim=0)
 
 
+# 3D primitives, ordered to produce canonical compound strings like
+# "pointmap+confidence", "depth+pose+confidence", "campointmap+pose+confidence".
+# Order matters: it determines the canonical "+"-joined name returned for
+# compound 3D modalities.
+_THREE_D_NAME_ORDER: tuple[tuple[str, "OutputModality"], ...] = (
+    ("pointmap",     OutputModality.POINTMAP),
+    ("campointmap",  OutputModality.CAMPOINTMAP),
+    ("depth",        OutputModality.DEPTH),
+    ("pose",         OutputModality.POSE),
+    ("confidence",   OutputModality.CONFIDENCE),
+)
+
+
 def _modality_to_type_string(modality: OutputModality) -> str:
-    """Convert an OutputModality flag to a lowercase type string."""
+    """Convert an OutputModality flag to a lowercase type string.
+
+    For 3D-reconstruction compounds (any combination of pointmap, campointmap,
+    depth, pose, confidence) returns a canonical ``+``-joined name, e.g.
+    ``"depth+pose"`` or ``"campointmap+pose+confidence"``.
+    """
     try:
+        # 3D compounds must be checked first: an OutputModality with multiple
+        # 3D flags set should produce a "+"-joined name, not just the first
+        # matching primitive.
+        three_d_parts = [name for name, flag in _THREE_D_NAME_ORDER if flag in modality]
+        if three_d_parts:
+            return "+".join(three_d_parts)
         if OutputModality.AUDIO in modality:
             return "audio"
         if OutputModality.IMAGE in modality:
@@ -100,6 +124,14 @@ def _modality_to_type_string(modality: OutputModality) -> str:
         # Flag identity mismatch (e.g. after module reload in tests).
         name = getattr(modality, "name", "") or ""
         lowered = name.lower()
+        # 3D primitives — check first so a "depth|pose" compound name still
+        # gets recognized via substring match.
+        parts: list[str] = []
+        for nm, _flag in _THREE_D_NAME_ORDER:
+            if nm in lowered:
+                parts.append(nm)
+        if parts:
+            return "+".join(parts)
         if "audio" in lowered:
             return "audio"
         if "image" in lowered:

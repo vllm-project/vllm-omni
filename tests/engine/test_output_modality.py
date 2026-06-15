@@ -73,6 +73,94 @@ def test_output_modality_parsing_and_flags():
         OutputModality.from_string("video")
 
 
+def test_output_modality_3d_primitives():
+    """Each 3D primitive parses to its own flag."""
+    assert OutputModality.from_string("pointmap") == OutputModality.POINTMAP
+    assert OutputModality.from_string("campointmap") == OutputModality.CAMPOINTMAP
+    assert OutputModality.from_string("depth") == OutputModality.DEPTH
+    assert OutputModality.from_string("pose") == OutputModality.POSE
+    assert OutputModality.from_string("confidence") == OutputModality.CONFIDENCE
+
+
+def test_output_modality_3d_aliases():
+    """3D modality aliases parse to the canonical primitive."""
+    assert OutputModality.from_string("point_map") == OutputModality.POINTMAP
+    assert OutputModality.from_string("pointmaps") == OutputModality.POINTMAP
+    assert OutputModality.from_string("cam_pointmap") == OutputModality.CAMPOINTMAP
+    assert OutputModality.from_string("camera_pointmap") == OutputModality.CAMPOINTMAP
+    assert OutputModality.from_string("depth_map") == OutputModality.DEPTH
+    assert OutputModality.from_string("extrinsic") == OutputModality.POSE
+    assert OutputModality.from_string("extrinsics") == OutputModality.POSE
+    assert OutputModality.from_string("conf") == OutputModality.CONFIDENCE
+
+
+@pytest.mark.parametrize(
+    "spec, expected_flags",
+    [
+        ("pointmap",                       ("POINTMAP",)),
+        ("depth+pose",                     ("DEPTH", "POSE")),
+        ("campointmap+pose",               ("CAMPOINTMAP", "POSE")),
+        ("pointmap+confidence",            ("POINTMAP", "CONFIDENCE")),
+        ("depth+pose+confidence",          ("DEPTH", "POSE", "CONFIDENCE")),
+        ("campointmap+pose+confidence",    ("CAMPOINTMAP", "POSE", "CONFIDENCE")),
+    ],
+)
+def test_output_modality_3d_compound_specs(spec, expected_flags):
+    """The 6 supported 3D compound specs each parse to the correct flag set."""
+    parsed = OutputModality.from_string(spec)
+    for name in expected_flags:
+        assert getattr(OutputModality, name) in parsed, f"{name} missing from {spec!r}"
+    # No TEXT contamination
+    assert not parsed.has_text
+    # Confirms 3D modalities are correctly classified as multimodal
+    assert parsed.has_multimodal
+
+
+def test_output_modality_3d_compound_canonical_string():
+    """``_modality_to_type_string`` returns the canonical ``+``-joined name."""
+    # Load the output_processor module the same way the test file loads peers.
+    op_mod = _load_module(
+        "vllm_omni.engine.output_processor_helpers",
+        _ENGINE_DIR / "output_processor.py",
+    )
+    to_string = op_mod._modality_to_type_string
+
+    cases = {
+        "pointmap":                    OutputModality.POINTMAP,
+        "depth+pose":                  OutputModality.DEPTH | OutputModality.POSE,
+        "campointmap+pose":            OutputModality.CAMPOINTMAP | OutputModality.POSE,
+        "pointmap+confidence":         OutputModality.POINTMAP | OutputModality.CONFIDENCE,
+        "depth+pose+confidence":       OutputModality.DEPTH | OutputModality.POSE | OutputModality.CONFIDENCE,
+        "campointmap+pose+confidence": OutputModality.CAMPOINTMAP | OutputModality.POSE | OutputModality.CONFIDENCE,
+    }
+    for expected, flag in cases.items():
+        assert to_string(flag) == expected, (
+            f"Expected {expected!r} for {flag}, got {to_string(flag)!r}"
+        )
+
+
+def test_output_modality_3d_accumulation_strategy():
+    """3D modalities all use CONCAT_DIM0 (frame dimension is dim 0)."""
+    for flag in (
+        OutputModality.POINTMAP,
+        OutputModality.CAMPOINTMAP,
+        OutputModality.DEPTH,
+        OutputModality.POSE,
+        OutputModality.CONFIDENCE,
+        OutputModality.DEPTH | OutputModality.POSE,
+        OutputModality.CAMPOINTMAP | OutputModality.POSE | OutputModality.CONFIDENCE,
+    ):
+        assert get_accumulation_strategy(flag) == TensorAccumulationStrategy.CONCAT_DIM0
+
+
+def test_output_modality_3d_drainability():
+    """3D modalities are non-drainable (must be delivered as a complete payload)."""
+    OutputModalityNames = _om_mod.OutputModalityNames
+    NON_DRAINABLE = _om_mod.NON_DRAINABLE_MODALITIES
+    for name in ("POINTMAP", "CAMPOINTMAP", "DEPTH", "POSE", "CONFIDENCE"):
+        assert getattr(OutputModalityNames, name) in NON_DRAINABLE
+
+
 def test_multimodal_payload_and_completion_output():
     """Test MultimodalPayload and MultimodalCompletionOutput wrapper."""
     # Payload from_dict separates tensors and metadata
