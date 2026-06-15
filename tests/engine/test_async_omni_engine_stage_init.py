@@ -1,7 +1,6 @@
 import contextlib
 import importlib
 import os
-import threading
 import time
 import types
 

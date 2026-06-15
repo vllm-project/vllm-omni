@@ -72,9 +72,6 @@ def set_stage_devices(
         The list of physical devices that were set for the given stage
         or None if we have no passed devices / are using cpu.
     """
-    env_var = current_omni_platform.device_control_env_var
-    vis = os.environ.get(env_var)
-
     if devices in (None, "cpu"):
         logger.debug("[Stage-%s] Using default device visibility (devices=%s)", stage_id, devices)
         return None

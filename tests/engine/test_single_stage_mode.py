@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -898,9 +897,7 @@ class TestSingleStageReplicaInitialization:
             side_effect=lambda **_: sentinel_client,
         )
         try:
-            result = runtime._initialize_local_llm_replica(
-                plan, stage_init_timeout=60
-            )
+            result = runtime._initialize_local_llm_replica(plan, stage_init_timeout=60)
         finally:
             if prev_device_env is None:
                 os.environ.pop(device_env_var, None)
@@ -1022,9 +1019,7 @@ class TestSingleStageReplicaInitialization:
         )
 
         try:
-            result = runtime._initialize_local_diffusion_replica(
-                plan, stage_init_timeout=60
-            )
+            result = runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=60)
         finally:
             if prev_device_env is None:
                 os.environ.pop(device_env_var, None)
@@ -1106,9 +1101,7 @@ class TestSingleStageReplicaInitialization:
 
         try:
             with pytest.raises(RuntimeError, match="handshake failed"):
-                runtime._initialize_local_diffusion_replica(
-                    plan, stage_init_timeout=60
-                )
+                runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=60)
         finally:
             if prev_device_env is None:
                 os.environ.pop(device_env_var, None)

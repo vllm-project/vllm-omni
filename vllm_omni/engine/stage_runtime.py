@@ -61,8 +61,8 @@ from vllm_omni.engine.stage_init_utils import (
     release_device_locks,
 )
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.entrypoints.utils import inject_omni_kv_config
 from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
+from vllm_omni.entrypoints.utils import inject_omni_kv_config
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
