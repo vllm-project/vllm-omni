@@ -101,7 +101,10 @@ vllm serve nvidia/Cosmos3-Nano \
 To run **without** guardrails (you are responsible for license compliance),
 add `--no-guardrails` (no token/`cosmos-guardrail` needed). For extra GPUs use
 `--ulysses-degree N` (context parallel) or `--tensor-parallel-size N`;
-`--enable-layerwise-offload` reduces VRAM on smaller GPUs. The pipeline
+`--enable-layerwise-offload` reduces VRAM on smaller GPUs;
+`--quantization fp8` (online, no calibration) cuts peak VRAM for 720p video
+generation from ~50 GB to ~36 GB with BF16-level quality (T2V composition can
+shift at the same seed). The pipeline
 auto-resolves from `model_index.json`; pass
 `--model-class-name Cosmos3OmniDiffusersPipeline` to force it explicitly.
 
