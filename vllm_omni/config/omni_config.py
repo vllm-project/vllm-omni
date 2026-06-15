@@ -1104,11 +1104,6 @@ class VllmOmniConfig:
     stage_configs: tuple[VllmOmniStageConfig, ...]
     orchestrator_config: OrchestratorConfig = field(default_factory=OrchestratorConfig)
 
-    @property
-    def pipeline(self) -> PipelineConfig:
-        """Compatibility alias for the RFC sketch."""
-        return self.pipeline_config
-
     def stage_by_id(self, stage_id: int) -> VllmOmniStageConfig:
         for stage in self.stage_configs:
             if stage.stage_id == stage_id:

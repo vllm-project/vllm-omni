@@ -63,7 +63,6 @@ def test_vllm_omni_config_from_registry_matches_merge_pipeline_deploy(model_type
     omni_config = VllmOmniConfig.from_registry(model_type)
 
     assert omni_config.pipeline_config is pipeline
-    assert omni_config.pipeline is pipeline
     assert len(omni_config.stage_configs) == len(legacy_stages)
 
     for legacy_stage, omni_stage in zip(legacy_stages, omni_config.stage_configs, strict=True):
@@ -111,6 +110,7 @@ def test_from_registry_preserves_current_pipeline_config_object():
     omni_config = VllmOmniConfig.from_registry("minicpmo_4_5")
 
     assert omni_config.pipeline_config is _PIPELINE_REGISTRY["minicpmo_4_5"]
+    assert not hasattr(omni_config, "pipeline")
     assert "hf_config_predicate" in {f.name for f in fields(PipelineConfig)}
     assert omni_config.pipeline_config.hf_config_predicate is _PIPELINE_REGISTRY["minicpmo_4_5"].hf_config_predicate
 
