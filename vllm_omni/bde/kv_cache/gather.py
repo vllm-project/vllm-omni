@@ -101,25 +101,73 @@ def pool_gather_window(
     return window
 
 
+class BDEKVState:
+    """Per-request bridge between a DreamZero rollout and the BDE KV pool.
+
+    Replaces the model-local ``DreamZeroState`` KV methods::
+      state.get_kv_caches(neg)    →  bde_state.get_kv_caches(neg)
+      state.update_kv_cache(i,kv) →  bde_state.update_kv_cache(i,kv,neg)
+      state.create_kv_caches(...) →  no-op (pool is pre-allocated)
+
+    One ``BDEKVState`` per request holds the ``BDEKVCache`` and both CFG adapters
+    (positive / negative). The runner sets ``pipeline._bde_kv_state`` before
+    ``pipeline.forward(req)``; the pipeline delegates every KV call to it when
+    the attribute is present and not None.
+
+    Call ``commit_chunk()`` after all layers have been written for a chunk
+    (once per chunk, not per denoise step).
+    """
+
+    def __init__(self, kv_cache, pos_adapter, neg_adapter, num_layers: int) -> None:
+        self.kv_cache = kv_cache
+        self.pos = pos_adapter
+        self.neg = neg_adapter
+        self.num_layers = num_layers
+
+    def get_kv_caches(self, is_negative: bool) -> list[torch.Tensor]:
+        adapter = self.neg if is_negative else self.pos
+        return [self.kv_cache.gather_window(i, adapter) for i in range(self.num_layers)]
+
+    def update_kv_cache(self, layer_idx: int, updated_kv: torch.Tensor, is_negative: bool) -> None:
+        adapter = self.neg if is_negative else self.pos
+        new_k = updated_kv[0].unsqueeze(0)  # add batch dim: (seq, n_heads, head_dim) → (1, seq, ...)
+        new_v = updated_kv[1].unsqueeze(0)
+        self.kv_cache.write_chunk_kv(layer_idx, new_k, new_v, adapter)
+
+    def commit_chunk(self) -> None:
+        self.kv_cache.commit_chunk(self.pos)
+        self.kv_cache.commit_chunk(self.neg)
+
+
 class BDEPipelineMixin:
     """Mixin that replaces model-local KV state with pool-backed storage.
 
-    A DreamZero pipeline inheriting this mixin overrides the KV access pattern
-    (get / update / reset) to route through the ``BDEKVCache`` owned by the
-    ``BDEModelRunner``, without changing the attention kernel.
-
-    Usage from the model runner (per request):
-        pipeline.set_kv_cache(runner.kv_cache)   # once, before the rollout
-        pipeline.forward(req)                    # pool gather/write happens inside
+    A DreamZero pipeline inheriting this mixin delegates KV access through
+    proxy methods (``_bde_kv_get`` / ``_bde_kv_create`` / ``_bde_kv_update``)
+    that check for ``self._bde_kv_state`` and route to :class:`BDEKVState`
+    when present, falling back to the ``DreamZeroState`` methods otherwise.
     """
 
-    _bde_kv_cache = None
+    _bde_kv_state: BDEKVState | None = None
 
-    def set_kv_cache(self, kv_cache) -> None:
-        self._bde_kv_cache = kv_cache
+    # -- proxy methods (call these instead of state.*) -----------------------
 
-    def kv_get_window(
-        self, layer_index: int, is_negative: bool
-    ) -> torch.Tensor | None:
-        """Return the gathered window K/V for a layer, or None if KV is off."""
-        raise NotImplementedError("subclass provides this")
+    def _bde_kv_get(self, state, is_negative):
+        if self._bde_kv_state is not None:
+            return self._bde_kv_state.get_kv_caches(is_negative)
+        return state.get_kv_caches(is_negative)
+
+    def _bde_kv_create(self, state, batch_size, dtype, device, num_layers, num_heads, head_dim):
+        if self._bde_kv_state is not None:
+            return  # pool already allocated
+        state.create_kv_caches(batch_size, dtype, device, num_layers, num_heads, head_dim)
+
+    def _bde_kv_update(self, state, layer_idx, updated_kv, is_negative):
+        if self._bde_kv_state is not None:
+            self._bde_kv_state.update_kv_cache(layer_idx, updated_kv, is_negative)
+            return
+        state.update_kv_cache(layer_idx, updated_kv, is_negative=is_negative)
+
+    def _bde_kv_commit(self):
+        if self._bde_kv_state is not None:
+            self._bde_kv_state.commit_chunk()

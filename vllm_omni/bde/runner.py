@@ -16,6 +16,7 @@ from __future__ import annotations
 from vllm.logger import init_logger
 
 from vllm_omni.bde.kv_cache.config import BDEKVConfig
+from vllm_omni.bde.kv_cache.gather import BDEKVState
 from vllm_omni.bde.kv_cache.manager import BDEKVCache
 from vllm_omni.diffusion.data import OmniDiffusionConfig, DiffusionOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -89,10 +90,20 @@ class BDEModelRunner(DiffusionModelRunner):
         if self.kv_cache is None:
             return super().execute_model(req)
 
-        # Bracket the rollout: the pipeline drives per-chunk ops against
-        # self.kv_cache during pipeline.forward; we own begin/end here.
-        adapter = self.kv_cache.begin_request(req.request_id)
+        kv = self.kv_cache
+        pos = kv.begin_request(req.request_id)
+        neg = kv.begin_request(req.request_id + "__neg")
+        # Allocate the prefill chunk so the first gather has blocks to read.
+        kv.allocate_chunk(pos)
+        kv.allocate_chunk(neg)
+        kv_state = BDEKVState(
+            kv, pos, neg,
+            num_layers=kv.num_layers,
+        )
+        self.pipeline._bde_kv_state = kv_state
         try:
             return super().execute_model(req)
         finally:
-            self.kv_cache.end_request(adapter)
+            self.pipeline._bde_kv_state = None
+            kv.end_request(pos)
+            kv.end_request(neg)
