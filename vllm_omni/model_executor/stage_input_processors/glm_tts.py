@@ -188,7 +188,7 @@ def _to_cpu_tensor(value: Any) -> torch.Tensor | None:
 
 def ar_to_dit_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any] | None,
+    multimodal_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -216,6 +216,7 @@ def ar_to_dit_async_chunk(
     if request_id is None:
         raise ValueError("GLM-TTS async chunk request is missing request id")
     finished = bool(is_finished or request.is_finished())
+    pooling_output = multimodal_output
 
     # Read connector chunk config (supports progressive list or single int)
     connector = getattr(transfer_manager, "connector", None)

@@ -1,24 +1,15 @@
 <!-- markdownlint-disable -->
-**Before submitting:** run the precheck-pr skill with code agent for a self-check against project conventions — catches dead code, missing benchmarks, and title format issues.
-
-PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTTOM) HAVE BEEN CONSIDERED.
+PLEASE FILL IN THE PR DESCRIPTION HERE.
 
 ## Purpose
 
 ## Test Plan
 
+**vLLM Version:**
+
+**vLLM-Omni Commit:**
+
 ## Test Result
 
----
-<details>
-<summary> Essential Elements of an Effective PR Description Checklist </summary>
-
-- [ ] The purpose of the PR, such as "Fix some issue (link existing issues this PR will resolve)".
-- [ ] The test plan. Please provide the test scripts & test commands. Please state the reasons if your codes don't require additional test scripts. For test file guidelines, please check the [test style doc](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/tests_style/)
-- [ ] The test results. Please paste the results comparison before and after, or the e2e results.
-- [ ] (Optional) The necessary documentation update, such as updating `supported_models.md` and `examples` for a new model. **Please run `mkdocs serve` to sync the documentation editions to `./docs`.**
-- [ ] (Optional) Release notes update. If your change is user-facing, please update the release notes draft.
-</details>
-
-**BEFORE SUBMITTING,** please read <https://github.com/vllm-project/vllm-omni/blob/main/CONTRIBUTING.md>
+**BEFORE SUBMITTING:** read [CONTRIBUTING.md](https://github.com/vllm-project/vllm-omni/blob/main/CONTRIBUTING.md) and run the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) with the code agent for a self-check against project conventions.
 (anything written below this line will be removed by GitHub Actions)

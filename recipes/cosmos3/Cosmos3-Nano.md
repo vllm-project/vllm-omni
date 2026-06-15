@@ -47,6 +47,10 @@ mode is selected per request:
   **`nvidia/Cosmos3-Nano-Policy-DROID`** is served the same way
   (`domain_name=droid_lerobot`).
 
+- **DROID OpenPI policy server** — serve `nvidia/Cosmos3-Nano-Policy-DROID` and
+  connect an OpenPI-compatible websocket client to `/v1/realtime/robot/openpi`.
+  This path returns action chunks directly instead of an mp4.
+
   Action requests can use `input_reference` or `video_reference` for video input.
   `policy` and `forward_dynamics` can also use an image reference; `inverse_dynamics`
   requires a video reference.
@@ -101,7 +105,10 @@ vllm serve nvidia/Cosmos3-Nano \
 To run **without** guardrails (you are responsible for license compliance),
 add `--no-guardrails` (no token/`cosmos-guardrail` needed). For extra GPUs use
 `--ulysses-degree N` (context parallel) or `--tensor-parallel-size N`;
-`--enable-layerwise-offload` reduces VRAM on smaller GPUs. The pipeline
+`--enable-layerwise-offload` reduces VRAM on smaller GPUs;
+`--quantization fp8` (online, no calibration) cuts peak VRAM for 720p video
+generation from ~50 GB to ~36 GB with BF16-level quality (T2V composition can
+shift at the same seed). The pipeline
 auto-resolves from `model_index.json`; pass
 `--model-class-name Cosmos3OmniDiffusersPipeline` to force it explicitly.
 
@@ -245,6 +252,39 @@ VIDEO_ID=$(curl -sS -X POST http://localhost:8000/v1/videos \
 # poll until status == completed, then:
 curl -sS "http://localhost:8000/v1/videos/$VIDEO_ID" | jq '.action | {shape, dtype, raw_action_dim, domain_id}'
 curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_inverse_dynamics.mp4
+
+# DROID OpenPI policy server (websocket action serving).
+# Requires cosmos_framework on PYTHONPATH because the pipeline reuses the
+# reference RoboLab action transforms. If your checkpoint config already
+# includes policy_server_config, omit the stage_overrides file and flag.
+cat > cosmos3_droid_openpi_stage_overrides.json <<'JSON'
+{
+  "0": {
+    "model_config": {
+      "policy_server_config": {
+        "image_resolution": [540, 640],
+        "n_external_cameras": 2,
+        "needs_wrist_camera": true,
+        "needs_stereo_camera": false,
+        "needs_session_id": true,
+        "action_space": "joint_position"
+      }
+    }
+  }
+}
+JSON
+
+vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
+  --omni \
+  --host 0.0.0.0 --port 8000 \
+  --model-class-name Cosmos3OmniDiffusersPipeline \
+  --no-guardrails \
+  --stage-overrides "$(cat cosmos3_droid_openpi_stage_overrides.json)"
+
+# Point an OpenPI websocket client at:
+#   ws://localhost:8000/v1/realtime/robot/openpi
+# The first server message is policy_server_config. Each infer request sends a
+# msgpack-numpy observation dict and receives a writable float32 action array.
 ```
 
 #### Notes
@@ -272,6 +312,13 @@ curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_inver
   For V2V, `condition_frame_indexes_vision` selects the clean conditioned latent
   frame indexes (default `[0, 1]`), and `condition_video_keep` selects whether the
   API decodes the first or last needed reference frames (`"first"` by default).
+- **DROID OpenPI observations:** include a string `prompt`, either
+  `observation/image` or the three-view DROID camera keys
+  (`observation/wrist_image_left`, `observation/exterior_image_1_left`,
+  `observation/exterior_image_2_left`), plus `observation/gripper_position` and
+  `observation/joint_position`. Optional extra params include `history_length`,
+  `conditioning_fps`, `action_chunk_size`, `raw_action_dim`, `deterministic_seed`,
+  and `session_id`.
 - **Known limitations:**
   - Guardrails-on requires `cosmos-guardrail` **and** access to the gated
     `nvidia/Cosmos-1.0-Guardrail` repo (accept license + `HF_TOKEN`); otherwise

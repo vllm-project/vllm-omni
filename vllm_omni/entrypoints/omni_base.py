@@ -20,6 +20,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
+from vllm_omni.errors import raise_client_error_or
 from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator
@@ -372,7 +373,7 @@ class OmniBase(PDDisaggregationMixin):
                     msg.error,
                     error_stage_id=msg.stage_id,
                 )
-            raise RuntimeError(msg.error)
+            self._raise_nonfatal_error_message(msg)
 
         if not isinstance(msg, OutputMessage):
             logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg.type)
@@ -408,6 +409,15 @@ class OmniBase(PDDisaggregationMixin):
 
         return False, req_id, stage_id, req_state
 
+    def _raise_nonfatal_error_message(self, msg: ErrorMessage) -> None:
+        """Raise the exception for a non-fatal, request-scoped error message."""
+        raise_client_error_or(
+            msg.error,
+            status_code=msg.status_code,
+            error_type=msg.error_type,
+            fallback=RuntimeError,
+        )
+
     def _check_engine_output_error(
         self,
         result: OutputMessage,
@@ -424,6 +434,8 @@ class OmniBase(PDDisaggregationMixin):
         error_text = getattr(engine_outputs, "error", None)
         if error_text is None:
             return
+        status_code = engine_outputs.error_status_code
+        error_type = engine_outputs.error_type
         logger.error(
             "[%s] Stage error for req=%s stage-%s: %s",
             self.__class__.__name__,
@@ -437,7 +449,12 @@ class OmniBase(PDDisaggregationMixin):
                 error_text,
                 error_stage_id=stage_id,
             )
-        raise EngineGenerateError(error_text)
+        raise_client_error_or(
+            error_text,
+            status_code=status_code,
+            error_type=error_type,
+            fallback=EngineGenerateError,
+        )
 
     def _process_single_result(
         self,

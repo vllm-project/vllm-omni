@@ -400,6 +400,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             torch.zeros(1, int(self.talker_config.hidden_size), dtype=model_dtype),
             persistent=False,
         )
+        self._embedding_dtype = torch.bfloat16
 
         tokenizer_config = Qwen3TTSTokenizerV2Config.from_pretrained(
             self.model_path,
@@ -537,10 +538,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
         audio_codes_list: list[torch.Tensor] = []
         ref_code_len_list: list[torch.Tensor] = []
-        ref_code_tensor: torch.Tensor | None = None
+        ref_code_list: list[torch.Tensor] = []
+        has_ref_code = False
         codec_streaming_list: list[torch.Tensor] = []
         for info in info_dicts:
             if not isinstance(info, dict):
+                ref_code_list.append(torch.empty(0, dtype=torch.long))
                 continue
             codes = info.get("codes", {})
             meta = info.get("meta", {})
@@ -554,7 +557,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     )
             ref_code = codes.get("ref")
             if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-                ref_code_tensor = ref_code
+                ref_code_list.append(ref_code)
+                has_ref_code = True
+            else:
+                ref_code_list.append(torch.empty(0, dtype=torch.long))
             ref_len = meta.get("ref_code_len")
             if ref_len is None:
                 continue
@@ -584,8 +590,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         mm: OmniPayload = {"codes": {"audio": audio_codes}}
         if ref_code_len_list:
             mm.setdefault("meta", {})["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
-        if ref_code_tensor is not None:
-            mm.setdefault("codes", {})["ref"] = [ref_code_tensor]
+        if has_ref_code:
+            # Batch-aligned, one entry per request: ``to_payload_element``
+            # indexes ``element[idx]`` per request, and a shorter list would
+            # silently broadcast one request's reference codes to the others.
+            mm.setdefault("codes", {})["ref"] = ref_code_list
         if codec_streaming_list:
             mm.setdefault("meta", {})["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
@@ -642,7 +651,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # :meth:`_init_runtime_buffers`. Materialize once on the right
         # device/dtype and reuse for both the prefill placeholder padding
         # and the decode text-step fallback below.
-        tts_pad_embed = self._tts_pad_embed.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+        dtype = self._embedding_dtype
+        tts_pad_embed = self._tts_pad_embed.to(device=input_ids.device, dtype=dtype).reshape(1, -1)
 
         if is_prefill:
             # Prefill (prompt embeddings)
@@ -689,7 +699,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 pad_n = int(span_len - int(take.shape[0]))
                 pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
                 take = torch.cat([take, pad_rows], dim=0)
-            prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
+            prompt_embeds = take.to(device=input_ids.device, dtype=dtype)
             info_update["meta"]["talker_prefill_offset"] = int(offset + span_len)
 
             # When inputs_embeds is set, token ids are ignored by the model but must stay in-vocab for vLLM bookkeeping.
@@ -719,7 +729,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     tail[text_offset : text_offset + 1]
                     .to(
                         device=input_ids.device,
-                        dtype=torch.bfloat16,
+                        dtype=dtype,
                     )
                     .reshape(1, -1)
                 )
@@ -744,14 +754,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         last_hidden = hs.get("last")
         if isinstance(last_hidden, torch.Tensor):
-            past_hidden = last_hidden.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+            past_hidden = last_hidden.to(device=input_ids.device, dtype=dtype).reshape(1, -1)
         else:
             # Defensive: EOS step row is zeroed by the invalid-layer-0 mask and filtered downstream.
             past_hidden = torch.zeros_like(text_step)
 
         # Use OmniGPUModelRunner talker_mtp fast-path for residual codebooks and per-step inputs_embeds update.
         last_id_hidden = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).to(
-            device=input_ids.device, dtype=torch.bfloat16
+            device=input_ids.device, dtype=dtype
         )
         inputs_embeds_out = last_id_hidden.reshape(1, -1)
 
@@ -784,7 +794,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
 
         device = input_ids_flat.device
-        dtype = torch.bfloat16
+        dtype = self._embedding_dtype
         # Request-independent constant (see :meth:`_init_runtime_buffers`) —
         # compute once for the batch instead of fetching it per request from
         # ``info_dict["embed"]["tts_pad"]``.
@@ -1043,11 +1053,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         bsz = int(input_ids.shape[0])
         q = int(self.talker_config.num_code_groups)
         dev = input_embeds.device
+        dtype = self._embedding_dtype
 
         input_ids = input_ids.reshape(bsz, 1).to(dtype=torch.long, device=dev)
-        last_id_hidden = input_embeds.reshape(bsz, 1, -1).to(dtype=torch.bfloat16, device=dev)
-        past_hidden = last_talker_hidden.reshape(bsz, 1, -1).to(dtype=torch.bfloat16, device=dev)
-        text_step = text_step.reshape(bsz, 1, -1).to(dtype=torch.bfloat16, device=dev)
+        last_id_hidden = input_embeds.reshape(bsz, 1, -1).to(dtype=dtype, device=dev)
+        past_hidden = last_talker_hidden.reshape(bsz, 1, -1).to(dtype=dtype, device=dev)
+        text_step = text_step.reshape(bsz, 1, -1).to(dtype=dtype, device=dev)
 
         # Residual predictor runs fixed-length (Q-1) steps via the vLLM-native code_predictor.
         max_steps = q - 1
