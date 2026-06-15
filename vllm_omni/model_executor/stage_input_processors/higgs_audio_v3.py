@@ -214,7 +214,7 @@ def _extract_last_step_row(pooling_output: OmniPayload) -> torch.Tensor | None:
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload | None,
+    multimodal_output: OmniPayload | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -244,6 +244,7 @@ def talker2code2wav_async_chunk(
     """
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
+    pooling_output = multimodal_output
 
     # Per-request rolling state. ``code_prompt_token_ids`` is the
     # framework-provided buffer; ``higgs_v3_emitted_frames`` tracks how many

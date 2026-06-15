@@ -18,6 +18,7 @@ import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 
 _SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
+DIFFUSION_RPC_RESULT_ENVELOPE = "diffusion_rpc_result"
 
 
 def _tensor_to_shm(tensor: torch.Tensor) -> dict[str, Any]:
@@ -130,14 +131,25 @@ def _pack_diffusion_fields(output: DiffusionOutput) -> DiffusionOutput:
     return output
 
 
+def _is_rpc_result_envelope(output: object) -> bool:
+    return isinstance(output, dict) and output.get("type") == DIFFUSION_RPC_RESULT_ENVELOPE
+
+
 def pack_diffusion_output_shm(output: object) -> object:
     """Replace large tensors in diffusion worker outputs with SHM handles.
 
     Supports either a bare ``DiffusionOutput`` or a wrapper object carrying one
-    in ``.result`` (for example ``RunnerOutput``).
+    in ``.result`` (for example ``RunnerOutput``), or an RPC result envelope
+    carrying the diffusion output in ``["result"]``.
     """
     if isinstance(output, DiffusionOutput):
         return _pack_diffusion_fields(output)
+
+    if _is_rpc_result_envelope(output):
+        result = output.get("result")
+        if isinstance(result, DiffusionOutput):
+            output["result"] = _pack_diffusion_fields(result)
+        return output
 
     result = getattr(output, "result", None)
     if isinstance(result, DiffusionOutput):
@@ -157,6 +169,12 @@ def unpack_diffusion_output_shm(output: object) -> object:
     """Reconstruct tensors from SHM handles in diffusion worker outputs."""
     if isinstance(output, DiffusionOutput):
         return _unpack_diffusion_fields(output)
+
+    if _is_rpc_result_envelope(output):
+        result = output.get("result")
+        if isinstance(result, DiffusionOutput):
+            output["result"] = _unpack_diffusion_fields(result)
+        return output
 
     result = getattr(output, "result", None)
     if isinstance(result, DiffusionOutput):

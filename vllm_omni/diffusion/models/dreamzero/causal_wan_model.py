@@ -617,6 +617,8 @@ class CausalWanModel(nn.Module):
     Architecture (14B): 40 layers, dim=5120, heads=40, ffn=13824
     """
 
+    _layerwise_offload_blocks_attrs = ["blocks"]
+
     def __init__(
         self,
         model_type: str = "t2v",

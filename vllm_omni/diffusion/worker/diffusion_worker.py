@@ -12,6 +12,7 @@ import gc
 import multiprocessing as mp
 import os
 import signal
+import traceback
 from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -41,7 +42,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
-from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
+from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -740,6 +741,18 @@ class WorkerProc:
         """Receive messages from broadcast queue."""
         return self.mq.dequeue(indefinite=True)
 
+    def _gather_rpc_rank_statuses(self, status: dict[str, Any]) -> list[dict[str, Any]]:
+        if not torch.distributed.is_initialized():
+            return [status]
+
+        world_size = torch.distributed.get_world_size()
+        statuses: list[dict[str, Any] | None] = [None] * world_size
+        torch.distributed.all_gather_object(statuses, status)
+        missing_ranks = [rank for rank, rank_status in enumerate(statuses) if rank_status is None]
+        if missing_ranks:
+            logger.warning("RPC rank status gather returned missing entries for ranks: %s", missing_ranks)
+        return [s for s in statuses if s is not None]
+
     def execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
         """Execute an RPC request and indicate whether to reply."""
         method = rpc_request["method"]
@@ -747,6 +760,10 @@ class WorkerProc:
         kwargs = rpc_request.get("kwargs", {})
         output_rank = rpc_request.get("output_rank")
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
+        collect_rank_status = rpc_request.get("collect_rank_status", False)
+
+        if collect_rank_status and not exec_all_ranks:
+            raise ValueError("collect_rank_status requires exec_all_ranks=True so all ranks enter the status gather")
 
         should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
         should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
@@ -754,13 +771,52 @@ class WorkerProc:
         if not should_execute:
             return None, False
 
+        result = None
+        rpc_exception: Exception | None = None
+        status: dict[str, Any] = {
+            "rank": self.gpu_id,
+            "ok": True,
+            "error": None,
+            "error_type": None,
+            "traceback": None,
+            "bool_result": None,
+        }
+
         try:
             # Use execute_method from WorkerWrapperBase for consistent method resolution
             result = self.worker.execute_method(method, *args, **kwargs)
-            return result, should_reply
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
-            raise e
+            rpc_exception = e
+            status.update(
+                {
+                    "ok": False,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "traceback": traceback.format_exc(),
+                }
+            )
+
+        if isinstance(result, bool):
+            status["bool_result"] = result
+
+        if collect_rank_status:
+            rank_statuses = self._gather_rpc_rank_statuses(status)
+            if should_reply:
+                return (
+                    {
+                        "type": DIFFUSION_RPC_RESULT_ENVELOPE,
+                        "method": method,
+                        "result": result,
+                        "rank_statuses": rank_statuses,
+                    },
+                    True,
+                )
+            return None, False
+
+        if rpc_exception is not None:
+            raise rpc_exception
+        return result, should_reply
 
     def worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
@@ -801,7 +857,7 @@ class WorkerProc:
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
-                        self.return_result(DiffusionOutput.from_exception(e))
+                        self.return_result({"status": "error", "error": str(e)})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

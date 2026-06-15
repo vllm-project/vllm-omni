@@ -3,7 +3,7 @@
 
 import importlib
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -146,7 +146,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def save_async(
         self,
-        pooling_output: torch.Tensor | None = None,
+        multimodal_output: dict[str, Any] | None = None,
         request: Request | None = None,
         is_segment_finished: bool = False,
     ):
@@ -163,7 +163,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         as ``request.is_finished()``.
 
         Args:
-            pooling_output: Partial pooling output dictionary
+            multimodal_output: Per-request multimodal output dictionary
             request: Request object
             is_segment_finished: whether the segment of request is finished
         """
@@ -183,7 +183,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
         task = {
-            "pooling_output": pooling_output,
+            "multimodal_output": multimodal_output,
             "request": request,
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
@@ -292,8 +292,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _send_single_request(self, task: dict):
-        raw_po = task["pooling_output"]
-        pooling_output = unflatten_payload(raw_po) if isinstance(raw_po, dict) else raw_po
+        raw_mm = task["multimodal_output"]
+        multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
@@ -308,7 +308,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             try:
                 payload_data = self.custom_process_next_stage_input_func(
                     transfer_manager=self,
-                    pooling_output=pooling_output,
+                    multimodal_output=multimodal_output,
                     request=request,
                     # Existing processors use is_finished as a flush signal.
                     is_finished=is_segment_finished,

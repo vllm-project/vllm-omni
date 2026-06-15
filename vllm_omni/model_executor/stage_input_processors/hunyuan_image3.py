@@ -12,94 +12,24 @@ signature pattern as glm_image.ar2diffusion.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
 
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+    Resolution,
+    ResolutionGroup,
+    get_cached_resolution_group,
+)
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
-
-# AR emits `<img_size_BASE><img_ratio_Y>` after `</recaption>` in IT2I/T2I
-# (see `HunyuanImage3ForCausalMM.sample` and `_stage_transitions`). The
-# ratio_index resolves to a (height, width) bucket via ResolutionGroup, which
-# is the official upstream's mechanism for AR-driven output aspect; without
-# this lookup the DiT pipeline falls back to the user-provided width/height
-# (in the `/v1/images/edits` path that defaults to `pil_images[0].size`,
-# i.e. the first reference image's bucket, usually square, see
-# api_server.py:1808-1811).
-_HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS: tuple[str, ...] = (
-    "1024x768",
-    "1280x720",
-    "768x1024",
-    "720x1280",
-)
-
-
-class _Resolution:
-    def __init__(self, size: str | int | tuple[int, int], *args: int):
-        if isinstance(size, str):
-            if "x" in size:
-                h, w = size.split("x")
-                size = (int(h), int(w))
-            else:
-                size = int(size)
-        if args:
-            size = (int(size), args[0])
-        if isinstance(size, int):
-            size = (size, size)
-
-        self.height = int(size[0])
-        self.width = int(size[1])
-        self.ratio = self.height / self.width
-
-
-def _build_resolutions_by_step(base_size: int, align: int = 1) -> list[_Resolution]:
-    step = base_size // 16
-    min_height = base_size // 2
-    min_width = base_size // 2
-    max_height = base_size * 2
-    max_width = base_size * 2
-
-    resolutions = [_Resolution(base_size, base_size)]
-
-    cur_height, cur_width = base_size, base_size
-    while True:
-        if cur_height >= max_height and cur_width <= min_width:
-            break
-        cur_height = min(cur_height + step, max_height)
-        cur_width = max(cur_width - step, min_width)
-        resolutions.append(_Resolution(cur_height // align * align, cur_width // align * align))
-
-    cur_height, cur_width = base_size, base_size
-    while True:
-        if cur_height <= min_height and cur_width >= max_width:
-            break
-        cur_height = max(cur_height - step, min_height)
-        cur_width = min(cur_width + step, max_width)
-        resolutions.append(_Resolution(cur_height // align * align, cur_width // align * align))
-
-    return sorted(resolutions, key=lambda x: x.ratio)
-
-
-@lru_cache(maxsize=4)
-def _build_ratio_size_table(base_size: int) -> list[tuple[int, int]]:
-    """Return `[(height, width)]` indexed by ratio_index for HunyuanImage-3.
-
-    Mirrors `HunyuanImage3ImageProcessor.build_image_info`'s
-    `reso_group[ratio_index]` reverse lookup. Cached because the table
-    is constant per `base_size`.
-    """
-    resolutions = _build_resolutions_by_step(base_size)
-    for extra_resolution in (_Resolution(s) for s in _HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS):
-        if not any(r.ratio == extra_resolution.ratio for r in resolutions):
-            resolutions.append(extra_resolution)
-    return [(r.height, r.width) for r in resolutions]
 
 
 def _truncate_at_cot_end(generated_text: str) -> str:
@@ -217,16 +147,18 @@ def ar2diffusion(
         ar_predicted = False
         if ratio_idx is not None:
             base_size = int(original_prompt.get("image_base_size", 1024))
-            size_table = _build_ratio_size_table(base_size)
-            if 0 <= ratio_idx < len(size_table):
-                height, width = size_table[ratio_idx]
+            reso_group: ResolutionGroup = get_cached_resolution_group(base_size=base_size)
+            try:
+                reso: Resolution = reso_group[ratio_idx]
+                height = reso.height
+                width = reso.width
                 ar_predicted = True
-            else:
+            except IndexError:
                 logger.warning(
                     "[ar2diffusion] Request %d: ratio_index=%d out of range [0,%d), keeping prompt size %dx%d",
                     i,
                     ratio_idx,
-                    len(size_table),
+                    len(reso_group),
                     height,
                     width,
                 )
@@ -277,7 +209,7 @@ def ar2diffusion(
         # Forward multimodal output from AR (if any)
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
             mm_output = ar_output.multimodal_output
-            if isinstance(mm_output, dict):
+            if isinstance(mm_output, Mapping):
                 diffusion_input["extra"]["ar_multimodal_output"] = mm_output
 
         # Forward sampling params
