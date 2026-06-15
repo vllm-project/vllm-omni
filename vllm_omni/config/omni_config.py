@@ -12,7 +12,7 @@ from __future__ import annotations
 import copy
 import re
 from collections.abc import Mapping
-from dataclasses import InitVar, field, fields
+from dataclasses import field, fields
 from pathlib import Path
 from typing import Any
 
@@ -349,14 +349,14 @@ class RuntimeConfig:
 class ParallelConfig:
     """Per-stage distributed parallelism behavior."""
 
-    _pipeline_parallel_size: InitVar[int | None] = None
-    _data_parallel_size: InitVar[int | None] = None
+    pipeline_parallel_size: int = Field(default=1, ge=1)
+    data_parallel_size: int = Field(default=1, ge=1)
     tensor_parallel_size: int = Field(default=1, ge=1)
     sequence_parallel_size: int = Field(default=1, ge=1)
     ulysses_degree: int = Field(default=1, ge=1)
     ring_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
-    cfg_parallel_size: int = Field(default=1, ge=1, le=2)
+    cfg_parallel_size: int = Field(default=1, ge=1, le=3)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     use_hsdp: bool = False
     hsdp_shard_size: int = -1
@@ -364,11 +364,7 @@ class ParallelConfig:
     enable_expert_parallel: bool = False
     world_size: int = Field(default=1, ge=1)
 
-    def __post_init__(
-        self,
-        _pipeline_parallel_size: int | None,
-        _data_parallel_size: int | None,
-    ) -> None:
+    def __post_init__(self) -> None:
         if self.sequence_parallel_size != self.ulysses_degree * self.ring_degree:
             raise ValueError(
                 f"sequence_parallel_size ({self.sequence_parallel_size}) must equal "
@@ -378,8 +374,8 @@ class ParallelConfig:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
 
         base_world_size = (
-            (_pipeline_parallel_size or 1)
-            * (_data_parallel_size or 1)
+            self.pipeline_parallel_size
+            * self.data_parallel_size
             * self.tensor_parallel_size
             * self.sequence_parallel_size
             * self.cfg_parallel_size
@@ -613,6 +609,60 @@ class DiffusionConfig:
 
 
 _DIFFUSION_CONFIG_FIELDS = frozenset(f.name for f in fields(DiffusionConfig))
+
+# Current OmniDiffusionConfig still contains a flat mix of shared engine,
+# runtime, parallel, and diffusion-specific knobs. Keep this classification
+# explicit while Phase 2 is additive; later cutover PRs can move or remove
+# fields without rediscovering the current boundary.
+_DIFFUSION_SHARED_CONFIG_FIELDS = frozenset(
+    {
+        "stage_id",
+        "model",
+        "model_arch",
+        "dtype",
+        "trust_remote_code",
+        "revision",
+        "distributed_executor_backend",
+        "dist_timeout",
+        "model_config",
+        "quantization_config",
+    }
+)
+_DIFFUSION_RUNTIME_CONFIG_FIELDS = frozenset(
+    {
+        "host",
+        "port",
+        "scheduler_port",
+        "nccl_port",
+        "master_port",
+        "worker_extension_cls",
+        "enable_stage_verification",
+        "prompt_file_path",
+    }
+)
+_DIFFUSION_PARALLEL_CONFIG_FIELDS = frozenset()
+_DIFFUSION_ONLY_CONFIG_FIELDS = (
+    _DIFFUSION_CONFIG_FIELDS
+    - _DIFFUSION_SHARED_CONFIG_FIELDS
+    - _DIFFUSION_RUNTIME_CONFIG_FIELDS
+    - _DIFFUSION_PARALLEL_CONFIG_FIELDS
+)
+_DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
+    {
+        "parallel_config",
+        "num_gpus",
+        "log_level",
+        "profiler_config",
+        "omni_kv_config",
+        "cfg_kv_collect_func",
+        "max_num_seqs",
+        "enable_sleep_mode",
+        "enforce_eager",
+        "enable_multithread_weight_load",
+        "num_weight_load_threads",
+        "disable_autocast",
+    }
+)
 
 
 _STAGE_DEPLOY_TYPED_ENGINE_FIELDS: tuple[str, ...] = (
@@ -951,13 +1001,13 @@ def _build_parallel_config(
         default=ulysses_degree * ring_degree,
     )
     return ParallelConfig(
-        _pipeline_parallel_size=_first_defined(
+        pipeline_parallel_size=_first_defined(
             parallel_config.get("pipeline_parallel_size"),
             engine.get("pipeline_parallel_size"),
             deploy.pipeline_parallel_size,
             default=1,
         ),
-        _data_parallel_size=_first_defined(
+        data_parallel_size=_first_defined(
             parallel_config.get("data_parallel_size"),
             engine.get("data_parallel_size"),
             deploy.data_parallel_size,

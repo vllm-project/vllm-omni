@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from vllm_omni.config import omni_config as omni_config_module
 from vllm_omni.config.omni_config import (
     CacheConfig,
     ConnectorConfig,
@@ -26,11 +27,13 @@ from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     _PIPELINE_REGISTRY,
     DeployConfig,
+    PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
     load_deploy_config,
     merge_pipeline_deploy,
 )
+from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
 _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 
@@ -102,6 +105,14 @@ def test_stage_by_id_raises_for_unknown_stage():
 
     with pytest.raises(KeyError, match="no stage 99"):
         omni_config.stage_by_id(99)
+
+
+def test_from_registry_preserves_current_pipeline_config_object():
+    omni_config = VllmOmniConfig.from_registry("minicpmo_4_5")
+
+    assert omni_config.pipeline_config is _PIPELINE_REGISTRY["minicpmo_4_5"]
+    assert "hf_config_predicate" in {f.name for f in fields(PipelineConfig)}
+    assert omni_config.pipeline_config.hf_config_predicate is _PIPELINE_REGISTRY["minicpmo_4_5"].hf_config_predicate
 
 
 def test_from_registry_normalizes_stage_engine_extras_without_expanding_stage_deploy_config():
@@ -226,6 +237,8 @@ def test_sub_config_fields_match_rfc_scopes():
         "input_connectors",
     }
     assert {f.name for f in fields(ParallelConfig)} == {
+        "pipeline_parallel_size",
+        "data_parallel_size",
         "tensor_parallel_size",
         "sequence_parallel_size",
         "ulysses_degree",
@@ -241,21 +254,101 @@ def test_sub_config_fields_match_rfc_scopes():
     }
 
 
-def test_parallel_config_rejects_legacy_pp_dp_as_public_constructor_fields():
-    with pytest.raises(ValidationError):
-        ParallelConfig(pipeline_parallel_size=2)
+def test_parallel_config_keeps_current_diffusion_parallel_surface():
+    cfg = ParallelConfig(
+        pipeline_parallel_size=2,
+        data_parallel_size=3,
+        tensor_parallel_size=4,
+        cfg_parallel_size=3,
+    )
+
+    assert cfg.pipeline_parallel_size == 2
+    assert cfg.data_parallel_size == 3
+    assert cfg.cfg_parallel_size == 3
+    assert cfg.world_size == 72
 
 
-def test_from_registry_preserves_legacy_pp_dp_for_world_size_without_public_fields():
+def test_from_registry_preserves_legacy_pp_dp_for_world_size():
     cfg = VllmOmniConfig.from_registry("hunyuan_image3_dit").stage_by_id(0).parallel_config
 
+    assert cfg.pipeline_parallel_size == 1
+    assert cfg.data_parallel_size == 1
     assert cfg.tensor_parallel_size == 4
     assert cfg.world_size == 4
 
 
-def test_parallel_config_rejects_cfg_parallel_size_outside_rfc_bound():
+def test_parallel_config_rejects_cfg_parallel_size_outside_current_bound():
     with pytest.raises(ValidationError):
-        ParallelConfig(cfg_parallel_size=3)
+        ParallelConfig(cfg_parallel_size=4)
+
+
+def test_from_registry_matches_stage_config_to_omegaconf_behavior_for_representative_stage():
+    pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy("qwen3_tts"))[0]
+    omega_stage = legacy_stage.to_omegaconf()
+    omni_stage = VllmOmniConfig.from_registry("qwen3_tts").stage_by_id(legacy_stage.stage_id)
+
+    assert omega_stage.stage_id == omni_stage.stage_id
+    assert omega_stage.stage_type == omni_stage.stage_type.value
+    assert omega_stage.engine_input_source == omni_stage.input_sources
+    assert omega_stage.final_output == omni_stage.final_output
+    assert omega_stage.final_output_type == omni_stage.final_output_type
+    assert omega_stage.is_comprehension == omni_stage.is_comprehension
+    assert omega_stage.engine_args.model_stage == omni_stage.model_stage
+    assert omega_stage.engine_args.worker_type == omni_stage.worker_type
+    assert omega_stage.engine_args.scheduler_cls == omni_stage.scheduler_cls
+    assert omega_stage.runtime.process is True
+    assert omega_stage.runtime.requires_multimodal_data == omni_stage.requires_multimodal_data
+
+
+def test_from_registry_matches_to_omegaconf_diffusion_parallel_config():
+    pipeline = _PIPELINE_REGISTRY["hunyuan_image3_dit"]
+    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy("hunyuan_image3_dit"))[0]
+    omega_stage = legacy_stage.to_omegaconf()
+    omni_stage = VllmOmniConfig.from_registry("hunyuan_image3_dit").stage_by_id(legacy_stage.stage_id)
+
+    assert (
+        omega_stage.engine_args.parallel_config.pipeline_parallel_size
+        == omni_stage.parallel_config.pipeline_parallel_size
+    )
+    assert omega_stage.engine_args.parallel_config.data_parallel_size == omni_stage.parallel_config.data_parallel_size
+    assert (
+        omega_stage.engine_args.parallel_config.tensor_parallel_size == omni_stage.parallel_config.tensor_parallel_size
+    )
+    assert (
+        omega_stage.engine_args.parallel_config.sequence_parallel_size
+        == omni_stage.parallel_config.sequence_parallel_size
+    )
+    assert omega_stage.engine_args.parallel_config.cfg_parallel_size == omni_stage.parallel_config.cfg_parallel_size
+    assert (
+        omega_stage.engine_args.parallel_config.vae_patch_parallel_size
+        == omni_stage.parallel_config.vae_patch_parallel_size
+    )
+
+
+def test_from_registry_matches_build_engine_args_dict_behavior_for_representative_stage(monkeypatch):
+    from vllm_omni.engine import stage_init_utils
+
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
+    pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy("qwen3_tts"))[0]
+    omega_stage = legacy_stage.to_omegaconf()
+    legacy_engine_args = build_engine_args_dict(
+        omega_stage,
+        model="/tmp/qwen3-tts",
+        stage_connector_spec={"name": "SharedMemoryConnector", "extra": {}},
+    )
+    omni_stage = VllmOmniConfig.from_registry("qwen3_tts").stage_by_id(legacy_stage.stage_id)
+
+    assert legacy_engine_args["model"] == "/tmp/qwen3-tts"
+    assert legacy_engine_args["stage_id"] == omni_stage.stage_id
+    assert legacy_engine_args["model_stage"] == omni_stage.model_stage
+    assert legacy_engine_args["worker_type"] == omni_stage.worker_type
+    assert legacy_engine_args["scheduler_cls"] == omni_stage.scheduler_cls
+    assert legacy_engine_args["stage_connector_spec"] == {"name": "SharedMemoryConnector", "extra": {}}
+    assert legacy_engine_args["has_sampling_extra_args"] == bool(
+        (omni_stage.model_config.default_sampling_params or {}).get("extra_args")
+    )
 
 
 def test_diffusion_config_preserves_existing_coercion_hooks():
@@ -278,3 +371,25 @@ def test_diffusion_config_preserves_existing_coercion_hooks():
     assert cfg.diffusion_kv_cache_skip_step_indices == {0, 1, 2, 4}
     assert cfg.diffusion_kv_cache_skip_layer_indices == {1, 3}
     assert cfg.max_cpu_loras == 1
+
+
+def test_diffusion_config_field_classification_covers_current_fields():
+    classified_fields = (
+        omni_config_module._DIFFUSION_SHARED_CONFIG_FIELDS
+        | omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
+        | omni_config_module._DIFFUSION_PARALLEL_CONFIG_FIELDS
+        | omni_config_module._DIFFUSION_ONLY_CONFIG_FIELDS
+    )
+
+    assert classified_fields == {f.name for f in fields(DiffusionConfig)}
+    assert {
+        "enable_prompt_embed_cache",
+        "prompt_embed_cache_size",
+        "diffusion_kv_cache_dtype",
+    } <= omni_config_module._DIFFUSION_ONLY_CONFIG_FIELDS
+    assert {
+        "revision",
+        "trust_remote_code",
+        "distributed_executor_backend",
+    } <= omni_config_module._DIFFUSION_SHARED_CONFIG_FIELDS
+    assert "prompt_file_path" in omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
