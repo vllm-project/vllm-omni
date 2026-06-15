@@ -266,7 +266,6 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
     return temp_file.name
 
 
-@pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)

@@ -809,6 +809,8 @@ class Orchestrator:
                 request_id=parent_id,
                 stage_id=stage_id,
                 error=output.error,
+                status_code=getattr(output, "error_status_code", None),
+                error_type=getattr(output, "error_type", None),
             )
         )
         await self._cleanup_request_ids(

@@ -113,6 +113,7 @@ from vllm_omni.entrypoints.openai.utils import (
     resolve_diffusion_od_config,
     validate_requested_speaker,
 )
+from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
@@ -2869,6 +2870,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     "[OmniOpenAIServingChat] Engine dead during streaming image edit, "
                     "but cannot terminate server (no raw_request context)."
                 )
+        except OmniClientError as exc:
+            logger.info("Client error during streaming image edit: %s", exc)
+            chunk = ImageEditStreamError(
+                created=created,
+                model=model,
+                error={
+                    "message": exc.message,
+                    "type": exc.error_type,
+                    "code": exc.status_code,
+                },
+            )
+            yield f"data: {chunk.model_dump_json()}\n\n"
         except Exception as exc:
             logger.exception("Streaming image edit failed: %s", exc)
             chunk = ImageEditStreamError(
@@ -3265,6 +3278,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             return response
 
+        except OmniClientError as e:
+            logger.info("Client error during diffusion chat completion: %s", e)
+            return self._create_error_response(
+                e.message,
+                err_type=e.error_type,
+                status_code=e.status_code,
+            )
         except Exception as e:
             logger.exception("Diffusion chat completion failed: %s", e)
             return self._create_error_response(

@@ -41,7 +41,7 @@ class TestVoxtralTTSFixedVoice:
 
     @pytest.mark.core_model
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speech_english_basic(self, omni_server, openai_client) -> None:
         """Test basic English TTS generation."""
         openai_client.send_audio_speech_request(
@@ -58,7 +58,7 @@ class TestVoxtralTTSFixedVoice:
 
     @pytest.mark.core_model
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speech_english_streaming(self, omni_server, openai_client) -> None:
         """Test basic streaming English TTS generation (PCM via streaming API)."""
         openai_client.send_audio_speech_request(
@@ -76,7 +76,7 @@ class TestVoxtralTTSFixedVoice:
 
     @pytest.mark.advanced_model
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speech_different_voices(self, omni_server, openai_client) -> None:
         """Test TTS with different voice presets."""
         voices = ["casual_female", "neutral_male"]
@@ -94,7 +94,7 @@ class TestVoxtralTTSFixedVoice:
 
     @pytest.mark.advanced_model
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speech_speed(self, omni_server, openai_client) -> None:
         """Request with speed parameters"""
         speeds = [0.5, 1, 1.5, 2, 2.5]
@@ -113,7 +113,7 @@ class TestVoxtralTTSFixedVoice:
 
     @pytest.mark.advanced_model
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speech_instructions(self, omni_server, openai_client) -> None:
         """Request with instructions parameters"""
         instructions = [
@@ -137,7 +137,7 @@ class TestVoxtralTTSFixedVoice:
 
     @pytest.mark.advanced_model
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speech_response_formats(self, omni_server, openai_client) -> None:
         """Test TTS with different response formats"""
         response_formats = ["wav", "mp3"]
@@ -155,7 +155,7 @@ class TestVoxtralTTSFixedVoice:
 
     @pytest.mark.advanced_model
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speech_batches(self, omni_server, openai_client) -> None:
         """Test TTS batches"""
         items = [

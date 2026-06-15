@@ -1519,7 +1519,7 @@ class Cosmos3VFMTransformer(nn.Module):
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
 
-            hidden_gen = self.gen_sp_gather(hidden_gen)
+        hidden_gen = self.gen_sp_gather(hidden_gen)
 
         # Final norm and project back to latent space
         hidden_gen = self.norm_moe_gen(hidden_gen)

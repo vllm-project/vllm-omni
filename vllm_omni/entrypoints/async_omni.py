@@ -33,6 +33,7 @@ from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
 )
+from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -483,10 +484,13 @@ class AsyncOmni(EngineClient, OmniBase):
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
+                status_code, error_type = client_error_metadata(error)
                 await req_state.queue.put(
                     ErrorMessage(
                         request_id=request_id,
                         error=str(error),
+                        status_code=status_code,
+                        error_type=error_type,
                     )
                 )
             finally:
@@ -589,7 +593,7 @@ class AsyncOmni(EngineClient, OmniBase):
                         result.error,
                         error_stage_id=result.stage_id,
                     )
-                raise RuntimeError(result.error)
+                self._raise_nonfatal_error_message(result)
 
             if not isinstance(result, OutputMessage):
                 logger.warning("[AsyncOmni] Dropping unexpected per-request message %r", result)
@@ -660,6 +664,18 @@ class AsyncOmni(EngineClient, OmniBase):
                         tid = getattr(msg, "task_id")
                         logger.info(f"[{self._name}] Intercepted task-ID object: {tid}")
                         await self.event_resolver.resolve(msg)
+                        continue
+
+                    if isinstance(msg, ErrorMessage) and not msg.fatal:
+                        req_state = self.request_states.get(msg.request_id)
+                        if req_state is not None:
+                            await req_state.queue.put(msg)
+                        else:
+                            logger.warning(
+                                "[%s] dropping non-fatal error for unknown req %s",
+                                self._name,
+                                msg.request_id,
+                            )
                         continue
 
                     should_continue, _, stage_id, req_state = self._handle_output_message(msg)

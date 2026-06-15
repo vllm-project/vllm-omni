@@ -271,7 +271,7 @@ async def test_diffusion_generate_request_id():
         engine.shutdown()
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
 async def test_omni_generate_request_id():
