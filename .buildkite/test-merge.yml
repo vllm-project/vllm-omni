@@ -149,7 +149,7 @@ steps:
         commands:
           - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and L4" --run-level "advanced_model"
         agents:
-          queue: "gpu_4_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+          queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:
           - docker#v5.2.0:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
@@ -164,7 +164,35 @@ steps:
   - group: ":card_index_dividers: E2E Test"
     depends_on: upload-merge-pipeline
     steps:
+      - label: "TTS · Step-Audio2 E2E Test"
+        timeout_in_minutes: 20
+        commands:
+          - |
+            timeout 20m bash -c "
+              export VLLM_LOGGING_LEVEL=DEBUG
+              export VLLM_WORKER_MULTIPROC_METHOD=spawn
+              pytest -s -v tests/e2e/offline_inference/test_step_audio2.py -m 'advanced_model' --run-level 'advanced_model'
+            "
+        agents:
+          queue: "gpu_4_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
       - label: "TTS · Qwen3-TTS CustomVoice Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen3_tts_customvoice.py
+          - tests/e2e/offline_inference/test_qwen3_tts_customvoice.py
+          - vllm_omni/model_executor/models/qwen3_tts/
+          - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
+          - vllm_omni/deploy/qwen3_tts.yaml
         commands:
           - |
             timeout 20m bash -c "
@@ -173,7 +201,7 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py tests/e2e/offline_inference/test_qwen3_tts_customvoice.py -m 'advanced_model and cuda' --run-level 'advanced_model'
             "
         agents:
-          queue: "gpu_4_queue"
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
           - docker#v5.2.0:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
@@ -186,6 +214,12 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "TTS · Qwen3-TTS Base Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen3_tts_base.py
+          - tests/e2e/offline_inference/test_qwen3_tts_base.py
+          - vllm_omni/model_executor/models/qwen3_tts/
+          - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
+          - vllm_omni/deploy/qwen3_tts.yaml
         commands:
           - |
             timeout 20m bash -c "
@@ -194,7 +228,7 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py tests/e2e/offline_inference/test_qwen3_tts_base.py -m 'advanced_model and cuda' --run-level 'advanced_model'
             "
         agents:
-          queue: "gpu_4_queue"
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
           - docker#v5.2.0:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
@@ -207,6 +241,12 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "TTS · Ming-Omni-TTS Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_ming_tts.py
+          - tests/e2e/offline_inference/test_ming_tts.py
+          - vllm_omni/model_executor/models/ming_tts/
+          - vllm_omni/model_executor/stage_input_processors/ming_tts.py
+          - vllm_omni/deploy/ming_tts.yaml
         timeout_in_minutes: 20
         commands:
           - |
@@ -411,6 +451,11 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "TTS · VoxCPM2 Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/test_voxcpm2_tts.py
+          - tests/e2e/online_serving/test_voxcpm2_tts.py
+          - vllm_omni/model_executor/models/voxcpm2/
+          - vllm_omni/deploy/voxcpm2.yaml
         timeout_in_minutes: 30
         commands:
           - |
@@ -434,6 +479,12 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "Omni · Higgs-Audio V2 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_higgs_audio_v2.py
+          - tests/e2e/offline_inference/test_higgs_audio_v2.py
+          - vllm_omni/model_executor/models/higgs_audio_v2/
+          - vllm_omni/model_executor/stage_input_processors/higgs_audio_v2.py
+          - vllm_omni/deploy/higgs_audio_v2.yaml
         timeout_in_minutes: 30
         commands:
           - |
@@ -805,6 +856,10 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "Diffusion · Z Image Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/test_z_image.py
+          - tests/e2e/online_serving/test_z_image.py
+          - vllm_omni/diffusion/models/z_image/
         timeout_in_minutes: 30
         commands:
           - pytest -s -v tests/e2e/offline_inference/test_z_image.py tests/e2e/online_serving/test_z_image.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
@@ -822,6 +877,10 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "Diffusion · FLUX.2 Klein Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/test_flux2_klein.py
+          - tests/e2e/online_serving/test_flux2_klein.py
+          - vllm_omni/diffusion/models/flux2_klein/
         timeout_in_minutes: 30
         commands:
           - pytest -s -v tests/e2e/offline_inference/test_flux2_klein.py tests/e2e/online_serving/test_flux2_klein.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'

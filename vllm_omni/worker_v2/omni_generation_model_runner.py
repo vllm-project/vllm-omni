@@ -26,6 +26,7 @@ from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestDat
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.forward_compat import add_forward_compat_kwargs
+from vllm_omni.worker_v2.omni_ar_model_runner import _ensure_tensor_values
 from vllm_omni.worker_v2.omni_model_runner import (
     OmniGPUModelRunner,
     _make_execute_model_state,
@@ -217,10 +218,10 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
         inputs_embeds = None
         if self.supports_mm_inputs and self.is_first_pp_rank:
+            # vLLM 0.23 dropped the req_states arg from get_mm_embeddings.
             inputs_embeds = self.model_state.get_mm_embeddings(
                 scheduler_output.scheduled_encoder_inputs,
                 input_batch,
-                self.req_states,
             )
 
         model_inputs = {
@@ -247,7 +248,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             self.kv_connector.pre_forward(scheduler_output)
             model_output = self.model(**model_inputs)
 
-        kv_connector_output = self.kv_connector.post_forward(scheduler_output)
+        kv_connector_output = self.kv_connector.post_forward(scheduler_output.finished_req_ids)
 
         # Convert raw model output to OmniOutput.
         if not isinstance(model_output, OmniOutput):
@@ -270,6 +271,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                     slot_mappings_by_layer=None,
                     hidden_states=self._dummy_hidden,
                     aux_hidden_states=None,
+                    finished_req_ids=scheduler_output.finished_req_ids,
                     kv_connector_output=kv_connector_output,
                     num_tokens_across_dp=None,
                 )
@@ -288,6 +290,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             slot_mappings_by_layer=None,
             hidden_states=self._dummy_hidden,
             aux_hidden_states=None,
+            finished_req_ids=scheduler_output.finished_req_ids,
             kv_connector_output=kv_connector_output,
             num_tokens_across_dp=None,
         )
@@ -337,10 +340,11 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         sampled_token_ids: list[list[int]] = [[] for _ in range(len(req_ids))]
         self._release_generation_slots(input_batch)
 
-        # model_output is guaranteed to be OmniOutput here — the
-        # make_omni_output failure path sets _gen_model_output = None
-        # and we return None at the top of this method.
-        multimodal_outputs = model_output.multimodal_outputs or {}
+        # Per-request multimodal_output (tensor-only) built from the same payloads.
+        # OmniGenerationScheduler indexes this as mm_outputs[req_index], and for the
+        # final (code2wav) stage it becomes the user-facing outputs[0].multimodal_output.
+        # Must be a per-request list (not the raw dict), matching the V1 runner.
+        multimodal_outputs = [_ensure_tensor_values(p) if p else {} for p in pooler_output]
 
         return OmniModelRunnerOutput(
             req_ids=req_ids,

@@ -33,7 +33,14 @@ logger = init_logger(__name__)
 
 _model_state_patch_lock = threading.RLock()
 _GPU_MODEL_RUNNER_HAS_SHUTDOWN = hasattr(GPUModelRunner, "shutdown")
-_KNOWN_EXECUTE_MODEL_STATE_COMPAT_FIELDS = {"num_tokens_across_dp"}
+# Fields the omni runners still pass to ExecuteModelState that current vLLM no
+# longer declares on the namedtuple. They are filtered out by
+# make_filtered_namedtuple and carried out-of-band instead:
+#  - num_tokens_across_dp: only consumed inside execute_model's forward context.
+#  - kv_connector_output: removed from ExecuteModelState in vLLM 0.23.0 (post_forward
+#    now runs in sample_tokens). Carried via self._last_kv_connector_output (AR) /
+#    self._gen_kv_connector_output (generation).
+_KNOWN_EXECUTE_MODEL_STATE_COMPAT_FIELDS = {"num_tokens_across_dp", "kv_connector_output"}
 
 
 def _make_execute_model_state(**kwargs):
@@ -75,6 +82,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 _mr_module.init_model_state = _orig
         self._last_aux_output = None
         self._last_multimodal_outputs = None
+        self._last_kv_connector_output = None
         self._model_returns_tuple = _needs_capture_tensor_unwrap(self.model)
         self._exclude_full_graph = self._model_returns_tuple or hasattr(self.model, "_last_captured_layers")
 
@@ -101,11 +109,22 @@ class OmniGPUModelRunner(GPUModelRunner):
         """
         if self._exclude_full_graph:
             mgr = self.cudagraph_manager
-            if CUDAGraphMode.FULL in mgr._capture_descs:
-                del mgr._capture_descs[CUDAGraphMode.FULL]
-                for i, descs in enumerate(mgr._candidates):
-                    mgr._candidates[i] = [d for d in descs if d.cg_mode != CUDAGraphMode.FULL]
-                logger.info("Excluded FULL CUDA graph capture for Omni model. PIECEWISE graphs will still be captured.")
+            # NOTE: ``_capture_descs`` / ``_candidates`` are private CudaGraphManager
+            # internals (present and same-typed as of vLLM 0.23.0). Guard with hasattr
+            # so a future vLLM that renames/removes them degrades to a warning instead
+            # of an AttributeError; the worst case is FULL graphs not being excluded.
+            if hasattr(mgr, "_capture_descs") and hasattr(mgr, "_candidates"):
+                if CUDAGraphMode.FULL in mgr._capture_descs:
+                    del mgr._capture_descs[CUDAGraphMode.FULL]
+                    for i, descs in enumerate(mgr._candidates):
+                        mgr._candidates[i] = [d for d in descs if d.cg_mode != CUDAGraphMode.FULL]
+                    logger.info("Excluded FULL CUDA graph capture for Omni model. PIECEWISE graphs will still be captured.")
+            else:
+                logger.warning(
+                    "CudaGraphManager lacks _capture_descs/_candidates; cannot exclude "
+                    "FULL graph capture for tuple-returning Omni model. vLLM internals "
+                    "may have changed — verify omni_model_runner.capture_model()."
+                )
 
         # Wrap model forward during capture so tuple returns don't crash
         # torch.empty_like() in the PIECEWISE warmup pass.
@@ -234,10 +253,10 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         inputs_embeds = None
         if self.supports_mm_inputs and self.is_first_pp_rank:
+            # vLLM 0.23 dropped the req_states arg from get_mm_embeddings.
             inputs_embeds = self.model_state.get_mm_embeddings(
                 scheduler_output.scheduled_encoder_inputs,
                 input_batch,
-                self.req_states,
             )
 
         model_inputs: dict[str, Any] = {
@@ -307,13 +326,15 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not dummy_run and isinstance(hidden_states, torch.Tensor):
             self.model_state.run_postprocess(hidden_states, input_batch)
 
-        kv_connector_output = self.kv_connector.post_forward(scheduler_output)
+        kv_connector_output = self.kv_connector.post_forward(scheduler_output.finished_req_ids)
+        self._last_kv_connector_output = kv_connector_output
         self.execute_model_state = _make_execute_model_state(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,
             hidden_states=hidden_states,
             aux_hidden_states=None,
+            finished_req_ids=scheduler_output.finished_req_ids,
             kv_connector_output=kv_connector_output,
             num_tokens_across_dp=num_tokens_across_dp,
         )

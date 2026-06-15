@@ -79,7 +79,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
         input_batch = self.execute_model_state.input_batch
         hidden_states = self.execute_model_state.hidden_states
-        kv_connector_output = self.execute_model_state.kv_connector_output
+        # kv_connector_output is no longer a field on vLLM 0.23.0's ExecuteModelState;
+        # the base execute_model stashes it here after post_forward().
+        kv_connector_output = self._last_kv_connector_output
+        self._last_kv_connector_output = None
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -89,7 +92,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 input_batch.num_reqs,
                 max_sample_len=self.num_speculative_steps + 1,
             )
-            self.postprocess(input_batch, sampled, num_sampled, num_rejected)
+            # vLLM 0.23.0 renamed postprocess() -> postprocess_sampled() and now
+            # takes idx_mapping (+ query_start_loc) instead of the InputBatch.
+            self.postprocess_sampled(
+                input_batch.idx_mapping,
+                sampled,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
             return None
 
         # --- Omni: reconstruct raw model output and post-process ---
@@ -120,6 +131,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
         # --- Omni: prompt logprobs ---
         assert self.prompt_logprobs_worker is not None
+        # vLLM 0.23.0 dropped the prefill_len / num_computed_prefill_tokens args;
+        # compute_prompt_logprobs now reads prefill_len_np /
+        # num_computed_prefill_tokens_np from input_batch instead. Mirror the
+        # parent GPUModelRunner's 6-arg call exactly.
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
             self.model.compute_logits,
             text_hidden,
@@ -127,8 +142,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
             self.req_states.all_token_ids.gpu,
             self.req_states.num_computed_tokens.gpu,
             self.req_states.prompt_len.np,
-            self.req_states.prefill_len.np,
-            self.req_states.num_computed_prefill_tokens,
         )
 
         # --- Omni: pooler_output ---
@@ -159,11 +172,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
         # Postprocess AFTER creating async output (so copy_event is
         # recorded before postprocess, matching upstream pattern).
-        self.postprocess(
-            input_batch,
+        self.postprocess_sampled(
+            input_batch.idx_mapping,
             sampler_output.sampled_token_ids,
             num_sampled,
             num_rejected,
+            input_batch.query_start_loc,
         )
 
         if self.use_async_scheduling:
@@ -401,6 +415,38 @@ def _slice_pooler_value(
     return value
 
 
+def _ensure_tensor_values(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
+    """Convert a flattened payload to strictly ``dict[str, torch.Tensor]``.
+
+    Non-tensor scalars (int/float/bool) are wrapped with ``torch.tensor()``;
+    values that cannot be safely converted are dropped. Enforces the tensor-only
+    invariant required by ``OmniEngineCoreOutput.multimodal_output`` (the channel
+    the async_chunk stage-input processor reads). Mirrors the V1 runner helper.
+    """
+    result: dict[str, torch.Tensor] = {}
+    for key, val in payload.items():
+        if isinstance(val, torch.Tensor):
+            result[key] = val
+        elif isinstance(val, (int, float, bool)):
+            result[key] = torch.tensor(val)
+        elif isinstance(val, (list, tuple)):
+            try:
+                result[key] = torch.tensor(val)
+            except (ValueError, TypeError, RuntimeError):
+                logger.warning(
+                    "Dropping non-tensorizable multimodal output key '%s' (type=%s).",
+                    key,
+                    type(val).__name__,
+                )
+        else:
+            logger.warning(
+                "Dropping non-tensor multimodal output key '%s' (type=%s).",
+                key,
+                type(val).__name__,
+            )
+    return result
+
+
 class OmniAsyncOutput(AsyncModelRunnerOutput):
     """Async D2H copy for Omni AR model outputs.
 
@@ -497,14 +543,22 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
 
-        # Pooler output
+        # Pooler output. Populate two channels from the same per-request payloads,
+        # mirroring the V1 runner:
+        #   * pooler_output  -> sync/full-payload path (inline pooling_output bridge)
+        #   * multimodal_outputs -> wire multimodal_output, which the async_chunk
+        #     stage-input processor (talker2code2wav_async_chunk) reads for codes.
         if self._need_pooler and self._hidden_cpu is not None:
-            self.model_runner_output.pooler_output = OmniARModelRunner._build_pooler_output_from_cpu(
+            pooler_output = OmniARModelRunner._build_pooler_output_from_cpu(
                 self._hidden_cpu,
                 self._mm_cpu,
                 self._query_start_loc_np,
                 self._num_scheduled_tokens,
                 self._num_reqs,
             )
+            self.model_runner_output.pooler_output = pooler_output
+            self.model_runner_output.multimodal_outputs = [
+                _ensure_tensor_values(p) if p else {} for p in pooler_output
+            ]
 
         return self.model_runner_output

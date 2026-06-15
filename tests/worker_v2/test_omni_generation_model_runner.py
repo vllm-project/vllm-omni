@@ -226,7 +226,11 @@ class TestReqStatesUpdate(unittest.TestCase):
 
 
 class TestMultimodalOutputsPassthrough(unittest.TestCase):
-    """Verify multimodal_outputs dict is forwarded to OmniModelRunnerOutput."""
+    """multimodal_outputs is a per-request list (tensor-only) on OmniModelRunnerOutput.
+
+    OmniGenerationScheduler indexes it as mm_outputs[req_index], so it must be a
+    list (not the raw dict). Each entry mirrors the per-request pooler payload.
+    """
 
     def test_multimodal_outputs_on_result(self):
         from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
@@ -236,7 +240,10 @@ class TestMultimodalOutputsPassthrough(unittest.TestCase):
         runner = _make_runner(output, num_reqs=1)
         result = OmniGenerationModelRunner.sample_tokens(runner)
 
-        assert result.multimodal_outputs is mm
+        assert isinstance(result.multimodal_outputs, list)
+        assert len(result.multimodal_outputs) == 1
+        assert "audio" in result.multimodal_outputs[0]
+        assert torch.is_tensor(result.multimodal_outputs[0]["audio"])
 
     def test_none_multimodal_outputs_becomes_empty_dict(self):
         from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
@@ -245,7 +252,8 @@ class TestMultimodalOutputsPassthrough(unittest.TestCase):
         runner = _make_runner(output, num_reqs=1)
         result = OmniGenerationModelRunner.sample_tokens(runner)
 
-        assert result.multimodal_outputs == {}
+        # No multimodal data -> one empty dict per request.
+        assert result.multimodal_outputs == [{}]
 
 
 if __name__ == "__main__":

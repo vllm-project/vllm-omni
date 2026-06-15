@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -33,8 +34,8 @@ MING_FINAL_DECODE_STEP_KEY = "ming_final_decode_step"
 MING_STOP_REASON_BY_CODE = {code: reason for reason, code in MING_STOP_REASON_CODES.items()}
 
 
-def _extract_last_patch(pooling_output: dict[str, Any] | None) -> torch.Tensor | None:
-    if not isinstance(pooling_output, dict):
+def _extract_last_patch(pooling_output: Mapping[str, Any] | None) -> torch.Tensor | None:
+    if not isinstance(pooling_output, Mapping):
         return None
     has_patch = pooling_output.get("ming_has_patch")
     patch = pooling_output.get("ming_latent_patch")
@@ -54,8 +55,8 @@ def _extract_last_patch(pooling_output: dict[str, Any] | None) -> torch.Tensor |
     return patch.to(torch.float32).cpu()
 
 
-def _extract_all_patches(pooling_output: dict[str, Any] | None) -> torch.Tensor | None:
-    if not isinstance(pooling_output, dict):
+def _extract_all_patches(pooling_output: Mapping[str, Any] | None) -> torch.Tensor | None:
+    if not isinstance(pooling_output, Mapping):
         return None
     has_patch = pooling_output.get("ming_has_patch")
     patch = pooling_output.get("ming_latent_patch")
@@ -78,8 +79,8 @@ def _extract_all_patches(pooling_output: dict[str, Any] | None) -> torch.Tensor 
     return patch.to(torch.float32).cpu()
 
 
-def _extract_last_value(pooling_output: dict[str, Any] | None, key: str) -> Any:
-    if not isinstance(pooling_output, dict):
+def _extract_last_value(pooling_output: Mapping[str, Any] | None, key: str) -> Any:
+    if not isinstance(pooling_output, Mapping):
         return None
     value = pooling_output.get(key)
     if value is None:
@@ -118,7 +119,7 @@ def _decode_stop_reason(value: Any) -> str | None:
 def _get_async_chunk_config(transfer_manager: Any) -> tuple[int, int]:
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
-    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, Mapping) else {}
     if "latent_chunk_size" not in cfg:
         logger.warning(
             "Ming async chunk config missing latent_chunk_size, using fallback value %s",

@@ -122,9 +122,11 @@ class OmniRequestState(RequestState):
         *args,
         **kwargs,
     ):
+        # arrival_time is always passed as a keyword argument by the sole caller
+        # (from_new_request).  The *args fallback via positional index was removed
+        # because upstream RequestState.__init__ reorders parameters between
+        # releases, making args[12] fragile.
         arrival_time = kwargs.get("arrival_time")
-        if arrival_time is None and len(args) > 12:
-            arrival_time = args[12]
         super().__init__(*args, **kwargs)
         self.native_text_stats = RequestStateStats(arrival_time=float(arrival_time or 0.0))
         # Omni-specific: multimodal output accumulation
@@ -669,6 +671,14 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         native_stats = req_state.native_text_stats if isinstance(req_state, OmniRequestState) else None
         previous_last_token_ts = native_stats.last_token_ts if native_stats is not None else 0.0
 
+        # NOTE: We pass ``None`` for  *iteration_stats* to the parent so that
+        # the upstream's ``_update_stats_from_output`` logs stats via its own
+        # ``RequestStateStats`` (req_state.stats) without touching the omni
+        # ``IterationStats`` object.  Below we re-apply the same update using
+        # *native_stats* (the omni-specific ``RequestStateStats`` attached to
+        # ``OmniRequestState``), which correctly feeds the omni metrics path.
+        # If the upstream adds new logic in ``_update_stats_from_output`` (e.g.
+        # additional stat fields), this override must be kept in sync.
         super()._update_stats_from_output(
             req_state,
             engine_core_output,

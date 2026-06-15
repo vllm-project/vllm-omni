@@ -762,6 +762,10 @@ class OmniResponse:
     prompt_tokens: int | None = None
     cached_tokens: int | None = None
     logprobs: list | None = None
+    #: HTTP status + error text for the error-handling path (e.g. validator
+    #: rejections); populated when the OpenAI client raises an APIError.
+    status_code: int | None = None
+    error_message: str | None = None
 
 
 @dataclass

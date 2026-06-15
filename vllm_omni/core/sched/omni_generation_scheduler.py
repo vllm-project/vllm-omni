@@ -36,13 +36,12 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 
 logger = init_logger(__name__)
 
-VLLM_OMNI_USE_V2_RUNNER = bool(
-    int(os.environ.get("VLLM_OMNI_USE_V2_MODEL_RUNNER", os.environ.get("VLLM_OMNI_USE_V2_RUNNER", "0")))
-)
+VLLM_OMNI_USE_V2_RUNNER = bool(int(os.environ.get("VLLM_OMNI_USE_V2_RUNNER", "0")))
 
 _KNOWN_ENGINE_CORE_OUTPUT_COMPAT_FIELDS = {
     "num_cached_tokens",
@@ -597,6 +596,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if num_cached < 0:
                     logger.warning("Negative num_cached_tokens (%d) for request %s, clamping to 0", num_cached, req_id)
                     num_cached = 0
+                # vLLM 0.23 strictly decodes EngineCoreOutput.pooling_output as a
+                # torch.Tensor; a dict-shaped MR V2 payload rides the bytes channel
+                # instead (rehydrated in StagePool._poll_stage_raw). See OmniARScheduler.
+                pooling_output_wire = pooler_output
+                pooling_output_payload = None
+                if isinstance(pooler_output, dict):
+                    pooling_output_payload = serialize_additional_information(pooler_output)
+                    pooling_output_wire = None
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     _make_engine_core_output(
@@ -605,7 +612,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                        pooling_output=pooler_output,
+                        pooling_output=pooling_output_wire,
+                        pooling_output_payload=pooling_output_payload,
                         multimodal_output=mm_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),

@@ -29,7 +29,10 @@ from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
-from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
+)
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
@@ -493,6 +496,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+                # vLLM 0.23 strictly decodes EngineCoreOutput.pooling_output as a
+                # torch.Tensor. MR V2 runners hand off a per-request dict here, so
+                # serialize it onto the bytes channel; StagePool._poll_stage_raw
+                # rehydrates it. Tensor pooling outputs ride pooling_output as before.
+                pooling_output_wire = pooler_output
+                pooling_output_payload = None
+                if isinstance(pooler_output, dict):
+                    pooling_output_payload = serialize_additional_information(pooler_output)
+                    pooling_output_wire = None
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     _make_engine_core_output(
@@ -501,7 +513,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                        pooling_output=pooler_output,
+                        pooling_output=pooling_output_wire,
+                        pooling_output_payload=pooling_output_payload,
                         multimodal_output=mm_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
@@ -741,6 +754,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         assert request.is_finished()
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
+
+        # [Upstream compat] Discard request from in-flight prefills set added
+        # upstream for routed-experts in-flight reservation tracking.
+        # Use getattr for safety with test __new__ code paths.
+        getattr(self, "_inflight_prefills", set()).discard(request)
 
         # 1. Standard cleanup parts from base _free_request
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)

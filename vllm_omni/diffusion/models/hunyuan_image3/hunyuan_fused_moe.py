@@ -4,7 +4,6 @@
 from typing import Any
 
 import vllm.forward_context as _vllm_fc
-from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.platforms import current_omni_platform
@@ -25,22 +24,93 @@ def _set_forward_context_num_tokens(num_tokens: int) -> None:
         forward_context.in_profile_run = False
 
 
-class HunyuanFusedMoEDefault(FusedMoE):
-    def __init__(self, *, prefix: str = "", **kwargs: Any) -> None:
+class HunyuanFusedMoEDefault:
+    """Adapter that configures the upstream FusedMoE ``MoERunner`` for HunyuanImage3.
+
+    Upstream commit dc68bd8c41 refactored FusedMoE from a class (``nn.Module``)
+    into a factory function that returns a ``MoERunner`` instance, whose expert
+    weights live in a ``routed_experts`` submodule
+    (``...experts.routed_experts.w13_weight`` / ``...w2_weight``).
+
+    This adapter builds that runner, installs the omni-specific forward-context
+    setup and one-shot kernel-initialisation hook, and returns the runner
+    *directly* from ``__new__`` so the parent MoE block registers it as a real
+    ``nn.Module`` submodule.
+
+    Returning the runner (rather than wrapping it in a plain object that holds it
+    in an attribute) is required for correctness: a non-Module wrapper hides the
+    runner's parameters from ``named_parameters()``, so ``load_weights`` cannot
+    find ``...experts.routed_experts.w13_weight`` and raises ``KeyError`` during
+    weight loading.
+    """
+
+    def __new__(cls, *, prefix: str = "", **kwargs: Any) -> Any:
         # Current vLLM FusedMoE handles output reduction internally.
         kwargs.pop("reduce_results", None)
-        super().__init__(prefix=prefix, **kwargs)
-        self._prefix = prefix
-        self._init_hook_handle = self.register_forward_pre_hook(self._initialize_kernel_hook, with_kwargs=True)
+        # FusedMoE is now a factory function — call it to get a MoERunner.
+        from vllm.model_executor.layers.fused_moe import FusedMoE as _FusedMoE
 
-    def _initialize_kernel_hook(self, module: Any, args: Any, kwargs: Any) -> None:
-        if self.quant_method and getattr(self.quant_method, "moe_kernel", None) is None:
-            self.quant_method.process_weights_after_loading(self)
-        self._init_hook_handle.remove()
+        moe_runner = _FusedMoE(prefix=prefix, **kwargs)
 
-    def forward(self, hidden_states: Any, router_logits: Any) -> Any:
-        _set_forward_context_num_tokens(hidden_states.shape[0])
-        return super().forward(hidden_states, router_logits)
+        # Set ForwardContext.num_tokens before each forward. After the rebase to
+        # vLLM 0.18.0 FusedMoE requires this; without it MoE routing is silently
+        # incorrect. Previously done in the wrapper's forward(); now a pre-hook
+        # on the runner so we can return the runner directly.
+        def _num_tokens_pre_hook(module: Any, args: Any, kwargs: Any) -> None:
+            hidden_states = kwargs.get("hidden_states")
+            if hidden_states is None and args:
+                hidden_states = args[0]
+            if hidden_states is not None:
+                _set_forward_context_num_tokens(hidden_states.shape[0])
+
+        moe_runner.register_forward_pre_hook(_num_tokens_pre_hook, with_kwargs=True)
+
+        # One-shot lazy kernel initialisation on the first forward (no-op unless
+        # the runner exposes an uninitialised quant_method). Mirrors the prior
+        # wrapper behaviour exactly, just bound to the runner module.
+        init_handle: Any = None
+
+        def _kernel_init_pre_hook(module: Any, args: Any, kwargs: Any) -> None:
+            nonlocal init_handle
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None and getattr(quant_method, "moe_kernel", None) is None:
+                quant_method.process_weights_after_loading(module)
+            if init_handle is not None:
+                init_handle.remove()
+
+        init_handle = moe_runner.register_forward_pre_hook(_kernel_init_pre_hook, with_kwargs=True)
+
+        return moe_runner
+
+    @staticmethod
+    def make_expert_params_mapping(
+        model: Any,
+        ckpt_gate_proj_name: str,
+        ckpt_down_proj_name: str,
+        ckpt_up_proj_name: str,
+        num_experts: int,
+        num_redundant_experts: int = 0,
+    ) -> list[tuple[str, str, int, str]]:
+        """Delegate to the upstream standalone function.
+
+        Upstream vLLM refactored ``FusedMoE`` from a class (which had
+        ``make_expert_params_mapping`` as a classmethod) to a factory
+        function.  The method was moved to a standalone function
+        ``fused_moe_make_expert_params_mapping`` in
+        ``vllm.model_executor.layers.fused_moe``.
+        """
+        from vllm.model_executor.layers.fused_moe import (
+            fused_moe_make_expert_params_mapping,
+        )
+
+        return fused_moe_make_expert_params_mapping(
+            model,
+            ckpt_gate_proj_name=ckpt_gate_proj_name,
+            ckpt_down_proj_name=ckpt_down_proj_name,
+            ckpt_up_proj_name=ckpt_up_proj_name,
+            num_experts=num_experts,
+            num_redundant_experts=num_redundant_experts,
+        )
 
 
 class HunyuanFusedMoE:
