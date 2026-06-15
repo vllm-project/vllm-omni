@@ -427,6 +427,7 @@ async def _enqueue_add_request(
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
             preprocess_ms=0.0,
+            request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
         )
     )
@@ -984,6 +985,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
             sampling_params_list=[_sampling_params()],
             final_stage_id=0,
             preprocess_ms=0.0,
+            request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
         )
     )

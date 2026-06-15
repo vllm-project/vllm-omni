@@ -37,8 +37,8 @@ from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
-from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
+from vllm_omni.diffusion.io_support import supports_audio_output
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.stage_diffusion_proc import (
     complete_diffusion_handshake,
@@ -125,6 +125,7 @@ class StageRuntimeInfo:
     final_output: bool
     final_output_type: FinalOutputModalityType | None
     stage_type: str
+    model_stage: str | None = None
 
 
 # ============================================================================
@@ -1129,7 +1130,7 @@ class AsyncOmniEngine:
         stage_plans: Sequence[LogicalStageInitPlan],
         stage_init_timeout: int,
     ) -> dict[int, list[StagePoolClient | None]]:
-        """Initialize all stage replicas.
+        """Initialize all stage replicas with parallel startup.
 
         Diffusion replicas are launched **inline on the orchestrator thread**
         (the long-lived daemon thread created in ``__init__``). Their
@@ -1138,9 +1139,17 @@ class AsyncOmniEngine:
         scoped ``ThreadPoolExecutor`` causes the clone-parent Python thread to
         be destroyed at the end of init, which under Ray's actor subreaper
         leads the spawned ``DiffusionWorker`` processes to be silently
-        ``SIGKILL``ed (exitcode -9). See git blame on this method.
+        ``SIGKILL``ed (exitcode -9).
 
-        LLM replicas keep using the parallel init executor.
+        LLM replicas are submitted to a **long-lived** engine-level executor
+        (``_stage_init_executor``) whose threads outlive the init phase,
+        preventing ``prctl(PR_SET_PDEATHSIG, SIGTERM)`` from firing when the
+        spawning thread exits.
+
+        To achieve parallel startup, LLM replicas are submitted to the
+        executor first so they begin loading in background, then diffusion
+        replicas run inline on the orchestrator thread concurrently, and
+        finally LLM futures are awaited.
         """
 
         stage_launch_lock = threading.Lock()
@@ -1149,8 +1158,8 @@ class AsyncOmniEngine:
         }
         primary_exc: Exception | None = None
 
-        # Partition replicas: diffusion runs inline on the caller's thread;
-        # LLM replicas are submitted to a scoped ThreadPoolExecutor.
+        # Partition replicas: diffusion runs inline on the orchestrator thread;
+        # LLM replicas are submitted to the engine-level executor.
         diffusion_replicas: list[tuple[int, ReplicaInitPlan]] = []
         llm_replicas: list[tuple[int, ReplicaInitPlan]] = []
         for plan in stage_plans:
@@ -1160,36 +1169,41 @@ class AsyncOmniEngine:
                 else:
                     llm_replicas.append((plan.stage_idx, replica))
 
-        # --- 1) Diffusion replicas: inline on the orchestrator thread. ---
-        for stage_idx, replica in diffusion_replicas:
-            try:
-                initialized_clients_by_stage[stage_idx][replica.replica_id] = self._initialize_replica(
-                    replica,
-                    stage_init_timeout,
-                    stage_launch_lock,
-                )
-            except Exception as exc:
-                primary_exc = exc
-                break
+        # Lazily create the engine-level executor (once per engine lifetime).
+        if llm_replicas and getattr(self, "_stage_init_executor", None) is None:
+            self._stage_init_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, len(llm_replicas)),
+                thread_name_prefix="stage-init",
+            )
 
-        # --- 2) LLM replicas: parallel init via a long-lived ThreadPoolExecutor. ---
-        if primary_exc is None and llm_replicas:
-            future_to_replica: dict[concurrent.futures.Future[StagePoolClient], tuple[int, int]] = {}
-            if getattr(self, "_stage_init_executor", None) is None:
-                self._stage_init_executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=max(1, len(llm_replicas)),
-                    thread_name_prefix="stage-init",
-                )
-            init_executor = self._stage_init_executor
-            for stage_idx, replica in llm_replicas:
-                future = init_executor.submit(
-                    self._initialize_replica,
-                    replica,
-                    stage_init_timeout,
-                    stage_launch_lock,
-                )
-                future_to_replica[future] = (stage_idx, replica.replica_id)
+        # --- 1) Submit LLM replicas to the long-lived executor (starts
+        #     loading in background). ---
+        future_to_replica: dict[concurrent.futures.Future[StagePoolClient], tuple[int, int]] = {}
+        for stage_idx, replica in llm_replicas:
+            future = self._stage_init_executor.submit(
+                self._initialize_replica,
+                replica,
+                stage_init_timeout,
+                stage_launch_lock,
+            )
+            future_to_replica[future] = (stage_idx, replica.replica_id)
 
+        # --- 2) Diffusion replicas: inline on the orchestrator thread.
+        #     LLM is already loading in background — both run concurrently. ---
+        if primary_exc is None:
+            for stage_idx, replica in diffusion_replicas:
+                try:
+                    initialized_clients_by_stage[stage_idx][replica.replica_id] = self._initialize_replica(
+                        replica,
+                        stage_init_timeout,
+                        stage_launch_lock,
+                    )
+                except Exception as exc:
+                    primary_exc = exc
+                    break
+
+        # --- 3) Await LLM futures. ---
+        if primary_exc is None and future_to_replica:
             for future in concurrent.futures.as_completed(future_to_replica):
                 stage_idx, replica_id = future_to_replica[future]
                 try:
@@ -1249,6 +1263,7 @@ class AsyncOmniEngine:
                     final_output=first_client.final_output,
                     final_output_type=first_client.final_output_type,
                     stage_type=first_client.stage_type,
+                    model_stage=getattr(first_client, "model_stage", None),
                 )
             )
 
@@ -1363,6 +1378,7 @@ class AsyncOmniEngine:
 
         async def _run_orchestrator() -> None:
             self._initialize_stages(stage_init_timeout)
+
             pd_config = self._detect_pd_config()
             coordinator_pub_address: str | None = None
             load_balancer_factory: Callable[[], LoadBalancer] | None = None
@@ -1492,7 +1508,7 @@ class AsyncOmniEngine:
             return
 
         mm_data = prompt.get("multi_modal_data")
-        if not isinstance(mm_data, dict) or not mm_data:
+        if not isinstance(mm_data, Mapping) or not mm_data:
             return
 
         from vllm.multimodal.hasher import MultiModalHasher
@@ -1631,6 +1647,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         lora_request: Any = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -1643,6 +1660,7 @@ class AsyncOmniEngine:
         message_type: Literal["add_request", "streaming_update"] = "add_request",
     ) -> StageSubmissionMessage:
         """Build an add_request message after stage-0 preprocessing."""
+        request_timestamp = float(arrival_time) if arrival_time is not None else time.time()
         effective_sampling_params_list: list[OmniSamplingParams] = (
             list(cast(Sequence[OmniSamplingParams], sampling_params_list))
             if sampling_params_list is not None
@@ -1728,7 +1746,9 @@ class AsyncOmniEngine:
             output_prompt_text=output_prompt_text,
             sampling_params_list=effective_sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=list(final_output_stage_ids) if final_output_stage_ids is not None else None,
             preprocess_ms=_preprocess_ms,
+            request_timestamp=request_timestamp,
             enqueue_ts=time.perf_counter(),
         )
 
@@ -2201,6 +2221,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         lora_request: Any = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -2224,6 +2245,7 @@ class AsyncOmniEngine:
             prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
@@ -2251,6 +2273,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         lora_request: Any = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -2268,6 +2291,7 @@ class AsyncOmniEngine:
             prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
@@ -2285,6 +2309,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         *,
         resumable: bool = True,
@@ -2296,6 +2321,7 @@ class AsyncOmniEngine:
             prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             resumable=resumable,
             message_type="streaming_update",
@@ -2309,6 +2335,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
         *,
         resumable: bool = True,
@@ -2320,6 +2347,7 @@ class AsyncOmniEngine:
             prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             resumable=resumable,
         )
@@ -2479,6 +2507,28 @@ class AsyncOmniEngine:
             except Exception:
                 logger.exception("[AsyncOmniEngine] Failed to close OmniCoordinatorRuntime during shutdown")
             self._coordinator_runtime = None
+
+        # ── Release CuMem allocator memory pool ──────────────────────────────
+        # When enable_sleep_mode is in use, the CuMem (CUDA Virtual Memory
+        # Management) allocator holds model weights in a singleton memory pool
+        # that lives in the parent process.  Killing the engine-core subprocess
+        # does NOT release this pool — the weights stay resident on the GPU
+        # and can cause CUDA OOM for subsequent engine instances (especially
+        # large models like BAGEL-7B-MoT whose weights alone consume ~134 GiB).
+        #
+        # Discard mode (level=2) is correct at shutdown: there is no benefit to
+        # keeping a CPU backup when the engine is being torn down.
+        try:
+            from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+
+            if cumem_available:
+                allocator = CuMemAllocator.get_instance()
+                # Sleep at level 2 discards all pool memory from the GPU
+                # without creating CPU backups — cheapest and fastest.
+                allocator.sleep()
+                logger.debug("[AsyncOmniEngine] Released CuMem memory pool during shutdown")
+        except Exception:
+            pass
 
     def _try_shutdown(self, *args, **kwargs) -> None:
         try:

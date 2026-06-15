@@ -33,6 +33,7 @@ from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
 )
+from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -261,6 +262,7 @@ class AsyncOmni(EngineClient, OmniBase):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        arrival_time: float | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -334,11 +336,12 @@ class AsyncOmni(EngineClient, OmniBase):
             )
 
             # Track per-request metrics
-            wall_start_ts = time.time()
+            wall_start_ts = float(arrival_time) if arrival_time is not None else time.time()
             req_start_ts: dict[str, float] = {}
 
             # Determine the final stage for E2E stats
             final_stage_id_for_e2e = self._compute_final_stage_id(output_modalities)
+            final_output_stage_ids = self._compute_final_output_stage_ids(output_modalities) or [final_stage_id_for_e2e]
 
             metrics = OrchestratorMetrics(
                 self.num_stages,
@@ -372,6 +375,8 @@ class AsyncOmni(EngineClient, OmniBase):
                     input_stream=prompt,
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
+                    final_output_stage_ids=final_output_stage_ids,
+                    arrival_time=wall_start_ts,
                 )
             else:
                 await self.engine.add_request_async(
@@ -379,6 +384,8 @@ class AsyncOmni(EngineClient, OmniBase):
                     prompt=prompt,
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
+                    final_output_stage_ids=final_output_stage_ids,
+                    arrival_time=wall_start_ts,
                 )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
@@ -421,6 +428,8 @@ class AsyncOmni(EngineClient, OmniBase):
         input_stream: AsyncGenerator[StreamingInput, None],
         sampling_params_list: Sequence[OmniSamplingParams],
         final_stage_id: int,
+        final_output_stage_ids: Sequence[int],
+        arrival_time: float,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -456,6 +465,8 @@ class AsyncOmni(EngineClient, OmniBase):
                             prompt_text=prompt_text,
                             sampling_params_list=chunk_sampling_params_list,
                             final_stage_id=final_stage_id,
+                            final_output_stage_ids=final_output_stage_ids,
+                            arrival_time=arrival_time,
                             resumable=True,
                         )
                         has_submitted_first_chunk = True
@@ -466,15 +477,20 @@ class AsyncOmni(EngineClient, OmniBase):
                             prompt_text=prompt_text,
                             sampling_params_list=chunk_sampling_params_list,
                             final_stage_id=final_stage_id,
+                            final_output_stage_ids=final_output_stage_ids,
+                            arrival_time=arrival_time,
                             resumable=True,
                         )
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
+                status_code, error_type = client_error_metadata(error)
                 await req_state.queue.put(
                     ErrorMessage(
                         request_id=request_id,
                         error=str(error),
+                        status_code=status_code,
+                        error_type=error_type,
                     )
                 )
             finally:
@@ -492,6 +508,8 @@ class AsyncOmni(EngineClient, OmniBase):
                             prompt_text=None,
                             sampling_params_list=final_sampling_params_list,
                             final_stage_id=final_stage_id,
+                            final_output_stage_ids=final_output_stage_ids,
+                            arrival_time=arrival_time,
                             resumable=False,
                         )
                     else:
@@ -501,6 +519,8 @@ class AsyncOmni(EngineClient, OmniBase):
                             prompt_text=None,
                             sampling_params_list=final_sampling_params_list,
                             final_stage_id=final_stage_id,
+                            final_output_stage_ids=final_output_stage_ids,
+                            arrival_time=arrival_time,
                             resumable=False,
                         )
 
@@ -573,7 +593,7 @@ class AsyncOmni(EngineClient, OmniBase):
                         result.error,
                         error_stage_id=result.stage_id,
                     )
-                raise RuntimeError(result.error)
+                self._raise_nonfatal_error_message(result)
 
             if not isinstance(result, OutputMessage):
                 logger.warning("[AsyncOmni] Dropping unexpected per-request message %r", result)
@@ -644,6 +664,18 @@ class AsyncOmni(EngineClient, OmniBase):
                         tid = getattr(msg, "task_id")
                         logger.info(f"[{self._name}] Intercepted task-ID object: {tid}")
                         await self.event_resolver.resolve(msg)
+                        continue
+
+                    if isinstance(msg, ErrorMessage) and not msg.fatal:
+                        req_state = self.request_states.get(msg.request_id)
+                        if req_state is not None:
+                            await req_state.queue.put(msg)
+                        else:
+                            logger.warning(
+                                "[%s] dropping non-fatal error for unknown req %s",
+                                self._name,
+                                msg.request_id,
+                            )
                         continue
 
                     should_continue, _, stage_id, req_state = self._handle_output_message(msg)

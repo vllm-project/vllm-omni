@@ -1,0 +1,74 @@
+[
+  {
+    "test_name": "test_higgs_audio_v3",
+    "server_params": {
+      "model": "bosonai/higgs-audio-v3-tts-4b",
+      "stage_overrides": {
+        "0": {
+          "gpu_memory_utilization": 0.3
+        },
+        "1": {
+          "gpu_memory_utilization": 0.2
+        }
+      },
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/higgs_multimodal_qwen3.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "task": "default_voice",
+        "eval_phase": "latency",
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "num_prompts": [
+          20
+        ],
+        "max_concurrency": [
+          1
+        ],
+        "seed_tts_locale": "en",
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {
+          "median_audio_ttfp_ms": [
+            3000
+          ],
+          "median_audio_rtf": [
+            0.5
+          ]
+        }
+      },
+      {
+        "task": "default_voice",
+        "eval_phase": "throughput",
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "num_prompts": [
+          500
+        ],
+        "max_concurrency": [
+          16
+        ],
+        "seed_tts_locale": "en",
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {
+          "median_audio_ttfp_ms": [
+            5000
+          ],
+          "median_audio_rtf": [
+            1.2
+          ],
+          "audio_throughput": [
+            30
+          ]
+        }
+      }
+    ]
+  }
+]

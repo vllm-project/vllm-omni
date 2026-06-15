@@ -154,6 +154,7 @@ class TestRequestLifecycleGauges:
         obj.engine = SimpleNamespace(_running_counter=OmniRequestCounter())
         obj.prom_metrics = OmniPrometheusMetrics(model_name="lifecycle-test")
         obj.request_states = {}
+        obj._consumed_metric_messages = {}
         obj.log_stats = False
 
         # Simulate request lifecycle: start (counter 0→1, dict {} → {req}),
@@ -182,6 +183,7 @@ class TestRequestLifecycleGauges:
         obj.engine = SimpleNamespace(_running_counter=OmniRequestCounter())
         obj.prom_metrics = OmniPrometheusMetrics(model_name="lifecycle-test-2")
         obj.request_states = {}
+        obj._consumed_metric_messages = {}
         obj.log_stats = False
 
         # Two in flight, one finalizes — running should report 1, waiting 0.

@@ -9,7 +9,7 @@ import base64
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import cast
 from uuid import uuid4
 
@@ -313,13 +313,21 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     def _extract_audio_chunks(self, output) -> tuple[list[np.ndarray], int]:
         mm = getattr(output, "multimodal_output", None)
-        if not isinstance(mm, dict):
+        if mm is None:
+            return [], 24000
+        # Support both MultimodalPayload and plain dict
+        if not isinstance(mm, Mapping):
             return [], 24000
 
         sr = mm.get("sr") or mm.get("sample_rate") or mm.get("audio_sample_rate") or 24000
+        if isinstance(sr, (list, tuple)) and sr:
+            sr = sr[-1]
+        if hasattr(sr, "item"):
+            sr = sr.item()
+        sample_rate_hz = int(sr)
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
         if key is None:
-            return [], int(sr)
+            return [], sample_rate_hz
 
         raw_audio = mm.get(key)
         chunks: list[np.ndarray] = []
@@ -332,7 +340,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             arr = self._tensor_to_numpy(raw_audio)
             if arr is not None and arr.size > 0:
                 chunks.extend(self._raw_waveform_to_deltas(arr))
-        return chunks, int(sr)
+        return chunks, sample_rate_hz
 
     # Maximum raw PCM bytes per WebSocket message for response.audio.delta.
     # Base64 encoding inflates by ~4/3, so 200 KB raw → ~267 KB on the wire.

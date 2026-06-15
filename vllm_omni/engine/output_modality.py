@@ -21,6 +21,8 @@ _MODALITY_ALIASES: dict[str, str] = {
     "waveform": "audio",
     "pixel_values": "image",
     "pixels": "image",
+    "token_ids": "text",
+    "tokens": "text",
 }
 
 

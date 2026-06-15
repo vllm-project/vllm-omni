@@ -5,6 +5,7 @@ from einops import rearrange, repeat
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -300,3 +301,234 @@ def apply_rope_to_qk(
         query = rope(query, cos, sin)
         key = rope(key, cos, sin)
     return query, key
+
+
+class WanS2VRotaryPosEmbed(torch.nn.Module):
+    """Precompute complex-valued RoPE embeddings for S2V multi-grid positions.
+
+    Owns the base frequency buffer and provides forward() to compute position
+    embeddings given hidden_states (for shape) and grid_sizes.
+    """
+
+    def __init__(self, num_heads: int, head_dim: int, max_seq_len: int = 1024):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        d = head_dim
+        freqs = torch.cat(
+            [
+                self._rope_params(max_seq_len, d - 4 * (d // 6)),
+                self._rope_params(max_seq_len, 2 * (d // 6)),
+                self._rope_params(max_seq_len, 2 * (d // 6)),
+            ],
+            dim=1,
+        )
+        self.register_buffer("freqs", freqs.to(torch.complex64), persistent=False)
+
+    @staticmethod
+    @torch.amp.autocast(current_omni_platform.device_type, enabled=False)
+    def _rope_params(max_seq_len, dim, theta=10000):
+        if dim % 2 != 0:
+            raise ValueError(f"dim ({dim}) must be even")
+        freqs = torch.outer(
+            torch.arange(max_seq_len), 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim))
+        )
+        return torch.polar(torch.ones_like(freqs), freqs)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        grid_sizes: list,
+        trainable_freqs: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Precompute RoPE embeddings for the given grid layout.
+
+        Args:
+            hidden_states: Tensor [B, S, ...] (used for batch/seq shape and device)
+            grid_sizes: Grid specification (list of [offsets, sizes, totals])
+            trainable_freqs: Optional trainable frequency overrides for t_f < 0
+
+        Returns:
+            Complex tensor [B, S, 1, head_dim//2] of precomputed position embeddings
+        """
+        b, s = hidden_states.shape[0], hidden_states.shape[1]
+        c = self.head_dim // 2
+        device = hidden_states.device
+
+        freqs = self.freqs.to(device)
+        if trainable_freqs is not None:
+            freqs_input = [freqs, trainable_freqs]
+        else:
+            freqs_input = freqs
+
+        if isinstance(freqs_input, list):
+            trainable_f = freqs_input[1]
+            freqs_split = freqs_input[0]
+        else:
+            trainable_f = None
+            freqs_split = freqs_input
+        freqs_split = freqs_split.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+        output = torch.empty((b, s, 1, c), device=device, dtype=torch.complex64)
+        seq_bucket = [0]
+        if not isinstance(grid_sizes, list):
+            grid_sizes = [grid_sizes]
+        for g in grid_sizes:
+            if not isinstance(g, list):
+                g = [torch.zeros_like(g), g]
+            batch_size = g[0].shape[0]
+            for i in range(batch_size):
+                f_o, h_o, w_o = g[0][i]
+                f, h, w = g[1][i]
+                t_f, t_h, t_w = g[2][i]
+                seq_f, seq_h, seq_w = f - f_o, h - h_o, w - w_o
+                seq_len = int(seq_f * seq_h * seq_w)
+                if seq_len > 0:
+                    if t_f > 0:
+                        assert f_o * f >= 0 and h_o * h >= 0 and w_o * w >= 0
+                        seq_f_int = int(seq_f)
+                        seq_h_int = int(seq_h)
+                        seq_w_int = int(seq_w)
+
+                        if f_o >= 0:
+                            f_sam = torch.linspace(int(f_o), int(t_f + f_o) - 1, seq_f_int, device=device).long()
+                        else:
+                            f_sam = torch.linspace(int(-f_o), int(-t_f - f_o) + 1, seq_f_int, device=device).long()
+                        h_sam = torch.linspace(int(h_o), int(t_h + h_o) - 1, seq_h_int, device=device).long()
+                        w_sam = torch.linspace(int(w_o), int(t_w + w_o) - 1, seq_w_int, device=device).long()
+
+                        freqs_0 = freqs_split[0][f_sam] if f_o >= 0 else freqs_split[0][f_sam].conj()
+                        freqs_0 = freqs_0.view(seq_f_int, 1, 1, -1)
+
+                        freqs_i = torch.cat(
+                            [
+                                freqs_0.expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                freqs_split[1][h_sam]
+                                .view(1, seq_h_int, 1, -1)
+                                .expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                freqs_split[2][w_sam]
+                                .view(1, 1, seq_w_int, -1)
+                                .expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                            ],
+                            dim=-1,
+                        ).reshape(seq_len, 1, -1)
+                    elif t_f < 0:
+                        freqs_i = trainable_f.unsqueeze(1)
+                    output[i, seq_bucket[-1] : seq_bucket[-1] + seq_len] = freqs_i
+            seq_bucket.append(seq_bucket[-1] + seq_len)
+        return output
+
+
+class RotaryEmbeddingWanS2V(RotaryEmbeddingWan):
+    """Apply RoPE using precomputed complex freqs for Wan S2V main transformer.
+
+    Converts complex freqs (from WanS2VRotaryPosEmbed) to cos/sin and delegates
+    to RotaryEmbeddingWan for platform-optimized application (float32 kernel).
+    Under TP, freqs has 1 head — broadcasts automatically via cos/sin.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(is_neox_style=False, half_head_dim=True)
+
+    def forward(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        freqs_sliced = freqs[:, : x.size(1)]
+        cos = freqs_sliced.real.to(x.dtype)
+        sin = freqs_sliced.imag.to(x.dtype)
+        return super().forward(x, cos, sin)
+
+
+class RotaryEmbeddingS2VGrid(torch.nn.Module):
+    """Grid-based RoPE for S2V motioner/init attention.
+
+    Applies complex-valued rotary embeddings using 3D grid sampling
+    (frame, height, width). Used by SimpleSelfAttention, SwinSelfAttention,
+    CausalSelfAttention in motioner blocks.
+    """
+
+    @staticmethod
+    @torch.amp.autocast(current_omni_platform.device_type, enabled=False)
+    def precompute(
+        seq_len: int, num_heads: int, head_dim: int, grid_sizes, freqs: torch.Tensor, device: torch.device, start=None
+    ) -> torch.Tensor:
+        """Precompute position frequency tensor from grid specification.
+
+        Returns a complex tensor that can be reused across layers via apply_precomputed().
+        """
+        c = head_dim // 2
+
+        trainable_freqs = None
+        if isinstance(freqs, list):
+            trainable_freqs = freqs[1]
+            freqs = freqs[0]
+        freqs = freqs.to(device)
+        freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+        if not isinstance(grid_sizes, list):
+            grid_sizes = [grid_sizes]
+
+        batch_size = grid_sizes[0][0].shape[0] if isinstance(grid_sizes[0], list) else grid_sizes[0].shape[0]
+        precomputed = torch.empty((batch_size, seq_len, 1, c), device=device, dtype=torch.complex64)
+        seq_bucket = [0]
+
+        for g in grid_sizes:
+            if not isinstance(g, list):
+                g = [torch.zeros_like(g), g]
+            g_batch_size = g[0].shape[0]
+            for i in range(g_batch_size):
+                if start is None:
+                    f_o, h_o, w_o = g[0][i]
+                else:
+                    f_o, h_o, w_o = start[i]
+
+                f, h, w = g[1][i]
+                t_f, t_h, t_w = g[2][i]
+                seq_f, seq_h, seq_w = f - f_o, h - h_o, w - w_o
+                seg_len = int(seq_f * seq_h * seq_w)
+                if seg_len > 0:
+                    if t_f > 0:
+                        seq_f_int = int(seq_f)
+                        seq_h_int = int(seq_h)
+                        seq_w_int = int(seq_w)
+
+                        if f_o >= 0:
+                            f_sam = torch.linspace(int(f_o), int(t_f + f_o) - 1, seq_f_int, device=device).long()
+                        else:
+                            f_sam = torch.linspace(int(-f_o), int(-t_f - f_o) + 1, seq_f_int, device=device).long()
+                        h_sam = torch.linspace(int(h_o), int(t_h + h_o) - 1, seq_h_int, device=device).long()
+                        w_sam = torch.linspace(int(w_o), int(t_w + w_o) - 1, seq_w_int, device=device).long()
+
+                        freqs_0 = freqs[0][f_sam] if f_o >= 0 else freqs[0][f_sam].conj()
+                        freqs_0 = freqs_0.view(seq_f_int, 1, 1, -1)
+
+                        freqs_i = torch.cat(
+                            [
+                                freqs_0.expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                freqs[1][h_sam].view(1, seq_h_int, 1, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                freqs[2][w_sam].view(1, 1, seq_w_int, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                            ],
+                            dim=-1,
+                        ).reshape(seg_len, 1, -1)
+                    elif t_f < 0:
+                        freqs_i = trainable_freqs.unsqueeze(1)
+                    precomputed[i, seq_bucket[-1] : seq_bucket[-1] + seg_len] = freqs_i
+            seq_bucket.append(seq_bucket[-1] + seg_len)
+        return precomputed
+
+    @staticmethod
+    @torch.amp.autocast(current_omni_platform.device_type, enabled=False)
+    def apply_precomputed(x: torch.Tensor, precomputed_freqs: torch.Tensor) -> torch.Tensor:
+        """Apply precomputed position frequencies to input tensor."""
+        n = x.size(2)
+        input_dtype = x.dtype
+        seq_len = x.size(1)
+        precomputed_freqs = precomputed_freqs[:, :seq_len]
+        x_c = torch.view_as_complex(x.to(torch.float64).reshape(x.size(0), seq_len, n, -1, 2))
+        x_c = torch.view_as_real(x_c * precomputed_freqs).flatten(3)
+        return x_c.reshape(x.size(0), seq_len, n, -1).to(input_dtype)
+
+    @staticmethod
+    @torch.amp.autocast(current_omni_platform.device_type, enabled=False)
+    def forward(x: torch.Tensor, grid_sizes, freqs: torch.Tensor, start=None) -> torch.Tensor:
+        n, d = x.size(2), x.size(3)
+        precomputed = RotaryEmbeddingS2VGrid.precompute(x.size(1), n, d, grid_sizes, freqs, x.device, start=start)
+        return RotaryEmbeddingS2VGrid.apply_precomputed(x, precomputed)

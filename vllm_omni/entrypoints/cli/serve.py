@@ -17,7 +17,7 @@ from typing import Any
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.cli.logo import log_logo
@@ -100,6 +100,9 @@ class OmniServeCommand(CLISubcommand):
             model_config = dict(existing) if isinstance(existing, dict) else {}
             model_config["guardrails"] = False
             args.model_config = model_config
+            explicit_keys = getattr(args, "explicit_keys", None)
+            if explicit_keys is not None:
+                args.explicit_keys = explicit_keys | {"model_config"}
 
         if args.headless:
             run_headless(args)

@@ -25,6 +25,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_hunyuan_video_1
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15Transformer3DModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
@@ -101,9 +102,20 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Diff
         model = od_config.model
         local_files_only = os.path.exists(model)
 
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the whole component set before any from_pretrained so
+        # peer workers load from a warm, complete cache.
+        hv_subfolders = ["tokenizer", "text_encoder", "tokenizer_2", "text_encoder_2", "vae", "scheduler"]
+        prefetch_subfolders(model, hv_subfolders, local_files_only=local_files_only)
+
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.text_encoder = Qwen2_5_VLTextModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+        self.text_encoder = from_pretrained_with_prefetch(
+            Qwen2_5_VLTextModel.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=hv_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         self.tokenizer_2 = ByT5Tokenizer.from_pretrained(
@@ -112,8 +124,13 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Diff
         t5_config = AutoConfig.from_pretrained(model, subfolder="text_encoder_2", local_files_only=local_files_only)
         self.text_encoder_2 = T5EncoderModel(t5_config, prefix="text_encoder_2").to(dtype=dtype, device=self.device)
 
-        self.vae = DistributedAutoencoderKLHunyuanVideo15.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+        self.vae = from_pretrained_with_prefetch(
+            DistributedAutoencoderKLHunyuanVideo15.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=hv_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=torch.float32,
         ).to(self.device)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -126,7 +143,9 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Diff
             self.scheduler._shift = od_config.flow_shift
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, HunyuanVideo15Transformer3DModel)
-        self.transformer = HunyuanVideo15Transformer3DModel(od_config=od_config, **transformer_kwargs)
+        self.transformer = HunyuanVideo15Transformer3DModel(
+            od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
+        )
 
         # Check if model uses meanflow (distilled variants)
         self.use_meanflow = getattr(od_config.tf_model_config, "use_meanflow", False)
