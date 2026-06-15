@@ -391,18 +391,10 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
             )
 
-        if prompt_embeds is not None and prompt_embeds_mask is None:
-            raise ValueError(
-                "If `prompt_embeds` are provided, `prompt_embeds_mask` also have to be passed. "
-                "Make sure to generate `prompt_embeds_mask` from the same text encoder "
-                "that was used to generate `prompt_embeds`."
-            )
-        if negative_prompt_embeds is not None and negative_prompt_embeds_mask is None:
-            raise ValueError(
-                "If `negative_prompt_embeds` are provided, `negative_prompt_embeds_mask` also have to be passed. "
-                "Make sure to generate `negative_prompt_embeds_mask` from the same text encoder "
-                "that was used to generate `negative_prompt_embeds`."
-            )
+        # NOTE: prompt_embeds_mask=None is valid and means "all tokens are
+        # valid" (matching the diffusers convention set by encode_prompt when
+        # all mask elements are True).  We therefore no longer reject
+        # prompt_embeds without an accompanying mask.
 
         if max_sequence_length is not None and max_sequence_length > self.tokenizer_max_length:
             raise ValueError(
@@ -515,6 +507,11 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         prompt_embeds_mask = prompt_embeds_mask.repeat(1, num_images_per_prompt, 1)
         prompt_embeds_mask = prompt_embeds_mask.view(batch_size * num_images_per_prompt, seq_len)
 
+        # Match diffusers convention: set all-True masks to None so the
+        # transformer skips masked attention and uses the full sequence.
+        if prompt_embeds_mask is not None and prompt_embeds_mask.all():
+            prompt_embeds_mask = None
+
         return prompt_embeds, prompt_embeds_mask
 
     @staticmethod
@@ -552,7 +549,6 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         generator,
         latents=None,
     ) -> torch.Tensor:
-        # generator=torch.Generator(device="cuda").manual_seed(42)
         # VAE applies 8x compression on images but we must also account for packing which requires
         # latent height and width to be divisible by 2.
         height = 2 * (int(height) // (self.vae_scale_factor * 2))
@@ -730,10 +726,18 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         else:
             guidance = None
 
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
-        negative_txt_seq_lens = (
-            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
-        )
+        # When the mask is None (all tokens valid), derive txt_seq_lens from
+        # the embedding shape — matching diffusers' internal convention.
+        if prompt_embeds_mask is not None:
+            txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
+        else:
+            txt_seq_lens = [prompt_embeds.shape[1]] * prompt_embeds.shape[0]
+        if negative_prompt_embeds_mask is not None:
+            negative_txt_seq_lens = negative_prompt_embeds_mask.sum(dim=1).tolist()
+        elif negative_prompt_embeds is not None:
+            negative_txt_seq_lens = [negative_prompt_embeds.shape[1]] * negative_prompt_embeds.shape[0]
+        else:
+            negative_txt_seq_lens = None
 
         return {
             "prompt_embeds": prompt_embeds,
