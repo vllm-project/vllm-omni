@@ -1499,6 +1499,11 @@ class WanS2VTransformer3DModel(nn.Module):
             dict with 'audio_emb' (and optionally 'audio_emb_global' when
             enable_adain is True).
         """
+        # Under HSDP, this method is called outside the FSDP forward hook.
+        # Unshard root-managed params so casual_audio_encoder can run.
+        is_fsdp = hasattr(self, "unshard") and hasattr(self, "reshard")
+        if is_fsdp:
+            self.unshard()
         audio_input = torch.cat(
             [audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input],
             dim=-1,
@@ -1511,6 +1516,8 @@ class WanS2VTransformer3DModel(nn.Module):
         else:
             audio_emb = audio_emb_res
         result["audio_emb"] = audio_emb[:, motion_frames[1] :, :]
+        if is_fsdp:
+            self.reshard()
         return result
 
     def forward(
