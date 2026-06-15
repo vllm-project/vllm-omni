@@ -203,8 +203,13 @@ class DiffusionWorker:
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
-        # Create model runner using the platform-specified class
-        model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
+        # Create model runner. An od_config override (e.g. the BDE engine selecting
+        # BDEModelRunner) takes precedence; unset falls back to the platform default,
+        # so existing models are unaffected.
+        model_runner_cls_path = (
+            getattr(self.od_config, "diffusion_model_runner_cls", None)
+            or current_omni_platform.get_diffusion_model_runner_cls()
+        )
         model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
         self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,

@@ -554,6 +554,11 @@ class OmniDiffusionConfig:
     #                import path string.
     engine_backend: str = "default"
 
+    # Optional override for the diffusion model runner class (import path).
+    # The worker uses it instead of the platform default when set; the BDE engine
+    # sets it to BDEModelRunner. Unset -> platform default (existing behavior).
+    diffusion_model_runner_cls: str | None = None
+
     # HuggingFace specific parameters
     trust_remote_code: bool = False
     revision: str | None = None

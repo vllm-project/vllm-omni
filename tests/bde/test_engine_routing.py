@@ -12,7 +12,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.bde.engine import BDEEngine
+from vllm.utils.import_utils import resolve_obj_by_qualname
+
+from vllm_omni.bde.engine import (
+    BDE_MODEL_RUNNER_CLS,
+    BDEEngine,
+    apply_bde_runner_default,
+)
 from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
     default_engine_backend_for_model,
@@ -94,3 +100,36 @@ def test_dreamzero_default_routes_to_bde_engine():
     # to BDEEngine through the same dispatcher used by make_engine.
     backend = default_engine_backend_for_model("DreamZeroPipeline")
     assert DiffusionEngine.resolve_engine_class(_cfg(backend)) is BDEEngine
+
+
+# --- BDE worker/runner wiring -----------------------------------------------
+
+
+def test_bde_model_runner_cls_resolves():
+    cls = resolve_obj_by_qualname(BDE_MODEL_RUNNER_CLS)
+    assert cls.__name__ == "BDEModelRunner"
+
+
+def test_apply_runner_default_sets_when_unset():
+    cfg = SimpleNamespace(diffusion_model_runner_cls=None)
+    apply_bde_runner_default(cfg)
+    assert cfg.diffusion_model_runner_cls == BDE_MODEL_RUNNER_CLS
+
+
+def test_apply_runner_default_respects_explicit_choice():
+    cfg = SimpleNamespace(diffusion_model_runner_cls="my.custom.Runner")
+    apply_bde_runner_default(cfg)
+    assert cfg.diffusion_model_runner_cls == "my.custom.Runner"
+
+
+def test_config_runner_cls_field_defaults_none():
+    field = {f.name: f for f in fields(OmniDiffusionConfig)}["diffusion_model_runner_cls"]
+    assert field.default is None
+
+
+def test_worker_runner_selection_prefers_override():
+    # Mirrors the worker hook: an od_config override wins over the platform default.
+    over = SimpleNamespace(diffusion_model_runner_cls=BDE_MODEL_RUNNER_CLS)
+    assert (getattr(over, "diffusion_model_runner_cls", None) or "PLATFORM") == BDE_MODEL_RUNNER_CLS
+    unset = SimpleNamespace(diffusion_model_runner_cls=None)
+    assert (getattr(unset, "diffusion_model_runner_cls", None) or "PLATFORM") == "PLATFORM"
