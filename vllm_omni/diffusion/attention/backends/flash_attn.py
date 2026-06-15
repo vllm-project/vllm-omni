@@ -160,6 +160,42 @@ class FlashAttentionImpl(AttentionImpl):
         # (b s) h d -> b s h d
         return out.reshape(batch_size, q_len, *out.shape[1:])
 
+    def _forward_varlen_flat(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Run padding-free FlashAttention over flat packed dynamic Q/K/V."""
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            flash_attn_varlen_func,
+        )
+
+        if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+            raise ValueError("Flat varlen FlashAttention expects [total_tokens, heads, head_dim] Q/K/V.")
+        if attn_metadata.attn_mask is not None or attn_metadata.joint_attn_mask is not None:
+            raise ValueError("Flat varlen FlashAttention does not accept attention masks.")
+        if attn_metadata.padded_tokens != 0:
+            raise ValueError("Flat varlen FlashAttention requires padded_tokens=0.")
+        if attn_metadata.q_cu_seqlens is None or attn_metadata.kv_cu_seqlens is None:
+            raise ValueError("Flat varlen FlashAttention requires q_cu_seqlens and kv_cu_seqlens.")
+        if attn_metadata.max_q_len is None or attn_metadata.max_kv_len is None:
+            raise ValueError("Flat varlen FlashAttention requires max_q_len and max_kv_len.")
+
+        out = flash_attn_varlen_func(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=attn_metadata.q_cu_seqlens,
+            cu_seqlens_k=attn_metadata.kv_cu_seqlens,
+            max_seqlen_q=attn_metadata.max_q_len,
+            max_seqlen_k=attn_metadata.max_kv_len,
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
+        )
+        return self._unwrap_flash_output(out)
+
     def forward_cuda(
         self,
         query: torch.Tensor,
@@ -182,6 +218,9 @@ class FlashAttentionImpl(AttentionImpl):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+
+        if attn_metadata is not None and attn_metadata.is_varlen:
+            return self._forward_varlen_flat(query, key, value, attn_metadata)
 
         # Try piecewise attention
         if full_attn_spans is not None:
@@ -244,6 +283,9 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+
+        if attn_metadata is not None and attn_metadata.is_varlen:
+            return self._forward_varlen_flat(query, key, value, attn_metadata)
 
         if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(

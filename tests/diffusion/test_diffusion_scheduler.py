@@ -194,6 +194,82 @@ class TestGetSamplingParamsKey:
         b = get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
         assert a == b
 
+    @staticmethod
+    def _qwen_config() -> SimpleNamespace:
+        return SimpleNamespace(
+            step_execution=True,
+            max_num_seqs=2,
+            model_class_name="QwenImagePipeline",
+            model="Qwen/Qwen-Image",
+        )
+
+    @staticmethod
+    def _make_qwen(
+        *,
+        request_id: str,
+        height: int = 512,
+        width: int = 512,
+        negative_prompt: str | None = "low quality",
+        true_cfg_scale: float = 4.0,
+        lora_int_id: int | None = None,
+    ) -> OmniDiffusionRequest:
+        from vllm_omni.lora.request import LoRARequest
+
+        sp = OmniDiffusionSamplingParams(
+            num_inference_steps=2,
+            height=height,
+            width=width,
+            true_cfg_scale=true_cfg_scale,
+        )
+        if lora_int_id is not None:
+            sp.lora_request = LoRARequest(
+                lora_name=f"adapter-{lora_int_id}",
+                lora_int_id=lora_int_id,
+                lora_path=f"/tmp/lora-{lora_int_id}",
+            )
+        prompt = {"prompt": f"prompt-{request_id}"}
+        if negative_prompt is not None:
+            prompt["negative_prompt"] = negative_prompt
+        return OmniDiffusionRequest(
+            prompts=[prompt],
+            sampling_params=sp,
+            request_id=request_id,
+        )
+
+    def test_qwen_dynamic_admission_ignores_resolution_and_cfg_scalar(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        config = self._qwen_config()
+        a = get_sampling_params_key(
+            self._make_qwen(request_id="a", height=512, width=512, true_cfg_scale=4.0),
+            config,
+        )
+        b = get_sampling_params_key(
+            self._make_qwen(request_id="b", height=1024, width=1024, true_cfg_scale=7.0),
+            config,
+        )
+        assert a == b
+
+    def test_qwen_dynamic_admission_keeps_cfg_shape_and_lora(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+
+        config = self._qwen_config()
+        cfg = get_sampling_params_key(self._make_qwen(request_id="cfg"), config)
+        no_cfg = get_sampling_params_key(
+            self._make_qwen(request_id="no-cfg", negative_prompt=None),
+            config,
+        )
+        scale_one = get_sampling_params_key(
+            self._make_qwen(request_id="scale-one", true_cfg_scale=1.0),
+            config,
+        )
+        lora_1 = get_sampling_params_key(self._make_qwen(request_id="lora-1", lora_int_id=1), config)
+        lora_2 = get_sampling_params_key(self._make_qwen(request_id="lora-2", lora_int_id=2), config)
+
+        assert cfg != no_cfg
+        assert cfg != scale_one
+        assert lora_1 != lora_2
+
 
 class TestRequestScheduler:
     def setup_method(self) -> None:
@@ -276,6 +352,54 @@ class TestRequestScheduler:
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 0
 
+    def test_qwen_dynamic_batches_different_resolution_and_cfg_scale(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(TestGetSamplingParamsKey._qwen_config())
+
+        req_a = scheduler.add_request(
+            TestGetSamplingParamsKey._make_qwen(
+                request_id="a",
+                height=512,
+                width=512,
+                true_cfg_scale=4.0,
+            )
+        )
+        req_b = scheduler.add_request(
+            TestGetSamplingParamsKey._make_qwen(
+                request_id="b",
+                height=1024,
+                width=1024,
+                true_cfg_scale=7.0,
+            )
+        )
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_a, req_b]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 0
+
+    def test_qwen_dynamic_does_not_mix_cfg_disabled_scale_one(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                step_execution=True,
+                max_num_seqs=3,
+                model_class_name="QwenImagePipeline",
+                model="Qwen/Qwen-Image",
+            )
+        )
+
+        req_a = scheduler.add_request(TestGetSamplingParamsKey._make_qwen(request_id="a", true_cfg_scale=4.0))
+        scheduler.add_request(TestGetSamplingParamsKey._make_qwen(request_id="b", true_cfg_scale=1.0))
+        scheduler.add_request(TestGetSamplingParamsKey._make_qwen(request_id="c", true_cfg_scale=7.0))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_a]
+        assert sched_output.num_running_reqs == 1
+        assert sched_output.num_waiting_reqs == 2
+
     def test_incompatible_waiting_head_blocks_later_compatible_request(self) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=3))
@@ -284,7 +408,7 @@ class TestRequestScheduler:
         req_id_b = scheduler.add_request(
             OmniDiffusionRequest(
                 prompts=["prompt_b"],
-                sampling_params=OmniDiffusionSamplingParams(width=768),
+                sampling_params=OmniDiffusionSamplingParams(do_classifier_free_guidance=True),
                 request_id="b",
             )
         )
@@ -757,7 +881,7 @@ class TestStepScheduler:
             _make_step_request(
                 "b",
                 sampling_params=OmniDiffusionSamplingParams(
-                    height=768,
+                    do_classifier_free_guidance=True,
                     num_inference_steps=4,
                 ),
             )

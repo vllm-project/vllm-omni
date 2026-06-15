@@ -10,6 +10,32 @@ import torch
 from vllm_omni.platforms import current_omni_platform
 
 
+@dataclass(frozen=True)
+class AttentionSegment:
+    """Request-local semantic span used to split/gather dynamic attention.
+
+    This describes model semantics, not cache layout. Cache-specific block
+    tables and slot mappings stay on ``AttentionMetadata``.
+    """
+
+    request_id: str
+    request_index: int
+    role: str
+    packed_start: int
+    length: int
+    request_start: int = 0
+    branch: str = "positive"
+    position_id: str | None = None
+
+    @property
+    def packed_end(self) -> int:
+        return self.packed_start + self.length
+
+    @property
+    def request_end(self) -> int:
+        return self.request_start + self.length
+
+
 class AttentionBackend(ABC):
     """Abstract class for diffusion attention backends."""
 
@@ -53,6 +79,21 @@ class AttentionBackend(ABC):
 
 @dataclass
 class AttentionMetadata:
+    # Varlen execution contract. These fields are direct because attention
+    # backends consume them on the hot path.
+    q_cu_seqlens: torch.Tensor | None = None
+    kv_cu_seqlens: torch.Tensor | None = None
+    max_q_len: int | None = None
+    max_kv_len: int | None = None
+    q_segments: list[AttentionSegment] | None = None
+    kv_segments: list[AttentionSegment] | None = None
+    position: Any | None = None
+    padded_tokens: int = 0
+
+    # Future cache layout hooks, kept separate from AttentionSegment.
+    # block_table: torch.Tensor | None = None
+    # slot_mapping: torch.Tensor | None = None
+
     attn_mask: torch.Tensor | None = None
     joint_attn_mask: torch.Tensor | None = None
     # a joint mask for the joint query, key, and value, depends the joint_strategy
@@ -75,6 +116,10 @@ class AttentionMetadata:
     # Piecewise attention metadata (mixed causal/full masks).
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
     full_attn_spans: list[list[tuple[int, int]]] | None = None
+
+    @property
+    def is_varlen(self) -> bool:
+        return self.q_cu_seqlens is not None or self.kv_cu_seqlens is not None
 
 
 T = TypeVar("T", bound=AttentionMetadata)
@@ -109,6 +154,11 @@ class AttentionImpl(ABC, Generic[T]):
         if kv_cache_dtype is None:
             return True
         return kv_cache_dtype in cls._supported_kv_cache_dtypes.get(platform_key, set())
+
+    def get_kv_cache_spec(self, *args: Any, **kwargs: Any) -> None:
+        # TODO(kv-cache): attention implementations do not register cache specs
+        # for diffusion dynamic attention yet.
+        return None
 
     def forward(
         self,

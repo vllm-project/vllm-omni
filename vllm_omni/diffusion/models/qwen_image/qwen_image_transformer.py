@@ -41,7 +41,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
@@ -50,6 +50,15 @@ logger = init_logger(__name__)
 
 def _join_prefix(prefix: str, suffix: str) -> str:
     return f"{prefix}.{suffix}" if prefix else suffix
+
+
+def _get_qwen_image_attention_metadata(attention_id: str | None) -> AttentionMetadata | None:
+    if attention_id is None or not is_forward_context_available():
+        return None
+    metadata = get_forward_context().attn_metadata
+    if isinstance(metadata, dict):
+        return metadata.get(attention_id)
+    return None
 
 
 class ImageRopePrepare(nn.Module):
@@ -695,6 +704,94 @@ class QwenImageCrossAttention(nn.Module):
 
         return img_attn_output, txt_attn_output
 
+    def forward_dynamic(
+        self,
+        hidden_states: list[torch.Tensor],
+        encoder_hidden_states: list[torch.Tensor],
+        vid_freqs: list[torch.Tensor],
+        txt_freqs: list[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        flat_queries: list[torch.Tensor] = []
+        flat_keys: list[torch.Tensor] = []
+        flat_values: list[torch.Tensor] = []
+        image_lens: list[int] = []
+        text_lens: list[int] = []
+
+        q_size = self.query_num_heads * self.head_dim
+        kv_size = self.kv_num_heads * self.head_dim
+        add_q_size = self.add_query_num_heads * self.head_dim
+        add_kv_size = self.add_kv_num_heads * self.head_dim
+
+        for img_tokens, txt_tokens, img_freq, txt_freq in zip(
+            hidden_states,
+            encoder_hidden_states,
+            vid_freqs,
+            txt_freqs,
+            strict=True,
+        ):
+            img_qkv, _ = self.to_qkv(img_tokens)
+            img_query, img_key, img_value = img_qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+            txt_qkv, _ = self.add_kv_proj(txt_tokens)
+            txt_query, txt_key, txt_value = txt_qkv.split([add_q_size, add_kv_size, add_kv_size], dim=-1)
+
+            img_query = img_query.unflatten(-1, (self.query_num_heads, self.head_dim))
+            img_key = img_key.unflatten(-1, (self.kv_num_heads, self.head_dim))
+            img_value = img_value.unflatten(-1, (self.kv_num_heads, self.head_dim))
+
+            txt_query = txt_query.unflatten(-1, (self.add_query_num_heads, self.head_dim))
+            txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
+            txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
+
+            img_query = self.norm_q(img_query)
+            img_key = self.norm_k(img_key)
+            txt_query = self.norm_added_q(txt_query)
+            txt_key = self.norm_added_k(txt_key)
+
+            img_cos = img_freq.real.to(img_query.dtype)
+            img_sin = img_freq.imag.to(img_query.dtype)
+            txt_cos = txt_freq.real.to(txt_query.dtype)
+            txt_sin = txt_freq.imag.to(txt_query.dtype)
+
+            img_query = self.rope(img_query, img_cos, img_sin)
+            img_key = self.rope(img_key, img_cos, img_sin)
+            txt_query = self.rope(txt_query, txt_cos, txt_sin)
+            txt_key = self.rope(txt_key, txt_cos, txt_sin)
+
+            image_lens.append(int(img_query.shape[1]))
+            text_lens.append(int(txt_query.shape[1]))
+            flat_queries.append(torch.cat([txt_query.squeeze(0), img_query.squeeze(0)], dim=0))
+            flat_keys.append(torch.cat([txt_key.squeeze(0), img_key.squeeze(0)], dim=0))
+            flat_values.append(torch.cat([txt_value.squeeze(0), img_value.squeeze(0)], dim=0))
+
+        joint_query = torch.cat(flat_queries, dim=0)
+        joint_key = torch.cat(flat_keys, dim=0)
+        joint_value = torch.cat(flat_values, dim=0)
+
+        joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
+        joint_hidden_states = joint_hidden_states.flatten(1, 2).to(joint_query.dtype)
+
+        img_outputs: list[torch.Tensor] = []
+        txt_outputs: list[torch.Tensor] = []
+        offset = 0
+        for text_len, image_len in zip(text_lens, image_lens, strict=True):
+            txt_attn_output = joint_hidden_states[offset : offset + text_len].unsqueeze(0)
+            img_start = offset + text_len
+            img_attn_output = joint_hidden_states[img_start : img_start + image_len].unsqueeze(0)
+            offset = img_start + image_len
+
+            img_outputs.append(self.to_out(img_attn_output))
+            txt_outputs.append(self.to_add_out(txt_attn_output))
+
+        if offset != int(joint_hidden_states.shape[0]):
+            raise ValueError(
+                f"Dynamic Qwen-Image attention consumed {offset} tokens, "
+                f"but produced {joint_hidden_states.shape[0]} tokens."
+            )
+
+        return img_outputs, txt_outputs
+
 
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
@@ -885,6 +982,67 @@ class QwenImageTransformerBlock(nn.Module):
 
         return encoder_hidden_states, hidden_states
 
+    def forward_dynamic(
+        self,
+        hidden_states: list[torch.Tensor],
+        encoder_hidden_states: list[torch.Tensor],
+        temb: torch.Tensor,
+        image_rotary_emb: tuple[list[torch.Tensor], list[torch.Tensor]],
+        attn_metadata: AttentionMetadata,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        if self.zero_cond_t:
+            raise ValueError("Qwen-Image dynamic step batching does not support zero_cond_t/edit blocks yet.")
+
+        img_modulated: list[torch.Tensor] = []
+        txt_modulated: list[torch.Tensor] = []
+        img_gate1: list[torch.Tensor] = []
+        txt_gate1: list[torch.Tensor] = []
+        img_mod2_by_request: list[torch.Tensor] = []
+        txt_mod2_by_request: list[torch.Tensor] = []
+        for index, (img_tokens, txt_tokens) in enumerate(zip(hidden_states, encoder_hidden_states, strict=True)):
+            img_mod1, img_mod2 = self.img_mod(temb[index : index + 1]).chunk(2, dim=-1)
+            txt_mod1, txt_mod2 = self.txt_mod(temb[index : index + 1]).chunk(2, dim=-1)
+            img_scale1, img_shift1, img_gate = self._modulate(img_mod1)
+            txt_scale1, txt_shift1, txt_gate = self._modulate(txt_mod1)
+            img_modulated.append(self.img_norm1(img_tokens, img_scale1, img_shift1))
+            txt_modulated.append(self.txt_norm1(txt_tokens, txt_scale1, txt_shift1))
+            img_gate1.append(img_gate)
+            txt_gate1.append(txt_gate)
+            img_mod2_by_request.append(img_mod2)
+            txt_mod2_by_request.append(txt_mod2)
+
+        img_attn_output, txt_attn_output = self.attn.forward_dynamic(
+            hidden_states=img_modulated,
+            encoder_hidden_states=txt_modulated,
+            vid_freqs=image_rotary_emb[0],
+            txt_freqs=image_rotary_emb[1],
+            attn_metadata=attn_metadata,
+        )
+
+        next_hidden_states: list[torch.Tensor] = []
+        next_encoder_hidden_states: list[torch.Tensor] = []
+        for index, (img_tokens, txt_tokens, img_attn, txt_attn) in enumerate(
+            zip(hidden_states, encoder_hidden_states, img_attn_output, txt_attn_output, strict=True)
+        ):
+            img_tokens = img_tokens + img_gate1[index] * img_attn
+            txt_tokens = txt_tokens + txt_gate1[index] * txt_attn
+
+            img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2_by_request[index])
+            txt_scale2, txt_shift2, txt_gate2 = self._modulate(txt_mod2_by_request[index])
+
+            img_tokens = img_tokens + img_gate2 * self.img_mlp(self.img_norm2(img_tokens, img_scale2, img_shift2))
+            txt_tokens = txt_tokens + txt_gate2 * self.txt_mlp(self.txt_norm2(txt_tokens, txt_scale2, txt_shift2))
+
+            if txt_tokens.dtype == torch.float16:
+                txt_tokens = txt_tokens.clip(-65504, 65504)
+            if img_tokens.dtype == torch.float16:
+                img_tokens = img_tokens.clip(-65504, 65504)
+
+            next_hidden_states.append(img_tokens)
+            next_encoder_hidden_states.append(txt_tokens)
+
+        return next_encoder_hidden_states, next_hidden_states
+
 
 # Note: inheriting from CachedTransformer only when we support caching
 class QwenImageTransformer2DModel(CachedTransformer):
@@ -1059,9 +1217,144 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Only active when zero_cond_t=True (image editing models)
         self.modulate_index_prepare = ModulateIndexPrepare(zero_cond_t=zero_cond_t)
 
+    def _forward_dynamic(
+        self,
+        hidden_states: list[torch.Tensor],
+        encoder_hidden_states: torch.Tensor | list[torch.Tensor],
+        encoder_hidden_states_mask: torch.Tensor | None,
+        timestep: torch.LongTensor,
+        img_shapes: list[tuple[int, int, int]] | None,
+        txt_seq_lens: list[int] | None,
+        guidance: torch.Tensor | None,
+        attention_kwargs: dict[str, Any] | None,
+        additional_t_cond=None,
+    ) -> Transformer2DModelOutput:
+        if self.zero_cond_t:
+            raise ValueError("Qwen-Image dynamic step batching does not support zero_cond_t/edit mode yet.")
+        sp_size = (
+            1 if self.parallel_config is None else (getattr(self.parallel_config, "sequence_parallel_size", 1) or 1)
+        )
+        if sp_size > 1:
+            raise ValueError("Qwen-Image dynamic step batching does not support sequence parallelism yet.")
+
+        attention_id = None if attention_kwargs is None else attention_kwargs.get("attention_id")
+        attn_metadata = _get_qwen_image_attention_metadata(attention_id)
+        if attn_metadata is None or not attn_metadata.is_varlen:
+            raise ValueError("Qwen-Image dynamic forward requires varlen AttentionMetadata.")
+        if attn_metadata.padded_tokens != 0:
+            raise ValueError("Qwen-Image dynamic forward requires padded_tokens=0.")
+        if encoder_hidden_states is None:
+            raise ValueError("Qwen-Image dynamic forward requires encoder_hidden_states.")
+        if timestep is None:
+            raise ValueError("Qwen-Image dynamic forward requires timestep.")
+
+        batch_size = len(hidden_states)
+        if batch_size == 0:
+            raise ValueError("Qwen-Image dynamic forward received an empty batch.")
+        if txt_seq_lens is None:
+            if encoder_hidden_states_mask is None:
+                if not torch.is_tensor(encoder_hidden_states):
+                    raise ValueError("txt_seq_lens is required when dynamic text embeddings are provided as a list.")
+                txt_seq_lens = [int(encoder_hidden_states.shape[1])] * batch_size
+            else:
+                txt_seq_lens = encoder_hidden_states_mask.sum(dim=1, dtype=torch.int32).tolist()
+        if len(txt_seq_lens) != batch_size:
+            raise ValueError(f"Expected {batch_size} text sequence lengths, got {len(txt_seq_lens)}.")
+
+        if img_shapes is None:
+            position = attn_metadata.position if isinstance(attn_metadata.position, dict) else {}
+            img_shapes = position.get("img_shapes")
+        if img_shapes is None or len(img_shapes) != batch_size:
+            raise ValueError(f"Expected {batch_size} image shape entries for dynamic Qwen-Image forward.")
+
+        device = hidden_states[0].device
+        dtype = hidden_states[0].dtype
+        for tensor in hidden_states:
+            if tensor.ndim != 3 or tensor.shape[0] != 1:
+                raise ValueError("Dynamic Qwen-Image hidden states must be [1, image_tokens, channels].")
+            if tensor.device != device or tensor.dtype != dtype:
+                raise ValueError("Dynamic Qwen-Image hidden states must share device and dtype.")
+
+        image_states: list[torch.Tensor] = []
+        image_freqs: list[torch.Tensor] = []
+        text_freqs: list[torch.Tensor] = []
+        for tensor, image_shape, txt_len in zip(hidden_states, img_shapes, txt_seq_lens, strict=True):
+            image_tokens = self.img_in(tensor)
+            vid_freq, txt_freq = self.pos_embed(image_shape, [int(txt_len)], device=image_tokens.device)
+            if int(vid_freq.shape[0]) != int(image_tokens.shape[1]):
+                raise ValueError(
+                    f"Qwen-Image dynamic RoPE image length {vid_freq.shape[0]} "
+                    f"does not match hidden length {image_tokens.shape[1]}."
+                )
+            image_states.append(image_tokens)
+            image_freqs.append(vid_freq)
+            text_freqs.append(txt_freq[: int(txt_len)])
+
+        text_states: list[torch.Tensor] = []
+        if torch.is_tensor(encoder_hidden_states):
+            if encoder_hidden_states.shape[0] != batch_size:
+                raise ValueError(f"Expected {batch_size} encoder rows, got {int(encoder_hidden_states.shape[0])}.")
+            for index, txt_len in enumerate(txt_seq_lens):
+                text_states.append(encoder_hidden_states[index : index + 1, : int(txt_len)])
+        else:
+            if len(encoder_hidden_states) != batch_size:
+                raise ValueError(f"Expected {batch_size} encoder tensors, got {len(encoder_hidden_states)}.")
+            for tensor, txt_len in zip(encoder_hidden_states, txt_seq_lens, strict=True):
+                text_states.append(tensor[:, : int(txt_len)])
+        text_states = [self.txt_in(self.txt_norm(tensor)) for tensor in text_states]
+
+        timestep = timestep.to(device=device, dtype=dtype)
+        if timestep.ndim == 0:
+            timestep = timestep.reshape(1).expand(batch_size)
+        elif int(timestep.numel()) != batch_size:
+            raise ValueError(f"Expected {batch_size} timesteps, got {int(timestep.numel())}.")
+        timestep = timestep.reshape(batch_size)
+
+        if guidance is not None:
+            guidance = guidance.to(device=device, dtype=dtype) * 1000
+
+        temb_values: list[torch.Tensor] = []
+        for index, image_tokens in enumerate(image_states):
+            additional_t_cond_i = None if additional_t_cond is None else additional_t_cond[index : index + 1]
+            if guidance is None:
+                temb_values.append(
+                    self.time_text_embed(
+                        timestep[index : index + 1],
+                        image_tokens,
+                        additional_t_cond_i,
+                    )
+                )
+            else:
+                temb_values.append(
+                    self.time_text_embed(
+                        timestep[index : index + 1],
+                        guidance[index : index + 1],
+                        image_tokens,
+                        additional_t_cond_i,
+                    )
+                )
+        temb = torch.cat(temb_values, dim=0)
+
+        image_rotary_emb = (image_freqs, text_freqs)
+        for block in self.transformer_blocks:
+            text_states, image_states = block.forward_dynamic(
+                hidden_states=image_states,
+                encoder_hidden_states=text_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                attn_metadata=attn_metadata,
+            )
+
+        outputs: list[torch.Tensor] = []
+        for index, image_tokens in enumerate(image_states):
+            output = self.proj_out(self.norm_out(image_tokens, temb[index : index + 1]))
+            outputs.append(output)
+
+        return Transformer2DModelOutput(sample=outputs)
+
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | list[torch.Tensor],
         encoder_hidden_states: torch.Tensor = None,
         encoder_hidden_states_mask: torch.Tensor = None,
         timestep: torch.LongTensor = None,
@@ -1101,6 +1394,19 @@ class QwenImageTransformer2DModel(CachedTransformer):
         #     lora_scale = attention_kwargs.pop("scale", 1.0)
         # else:
         #     lora_scale = 1.0
+
+        if isinstance(hidden_states, (list, tuple)):
+            return self._forward_dynamic(
+                hidden_states=list(hidden_states),
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                timestep=timestep,
+                img_shapes=img_shapes,
+                txt_seq_lens=txt_seq_lens,
+                guidance=guidance,
+                attention_kwargs=attention_kwargs,
+                additional_t_cond=additional_t_cond,
+            )
 
         # Set split_text_embed_in_sp = False for dual-stream attention
         # QwenImage uses *dual-stream* (text + image) and runs a *joint attention*.

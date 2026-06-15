@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import fields
 
 from vllm.logger import init_logger
 
@@ -22,21 +21,35 @@ from vllm_omni.diffusion.sched.interface import (
 
 logger = init_logger(__name__)
 
-# LoRA identity is derived from `sampling.lora_request`, not a same-named field
-# on sampling params, so it must be resolved separately from the bulk lookup.
-_KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {"lora_int_id"}
 
-
-def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey | None:
+def get_sampling_params_key(
+    request: OmniDiffusionRequest,
+    od_config: OmniDiffusionConfig | None = None,
+) -> SamplingParamsKey | None:
     """Build a batch-compatibility key from the request's sampling params."""
     if len(request.prompts) != 1:
         return None
 
     sampling = request.sampling_params
     lora_request = getattr(sampling, "lora_request", None)
+    do_classifier_free_guidance = getattr(sampling, "do_classifier_free_guidance", False)
+
+    if (
+        od_config is not None
+        and getattr(od_config, "step_execution", False)
+        and getattr(od_config, "model_class_name", None) == "QwenImagePipeline"
+    ):
+        true_cfg_scale = getattr(sampling, "true_cfg_scale", None)
+        true_cfg_scale = 4.0 if true_cfg_scale is None else true_cfg_scale
+        has_negative_prompt = any(
+            not isinstance(prompt, str) and prompt.get("negative_prompt") is not None for prompt in request.prompts
+        )
+        do_classifier_free_guidance = true_cfg_scale > 1 and has_negative_prompt
+
     return SamplingParamsKey(
+        do_classifier_free_guidance=do_classifier_free_guidance,
         lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
-        **{name: getattr(sampling, name) for name in _KEY_FIELD_NAMES},
+        lora_scale=getattr(sampling, "lora_scale", 1.0),
     )
 
 
@@ -230,7 +243,7 @@ class _BaseScheduler(SchedulerInterface):
         return DiffusionRequestState(
             request_id=request_id,
             req=request,
-            sampling_params_key=get_sampling_params_key(request),
+            sampling_params_key=get_sampling_params_key(request, self.od_config),
         )
 
     def _can_schedule_waiting(self, state: DiffusionRequestState) -> bool:

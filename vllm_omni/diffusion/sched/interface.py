@@ -42,23 +42,10 @@ class SamplingParamsKey:
     participate in the current homogeneous batching policy.
     """
 
-    # Spatial / temporal shape.
-    height: int | None = None
-    width: int | None = None
-    num_frames: int = 1
-    resolution: int | str | None = None
-    fps: int | None = None
-    frame_rate: float | None = None
-    boundary_ratio: float | None = None
+    # Spatial / temporal shape can be deleted
 
-    # CFG / guidance.
+    # CFG / guidance can be deleted
     do_classifier_free_guidance: bool = False
-    guidance_scale: float = 0.0
-    guidance_scale_provided: bool = False
-    guidance_scale_2: float | None = None
-    guidance_rescale: float = 0.0
-    true_cfg_scale: float | None = None
-    cfg_normalize: bool = False
 
     # LoRA identity. Requests with different adapters or scales must run in
     # separate batches so the worker can activate exactly one adapter per step.

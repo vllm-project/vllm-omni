@@ -14,7 +14,6 @@ import copy
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any
 
 import torch
 from torch.profiler import record_function
@@ -22,6 +21,8 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, AttentionSegment
+from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
@@ -352,6 +353,44 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
+    def _supports_qwen_image_dynamic_step_batching(self) -> bool:
+        if self.pipeline is None:
+            return False
+        if not getattr(self.od_config, "step_execution", False):
+            return False
+        try:
+            if int(getattr(self.od_config, "max_num_seqs", 1)) <= 1:
+                return False
+        except (TypeError, ValueError):
+            return False
+        cls = self.pipeline.__class__
+        return cls.__name__ == "QwenImagePipeline" and "qwen_image" in cls.__module__
+
+    def _validate_qwen_image_dynamic_step_batch(self, input_batch: InputBatch) -> None:
+        if not input_batch.is_dynamic:
+            return
+        if not self._supports_qwen_image_dynamic_step_batching():
+            raise ValueError("Dynamic step batching is only enabled for QwenImagePipeline.")
+        if not self.od_config.enforce_eager:
+            raise ValueError("Qwen-Image dynamic step batching requires enforce_eager=True in the first version.")
+        if getattr(self.od_config, "cache_backend", "none") not in (None, "none"):
+            raise ValueError("Qwen-Image dynamic step batching does not support diffusion cache backends yet.")
+        if getattr(self.od_config, "diffusion_kv_cache_dtype", None) is not None:
+            raise ValueError("Qwen-Image dynamic step batching does not support diffusion KV cache yet.")
+        parallel_config = self.od_config.parallel_config
+        if getattr(parallel_config, "sequence_parallel_size", 1) not in (None, 1):
+            raise ValueError("Qwen-Image dynamic step batching does not support sequence parallelism yet.")
+        if getattr(parallel_config, "ring_degree", 1) != 1:
+            raise ValueError("Qwen-Image dynamic step batching does not support ring attention yet.")
+        if getattr(parallel_config, "cfg_parallel_size", 1) != 1:
+            raise ValueError("Qwen-Image dynamic step batching does not support CFG parallelism yet.")
+        if getattr(parallel_config, "use_hsdp", False):
+            raise ValueError("Qwen-Image dynamic step batching does not support HSDP yet.")
+
+        for module in self.pipeline.modules():
+            if isinstance(module, Attention) and module.attn_backend.get_name() != "FLASH_ATTN":
+                raise ValueError("Qwen-Image dynamic step batching requires FlashAttention backend.")
+
     def _update_states(
         self, scheduler_output: DiffusionSchedulerOutput
     ) -> tuple[list[DiffusionRequestState], list[str]]:
@@ -409,7 +448,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         input_batch = InputBatch.make_batch(
             states,
             cached_batch=getattr(self, "input_batch", None),
+            allow_dynamic=self._supports_qwen_image_dynamic_step_batching(),
         )
+        self._validate_qwen_image_dynamic_step_batch(input_batch)
         self.input_batch = input_batch
         return input_batch
 
@@ -420,6 +461,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         interrupted: bool = False,
     ):
         """Step-after update: clear cached state for completed request."""
+        if input_batch.is_dynamic:
+            self.input_batch = input_batch
+            for state in states:
+                if interrupted or state.denoise_completed:
+                    self.state_cache.pop(state.request_id, None)
+            return
+
         gathered_latents = torch.cat([state.latents for state in states], dim=0)
         if (
             input_batch.latents.size() == gathered_latents.size()
@@ -437,14 +485,133 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if interrupted or state.denoise_completed:
                 self.state_cache.pop(state.request_id, None)
 
-    def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
+    def _make_qwen_image_metadata(
+        self,
+        input_batch: InputBatch,
+        *,
+        branch: str,
+    ) -> AttentionMetadata:
+        if input_batch.dynamic_latents is not None:
+            device = input_batch.dynamic_latents[0].device
+            image_lens = [int(value.shape[1]) for value in input_batch.dynamic_latents]
+        elif input_batch.latents is not None:
+            device = input_batch.latents.device
+            image_lens = [int(input_batch.latents.shape[1])] * int(input_batch.latents.shape[0])
+        else:
+            raise ValueError("Cannot build Qwen-Image attention metadata without latents.")
+
+        row_requests: list[tuple[str, int, int]] = []
+        for span in input_batch.request_spans:
+            for row_in_request in range(span.row_count):
+                row_requests.append((span.request_id, span.request_index, row_in_request))
+
+        if branch == "negative":
+            txt_lens = input_batch.negative_txt_seq_lens
+        else:
+            txt_lens = input_batch.txt_seq_lens
+        if txt_lens is None:
+            embeds = input_batch.negative_prompt_embeds if branch == "negative" else input_batch.prompt_embeds
+            txt_lens = [int(embeds.shape[1])] * len(row_requests)
+        elif len(txt_lens) == input_batch.num_reqs and len(row_requests) != input_batch.num_reqs:
+            txt_lens = [
+                int(txt_lens[span.request_index]) for span in input_batch.request_spans for _ in range(span.row_count)
+            ]
+        if len(txt_lens) != len(row_requests) or len(image_lens) != len(row_requests):
+            raise ValueError(
+                "Qwen-Image attention metadata row count mismatch: "
+                f"rows={len(row_requests)}, text_lens={len(txt_lens)}, image_lens={len(image_lens)}."
+            )
+
+        lengths: list[int] = []
+        segments: list[AttentionSegment] = []
+        offset = 0
+        for (request_id, request_index, row_in_request), txt_len, image_len in zip(
+            row_requests, txt_lens, image_lens, strict=True
+        ):
+            txt_len = int(txt_len)
+            image_len = int(image_len)
+            position_suffix = f"{request_id}:{row_in_request}"
+            if txt_len:
+                segments.append(
+                    AttentionSegment(
+                        request_id=request_id,
+                        request_index=request_index,
+                        branch=branch,
+                        role="text" if branch == "positive" else "negative_text",
+                        packed_start=offset,
+                        length=txt_len,
+                        request_start=0,
+                        position_id=f"{position_suffix}:{branch}:text",
+                    )
+                )
+            if image_len:
+                segments.append(
+                    AttentionSegment(
+                        request_id=request_id,
+                        request_index=request_index,
+                        branch=branch,
+                        role="image",
+                        packed_start=offset + txt_len,
+                        length=image_len,
+                        request_start=0,
+                        position_id=f"{position_suffix}:image",
+                    )
+                )
+            total_len = txt_len + image_len
+            lengths.append(total_len)
+            offset += total_len
+
+        cu_values = [0]
+        for length in lengths:
+            cu_values.append(cu_values[-1] + int(length))
+        cu_seqlens = torch.tensor(cu_values, dtype=torch.int32, device=device)
+        max_len = max(lengths) if lengths else 0
+        return AttentionMetadata(
+            q_cu_seqlens=cu_seqlens,
+            kv_cu_seqlens=cu_seqlens,
+            max_q_len=max_len,
+            max_kv_len=max_len,
+            q_segments=segments,
+            kv_segments=segments,
+            position={
+                "kind": "qwen_image_rope_plan",
+                "branch": branch,
+                "img_shapes": input_batch.img_shapes,
+                "txt_seq_lens": txt_lens,
+            },
+            padded_tokens=0,
+            extra={
+                "attention_id": f"qwen_image.joint.{branch}",
+                "qwen_image_dynamic": input_batch.is_dynamic,
+                "request_ids": tuple(input_batch.request_ids),
+                "lengths": tuple(lengths),
+                "num_rows": len(row_requests),
+            },
+        )
+
+    def _prepare_attn_metadata(self, input_batch: InputBatch) -> dict[str, AttentionMetadata]:
+        if self._supports_qwen_image_dynamic_step_batching():
+            metadata = {
+                "qwen_image.joint.positive": self._make_qwen_image_metadata(
+                    input_batch,
+                    branch="positive",
+                )
+            }
+            if input_batch.do_true_cfg:
+                metadata["qwen_image.joint.negative"] = self._make_qwen_image_metadata(
+                    input_batch,
+                    branch="negative",
+                )
+            return metadata
+
         model_state = getattr(self, "model_state", None)
         if model_state is None:
             return {}
         prepare_attn = getattr(model_state, "prepare_attn", None)
         if not callable(prepare_attn):
             return {}
-        return prepare_attn(input_batch)
+        metadata = prepare_attn(input_batch)
+        return metadata if isinstance(metadata, dict) else {}
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
@@ -486,12 +653,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                 else:
                     offset = 0
-                    for req in states:
-                        row_num = req.latents.shape[0]
-                        self.pipeline.step_scheduler(
-                            req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                        )
-                        offset = offset + row_num
+                    if input_batch.is_dynamic and noise_pred is not None:
+                        if not isinstance(noise_pred, list) or len(noise_pred) != len(states):
+                            raise ValueError("Dynamic stepwise denoise must return one noise tensor per request.")
+
+                    for req_idx, req in enumerate(states):
+                        if input_batch.is_dynamic:
+                            req_noise_pred = None if noise_pred is None else noise_pred[req_idx]
+                        else:
+                            row_num = req.latents.shape[0]
+                            req_noise_pred = noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                            offset = offset + row_num
+                        self.pipeline.step_scheduler(req, req_noise_pred)
                         if req.denoise_completed:
                             result = self.pipeline.post_decode(req)
                         else:
@@ -505,7 +678,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             )
                         )
 
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
+                    if not input_batch.is_dynamic and noise_pred is not None and offset != noise_pred.shape[0]:
                         raise ValueError(
                             f"Stepwise noise_pred consumed {offset} rows, "
                             f"but batched noise_pred has {noise_pred.shape[0]} rows."
