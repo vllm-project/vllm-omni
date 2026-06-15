@@ -11,7 +11,12 @@ import re
 from enum import Enum, Flag, StrEnum, auto
 from typing import Literal, TypeAlias
 
-FinalOutputModalityType: TypeAlias = Literal["text", "image", "audio", "video"]
+FinalOutputModalityType: TypeAlias = Literal[
+    "text", "image", "audio", "video",
+    # 3D reconstruction modalities (LingBot-MAP and similar models).
+    # Composable via "+" — e.g. "depth+pose", "campointmap+pose+confidence".
+    "pointmap", "campointmap", "depth", "pose", "confidence",
+]
 
 _MODALITY_ALIASES: dict[str, str] = {
     "speech": "audio",
@@ -23,6 +28,19 @@ _MODALITY_ALIASES: dict[str, str] = {
     "pixels": "image",
     "token_ids": "text",
     "tokens": "text",
+    # 3D modality aliases
+    "point_map": "pointmap",
+    "pointmaps": "pointmap",
+    "cam_pointmap": "campointmap",
+    "campointmaps": "campointmap",
+    "camera_pointmap": "campointmap",
+    "depths": "depth",
+    "depth_map": "depth",
+    "poses": "pose",
+    "extrinsic": "pose",
+    "extrinsics": "pose",
+    "confidences": "confidence",
+    "conf": "confidence",
 }
 
 
@@ -37,13 +55,29 @@ class OutputModalityNames(StrEnum):
     IMAGE = "image"
     AUDIO = "audio"
     LATENT = "latent"
+    # 3D primitives
+    POINTMAP = "pointmap"
+    CAMPOINTMAP = "campointmap"
+    DEPTH = "depth"
+    POSE = "pose"
+    CONFIDENCE = "confidence"
 
 
 # Specify which output modalities may be drained when handling delta messages.
 # For some types, e.g., latents, we need to be careful to ensure the full context
 # is passed as the stream yields due to assumptions in the I/O processing and model
 # when async chunk isn't enabled.
-NON_DRAINABLE_MODALITIES = {OutputModalityNames.TEXT, OutputModalityNames.LATENT}
+# 3D outputs are frame-aligned dense tensors (depth maps, point clouds) that must
+# be delivered as a complete payload — treat them like LATENT (non-drainable).
+NON_DRAINABLE_MODALITIES = {
+    OutputModalityNames.TEXT,
+    OutputModalityNames.LATENT,
+    OutputModalityNames.POINTMAP,
+    OutputModalityNames.CAMPOINTMAP,
+    OutputModalityNames.DEPTH,
+    OutputModalityNames.POSE,
+    OutputModalityNames.CONFIDENCE,
+}
 DRAINABLE_MODALITIES = {mod for mod in OutputModalityNames if mod not in NON_DRAINABLE_MODALITIES}
 
 
@@ -55,6 +89,11 @@ class OutputModality(Flag):
     Single:   ``OutputModality.TEXT``, ``OutputModality.IMAGE``, ...
     Compound: ``OutputModality.TEXT | OutputModality.IMAGE``  (text+image)
 
+    3D reconstruction compounds supported via the same Flag mechanism:
+        "pointmap", "depth+pose", "campointmap+pose",
+        "pointmap+confidence", "depth+pose+confidence",
+        "campointmap+pose+confidence"
+
     Note: POOLING is intentionally excluded. Pooling/embedding is vLLM's
     native path (pooling_output → PoolingRequestOutput), handled entirely
     by the base OutputProcessor. vLLM-Omni's layer does not participate.
@@ -64,6 +103,12 @@ class OutputModality(Flag):
     IMAGE = auto()
     AUDIO = auto()
     LATENT = auto()
+    # 3D primitives (LingBot-MAP and similar 3D-reconstruction models).
+    POINTMAP = auto()
+    CAMPOINTMAP = auto()
+    DEPTH = auto()
+    POSE = auto()
+    CONFIDENCE = auto()
 
     @classmethod
     def from_string(cls, s: str | None) -> OutputModality:
@@ -114,10 +159,25 @@ class TensorAccumulationStrategy(Enum):
     """Replace previous tensor entirely with the latest one."""
 
 
+_THREE_D_FLAGS = (
+    OutputModality.POINTMAP
+    | OutputModality.CAMPOINTMAP
+    | OutputModality.DEPTH
+    | OutputModality.POSE
+    | OutputModality.CONFIDENCE
+)
+
+
 def get_accumulation_strategy(modality: OutputModality) -> TensorAccumulationStrategy:
     """Determine tensor merge strategy from the multimodal flags."""
     if OutputModality.AUDIO in modality:
         return TensorAccumulationStrategy.CONCAT_LAST
     if OutputModality.IMAGE in modality or OutputModality.LATENT in modality:
+        return TensorAccumulationStrategy.CONCAT_DIM0
+    # 3D outputs (depth/pose/pointmap/campointmap/confidence) are produced
+    # one-shot by 3D-reconstruction pipelines and arrive as a single
+    # [S, ...] tensor per request. CONCAT_DIM0 is the safe default for
+    # multi-chunk delivery (frame dimension is dim 0).
+    if modality & _THREE_D_FLAGS:
         return TensorAccumulationStrategy.CONCAT_DIM0
     return TensorAccumulationStrategy.CONCAT_DIM0  # default
