@@ -170,6 +170,14 @@ class SchedulerInterface(ABC):
         """Return whether the scheduler still owns runnable requests."""
 
     @abstractmethod
+    def num_waiting_requests(self) -> int:
+        """Return the number of requests waiting to be scheduled."""
+
+    @abstractmethod
+    def num_running_requests(self) -> int:
+        """Return the number of requests currently running."""
+
+    @abstractmethod
     def pop_request_state(self, request_id: str) -> DiffusionRequestState | None:
         """Remove and return request state if present."""
 

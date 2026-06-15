@@ -127,6 +127,12 @@ class _StubScheduler(SchedulerInterface):
     def has_requests(self) -> bool:
         return not self._scheduled
 
+    def num_waiting_requests(self) -> int:
+        return 0 if self._scheduled else 1
+
+    def num_running_requests(self) -> int:
+        return 1 if self._scheduled else 0
+
     def get_request_state(self, request_id: str):
         del request_id
         return self._state

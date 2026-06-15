@@ -622,6 +622,12 @@ class OmniDiffusionConfig:
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
+    # Request-mode batch admission: wait briefly for compatible requests to
+    # accumulate in the scheduler waiting queue before the first schedule() of
+    # a wave.  Improves fused forward batch sizes under bursty HTTP ingress.
+    # 0 disables admission (default; no added latency).
+    request_batch_max_wait_ms: float = 0.0
+
     # Supplementary model specific parameters
     extras: dict[str, Any] = Field(default_factory=dict)
 

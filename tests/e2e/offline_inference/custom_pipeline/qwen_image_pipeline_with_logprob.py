@@ -33,6 +33,8 @@ def _maybe_to_cpu(v):
 # Custom pipeline class for QwenImage that returns log probabilities during the diffusion process.
 # This is for test
 class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
+    supports_request_batch = False
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
         self.device = get_local_device()

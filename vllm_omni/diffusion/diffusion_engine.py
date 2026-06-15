@@ -101,11 +101,57 @@ def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) ->
     )
 
 
+def _is_diffusion_output_list_annotation(annotation: object) -> bool:
+    if annotation is inspect.Parameter.empty:
+        return False
+    if getattr(annotation, "__origin__", None) is list:
+        args = getattr(annotation, "__args__", ())
+        if args and getattr(args[0], "__name__", "") == "DiffusionOutput":
+            return True
+    ann_text = str(annotation).replace(" ", "")
+    return "list[" in ann_text and "DiffusionOutput" in ann_text
+
+
+def _pipeline_forward_is_request_batch_capable(pipeline_cls: type) -> bool:
+    """Validate that the effective forward() implements the request-batch contract.
+
+    Custom pipeline subclasses may inherit ``supports_request_batch = True`` from
+    a batch-capable parent while overriding ``forward`` with the legacy
+    single-request API. Those pipelines must not route through execute_batch.
+    """
+    if not getattr(pipeline_cls, "supports_request_batch", False):
+        return False
+
+    forward = pipeline_cls.__dict__.get("forward")
+    if forward is None:
+        return True
+
+    try:
+        signature = inspect.signature(forward)
+    except (TypeError, ValueError):
+        return False
+
+    parameters = list(signature.parameters.values())
+    if len(parameters) >= 2:
+        req_annotation = parameters[1].annotation
+        if req_annotation is not inspect.Parameter.empty:
+            req_name = getattr(req_annotation, "__name__", str(req_annotation))
+            if req_name == "OmniDiffusionRequest":
+                return False
+
+    return_annotation = signature.return_annotation
+    if return_annotation is DiffusionOutput:
+        return False
+    return _is_diffusion_output_list_annotation(return_annotation)
+
+
 def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
     model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
     if model_cls is None:
         model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
-    return bool(model_cls is not None and getattr(model_cls, "supports_request_batch", False))
+    if model_cls is None:
+        return False
+    return _pipeline_forward_is_request_batch_capable(model_cls)
 
 
 def _move_tensor_tree_to_cpu(value: object) -> object:
@@ -190,6 +236,13 @@ class DiffusionEngine:
             self.execute_fn = self.executor.execute_batch
         else:
             self.execute_fn = self.executor.execute_request
+
+        if self.supports_request_batch:
+            logger.info(
+                "[RequestBatch] engine init max_num_seqs=%s max_wait_ms=%s",
+                getattr(od_config, "max_num_seqs", None),
+                getattr(od_config, "request_batch_max_wait_ms", None),
+            )
 
         try:
             self._dummy_run()
@@ -345,6 +398,9 @@ class DiffusionEngine:
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
+                if self.supports_request_batch:
+                    self._wait_for_request_batch_admission_locked()
+
                 sched_output = self.scheduler.schedule()
 
             if sched_output.is_empty:
@@ -376,6 +432,61 @@ class DiffusionEngine:
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
+
+    def _wait_for_request_batch_admission_locked(self) -> None:
+        """Wait for compatible requests to accumulate before scheduling a wave.
+
+        Caller must hold ``self._cv``.
+        """
+        if self.step_execution or not self.supports_request_batch:
+            return
+
+        max_wait_s = float(getattr(self.od_config, "request_batch_max_wait_ms", 0.0) or 0.0) / 1000.0
+        if max_wait_s <= 0:
+            return
+
+        max_batch = self.scheduler.max_num_running_reqs
+        waiting = self.scheduler.num_waiting_requests()
+        running = self.scheduler.num_running_requests()
+
+        if running > 0:
+            return
+
+        start = time.monotonic()
+        deadline = start + max_wait_s
+        last_waiting = -1
+        stable_since = start
+        # Require a short idle period with no queue growth so bursty HTTP
+        # ingress can land before the first schedule() of a wave.
+        stable_window_s = min(0.05, max_wait_s / 5.0)
+
+        while not self.stop_event.is_set():
+            waiting = self.scheduler.num_waiting_requests()
+            now = time.monotonic()
+
+            if waiting >= max_batch:
+                break
+            if waiting > 0 and (now - stable_since) >= stable_window_s:
+                break
+            if now >= deadline:
+                break
+
+            if waiting > last_waiting:
+                stable_since = now
+                last_waiting = waiting
+
+            remaining = deadline - now
+            self._cv.wait(timeout=min(remaining, 0.002))
+
+        waited_ms = (time.monotonic() - start) * 1000.0
+        final_waiting = self.scheduler.num_waiting_requests()
+        if final_waiting > 0:
+            logger.info(
+                "[RequestBatch] admission wait done waiting=%d max_batch=%d waited_ms=%.1f",
+                final_waiting,
+                max_batch,
+                waited_ms,
+            )
 
     def _process_rpc_queue(self) -> None:
         """Execute pending collective_rpc tasks from the busy-loop thread.

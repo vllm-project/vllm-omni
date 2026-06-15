@@ -14,6 +14,7 @@ import torch
 from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, _move_tensor_tree_to_cpu
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -85,6 +86,11 @@ class _SingleRequestPipeline:
     pass
 
 
+class _SingleRequestOverridePipeline(_BatchCapablePipeline):
+    def forward(self, req, prompt_ids=None):
+        return DiffusionOutput(output=None)
+
+
 def _make_request_mode_sched_output(*request_ids: str) -> RealDiffusionSchedulerOutput:
     new_reqs = [
         NewRequestData(
@@ -153,6 +159,21 @@ class TestRequestBatchCapability:
         )
 
         assert diffusion_engine_module.supports_request_batch(od_config) is True
+
+    def test_supports_request_batch_rejects_custom_single_request_forward_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="BatchPipeline",
+            custom_pipeline_args={"pipeline_class": _SingleRequestOverridePipeline},
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: None,
+        )
+
+        assert diffusion_engine_module.supports_request_batch(od_config) is False
 
     def test_supports_request_batch_rejects_invalid_custom_pipeline_class_name(
         self,
@@ -260,6 +281,80 @@ class TestRequestBatchCapability:
         assert output == "batch"
         fake_executor.execute_batch.assert_called_once()
         fake_executor.execute_request.assert_not_called()
+
+
+class TestRequestBatchAdmission:
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    def test_scheduler_exposes_waiting_and_running_counts(self) -> None:
+        from vllm_omni.diffusion.sched import RequestScheduler
+
+        od_config = SimpleNamespace(max_num_seqs=4)
+        scheduler = RequestScheduler()
+        scheduler.initialize(od_config)
+
+        assert scheduler.num_waiting_requests() == 0
+        assert scheduler.num_running_requests() == 0
+
+        scheduler.add_request(
+            OmniDiffusionRequest(
+                prompt="prompt_a",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+                request_id="req-a",
+            )
+        )
+        scheduler.add_request(
+            OmniDiffusionRequest(
+                prompt="prompt_b",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+                request_id="req-b",
+            )
+        )
+        assert scheduler.num_waiting_requests() == 2
+        assert scheduler.num_running_requests() == 0
+
+        scheduler.schedule()
+        assert scheduler.num_waiting_requests() == 0
+        assert scheduler.num_running_requests() == 2
+
+    def test_request_batch_admission_exits_early_when_waiting_queue_stable(self) -> None:
+        from vllm_omni.diffusion.sched import RequestScheduler
+
+        od_config = SimpleNamespace(
+            max_num_seqs=32,
+            request_batch_max_wait_ms=1000.0,
+            step_execution=False,
+        )
+        scheduler = RequestScheduler()
+        scheduler.initialize(od_config)
+        for idx in range(2):
+            scheduler.add_request(
+                OmniDiffusionRequest(
+                    prompt=f"prompt_{idx}",
+                    sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+                    request_id=f"req-{idx}",
+                )
+            )
+
+        engine = object.__new__(DiffusionEngine)
+        engine.od_config = od_config
+        engine.scheduler = scheduler
+        engine.step_execution = False
+        engine.supports_request_batch = True
+        engine.stop_event = threading.Event()
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+
+        start = time.monotonic()
+        with engine._cv:
+            engine._wait_for_request_batch_admission_locked()
+        waited_s = time.monotonic() - start
+
+        # Stable-window exit (~50ms), not the full 1000ms deadline.
+        assert waited_s < 0.5
+        assert waited_s >= 0.04
+        assert scheduler.num_waiting_requests() == 2
+        assert scheduler.num_running_requests() == 0
 
 
 @pytest.mark.core_model
