@@ -9,13 +9,23 @@ AR-diffusion models. See ``BDE_doc/dreamzero_kv_phase1_plan.md``.
 from vllm_omni.bde.kv_cache.adapter import BDERequestAdapter
 from vllm_omni.bde.kv_cache.chunk_window import ChunkWindowManager, ChunkWindowSpec
 from vllm_omni.bde.kv_cache.config import BDEKVConfig
+from vllm_omni.bde.kv_cache.manager import BDEKVCache
 from vllm_omni.bde.kv_cache.pool import build_kv_manager, compute_num_blocks
+from vllm_omni.bde.kv_cache.slot_mapping import (
+    chunk_slot_mapping,
+    compute_slot_mapping,
+    resident_block_ids,
+)
 
 __all__ = [
+    "BDEKVCache",
     "BDEKVConfig",
     "BDERequestAdapter",
     "ChunkWindowManager",
     "ChunkWindowSpec",
     "build_kv_manager",
+    "chunk_slot_mapping",
     "compute_num_blocks",
+    "compute_slot_mapping",
+    "resident_block_ids",
 ]
