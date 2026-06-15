@@ -1321,7 +1321,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             try:
                 model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(nstp)
             except Exception as e:
-                logger.debug("[OMNI] Failed to compute request_token_spans: %s", e)
+                # Visible on purpose: the fallback is the equal rows-per-request
+                # split, which can re-introduce the cross-request corruption this
+                # plumbing fixes — a silent failure here must not pass unnoticed.
+                logger.warning("[OMNI] Failed to compute request_token_spans: %s", e)
 
         if self._omni_query_start_loc_model_kwarg:
             try:
