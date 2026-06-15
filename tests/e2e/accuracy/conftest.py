@@ -216,24 +216,6 @@ def accuracy_assets_root() -> Path:
 
 
 @pytest.fixture(scope="session")
-def qwen_bear_image(accuracy_artifact_root: Path):
-    """Download the Qwen bear image from the URL and save it to the accuracy artifact root."""
-    QWEN_BEAR_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/qwen-bear.png"
-    image_path = accuracy_artifact_root / "qwen_bear.png"
-    if image_path.exists():
-        image = Image.open(image_path).convert("RGB")
-        yield image
-        image.close()
-        return
-    response = requests.get(QWEN_BEAR_IMAGE_URL, timeout=60)
-    response.raise_for_status()
-    image = Image.open(BytesIO(response.content)).convert("RGB")
-    image.save(image_path)
-    yield image
-    image.close()
-
-
-@pytest.fixture(scope="session")
 def rabbit_image(accuracy_artifact_root: Path):
     """Download the rabbit image from the URL and save it to the accuracy artifact root."""
     RABBIT_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/rabbit.png"

@@ -72,7 +72,12 @@ def replace_linear_class(
     )
 
 
-def recursive_replace_linear(model: nn.Module, od_config: OmniDiffusionConfig):
+def recursive_replace_linear(
+    model: nn.Module,
+    od_config: OmniDiffusionConfig,
+    *,
+    root_prefix: str = "",
+):
     """Recursively replace modules in the model as needed.
     Currently, this replaces:
     - `nn.Linear` with vLLM's tensor parallel linear classes
@@ -93,7 +98,7 @@ def recursive_replace_linear(model: nn.Module, od_config: OmniDiffusionConfig):
             if new_module is not child_module:
                 setattr(module, child_name, new_module)
 
-    _recursive_replace(model, prefix="")
+    _recursive_replace(model, prefix=root_prefix)
 
 
 def init_parameters(
@@ -122,13 +127,15 @@ def create_transformers_model(
     hf_config: PretrainedConfig,
     dtype: torch.dtype | None = None,
     device: torch.device | None = None,
+    *,
+    root_prefix: str = "",
 ) -> PreTrainedModel:
     """Create a HuggingFace model using the given auto class and model name."""
     dtype = dtype or od_config.dtype
     device = device or torch.get_default_device()
     with init_on_device_without_buffers("meta"):
         model = auto_cls.from_config(hf_config)
-    recursive_replace_linear(model, od_config)
+    recursive_replace_linear(model, od_config, root_prefix=root_prefix)
     init_parameters(model, dtype=dtype, device=device)
     return model
 
