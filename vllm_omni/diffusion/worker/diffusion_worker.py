@@ -227,7 +227,12 @@ class DiffusionWorker:
         # so DeviceConfig does not rely on current_platform in worker subprocesses.
         vllm_config = _create_diffusion_worker_vllm_config(self.device, self.od_config)
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
-        vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
+        vllm_config.parallel_config.prefill_context_parallel_size = (
+            self.od_config.parallel_config.sequence_parallel_size
+        )
+        vllm_config.parallel_config.data_parallel_size = (
+            self.od_config.parallel_config.data_parallel_size * self.od_config.parallel_config.cfg_parallel_size
+        )
         vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
         vllm_config.profiler_config = self.od_config.profiler_config
         vllm_config.model_config = _make_diffusion_vllm_model_config(self.od_config)  # type: ignore[assignment]

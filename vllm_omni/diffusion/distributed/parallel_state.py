@@ -791,7 +791,6 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="data",
     )
-    vllm_parallel_state._DP = _DP
 
     global _CFG
     assert _CFG is None, "classifier_free_guidance group is already initialized"
@@ -828,6 +827,7 @@ def initialize_model_parallel(
         ulysses_group=ulysses_pg,
         ring_group=ring_pg,
     )
+    vllm_parallel_state._PCP = _SP
 
     assert vllm_parallel_state._TP is None, "Tensor parallel group is already initialized"
     vllm_parallel_state._TP = init_model_parallel_group(
@@ -836,6 +836,16 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
+    assert vllm_parallel_state._DP is None, "data parallel group is already initialized"
+    if cfg_parallel_size == 1:
+        vllm_parallel_state._DP = _DP
+    else:
+        vllm_parallel_state._DP = init_model_parallel_group(
+            group_ranks=rank_generator.get_ranks("cfg-dp"),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="data",
+        )
 
     global _FS
     assert _FS is None, "fully shard group is already initialized"
@@ -850,7 +860,7 @@ def initialize_model_parallel(
         od_config: OmniDiffusionConfig | None = get_forward_context().omni_diffusion_config
         if od_config and od_config.is_moe:
             vllm_parallel_state._EP = init_model_parallel_group(
-                group_ranks=rank_generator.get_ranks("ep"),
+                group_ranks=rank_generator.get_ranks("tp-sp-cfg-dp"),
                 local_rank=get_world_group().local_rank,
                 backend=backend,
                 parallel_mode="expert",
@@ -863,17 +873,28 @@ def initialize_model_parallel(
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _DP
+    global _DP, _CFG, _SP, _PP, _FS
+
+    if vllm_parallel_state._DP and vllm_parallel_state._DP is not _DP:
+        vllm_parallel_state._DP.destroy()
+    vllm_parallel_state._DP = None
+
+    if vllm_parallel_state._PP and vllm_parallel_state._PP is not _PP:
+        vllm_parallel_state._PP.destroy()
+    vllm_parallel_state._PP = None
+
     if _DP:
         _DP.destroy()
     _DP = None
 
-    global _CFG
     if _CFG:
         _CFG.destroy()
     _CFG = None
 
-    global _SP
+    if vllm_parallel_state._PCP and vllm_parallel_state._PCP is not _SP:
+        vllm_parallel_state._PCP.destroy()
+    vllm_parallel_state._PCP = None
+
     if _SP:
         _SP.destroy()
     _SP = None
@@ -886,12 +907,10 @@ def destroy_model_parallel():
         vllm_parallel_state._EP.destroy()
     vllm_parallel_state._EP = None
 
-    global _PP
     if _PP:
         _PP.destroy()
     _PP = None
 
-    global _FS
     if _FS:
         _FS.destroy()
     _FS = None

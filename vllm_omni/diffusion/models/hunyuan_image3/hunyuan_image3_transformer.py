@@ -1574,7 +1574,6 @@ class HunYuanSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
-            pcp_size=1,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

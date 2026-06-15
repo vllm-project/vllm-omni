@@ -67,12 +67,12 @@ def _init_mc2_group_for_diffusion(
 
 
 def _sync_ascend_ep_group_for_diffusion() -> None:
-    """Make vllm-ascend use Omni's diffusion EP group for expert placement.
+    """Make vllm-ascend use vLLM's EP group for expert placement.
 
-    HunyuanImage3 diffusion EP includes the SP dimension. vllm-ascend keeps its
-    own parallel-state module, so without this sync its FusedMoE may size local
-    experts from the TP-only EP group while token dispatch uses the diffusion
-    MC2 group.
+    vllm-omni maps diffusion SP to vLLM PCP and CFG to vLLM DP, so vLLM's
+    FusedMoE computes EP from TP * PCP * DP. vllm-ascend keeps its own
+    parallel-state module, so mirror the vLLM EP group there without changing
+    FusedMoE's tp_size/pcp_size/dp_size inputs.
     """
     import vllm_ascend.distributed.parallel_state as vllm_ascend_parallel_state
 
@@ -127,75 +127,15 @@ def prepare_hunyuan_fused_moe_runtime() -> None:
     _ensure_forward_context_attr("flash_comm_v1_enabled", bool, False)
 
 
-def _set_effective_moe_tp_size(kwargs: dict[str, Any]) -> None:
-    vllm_config = omni_get_ctx().vllm_config
-    if not vllm_config.parallel_config.enable_expert_parallel:
-        return
-
-    effective_ep_size = get_ep_group().world_size
-    dp_size = kwargs.get("dp_size", get_data_parallel_world_size())
-    pcp_size = kwargs.get("pcp_size", 1)
-    flatten_size = dp_size * pcp_size
-    if effective_ep_size % flatten_size != 0:
-        raise ValueError(
-            f"effective_ep_size ({effective_ep_size}) must be divisible by dp_size * pcp_size ({flatten_size})"
-        )
-    # vLLM MoE folds DP/PCP into TP while constructing the EP layout.
-    kwargs["tp_size"] = effective_ep_size // flatten_size
-
-
-def _sync_effective_moe_ep_rank(layer: Any) -> None:
-    vllm_config = omni_get_ctx().vllm_config
-    if not vllm_config.parallel_config.enable_expert_parallel:
-        return
-
-    ep_group = get_ep_group()
-    moe_parallel_config = getattr(layer, "moe_parallel_config", None)
-    if moe_parallel_config is None:
-        return
-
-    current_ep_size = getattr(layer, "ep_size", None)
-    current_ep_rank = getattr(layer, "ep_rank", None)
-    if current_ep_size == ep_group.world_size and current_ep_rank == ep_group.rank_in_group:
-        return
-
-    moe_parallel_config.ep_size = ep_group.world_size
-    moe_parallel_config.ep_rank = ep_group.rank_in_group
-    moe_parallel_config.tp_size = 1
-    moe_parallel_config.tp_rank = 0
-    moe_parallel_config.use_ep = True
-
-    moe_config = getattr(layer, "moe_config", None)
-    if moe_config is not None:
-        moe_config.moe_parallel_config = moe_parallel_config
-        moe_config.num_local_experts = layer.global_num_experts // ep_group.world_size
-        if hasattr(moe_config, "ep_group"):
-            moe_config.ep_group = ep_group
-
-    expert_map_manager = getattr(layer, "expert_map_manager", None)
-    if expert_map_manager is not None:
-        expert_map_manager.update(
-            moe_parallel_config,
-            global_num_experts=layer.global_num_experts,
-        )
-        layer.local_num_experts = expert_map_manager.local_num_experts
-        layer.expert_placement_strategy = expert_map_manager.placement_strategy
-        layer._expert_map = expert_map_manager.expert_map
-        layer.expert_mask = expert_map_manager.expert_mask
-        if moe_config is not None:
-            moe_config.num_local_experts = layer.local_num_experts
-
-
 # NOTE: vLLM v0.20.0 folded SharedFusedMoE into FusedMoE, and vllm-ascend in turn
 # removed AscendSharedFusedMoE — the shared-experts / gate / multistream-overlap
 # paths now live directly on AscendFusedMoE and are activated by passing
 # shared_experts= as a kwarg.
 class AscendHunyuanFusedMoE(AscendFusedMoE):
     def __init__(self, *, prefix: str = "", **kwargs: Any) -> None:
-        kwargs = dict(kwargs)
-        _set_effective_moe_tp_size(kwargs)
+        if omni_get_ctx().vllm_config.parallel_config.enable_expert_parallel:
+            _sync_ascend_ep_group_for_diffusion()
         super().__init__(prefix=prefix, **kwargs)
-        _sync_effective_moe_ep_rank(self)
         self._prefix = prefix
 
     def forward(self, hidden_states: Any, router_logits: Any) -> Any:
