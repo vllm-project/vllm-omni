@@ -6,11 +6,7 @@ import torch
 
 from vllm_omni.attention import fish_kvcache_attn, fish_kvcache_backend
 
-pytestmark = [
-    pytest.mark.core_model,
-    pytest.mark.cpu,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="debug for test"),
-]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _FakeImpl:
