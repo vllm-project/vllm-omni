@@ -48,7 +48,7 @@ Use [references/test-routing.md](references/test-routing.md) for level-to-marker
 
 Always attach markers deliberately:
 
-- **Level**: `core_model` (L1/L2) or `advanced_model` / `full_model` (L3/L4 — nightly steps in `test-nightly.yml` use `full_model`; merge/ready steps often use `advanced_model`)
+- **Level**: `core_model` (L1/L2) and/or `advanced_model` (L3) and/or `full_model` (L4 nightly)
 - **Model type** (required on model-centric e2e — pick exactly one):
   - `omni` — end-to-end multimodal LLM pipelines (thinker/talker/stages; Qwen-Omni family)
   - `tts` — speech synthesis / TTS-only models (`/v1/audio/speech`, voice clone, etc.)
@@ -56,6 +56,8 @@ Always attach markers deliberately:
 - **Cross-cutting area** (when relevant): `parallel`, `cache`, `example`, `benchmark`
 - **Hardware**: `cpu`, `gpu`, `cuda`, `rocm`, `npu`, `L4`, `H100`, `distributed_cuda`, …
 - Optional: `slow`, distributed markers when multi-card is required
+
+**Baseline smoke (L2 + L3):** The simplest e2e case per model — default deploy, minimal request — should usually carry **both** `@pytest.mark.core_model` and `@pytest.mark.advanced_model` on the **same** test function so `test-ready.yml` and `test-merge.yml` share one test. `send_*_request` picks validation depth from `--run-level`. References: `test_voxcpm2_tts.py::test_text_to_audio_001`, `test_qwen3_tts_customvoice.py::test_text_to_audio_001`. Heavier scenarios use **`advanced_model` only**; L4 expansion uses **`full_model`**.
 
 For hardware-aware tests, prefer `@hardware_test(...)` or `hardware_marks(...)` in `tests/helpers/mark.py`.
 
@@ -95,7 +97,7 @@ Existing references: `tests/e2e/offline_inference/test_qwen2_5_omni.py` (L2-styl
 | Scenario | Typical location | Fixtures / runner pattern | Baseline markers & level |
 |----------|------------------|---------------------------|---------------------------|
 | **Offline inference e2e** | `tests/e2e/offline_inference/` | **Module (default):** `omni_runner` + `omni_runner_handler`. **Function (isolation only):** `omni_runner_function` + `omni_runner_handler_function`. Diffusion/TTS may use `Omni(...).generate` directly | L2: `core_model` + **one of** `omni` / `tts` / `diffusion`; `@hardware_test(...)` when GPU/NPU is required |
-| **Online serving e2e** | `tests/e2e/online_serving/` | **Module (default):** `omni_server` + `openai_client`. **Function (isolation only):** `omni_server_function` + `openai_client_function`. Clients: `send_omni_request` (omni), `send_audio_speech_request` (tts), `send_diffusion_request` / `send_video_diffusion_request` / `send_images_generations_request` (diffusion) | L2: `core_model` smoke; L3/L4: `advanced_model` or `full_model` for expansion / nightly |
+| **Online serving e2e** | `tests/e2e/online_serving/` | **Module (default):** `omni_server` + `openai_client`. **Function (isolation only):** `omni_server_function` + `openai_client_function`. Clients: `send_omni_request` (omni), `send_audio_speech_request` (tts), `send_diffusion_request` / `send_video_diffusion_request` / `send_images_generations_request` (diffusion) | Baseline smoke: **`core_model` + `advanced_model`**; heavier paths: `advanced_model` only; L4 expansion: `full_model` |
 | **Documentation / runnable examples** | `tests/examples/offline_inference/`, `tests/examples/online_serving/` | **Offline docs (preferred):** extract Python/Bash blocks from the doc README (e.g. `ReadmeSnippet.extract_readme_snippets`), `pytest.mark.parametrize` each snippet, run via `example_runner.run` with a stable `output_subfolder`. **Online docs:** copy client/request scripts into dedicated tests and keep them in sync with the doc page. | Usually **L4**: `advanced_model`, often `example` plus hardware marks matching the nightly docs-example job (see `.buildkite/test-nightly.yml`). Full conventions: [docs/contributing/ci/test_examples/doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/doc_example_tests.inc.md) (introduced in [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910): naming, output directory layout, skip rules, avoid trimming `num_inference_steps` without a strong CI reason). |
 | **Performance / benchmark** | `tests/dfx/perf/tests/*.json` + `run_*_benchmark.py` | JSON or script-driven server + load config; assert explicit metrics / baselines | L4 Perf: `full_model` + `benchmark`; wire `test-nightly.yml` Perf steps |
 | **Invalid parameter / negative HTTP validation** | `tests/dfx/reliability/invalid_param_test/` | Live `omni_server` + low-level `send_*_http_request` with `err_code` / `err_message` | `pytest.mark.slow` + `omni` / `tts` / `diffusion` + `@hardware_marks` (`H100` or `L4`); CI in **`test-weekly.yml`** (not ready/merge/nightly) |
@@ -177,24 +179,51 @@ See **L1 unit test constraints (mocking)** below for the full do/don't list.
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_<scenario>(omni_runner, omni_runner_handler) -> None:
     request_config = {"prompts": ..., "modalities": [...]}  # optional: images, videos, audios
-    omni_runner_handler.send_request(request_config)
+    omni_runner_handler.send_omni_request(request_config)
 ```
 
-*Offline generative e2e — **Diffusion** (representative; adjust markers to match CI — often `diffusion` + `advanced_model` for heavier cases):*
+*Offline generative e2e — **Diffusion** (representative):*
 
 ```python
-@pytest.mark.core_model  # or advanced_model — match existing tests in the same directory
+@pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(...)
-def test_<scenario>(run_level):
-    m = Omni(model=...)
-    outputs = m.generate(
-        "<prompt>",
-        OmniDiffusionSamplingParams(
-            height=..., width=..., num_inference_steps=..., generator=...,
-        ),
-    )
-    # Assert final_output_type, image/video fields, or use assert_diffusion_response via a diffusion handler pattern
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_text_to_image_001(omni_runner_handler) -> None:
+    omni_runner_handler.send_diffusion_request({"prompt": "...", "extra_body": {"num_inference_steps": 4, ...}})
+```
+
+*Offline TTS e2e — **Qwen3-TTS** (two-stage; representative):*
+
+```python
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(...)
+@pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
+def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
+    omni_runner_handler.send_audio_speech_request({
+        "input": "...",
+        "task_type": "Base",
+        "ref_audio": REF_AUDIO_URL,
+        "ref_text": REF_TEXT,
+    })
+```
+
+*Offline TTS e2e — **single-stage** (Coqui XTTS, MOSS-TTS-Nano; representative):*
+
+```python
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(...)
+@pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
+def test_voice_clone_001(omni_runner_handler) -> None:
+    omni_runner_handler.send_single_stage_tts_request({
+        "input": "...",
+        "language": "en",
+        "prompt_audio_path": REF_AUDIO_PATH,
+        "response_format": "wav",
+        "run_level": "advanced_model",
+    })
 ```
 
 *Online serving e2e — **Omni** (representative):*
@@ -213,6 +242,7 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 
 ```python
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.tts
 @hardware_test(...)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
@@ -252,8 +282,9 @@ def test_text_to_video_001(omni_server, openai_client) -> None:
 - **E2E test function layout**: **one case → one `test_<scenario>` function** with a name that states what is validated (endpoint, size/`n`, server flag, or route). **Do not** merge multiple cases into a single test that branches on `request.node.callspec.id`, `param.id`, or `if case_id == ...`. Use `@pytest.mark.parametrize("omni_server", [...], indirect=True)` per function (usually **one** `OmniServerParams` per test). A loop inside one test is OK only when it serves **that function’s single intent** (e.g. three standard sizes in `test_*_sizes_256_512_1024`).
 - **Runtime fixture scope** (`tests/helpers/fixtures/runtime.py`): default **`omni_server` / `omni_runner`** (module) + matching client/handler; use **`omni_server_function` / `omni_runner_function`** only when each `test_*` must start a fresh instance (see below).
 - **L1 mocks**: never `unittest.mock`; use `mocker` or `monkeypatch` only (see below).
-- **API calls (L2+ e2e)**: invoke endpoints via **`send_*_request`** in `tests/helpers/runtime.py`; **general** `assert_*` belongs inside `send_*_request`, **special** `assert_*` only in the test (see **General vs special assert placement**).
+- **API calls (L2+ e2e, online and offline)**: **reuse** `send_*_request` in `tests/helpers/runtime.py` when it exists; **otherwise add** the helper in `runtime.py` first, then call it from the test. General `assert_*` inside `send_*_request`; special `assert_*` only in the test. See **Runtime send helpers** below — do not call `omni.generate`, raw HTTP, or SDK clients from `test_*.py`.
 - **Response assertions**: reusable checks on API bodies / decoded media belong in **`tests/helpers/assertions.py`** — not as private `_assert_*` helpers inside `test_*.py` (see below).
+- **Model-specific payloads stay in test modules** — per-model `MODEL`, deploy path, `REF_AUDIO_URL`, `get_prompt()`, `_build_request()`, and inline `request_config` dicts live in `test_{slug}.py` / `test_{slug}_expansion.py` (and offline/L1 siblings). **Do not** create `tests/helpers/{slug}.py` to deduplicate them; a little copy across files is preferred (see `test_glm_tts.py`, `test_cosyvoice3_tts_expansion.py`). `tests/helpers/` is repo-wide harness only (`mark`, `media`, `runtime`, `stage_config`, `assertions`, `fixtures/`).
 
 #### L1 unit test constraints (mocking)
 
@@ -321,24 +352,37 @@ def test_foo_sleep_wakeup_cycle(omni_server_function, openai_client_function) ->
     openai_client_function.send_omni_wakeup_http_request({...})
 ```
 
-#### API client helpers (`tests/helpers/runtime.py`)
+#### Runtime send helpers — online **and** offline (`tests/helpers/runtime.py`)
 
-When a test needs to **call a live HTTP/WebSocket API** (online serving e2e, dfx reliability, doc-example clients), **always go through `tests/helpers/runtime.py`** — do not embed raw HTTP in `test_*.py`.
+**L2+ e2e (online serving and offline inference) must call APIs through `tests/helpers/runtime.py`.** Fixtures live in `tests/helpers/fixtures/runtime.py`; **send/assert implementation** lives in `tests/helpers/runtime.py` + `tests/helpers/assertions.py`.
+
+| Principle | Action |
+|-----------|--------|
+| **Reuse first** | Grep `runtime.py` for an existing **`send_*_request`** on `OpenAIClientHandler` (online) or `OmniRunnerHandler` (offline) that matches the endpoint / pipeline shape. |
+| **Extend when close** | If an existing `send_*_request` almost fits (e.g. missing one optional field), extend it in `runtime.py` — do not fork logic in the test file. |
+| **Add when missing** | No suitable helper → add **`send_<feature>_request`** (high-level: call + general `assert_*`) or **`send_<route>_<verb>_http_request`** (low-level HTTP for negative/dfx) in **`runtime.py` first**, then call it from tests. |
+| **Test module owns payload only** | In `test_*.py`: `MODEL`, deploy path, vendored media, `get_prompt()`, and inline **`request_config` dicts** only. **No** `omni.generate(...)`, raw `requests.post`, OpenAI SDK calls, or `_collect_audio()` / `_process_output()` in e2e tests. |
+
+**Online** (`openai_client` from `omni_server`): `OpenAIClientHandler.send_*_request`.
+
+**Offline** (`omni_runner_handler` from `omni_runner`): `OmniRunnerHandler.send_*_request`.
 
 | Do | Don't |
 |----|-------|
-| Reuse `openai_client.send_omni_request`, `send_diffusion_request`, `send_audio_speech_request`, `send_video_diffusion_request`, `send_images_generations_http_request`, `send_images_edits_http_request`, … | `requests.post(f"{base_url}/v1/images/generations", json=…)` inside a test |
-| Offline e2e: `omni_runner_handler.send_request`, `send_diffusion_request`, `send_audio_speech_request` on `OmniRunnerHandler` | Copy-paste OpenAI SDK `client.chat.completions.create(...)` in each expansion file |
-| Add `send_<route>_<verb>_http_request` (low-level HTTP) or a typed `send_<feature>_request` (high-level + assert hook) to **`runtime.py` first**, then call from tests | A one-off `def _post_images(...)` helper at the bottom of a test module |
-| Mirror naming/style of neighboring `send_*` (docstring, `request_config` dict, optional `err_code` / `err_message` for negative cases) | Different parameter shapes per test file for the same endpoint |
+| Online: `openai_client.send_omni_request`, `send_diffusion_request`, `send_audio_speech_request`, `send_video_diffusion_request`, `send_images_generations_request`, … | `requests.post(f"{base_url}/v1/...", json=…)` or `client.chat.completions.create(...)` inside a test |
+| Offline: `omni_runner_handler.send_omni_request`, `send_diffusion_request`, `send_audio_speech_request`, `send_single_stage_tts_request`, `send_single_stage_tts_batch_request`, … | `omni_runner.omni.generate(...)` + hand-rolled tensor/WAV extraction in `test_*.py` |
+| Add missing `send_*` to **`runtime.py`** first; bundle general `assert_*` inside the send helper | A one-off `def _post_*` / `def _collect_audio` at the bottom of a test module |
+| Mirror naming/style of neighboring `send_*` (docstring, `request_config` dict, optional `run_level`, `err_code` / `err_message` for negative cases) | Different parameter shapes per test file for the same endpoint |
 
 **Workflow when generating online/offline e2e tests:**
 
-1. Decide whether the needed check is **general** (applies to every success call of this `send_*`) or **special** (one case / one parameter combo only). See **General vs special assert placement** below.
-2. Search `runtime.py` for **`send_*_request`** that already bundles the general `assert_*`; if missing, add the general `assert_*` call **inside** a new or existing high-level `send_*_request`.
-3. Reserve **low-level** `send_*_http_request` for negative/dfx tests (`err_code` / `err_message`) and for runtime internals — not for ordinary L2+ success-path e2e.
-4. In the test module: build `request_config` → call high-level **`send_*_request` only** for the general contract; call **`assert_*` in the test file only** for special, case-specific checks (import from `assertions.py`).
+1. Decide whether the needed check is **general** (every success call of this `send_*`) or **special** (one case / one parameter combo only). See **General vs special assert placement** below.
+2. **Search `runtime.py`** for a matching **`send_*_request`**; if missing, add it (with general `assert_*` inside) before writing the test body.
+3. In the test module: build `request_config` → call **`send_*_request` only** for the general contract; call **`assert_*` in the test file only** for special, case-specific checks (import from `assertions.py`).
+4. Reserve **low-level** `send_*_http_request` for negative/dfx tests (`err_code` / `err_message`) — not for ordinary L2+ success-path e2e.
 5. When wiring Buildkite `source_file_dependencies`, include **`tests/helpers/runtime.py`** and/or **`tests/helpers/assertions.py`** when new helpers were added.
+
+**Exceptions (document in the test docstring why):** models whose offline prompt path cannot go through existing handlers yet (e.g. `test_higgs_audio_v2.py`, `test_voxtral_tts.py` with custom tokenizer compose) may call `omni.generate` directly until a `send_*_request` is added to `runtime.py` — treat as **debt**, not the default for new TTS/diffusion/omni e2e.
 
 **General vs special assert placement:**
 
@@ -370,10 +414,20 @@ Changing `request_config` fields (`size`, `n`, `seed`, server flags) is **not** 
 | Diffusion T2I (chat route) | `send_diffusion_request` | — |
 | Diffusion X2V | `send_video_diffusion_request` | `send_videos_create_http_request`, `send_video_content_http_request`, … |
 | DALL-E T2I / edit | `send_images_generations_request`, `send_images_edits_request` | `send_images_generations_http_request`, `send_images_edits_http_request` |
-| TTS | `send_audio_speech_request` | `send_audio_speech_http_request`, `send_audio_generate_http_request`, … |
+| TTS (online) | `send_audio_speech_request` | `send_audio_speech_http_request`, `send_audio_generate_http_request`, … |
 | Ops / meta | — | `send_health_http_request`, `send_models_http_request`, `send_omni_sleep_http_request`, … |
 
-L1 tests under `tests/entrypoints/` may use **FastAPI `TestClient`** or direct handler calls with mocks; they do **not** need `OpenAIClientHandler`. L2+ serving e2e must use `runtime.py` send helpers.
+**Common `OmniRunnerHandler` entry points** (offline — grep `runtime.py` before adding):
+
+| Area | High-level (`send_*_request` + assert) | Notes |
+|------|----------------------------------------|-------|
+| Omni multimodal | `send_omni_request` | `generate_multimodal` path |
+| Diffusion offline | `send_diffusion_request` | chat-route / `OmniTextPrompt` offline |
+| Qwen-style TTS | `send_audio_speech_request` | two-stage, `generate_multimodal` + `mm_processor_kwargs` |
+| Single-stage TTS (Coqui XTTS, MOSS-TTS-Nano, …) | `send_single_stage_tts_request`, `send_single_stage_tts_batch_request` | `prompt` + `additional_information` + `omni.generate` — **do not** duplicate in tests |
+| New model family | **Add** `send_<family>_request` here first | Then call from `tests/e2e/offline_inference/test_*.py` |
+
+L1 tests under `tests/entrypoints/` may use **FastAPI `TestClient`** or direct handler calls with mocks; they do **not** need `OpenAIClientHandler` / `OmniRunnerHandler`. **L2+ online and offline e2e** must use `runtime.py` `send_*` helpers.
 
 #### Invalid parameter validation (`tests/dfx/reliability/invalid_param_test/`)
 
@@ -547,7 +601,7 @@ Implementation strategy:
 | Model type | Runner script | Example config |
 |------------|---------------|----------------|
 | **Diffusion X2I/X2V** | `tests/dfx/perf/scripts/run_diffusion_benchmark.py` | `tests/dfx/perf/tests/test_qwen_image_vllm_omni.json` |
-| **TTS** | `tests/dfx/perf/scripts/run_benchmark.py` | `tests/dfx/perf/tests/test_tts.json` |
+| **TTS** | `tests/dfx/perf/scripts/run_benchmark.py` | `tests/dfx/perf/tests/test_tts.json` (shared) or `test_{slug}.json` (dedicated; use when the model must not join the shared nightly matrix before integration — e.g. `test_voxcpm2.json`, `test_coqui_tts.json`) |
 | **Omni** | (see existing Omni Perf steps — `run_benchmark.py` / dedicated omni configs in-tree) | `tests/dfx/perf/tests/test_omni*.json` |
 
 5. Wire **`test-nightly.yml` · Perf Test** step for that model (separate from Function Test): export `DIFFUSION_BENCHMARK_DIR` / `BENCHMARK_DIR`, run pytest on the script with `--test-config-file`, **upload artifacts** (`buildkite-agent artifact upload`), often **multi-GPU H100** for diffusion perf.
@@ -815,7 +869,7 @@ Before finishing:
 When completing a request, return:
 
 1. **Test plan** (level, markers, file target, **L4 pillar(s)** if applicable: Function / Accuracy / Perf / Doc; **or** **Invalid param** pillar with target `invalid_param_test/test_invalid_<area>.py`; module basename for e2e: `test_{slug}.py` / `test_{slug}_expansion.py`)
-2. **Generated/updated test file(s)** — and **`tests/helpers/runtime.py`** / **`tests/helpers/assertions.py`** when new `send_*` or shared assert helpers are required (do not leave ad-hoc HTTP or `_assert_*` in test modules). **If L4 Perf was requested**, also list **`tests/dfx/perf/tests/*.json`**. **If invalid-param cases were requested**, list the **`invalid_param_test/` script** and parametrized `test_*` / new `id=` rows — **not** e2e paths.
+2. **Generated/updated test file(s)** — model-specific constants and request payloads stay **inside** those test modules (**never** `tests/helpers/{slug}.py`). Extend **`tests/helpers/runtime.py`** / **`tests/helpers/assertions.py`** only when new **repo-wide** `send_*` or shared assert helpers are required (do not leave ad-hoc HTTP or `_assert_*` in test modules). **If L4 Perf was requested**, also list **`tests/dfx/perf/tests/*.json`**. **If invalid-param cases were requested**, list the **`invalid_param_test/` script** and parametrized `test_*` / new `id=` rows — **not** e2e paths.
 3. **Buildkite change** — **match the requested level and pillar**:
    - **L4 Function**: `test-nightly.yml` **Function Test** shard (file list / note existing sweep). **No** `test-merge.yml` unless user also asked for L3.
    - **L4 Perf**: `test-nightly.yml` **Perf Test · &lt;Model&gt;** step (new step or extend commands); include env exports + artifact upload pattern from a sibling perf job.
