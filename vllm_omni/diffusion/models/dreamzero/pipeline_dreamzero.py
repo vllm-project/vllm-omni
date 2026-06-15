@@ -3,7 +3,7 @@
 
 """DreamZero pipeline for vllm-omni.
 
-Entry point for DiffusionEngine.step() → pipeline.forward(req)
+Entry point for DiffusionEngine.step() -> pipeline.forward(req)
 """
 
 from __future__ import annotations
@@ -94,17 +94,41 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     Multi-output: predict_noise() returns (video_pred, action_pred).
     CFG: video gets standard CFG, action takes positive branch only.
-    State: DreamZeroState manages KV cache + frame buffer across forward() calls.
+
+    BDE KV integration: when ``self._bde_kv_state`` is set by a BDEModelRunner
+    before ``forward()``, the pipeline routes its KV access (get / create / update
+    / commit) through the pool-backed ``BDEKVState`` instead of the model-local
+    ``DreamZeroState``. No BDE imports -- purely duck-typed, inactive by default.
     """
+
+    _bde_kv_state = None  # set by BDEModelRunner when KV management is enabled
+
+    def _kv_get(self, state, is_negative):
+        s = self._bde_kv_state
+        return s.get_kv_caches(is_negative) if s is not None else state.get_kv_caches(is_negative)
+
+    def _kv_create(self, state, batch_size, dtype, device, num_layers, num_heads, head_dim):
+        if self._bde_kv_state is not None:
+            return  # pool pre-allocated
+        self._kv_create(state, batch_size, dtype, device, num_layers, num_heads, head_dim)
+
+    def _kv_update(self, state, layer_idx, updated_kv, is_negative):
+        s = self._bde_kv_state
+        if s is not None: s.update_kv_cache(layer_idx, updated_kv, is_negative)
+        else: state.update_kv_cache(layer_idx, updated_kv, is_negative=is_negative)
+
+    def _kv_commit(self):
+        s = self._bde_kv_state
+        if s is not None: s.commit_chunk()
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         """Initialize pipeline components.
 
         DreamZero root checkpoint layout (GEAR-Dreams/DreamZero-DROID):
-          config.json                     — root config (action_head_cfg, architectures, etc.)
-          model-*.safetensors             — all learned weights (action_head.{model,text_encoder,image_encoder,vae}.*)
-          experiment_cfg/metadata.json    — per-embodiment action normalization stats
-          vae/                            — symlink to Wan2.1 VAE (diffusers-compatible)
+          config.json                     -- root config (action_head_cfg, architectures, etc.)
+          model-*.safetensors             -- all learned weights (action_head.{model,text_encoder,image_encoder,vae}.*)
+          experiment_cfg/metadata.json    -- per-embodiment action normalization stats
+          vae/                            -- symlink to Wan2.1 VAE (diffusers-compatible)
 
         Components are instantiated from config (not from_pretrained), then filled
         by load_weights() which reads root safetensors and remaps key prefixes.
@@ -227,7 +251,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         self.negative_prompt: str = model_config.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
 
-        # Embodiment name → numeric ID mapping (model knowledge)
+        # Embodiment name -> numeric ID mapping (model knowledge)
         self.embodiment_name_to_id: dict[str, int] = model_config.get(
             "embodiment_name_to_id",
             DEFAULT_EMBODIMENT_NAME_TO_ID,
@@ -325,7 +349,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             state = kwargs.get("dreamzero_state", self.state)
             is_neg = kwargs.get("is_negative", False)
             for i, kv in enumerate(updated_kv_caches):
-                state.update_kv_cache(i, kv, is_negative=is_neg)
+                self._kv_update(state, i, kv, is_neg)
+            self._kv_commit()
 
         video_pred = video_pred.clone()
         if action_pred is not None:
@@ -375,7 +400,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     # -----------------------------------------------------------------------
 
     def _preprocess_video(self, videos: torch.Tensor) -> torch.Tensor:
-        """uint8 [B,T,H,W,C] → bfloat16 [B,C,T,H,W] normalized to [-1,1]."""
+        """uint8 [B,T,H,W,C] -> bfloat16 [B,C,T,H,W] normalized to [-1,1]."""
         videos = videos.permute(0, 4, 1, 2, 3)
         if videos.dtype == torch.uint8:
             videos = videos.float() / 255.0
@@ -487,7 +512,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     ) -> None:
         """Prefill KV cache with first frame and/or current observation.
 
-        Uses predict_noise_maybe_with_cfg() for CFG parallel — same path as
+        Uses predict_noise_maybe_with_cfg() for CFG parallel -- same path as
         the denoise loop. The mixin handles rank dispatch automatically.
         KV cache update happens as a side effect inside predict_noise().
         """
@@ -498,7 +523,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         head_dim = self.transformer.dim // self.transformer.num_heads
 
         if state.current_start_frame == 0:
-            state.create_kv_caches(
+            self._kv_create(state,
                 batch_size,
                 dtype,
                 device,
@@ -523,7 +548,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
             positive_kwargs = dict(
                 encoder_hidden_states=prompt_embeds,
-                kv_cache=state.get_kv_caches(False),
+                kv_cache=self._kv_get(state, False),
                 crossattn_cache=state.get_crossattn_caches(False),
                 is_negative=False,
                 **common,
@@ -531,7 +556,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             negative_kwargs = (
                 dict(
                     encoder_hidden_states=negative_prompt_embeds,
-                    kv_cache=state.get_kv_caches(True),
+                    kv_cache=self._kv_get(state, True),
                     crossattn_cache=state.get_crossattn_caches(True),
                     is_negative=True,
                     **common,
@@ -573,7 +598,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
             positive_kwargs = dict(
                 encoder_hidden_states=prompt_embeds,
-                kv_cache=state.get_kv_caches(False),
+                kv_cache=self._kv_get(state, False),
                 crossattn_cache=state.get_crossattn_caches(False),
                 is_negative=False,
                 **common,
@@ -581,7 +606,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             negative_kwargs = (
                 dict(
                     encoder_hidden_states=negative_prompt_embeds,
-                    kv_cache=state.get_kv_caches(True),
+                    kv_cache=self._kv_get(state, True),
                     crossattn_cache=state.get_crossattn_caches(True),
                     is_negative=True,
                     **common,
@@ -615,8 +640,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         For each timestep:
           1. Build positive_kwargs / negative_kwargs
-          2. predict_noise_maybe_with_cfg()    → (video_pred, action_pred)
-          3. scheduler_step_maybe_with_cfg()   → VideoActionScheduler
+          2. predict_noise_maybe_with_cfg()    -> (video_pred, action_pred)
+          3. scheduler_step_maybe_with_cfg()   -> VideoActionScheduler
           4. _synchronize_cfg_parallel_step_output()
         """
         seq_len = kwargs["seq_len"]
@@ -667,7 +692,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 hidden_states=noisy_input.transpose(1, 2),
                 timestep_video=timestep,
                 encoder_hidden_states=prompt_embeds,
-                kv_cache=state.get_kv_caches(False),
+                kv_cache=self._kv_get(state, False),
                 crossattn_cache=state.get_crossattn_caches(False),
                 y=y,
                 clip_feature=state.clip_feas,
@@ -683,7 +708,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     hidden_states=noisy_input.transpose(1, 2),
                     timestep_video=timestep,
                     encoder_hidden_states=negative_prompt_embeds,
-                    kv_cache=state.get_kv_caches(True),
+                    kv_cache=self._kv_get(state, True),
                     crossattn_cache=state.get_crossattn_caches(True),
                     y=y,
                     clip_feature=state.clip_feas,
@@ -770,7 +795,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             device=device,
         )
 
-        # State: raw from transform → pad to (B, state_horizon=1, max_state_dim)
+        # State: raw from transform -> pad to (B, state_horizon=1, max_state_dim)
         raw_state = unified_obs["state"]
         state_for_postprocess = None
         if raw_state is not None:
@@ -816,11 +841,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             state.reset()
         state.language = text_tokens
 
-        # Frame accumulation: stitched single frame → multi-frame video
+        # Frame accumulation: stitched single frame -> multi-frame video
         video_frames = state.accumulate_frames(stitched)  # (T, H, W, C)
         videos = torch.from_numpy(video_frames).unsqueeze(0).to(device)  # (B=1, T, H, W, C)
 
-        videos = self._preprocess_video(videos)  # → [B,C,T,H,W] bf16
+        videos = self._preprocess_video(videos)  # -> [B,C,T,H,W] bf16
         _, _, num_frames_raw, height, width = videos.shape
 
         prompt_embeds = self._encode_text(text_tokens, attention_mask)
@@ -959,10 +984,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             video_out = torch.cat([image, video_out], dim=1)
         state.current_start_frame += self.num_frame_per_block
 
-        # q99 denorm: [-1,1] → real values
+        # q99 denorm: [-1,1] -> real values
         action_out = self._denormalize_action(action_out.float(), embodiment_name)
 
-        # Relative → absolute: only for relative_action_keys (joint_position only)
+        # Relative -> absolute: only for relative_action_keys (joint_position only)
         # gripper_position is NOT relative, so don't add state back to it
         if self.relative_action and state_for_postprocess is not None:
             n_relative = self.relative_action_dim  # 7 for DROID (joint only)
@@ -974,7 +999,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 action_out[..., :n_relative] + last_state.unsqueeze(1)  # broadcast over horizon
             )
 
-        # Squeeze batch dim for output: (B, horizon, dim) → (horizon, dim)
+        # Squeeze batch dim for output: (B, horizon, dim) -> (horizon, dim)
         actions_np = action_out.squeeze(0).float().cpu().numpy()  # (horizon, max_action_dim)
         actions_np = transform.transform_action_output(actions_np)
 
@@ -1074,7 +1099,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         q01 = stats["q01"].to(device=action.device, dtype=action.dtype)
         q99 = stats["q99"].to(device=action.device, dtype=action.dtype)
         # action shape: (B, horizon, action_dim) or (B, horizon, max_action_dim)
-        # q01/q99 shape: (actual_action_dim,) — only denorm actual dims
+        # q01/q99 shape: (actual_action_dim,) -- only denorm actual dims
         actual_dim = q01.shape[0]
         action_real = action.clone()
         action_real[..., :actual_dim] = (action[..., :actual_dim] + 1) / 2 * (q99 - q01) + q01
