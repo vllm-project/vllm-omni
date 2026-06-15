@@ -761,6 +761,29 @@ def connect_remote_diffusion_proc(
 
 
 @contextlib.contextmanager
+def scoped_spawn_device_env(
+    stage_visible_devices: str | None,
+    spawn_device_lock: threading.Lock | None,
+) -> Iterator[None]:
+    """Briefly scope device visibility while spawning a stage subprocess."""
+    if stage_visible_devices is None or spawn_device_lock is None:
+        yield
+        return
+
+    device_control_env = current_omni_platform.device_control_env_var
+    with spawn_device_lock:
+        previous_visible_devices = os.environ.get(device_control_env)
+        try:
+            current_omni_platform.set_device_control_env_var(stage_visible_devices)
+            yield
+        finally:
+            if previous_visible_devices is None:
+                current_omni_platform.unset_device_control_env_var()
+            else:
+                current_omni_platform.set_device_control_env_var(previous_visible_devices)
+
+
+@contextlib.contextmanager
 def _launch_omni_core_engines(
     vllm_config: VllmConfig,
     executor_class: type[Executor],
@@ -771,6 +794,8 @@ def _launch_omni_core_engines(
     replica_id: int = 0,
     *,
     omni_coordinator_address: str | None = None,
+    stage_visible_devices: str | None = None,
+    spawn_device_lock: threading.Lock | None = None,
 ) -> Iterator[tuple[CoreEngineProcManager, DPCoordinator | None, EngineZmqAddresses]]:
     """Launch local engine cores using the omni registration flow.
 
@@ -843,30 +868,32 @@ def _launch_omni_core_engines(
             # an OmniCoordClientForStage and heartbeats to the coordinator.
             from vllm_omni.engine.stage_engine_core_proc_manager import StageEngineCoreProcManager
 
-            local_engine_manager: CoreEngineProcManager = StageEngineCoreProcManager(
-                local_engine_count=local_engine_count,
-                start_index=start_index,
-                local_start_index=local_start_index,
-                vllm_config=vllm_config,
-                local_client=True,
-                handshake_address=handshake_address,
-                executor_class=executor_class,
-                log_stats=log_stats,
-                omni_stage_id=stage_id,
-                omni_coordinator_address=omni_coordinator_address,
-                omni_replica_base_id=replica_id,
-            )
+            with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+                local_engine_manager: CoreEngineProcManager = StageEngineCoreProcManager(
+                    local_engine_count=local_engine_count,
+                    start_index=start_index,
+                    local_start_index=local_start_index,
+                    vllm_config=vllm_config,
+                    local_client=True,
+                    handshake_address=handshake_address,
+                    executor_class=executor_class,
+                    log_stats=log_stats,
+                    omni_stage_id=stage_id,
+                    omni_coordinator_address=omni_coordinator_address,
+                    omni_replica_base_id=replica_id,
+                )
         else:
-            local_engine_manager = CoreEngineProcManager(
-                local_engine_count=local_engine_count,
-                start_index=start_index,
-                local_start_index=local_start_index,
-                vllm_config=vllm_config,
-                local_client=True,
-                handshake_address=handshake_address,
-                executor_class=executor_class,
-                log_stats=log_stats,
-            )
+            with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+                local_engine_manager = CoreEngineProcManager(
+                    local_engine_count=local_engine_count,
+                    start_index=start_index,
+                    local_start_index=local_start_index,
+                    vllm_config=vllm_config,
+                    local_client=True,
+                    handshake_address=handshake_address,
+                    executor_class=executor_class,
+                    log_stats=log_stats,
+                )
 
         yield local_engine_manager, coordinator, addresses
         wait_for_engine_startup(
@@ -892,6 +919,8 @@ def launch_stage_replica(
     stage_config: Any = None,
     omni_master_server: OmniMasterServer | None = None,
     omni_coordinator_address: str | None = None,
+    stage_visible_devices: str | None = None,
+    spawn_device_lock: threading.Lock | None = None,
 ) -> Iterator[StageReplicaResources]:
     """Launch a local LLM stage replica.
 
@@ -911,6 +940,8 @@ def launch_stage_replica(
             stage_config=stage_config,
             replica_id=replica_id,
             omni_coordinator_address=omni_coordinator_address,
+            stage_visible_devices=stage_visible_devices,
+            spawn_device_lock=spawn_device_lock,
         ) as resources:
             engine_manager, coordinator, addresses = resources
             yield StageReplicaResources(
@@ -927,19 +958,20 @@ def launch_stage_replica(
     addresses = get_engine_zmq_addresses(vllm_config)
     handshake_address = get_open_zmq_ipc_path()
     engines_to_handshake = [CoreEngine(index=0, local=True)]
-    engine_manager = StageEngineCoreProcManager(
-        local_engine_count=1,
-        start_index=0,
-        local_start_index=0,
-        vllm_config=vllm_config,
-        local_client=True,
-        handshake_address=handshake_address,
-        executor_class=executor_class,
-        log_stats=log_stats,
-        omni_stage_id=stage_id,
-        omni_coordinator_address=omni_coordinator_address,
-        omni_replica_base_id=replica_id,
-    )
+    with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+        engine_manager = StageEngineCoreProcManager(
+            local_engine_count=1,
+            start_index=0,
+            local_start_index=0,
+            vllm_config=vllm_config,
+            local_client=True,
+            handshake_address=handshake_address,
+            executor_class=executor_class,
+            log_stats=log_stats,
+            omni_stage_id=stage_id,
+            omni_coordinator_address=omni_coordinator_address,
+            omni_replica_base_id=replica_id,
+        )
 
     with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
         yield StageReplicaResources(

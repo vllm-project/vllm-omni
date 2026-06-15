@@ -192,11 +192,8 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
     env_var = current_omni_platform.device_control_env_var
     old_env = os.environ.get(env_var)
     os.environ[env_var] = "0,1"
+    runtime._init_visible_devices_baseline = "0,1"
 
-    def _fake_setup_stage_devices(_stage_id, _runtime_cfg):
-        current_omni_platform.set_device_control_env_var("1")
-
-    monkeypatch.setattr(runtime_mod, "setup_stage_devices", _fake_setup_stage_devices)
     monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
     monkeypatch.setattr(
         runtime_mod,
@@ -205,7 +202,7 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
     )
 
     try:
-        runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1, stage_launch_lock=threading.Lock())
+        runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1)
         assert os.environ.get(env_var) == "0,1"
     finally:
         if old_env is None:
@@ -231,7 +228,6 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
 
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(runtime_mod, "setup_stage_devices", lambda *_: None)
     monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
 
     def _capture_launch_diffusion_stage_replica(**kwargs):
@@ -244,7 +240,7 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
 
     monkeypatch.setattr(runtime_mod, "launch_diffusion_stage_replica", _capture_launch_diffusion_stage_replica)
 
-    runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=302, stage_launch_lock=threading.Lock())
+    runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=302)
 
     assert captured == {
         "stage_id": 0,
@@ -395,7 +391,7 @@ def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monk
         (1, 1): types.SimpleNamespace(name="stage1-replica1"),
     }
 
-    def _initialize_replica(plan, _stage_init_timeout, _stage_launch_lock):
+    def _initialize_replica(plan, _stage_init_timeout):
         time.sleep(0.02 * (3 - plan.metadata.stage_id - plan.replica_id))
         return clients[(plan.metadata.stage_id, plan.replica_id)]
 
@@ -451,7 +447,7 @@ def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_rep
 
     monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: stage_plans)
 
-    def _initialize_replica(plan, _stage_init_timeout, _stage_launch_lock):
+    def _initialize_replica(plan, _stage_init_timeout):
         if plan.replica_id == 0:
             return initialized_client
         time.sleep(0.05)
@@ -566,7 +562,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     )
 
     try:
-        runtime._initialize_local_llm_replica(plan, 302, threading.Lock())
+        runtime._initialize_local_llm_replica(plan, 302)
     finally:
         if prev_device_env is None:
             os.environ.pop(device_env_var, None)

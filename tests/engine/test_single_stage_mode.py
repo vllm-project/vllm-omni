@@ -886,8 +886,8 @@ class TestSingleStageReplicaInitialization:
         device_env_var = current_omni_platform.device_control_env_var
         prev_device_env = os.environ.get(device_env_var)
         os.environ[device_env_var] = "0"
+        runtime._init_visible_devices_baseline = "0"
 
-        mocker.patch.object(runtime_mod, "setup_stage_devices")
         mocker.patch.object(runtime_mod, "build_engine_args_dict", return_value={})
         mocker.patch.object(runtime_mod, "acquire_device_locks", return_value=[])
         mocker.patch.object(runtime_mod, "release_device_locks")
@@ -899,7 +899,7 @@ class TestSingleStageReplicaInitialization:
         )
         try:
             result = runtime._initialize_local_llm_replica(
-                plan, stage_init_timeout=60, llm_stage_launch_lock=threading.Lock()
+                plan, stage_init_timeout=60
             )
         finally:
             if prev_device_env is None:
@@ -991,8 +991,8 @@ class TestSingleStageReplicaInitialization:
         device_env_var = current_omni_platform.device_control_env_var
         prev_device_env = os.environ.get(device_env_var)
         os.environ[device_env_var] = "0"
+        runtime._init_visible_devices_baseline = "0"
 
-        mocker.patch.object(runtime_mod, "setup_stage_devices")
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value="diffusion-config")
         mock_register = mocker.patch(
@@ -1023,7 +1023,7 @@ class TestSingleStageReplicaInitialization:
 
         try:
             result = runtime._initialize_local_diffusion_replica(
-                plan, stage_init_timeout=60, stage_launch_lock=threading.Lock()
+                plan, stage_init_timeout=60
             )
         finally:
             if prev_device_env is None:
@@ -1085,8 +1085,8 @@ class TestSingleStageReplicaInitialization:
         device_env_var = current_omni_platform.device_control_env_var
         prev_device_env = os.environ.get(device_env_var)
         os.environ[device_env_var] = "0"
+        runtime._init_visible_devices_baseline = "0"
 
-        mocker.patch.object(runtime_mod, "setup_stage_devices")
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value="diffusion-config")
         mocker.patch(
@@ -1107,7 +1107,7 @@ class TestSingleStageReplicaInitialization:
         try:
             with pytest.raises(RuntimeError, match="handshake failed"):
                 runtime._initialize_local_diffusion_replica(
-                    plan, stage_init_timeout=60, stage_launch_lock=threading.Lock()
+                    plan, stage_init_timeout=60
                 )
         finally:
             if prev_device_env is None:
