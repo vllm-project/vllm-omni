@@ -11,8 +11,11 @@
 
 | Model | Size | Task Types |
 |---|---|---|
-| Qwen/Qwen3-TTS-0.6B | 0.6B | CustomVoice, VoiceDesign, Base |
-| Qwen/Qwen3-TTS-8B | 8B | CustomVoice, VoiceDesign, Base |
+| Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice | 0.6B | CustomVoice |
+| Qwen/Qwen3-TTS-12Hz-0.6B-Base | 0.6B | Base (voice cloning) |
+| Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice | 1.7B | CustomVoice |
+| Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign | 1.7B | VoiceDesign |
+| Qwen/Qwen3-TTS-12Hz-1.7B-Base | 1.7B | Base (voice cloning) |
 
 **Task types:**
 - **CustomVoice** — generate speech with a known speaker identity
@@ -36,11 +39,11 @@ pip install qwen-tts
 ## Hardware: NVIDIA CUDA
 
 ### Tested configurations
-- 1× A100 80GB (CUDA 12.4)
-- 1× H100 80GB (CUDA 12.4)
+- 1× A100 80GB (CUDA 12.1)
+- 1× H100 80GB (CUDA 12.1)
 
-Qwen3-TTS-0.6B fits comfortably on a single 16GB GPU.
-Qwen3-TTS-8B requires at least 24GB VRAM.
+Qwen3-TTS-0.6B fits comfortably on a single 8GB GPU.
+Qwen3-TTS-1.7B requires at least 12GB VRAM.
 
 ---
 
@@ -77,10 +80,10 @@ python end2end.py --query-type Base --mode-tag icl
 
 ```bash
 # 0.6B variant
-vllm serve Qwen/Qwen3-TTS-0.6B --omni --port 8091
+vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --omni --port 8091
 
 # 8B variant
-vllm serve Qwen/Qwen3-TTS-8B --omni --port 8091
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091
 ```
 
 ### Make a request
@@ -89,7 +92,7 @@ vllm serve Qwen/Qwen3-TTS-8B --omni --port 8091
 curl -X POST http://localhost:8091/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen3-TTS-0.6B",
+    "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
     "input": "Hello, welcome to vLLM-Omni text-to-speech.",
     "voice": "default"
   }' \
