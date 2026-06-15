@@ -23,6 +23,8 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+_log = logging.getLogger(__name__)
+
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
     DistributedAutoencoderKLWan,
@@ -105,21 +107,30 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def _kv_get(self, state, is_negative):
         s = self._bde_kv_state
-        return s.get_kv_caches(is_negative) if s is not None else state.get_kv_caches(is_negative)
+        if s is not None:
+            _log.debug("BDE KV get (neg=%s): %d layers", is_negative, s.num_layers)
+            return s.get_kv_caches(is_negative)
+        return state.get_kv_caches(is_negative)
 
     def _kv_create(self, state, batch_size, dtype, device, num_layers, num_heads, head_dim):
         if self._bde_kv_state is not None:
-            return  # pool pre-allocated
+            _log.debug("BDE KV create: pool already allocated (%d layers)", num_layers)
+            return
         state.create_kv_caches(batch_size, dtype, device, num_layers, num_heads, head_dim)
 
     def _kv_update(self, state, layer_idx, updated_kv, is_negative):
         s = self._bde_kv_state
-        if s is not None: s.update_kv_cache(layer_idx, updated_kv, is_negative)
-        else: state.update_kv_cache(layer_idx, updated_kv, is_negative=is_negative)
+        if s is not None:
+            _log.debug("BDE KV write: layer %d neg=%s shape=%s", layer_idx, is_negative, tuple(updated_kv.shape))
+            s.update_kv_cache(layer_idx, updated_kv, is_negative)
+        else:
+            state.update_kv_cache(layer_idx, updated_kv, is_negative=is_negative)
 
     def _kv_commit(self):
         s = self._bde_kv_state
-        if s is not None: s.commit_chunk()
+        if s is not None:
+            _log.debug("BDE KV commit: pos=%d chunks neg=%d chunks", s.pos.completed_chunks, s.neg.completed_chunks)
+            s.commit_chunk()
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         """Initialize pipeline components.

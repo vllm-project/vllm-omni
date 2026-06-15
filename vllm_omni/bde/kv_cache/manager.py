@@ -12,6 +12,8 @@ thin.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from vllm_omni.bde.kv_cache.adapter import BDERequestAdapter
@@ -20,6 +22,8 @@ from vllm_omni.bde.kv_cache.config import BDEKVConfig
 from vllm_omni.bde.kv_cache.pool import build_kv_manager, compute_num_blocks
 from vllm_omni.bde.kv_cache.slot_mapping import chunk_slot_mapping, resident_block_ids
 from vllm_omni.bde.kv_cache.gather import allocate_kv_pool, pool_gather_window, pool_write_chunk
+
+_log = logging.getLogger(__name__)
 
 
 class BDEKVCache:
@@ -100,9 +104,13 @@ class BDEKVCache:
             prefill_prefix_tokens=prefill_prefix_tokens,
         )
         self._adapters[request_id] = adapter
+        _log.debug("BDE begin_request: req=%s prefill=%d", request_id, prefill_prefix_tokens)
         return adapter
 
     def end_request(self, adapter: BDERequestAdapter) -> None:
+        _log.debug("BDE end_request: req=%s chunks=%d free=%d",
+                    adapter.request_id, adapter.completed_chunks,
+                    self.manager.block_pool.get_num_free_blocks())
         self.manager.free(adapter)
         self._adapters.pop(adapter.request_id, None)
 
@@ -115,10 +123,13 @@ class BDEKVCache:
         """
         blocks = self.manager.allocate_slots(adapter, num_new_tokens=self.spec.chunk_size)
         if blocks is None:
-            # Phase 2 turns this into scheduler back-pressure; for the Phase-1
-            # single-request demo a full pool is a hard error.
             raise RuntimeError("BDE KV pool exhausted while allocating a chunk")
-        return self.block_table(adapter)
+        table = self.block_table(adapter)
+        resident = resident_block_ids(table, self.null_block_id)
+        _log.debug("BDE allocate_chunk: req=%s chunk=%d table_len=%d resident=%d free=%d",
+                    adapter.request_id, adapter.completed_chunks, len(table),
+                    len(resident), self.manager.block_pool.get_num_free_blocks())
+        return table
 
     def block_table(self, adapter: BDERequestAdapter) -> list[int]:
         return list(self.manager.get_block_ids(adapter.request_id)[0])
@@ -138,7 +149,9 @@ class BDEKVCache:
 
     def commit_chunk(self, adapter: BDERequestAdapter) -> None:
         """Advance after the chunk's K/V is written. Once per chunk, not per step."""
+        _log.debug("BDE commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
         adapter.on_chunk_committed()
+        _log.debug("BDE commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)
 
     # -- pool-backed K/V access (Step 4 — gather / write) --------------------
 
@@ -151,6 +164,9 @@ class BDEKVCache:
     ) -> None:
         """Write one layer's committed-chunk K/V into the pool."""
         slots = self.chunk_write_slots(adapter)
+        _log.debug("BDE write: req=%s layer=%d chunk=%d shapes=%s dev=%s",
+                    adapter.request_id, layer_index, adapter.completed_chunks,
+                    (tuple(new_k.shape), tuple(new_v.shape)), slots.device)
         pool_write_chunk(
             self._k_pools[layer_index],
             self._v_pools[layer_index],
@@ -166,10 +182,14 @@ class BDEKVCache:
         DreamZero's existing attention expects as its ``kv_cache`` argument.
         """
         window_ids = self.window_block_ids(adapter)
-        return pool_gather_window(
+        window = pool_gather_window(
             self._k_pools[layer_index],
             self._v_pools[layer_index],
             window_ids,
             self.block_size,
             self.spec.sliding_window,
         )
+        _log.debug("BDE gather: req=%s layer=%d blocks=%s window=%s dev=%s",
+                    adapter.request_id, layer_index, window_ids,
+                    tuple(window.shape), window.device)
+        return window

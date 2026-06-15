@@ -91,19 +91,20 @@ class BDEModelRunner(DiffusionModelRunner):
             return super().execute_model(req)
 
         kv = self.kv_cache
+        logger.debug(
+            "BDE execute_model: req=%s chunk_size=%d window_chunks=%s num_blocks=%d",
+            req.request_id, kv.spec.chunk_size, kv.config.window_chunks, kv.num_blocks,
+        )
         pos = kv.begin_request(req.request_id)
         neg = kv.begin_request(req.request_id + "__neg")
-        # Allocate the prefill chunk so the first gather has blocks to read.
         kv.allocate_chunk(pos)
         kv.allocate_chunk(neg)
-        kv_state = BDEKVState(
-            kv, pos, neg,
-            num_layers=kv.num_layers,
-        )
-        self.pipeline._bde_kv_state = kv_state
+        logger.debug("BDE prefill allocated: pos=%d neg=%d blocks", len(kv.block_table(pos)), len(kv.block_table(neg)))
+        self.pipeline._bde_kv_state = BDEKVState(kv, pos, neg, num_layers=kv.num_layers)
         try:
             return super().execute_model(req)
         finally:
             self.pipeline._bde_kv_state = None
+            logger.debug("BDE request done: req=%s pos_chunks=%d neg_chunks=%d", req.request_id, pos.completed_chunks, neg.completed_chunks)
             kv.end_request(pos)
             kv.end_request(neg)
