@@ -68,3 +68,15 @@ def test_kv_state_noop():
     assert p._bde_kv_state is None
     for attr in ("_kv_get", "_kv_create", "_kv_update", "_kv_commit"):
         assert hasattr(p, attr), f"proxy method {attr} missing"
+
+
+def test_kv_create_fallback_does_not_recurse():
+    """Regression: _kv_create must call state.create_kv_caches, NOT itself."""
+    from unittest.mock import MagicMock
+    from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
+
+    p = DreamZeroPipeline.__new__(DreamZeroPipeline)
+    p._bde_kv_state = None  # explicitly None, as in the default
+    state = MagicMock()
+    p._kv_create(state, 1, "float32", "cpu", 24, 4, 64)
+    state.create_kv_caches.assert_called_once_with(1, "float32", "cpu", 24, 4, 64)

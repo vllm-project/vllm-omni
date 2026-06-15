@@ -110,7 +110,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def _kv_create(self, state, batch_size, dtype, device, num_layers, num_heads, head_dim):
         if self._bde_kv_state is not None:
             return  # pool pre-allocated
-        self._kv_create(state, batch_size, dtype, device, num_layers, num_heads, head_dim)
+        state.create_kv_caches(batch_size, dtype, device, num_layers, num_heads, head_dim)
 
     def _kv_update(self, state, layer_idx, updated_kv, is_negative):
         s = self._bde_kv_state
