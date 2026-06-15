@@ -18,6 +18,7 @@ from vllm_omni.config.omni_config import (
     VllmOmniStageConfig,
 )
 from vllm_omni.config.stage_config import (
+    PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
     PipelineConfig,
     StageConfig,
@@ -59,6 +60,7 @@ __all__ = [
     "PipelineConfig",
     "StageDeployConfig",
     "DeployConfig",
+    "PIPELINE_WIDE_ENGINE_FIELDS",
     "load_deploy_config",
     "merge_pipeline_deploy",
     "register_pipeline",

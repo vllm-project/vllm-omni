@@ -26,6 +26,7 @@ from vllm_omni.config.omni_config import (
 from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     _PIPELINE_REGISTRY,
+    PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
     PipelineConfig,
     StageDeployConfig,
@@ -141,6 +142,51 @@ def test_from_registry_applies_cli_overrides_without_stage_config_runtime_bridge
 
     assert stage0.scheduler_config.max_num_seqs == 7
     assert stage1.parallel_config.tensor_parallel_size == 2
+
+
+def test_pipeline_deploy_cli_fields_reuse_legacy_pipeline_wide_engine_fields():
+    assert omni_config_module._PIPELINE_DEPLOY_CLI_FIELDS is PIPELINE_WIDE_ENGINE_FIELDS
+    assert "active_stream_window" in omni_config_module._PIPELINE_DEPLOY_CLI_FIELDS
+    assert "custom_voice_dir" in omni_config_module._PIPELINE_DEPLOY_CLI_FIELDS
+
+
+def test_from_registry_keeps_worker_backend_separate_from_distributed_executor_backend():
+    omni_config = VllmOmniConfig.from_registry("dreamzero", deploy_config_path="dreamzero_tp1_cfg2")
+
+    assert omni_config.stage_by_id(0).parallel_config.distributed_executor_backend == "mp"
+    assert omni_config.orchestrator_config.worker_backend == "multi_process"
+
+
+def test_from_registry_maps_orchestrator_cli_overrides():
+    omni_config = VllmOmniConfig.from_registry(
+        "qwen3_tts",
+        cli_overrides={
+            "stage_init_timeout": 1200,
+            "init_timeout": 1800,
+            "worker_backend": "ray",
+            "ray_address": "ray://127.0.0.1:10001",
+            "omni_master_address": "127.0.0.1",
+            "omni_master_port": 12345,
+            "omni_dp_size_local": 2,
+            "omni_lb_policy": "round_robin",
+            "omni_heartbeat_timeout": 9.5,
+            "shm_threshold_bytes": 4096,
+            "batch_timeout": 3,
+        },
+    )
+
+    orchestrator_config = omni_config.orchestrator_config
+    assert orchestrator_config.stage_init_timeout == 1200
+    assert orchestrator_config.init_timeout == 1800
+    assert orchestrator_config.worker_backend == "ray"
+    assert orchestrator_config.ray_address == "ray://127.0.0.1:10001"
+    assert orchestrator_config.omni_master_address == "127.0.0.1"
+    assert orchestrator_config.omni_master_port == 12345
+    assert orchestrator_config.omni_dp_size_local == 2
+    assert orchestrator_config.omni_lb_policy == "round_robin"
+    assert orchestrator_config.omni_heartbeat_timeout == 9.5
+    assert orchestrator_config.shm_threshold_bytes == 4096
+    assert orchestrator_config.batch_timeout == 3
 
 
 def test_from_registry_records_loaded_deploy_path_on_orchestrator_config():

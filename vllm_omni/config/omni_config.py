@@ -22,6 +22,7 @@ from vllm.config.utils import config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     _PIPELINE_REGISTRY,
+    PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
     PipelineConfig,
     StageDeployConfig,
@@ -75,16 +76,7 @@ _ORCHESTRATOR_ONLY_CLI_KEYS = frozenset(
     }
 )
 
-_PIPELINE_DEPLOY_CLI_FIELDS = (
-    "trust_remote_code",
-    "distributed_executor_backend",
-    "dtype",
-    "quantization",
-    "enable_prefix_caching",
-    "enable_chunked_prefill",
-    "data_parallel_size",
-    "pipeline_parallel_size",
-)
+_PIPELINE_DEPLOY_CLI_FIELDS = PIPELINE_WIDE_ENGINE_FIELDS
 
 
 def _copy_value(value: Any) -> Any:
@@ -736,6 +728,17 @@ def _stage_sampling_params(
     return sampling or None
 
 
+def _orchestrator_cli_overrides(cli_overrides: Mapping[str, Any]) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    for config_field in fields(OrchestratorConfig):
+        name = config_field.name
+        if name == "deploy_config_path":
+            continue
+        if cli_overrides.get(name) is not None:
+            overrides[name] = _copy_value(cli_overrides[name])
+    return overrides
+
+
 @config
 class OrchestratorConfig:
     """Configuration consumed by the orchestrator process only."""
@@ -1164,14 +1167,9 @@ class VllmOmniConfig:
             for topology in pipeline.stages
         )
 
-        worker_backend = (
-            cli_overrides.get("distributed_executor_backend")
-            or deploy_for_registry.distributed_executor_backend
-            or "multi_process"
-        )
         orchestrator_config = OrchestratorConfig(
-            worker_backend=worker_backend,
             deploy_config_path=loaded_deploy_config_path,
+            **_orchestrator_cli_overrides(cli_overrides),
         )
         return cls(
             pipeline_config=pipeline,
