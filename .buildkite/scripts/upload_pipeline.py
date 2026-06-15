@@ -157,6 +157,7 @@ def _is_test_python_file(file_path: str) -> bool:
 
 _SKIP_MARK_RE = re.compile(r"pytest\.mark\.skip(?:if)?\b|pytest\.skip\s*\(")
 _PYTESTMARK_SKIP_RE = re.compile(r"pytest\.mark\.skip\b")
+_PYTEST_MARK_ONLY_RE = re.compile(r"pytest\.mark\.\w+")
 
 
 def _paren_balance(line: str) -> int:
@@ -172,10 +173,25 @@ def _is_skip_mark_related_content(line: str) -> bool:
     return _SKIP_MARK_RE.search(stripped) is not None
 
 
+def _is_pytestmark_adjacent_content(line: str) -> bool:
+    """Allow pytestmark list refactors that only add skip/skipif alongside existing marks."""
+    stripped = line.strip().rstrip(",")
+    if not stripped:
+        return True
+    if stripped in {"[", "]"}:
+        return True
+    if stripped.startswith("#"):
+        return True
+    if stripped.startswith("pytestmark"):
+        return True
+    return _PYTEST_MARK_ONLY_RE.search(stripped) is not None
+
+
 def diff_only_contains_skip_mark_changes(diff_text: str) -> bool:
-    """True when every added/removed line in a unified diff is skip-mark related."""
+    """True when diff only edits skip marks or reformats pytestmark to add them."""
     pending_depth = 0
     saw_change = False
+    has_skip_mark_edit = False
     for raw_line in diff_text.splitlines():
         if raw_line.startswith("@@"):
             pending_depth = 0
@@ -195,12 +211,16 @@ def diff_only_contains_skip_mark_changes(diff_text: str) -> bool:
             continue
 
         if _is_skip_mark_related_content(content):
+            has_skip_mark_edit = True
             pending_depth = max(0, _paren_balance(content))
+            continue
+
+        if _is_pytestmark_adjacent_content(content):
             continue
 
         return False
 
-    return saw_change
+    return saw_change and has_skip_mark_edit
 
 
 def _git_file_diff(file_path: str, diff_range: str) -> str | None:
