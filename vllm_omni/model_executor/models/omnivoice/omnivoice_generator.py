@@ -6,9 +6,8 @@ OmniVoice Generator (Stage 0) - Iterative unmasking with Qwen3 backbone.
 Generates 8-codebook audio tokens from text via 32-step non-autoregressive
 iterative masked prediction with classifier-free guidance.
 
-Uses full bidirectional attention computed directly with PyTorch SDPA
-(torch.nn.functional.scaled_dot_product_attention); no auto-selected
-FlashAttention/SageAttention/DiffusionAttention backend is used.
+Uses vLLM-Omni's DiffusionAttention for optimized full (bidirectional) attention
+via FlashAttention/SageAttention/SDPA backends.
 """
 
 from __future__ import annotations
@@ -238,7 +237,7 @@ def _gumbel_sample(logits: torch.Tensor, temperature: float, generator: torch.Ge
 
 
 # ---------------------------------------------------------------------------
-# Qwen3-style transformer blocks using PyTorch SDPA
+# Qwen3-style transformer blocks using DiffusionAttention
 # ---------------------------------------------------------------------------
 
 
@@ -257,7 +256,7 @@ class OmniVoiceRMSNorm(nn.Module):
 
 
 class OmniVoiceAttention(nn.Module):
-    """Qwen3-style GQA attention using PyTorch SDPA (full bidirectional)."""
+    """Qwen3-style GQA attention using DiffusionAttention backend."""
 
     def __init__(self, config: OmniVoiceConfig):
         super().__init__()
@@ -316,17 +315,18 @@ class OmniVoiceAttention(nn.Module):
         v = v.permute(0, 2, 1, 3)
 
         # Convert [B, 1, S, S] bool mask to float mask for SDPA
-        # (0.0 where attend, -inf where masked)
         sdpa_mask = None
         if attention_mask is not None:
-            sdpa_mask = torch.zeros_like(attention_mask, dtype=q.dtype).masked_fill_(~attention_mask, float("-inf"))
+            sdpa_mask = attention_mask.to(dtype=q.dtype)
+            sdpa_mask = sdpa_mask.masked_fill(~attention_mask, float("-inf"))
+            sdpa_mask = sdpa_mask.masked_fill(attention_mask, 0.0)
 
         out = F.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=sdpa_mask,
-            scale=self.scale,
+            scale=1.0 / math.sqrt(self.head_dim),
         )
 
         # Back to (batch, seq, heads * head_dim)
@@ -351,7 +351,7 @@ class OmniVoiceMLP(nn.Module):
 
 
 class OmniVoiceTransformerBlock(nn.Module):
-    """Single Qwen3 transformer block with PyTorch SDPA attention."""
+    """Single Qwen3 transformer block with DiffusionAttention."""
 
     def __init__(self, config: OmniVoiceConfig):
         super().__init__()
@@ -643,9 +643,10 @@ class OmniVoiceGenerator(nn.Module):
     - 32-step iterative unmasking with classifier-free guidance
 
     Optimizations:
-    - Full bidirectional attention via PyTorch SDPA (no auto-selected
-      FlashAttn/SageAttn/DiffusionAttention backend)
+    - DiffusionAttention (FlashAttn/SageAttn/SDPA auto-selected)
+    - TeaCache / Cache-DiT compatible (hook-based, non-intrusive)
     - regionally_compile() compatible for torch.compile on repeated blocks
+    - Sequence parallelism via SP hooks for multi-GPU
     """
 
     # For regionally_compile() support

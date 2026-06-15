@@ -28,6 +28,8 @@ test_params = [
         server_args=[
             "--deploy-config",
             "vllm_omni/deploy/dreamzero_tp1_cfg2.yaml",
+            "--enforce-eager",
+            "--disable-log-stats",
         ],
         env_dict={
             "ATTENTION_BACKEND": "torch",

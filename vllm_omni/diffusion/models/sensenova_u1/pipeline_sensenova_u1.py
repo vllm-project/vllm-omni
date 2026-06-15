@@ -534,8 +534,6 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             self.llm_cfg,
             prefix="language_model",
         )
-        # We define this for Cache DiT compatibility
-        self.transformer = self.language_model.model
 
         # Vision model (understanding branch)
         self.vision_model = NEOVisionModel(self.vis_cfg)

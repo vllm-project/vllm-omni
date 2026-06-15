@@ -26,17 +26,17 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
     Step-Audio2 Main Controller
 
     Manages two-stage inference pipeline:
-    - Stage 0 (Thinker): Audio understanding and token generation
-    - Stage 1 (Token2Wav): Audio token to waveform synthesis
+    - Stage 1 (Thinker): Audio understanding and token generation
+    - Stage 2 (Token2Wav): Audio token to waveform synthesis
 
     Usage:
-        # Stage 0: Thinker
+        # Stage 1: Thinker
         model = StepAudio2ForConditionalGeneration(
             vllm_config=config,
             model_stage="thinker"
         )
 
-        # Stage 1: Token2Wav
+        # Stage 2: Token2Wav
         model = StepAudio2ForConditionalGeneration(
             vllm_config=config,
             model_stage="token2wav"

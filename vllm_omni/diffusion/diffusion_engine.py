@@ -17,6 +17,7 @@ import numpy as np
 import PIL.Image
 import torch
 from vllm.logger import init_logger
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import (
@@ -412,19 +413,62 @@ class DiffusionEngine:
             self._complete_future(fut, out)
 
     @staticmethod
-    def make_engine(
-        config: OmniDiffusionConfig,
-        scheduler: SchedulerInterface | None = None,
-    ) -> DiffusionEngine:
-        """Factory method to create a DiffusionEngine instance.
+    def resolve_engine_class(config: OmniDiffusionConfig) -> type[DiffusionEngine]:
+        """Resolve the engine class selected by ``config.engine_backend``.
+
+        Mirrors ``DiffusionExecutor.get_class``: accepts the string keys
+        ``"default"`` / ``"bde"``, a ``DiffusionEngine`` subclass, or an import
+        path string. Kept separate from :meth:`make_engine` so the selection is
+        testable without constructing an engine (which runs a dummy forward).
 
         Args:
             config: The configuration for the diffusion engine.
 
         Returns:
-            An instance of DiffusionEngine.
+            The ``DiffusionEngine`` (sub)class to instantiate.
         """
-        return DiffusionEngine(config, scheduler=scheduler)
+        backend = getattr(config, "engine_backend", "default") or "default"
+
+        if isinstance(backend, type):
+            if not issubclass(backend, DiffusionEngine):
+                raise TypeError(f"engine_backend must be a DiffusionEngine subclass. Got {backend}.")
+            return backend
+        if backend == "default":
+            return DiffusionEngine
+        if backend == "bde":
+            # Lazy import to avoid a circular dependency (bde.engine imports this
+            # module), mirroring how DiffusionExecutor.get_class imports backends.
+            from vllm_omni.bde.engine import BDEEngine
+
+            return BDEEngine
+        if isinstance(backend, str):
+            try:
+                engine_class = resolve_obj_by_qualname(backend)
+            except (ImportError, ValueError) as e:
+                raise ValueError(
+                    f"Failed to load engine_backend '{backend}'. Ensure it is a valid "
+                    f"python path. Error: {e}"
+                ) from e
+            if not issubclass(engine_class, DiffusionEngine):
+                raise TypeError(f"engine_backend must resolve to a DiffusionEngine subclass. Got {engine_class}.")
+            return engine_class
+        raise ValueError(f"Unknown engine_backend: {backend!r}")
+
+    @staticmethod
+    def make_engine(
+        config: OmniDiffusionConfig,
+        scheduler: SchedulerInterface | None = None,
+    ) -> DiffusionEngine:
+        """Factory method to create the engine selected by ``config.engine_backend``.
+
+        Args:
+            config: The configuration for the diffusion engine.
+
+        Returns:
+            An instance of the resolved ``DiffusionEngine`` (sub)class.
+        """
+        engine_class = DiffusionEngine.resolve_engine_class(config)
+        return engine_class(config, scheduler=scheduler)
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         with self._cv:

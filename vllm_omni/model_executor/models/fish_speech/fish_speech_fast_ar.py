@@ -191,11 +191,7 @@ class _FastARMLP(nn.Module):
 
 
 class _FastARDecoderLayer(nn.Module):
-    """Transformer decoder layer for Fast AR.
-
-    The batched ``forward`` runs SDPA over the full sequence and is cache-free,
-    while ``forward_one`` decodes a single step using a per-call KV cache.
-    """
+    """Transformer decoder layer for Fast AR (SDPA, no KV cache)."""
 
     def __init__(self, config: FishSpeechFastARConfig, *, prefix: str = "") -> None:
         super().__init__()
@@ -523,7 +519,7 @@ class FishSpeechFastAR(nn.Module):
         embed_buf[:bsz, 0, :] = projected
 
         # Position 1: embedding of semantic code.
-        code_embed = self.fast_embeddings(semantic_code)
+        code_embed = self.fast_embeddings(semantic_code.clamp(min=0))
         embed_buf[:bsz, 1, :] = code_embed
 
         use_sampling = do_sample and temperature > 0
@@ -546,7 +542,8 @@ class FishSpeechFastAR(nn.Module):
             logits = self.fast_output(self.fast_norm(hidden_out))
 
             # Residual codebooks (step >= 1) only have 1024 entries.
-            logits = logits[:, :residual_codebook_size]
+            if step >= 1:
+                logits = logits[:, :residual_codebook_size]
 
             if use_sampling:
                 scaled = logits * inv_temperature
