@@ -30,7 +30,7 @@ DEFAULT_TTS_REF_AUDIO = default_qwen3_tts_ref_audio_path()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Gradio demo for AURA Omni online inference.")
-    parser.add_argument("--model", default="aura_omni", help="Model name served by vLLM.")
+    parser.add_argument("--model", default="aurateam/AURA", help="Model name served by vLLM.")
     parser.add_argument("--api-base", default="http://localhost:8091/v1", help="OpenAI-compatible API base.")
     parser.add_argument("--ip", default="127.0.0.1", help="Gradio host.")
     parser.add_argument("--port", type=int, default=7862, help="Gradio port.")

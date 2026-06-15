@@ -333,12 +333,11 @@ def aura2tts(
         non_streaming_mode = non_streaming_mode_raw if isinstance(non_streaming_mode_raw, bool) else None
         ref_code_len_raw = _first_value(additional_info.get("tts_ref_code_length"), None)
         ref_code_len = int(ref_code_len_raw) if isinstance(ref_code_len_raw, int) else None
+        ref_audio = None
+        ref_text = None
         if task_type == "Base" and not x_vector_only_mode and ref_code_len is None:
-            ref_audio_for_len = _first_value(
-                additional_info.get("tts_ref_audio"),
-                default_qwen3_tts_ref_audio_path(),
-            )
-            ref_code_len = _estimate_ref_code_len_from_ref_audio(ref_audio_for_len)
+            ref_audio = _first_value(additional_info.get("tts_ref_audio"), None)
+            ref_code_len = _estimate_ref_code_len_from_ref_audio(ref_audio)
 
         assistant_token_ids_for_len = _qwen3_tts_assistant_token_ids_from_aura(source_output)
         pass_token_ids = _first_bool(additional_info.get("tts_pass_token_ids"), False)
@@ -365,13 +364,13 @@ def aura2tts(
         )
 
         if task_type == "Base":
-            ref_audio = _first_value(additional_info.get("tts_ref_audio"), DEFAULT_QWEN3_TTS_REF_AUDIO)
-            ref_text = _first_value(additional_info.get("tts_ref_text"), DEFAULT_QWEN3_TTS_REF_TEXT)
+            ref_audio = ref_audio or _first_value(additional_info.get("tts_ref_audio"), None)
+            ref_text = _first_value(additional_info.get("tts_ref_text"), None)
+            if not ref_audio or not ref_text:
+                raise ValueError("AURA Base TTS requires tts_ref_audio and tts_ref_text.")
             x_vector_only_mode = _first_bool(additional_info.get("tts_x_vector_only_mode"), False)
-            if ref_audio:
-                tts_info["ref_audio"] = [ref_audio]
-            if ref_text:
-                tts_info["ref_text"] = [ref_text]
+            tts_info["ref_audio"] = [ref_audio]
+            tts_info["ref_text"] = [ref_text]
             tts_info["x_vector_only_mode"] = [x_vector_only_mode]
         elif task_type == "CustomVoice":
             tts_info["speaker"] = [

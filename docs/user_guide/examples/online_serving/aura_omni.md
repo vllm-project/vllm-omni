@@ -13,7 +13,7 @@ Talker and Code2Wav implementation.
 vllm serve aurateam/AURA \
   --omni \
   --deploy-config vllm_omni/deploy/aura_omni.yaml \
-  --served-model-name aura_omni \
+  --served-model-name aurateam/AURA \
   --trust-remote-code
 ```
 

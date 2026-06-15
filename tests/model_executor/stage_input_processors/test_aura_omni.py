@@ -9,7 +9,6 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-    DEFAULT_QWEN3_TTS_REF_AUDIO,
     SILENT_TEXT,
     asr2aura,
     aura2tts,
@@ -20,6 +19,16 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _source_output(text: str, request_id: str = "req-1", token_ids: list[int] | None = None):
     output = SimpleNamespace(text=text, cumulative_token_ids=token_ids or [1, 2, 3], multimodal_output={})
+    return SimpleNamespace(request_id=request_id, outputs=[output])
+
+
+def _source_delta_final_output(cumulative_text: str, request_id: str = "req-1"):
+    output = SimpleNamespace(
+        text="",
+        cumulative_text=cumulative_text,
+        cumulative_token_ids=[1, 2, 3],
+        multimodal_output={},
+    )
     return SimpleNamespace(request_id=request_id, outputs=[output])
 
 
@@ -79,6 +88,7 @@ def test_aura2tts_builds_qwen3_tts_prompt_information():
         "additional_information": {
             "tts_language": ["Chinese"],
             "tts_instruct": ["Calm voice."],
+            "tts_ref_audio": ["ref.wav"],
             "tts_ref_text": ["Reference transcript sample."],
         }
     }
@@ -90,7 +100,7 @@ def test_aura2tts_builds_qwen3_tts_prompt_information():
     assert PRECOMPUTED_TEXT_IDS_KEY not in tts_input["additional_information"]
     assert tts_input["additional_information"]["task_type"] == ["Base"]
     assert tts_input["additional_information"]["language"] == ["Chinese"]
-    assert tts_input["additional_information"]["ref_audio"] == [DEFAULT_QWEN3_TTS_REF_AUDIO]
+    assert tts_input["additional_information"]["ref_audio"] == ["ref.wav"]
     assert tts_input["additional_information"]["ref_text"] == ["Reference transcript sample."]
     assert tts_input["additional_information"]["x_vector_only_mode"] == [False]
     assert tts_input["additional_information"]["instruct"] == ["Calm voice."]
@@ -117,6 +127,8 @@ def test_aura2tts_supports_x_vector_only_mode_for_base():
         "additional_information": {
             "tts_task_type": ["Base"],
             "tts_x_vector_only_mode": [True],
+            "tts_ref_audio": ["ref.wav"],
+            "tts_ref_text": ["Reference transcript sample."],
         }
     }
 
@@ -143,6 +155,7 @@ def test_aura2tts_supports_custom_voice_mode():
 def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
     prompt = {
         "additional_information": {
+            "tts_ref_audio": ["ref.wav"],
             "tts_ref_text": ["Reference transcript sample."],
             "tts_pass_token_ids": [True],
         }

@@ -16,7 +16,7 @@ vllm serve aurateam/AURA \
   --omni \
   --port 8091 \
   --deploy-config vllm_omni/deploy/aura_omni.yaml \
-  --served-model-name aura_omni \
+  --served-model-name aurateam/AURA \
   --trust-remote-code
 ```
 
@@ -30,10 +30,6 @@ For local weights, edit the `model` value on each stage in
 `vllm_omni/deploy/aura_omni.yaml`. The deploy profile includes
 `pipeline: aura_omni`, so the server uses this four-stage topology even when
 the command-line model path points at one component checkpoint.
-
-Use `aura_omni` as the OpenAI API `model` value. The component checkpoint paths
-belong in the deploy YAML; they are not valid request model names unless you
-also register them with `--served-model-name`.
 
 Expected request shape:
 
@@ -70,7 +66,7 @@ Recommended baseline on one GPU for H200
 python examples/online_serving/aura_omni/openai_chat_completion_client.py \
   --host localhost \
   --port 8091 \
-  --model aura_omni \
+  --model aurateam/AURA \
   --modalities text,audio
 ```
 
@@ -123,8 +119,8 @@ bash run_curl_multimodal_generation.sh
 Set `PORT`, `MODEL`, or `OUTPUT_DIR` to override defaults:
 
 ```bash
-PORT=8666 MODEL=aura_omni bash run_curl_multimodal_generation.sh
-TTS_PASS_TOKEN_IDS=true PORT=8666 MODEL=aura_omni bash run_curl_multimodal_generation.sh
+PORT=8666 MODEL=aurateam/AURA bash run_curl_multimodal_generation.sh
+TTS_PASS_TOKEN_IDS=true PORT=8666 MODEL=aurateam/AURA bash run_curl_multimodal_generation.sh
 ```
 
 ## Gradio
@@ -140,7 +136,7 @@ If the server is already running:
 
 ```bash
 python examples/online_serving/aura_omni/gradio_demo.py \
-  --model aura_omni \
+  --model aurateam/AURA \
   --api-base http://localhost:8091/v1
 ```
 

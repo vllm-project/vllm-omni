@@ -19,7 +19,7 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
 )
 
 SEED = 42
-DEFAULT_MODEL = "aura_omni"
+DEFAULT_MODEL = "aurateam/AURA"
 DEFAULT_VIDEO_URL = "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4"
 
 
