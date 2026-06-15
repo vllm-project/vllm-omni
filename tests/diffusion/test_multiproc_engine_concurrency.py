@@ -17,8 +17,10 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
 from vllm_omni.diffusion.sched import RequestScheduler
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
+from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -305,6 +307,80 @@ class TestSerialEngineOperations:
         assert len(results) == 1
         assert results[0].error == "rank0"
 
+    def test_collective_rpc_all_rank_status_error_propagation(self):
+        engine, _, _, res_q = _make_engine(num_gpus=2)
+
+        res_q.put(
+            {
+                "type": DIFFUSION_RPC_RESULT_ENVELOPE,
+                "method": "add_lora",
+                "result": True,
+                "rank_statuses": [
+                    {"rank": 0, "ok": True, "bool_result": True},
+                    {
+                        "rank": 1,
+                        "ok": False,
+                        "error": "rank1 boom",
+                        "error_type": "RuntimeError",
+                        "traceback": "rank1 traceback",
+                    },
+                ],
+            }
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            engine.collective_rpc("add_lora")
+        error = str(excinfo.value)
+        assert "rank 1" in error
+        assert "rank1 boom" in error
+        assert "rank1 traceback" in error
+
+    def test_collective_rpc_all_rank_bool_false_is_aggregated(self):
+        engine, _, _, res_q = _make_engine(num_gpus=2)
+
+        res_q.put(
+            {
+                "type": DIFFUSION_RPC_RESULT_ENVELOPE,
+                "method": "remove_lora",
+                "result": True,
+                "rank_statuses": [
+                    {"rank": 0, "ok": True, "bool_result": True},
+                    {"rank": 1, "ok": True, "bool_result": False},
+                ],
+            }
+        )
+
+        assert engine.collective_rpc("remove_lora") == [False]
+
+    def test_collective_rpc_collects_rank_status_only_for_control_plane_all_rank_rpc(self):
+        executor, req_q, res_q = _make_executor(num_gpus=2)
+
+        res_q.put(_tagged_output("forward"))
+        result = executor.collective_rpc(
+            "execute_stepwise",
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        forward_rpc = req_q.get_nowait()
+
+        assert result.error == "forward"
+        assert forward_rpc["exec_all_ranks"] is True
+        assert forward_rpc["collect_rank_status"] is False
+
+        res_q.put(
+            {
+                "type": DIFFUSION_RPC_RESULT_ENVELOPE,
+                "method": "remove_lora",
+                "result": True,
+                "rank_statuses": [{"rank": 0, "ok": True, "bool_result": True}],
+            }
+        )
+        assert executor.collective_rpc("remove_lora") == [True]
+        control_rpc = req_q.get_nowait()
+
+        assert control_rpc["exec_all_ranks"] is True
+        assert control_rpc["collect_rank_status"] is True
+
     def test_serial_add_req_then_collective_rpc(self):
         engine, _, req_q, res_q = _make_engine()
         wt = _start_worker(req_q, res_q, count=2)
@@ -346,6 +422,115 @@ class TestSerialEngineOperations:
 
         with pytest.raises(RuntimeError, match="closed"):
             engine.collective_rpc("anything")
+
+
+class TestWorkerProcRpcRankStatus:
+    def _make_worker_proc(self, has_result_mq: bool = True):
+        proc = object.__new__(WorkerProc)
+        proc.gpu_id = 0
+        proc.result_mq = object() if has_result_mq else None
+        proc.worker = SimpleNamespace(execute_method=Mock(return_value=True))
+        return proc
+
+    def test_execute_rpc_returns_rank_status_envelope(self, monkeypatch):
+        proc = self._make_worker_proc()
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+        def _all_gather_object(out, local):
+            out[0] = local
+            out[1] = {
+                "rank": 1,
+                "ok": False,
+                "error": "rank1 boom",
+                "error_type": "RuntimeError",
+                "traceback": "trace",
+                "bool_result": None,
+            }
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", _all_gather_object)
+
+        result, should_reply = proc.execute_rpc(
+            {
+                "method": "remove_lora",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": True,
+                "collect_rank_status": True,
+            }
+        )
+
+        assert should_reply is True
+        assert result["type"] == DIFFUSION_RPC_RESULT_ENVELOPE
+        assert result["result"] is True
+        assert result["rank_statuses"][0]["rank"] == 0
+        assert result["rank_statuses"][1]["rank"] == 1
+        assert result["rank_statuses"][1]["ok"] is False
+
+    def test_execute_rpc_local_exception_is_reported_in_envelope(self, monkeypatch):
+        proc = self._make_worker_proc()
+        proc.worker.execute_method = Mock(side_effect=RuntimeError("local boom"))
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+        result, should_reply = proc.execute_rpc(
+            {
+                "method": "add_lora",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": True,
+                "collect_rank_status": True,
+            }
+        )
+
+        assert should_reply is True
+        assert result["type"] == DIFFUSION_RPC_RESULT_ENVELOPE
+        assert len(result["rank_statuses"]) == 1
+        status = result["rank_statuses"][0]
+        assert status["rank"] == 0
+        assert status["ok"] is False
+        assert status["error"] == "local boom"
+        assert status["error_type"] == "RuntimeError"
+        assert status["bool_result"] is None
+        assert "local boom" in status["traceback"]
+
+    def test_execute_rpc_rejects_collect_rank_status_without_all_ranks(self):
+        proc = self._make_worker_proc()
+
+        with pytest.raises(ValueError, match="collect_rank_status requires exec_all_ranks=True"):
+            proc.execute_rpc(
+                {
+                    "method": "ping",
+                    "args": (),
+                    "kwargs": {},
+                    "output_rank": 0,
+                    "exec_all_ranks": False,
+                    "collect_rank_status": True,
+                }
+            )
+
+        proc.worker.execute_method.assert_not_called()
+
+    def test_execute_rpc_non_collect_exception_preserves_original_type(self):
+        proc = self._make_worker_proc()
+        original = ValueError("local boom")
+        proc.worker.execute_method = Mock(side_effect=original)
+
+        with pytest.raises(ValueError) as excinfo:
+            proc.execute_rpc(
+                {
+                    "method": "bad",
+                    "args": (),
+                    "kwargs": {},
+                    "output_rank": 0,
+                    "exec_all_ranks": False,
+                    "collect_rank_status": False,
+                }
+            )
+
+        assert excinfo.value is original
 
 
 # ───────── error handling: EngineDeadError propagation through layers ─────

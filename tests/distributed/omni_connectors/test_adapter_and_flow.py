@@ -145,7 +145,7 @@ def test_shm_connector_flow(mocker: MockerFixture):
     Using real SharedMemoryConnector (inline mode for simplicity).
     """
     # 1. Setup Connector
-    config = {"shm_threshold_bytes": 1024}  # Large threshold to use inline
+    config = {"shm_threshold_bytes": 1024, "inline_small_payloads": True}
     connector = SharedMemoryConnector(config)
     connectors_map = {("0", "1"): connector}
 

@@ -1193,6 +1193,7 @@ async def benchmark(
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
+    self_timed: bool = False,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -1355,6 +1356,7 @@ async def benchmark(
         ramp_up_strategy,
         ramp_up_start_rps,
         ramp_up_end_rps,
+        self_timed,
     ):
         if ramp_up_strategy is not None:
             current_int_rps = int(current_request_rate)
@@ -1443,6 +1445,7 @@ async def benchmark(
             defs.AVERAGE_PIXELS_PER_IMAGE: getattr(metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
             defs.MEAN_DENOISE_STEP_LATENCY_MS: getattr(metrics, defs.MEAN_DENOISE_STEP_LATENCY_MS),
             "input_lens": [output.prompt_len for output in outputs],
+            "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,
             "ttfts": [output.ttft for output in outputs],
             "itls": [output.itl for output in outputs],

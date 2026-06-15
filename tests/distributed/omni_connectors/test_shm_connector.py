@@ -13,7 +13,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.fixture()
 def connector():
-    c = SharedMemoryConnector({"shm_threshold_bytes": 64})
+    c = SharedMemoryConnector({"shm_threshold_bytes": 0})
     yield c
     c.close()
 

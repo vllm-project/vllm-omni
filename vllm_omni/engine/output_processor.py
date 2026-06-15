@@ -1,8 +1,9 @@
+from dataclasses import fields as dataclass_fields
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
-from vllm.outputs import PoolingRequestOutput
+from vllm.outputs import CompletionOutput, PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
@@ -16,10 +17,96 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 
 from vllm_omni.data_entry_keys import unflatten_payload
-from vllm_omni.engine.output_modality import DRAINABLE_MODALITIES
+from vllm_omni.engine.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
+from vllm_omni.engine.output_modality import (
+    DRAINABLE_MODALITIES,
+    OutputModality,
+    TensorAccumulationStrategy,
+    get_accumulation_strategy,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _to_cpu(x: Any) -> Any:
+    """Move a tensor to CPU; pass through non-tensors unchanged."""
+    if isinstance(x, torch.Tensor):
+        try:
+            return x.detach().to("cpu", non_blocking=True).contiguous()
+        except (RuntimeError, AttributeError):
+            return x
+    if isinstance(x, dict):
+        return {str(sk): _to_cpu(sv) for sk, sv in x.items()}
+    return x
+
+
+def _merge_payload(target: MultimodalPayload, incoming: MultimodalPayload) -> None:
+    """Merge *incoming* into *target* using list-based deferred concatenation."""
+    for k, v in incoming.tensors.items():
+        if k not in target.tensors:
+            target.tensors[k] = v
+        else:
+            existing = target.tensors[k]
+            if isinstance(existing, list):
+                existing.append(v)
+            elif isinstance(existing, torch.Tensor) and isinstance(v, torch.Tensor):
+                target.tensors[k] = [existing, v]
+            else:
+                target.tensors[k] = v
+
+    for k, v in incoming.metadata.items():
+        if k not in target.metadata:
+            target.metadata[k] = v
+        else:
+            existing = target.metadata[k]
+            if isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
+                target.metadata[k] = [existing, v]
+            elif isinstance(v, torch.Tensor) and isinstance(existing, list):
+                existing.append(v)
+            else:
+                # Metadata: replace with latest value
+                target.metadata[k] = v
+
+
+def _cat_tensors(
+    tensors: list[torch.Tensor],
+    strategy: TensorAccumulationStrategy,
+) -> torch.Tensor:
+    """Concatenate a list of tensors according to *strategy*."""
+    if strategy == TensorAccumulationStrategy.CONCAT_LAST:
+        return torch.cat(tensors, dim=-1)
+    if strategy == TensorAccumulationStrategy.REPLACE:
+        return tensors[-1]
+    # CONCAT_DIM0 / APPEND_LIST / default
+    return torch.cat(tensors, dim=0)
+
+
+def _modality_to_type_string(modality: OutputModality) -> str:
+    """Convert an OutputModality flag to a lowercase type string."""
+    try:
+        if OutputModality.AUDIO in modality:
+            return "audio"
+        if OutputModality.IMAGE in modality:
+            return "image"
+        if OutputModality.LATENT in modality:
+            return "latent"
+    except TypeError:
+        # Flag identity mismatch (e.g. after module reload in tests).
+        name = getattr(modality, "name", "") or ""
+        lowered = name.lower()
+        if "audio" in lowered:
+            return "audio"
+        if "image" in lowered:
+            return "image"
+        if "latent" in lowered:
+            return "latent"
+    return "text"
 
 
 class OmniRequestState(RequestState):
@@ -35,16 +122,20 @@ class OmniRequestState(RequestState):
         *args,
         **kwargs,
     ):
+        # arrival_time is always passed as a keyword argument by the sole caller
+        # (from_new_request).  The *args fallback via positional index was removed
+        # because upstream RequestState.__init__ reorders parameters between
+        # releases, making args[12] fragile.
         arrival_time = kwargs.get("arrival_time")
-        if arrival_time is None and len(args) > 12:
-            arrival_time = args[12]
         super().__init__(*args, **kwargs)
         self.native_text_stats = RequestStateStats(arrival_time=float(arrival_time or 0.0))
         # Omni-specific: multimodal output accumulation
-        # NOTE: Keys in mm_accumulated matter, because they dictate which
-        # outputs are drained (i.e., only drain modality keys, don't drain
-        # hidden states).
-        self.mm_accumulated: dict[str, Any] = {}
+        # TODO: mm_type is per-request, not per-key. If a model ever produces
+        # both audio and latent outputs, the modality type would flip on each
+        # add_multimodal_tensor() call. Consider tracking per-key modality
+        # types (e.g. dict[str, str]) for future multi-output models.
+        self.mm_type: str | None = None
+        self.mm_accumulated: MultimodalPayload = MultimodalPayload()
 
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)
@@ -53,8 +144,6 @@ class OmniRequestState(RequestState):
     @staticmethod
     def _to_cpu(x):
         """Try to convert to CPU tensor if needed."""
-        # TODO: Make this more robust and unify with other payload
-        # building utils, we do this in multiple places.
         if isinstance(x, torch.Tensor):
             try:
                 return x.detach().to("cpu", non_blocking=True).contiguous()
@@ -63,109 +152,94 @@ class OmniRequestState(RequestState):
         return x
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
+        """Accumulate a multimodal tensor payload into the request state.
+
+        Normalizes incoming payloads (dict or raw tensor) into a
+        MultimodalPayload and merges with any previously accumulated data.
+        Uses list-based deferred concatenation to avoid O(n²) repeated
+        torch.cat calls.
+        """
         if payload is None:
             return
-
-        mm_type = (mm_type or "").lower()
         try:
+            if mm_type:
+                self.mm_type = (mm_type or "").lower()
+
+            target_key = self.mm_type or "hidden"
+
+            # Build incoming MultimodalPayload
             if isinstance(payload, dict):
-                # Keep payload flat (dotted keys like "hidden_states.layer_0")
-                # during accumulation so that all values are tensors/scalars and
-                # the merge logic below works correctly.  Unflatten happens
-                # later in _consolidate_multimodal_tensors after concatenation.
-
-                incoming: dict[str, Any] = {}
-                # TODO (Alex): Clean up and simplify key management
-                target_key = mm_type or "hidden"
-
+                remapped: dict[str, Any] = {}
                 for k, v in payload.items():
+                    # Normalize producer keys to the modality name.
+                    # AR runners produce {"hidden": ...} and generation
+                    # runners produce {"model_outputs": ...}; remap both
+                    # to the semantic modality key (e.g. "audio", "latent").
                     if k == "model_outputs":
                         k = target_key
                     elif k == "hidden" and target_key != "hidden":
                         k = target_key
-
-                    incoming[k] = self._to_cpu(v)
+                    remapped[k] = _to_cpu(v)
+                incoming = MultimodalPayload.from_dict(remapped)
+            elif isinstance(payload, MultimodalPayload):
+                incoming = payload
             else:
-                key = mm_type or "hidden"
-                incoming = {key: self._to_cpu(payload)}
+                incoming = MultimodalPayload.from_dict({target_key: _to_cpu(payload)})
 
-            if not self.mm_accumulated:
+            if incoming is None:
+                return
+
+            if self.mm_accumulated.is_empty:
                 self.mm_accumulated = incoming
             else:
-                for k, v in incoming.items():
-                    if k not in self.mm_accumulated:
-                        self.mm_accumulated[k] = v
-                    else:
-                        existing = self.mm_accumulated[k]
-                        if isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
-                            self.mm_accumulated[k] = [existing, v]
-                        elif isinstance(v, torch.Tensor) and isinstance(existing, list):
-                            existing.append(v)
-                        elif isinstance(v, dict) and isinstance(existing, dict):
-                            for sk, sv in v.items():
-                                if sk not in existing:
-                                    existing[sk] = sv
-                                elif isinstance(sv, torch.Tensor) and isinstance(existing[sk], torch.Tensor):
-                                    existing[sk] = [existing[sk], sv]
-                                elif isinstance(sv, torch.Tensor) and isinstance(existing[sk], list):
-                                    existing[sk].append(sv)
-                                else:
-                                    existing[sk] = sv
-                        else:
-                            self.mm_accumulated[k] = v
-        except Exception:
-            # Log and continue without crashing the output pipeline
+                _merge_payload(self.mm_accumulated, incoming)
+        except (ValueError, TypeError, RuntimeError):
             logger.exception("Error accumulating multimodal tensor")
 
     def _consolidate_multimodal_tensors(self) -> None:
-        """Consolidate accumulated tensor lists into single tensors via concatenation.
+        """Consolidate accumulated tensor lists into single tensors.
 
-        Only DELTA drains modality keys per-step, so they will never be lists here and
-        can be skipped.  For CUMULATIVE and FINAL_ONLY, modality keys accumulate across
-        steps and need consolidation.
+        Uses TensorAccumulationStrategy derived from the output modality
+        to determine concatenation behavior. Metadata values always use
+        REPLACE (keep latest).
         """
-        if not self.mm_accumulated:
+        if self.mm_accumulated.is_empty:
             return
 
-        skip_modality = self.output_kind == RequestOutputKind.DELTA
         try:
-            for k, v in self.mm_accumulated.items():
-                if skip_modality and k in DRAINABLE_MODALITIES:
-                    continue
+            modality = OutputModality.from_string(self.mm_type)
+        except (ValueError, KeyError):
+            modality = OutputModality.TEXT
+        strategy = get_accumulation_strategy(modality)
+
+        try:
+            for k, v in list(self.mm_accumulated.tensors.items()):
                 if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
                     try:
+                        self.mm_accumulated.tensors[k] = _cat_tensors(v, strategy)
+                    except RuntimeError:
                         if k == "audio":
-                            # Preserve channel dimension when chunks are compatible;
-                            # fall back to 1-D waveform concatenation for uneven chunks.
                             try:
-                                self.mm_accumulated[k] = torch.cat(v, dim=-1)
+                                self.mm_accumulated.tensors[k] = torch.cat(v, dim=-1)
                             except RuntimeError:
-                                self.mm_accumulated[k] = torch.cat([t.reshape(-1) for t in v], dim=0)
-                        elif k == "sr":
-                            # Sample rate is a constant scalar, keep last value.
-                            self.mm_accumulated[k] = v[-1]
+                                self.mm_accumulated.tensors[k] = torch.cat([t.reshape(-1) for t in v], dim=0)
                         else:
-                            self.mm_accumulated[k] = torch.cat(v, dim=0)
-                    except Exception:
-                        # Keep last tensor on failure
-                        logger.warning(f"Error concatenating tensor for key {k}; keeping last tensor")
-                        self.mm_accumulated[k] = v[-1]
-                elif isinstance(v, dict):
-                    for sk, sv in v.items():
-                        if isinstance(sv, list) and sv and isinstance(sv[0], torch.Tensor):
-                            try:
-                                v[sk] = torch.cat(sv, dim=0)
-                            except Exception:
-                                v[sk] = sv[-1]
-        except Exception:
-            logger.exception("Error consolidating multimodal tensors")
+                            logger.warning(
+                                "Error concatenating tensor for key %s; keeping last tensor",
+                                k,
+                            )
+                            self.mm_accumulated.tensors[k] = v[-1]
 
-        # Restore nested structure from flat dotted keys now that all tensor
-        # lists have been concatenated into single tensors.
-        try:
-            self.mm_accumulated = unflatten_payload(self.mm_accumulated)
-        except Exception:
-            logger.exception("Error unflattening consolidated multimodal tensors")
+            # Metadata: consolidate any deferred tensor lists (REPLACE semantics)
+            for k, v in list(self.mm_accumulated.metadata.items()):
+                if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                    self.mm_accumulated.metadata[k] = v[-1]
+                elif isinstance(v, dict):
+                    for sk, sv in list(v.items()):
+                        if isinstance(sv, list) and sv and isinstance(sv[0], torch.Tensor):
+                            v[sk] = sv[-1]
+        except (RuntimeError, TypeError, KeyError):
+            logger.exception("Error consolidating multimodal tensors")
 
     # Override: do not route to pooling-only path; always create completion
     # outputs, and attach pooling_result into the CompletionOutput.
@@ -205,18 +279,18 @@ class OmniRequestState(RequestState):
             )
 
         finished = finish_reason is not None
-        is_final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
+        final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
         is_delta = self.output_kind == RequestOutputKind.DELTA
 
-        if not finished and is_final_only:
+        if not finished and final_only:
             return None
 
+        # Consolidate accumulated tensors when finishing, or for every
+        # CUMULATIVE step so the consumer always sees a single tensor.
         if finished or not is_delta:
             self._consolidate_multimodal_tensors()
 
-        if self.stream_interval > 1:
-            assert self.detokenizer is not None
-
+        if self.stream_interval > 1 and self.detokenizer is not None:
             # Send output request only when
             # 1. It has finished, or
             # 2. It is the first token, or
@@ -228,7 +302,7 @@ class OmniRequestState(RequestState):
             ):
                 return None
 
-            if is_delta:
+            if self.output_kind == RequestOutputKind.DELTA:
                 # Send tokens from the offset in DELTA mode, otherwise all
                 # tokens are sent.
                 new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
@@ -258,50 +332,127 @@ class OmniRequestState(RequestState):
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
-    ) -> Any:
-        # Reuse base text/logprobs logic, then annotate with pooling_result.
-        # Note: upstream _new_completion_output no longer accepts routed_experts
-        # as a parameter; it reads from ``self.routed_experts_chunks`` internally.
-        base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
+    ) -> MultimodalCompletionOutput | CompletionOutput:
+        """Create a completion output with multimodal data attached.
 
-        # Inter-stage processors need the full cumulative token sequence.
-        # In DELTA mode, base_output.token_ids only has the latest step's
-        # tokens, so we always store a cumulative copy here.
-        base_output.cumulative_token_ids = list(self.detokenizer.output_token_ids)
+        Returns a MultimodalCompletionOutput when multimodal data has been
+        accumulated, otherwise returns the base CompletionOutput.  Snapshots
+        the accumulated payload before draining DELTA-mode modality keys so
+        that callers receive an immutable view.
+        """
+        # When there is no detokenizer (generation stages), build a minimal
+        # CompletionOutput directly since upstream asserts detokenizer != None.
+        if self.detokenizer is None:
+            finished = finish_reason is not None
+            base_output = CompletionOutput(
+                index=self.request_index,
+                text="",
+                token_ids=token_ids,
+                logprobs=None,
+                cumulative_logprob=None,
+                finish_reason=str(finish_reason) if finished else None,
+                stop_reason=stop_reason if finished else None,
+            )
+        else:
+            base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
+
+        # Always provide cumulative token IDs for inter-stage processors.
+        if self.detokenizer is not None:
+            base_output.cumulative_token_ids = list(self.detokenizer.output_token_ids)
+        else:
+            base_output.cumulative_token_ids = list(token_ids)
 
         # Attach cumulative_text only at the final step for inter-stage use.
         if finish_reason is not None and hasattr(self.detokenizer, "output_text"):
             base_output.cumulative_text = self.detokenizer.output_text
 
-        if not hasattr(base_output, "multimodal_output"):
-            setattr(base_output, "multimodal_output", {})
-        if self.mm_accumulated:
-            mm_out = getattr(base_output, "multimodal_output")
-            if isinstance(mm_out, dict):
-                for k, v in self.mm_accumulated.items():
-                    mm_out[k] = v
-            else:
-                setattr(base_output, "multimodal_output", self.mm_accumulated)
+        try:
+            if self.mm_accumulated and not self.mm_accumulated.is_empty:
+                # Snapshot: copy current tensors/metadata so drain doesn't
+                # mutate the payload already handed to the caller.
+                # Unflatten dotted keys (e.g. "hidden_states.layer_0") back
+                # to nested dicts so downstream consumers (thinker2talker etc.)
+                # can access with .get("hidden_states", {}).get("layers", {}).
+                merged = {**self.mm_accumulated.tensors, **self.mm_accumulated.metadata}
+                nested = unflatten_payload(merged)
+                snapshot = MultimodalPayload.from_dict(nested) or MultimodalPayload()
+                kwargs = {f.name: getattr(base_output, f.name) for f in dataclass_fields(CompletionOutput)}
+                output = MultimodalCompletionOutput(
+                    multimodal_output=snapshot,
+                    **kwargs,
+                )
+                output.cumulative_token_ids = base_output.cumulative_token_ids
+                if hasattr(base_output, "cumulative_text"):
+                    output.cumulative_text = base_output.cumulative_text
 
-        if self.output_kind == RequestOutputKind.DELTA:
-            for modality_key in DRAINABLE_MODALITIES:
-                self.mm_accumulated.pop(modality_key, None)
+                # DELTA mode: drain modality keys (e.g. audio) so the next
+                # step only sees freshly accumulated data for those keys.
+                if self.output_kind == RequestOutputKind.DELTA:
+                    for modality_key in DRAINABLE_MODALITIES:
+                        self.mm_accumulated.tensors.pop(modality_key, None)
 
+                return output
+        except (RuntimeError, TypeError, AttributeError):
+            logger.exception("Error creating MultimodalCompletionOutput")
         return base_output
+
+    def _new_request_output(
+        self,
+        external_req_id: str,
+        outputs: list,
+        finished: bool,
+        kv_transfer_params: dict[str, Any] | None = None,
+    ) -> RequestOutput | PoolingRequestOutput:
+        """Create request output, handling no-detokenizer generation stages.
+
+        Upstream asserts ``self.logprobs_processor is not None`` which fails
+        for generation stages (talker, code2wav) that have no tokenizer.
+        When the logprobs processor is absent we build the RequestOutput
+        directly with ``prompt_logprobs=None``.
+        """
+        if self.logprobs_processor is not None:
+            return super()._new_request_output(
+                external_req_id,
+                outputs,
+                finished,
+                kv_transfer_params,
+            )
+
+        # No-detokenizer path: build RequestOutput directly.
+        prompt_token_ids = self.prompt_token_ids
+        if prompt_token_ids is None and self.prompt_embeds is not None:
+            prompt_token_ids = [0] * len(self.prompt_embeds)
+        if prompt_token_ids is None:
+            prompt_token_ids = []
+
+        return RequestOutput(
+            request_id=external_req_id,
+            lora_request=self.lora_request,
+            prompt=self.prompt,
+            prompt_token_ids=prompt_token_ids,
+            prompt_logprobs=None,
+            outputs=outputs,
+            finished=finished,
+            kv_transfer_params=kv_transfer_params,
+            num_cached_tokens=self.num_cached_tokens,
+            metrics=self.stats,
+        )
 
 
 class MultimodalOutputProcessor(VLLMOutputProcessor):
-    """Handles multimodal output processing by capturing pooling_output
-    from EngineCoreOutput and accumulating it as multimodal tensors,
-    before delegating to the base vLLM OutputProcessor for text handling.
+    """Handles multimodal output processing.
 
-    The actual data flow is:
-    1. For each EngineCoreOutput with pooling_output and a detokenizer:
-       - Capture pooling_output into OmniRequestState.add_multimodal_tensor()
-       - Clear eco.pooling_output to force text path in base processor
+    Captures multimodal outputs from OmniEngineCoreOutput and accumulates
+    them as MultimodalPayload in OmniRequestState, before delegating to
+    the base vLLM OutputProcessor for text handling.
+
+    The data flow is:
+    1. For each EngineCoreOutput with multimodal_output:
+       - Capture into OmniRequestState.add_multimodal_tensor()
     2. Base vLLM OutputProcessor handles text detokenization
-    3. On finish, _consolidate_multimodal_tensors() concatenates accumulated tensors
-    4. _new_completion_output() attaches mm_accumulated to CompletionOutput
+    3. On finish, _consolidate_multimodal_tensors() concatenates accumulated
+       tensors using strategy-based dispatch
+    4. _new_completion_output() returns MultimodalCompletionOutput
     """
 
     def __init__(
@@ -312,6 +463,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         stream_interval: int = 1,
         tracing_enabled: bool = False,
         engine_core_output_type: str | None = None,
+        output_modality: OutputModality = OutputModality.TEXT,
     ):
         """Initialize the multimodal output processor.
 
@@ -319,9 +471,13 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             tokenizer: Tokenizer for detokenizing text outputs
             log_stats: Whether to log statistics
             stream_interval: Stream interval for output generation
-            engine_core_output_type: Optional output type specification
-                (e.g., "image", "audio", "latent"). Used to tag multimodal
-                outputs with the correct modality key.
+            engine_core_output_type: Optional output type string (e.g.,
+                "image", "audio", "latent"). Converted to OutputModality
+                internally. Kept for backward compatibility with
+                stage_init_utils.
+            output_modality: Type-safe output modality flag. Used to tag
+                multimodal outputs with the correct modality key when
+                per-output type info is unavailable.
         """
         super().__init__(
             tokenizer=tokenizer,
@@ -329,6 +485,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             stream_interval=stream_interval,
             tracing_enabled=tracing_enabled,
         )
+        # Convert string-based engine_core_output_type to OutputModality
+        if engine_core_output_type is not None:
+            self.output_modality = OutputModality.from_string(engine_core_output_type)
+        else:
+            self.output_modality = output_modality
         self.engine_core_output_type = engine_core_output_type
         self._native_text_metrics_by_request: dict[str, dict[str, Any]] = {}
 
@@ -426,21 +587,78 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
     ) -> OutputProcessorOutput:
+        default_mm_type = _modality_to_type_string(self.output_modality)
+
+        # Separate outputs that upstream can handle (has detokenizer or
+        # pooling) from multimodal-only outputs (no detokenizer, no pooling)
+        # that would trigger upstream's `assert detokenizer is not None`.
+        upstream_outputs: list[EngineCoreOutput] = []
+        mm_only_outputs: list[EngineCoreOutput] = []
+
+        for eco in engine_core_outputs:
+            req_state = self.request_states.get(eco.request_id)
+            if req_state is None:
+                continue
+
+            # Accumulate multimodal tensors regardless of path.
+            if isinstance(req_state, OmniRequestState):
+                mm_output = getattr(eco, "multimodal_output", None)
+                if mm_output is not None:
+                    mm_type = getattr(eco, "output_type", None) or default_mm_type
+                    req_state.add_multimodal_tensor(mm_output, mm_type)
+
+            # Route: if no detokenizer and no pooling output, handle locally
+            # to avoid upstream's assert on detokenizer.
+            if req_state.detokenizer is None and eco.pooling_output is None:
+                mm_only_outputs.append(eco)
+            else:
+                upstream_outputs.append(eco)
+
+        # Handle multimodal-only outputs (generation stages) locally.
+        self._process_mm_only_outputs(mm_only_outputs)
+
+        # Delegate text/pooling outputs to upstream.
+        return super().process_outputs(
+            upstream_outputs,
+            engine_core_timestamp=engine_core_timestamp,
+            iteration_stats=iteration_stats,
+        )
+
+    def _process_mm_only_outputs(
+        self,
+        engine_core_outputs: list[EngineCoreOutput],
+    ) -> None:
+        """Handle outputs from generation stages that have no detokenizer.
+
+        These cannot go through upstream process_outputs because it asserts
+        detokenizer is not None when pooling_output is None.
+        """
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
-            if eco.pooling_output is not None and req_state.detokenizer is not None:
-                mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
-                req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
-                # Force text path in base processor for multimodal outputs.
-                eco.pooling_output = None
 
-        return super().process_outputs(
-            engine_core_outputs,
-            engine_core_timestamp=engine_core_timestamp,
-            iteration_stats=iteration_stats,
-        )
+            new_token_ids = eco.new_token_ids
+            finish_reason = eco.finish_reason
+            stop_reason = eco.stop_reason
+            kv_transfer_params = eco.kv_transfer_params
+            routed_experts = eco.routed_experts
+            req_state.num_cached_tokens = eco.num_cached_tokens
+            req_state.is_prefilling = False
+
+            if request_output := req_state.make_request_output(
+                new_token_ids,
+                None,  # pooling_output
+                finish_reason,
+                stop_reason,
+                kv_transfer_params,
+                routed_experts,
+            ):
+                if req_state.queue is not None:
+                    req_state.queue.put(request_output)
+
+            if finish_reason is not None:
+                self._finish_request(req_state)
 
     def _update_stats_from_output(
         self,
@@ -453,6 +671,14 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         native_stats = req_state.native_text_stats if isinstance(req_state, OmniRequestState) else None
         previous_last_token_ts = native_stats.last_token_ts if native_stats is not None else 0.0
 
+        # NOTE: We pass ``None`` for  *iteration_stats* to the parent so that
+        # the upstream's ``_update_stats_from_output`` logs stats via its own
+        # ``RequestStateStats`` (req_state.stats) without touching the omni
+        # ``IterationStats`` object.  Below we re-apply the same update using
+        # *native_stats* (the omni-specific ``RequestStateStats`` attached to
+        # ``OmniRequestState``), which correctly feeds the omni metrics path.
+        # If the upstream adds new logic in ``_update_stats_from_output`` (e.g.
+        # additional stat fields), this override must be kept in sync.
         super()._update_stats_from_output(
             req_state,
             engine_core_output,

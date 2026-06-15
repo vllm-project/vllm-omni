@@ -33,11 +33,13 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     # conv2d convolution operator in the code2wav module of Qwen3-TTS not being able to run on Aclnn
     def __init__(self) -> None:
+        from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
         from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
             apply_qwen3_tts_code2wav_patch,
         )
 
         apply_qwen3_tts_code2wav_patch()
+        apply_310p_patches()
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:

@@ -34,7 +34,6 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http, terminate_if_errored
-from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
 from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
@@ -56,10 +55,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.openai.orca_metrics import metrics_header
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
-from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
-from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
 from vllm.entrypoints.pooling.pooling.serving import ServingPooling
@@ -71,18 +67,22 @@ from vllm.entrypoints.serve.disagg.serving import ServingTokens
 from vllm.entrypoints.serve.instrumentator.basic import base
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
+from vllm.entrypoints.serve.utils.api_utils import (
+    load_aware_call,
+    process_lora_modules,
+    validate_json_request,
+    with_cancellation,
+)
+from vllm.entrypoints.serve.utils.error_response import create_error_response
+from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
 )
 from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
-)
-from vllm.entrypoints.utils import (
-    create_error_response,
-    load_aware_call,
-    process_lora_modules,
-    with_cancellation,
 )
 from vllm.logger import init_logger
 from vllm.tasks import POOLING_TASKS
@@ -142,6 +142,7 @@ from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url, decode_input_reference
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -1812,6 +1813,9 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniClientError as e:
+        logger.info("Client error during image generation: %s", e)
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -2167,6 +2171,9 @@ async def edit_images(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniClientError as e:
+        logger.info("Client error during image edit: %s", e)
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -2667,6 +2674,9 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
         message = str(exc.detail) if exc.detail else str(exc)
         return VideoError(code=exc.status_code, message=message)
 
+    if isinstance(exc, OmniClientError):
+        return VideoError(code=exc.status_code, message=exc.message)
+
     if isinstance(exc, (EngineGenerateError, EngineDeadError)):
         err = create_error_response(exc)
         return VideoError(code=err.error.code, message=err.error.message)
@@ -2770,7 +2780,7 @@ async def _run_video_generation_job(
             os.unlink(reference_audio.path)
 
 
-VIDEO_SYNC_TIMEOUT_S = 600.0
+VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
 
 
 async def _parse_video_form(
@@ -3021,6 +3031,9 @@ async def create_video_sync(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniClientError as exc:
+        logger.info("Client error during sync video generation: %s", exc)
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     except Exception as exc:
         logger.exception("Sync video generation failed for request_id=%s", request_id)
         raise HTTPException(

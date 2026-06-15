@@ -420,6 +420,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
+        mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
 
@@ -498,6 +499,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             new_token_ids = generated_token_ids
             kv_transfer_params = None
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
+            mm_output = mm_outputs[req_index] if mm_outputs else None
             status_before_stop = request.status
             finish_reason = None
             routed_experts = None
@@ -558,7 +560,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
+            if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+                # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     OmniEngineCoreOutput(
                         request_id=req_id,
@@ -567,6 +570,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,
+                        multimodal_output=mm_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),

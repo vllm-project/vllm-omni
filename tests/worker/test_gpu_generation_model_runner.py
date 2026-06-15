@@ -49,8 +49,8 @@ def test_sample_tokens_tensor_output():
 
     output = GPUGenerationModelRunner.sample_tokens(runner)
 
-    assert len(output.pooler_output) == 1
-    assert output.pooler_output[0]["model_outputs"].shape == (2, 3)
+    assert len(output.multimodal_outputs) == 1
+    assert output.multimodal_outputs[0]["model_outputs"].shape == (2, 3)
 
 
 def test_sample_tokens_list_output():
@@ -59,8 +59,8 @@ def test_sample_tokens_list_output():
 
     output = GPUGenerationModelRunner.sample_tokens(runner)
 
-    assert len(output.pooler_output) == 1
-    assert output.pooler_output[0]["model_outputs"].shape == (2, 1)
+    assert len(output.multimodal_outputs) == 1
+    assert output.multimodal_outputs[0]["model_outputs"].shape == (2, 1)
 
 
 def test_sample_tokens_list_allows_none_output():
@@ -69,8 +69,8 @@ def test_sample_tokens_list_allows_none_output():
 
     output = GPUGenerationModelRunner.sample_tokens(runner)
 
-    assert len(output.pooler_output) == 1
-    assert output.pooler_output[0]["model_outputs"] is None
+    assert len(output.multimodal_outputs) == 1
+    assert output.multimodal_outputs[0]["model_outputs"] is None
 
 
 def test_sample_tokens_dict_output():
@@ -79,7 +79,7 @@ def test_sample_tokens_dict_output():
 
     output = GPUGenerationModelRunner.sample_tokens(runner)
 
-    assert len(output.pooler_output) == 1
-    assert "audio" in output.pooler_output[0]
-    assert "unused" not in output.pooler_output[0]
-    assert output.pooler_output[0]["audio"].shape == (1, 4)
+    assert len(output.multimodal_outputs) == 1
+    assert "audio" in output.multimodal_outputs[0]
+    assert "unused" not in output.multimodal_outputs[0]
+    assert output.multimodal_outputs[0]["audio"].shape == (1, 4)
