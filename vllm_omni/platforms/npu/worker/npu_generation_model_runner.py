@@ -482,7 +482,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},
-            pooler_output=pooler_output,
+            multimodal_outputs=pooler_output,
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
