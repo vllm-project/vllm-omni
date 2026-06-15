@@ -12,9 +12,9 @@ thin.
 
 from __future__ import annotations
 
-import logging
-
 import torch
+
+from vllm.logger import init_logger
 
 from vllm_omni.bde.kv_cache.adapter import BDERequestAdapter
 from vllm_omni.bde.kv_cache.chunk_window import ChunkWindowSpec
@@ -23,7 +23,7 @@ from vllm_omni.bde.kv_cache.pool import build_kv_manager, compute_num_blocks
 from vllm_omni.bde.kv_cache.slot_mapping import chunk_slot_mapping, resident_block_ids
 from vllm_omni.bde.kv_cache.gather import allocate_kv_pool, pool_gather_window, pool_write_chunk
 
-_log = logging.getLogger(__name__)
+_log = init_logger(__name__)
 
 
 class BDEKVCache:
