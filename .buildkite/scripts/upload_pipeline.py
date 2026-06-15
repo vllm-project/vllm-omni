@@ -106,29 +106,6 @@ def resolve_changed_files() -> list[str] | None:
     return files
 
 
-# Temporarily ignored when evaluating skip-ci (e.g. while debugging pipeline changes in a PR).
-_SKIP_CI_IGNORED_PATH_PREFIXES = (".buildkite/",)
-
-
-def _is_ignored_for_skip_ci_detection(file_path: str) -> bool:
-    for prefix in _SKIP_CI_IGNORED_PATH_PREFIXES:
-        if file_path == prefix.rstrip("/") or file_path.startswith(prefix):
-            return True
-    return False
-
-
-def _filter_skip_ci_changed_files(changed_files: list[str]) -> list[str]:
-    kept: list[str] = []
-    for file_path in changed_files:
-        if not file_path:
-            continue
-        if _is_ignored_for_skip_ci_detection(file_path):
-            _log(f"skip-ci: ignoring {file_path}")
-            continue
-        kept.append(file_path)
-    return kept
-
-
 def _is_doc_file(file_path: str) -> bool:
     if not file_path:
         return False
@@ -316,21 +293,16 @@ def resolve_skip_ci(changed_files: list[str] | None, *, diff_range: str | None =
         _log("skip-ci=0 (could not resolve changed files)")
         return False
 
-    effective_files = _filter_skip_ci_changed_files(changed_files)
-    if not effective_files:
-        _log("skip-ci=0 (no effective changes after ignoring configured paths)")
-        return False
-
-    if diff_range is not None and is_docs_or_skip_mark_only_change(effective_files, diff_range=diff_range):
-        if is_docs_only_change(effective_files):
+    if diff_range is not None and is_docs_or_skip_mark_only_change(changed_files, diff_range=diff_range):
+        if is_docs_only_change(changed_files):
             _log("docs-only change detected; skip-ci=1")
-        elif is_skip_mark_only_change(effective_files, diff_range=diff_range):
+        elif is_skip_mark_only_change(changed_files, diff_range=diff_range):
             _log("pytest skip-mark-only change detected; skip-ci=1")
         else:
             _log("docs + pytest skip-mark-only change detected; skip-ci=1")
         return True
 
-    if diff_range is None and is_docs_only_change(effective_files):
+    if diff_range is None and is_docs_only_change(changed_files):
         _log("docs-only change detected; skip-ci=1")
         return True
 
