@@ -225,13 +225,10 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion pipelines, the stage config field `stage_args.[].engine_args.max_num_seqs`
-    controls how many independent requests the scheduler may keep active. The
-    input list is sliced into single-item requests before feeding into the
-    diffusion pipeline; this is different from submitting a packed list-prompt
-    diffusion request. For models that support runtime batching, you can
-    [modify this configuration](../../../configuration/stage_configs.md) to let
-    the scheduler batch more compatible requests internally.
+    For diffusion pipelines, the input list is sliced into single-item requests
+    before feeding into the diffusion pipeline. For request-level batching
+    controls such as `max_num_seqs`, see
+    [Request-Level Batching](../../../docs/user_guide/diffusion/request_batching.md).
 
 ### Negative Prompts
 

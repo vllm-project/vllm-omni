@@ -58,8 +58,7 @@ as shown below.
 
     For diffusion pipelines, each prompt becomes a separate logical request.
     The runtime may automatically batch compatible in-flight requests through
-    the scheduler and runner. Diffusion list-prompt input is not represented as
-    one packed `OmniDiffusionRequest`.
+    the scheduler and runner.
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
@@ -88,10 +87,9 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion pipelines, `stage_args.[].engine_args.max_num_seqs` controls
-    how many compatible requests the scheduler may keep active. Increase it to
-    allow automatic request-level batching for models that support it; do not
-    use it to send a longer prompt list inside one diffusion request.
+    For diffusion request-level batching controls such as `max_num_seqs` and
+    `request_batch_max_wait_ms`, see
+    [Request-Level Batching](../user_guide/diffusion/request_batching.md).
 
 For more usages, please refer to [offline inference](../user_guide/examples/offline_inference/qwen2_5_omni.md)
 

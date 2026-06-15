@@ -235,7 +235,12 @@ while True:
 
 - **No scheduler-owned IPC**: Scheduler no longer talks to workers directly.
 
-- **Split concurrency model**: Request-mode diffusion remains single-active-request, while the step-wise path can keep multiple compatible requests running and advance them independently between denoise steps.
+- **Split concurrency model**: Request-mode diffusion can schedule a static
+  batch of compatible independent requests for one full pipeline forward when
+  the pipeline supports request-level batching; the step-wise path can also
+  admit or remove compatible requests between denoise steps. See
+  [Request-Level Batching](../feature/diffusion_request_level_batching.md) and
+  [Continuous Batching for Step-Wise Diffusion](../feature/diffusion_continuous_batching.md).
 
 ---
 

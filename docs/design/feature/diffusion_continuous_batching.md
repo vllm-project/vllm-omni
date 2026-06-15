@@ -92,10 +92,10 @@ key also covers LoRA identity (`lora_int_id`, `lora_scale`), so requests
 targeting different adapters or scales run in separate batches and the
 worker can activate exactly one adapter per step.
 
-The scheduler batching unit is one logical `OmniDiffusionRequest`, which
-contains a single prompt. Packed multi-prompt diffusion requests are rejected
-at the API and stage boundary. In the step-wise path, runtime tensor batching is
-represented as `StepInputBatch`.
+The scheduler batching unit is one logical `OmniDiffusionRequest`. In the
+step-wise path, runtime tensor batching is represented as `StepInputBatch`. For
+request-mode prompt semantics, see
+[Request-Level Batching](../../user_guide/diffusion/request_batching.md).
 
 ## Runner
 
@@ -141,8 +141,6 @@ compatibility gating and runner-side `StepInputBatch` packing.
 - Experimental feature; use `max_num_seqs=1` for the older conservative path.
 - Only native pipelines that already support `step_execution=True`.
 - Only homogeneous batches keyed by `SamplingParamsKey` are supported.
-- Packed multi-prompt diffusion requests are rejected; submit multiple
-  independent requests so the scheduler can batch compatible logical requests.
 - `cache_backend`, KV transfer, and other request-mode extras are not wired
   into the batched step-wise path yet.
 - Future work can relax the current same-shape restriction with richer

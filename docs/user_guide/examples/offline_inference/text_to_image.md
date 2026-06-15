@@ -183,16 +183,8 @@ if __name__ == "__main__":
 
 !!! info
 
-    Diffusion list-prompt input is not represented as one packed
-    `OmniDiffusionRequest`. Submit multiple prompts as independent requests to
-    use automatic request-level batching.
-
-!!! info
-
-    For diffusion pipelines, `stage_args.[].engine_args.max_num_seqs` controls
-    how many compatible requests the scheduler may keep active. Increase it to
-    allow automatic request-level batching for models that support it; do not
-    use it to send a longer prompt list inside one diffusion request.
+    For diffusion request-level batching controls such as `max_num_seqs`, see
+    [Request-Level Batching](../../diffusion/request_batching.md).
 
 ### Negative Prompts
 

@@ -389,14 +389,16 @@ def forward(
     height = sampling_params.height or (self.default_sample_size * self.vae_scale_factor)
     width = sampling_params.width or (self.default_sample_size * self.vae_scale_factor)
 
-    # For image editing pipelines, extract images from multi_modal_data
-    if hasattr(req, 'multi_modal_data') and req.multi_modal_data:
-        input_images = req.multi_modal_data.get('image', [])
+    # For image editing pipelines, extract media from each prompt dict
+    input_images = []
+    for p in req.prompts:
+        multi_modal_data = p.get("multi_modal_data", {}) if isinstance(p, dict) else {}
+        input_images.append(multi_modal_data.get("image"))
 
     # ... rest of generation logic
 ```
 
-For an image editing model, an example `OmniDiffusionRequest` is like:
+For an image editing model, the request `prompt` can be a dict like:
 ```python
 {
     "prompt": "turn this cat to a dog",
