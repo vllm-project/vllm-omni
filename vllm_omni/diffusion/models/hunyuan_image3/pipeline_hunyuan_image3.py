@@ -216,14 +216,19 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
         pil_image = _to_pil_image(raw_image).convert("RGB")
         orig_width, orig_height = pil_image.size
 
-        target_width, target_height = image_processor.reso_group.get_target_size(orig_width, orig_height)
-        target_width = int(target_width)
-        target_height = int(target_height)
-        vae_input = _resize_and_crop_center(pil_image, target_width, target_height)
-        vae_tensor = image_processor.vae_processor(vae_input)
+        # Use index-based primary resolution lookup for conditioning images
+        # (matching official HunyuanImage-3.0 behavior). This avoids the
+        # area-based sub-resolution matching via get_target_size().match(),
+        # which would shrink small inputs (e.g. 512x512 → 512x512) and
+        # diverge from the output generation size determined by AR ratio_idx.
         base_size, ratio_idx = image_processor.reso_group.get_base_size_and_ratio_index(orig_width, orig_height)
         base_size = int(base_size)
         ratio_idx = int(ratio_idx)
+        reso = image_processor.reso_group[ratio_idx]
+        target_width = int(reso.width)
+        target_height = int(reso.height)
+        vae_input = _resize_and_crop_center(pil_image, target_width, target_height)
+        vae_tensor = image_processor.vae_processor(vae_input)
 
         vae_info = ImageInfo(
             image_type="vae",
