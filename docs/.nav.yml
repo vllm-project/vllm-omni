@@ -115,6 +115,7 @@ nav:
       - design/feature/vae_parallel.md
       - design/feature/hsdp.md
       - design/feature/cache_dit.md
+      - design/feature/dit_cache_pool.md
       - design/feature/teacache.md
       - design/feature/async_chunk.md
       - design/feature/vae_parallel.md

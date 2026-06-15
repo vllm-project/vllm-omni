@@ -4,9 +4,8 @@
 
 Request states remain the only persistent source of truth. Static tensors are
 normalized/padded onto the request state once, while :class:`InputBatch`
-assembles an ephemeral step-local view. Dynamic tensors are re-gathered every
-step, and step outputs are scattered back into request states by
-``scatter_latents()`` using ``idx_mapping``.
+assembles an ephemeral step-local view. Dynamic tensors are re-gathered from
+request states every step.
 """
 
 from __future__ import annotations

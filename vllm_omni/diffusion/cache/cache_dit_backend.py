@@ -2116,6 +2116,11 @@ class CacheDiTBackend(CacheBackend):
         self.enabled = True
         logger.info(f"Cache-dit enabled successfully on {pipeline_name}")
 
+        # Monkey-patch CachePattern classes to support batch mode.
+        from vllm_omni.diffusion.cache.cache_dit_batch import patch_cache_dit_for_batching
+
+        patch_cache_dit_for_batching()
+
     def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context with new num_inference_steps.
 
@@ -2138,6 +2143,32 @@ class CacheDiTBackend(CacheBackend):
                 logger.info(f"Refreshing cache context for transformer with num_inference_steps: {num_inference_steps}")
             self._refresh_func(pipeline, num_inference_steps, verbose)
             self._last_num_inference_steps = num_inference_steps
+
+    def force_refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        """Refresh cache context unconditionally.
+
+        Stepwise serving needs this path for fresh request initialization even when
+        another request already used the same ``num_inference_steps``.
+        """
+
+        if not self.enabled or self._refresh_func is None:
+            logger.warning("Cache-dit is not enabled. Cannot refresh cache context.")
+            return
+
+        if verbose:
+            logger.info(
+                "Force refreshing cache context for transformer with num_inference_steps: %s",
+                num_inference_steps,
+            )
+        self._refresh_func(pipeline, num_inference_steps, verbose)
+        self._last_num_inference_steps = num_inference_steps
+
+    def create_state_driver(self, pipeline: Any) -> Any | None:
+        from vllm_omni.diffusion.cache.cache_dit_driver import CacheDiTStateDriver
+
+        if not self.enabled:
+            return None
+        return CacheDiTStateDriver(self, pipeline)
 
     def is_enabled(self) -> bool:
         """Check if cache-dit is enabled on this pipeline.
