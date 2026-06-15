@@ -274,6 +274,15 @@ class TestPipelineArgumentsHandling:
             adapter.load_weights()
         mock_from_pretrained.assert_not_called()
 
+    def test_adapter_rejects_dduf_file_with_converted_quantization(self):
+        with pytest.raises(NotImplementedError, match="dduf_file"):
+            DiffusersAdapterPipeline(
+                od_config=_make_od_config(
+                    quantization_config=SimpleNamespace(quant_method="int8"),
+                    diffusers_load_kwargs={"dduf_file": "model.dduf"},
+                )
+            )
+
     def test_adapter_load_weights_preserves_diffusers_native_quantization_config(self, mocker):
         class MockPipeline:
             def __call__(self, prompt=None):
@@ -291,13 +300,17 @@ class TestPipelineArgumentsHandling:
         adapter = DiffusersAdapterPipeline(
             od_config=_make_od_config(
                 quantization_config=SimpleNamespace(quant_method="gguf"),
-                diffusers_load_kwargs={"quantization_config": diffusers_native_quantization_config},
+                diffusers_load_kwargs={
+                    "dduf_file": "model.dduf",
+                    "quantization_config": diffusers_native_quantization_config,
+                },
             )
         )
         adapter.load_weights()
 
         kwargs = mock_from_pretrained.call_args.kwargs
         assert kwargs["quantization_config"] is diffusers_native_quantization_config
+        assert kwargs["dduf_file"] == "model.dduf"
 
     def test_adapter_load_weights_builds_diffusers_native_quantization_config_from_dict(self, mocker):
         FakePipelineQuantizationConfig, FakeTorchAoConfig, _ = _patch_fake_diffusers_quantization_backends(mocker)

@@ -221,6 +221,15 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             and "quantization_config" not in self.od_config.diffusers_load_kwargs
         ):
             ensure_supported_diffusers_quantization(self.od_config.quantization_config)
+            if self.od_config.diffusers_load_kwargs.get("dduf_file"):
+                raise NotImplementedError(
+                    "Diffusers backend quantization conversion does not support "
+                    "diffusers_load_kwargs.dduf_file yet. The preflight component "
+                    "discovery would need to mirror Diffusers' DDUF config loading. "
+                    "Use diffusers_load_kwargs.quantization_config for a native "
+                    "Diffusers quantization config, or omit dduf_file for vLLM-Omni "
+                    "quantization conversion."
+                )
 
     def _load_diffusers_component_names(
         self,
