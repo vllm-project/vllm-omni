@@ -162,6 +162,54 @@ def _build_delay_pattern(codes: torch.Tensor) -> torch.Tensor:
 _ENCODER_CACHE: Any | None = None
 _K2_OMNIVOICE_REPO = "k2-fsa/OmniVoice"
 _K2_OMNIVOICE_SUBDIR = "audio_tokenizer"
+_AUDIO_TOKENIZER_PATH_ENVS = (
+    "HIGGS_AUDIO_TOKENIZER_PATH",
+    "HIGGS_AUDIO_V2_TOKENIZER_PATH",
+)
+
+
+def _normalize_audio_tokenizer_dir(path: str) -> str | None:
+    if not path:
+        return None
+    expanded = os.path.abspath(os.path.expanduser(path))
+    if os.path.isfile(os.path.join(expanded, "config.json")):
+        return expanded
+    nested = os.path.join(expanded, _K2_OMNIVOICE_SUBDIR)
+    if os.path.isfile(os.path.join(nested, "config.json")):
+        return nested
+    return None
+
+
+def _resolve_audio_tokenizer_dir() -> str | None:
+    """Resolve the Higgs codec encoder dir without requiring online HF access.
+
+    Voice cloning runs in the API server process. Production H20 jobs are often
+    offline, so prefer explicit local directories and already-populated HF cache
+    before falling back to ``snapshot_download``.
+    """
+    for env_name in _AUDIO_TOKENIZER_PATH_ENVS:
+        candidate = _normalize_audio_tokenizer_dir(os.getenv(env_name, ""))
+        if candidate is not None:
+            return candidate
+
+    from huggingface_hub import try_to_load_from_cache
+
+    cached_config = try_to_load_from_cache(
+        repo_id=_K2_OMNIVOICE_REPO,
+        filename=f"{_K2_OMNIVOICE_SUBDIR}/config.json",
+    )
+    if isinstance(cached_config, str) and os.path.isfile(cached_config):
+        return os.path.dirname(cached_config)
+
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    safe = _K2_OMNIVOICE_REPO.replace("/", "--")
+    snapshots_dir = os.path.join(HF_HUB_CACHE, f"models--{safe}", "snapshots")
+    if os.path.isdir(snapshots_dir):
+        for rev in os.listdir(snapshots_dir):
+            candidate = _normalize_audio_tokenizer_dir(os.path.join(snapshots_dir, rev))
+            if candidate is not None:
+                return candidate
 
 
 def _load_audio_tokenizer():
@@ -180,14 +228,17 @@ def _load_audio_tokenizer():
 
     Only the ``audio_tokenizer/`` subdirectory (~806 MB) is downloaded.
     """
-    from huggingface_hub import snapshot_download
     from transformers import HiggsAudioV2TokenizerModel
 
-    repo_path = snapshot_download(
-        _K2_OMNIVOICE_REPO,
-        allow_patterns=[f"{_K2_OMNIVOICE_SUBDIR}/*"],
-    )
-    audio_tokenizer_dir = os.path.join(repo_path, _K2_OMNIVOICE_SUBDIR)
+    audio_tokenizer_dir = _resolve_audio_tokenizer_dir()
+    if audio_tokenizer_dir is None:
+        from huggingface_hub import snapshot_download
+
+        repo_path = snapshot_download(
+            _K2_OMNIVOICE_REPO,
+            allow_patterns=[f"{_K2_OMNIVOICE_SUBDIR}/*"],
+        )
+        audio_tokenizer_dir = os.path.join(repo_path, _K2_OMNIVOICE_SUBDIR)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = HiggsAudioV2TokenizerModel.from_pretrained(audio_tokenizer_dir).to(device)
     return model.eval()

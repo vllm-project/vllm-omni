@@ -171,6 +171,34 @@ python examples/offline_inference/speech_to_video/speech_to_video.py \
 ```
 
 
+### Online Serving
+
+#### Server
+
+```bash
+vllm serve Wan-AI/Wan2.2-S2V-14B --omni \
+  --model-class-name WanS2VPipeline \
+  --tensor-parallel-size 2 \
+  --flow-shift 3.0 \
+  --vae-use-slicing --vae-use-tiling \
+  --port 8091
+```
+
+#### Client
+
+```bash
+no_proxy=127.0.0.1 \
+curl -X POST http://127.0.0.1:8091/v1/videos/sync \
+  -F "prompt=A person singing" \
+  -F 'image_reference={"image_url": "https://raw.githubusercontent.com/Wan-Video/Wan2.2/main/examples/Five%20Hundred%20Miles.png"}' \
+  -F 'audio_reference={"audio_url": "https://raw.githubusercontent.com/Wan-Video/Wan2.2/main/examples/Five%20Hundred%20Miles.MP3"}' \
+  -F "width=832" -F "height=480" \
+  -F "num_inference_steps=40" \
+  -F "guidance_scale=4.5" \
+  -F "fps=16" \
+  --output s2v_480p_serve.mp4
+```
+
 #### Verification
 
 The output video should show a talking/singing person matching the reference

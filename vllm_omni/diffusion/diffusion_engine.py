@@ -34,6 +34,7 @@ from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusio
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
+from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -231,6 +232,12 @@ class DiffusionEngine:
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
+            if is_client_error_status(output.error_status_code):
+                raise client_error_from_metadata(
+                    output.error,
+                    status_code=output.error_status_code,
+                    error_type=output.error_type,
+                )
             raise RuntimeError(output.error)
         logger.debug("Generation completed successfully.")
 
@@ -507,7 +514,7 @@ class DiffusionEngine:
                             request_id=request_id,
                             step_index=None,
                             finished=True,
-                            result=DiffusionOutput(error=str(exc)),
+                            result=DiffusionOutput.from_exception(exc),
                         )
                         for request_id in sched_output.scheduled_request_ids
                     ]
@@ -664,7 +671,7 @@ class DiffusionEngine:
                         request_id=request_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput(error=str(exc)),
+                        result=DiffusionOutput.from_exception(exc),
                     )
 
                 self._process_aborts_queue()
