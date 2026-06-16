@@ -145,6 +145,7 @@ def _make_engine_with_loop(
     sched.initialize(SimpleNamespace(max_num_seqs=1))
     engine.scheduler = sched
     engine.step_execution = False
+    engine.supports_request_batch = False
     engine.execute_fn = engine.executor.execute_request
 
     engine._rpc_lock = threading.RLock()

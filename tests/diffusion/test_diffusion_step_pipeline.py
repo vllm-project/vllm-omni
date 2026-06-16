@@ -320,7 +320,7 @@ def _make_input_batch_state(request_id: str, latent_value: float) -> DiffusionRe
     state = DiffusionRequestState(
         request_id=request_id,
         sampling=SimpleNamespace(),
-        prompts=None,
+        prompt=None,
     )
     state.latents = torch.tensor([[latent_value]])
     state.timesteps = torch.tensor([1.0])
