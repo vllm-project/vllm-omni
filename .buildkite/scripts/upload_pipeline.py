@@ -3,7 +3,8 @@
 """Render and optionally upload Buildkite pipeline YAML with diff-aware logic.
 
 Bootstrap mode (pipeline.yml with __IMAGE_BUILD_IF__ placeholders):
-  - Detect docs-only PR/main changes and substitute skip-ci ``if`` expressions.
+  - Detect docs-only, pytest skip-mark-only, or combined docs+skip-mark PR/main changes and
+    substitute skip-ci ``if`` expressions.
 
 Test pipeline mode (e.g. test-merge.yml):
   - Drop steps or groups whose ``source_file_dependencies`` do not match changed files.
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -57,8 +59,8 @@ def _git(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def resolve_changed_files() -> list[str] | None:
-    """Return changed file paths, or None when diff cannot be resolved."""
+def resolve_diff_range() -> str | None:
+    """Return a git diff range for PR or main builds, or None when unavailable."""
     is_pr = os.environ.get("BUILDKITE_PULL_REQUEST", "false") != "false" and os.environ.get(
         "BUILDKITE_PULL_REQUEST", ""
     )
@@ -76,14 +78,22 @@ def resolve_changed_files() -> list[str] | None:
             else:
                 _log(f"cannot resolve PR base {base_branch}; using safe defaults")
                 return None
-        diff_range = f"{base_ref}...{commit}"
-    elif os.environ.get("BUILDKITE_BRANCH", "") == "main":
+        return f"{base_ref}...{commit}"
+
+    if os.environ.get("BUILDKITE_BRANCH", "") == "main":
         if _git("rev-parse", "--verify", f"{commit}^").returncode != 0:
             _log("main commit has no parent; using safe defaults")
             return None
-        diff_range = f"{commit}^..{commit}"
-    else:
-        _log("not PR/main build; using safe defaults")
+        return f"{commit}^..{commit}"
+
+    _log("not PR/main build; using safe defaults")
+    return None
+
+
+def resolve_changed_files() -> list[str] | None:
+    """Return changed file paths, or None when diff cannot be resolved."""
+    diff_range = resolve_diff_range()
+    if diff_range is None:
         return None
 
     result = _git("diff", "--name-only", diff_range)
@@ -96,30 +106,207 @@ def resolve_changed_files() -> list[str] | None:
     return files
 
 
+def _is_doc_file(file_path: str) -> bool:
+    if not file_path:
+        return False
+    if file_path.startswith("docs/"):
+        return True
+    if file_path.endswith(".md"):
+        return True
+    return file_path == "mkdocs.yml"
+
+
 def is_docs_only_change(changed_files: list[str]) -> bool:
     has_any = False
     for file_path in changed_files:
         if not file_path:
             continue
         has_any = True
-        if file_path.startswith("docs/"):
+        if not _is_doc_file(file_path):
+            return False
+    return has_any
+
+
+def _is_test_python_file(file_path: str) -> bool:
+    path = Path(file_path)
+    return path.suffix == ".py" and bool(path.parts) and path.parts[0] == "tests"
+
+
+_SKIP_MARK_RE = re.compile(r"pytest\.mark\.skip(?:if)?\b|pytest\.skip\s*\(")
+_PYTESTMARK_SKIP_RE = re.compile(r"pytest\.mark\.skip\b")
+_PYTEST_MARK_ONLY_RE = re.compile(r"pytest\.mark\.\w+")
+
+
+def _paren_balance(line: str) -> int:
+    return line.count("(") - line.count(")")
+
+
+def _is_skip_mark_related_content(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if stripped.startswith("#"):
+        return True
+    return _SKIP_MARK_RE.search(stripped) is not None
+
+
+def _is_pytestmark_adjacent_content(line: str) -> bool:
+    """Allow pytestmark list refactors that only add skip/skipif alongside existing marks."""
+    stripped = line.strip().rstrip(",")
+    if not stripped:
+        return True
+    if stripped in {"[", "]"}:
+        return True
+    if stripped.startswith("#"):
+        return True
+    if stripped.startswith("pytestmark"):
+        return True
+    return _PYTEST_MARK_ONLY_RE.search(stripped) is not None
+
+
+def diff_only_contains_skip_mark_changes(diff_text: str) -> bool:
+    """True when diff only edits skip marks or reformats pytestmark to add them."""
+    pending_depth = 0
+    saw_change = False
+    has_skip_mark_edit = False
+    for raw_line in diff_text.splitlines():
+        if raw_line.startswith("@@"):
+            pending_depth = 0
             continue
-        if file_path.endswith(".md"):
+        if not (raw_line.startswith("+") or raw_line.startswith("-")):
             continue
-        if file_path == "mkdocs.yml":
+        if raw_line.startswith("+++") or raw_line.startswith("---"):
             continue
+
+        saw_change = True
+        content = raw_line[1:]
+
+        if pending_depth > 0:
+            pending_depth += _paren_balance(content)
+            if pending_depth < 0:
+                pending_depth = 0
+            continue
+
+        if _is_skip_mark_related_content(content):
+            has_skip_mark_edit = True
+            pending_depth = max(0, _paren_balance(content))
+            continue
+
+        if _is_pytestmark_adjacent_content(content):
+            continue
+
+        return False
+
+    return saw_change and has_skip_mark_edit
+
+
+def _git_file_diff(file_path: str, diff_range: str) -> str | None:
+    result = _git("diff", diff_range, "--", file_path)
+    if result.returncode != 0:
+        _log(f"skip-mark-only: git diff failed for {file_path}")
+        return None
+    return result.stdout
+
+
+def _is_new_file_diff(diff_text: str) -> bool:
+    return "new file mode" in diff_text or "--- /dev/null" in diff_text
+
+
+def _file_has_module_level_pytest_skip(content: str) -> bool:
+    """True when ``pytestmark`` applies unconditional ``pytest.mark.skip`` to the module."""
+    match = re.search(r"^pytestmark\s*=\s*\[(.*?)^\s*\]", content, re.MULTILINE | re.DOTALL)
+    if match is not None:
+        return _PYTESTMARK_SKIP_RE.search(match.group(1)) is not None
+    match = re.search(r"^pytestmark\s*=\s*pytest\.mark\.skip\b", content, re.MULTILINE)
+    return match is not None
+
+
+def _file_content_at_commit(file_path: str, commit: str) -> str | None:
+    result = _git("show", f"{commit}:{file_path}")
+    if result.returncode != 0:
+        _log(f"skip-mark-only: cannot read {file_path} at {commit}")
+        return None
+    return result.stdout
+
+
+def _qualifies_as_skip_mark_test_change(file_path: str, diff_range: str) -> bool:
+    diff_text = _git_file_diff(file_path, diff_range)
+    if diff_text is None:
+        return False
+    if not diff_text.strip():
+        _log(f"skip-mark-only: empty diff for {file_path}")
+        return False
+
+    if diff_only_contains_skip_mark_changes(diff_text):
+        return True
+
+    if not _is_new_file_diff(diff_text):
+        _log(f"skip-mark-only: non-skip changes in {file_path}")
+        return False
+
+    commit = os.environ.get("BUILDKITE_COMMIT", "")
+    if not commit:
+        return False
+    content = _file_content_at_commit(file_path, commit)
+    if content is None:
+        return False
+    if _file_has_module_level_pytest_skip(content):
+        _log(f"skip-mark-only: new test file with module-level pytest.mark.skip: {file_path}")
+        return True
+
+    _log(f"skip-mark-only: new test file without module-level pytest.mark.skip: {file_path}")
+    return False
+
+
+def is_skip_mark_only_change(changed_files: list[str], *, diff_range: str) -> bool:
+    """True when every changed file is a tests/ module with only skip-mark edits."""
+    has_any = False
+    for file_path in changed_files:
+        if not file_path:
+            continue
+        has_any = True
+        if not _is_test_python_file(file_path):
+            return False
+        if not _qualifies_as_skip_mark_test_change(file_path, diff_range):
+            return False
+    return has_any
+
+
+def is_docs_or_skip_mark_only_change(changed_files: list[str], *, diff_range: str) -> bool:
+    """True when each changed file is a doc path or a qualifying skip-mark test change."""
+    has_any = False
+    for file_path in changed_files:
+        if not file_path:
+            continue
+        has_any = True
+        if _is_doc_file(file_path):
+            continue
+        if _is_test_python_file(file_path) and _qualifies_as_skip_mark_test_change(file_path, diff_range):
+            continue
+        _log(f"docs/skip-mark-only: rejecting {file_path}")
         return False
     return has_any
 
 
-def resolve_skip_ci(changed_files: list[str] | None) -> bool:
+def resolve_skip_ci(changed_files: list[str] | None, *, diff_range: str | None = None) -> bool:
     if changed_files is None:
         _log("skip-ci=0 (could not resolve changed files)")
         return False
-    if is_docs_only_change(changed_files):
+
+    if diff_range is not None and is_docs_or_skip_mark_only_change(changed_files, diff_range=diff_range):
+        if is_docs_only_change(changed_files):
+            _log("docs-only change detected; skip-ci=1")
+        elif is_skip_mark_only_change(changed_files, diff_range=diff_range):
+            _log("pytest skip-mark-only change detected; skip-ci=1")
+        else:
+            _log("docs + pytest skip-mark-only change detected; skip-ci=1")
+        return True
+
+    if diff_range is None and is_docs_only_change(changed_files):
         _log("docs-only change detected; skip-ci=1")
         return True
-    _log("non-doc changes detected; skip-ci=0")
+
+    _log("non-doc/non-skip-mark changes detected; skip-ci=0")
     return False
 
 
@@ -252,10 +439,14 @@ def resolve_pipeline_path(arg: str) -> Path:
 
 def render_pipeline(path: Path) -> str:
     text = path.read_text(encoding="utf-8")
+    diff_range = resolve_diff_range()
     changed_files = resolve_changed_files()
 
     if BOOTSTRAP_MARKER in text:
-        rendered = render_bootstrap_pipeline(text, skip_ci=resolve_skip_ci(changed_files))
+        rendered = render_bootstrap_pipeline(
+            text,
+            skip_ci=resolve_skip_ci(changed_files, diff_range=diff_range),
+        )
         return rendered
 
     doc = yaml.safe_load(text)
