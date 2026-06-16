@@ -222,7 +222,7 @@ def test_session_reset_clears_metadata() -> None:
     adapter.current_start_frame = 5
     adapter.clip_feas = torch.ones(2, 2)
 
-    manager.reset_session("s")
+    adapter.reset()
 
     fresh = DreamZeroStateAdapter("s", manager)
     assert fresh.language is None

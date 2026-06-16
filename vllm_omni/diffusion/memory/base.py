@@ -73,10 +73,21 @@ class MemoryObject(ABC):
         """Return what the consumer (attention metadata, pipeline) reads."""
 
     def evict(self, policy: Any = None) -> int:
-        """Free committed bytes and return how many were freed.
+        """Release this object's backing storage so it can be reused; return the
+        bytes freed.
 
-        With no paging yet, eviction simply drops the buffer (equivalent to
-        ``reset()``). Never reclaims staged bytes.
+        This is the backend-agnostic release hook. For a plain buffer it drops
+        the buffer and lets the garbage collector reclaim it; for a paged backend
+        it returns the blocks to the pool so they can be recycled. Never reclaims
+        staged bytes.
+
+        Precondition: only call this when the object is no longer in use.
+        Releasing storage that is still referenced is a correctness bug (another
+        consumer could reuse it). Count-based session eviction therefore does NOT
+        call this — it only drops the lookup-table entry and lets an unreferenced
+        session be garbage-collected. A byte-budget eviction planner (a later
+        phase) is what drives this hook, with the recompute-DAG safety from the
+        RFC; no caller invokes it yet.
         """
         freed = self.nbytes
         self.reset()

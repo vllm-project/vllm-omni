@@ -52,9 +52,6 @@ class SessionMemory:
         # (otherwise language/current_start_frame/clip_feas/ys would survive).
         self.attrs.clear()
 
-    def evict(self) -> int:
-        return sum(obj.evict() for obj in self._objects.values())
-
     @property
     def nbytes(self) -> int:
         return sum(obj.nbytes for obj in self._objects.values())
@@ -104,30 +101,6 @@ class SessionMemoryManager:
                 self.hits += 1
                 self._sessions.move_to_end(key)
             return session
-
-    def get_session(self, session_id: str | None) -> SessionMemory | None:
-        key = self._key(session_id)
-        with self._lock:
-            session = self._sessions.get(key)
-            if session is not None:
-                self._sessions.move_to_end(key)
-            return session
-
-    def reset_session(self, session_id: str | None) -> None:
-        key = self._key(session_id)
-        with self._lock:
-            session = self._sessions.get(key)
-        if session is not None:
-            session.reset()
-
-    def evict_session(self, session_id: str | None) -> int:
-        key = self._key(session_id)
-        with self._lock:
-            session = self._sessions.pop(key, None)
-            if session is None:
-                return 0
-            self.evictions += 1
-        return session.evict()
 
     def __len__(self) -> int:
         with self._lock:
