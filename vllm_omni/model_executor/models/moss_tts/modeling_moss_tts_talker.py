@@ -194,7 +194,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             hidden_states = hidden_states.text_hidden_states
         if hidden_states is None:
             return None
-        logits = self.logits_processor(self.text_lm_head, hidden_states, sampling_metadata)
+        logits = self.logits_processor(self.text_lm_head, hidden_states)
         if logits is None or self._batch_state is None:
             return logits
 

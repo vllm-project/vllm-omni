@@ -661,7 +661,7 @@ class DiffusersPipelineLoader:
         # Apply HSDP sharding to all transformers
         for name, trans in transformers_to_shard:
             logger.debug("Applying HSDP to %s", name)
-            apply_hsdp_to_model(trans, hsdp_config)
+            apply_hsdp_to_model(trans, hsdp_config, target_device=target_device)
 
         # # HSDP only shards transformer modules. All other runtime modules must
         # # be placed on the execution device explicitly after sharding.
