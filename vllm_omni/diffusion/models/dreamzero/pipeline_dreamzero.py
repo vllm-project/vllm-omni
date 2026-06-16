@@ -516,7 +516,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         ]
 
     def _get_or_create_state(self, session_id: str | None) -> DreamZeroState | DreamZeroStateAdapter:
-        if self._memory_manager is not None:
+        # getattr guards lightweight test fixtures that build the pipeline via
+        # __new__ and seed only the bespoke fields, never setting _memory_manager.
+        if getattr(self, "_memory_manager", None) is not None:
             # The manager owns session lifecycle and LRU; the adapter is a thin
             # per-call view over it (no second LRU to drift).
             return DreamZeroStateAdapter(session_id, self._memory_manager)

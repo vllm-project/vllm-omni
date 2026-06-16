@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 from vllm_omni.diffusion.memory.base import MemoryObject
-from vllm_omni.diffusion.memory.manager import SessionMemory, SessionMemoryManager
+from vllm_omni.diffusion.memory.manager import SessionMemoryManager
 from vllm_omni.diffusion.memory.objects import EncodeOnceKV, LatentBuffer, PagedKV
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import FRAMES_PER_CHUNK
 
@@ -57,31 +57,35 @@ class DreamZeroStateAdapter:
 
     def __init__(self, session_id: str | None, manager: SessionMemoryManager) -> None:
         self._session_id = session_id
-        self._manager = manager
-        session = manager.get_or_create_session(session_id)
-        for key, default in _META_DEFAULTS.items():
-            session.attrs.setdefault(key, default)
-        if session.get(_FRAMES) is None:
-            self._fresh_frame_buffer(session)
+        # Pin the session for this adapter's lifetime. The manager may evict the
+        # session from its lookup table to bound memory, but an adapter that is
+        # mid-generation keeps its own reference, so the in-progress state is not
+        # lost -- matching the bespoke DreamZeroState, which the caller holds even
+        # after it leaves the table. A fresh adapter is built per forward, so the
+        # session is still marked recently-used on each step.
+        self._session = manager.get_or_create_session(session_id)
+        self._ensure_frame_buffer()
 
     # -- session / metadata plumbing ------------------------------------
 
-    @property
-    def _session(self) -> SessionMemory:
-        # Re-fetch each access so the manager's LRU sees the touch and the
-        # adapter never caches a stale handle across evictions.
-        return self._manager.get_or_create_session(self._session_id)
-
     @staticmethod
-    def _fresh_frame_buffer(session: SessionMemory) -> LatentBuffer:
+    def _new_frame_buffer() -> LatentBuffer:
         buffer = LatentBuffer()
         buffer.allocate(maxlen=FRAMES_PER_CHUNK)
-        session.put(_FRAMES, buffer)
         return buffer
 
+    def _ensure_frame_buffer(self) -> LatentBuffer:
+        buffer = self._session.get(_FRAMES)
+        if not isinstance(buffer, LatentBuffer) or not buffer.resident:
+            buffer = self._new_frame_buffer()
+            self._session.put(_FRAMES, buffer)
+        return buffer
+
+    # Metadata getters read with a default so they never raise after a session
+    # reset clears attrs; setters write through to the pinned session.
     @property
     def call_count(self) -> int:
-        return int(self._session.attrs["call_count"])
+        return int(self._session.attrs.get("call_count", _META_DEFAULTS["call_count"]))
 
     @call_count.setter
     def call_count(self, value: int) -> None:
@@ -89,7 +93,7 @@ class DreamZeroStateAdapter:
 
     @property
     def current_start_frame(self) -> int:
-        return int(self._session.attrs["current_start_frame"])
+        return int(self._session.attrs.get("current_start_frame", _META_DEFAULTS["current_start_frame"]))
 
     @current_start_frame.setter
     def current_start_frame(self, value: int) -> None:
@@ -97,7 +101,7 @@ class DreamZeroStateAdapter:
 
     @property
     def clip_feas(self) -> torch.Tensor | None:
-        return cast("torch.Tensor | None", self._session.attrs["clip_feas"])
+        return cast("torch.Tensor | None", self._session.attrs.get("clip_feas"))
 
     @clip_feas.setter
     def clip_feas(self, value: torch.Tensor | None) -> None:
@@ -105,7 +109,7 @@ class DreamZeroStateAdapter:
 
     @property
     def ys(self) -> torch.Tensor | None:
-        return cast("torch.Tensor | None", self._session.attrs["ys"])
+        return cast("torch.Tensor | None", self._session.attrs.get("ys"))
 
     @ys.setter
     def ys(self, value: torch.Tensor | None) -> None:
@@ -113,7 +117,7 @@ class DreamZeroStateAdapter:
 
     @property
     def language(self) -> torch.Tensor | None:
-        return cast("torch.Tensor | None", self._session.attrs["language"])
+        return cast("torch.Tensor | None", self._session.attrs.get("language"))
 
     @language.setter
     def language(self, value: torch.Tensor | None) -> None:
@@ -121,10 +125,7 @@ class DreamZeroStateAdapter:
 
     @property
     def stitched_buffer(self) -> LatentBuffer:
-        buffer = self._session.get(_FRAMES)
-        if not isinstance(buffer, LatentBuffer):
-            buffer = self._fresh_frame_buffer(self._session)
-        return buffer
+        return self._ensure_frame_buffer()
 
     # -- frame accumulation (logic mirrors DreamZeroState) --------------
 
@@ -158,15 +159,10 @@ class DreamZeroStateAdapter:
 
     def reset(self) -> None:
         """Clear all state for this session."""
-        session = self._session
-        # Drop the typed KV/cross-attn objects (recreated by create_kv_caches).
-        for name in list(session.names()):
-            if name != _FRAMES:
-                obj = session.get(name)
-                if obj is not None:
-                    obj.reset()
-        self._fresh_frame_buffer(session)
-        session.attrs.update({key: default for key, default in _META_DEFAULTS.items()})
+        # Canonical reset: drop every typed object and clear session metadata.
+        self._session.reset()
+        # Leave an empty, allocated frame buffer ready for the next call.
+        self._ensure_frame_buffer()
 
     def should_reset(self, text_tokens: torch.Tensor | None, num_video_frames: int, local_attn_size: int) -> bool:
         """Determine if state should be reset before this forward()."""

@@ -48,6 +48,9 @@ class SessionMemory:
     def reset(self) -> None:
         for obj in self._objects.values():
             obj.reset()
+        # Clear session-scoped metadata too, so a reset leaves nothing stale
+        # (otherwise language/current_start_frame/clip_feas/ys would survive).
+        self.attrs.clear()
 
     def evict(self) -> int:
         return sum(obj.evict() for obj in self._objects.values())
@@ -90,8 +93,12 @@ class SessionMemoryManager:
                 session = SessionMemory()
                 self._sessions[key] = session
                 while len(self._sessions) > self.max_sessions:
-                    _, evicted = self._sessions.popitem(last=False)
-                    evicted.evict()
+                    # Drop the oldest from the table only; do not free its
+                    # buffers. An adapter still using the session keeps its own
+                    # reference, so its state survives (matching the bespoke
+                    # per-session state, which the caller holds even after it
+                    # leaves the table). Unreferenced sessions are GC-reclaimed.
+                    self._sessions.popitem(last=False)
                     self.evictions += 1
             else:
                 self.hits += 1

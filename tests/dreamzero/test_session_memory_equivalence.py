@@ -189,3 +189,61 @@ def test_cfg_branches_isolated() -> None:
         torch.testing.assert_close(adapter.get_kv_caches(False)[layer], pos)
         torch.testing.assert_close(adapter.get_kv_caches(True)[layer], neg)
         assert not torch.allclose(pos, neg)
+
+
+def test_adapter_keeps_state_when_its_session_is_evicted() -> None:
+    # Regression: an adapter mid-generation must not lose its data when the
+    # manager evicts its session to make room for newer ones. The adapter pins
+    # the session, so its stored KV survives eviction from the lookup table.
+    manager = SessionMemoryManager(max_sessions=2)
+    adapter = DreamZeroStateAdapter("active", manager)
+    adapter.create_kv_caches(BATCH, DTYPE, DEVICE, LAYERS, HEADS, HEAD_DIM)
+    kv = torch.randn(2, BATCH, 4, HEADS, HEAD_DIM)
+    for layer in range(LAYERS):
+        adapter.update_kv_cache(layer, kv, is_negative=False)
+
+    # Push "active" out of the manager's table with newer sessions.
+    for i in range(3):
+        DreamZeroStateAdapter(f"other{i}", manager)
+    assert "active" not in manager
+
+    # The in-use adapter still returns its own data.
+    for layer in range(LAYERS):
+        torch.testing.assert_close(adapter.get_kv_caches(False)[layer], kv)
+
+
+def test_session_reset_clears_metadata() -> None:
+    # Regression: resetting a session must not leave stale metadata behind, so a
+    # fresh adapter for the same session sees defaults, not the old values.
+    manager = SessionMemoryManager()
+    adapter = DreamZeroStateAdapter("s", manager)
+    adapter.create_kv_caches(BATCH, DTYPE, DEVICE, LAYERS, HEADS, HEAD_DIM)
+    adapter.language = torch.tensor([1, 2, 3])
+    adapter.current_start_frame = 5
+    adapter.clip_feas = torch.ones(2, 2)
+
+    manager.reset_session("s")
+
+    fresh = DreamZeroStateAdapter("s", manager)
+    assert fresh.language is None
+    assert fresh.current_start_frame == 0
+    assert fresh.clip_feas is None
+
+
+def test_bespoke_path_without_memory_manager() -> None:
+    # Regression: a pipeline built via __new__ (lightweight fixtures) seeds only
+    # the bespoke fields and never sets _memory_manager; _get_or_create_state
+    # must fall through to the bespoke DreamZeroState path without AttributeError.
+    from collections import OrderedDict
+
+    from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import (
+        MAX_DREAMZERO_SESSIONS,
+        DreamZeroPipeline,
+    )
+
+    pipe = DreamZeroPipeline.__new__(DreamZeroPipeline)
+    pipe._states = OrderedDict()
+    pipe._max_session_states = MAX_DREAMZERO_SESSIONS
+
+    state = DreamZeroPipeline._get_or_create_state(pipe, "x")
+    assert isinstance(state, DreamZeroState)
