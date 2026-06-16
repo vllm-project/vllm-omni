@@ -30,11 +30,9 @@ Default priorities:
 
 ### Step 1: Classify Test Goal
 
-- **Bugfix regression**: start from a minimal failing scenario and add assertions that prevent recurrence.
+- **Bugfix regression**: start from a minimal failing scenario and add assertions that prevent recurrence. Before writing tests, output **`required` / `recommended` / `not_needed`**: **`required`** — stable logic/contract bug that should have been caught; **`recommended`** — environment-sensitive but a small regression still helps; **`not_needed`** — one-off external/config failure or existing tests already cover the path. Prefer the narrowest stable L1 (CPU) case; escalate to L2/L3 only when the bug needs real weights or serving.
 - **Feature coverage**: verify new behavior and one negative/boundary case.
 - **Perf/benchmark claim**: require benchmark-oriented tests and explicit metrics.
-
-If the task is bug-oriented, also read [references/bug-test-coverage.md](../vllm-omni-review/references/bug-test-coverage.md) and produce an explicit conclusion (`required` / `recommended` / `not_needed`).
 
 ### Step 2: Select Test Level
 
@@ -98,7 +96,7 @@ Existing references: `tests/e2e/offline_inference/test_qwen2_5_omni.py` (L2-styl
 |----------|------------------|---------------------------|---------------------------|
 | **Offline inference e2e** | `tests/e2e/offline_inference/` | **Module (default):** `omni_runner` + `omni_runner_handler`. **Function (isolation only):** `omni_runner_function` + `omni_runner_handler_function`. Diffusion/TTS may use `Omni(...).generate` directly | L2: `core_model` + **one of** `omni` / `tts` / `diffusion`; `@hardware_test(...)` when GPU/NPU is required |
 | **Online serving e2e** | `tests/e2e/online_serving/` | **Module (default):** `omni_server` + `openai_client`. **Function (isolation only):** `omni_server_function` + `openai_client_function`. Clients: `send_omni_request` (omni), `send_audio_speech_request` (tts), `send_diffusion_request` / `send_video_diffusion_request` / `send_images_generations_request` (diffusion) | Baseline smoke: **`core_model` + `advanced_model`**; heavier paths: `advanced_model` only; L4 expansion: `full_model` |
-| **Documentation / runnable examples** | `tests/examples/offline_inference/`, `tests/examples/online_serving/` | **Offline docs (preferred):** extract Python/Bash blocks from the doc README (e.g. `ReadmeSnippet.extract_readme_snippets`), `pytest.mark.parametrize` each snippet, run via `example_runner.run` with a stable `output_subfolder`. **Online docs:** copy client/request scripts into dedicated tests and keep them in sync with the doc page. | Usually **L4**: `advanced_model`, often `example` plus hardware marks matching the nightly docs-example job (see `.buildkite/test-nightly.yml`). Full conventions: [docs/contributing/ci/test_examples/doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/doc_example_tests.inc.md) (introduced in [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910): naming, output directory layout, skip rules, avoid trimming `num_inference_steps` without a strong CI reason). |
+| **Documentation / runnable examples** | `tests/examples/offline_inference/`, `tests/examples/online_serving/` | **Offline docs (preferred):** extract Python/Bash blocks from the doc README (e.g. `ReadmeSnippet.extract_readme_snippets`), `pytest.mark.parametrize` each snippet, run via `example_runner.run` with a stable `output_subfolder`. **Online docs:** copy client/request scripts into dedicated tests and keep them in sync with the doc page. | Usually **L4**: `advanced_model`, often `example` plus hardware marks matching the nightly docs-example job (see `.buildkite/test-nightly.yml`). Full conventions: [docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md) (introduced in [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910): naming, output directory layout, skip rules, avoid trimming `num_inference_steps` without a strong CI reason). |
 | **Performance / benchmark** | `tests/dfx/perf/tests/*.json` + `run_*_benchmark.py` | JSON or script-driven server + load config; assert explicit metrics / baselines | L4 Perf: `full_model` + `benchmark`; wire `test-nightly.yml` Perf steps |
 | **Invalid parameter / negative HTTP validation** | `tests/dfx/reliability/invalid_param_test/` | Live `omni_server` + low-level `send_*_http_request` with `err_code` / `err_message` | `pytest.mark.slow` + `omni` / `tts` / `diffusion` + `@hardware_marks` (`H100` or `L4`); CI in **`test-weekly.yml`** (not ready/merge/nightly) |
 
@@ -270,7 +268,7 @@ def test_text_to_video_001(omni_server, openai_client) -> None:
     openai_client.send_video_diffusion_request({"model": ..., "form_data": {...}})  # /v1/videos
 ```
 
-*Documentation example tests:* follow the **Preferred Test Strategy** in [doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/doc_example_tests.inc.md): dynamic extraction for offline READMEs; explicit copied client code for online pages until extraction is justified; use the documented **naming**, **output directory** (page folder + case id), and **skipping** rules (e.g. Gradio-only scripts).
+*Documentation example tests:* follow the **Preferred Test Strategy** in [l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md): dynamic extraction for offline READMEs; explicit copied client code for online pages until extraction is justified; use the documented **naming**, **output directory** (page folder + case id), and **skipping** rules (e.g. Gradio-only scripts).
 
 *Performance tests:* add or extend entries under `tests/perf/` (and JSON configs where the project uses them), with **explicit baselines** and the same marker/run-level pairing as the CI step that will execute them.
 
@@ -889,5 +887,4 @@ When completing a request, return:
 
 - Marker and command routing: [references/test-routing.md](references/test-routing.md)
 - CI pipelines (vllm-omni): [test-ready.yml](../../../.buildkite/test-ready.yml) (L1/L2), [test-merge.yml](../../../.buildkite/test-merge.yml) (L3), [test-nightly.yml](../../../.buildkite/test-nightly.yml) (L4), [test-weekly.yml](../../../.buildkite/test-weekly.yml) (invalid param / reliability)
-- L4 documentation example tests (naming, extraction vs copied scripts, output dirs, skips): [docs/contributing/ci/test_examples/doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/doc_example_tests.inc.md) — see also [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910)
-- Bug regression coverage rubric: [../vllm-omni-review/references/bug-test-coverage.md](../vllm-omni-review/references/bug-test-coverage.md)
+- L4 documentation example tests (naming, extraction vs copied scripts, output dirs, skips): [docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md) — see also [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910)

@@ -97,6 +97,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>
         <strong>Model tests:</strong><br>
         /tests/e2e/online_serving/test_{model_name}.py<br>
+        /tests/e2e/offline_inference/test_{model_name}.py<br>
         <strong>Feature tests:</strong><br>
         /tests/{component_name}/test_xxx<br>
         <strong>Interface tests:</strong><br>
@@ -119,7 +120,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>&lt;3 hour</td>
       <td>
         <strong>Model tests:</strong><br>
-        /tests/e2e/online_serving/test_{model_name}.py<br>
+        /tests/e2e/online_serving/test_{model_name}_expansion.py<br>
         <strong>Feature tests:</strong><br>
         /tests/{component_name}/test_xxx<br>
         <strong>Interface tests:</strong><br>
