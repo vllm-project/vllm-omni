@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Source-level regression tests for DiffusionEngine.
+"""Source-level regression tests for diffusion output/engine helpers.
 
 These tests verify naming conventions and patterns by inspecting source code
 at the function level using AST. They are intentionally coupled to the source
-layout and should be updated whenever the metrics construction code is
-refactored.
+layout and should be updated whenever the inspected helper code is refactored.
 """
 
 from __future__ import annotations
@@ -23,10 +22,20 @@ _ENGINE_PATH = os.path.normpath(
         "diffusion_engine.py",
     )
 )
+_FORMATTER_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        os.pardir,
+        os.pardir,
+        "vllm_omni",
+        "diffusion",
+        "output_formatter.py",
+    )
+)
 
 
-def _read_engine_source() -> str:
-    with open(_ENGINE_PATH) as f:
+def _read_source(path: str) -> str:
+    with open(path) as f:
         return f.read()
 
 
@@ -60,37 +69,38 @@ def _get_function_source(source: str, class_name: str | None, func_name: str) ->
 
 
 class TestMetricKeys:
-    """Verify metric naming conventions in DiffusionEngine.step()."""
+    """Verify metric naming conventions in diffusion output formatting."""
 
     def test_no_duplicate_preprocess_key(self) -> None:
-        """step() should not contain 'preprocessing_time_ms' (duplicate of 'preprocess_time_ms')."""
-        source = _read_engine_source()
-        step_source = _get_function_source(source, "DiffusionEngine", "step")
-        assert "preprocessing_time_ms" not in step_source, (
-            "Found duplicate key 'preprocessing_time_ms' in step() — should only use 'preprocess_time_ms'"
+        """format_diffusion_outputs() should not duplicate 'preprocess_time_ms'."""
+        source = _read_source(_FORMATTER_PATH)
+        formatter_source = _get_function_source(source, None, "format_diffusion_outputs")
+        assert "preprocessing_time_ms" not in formatter_source, (
+            "Found duplicate key 'preprocessing_time_ms' in "
+            "format_diffusion_outputs() — should only use 'preprocess_time_ms'"
         )
 
     def test_metric_key_naming_consistency(self) -> None:
-        """In step(): exec_time should use exec_total_time, total_time should use step_total_ms."""
-        source = _read_engine_source()
-        step_source = _get_function_source(source, "DiffusionEngine", "step")
-        lines = step_source.split("\n")
+        """Metric keys should map to the explicit timing fields."""
+        source = _read_source(_FORMATTER_PATH)
+        formatter_source = _get_function_source(source, None, "format_diffusion_outputs")
+        lines = formatter_source.split("\n")
 
         found_exec = False
         found_total = False
         for line in lines:
             if '"diffusion_engine_exec_time_ms"' in line:
                 found_exec = True
-                assert "exec_total_time" in line, (
-                    "diffusion_engine_exec_time_ms should measure executor time only (exec_total_time)"
+                assert "timings.exec_time_s" in line, (
+                    "diffusion_engine_exec_time_ms should measure executor time only (timings.exec_time_s)"
                 )
             if '"diffusion_engine_total_time_ms"' in line:
                 found_total = True
-                assert "step_total_ms" in line, (
-                    "diffusion_engine_total_time_ms should measure full step time (step_total_ms)"
+                assert "timings.total_time_ms" in line, (
+                    "diffusion_engine_total_time_ms should measure full step time (timings.total_time_ms)"
                 )
-        assert found_exec, "diffusion_engine_exec_time_ms key not found in step()"
-        assert found_total, "diffusion_engine_total_time_ms key not found in step()"
+        assert found_exec, "diffusion_engine_exec_time_ms key not found in format_diffusion_outputs()"
+        assert found_total, "diffusion_engine_total_time_ms key not found in format_diffusion_outputs()"
 
 
 class TestDummyRunAllocation:
@@ -98,7 +108,7 @@ class TestDummyRunAllocation:
 
     def test_no_oversized_allocation(self) -> None:
         """_dummy_run should not allocate more audio than needed."""
-        source = _read_engine_source()
+        source = _read_source(_ENGINE_PATH)
         dummy_source = _get_function_source(source, "DiffusionEngine", "_dummy_run")
         assert "audio_sr * audio_duration_sec" not in dummy_source, (
             "_dummy_run should generate exact-sized audio, not allocate and slice"

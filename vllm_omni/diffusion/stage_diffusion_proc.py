@@ -33,6 +33,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
 )
 from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
 from vllm_omni.engine.stage_init_utils import set_death_signal
+from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -400,12 +401,15 @@ class StageDiffusionProc:
                 )
             except Exception as e:
                 logger.exception("Diffusion request %s failed: %s", request_id, e)
+                status_code, error_type = client_error_metadata(e)
                 await response_socket.send(
                     encoder.encode(
                         {
                             "type": "error",
                             "request_id": request_id,
                             "error": str(e),
+                            "status_code": status_code,
+                            "error_type": error_type,
                         }
                     )
                 )
@@ -483,12 +487,15 @@ class StageDiffusionProc:
                             )
                         except Exception as e:
                             logger.exception("Batch diffusion request %s failed: %s", rid, e)
+                            status_code, error_type = client_error_metadata(e)
                             await response_socket.send(
                                 encoder.encode(
                                     {
                                         "type": "error",
                                         "request_id": rid,
                                         "error": str(e),
+                                        "status_code": status_code,
+                                        "error_type": error_type,
                                     }
                                 )
                             )

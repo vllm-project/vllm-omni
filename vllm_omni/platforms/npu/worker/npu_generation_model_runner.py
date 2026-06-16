@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gc
 import time
+from collections.abc import Mapping
 from copy import copy, deepcopy
 
 import numpy as np
@@ -448,7 +449,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                 pooler_output.append(
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
-        elif isinstance(multimodal_outputs, dict):
+        elif isinstance(multimodal_outputs, Mapping):
             num_reqs = self.input_batch.num_reqs
             for i in range(num_reqs):
                 mm_payload = {}

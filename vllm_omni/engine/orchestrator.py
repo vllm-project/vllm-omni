@@ -689,7 +689,7 @@ class Orchestrator:
                             await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
                             for eco in raw_outputs.outputs:
                                 req_state = self.request_states.get(getattr(eco, "request_id", None))
-                                if req_state is None:
+                                if req_state is None or not req_state.streaming.enabled:
                                     continue
                                 req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
                                 req_state.streaming.new_prompt_len_snapshot = getattr(
@@ -809,6 +809,8 @@ class Orchestrator:
                 request_id=parent_id,
                 stage_id=stage_id,
                 error=output.error,
+                status_code=getattr(output, "error_status_code", None),
+                error_type=getattr(output, "error_type", None),
             )
         )
         await self._cleanup_request_ids(

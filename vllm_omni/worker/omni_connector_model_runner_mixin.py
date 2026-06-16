@@ -714,7 +714,7 @@ class OmniConnectorModelRunnerMixin:
             self._apply_staged_payloads_locked(results)
             for req_id, payload in results.items():
                 self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
-        logger.info(
+        logger.debug(
             "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
             self._stage_id,
             len(results),
@@ -919,7 +919,7 @@ class OmniConnectorModelRunnerMixin:
         if not (finished_req_ids & pending_req_ids):
             return
 
-        logger.info(
+        logger.debug(
             "[Stage-%s] flush_full_payload_outputs: finished_req_ids=%s, pending=%s",
             self._stage_id,
             finished_req_ids,
@@ -930,7 +930,7 @@ class OmniConnectorModelRunnerMixin:
             entry = self._pending_full_payload_send.pop(req_id, None)
             if entry is not None:
                 to_send[req_id] = self._materialize_full_payload_entry(entry)
-        logger.info("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
+        logger.debug("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
 
@@ -950,10 +950,10 @@ class OmniConnectorModelRunnerMixin:
         Returns list of request IDs successfully enqueued.
         """
         if self._omni_connector is None:
-            logger.info("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
+            logger.debug("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
             return []
         if not self.is_data_transfer_rank():
-            logger.info(
+            logger.debug(
                 "[Stage-%s] send_full_payload_outputs: not data_transfer_rank (rank=%s), skip",
                 self._stage_id,
                 self._local_rank,
@@ -977,7 +977,7 @@ class OmniConnectorModelRunnerMixin:
                 if payload is None:
                     continue
             if payload is None:
-                logger.info("[Stage-%s] send_full_payload_outputs: payload is None for %s", self._stage_id, req_id)
+                logger.debug("[Stage-%s] send_full_payload_outputs: payload is None for %s", self._stage_id, req_id)
                 continue
             if isinstance(payload, dict):
                 audio_codes = self._payload_audio_codes(payload)
@@ -988,7 +988,7 @@ class OmniConnectorModelRunnerMixin:
                 else:
                     code_len = None
                 meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-                logger.info(
+                logger.debug(
                     "[Stage-%s] send_full_payload_outputs: req=%s payload_keys=%s code_len=%s left_context_size=%s",
                     self._stage_id,
                     req_id,
@@ -1002,7 +1002,7 @@ class OmniConnectorModelRunnerMixin:
             self._put_req_chunk[req_id] += 1
             connector_put_key = f"{external_req_id}_{self._stage_id}_{chunk_id}"
 
-            logger.info(
+            logger.debug(
                 "[Stage-%s] send_full_payload_outputs: enqueue req=%s put_key=%s next_stage=%s",
                 self._stage_id,
                 req_id,
@@ -1578,7 +1578,7 @@ class OmniConnectorModelRunnerMixin:
             has_pending_kv_work=self.has_pending_kv_work(),
         )
         if output.stage_recv_req_ids or chunk_finished or newly_finished:
-            logger.info(
+            logger.debug(
                 "[Stage-%s] get_omni_connector_output: stage_recv=%s, chunk_finished=%s, chunk_ready=%s",
                 self._stage_id,
                 output.stage_recv_req_ids,
@@ -1786,7 +1786,7 @@ class OmniConnectorModelRunnerMixin:
         if not payload_data:
             return False
         if isinstance(payload_data, dict):
-            logger.info(
+            logger.debug(
                 "[Stage-%s] recv_chunk_result: req=%s ext=%s key=%s keys=%s finished=%s",
                 self._stage_id,
                 req_id,
@@ -1862,7 +1862,7 @@ class OmniConnectorModelRunnerMixin:
                 # actually visible to the model thread.
                 self._full_payload_pending_broadcast_req_ids.add(req_id)
                 self._pending_load_reqs.pop(req_id, None)
-            logger.info(
+            logger.debug(
                 "[Stage-%s] full_payload recv complete: req=%s key=%s payload_type=%s",
                 self._stage_id,
                 req_id,
@@ -1974,7 +1974,7 @@ class OmniConnectorModelRunnerMixin:
             put_key=put_key,
             data=payload_data,
         )
-        logger.info(
+        logger.debug(
             "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
             task["stage_id"],
             put_key,
