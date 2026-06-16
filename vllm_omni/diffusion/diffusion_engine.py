@@ -10,8 +10,8 @@ import queue
 import threading
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import PIL.Image
@@ -25,8 +25,22 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.io_support import (
+    get_dummy_run_num_frames,
+    get_extra_body_params,
+    get_extra_output_params,
+    image_color_format,
+    supports_audio_output,
+    supports_multimodal_input,
+)
+from vllm_omni.diffusion.output_formatter import (
+    DiffusionStepTimings,
+    format_diffusion_outputs,
+    format_empty_diffusion_outputs,
+    normalize_diffusion_postprocess_output,
+)
 from vllm_omni.diffusion.registry import (
-    DiffusionModelRegistry,
+    get_diffusion_action_post_process_func,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
 )
@@ -36,52 +50,32 @@ from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
-from vllm_omni.outputs import OmniRequestOutput
+
+if TYPE_CHECKING:
+    from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
-
-@dataclass
-class _RpcTask:
-    """A pending collective_rpc invocation queued for the busy loop."""
-
-    method: str
-    args: tuple
-    kwargs: dict | None
-    deadline: float | None
-    unique_reply_rank: int | None
-    future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
-
-
-def supports_multimodal_input(od_config: OmniDiffusionConfig) -> tuple[bool, bool]:
-    if od_config.diffusion_load_format == "diffusers" and (pipe_cls := od_config.diffusers_pipeline_cls) is not None:
-        signature = inspect.signature(pipe_cls.__call__)
-        support_image_input = "image" in signature.parameters
-        support_audio_input = (
-            "audio" in signature.parameters or "audio_latents" in signature.parameters
-        )  # ref. LTX-2 format
-        return support_image_input, support_audio_input
-
-    supports_image_input = False
-    supports_audio_input = False
-
-    model_cls = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
-    if model_cls is not None:
-        supports_image_input = bool(getattr(model_cls, "support_image_input", False))
-        supports_audio_input = bool(getattr(model_cls, "support_audio_input", False))
-    return supports_image_input, supports_audio_input
+__all__ = [
+    "DiffusionEngine",
+    "_RpcTask",
+    "_move_tensor_tree_to_cpu",
+    "get_dummy_run_num_frames",
+    "get_extra_body_params",
+    "get_extra_output_params",
+    "image_color_format",
+    "supports_audio_output",
+    "supports_multimodal_input",
+]
 
 
-def image_color_format(model_class_name: str) -> str:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    return getattr(model_cls, "color_format", "RGB")
-
-
-def supports_audio_output(model_class_name: str) -> bool:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
+def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
+    if func is None:
         return False
-    return bool(getattr(model_cls, "support_audio_output", False))
+    parameters = inspect.signature(func).parameters
+    return parameter_name in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
 def _move_tensor_tree_to_cpu(value: object) -> object:
@@ -96,41 +90,16 @@ def _move_tensor_tree_to_cpu(value: object) -> object:
     return value
 
 
-def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
-    """Get num_frames for the dummy warmup run. Returns 0 to skip warmup."""
+@dataclass
+class _RpcTask:
+    """A pending collective_rpc invocation queued for the busy loop."""
 
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
-        return int(getattr(model_cls, "dummy_run_num_frames"))
-    return 2 if supports_audio_input or supports_audio_output(model_class_name) else 1
-
-
-def get_extra_body_params(model_class_name: str) -> frozenset[str]:
-    """Return the set of extra_body keys accepted by a pipeline.
-
-    Each pipeline can declare ``EXTRA_BODY_PARAMS: ClassVar[frozenset[str]]``
-    to advertise which request-level parameters should be forwarded from
-    ``extra_body`` to ``OmniDiffusionSamplingParams.extra_args``.
-    Returns an empty frozenset when the pipeline does not declare any.
-    """
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return frozenset()
-    return frozenset(getattr(model_cls, "EXTRA_BODY_PARAMS", frozenset()))
-
-
-def get_extra_output_params(model_class_name: str) -> frozenset[str]:
-    """Return the set of custom_output keys to expose in API response metrics.
-
-    Each pipeline can declare ``EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]]``
-    to advertise which ``DiffusionOutput.custom_output`` keys should be
-    copied into the response ``metrics`` dict.
-    Returns an empty frozenset when the pipeline does not declare any.
-    """
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return frozenset()
-    return frozenset(getattr(model_cls, "EXTRA_OUTPUT_PARAMS", frozenset()))
+    method: str
+    args: tuple
+    kwargs: dict | None
+    deadline: float | None
+    unique_reply_rank: int | None
+    future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
 
 
 class DiffusionEngine:
@@ -149,12 +118,16 @@ class DiffusionEngine:
         self.od_config = od_config
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
+        self.action_post_process_func = get_diffusion_action_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
         # Cache whether the model-specific postprocess accepts request-level
         # sampling params so step() can support both legacy and extended hooks.
-        self._post_process_accepts_sampling_params = bool(
-            self.post_process_func is not None
-            and "sampling_params" in inspect.signature(self.post_process_func).parameters
+        self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
+        self._action_post_process_accepts_sampling_params = _func_accepts_parameter(
+            self.action_post_process_func, "sampling_params"
+        )
+        self._action_post_process_accepts_custom_output = _func_accepts_parameter(
+            self.action_post_process_func, "custom_output"
         )
 
         executor_class = DiffusionExecutor.get_class(od_config)
@@ -243,16 +216,7 @@ class DiffusionEngine:
 
         if output.output is None:
             logger.warning("Output is None, returning empty OmniRequestOutput")
-            return [
-                OmniRequestOutput.from_diffusion(
-                    request_id=request.request_id,
-                    images=[],
-                    prompt=prompt,
-                    metrics={},
-                    latents=None,
-                )
-                for i, prompt in enumerate(request.prompts)
-            ]
+            return format_empty_diffusion_outputs(request)
 
         # When CPU offload is enabled, move output to CPU before
         # post-processing to avoid device OOM — model weights may still
@@ -261,8 +225,14 @@ class DiffusionEngine:
         if self.od_config.enable_cpu_offload:
             output_data = _move_tensor_tree_to_cpu(output_data)
 
+        custom_output = output.custom_output or {}
+        action_payload = None
+        action_only_output = bool(custom_output.get("action_only_output"))
+
         postprocess_start_time = time.perf_counter()
-        if self.post_process_func is not None:
+        if action_only_output:
+            outputs = []
+        elif self.post_process_func is not None:
             # Some video pipelines need request-level controls during
             # postprocess (for example worker-side frame interpolation).
             if self._post_process_accepts_sampling_params:
@@ -271,18 +241,30 @@ class DiffusionEngine:
                 outputs = self.post_process_func(output_data)
         else:
             outputs = output_data
-        audio_payload = None
-        custom_output = output.custom_output or {}
-        model_audio_sample_rate = None
-        model_fps = None
-        action_payload = None
-        if isinstance(outputs, dict):
-            audio_payload = outputs.get("audio")
-            action_payload = outputs.get("actions")
-            custom_output.update(outputs.get("custom_output") or {})
-            model_audio_sample_rate = outputs.get("audio_sample_rate")
-            model_fps = outputs.get("fps")
-            outputs = outputs.get("video", outputs)
+
+        postprocess_output = normalize_diffusion_postprocess_output(outputs, custom_output)
+        custom_output = postprocess_output.custom_output
+        action_payload = postprocess_output.action_payload
+        if action_payload is None:
+            action_payload = custom_output.get("actions")
+            if action_payload is not None:
+                postprocess_output = replace(postprocess_output, action_payload=action_payload)
+        action_post_process_func = getattr(self, "action_post_process_func", None)
+        if action_payload is None and action_post_process_func is not None:
+            raw_action_payload = custom_output.get("action")
+            if raw_action_payload is not None:
+                action_kwargs: dict[str, Any] = {}
+                if getattr(self, "_action_post_process_accepts_custom_output", False):
+                    action_kwargs["custom_output"] = custom_output
+                if getattr(self, "_action_post_process_accepts_sampling_params", False):
+                    action_kwargs["sampling_params"] = request.sampling_params
+                action_payload = action_post_process_func(raw_action_payload, **action_kwargs)
+                custom_output = {**custom_output, "actions": action_payload}
+                postprocess_output = replace(
+                    postprocess_output,
+                    custom_output=custom_output,
+                    action_payload=action_payload,
+                )
         postprocess_time = time.perf_counter() - postprocess_start_time
         logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
 
@@ -296,184 +278,19 @@ class DiffusionEngine:
             step_total_ms,
         )
 
-        # Convert to OmniRequestOutput format
-        # Ensure outputs is a list
-        if not isinstance(outputs, list):
-            outputs = [outputs] if outputs is not None else []
-
-        metrics = {
-            "preprocess_time_ms": preprocess_time * 1000,
-            "diffusion_engine_exec_time_ms": exec_total_time * 1000,
-            "diffusion_engine_total_time_ms": step_total_ms,
-            "image_num": int(request.sampling_params.num_outputs_per_prompt),
-            "resolution": int(request.sampling_params.resolution),
-            "postprocess_time_ms": postprocess_time * 1000,
-        }
-
-        # Detect text output: when the pipeline returns a string (e.g.,
-        # SenseNova-U1 / BAGEL single-stage img2text / text2text), wrap it
-        # as a text-type response instead of an image.
-        is_text_output = isinstance(output_data, str) and custom_output.get("text_output") is not None
-
-        # Handle single request or multiple requests
-        is_audio_output = supports_audio_output(self.od_config.model_class_name)
-        if is_audio_output and model_audio_sample_rate is None:
-            model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
-            model_audio_sample_rate = getattr(model_cls, "audio_sample_rate", None)
-
-        def _audio_mm(payload: Any) -> dict[str, Any]:
-            mm: dict[str, Any] = {"audio": payload}
-            if model_audio_sample_rate is not None:
-                mm["audio_sample_rate"] = model_audio_sample_rate
-            return mm
-
-        if len(request.prompts) == 1:
-            # Single request: return single OmniRequestOutput
-            prompt = request.prompts[0]
-            request_id = request.request_id
-
-            if is_text_output:
-                return [
-                    OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=[],
-                        prompt=prompt,
-                        metrics=metrics,
-                        custom_output=custom_output,
-                        final_output_type="text",
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
-                    ),
-                ]
-            if is_audio_output:
-                request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
-                return [
-                    OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=[],
-                        prompt=prompt,
-                        metrics=metrics,
-                        latents=output.trajectory_latents,
-                        trajectory_latents=output.trajectory_latents,
-                        trajectory_timesteps=output.trajectory_timesteps,
-                        trajectory_log_probs=output.trajectory_log_probs,
-                        trajectory_decoded=output.trajectory_decoded,
-                        multimodal_output=_audio_mm(request_audio_payload),
-                        final_output_type="audio",
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
-                    ),
-                ]
-            else:
-                mm_output = {}
-                if audio_payload is not None:
-                    mm_output["audio"] = audio_payload
-                if model_audio_sample_rate is not None:
-                    mm_output["audio_sample_rate"] = model_audio_sample_rate
-                if model_fps is not None:
-                    mm_output["fps"] = model_fps
-                if action_payload is not None:
-                    mm_output["actions"] = action_payload
-                return [
-                    OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=outputs,
-                        prompt=prompt,
-                        metrics=metrics,
-                        latents=output.trajectory_latents,
-                        trajectory_latents=output.trajectory_latents,
-                        trajectory_timesteps=output.trajectory_timesteps,
-                        trajectory_log_probs=output.trajectory_log_probs,
-                        trajectory_decoded=output.trajectory_decoded,
-                        custom_output=custom_output,
-                        multimodal_output=mm_output,
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
-                    ),
-                ]
-        else:
-            # Multiple requests: return list of OmniRequestOutput
-            # Split images based on num_outputs_per_prompt for each request
-            results = []
-            output_idx = 0
-            request_id = request.request_id
-
-            for i, prompt in enumerate(request.prompts):
-                # Get images for this request
-                num_outputs = request.sampling_params.num_outputs_per_prompt
-                start_idx = output_idx
-                end_idx = start_idx + num_outputs
-                request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
-                output_idx = end_idx
-
-                if is_audio_output:
-                    request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
-                    results.append(
-                        OmniRequestOutput.from_diffusion(
-                            request_id=request_id,
-                            images=[],
-                            prompt=prompt,
-                            metrics=metrics,
-                            latents=output.trajectory_latents,
-                            trajectory_latents=output.trajectory_latents,
-                            trajectory_timesteps=output.trajectory_timesteps,
-                            trajectory_log_probs=output.trajectory_log_probs,
-                            trajectory_decoded=output.trajectory_decoded,
-                            multimodal_output=_audio_mm(request_audio_payload),
-                            final_output_type="audio",
-                            stage_durations=output.stage_durations,
-                            peak_memory_mb=output.peak_memory_mb,
-                        ),
-                    )
-                else:
-                    mm_output = {}
-                    if audio_payload is not None:
-                        sliced_audio = audio_payload
-                        if isinstance(audio_payload, (list, tuple)):
-                            sliced_audio = audio_payload[start_idx:end_idx]
-                            if len(sliced_audio) == 1:
-                                sliced_audio = sliced_audio[0]
-                        elif hasattr(audio_payload, "shape") and getattr(audio_payload, "shape", None) is not None:
-                            if len(audio_payload.shape) > 0 and audio_payload.shape[0] >= end_idx:
-                                sliced_audio = audio_payload[start_idx:end_idx]
-                                if num_outputs == 1:
-                                    sliced_audio = sliced_audio[0]
-                        mm_output["audio"] = sliced_audio
-                    if model_audio_sample_rate is not None:
-                        mm_output["audio_sample_rate"] = model_audio_sample_rate
-                    if model_fps is not None:
-                        mm_output["fps"] = model_fps
-                    if action_payload is not None:
-                        sliced_actions = action_payload
-                        if isinstance(action_payload, (list, tuple)):
-                            sliced_actions = action_payload[start_idx:end_idx]
-                            if len(sliced_actions) == 1:
-                                sliced_actions = sliced_actions[0]
-                        elif hasattr(action_payload, "shape") and getattr(action_payload, "shape", None) is not None:
-                            if len(action_payload.shape) > 0 and action_payload.shape[0] >= end_idx:
-                                sliced_actions = action_payload[start_idx:end_idx]
-                                if num_outputs == 1:
-                                    sliced_actions = sliced_actions[0]
-                        mm_output["actions"] = sliced_actions
-                    results.append(
-                        OmniRequestOutput.from_diffusion(
-                            request_id=request_id,
-                            images=request_outputs,
-                            prompt=prompt,
-                            metrics=metrics,
-                            latents=output.trajectory_latents,
-                            trajectory_latents=output.trajectory_latents,
-                            trajectory_timesteps=output.trajectory_timesteps,
-                            trajectory_log_probs=output.trajectory_log_probs,
-                            trajectory_decoded=output.trajectory_decoded,
-                            custom_output=custom_output,
-                            multimodal_output=mm_output,
-                            stage_durations=output.stage_durations,
-                            peak_memory_mb=output.peak_memory_mb,
-                        ),
-                    )
-
-            return results
+        return format_diffusion_outputs(
+            request=request,
+            od_config=self.od_config,
+            diffusion_output=output,
+            output_data=output_data,
+            postprocess_output=postprocess_output,
+            timings=DiffusionStepTimings(
+                preprocess_time_s=preprocess_time,
+                exec_time_s=exec_total_time,
+                postprocess_time_s=postprocess_time,
+                total_time_ms=step_total_ms,
+            ),
+        )
 
     def _busy_loop(self):
         while not self.stop_event.is_set():
