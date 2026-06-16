@@ -36,10 +36,12 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.memory import SessionMemoryManager, resolve_session_memory_config
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.dreamzero.causal_wan_model import CausalWanModel
 from vllm_omni.diffusion.models.dreamzero.image_encoder import DreamZeroImageEncoder
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
+from vllm_omni.diffusion.models.dreamzero.state_dreamzero_adapter import DreamZeroStateAdapter
 from vllm_omni.diffusion.models.dreamzero.transform import (
     DEFAULT_EMBODIMENT,
     ensure_transforms_loaded,
@@ -434,6 +436,17 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
 
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
+        # Opt-in: back per-session state with the shared SessionMemoryManager
+        # (RFC #4480). Default off -> the bespoke DreamZeroState path above.
+        self._use_memory_manager, mm_max_sessions = resolve_session_memory_config(
+            enable=od_config.enable_session_memory_manager,
+            max_sessions=MAX_DREAMZERO_SESSIONS,
+        )
+        self._memory_manager: SessionMemoryManager | None = (
+            SessionMemoryManager(max_sessions=mm_max_sessions) if self._use_memory_manager else None
+        )
+        if self._use_memory_manager:
+            logger.info("DreamZero: session memory manager enabled (max_sessions=%d)", mm_max_sessions)
         self.state = self._get_or_create_state("default")
 
         # DiT step cache is configured by StepCacheBackend
@@ -502,7 +515,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             ),
         ]
 
-    def _get_or_create_state(self, session_id: str | None) -> DreamZeroState:
+    def _get_or_create_state(self, session_id: str | None) -> DreamZeroState | DreamZeroStateAdapter:
+        if self._memory_manager is not None:
+            # The manager owns session lifecycle and LRU; the adapter is a thin
+            # per-call view over it (no second LRU to drift).
+            return DreamZeroStateAdapter(session_id, self._memory_manager)
+
         session_key = str(session_id or "default")
         state = self._states.get(session_key)
         if state is None:
