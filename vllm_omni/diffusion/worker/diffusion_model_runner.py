@@ -374,6 +374,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     sampling=copy.deepcopy(req.sampling_params),
                     prompts=req.prompts,
                 )
+                state_req = copy.copy(req)
+                state_req.sampling_params = new_state.sampling
+                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                    state_req,
+                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                    target_device=getattr(self.pipeline, "device", None),
+                )
                 self.state_cache[request_id] = new_state
                 resolved.append(new_state)
 
@@ -452,8 +459,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if not self.supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
         # Stepwise mode only supports the basic state-driven denoise path for now.
-        # Request-mode extras such as cache backends, KV transfer, editing inputs,
-        # and similar features are not supported here yet.
+        # Request-mode extras such as cache backends, editing inputs, and
+        # similar features are not supported here yet.
         if self.od_config.cache_backend not in (None, "none"):
             raise ValueError("Step mode does not support cache_backend yet.")
 

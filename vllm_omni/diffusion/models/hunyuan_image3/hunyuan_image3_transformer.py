@@ -1065,9 +1065,10 @@ class ImageKVCacheManager:
         assert self.image_kv_cache_lens is not None
         if position_ids is not None:
             assert position_ids.shape == (bs, q_len)
-            assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens), (
-                "The first current position must immediately follow each sample's cached prompt KV."
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens.to(position_ids.device)), (
+                    "The first current position must immediately follow each sample's cached prompt KV."
+                )
         new_key = torch.cat([cached_key, key], dim=1)
         new_value = torch.cat([cached_value, value], dim=1)
         return new_key.contiguous(), new_value.contiguous()
