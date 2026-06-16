@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -848,10 +849,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         if self.attention_kwargs is None:
             self._attention_kwargs = {}
 
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
-        negative_txt_seq_lens = (
-            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
-        )
+        txt_seq_lens = txt_seq_lens_from_embeds(prompt_embeds)
+        negative_txt_seq_lens = txt_seq_lens_from_embeds(negative_prompt_embeds)
         is_rgb = torch.tensor([0] * batch_size).to(device=self.device, dtype=torch.long)
 
         latents = self.diffuse(
