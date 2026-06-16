@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -117,7 +118,7 @@ class SDXLResnetBlock2D(nn.Module):
 class SDXLGEGLU(nn.Module):
     def __init__(self, dim_in: int, dim_out: int):
         super().__init__()
-        self.proj = ColumnParallelLinear(dim_in, dim_out * 2, bias=True)
+        self.proj = MergedColumnParallelLinear(dim_in, [dim_out, dim_out], bias=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states, _ = self.proj(hidden_states)
@@ -832,8 +833,17 @@ class SDXLUNet2DConditionModel(nn.Module):
 
         for name, loaded_weight in weights:
             # Handle GEGLU: diffusers stores as ff.net.0.proj.weight/bias
+            # MergedColumnParallelLinear needs the two halves loaded separately
             if ".ff.net.0.proj." in name:
                 name = name.replace(".ff.net.0.proj.", ".ff.geglu.proj.")
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    half = loaded_weight.shape[0] // 2
+                    weight_loader(param, loaded_weight[:half], 0)
+                    weight_loader(param, loaded_weight[half:], 1)
+                    loaded_params.add(name)
+                continue
             elif ".ff.net.2." in name:
                 name = name.replace(".ff.net.2.", ".ff.out_proj.")
 
