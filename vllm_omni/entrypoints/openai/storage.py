@@ -10,7 +10,7 @@ from typing import Generic, Literal, TypeVar
 
 from vllm.logger import init_logger
 
-from vllm_omni.entrypoints.openai.config import CONFIG, STORAGE_BACKENDS, FileBackend
+from vllm_omni.config.server_settings import SERVER_SETTINGS_CONFIG, STORAGE_BACKENDS, FileBackend
 
 logger = init_logger(__name__)
 
@@ -207,4 +207,4 @@ def get_storage_manager(storage_config: STORAGE_BACKENDS) -> StorageBaseManager[
     return manager
 
 
-STORAGE_MANAGER = get_storage_manager(CONFIG.storage)
+STORAGE_MANAGER = get_storage_manager(SERVER_SETTINGS_CONFIG.storage)
