@@ -857,16 +857,13 @@ def initialize_model_parallel(
         parallel_mode="fully_shard",
     )
 
-    if enable_expert_parallel:
-        if use_moe_parallel_mapping:
-            vllm_parallel_state._EP = init_model_parallel_group(
-                group_ranks=rank_generator.get_ranks("tp-sp-cfg-dp"),
-                local_rank=get_world_group().local_rank,
-                backend=backend,
-                parallel_mode="expert",
-            )
-        else:
-            raise RuntimeError("Expert parallelism enabled for a non-MoE model ")
+    if use_moe_parallel_mapping:
+        vllm_parallel_state._EP = init_model_parallel_group(
+            group_ranks=rank_generator.get_ranks("tp-sp-cfg-dp"),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="expert",
+        )
 
     init_dit_group(dit_parallel_size, backend)
 
