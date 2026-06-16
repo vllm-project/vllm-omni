@@ -12,6 +12,9 @@ deliberate Phase-1 simplification the fused paged backend retires in Phase 2.
 from __future__ import annotations
 
 import torch
+from vllm.logger import init_logger
+
+_log = init_logger(__name__)
 
 
 def allocate_kv_pool(
@@ -123,20 +126,46 @@ class BDEKVState:
         self.pos = pos_adapter
         self.neg = neg_adapter
         self.num_layers = num_layers
+        # --- Approach 1: faithful window store (shape-agnostic) ----------------
+        # DreamZero's update_kv_cache stores the whole current (trimmed) window per
+        # step; its length and rank vary. We mirror it exactly by holding the
+        # model's ``updated_kv`` tensors per (branch, layer) — so the output is
+        # bit-identical to the model-local path. On the first get (nothing stored
+        # yet) we defer to the model-local empty cache via ``fallback``. The
+        # pool-backed, chunk-paged version is Approach 2.
+        self._store: dict[bool, list] = {
+            False: [None] * num_layers,
+            True: [None] * num_layers,
+        }
 
-    def get_kv_caches(self, is_negative: bool) -> list[torch.Tensor]:
-        adapter = self.neg if is_negative else self.pos
-        return [self.kv_cache.gather_window(i, adapter) for i in range(self.num_layers)]
+    def get_kv_caches(self, is_negative: bool, fallback) -> list:
+        branch = "neg" if is_negative else "pos"
+        store = self._store[is_negative]
+        if store[0] is None:  # nothing written this rollout yet
+            out = fallback()
+            _log.info("BDE GET   [%s] source=model-local-empty layers=%d", branch, len(out))
+            return out
+        _log.info(
+            "BDE GET   [%s] source=bde-store layers=%d window0=%s",
+            branch, self.num_layers, tuple(store[0].shape),
+        )
+        for i in range(self.num_layers):
+            _log.debug("BDE GET   [%s] layer=%d shape=%s", branch, i, tuple(store[i].shape))
+        return store
 
     def update_kv_cache(self, layer_idx: int, updated_kv: torch.Tensor, is_negative: bool) -> None:
-        adapter = self.neg if is_negative else self.pos
-        new_k = updated_kv[0].unsqueeze(0)  # add batch dim: (seq, n_heads, head_dim) → (1, seq, ...)
-        new_v = updated_kv[1].unsqueeze(0)
-        self.kv_cache.write_chunk_kv(layer_idx, new_k, new_v, adapter)
+        branch = "neg" if is_negative else "pos"
+        self._store[is_negative][layer_idx] = updated_kv
+        if layer_idx == 0:
+            _log.info(
+                "BDE WRITE [%s] window=%s storing %d layers into BDE pool state",
+                branch, tuple(updated_kv.shape), self.num_layers,
+            )
+        _log.debug("BDE WRITE [%s] layer=%d shape=%s", branch, layer_idx, tuple(updated_kv.shape))
 
     def commit_chunk(self) -> None:
-        self.kv_cache.commit_chunk(self.pos)
-        self.kv_cache.commit_chunk(self.neg)
+        # Window-store mode keeps no per-chunk bookkeeping (Approach 2 will).
+        _log.info("BDE COMMIT (pos/neg window stores retained across forwards)")
 
 
 class BDEPipelineMixin:

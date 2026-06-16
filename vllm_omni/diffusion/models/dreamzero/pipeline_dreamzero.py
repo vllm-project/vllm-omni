@@ -109,13 +109,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         s = self._bde_kv_state
         if s is not None:
             _log.debug("BDE KV get (neg=%s): %d layers", is_negative, s.num_layers)
-            return s.get_kv_caches(is_negative)
+            return s.get_kv_caches(is_negative, lambda: state.get_kv_caches(is_negative))
         return state.get_kv_caches(is_negative)
 
     def _kv_create(self, state, batch_size, dtype, device, num_layers, num_heads, head_dim):
-        if self._bde_kv_state is not None:
-            _log.debug("BDE KV create: pool already allocated (%d layers)", num_layers)
-            return
+        # Always create the model-local caches so cross-attention (which BDE does
+        # NOT manage) is initialized. Under BDE the self-attn kv_cache created here
+        # is unused — _kv_get / _kv_update route self-attn KV through the pool.
         state.create_kv_caches(batch_size, dtype, device, num_layers, num_heads, head_dim)
 
     def _kv_update(self, state, layer_idx, updated_kv, is_negative):
@@ -359,6 +359,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if kwargs.get("update_kv_cache", False) and updated_kv_caches:
             state = kwargs.get("dreamzero_state", self.state)
             is_neg = kwargs.get("is_negative", False)
+            if self._bde_kv_state is not None:
+                _log.info(
+                    "BDE pipeline predict_noise -> write-back: is_neg=%s seq_len=%s "
+                    "current_start_frame=%s layers=%d",
+                    is_neg, kwargs.get("seq_len"), kwargs.get("current_start_frame"),
+                    len(updated_kv_caches),
+                )
             for i, kv in enumerate(updated_kv_caches):
                 self._kv_update(state, i, kv, is_neg)
             self._kv_commit()
