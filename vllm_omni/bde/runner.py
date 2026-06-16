@@ -131,24 +131,25 @@ class BDEModelRunner(DiffusionModelRunner):
         num_frame_per_block = int(t.num_frame_per_block)
         local_attn_size = int(t.local_attn_size)
         frame_seqlen = self._infer_frame_seqlen()
+        # The model's own attention window, in tokens (= the [-max_attention_size:]
+        # slice it applies). Read it directly rather than recomputing.
+        max_attention_size = int(t.blocks[0].self_attn.max_attention_size)
 
-        chunk_size = num_frame_per_block * frame_seqlen
-        window_chunks = self.bde_kv_config.window_chunks
-        if window_chunks is None:
-            if local_attn_size <= 0:
-                raise ValueError(
-                    "DreamZero local_attn_size <= 0 (full attention); set "
-                    "BDE_KV_WINDOW_CHUNKS to bound the BDE window"
-                )
-            window_chunks = local_attn_size // num_frame_per_block
+        # Frame-granular paging: 1 block = 1 frame = frame_seqlen tokens, so the
+        # resident window matches max_attention_size exactly (it need not be a whole
+        # number of num_frame_per_block causal blocks).
+        chunk_size = frame_seqlen
+        window_chunks = self.bde_kv_config.window_chunks or (max_attention_size // frame_seqlen)
 
         self.bde_kv_config = dataclasses.replace(
             self.bde_kv_config, chunk_size=chunk_size, window_chunks=window_chunks
         )
         free_bytes = torch.cuda.mem_get_info(self.device)[0]
         logger.info(
-            "BDE preallocating: frame_seqlen=%d num_frame_per_block=%d local_attn_size=%d",
+            "BDE preallocating (paged): frame_seqlen=%d num_frame_per_block=%d "
+            "local_attn_size=%d -> chunk_size=%d window_chunks=%d (window=%d tokens)",
             frame_seqlen, num_frame_per_block, local_attn_size,
+            chunk_size, window_chunks, window_chunks * chunk_size,
         )
         self.build_kv_cache(
             num_layers=num_layers,

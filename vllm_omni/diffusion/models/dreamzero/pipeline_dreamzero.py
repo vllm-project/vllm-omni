@@ -118,11 +118,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # is unused — _kv_get / _kv_update route self-attn KV through the pool.
         state.create_kv_caches(batch_size, dtype, device, num_layers, num_heads, head_dim)
 
-    def _kv_update(self, state, layer_idx, updated_kv, is_negative):
+    def _kv_update(self, state, layer_idx, updated_kv, is_negative, seq_len=None):
         s = self._bde_kv_state
         if s is not None:
             _log.debug("BDE KV write: layer %d neg=%s shape=%s", layer_idx, is_negative, tuple(updated_kv.shape))
-            s.update_kv_cache(layer_idx, updated_kv, is_negative)
+            s.update_kv_cache(layer_idx, updated_kv, is_negative, seq_len)
         else:
             state.update_kv_cache(layer_idx, updated_kv, is_negative=is_negative)
 
@@ -367,7 +367,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     len(updated_kv_caches),
                 )
             for i, kv in enumerate(updated_kv_caches):
-                self._kv_update(state, i, kv, is_neg)
+                self._kv_update(state, i, kv, is_neg, kwargs.get("seq_len"))
             self._kv_commit()
 
         video_pred = video_pred.clone()

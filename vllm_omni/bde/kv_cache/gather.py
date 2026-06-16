@@ -104,6 +104,13 @@ def pool_gather_window(
     return window
 
 
+def _drop_batch(t: torch.Tensor) -> torch.Tensor:
+    """``(1, L, n_heads, head_dim)`` -> ``(L, n_heads, head_dim)``; pass 3-D through."""
+    if t.dim() == 4 and t.shape[0] == 1:
+        return t[0]
+    return t
+
+
 class BDEKVState:
     """Per-request bridge between a DreamZero rollout and the BDE KV pool.
 
@@ -126,46 +133,71 @@ class BDEKVState:
         self.pos = pos_adapter
         self.neg = neg_adapter
         self.num_layers = num_layers
-        # --- Approach 1: faithful window store (shape-agnostic) ----------------
-        # DreamZero's update_kv_cache stores the whole current (trimmed) window per
-        # step; its length and rank vary. We mirror it exactly by holding the
-        # model's ``updated_kv`` tensors per (branch, layer) — so the output is
-        # bit-identical to the model-local path. On the first get (nothing stored
-        # yet) we defer to the model-local empty cache via ``fallback``. The
-        # pool-backed, chunk-paged version is Approach 2.
-        self._store: dict[bool, list] = {
-            False: [None] * num_layers,
-            True: [None] * num_layers,
-        }
+        # --- Approach 2: true chunk-paged write / gather -----------------------
+        # Each get gathers the resident window from the paged pool blocks; each
+        # update writes only the genuinely-new tokens (seq_len growth) into newly
+        # allocated frame-blocks, evicting out-of-window blocks via the
+        # ChunkWindowManager. ``_committed`` is the absolute token count written to
+        # the pool per branch; ``_pending`` holds this forward's new-chunk slot maps.
+        self._committed: dict[bool, int] = {False: 0, True: 0}
+        self._pending: dict[bool, list] = {False: [], True: []}
+
+    def _adapter(self, is_negative: bool):
+        return self.neg if is_negative else self.pos
 
     def get_kv_caches(self, is_negative: bool, fallback) -> list:
         branch = "neg" if is_negative else "pos"
-        store = self._store[is_negative]
-        if store[0] is None:  # nothing written this rollout yet
+        if self._committed[is_negative] == 0:  # nothing committed yet (prefill start)
             out = fallback()
             _log.info("BDE GET   [%s] source=model-local-empty layers=%d", branch, len(out))
             return out
+        adapter = self._adapter(is_negative)
+        windows = [self.kv_cache.gather_window(i, adapter) for i in range(self.num_layers)]
         _log.info(
-            "BDE GET   [%s] source=bde-store layers=%d window0=%s",
-            branch, self.num_layers, tuple(store[0].shape),
+            "BDE GET   [%s] source=paged-gather layers=%d window0=%s resident_blocks=%d/%d",
+            branch, self.num_layers, tuple(windows[0].shape),
+            len(self.kv_cache.window_block_ids(adapter)), self.kv_cache.spec.window_chunks,
         )
-        for i in range(self.num_layers):
-            _log.debug("BDE GET   [%s] layer=%d shape=%s", branch, i, tuple(store[i].shape))
-        return store
+        return windows
 
-    def update_kv_cache(self, layer_idx: int, updated_kv: torch.Tensor, is_negative: bool) -> None:
+    def update_kv_cache(self, layer_idx: int, updated_kv: torch.Tensor, is_negative: bool, seq_len) -> None:
         branch = "neg" if is_negative else "pos"
-        self._store[is_negative][layer_idx] = updated_kv
+        adapter = self._adapter(is_negative)
+        cs = self.kv_cache.spec.chunk_size
         if layer_idx == 0:
+            # The K appended this forward is the current observation's length
+            # (seq_len), not the cumulative-minus-committed delta. Allocate those
+            # frame-blocks once per forward (shared across layers).
+            new_count = int(seq_len)
+            n_chunks = new_count // cs
+            slots = []
+            for _ in range(n_chunks):
+                self.kv_cache.allocate_chunk(adapter)        # allocate + evict old
+                slots.append(self.kv_cache.chunk_write_slots(adapter))
+                adapter.on_chunk_committed()
+            self._pending[is_negative] = slots
+            self._committed[is_negative] += new_count
             _log.info(
-                "BDE WRITE [%s] window=%s storing %d layers into BDE pool state",
-                branch, tuple(updated_kv.shape), self.num_layers,
+                "BDE WRITE [%s] new_tokens=%d -> %d frame-chunks  resident=%d/%d  storing %d layers",
+                branch, new_count, n_chunks,
+                len(self.kv_cache.window_block_ids(adapter)), self.kv_cache.spec.window_chunks,
+                self.num_layers,
             )
-        _log.debug("BDE WRITE [%s] layer=%d shape=%s", branch, layer_idx, tuple(updated_kv.shape))
+        slots = self._pending[is_negative]
+        if not slots:
+            return
+        n = len(slots) * cs
+        k_all = _drop_batch(updated_kv[0])[-n:]  # (n, n_heads, head_dim) — the new tokens
+        v_all = _drop_batch(updated_kv[1])[-n:]
+        kpool = self.kv_cache._k_pools[layer_idx]
+        vpool = self.kv_cache._v_pools[layer_idx]
+        for c, sm in enumerate(slots):
+            k = k_all[c * cs : (c + 1) * cs].unsqueeze(0).to(kpool.dtype)
+            v = v_all[c * cs : (c + 1) * cs].unsqueeze(0).to(vpool.dtype)
+            pool_write_chunk(kpool, vpool, k, v, sm)
 
     def commit_chunk(self) -> None:
-        # Window-store mode keeps no per-chunk bookkeeping (Approach 2 will).
-        _log.info("BDE COMMIT (pos/neg window stores retained across forwards)")
+        _log.info("BDE COMMIT (paged; resident window retained across forwards)")
 
 
 class BDEPipelineMixin:

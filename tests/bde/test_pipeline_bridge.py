@@ -10,8 +10,8 @@ N_HEADS = 4
 HEAD_DIM = 64
 
 
-def make_state(num_layers=2):
-    cfg = BDEKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2)
+def make_state(num_layers=1, window_chunks=4):
+    cfg = BDEKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks)
     kv = BDEKVCache(cfg, num_layers=num_layers, num_kv_heads=N_HEADS, head_size=HEAD_DIM,
                     dtype=torch.float32, block_size=BLOCK, max_model_len=4096,
                     available_bytes=1 << 24, device=torch.device("cpu"))
@@ -20,40 +20,52 @@ def make_state(num_layers=2):
     return kv, BDEKVState(kv, pos, neg, num_layers=num_layers)
 
 
-# Approach 1: BDEKVState holds the model's window tensors opaquely (shape-agnostic),
-# falling back to the model-local empty cache until the first write.
+def _window(n_chunks):
+    """A model-style window tensor (2, 1, n_chunks*BLOCK, heads, head_dim)."""
+    return torch.randn(2, 1, n_chunks * BLOCK, N_HEADS, HEAD_DIM)
+
+
+# Approach 2: BDEKVState writes the new tokens into paged pool blocks and gathers
+# the resident window back; output mirrors the model-local sliding window.
 
 
 def test_get_returns_fallback_when_empty():
     _, st = make_state()
     sentinel = ["FALLBACK"]
-    assert st.get_kv_caches(False, lambda: sentinel) is sentinel
+    assert st.get_kv_caches(False, lambda: sentinel) is sentinel  # nothing committed
     assert st.get_kv_caches(True, lambda: sentinel) is sentinel
 
 
-def test_update_then_get_roundtrips_exactly():
-    _, st = make_state(num_layers=2)
-    # Variable-length / arbitrary-shape window tensors round-trip unchanged.
-    tensors = [torch.randn(2, 5, N_HEADS, HEAD_DIM), torch.randn(2, 9, N_HEADS, HEAD_DIM)]
-    for i, t in enumerate(tensors):
-        st.update_kv_cache(i, t, False)
-    got = st.get_kv_caches(False, lambda: ["UNUSED"])
-    assert [g is t for g, t in zip(got, tensors)] == [True, True]
+def test_paged_write_then_gather_roundtrips():
+    _, st = make_state(num_layers=1)
+    win = _window(2)  # this forward appends 2 frame-chunks
+    st.update_kv_cache(0, win, False, seq_len=2 * BLOCK)
+    got = st.get_kv_caches(False, lambda: ["X"])[0]  # (2, 1, W, heads, head_dim)
+    assert got.shape == (2, 1, 2 * BLOCK, N_HEADS, HEAD_DIM)
+    # The gathered window equals the tokens we wrote (bit-exact).
+    assert torch.allclose(got[0, 0], win[0, 0], atol=0)
+    assert torch.allclose(got[1, 0], win[1, 0], atol=0)
+
+
+def test_eviction_bounds_resident_window():
+    kv, st = make_state(num_layers=1, window_chunks=3)
+    st.update_kv_cache(0, _window(3), False, seq_len=3 * BLOCK)          # resident 3/3
+    st.update_kv_cache(0, _window(5), False, seq_len=2 * BLOCK)          # +2 -> evict to 3
+    got = st.get_kv_caches(False, lambda: ["X"])[0]
+    assert got.shape[2] <= 3 * BLOCK  # window bounded
 
 
 def test_branches_are_independent():
     _, st = make_state()
-    kpos = torch.randn(2, 3, N_HEADS, HEAD_DIM)
-    st.update_kv_cache(0, kpos, False)
-    st.update_kv_cache(1, kpos, False)
-    # Negative branch still empty -> fallback; positive returns the stored tensor.
+    st.update_kv_cache(0, _window(1), False, seq_len=BLOCK)
+    # Negative branch never written -> still falls back.
     assert st.get_kv_caches(True, lambda: ["NEG_EMPTY"]) == ["NEG_EMPTY"]
-    assert st.get_kv_caches(False, lambda: ["X"])[0] is kpos
+    assert st.get_kv_caches(False, lambda: ["X"])[0].shape[2] == BLOCK
 
 
 def test_commit_is_noop():
     _, st = make_state()
-    st.commit_chunk()  # window-store mode: no per-chunk bookkeeping, no error
+    st.commit_chunk()  # paged mode keeps resident windows; commit just logs
 
 
 def test_kv_state_noop():
