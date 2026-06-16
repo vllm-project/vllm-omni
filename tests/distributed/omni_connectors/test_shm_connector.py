@@ -41,6 +41,19 @@ class TestKeyBasedReadWrite:
         result = connector.get("s0", "s1", "no_such_key_xyz", metadata=None)
         assert result is None
 
+    def test_get_empty_shm_race_returns_none(self, connector, monkeypatch):
+        def raise_empty_file(*args, **kwargs):
+            raise ValueError("cannot mmap an empty file")
+
+        monkeypatch.setattr(
+            "vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_pkg.SharedMemory",
+            raise_empty_file,
+        )
+
+        result = connector.get("s0", "s1", "not_ready_yet", metadata=None)
+
+        assert result is None
+
     def test_rank_aware_keys_independent(self, connector):
         """Each TP rank writes/reads its own key — simulates homogeneous TP."""
         payloads = {}
