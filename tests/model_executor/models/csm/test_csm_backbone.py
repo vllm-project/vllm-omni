@@ -185,7 +185,19 @@ def test_forward_returns_omni_output_with_codes_latent(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_preprocess_decode_adds_cached_sigma_to_base_embed():
+def test_preprocess_decode_uses_cached_sigma_alone():
+    """REGRESSION GUARD (served-path fidelity): the decode-step backbone input is
+    the FULL previous-frame Sigma-embed ALONE, not ``base_cb0_embed + cached``.
+
+    HF ``CsmBackboneModelEmbeddings.forward`` builds a position's input as
+    ``embed_audio_tokens(codes + audio_tokens_offsets).sum(dim=2)`` over all 32
+    codebooks, and during AR generation that position's codes ARE the previously
+    generated frame. The cached Sigma is exactly that sum (cb0 is already its
+    k=0 term). Adding a separate cb0 base embed on top double-counts codebook 0
+    every decode step, compounds through the KV cache, and derails the rollout
+    (audio degrades after the first word, runs past EOS, over-loud). So the
+    composed decode embedding MUST equal the cached Sigma (5.0), NOT
+    base(2.0)+cached(5.0)=7.0."""
     m = _make_backbone()
     m.config = SimpleNamespace(vocab_size=2051)
     m._compose_frame_embed = lambda fc: torch.full((1, _HIDDEN), 2.0)
@@ -197,8 +209,8 @@ def test_preprocess_decode_adds_cached_sigma_to_base_embed():
         _omni_is_prefill=False,
     )
     assert torch.equal(ids, torch.tensor([7]))
-    # base (2.0) + cached Sigma (5.0) == 7.0 elementwise.
-    torch.testing.assert_close(embeds, torch.full((1, _HIDDEN), 7.0))
+    # Cached Sigma (5.0) ALONE. If this is 7.0 again, cb0 is being double-counted.
+    torch.testing.assert_close(embeds, torch.full((1, _HIDDEN), 5.0))
     assert upd == {}
 
 

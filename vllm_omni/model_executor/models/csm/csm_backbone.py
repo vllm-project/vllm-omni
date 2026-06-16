@@ -553,21 +553,31 @@ class CsmBackboneForConditionalGeneration(nn.Module):
                 take = torch.cat([take, pad], dim=0)
             return input_ids_out, take, {}
 
-        # Decode: span_len == 1. base = embed(cb0_token); add cached Sigma.
-        # The in-vocab token's base embedding is taken from the same per-codebook
-        # cb0 row of the frame-embed table (codebook 0), so the composed embedding
-        # equals embed_cb0(token) + Sigma(prev frame). When no cache yet (first
-        # decode after prefill), fall back to the runner-provided base embed.
+        # Decode: span_len == 1. The backbone input for this position is the FULL
+        # 32-codebook Sigma-embedding of the PREVIOUS frame, and nothing else. HF
+        # CsmBackboneModelEmbeddings.forward sums embed_audio over ALL 32 codebooks
+        # (modeling_csm.py: `embed_audio_tokens(input_ids + audio_tokens_offsets)`
+        # then `.sum(dim=2)`), and during AR generation a position's codes ARE the
+        # previously generated frame. That full-frame Sigma is composed from the
+        # real sampled 32-code frame and cached after the prior step's sampling, so
+        # we re-inject it as-is.
+        #
+        # Do NOT add a separate cb0 base embed on top: cb0 is already the k=0 term
+        # of the cached Sigma (frame_codes[...,0]). Adding embed_audio(cb0) again
+        # double-counts codebook 0 every decode step, which compounds through the
+        # KV cache and drifts the rollout (audio derails after frame 0, runs past
+        # EOS, over-loud). This was the served-path fidelity bug.
+        cached = self._cached_sigma_by_req.get(req_key)
+        if cached is not None:
+            return input_ids_out, cached.to(device=device, dtype=self._backbone_dtype), {}
+
+        # No cache yet. This should not happen at a real decode step (the prefill
+        # forward caches frame 0's Sigma before the first decode), but keep a safe
+        # fallback: the cb0-only embed of the scheduler-delivered token.
         cb0_token = input_ids_out.reshape(-1)[:1].to(torch.long)  # (1,)
-        # Build a (1, 32) frame with only cb0 set so the Sigma table contributes
-        # exactly the cb0 codebook-0 embedding for this token.
         cb0_frame = torch.zeros((1, self.num_codebooks), dtype=torch.long, device=device)
         cb0_frame[0, 0] = cb0_token[0]
         base = self._compose_frame_embed(cb0_frame)  # (1, hidden)
-
-        cached = self._cached_sigma_by_req.get(req_key)
-        if cached is not None:
-            base = base + cached.to(device=device, dtype=self._backbone_dtype)
         return input_ids_out, base, {}
 
     def preprocess_decode_batch(
