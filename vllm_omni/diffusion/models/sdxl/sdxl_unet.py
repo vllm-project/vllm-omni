@@ -609,6 +609,7 @@ def _build_sdxl_sp_plan() -> dict:
 
 class SDXLUNet2DConditionModel(nn.Module):
     _repeated_blocks = ["SDXLBasicTransformerBlock", "SDXLResnetBlock2D"]
+    _layerwise_offload_blocks_attrs = ["down_blocks", "up_blocks"]
     _sp_plan = _build_sdxl_sp_plan()
 
     @staticmethod
