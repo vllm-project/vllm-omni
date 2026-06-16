@@ -3,7 +3,7 @@
 """E2E online serving tests for IndexTTS2 via /v1/audio/speech endpoint.
 
 Two-stage pipeline: GPT AR → S2Mel + BigVGAN. Output is 22050 Hz mono WAV.
-Covers: basic TTS, streaming.
+Covers: basic TTS and the speech endpoint's stream=True compatibility path.
 """
 
 from __future__ import annotations
@@ -53,6 +53,7 @@ def test_basic_english(omni_server, openai_client) -> None:
         "stream": False,
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,
+        "min_audio_bytes": 1024,
     }
     openai_client.send_audio_speech_request(request_config)
 
@@ -61,10 +62,13 @@ def test_basic_english(omni_server, openai_client) -> None:
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_streaming(omni_server, openai_client) -> None:
     """
-    Streaming TTS: text + ref_audio, stream=True.
+    stream=True compatibility: IndexTTS2 itself is non-async-chunking, but the
+    OpenAI speech endpoint should still accept the streaming request path and
+    return a valid PCM response.
+
     Deploy Setting: default yaml
     Input Modal: text + reference audio
-    Output Modal: audio (22050 Hz, PCM stream)
+    Output Modal: audio (22050 Hz, PCM)
     Input Setting: stream=True
     """
     request_config = {
@@ -73,5 +77,6 @@ def test_streaming(omni_server, openai_client) -> None:
         "stream": True,
         "response_format": "pcm",
         "ref_audio": REF_AUDIO_URL,
+        "min_audio_bytes": 1024,
     }
     openai_client.send_audio_speech_request(request_config)

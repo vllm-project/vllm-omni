@@ -13,7 +13,7 @@ Examples:
         --emo-audio /path/to/happy.wav
 
 Server setup:
-    vllm serve IndexTeam/IndexTTS-2 --omni --host 0.0.0.0 --port 8000
+    vllm serve IndexTeam/IndexTTS-2 --omni --host 0.0.0.0 --port 8092
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import os
 
 import httpx
 
-DEFAULT_API_BASE = "http://localhost:8000"
+DEFAULT_API_BASE = "http://localhost:8092"
 DEFAULT_API_KEY = "sk-empty"
 
 
@@ -41,7 +41,7 @@ def encode_audio_to_base64(audio_path: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="IndexTTS2 OpenAI speech client")
     parser.add_argument("--text", type=str, required=True)
-    parser.add_argument("--ref-audio", type=str, required=True, help="Reference audio for voice cloning")
+    parser.add_argument("--ref-audio", type=str, default=None, help="Reference audio for voice cloning")
     parser.add_argument("--emo-audio", type=str, default=None, help="Emotion reference audio")
     parser.add_argument("--emo-text", type=str, default=None, help="Emotion description text")
     parser.add_argument(
@@ -55,18 +55,23 @@ def main() -> None:
     parser.add_argument("--use-emo-text", action="store_true", help="Infer emotion vector from emo-text or text")
     parser.add_argument("--use-random", action="store_true", help="Use random emotion prototypes")
     parser.add_argument("--model", type=str, default="IndexTeam/IndexTTS-2")
+    parser.add_argument("--voice", type=str, default=None, help="Uploaded voice name to use instead of --ref-audio")
     parser.add_argument("--output", type=str, default="output.wav")
     parser.add_argument("--api-base", type=str, default=DEFAULT_API_BASE)
     parser.add_argument("--api-key", type=str, default=DEFAULT_API_KEY)
     parser.add_argument("--response-format", type=str, default="wav")
     args = parser.parse_args()
 
+    if not args.ref_audio and not args.voice:
+        parser.error("IndexTTS2 requires --ref-audio or --voice for voice cloning")
+
     payload: dict = {
         "model": args.model,
         "input": args.text,
-        "voice": "default",
         "response_format": args.response_format,
     }
+    if args.voice:
+        payload["voice"] = args.voice
 
     if args.ref_audio:
         ref = args.ref_audio

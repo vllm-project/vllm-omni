@@ -24,7 +24,7 @@ _TTS_MAX_NEW_TOKENS_MAX = 4096
 _INDEXTTS2_EMOTION_KEYS = ("emo_audio", "emo_vector", "emo_alpha", "emo_text", "use_emo_text", "use_random")
 
 
-def _update_conditioning_hash(h: "hashlib._Hash", value: Any) -> None:
+def _update_conditioning_hash(h: hashlib._Hash, value: Any) -> None:
     """Hash request conditioning values without serializing huge repr strings."""
     if value is None:
         h.update(b"none")
@@ -78,7 +78,7 @@ def _first_conditioning_value(value: Any) -> Any:
 
 
 def indextts2_conditioning_cache_salt(
-    request: "OpenAICreateSpeechRequest",
+    request: OpenAICreateSpeechRequest,
     tts_params: dict[str, Any],
     *,
     request_id: str | None = None,
@@ -129,7 +129,7 @@ class IndexTTS2Adapter(ARTTSAdapter):
     stage_keys = frozenset({"indextts2_talker"})
     name = "indextts2"
 
-    def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
+    def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
         server = self.ctx.server
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
@@ -194,7 +194,7 @@ class IndexTTS2Adapter(ARTTSAdapter):
 
     async def build(
         self,
-        request: "OpenAICreateSpeechRequest",
+        request: OpenAICreateSpeechRequest,
         sampling_params_list: list,
         has_inline_ref_audio: bool,
     ) -> PreparedRequest:
@@ -215,7 +215,7 @@ class IndexTTS2Adapter(ARTTSAdapter):
         prompt["cache_salt"] = indextts2_conditioning_cache_salt(request, tts_params)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="indextts2")
 
-    async def _build_params(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
+    async def _build_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         server = self.ctx.server
         params: dict[str, Any] = {"text": [request.input]}
         voice_lower = request.voice.lower() if isinstance(request.voice, str) else None
