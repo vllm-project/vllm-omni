@@ -295,8 +295,6 @@ def main():
 
     # When --stream is set, print AR CoT text token-by-token in real time.
     # Otherwise, collect and print the full AR text once when stage 0 finishes.
-    printed_text: dict[str, str] = {}  # track cumulative printed text per request (streaming only)
-
     omni_outputs = omni.generate(
         prompts=formatted_prompts,
         sampling_params_list=params_list,
@@ -306,28 +304,20 @@ def main():
     img_idx = 0
     for req_output in omni_outputs:
         ro = getattr(req_output, "request_output", None)
-        req_id = getattr(req_output, "request_id", "")
         stage_id = getattr(req_output, "stage_id", None)
 
-        # Extract text from the output
-        txt = ""
-        if ro and getattr(ro, "outputs", None):
-            txt = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
-
-        if txt and stage_id == 0:
-            if args.stream:
-                # Stream-print AR text deltas as they arrive
-                prev = printed_text.get(req_id, "")
-                if txt.startswith(prev):
-                    delta = txt[len(prev) :]
-                else:
-                    delta = txt
-                if delta:
-                    print(delta, end="", flush=True)
-                    printed_text[req_id] = prev + delta
-            else:
-                # Non-streaming: print the full text once
-                print(txt, flush=True)
+        # AR stage text — each CompletionOutput.text is already a delta when
+        # output_kind=DELTA, so we can print it directly (matching the pattern
+        # in serving_chat.py).
+        if stage_id == 0 and ro and getattr(ro, "outputs", None):
+            for o in ro.outputs:
+                text = getattr(o, "text", "") or ""
+                if text:
+                    print(text, end="", flush=True)
+            # Non-streaming: one shot with full text — emit a trailing newline.
+            # Streaming: newline comes naturally via "\n" before image save below.
+            if not args.stream:
+                print(flush=True)
 
         # Collect images from diffusion stage
         images = getattr(req_output, "images", None)
