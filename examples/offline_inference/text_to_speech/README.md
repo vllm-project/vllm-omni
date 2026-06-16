@@ -95,6 +95,26 @@ Streaming is enabled by default via `async_chunk: true` in `vllm_omni/deploy/cos
 
 ---
 
+## CSM-1B
+
+2-stage TTS pipeline (Llama-3.2-1B backbone + Kyutai Mimi vocoder) at 24 kHz. Plain text to speech with single-speaker conditioning; no reference-audio voice cloning on this path.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/csm/end2end.py \
+    --text "The quick brown fox jumps over the lazy dog." \
+    --speaker 0 \
+    --output-dir ./output
+```
+
+### Notes
+- `sesame/csm-1b` is gated; accept its license on Hugging Face first.
+- Single default speaker; `--speaker` is a non-negative integer id.
+- `--max-new-tokens` caps frames (1 frame == 80 ms); the model also stops on its own end-of-speech frame.
+- Eager, no CUDA graph in this first pass.
+
+---
+
 ## GLM-TTS
 
 2-stage TTS pipeline (AR + DiT flow-matching) at 24 kHz. Every request requires reference audio and its transcript for zero-shot voice cloning.

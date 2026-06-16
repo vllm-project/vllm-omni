@@ -14,6 +14,7 @@ For the full list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
+| CSM-1B | `sesame/csm-1b` | — | — (async-chunk follow-up) | — | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | ✓ (`ref_audio` / `speaker_embedding`) | ✓ (PCM stream) | IP labels + structured `instructions` | — |
@@ -93,6 +94,34 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 24 kHz for the others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
+
+---
+
+## CSM-1B
+
+Plain text to speech (Llama-3.2-1B backbone + Kyutai Mimi vocoder) at 24 kHz, single default speaker. The OpenAI `voice` field maps to a CSM speaker id (a non-negative integer string, default `"0"`); no reference-audio voice cloning on this path.
+
+### Launch
+```bash
+vllm-omni serve sesame/csm-1b --deploy-config vllm_omni/deploy/csm.yaml --omni --trust-remote-code --port 8091
+# or:
+./csm/run_server.sh
+```
+
+### CLI client
+```bash
+cd examples/online_serving/text_to_speech/csm
+# Non-streaming WAV
+python speech_client.py --text "Hello from CSM." --output out.wav
+# Cap the length (frames; 1 frame == 80 ms)
+python speech_client.py --text "A longer line." --max-new-tokens 128
+```
+The client supports `--api-base`, `--model`, `--text`, `--voice`, `--response-format`, `--max-new-tokens`, `--seed`, `--stream`, and `--output`.
+
+### Notes
+- `sesame/csm-1b` is gated; accept its license on Hugging Face first.
+- `voice` is a CSM speaker id (non-negative integer string), default `"0"`.
+- `stream=true` currently returns the full clip after generation (no early time-to-first-audio); incremental async-chunk streaming is a follow-up.
 
 ---
 
