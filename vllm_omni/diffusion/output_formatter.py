@@ -75,11 +75,10 @@ def format_empty_diffusion_outputs(request: OmniDiffusionRequest) -> list[OmniRe
         OmniRequestOutput.from_diffusion(
             request_id=request.request_id,
             images=[],
-            prompt=prompt,
+            prompt=request.prompt,
             metrics={},
             latents=None,
         )
-        for prompt in request.prompts
     ]
 
 
@@ -115,24 +114,14 @@ def format_diffusion_outputs(
         model_cls = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
         audio_sample_rate = getattr(model_cls, "audio_sample_rate", None)
 
-    if len(request.prompts) == 1:
-        return _format_single_prompt_output(
-            request=request,
-            diffusion_output=diffusion_output,
-            outputs=outputs,
-            metrics=metrics,
-            postprocess_output=postprocess_output,
-            is_text_output=is_text_output,
-            is_audio_output=is_audio_output,
-            audio_sample_rate=audio_sample_rate,
-        )
-
-    return _format_multi_prompt_outputs(
+    return _format_single_prompt_output(
         request=request,
+        prompt=request.prompt,
         diffusion_output=diffusion_output,
         outputs=outputs,
         metrics=metrics,
         postprocess_output=postprocess_output,
+        is_text_output=is_text_output,
         is_audio_output=is_audio_output,
         audio_sample_rate=audio_sample_rate,
     )
@@ -178,6 +167,7 @@ def _build_multimodal_output(
 def _format_single_prompt_output(
     *,
     request: OmniDiffusionRequest,
+    prompt: Any,
     diffusion_output: DiffusionOutput,
     outputs: list[Any],
     metrics: dict[str, Any],
@@ -186,7 +176,6 @@ def _format_single_prompt_output(
     is_audio_output: bool,
     audio_sample_rate: int | None,
 ) -> list[OmniRequestOutput]:
-    prompt = request.prompts[0]
     request_id = request.request_id
     mm_output = _build_multimodal_output(postprocess_output, audio_sample_rate)
 
@@ -247,111 +236,3 @@ def _format_single_prompt_output(
             peak_memory_mb=diffusion_output.peak_memory_mb,
         ),
     ]
-
-
-def _format_multi_prompt_outputs(
-    *,
-    request: OmniDiffusionRequest,
-    diffusion_output: DiffusionOutput,
-    outputs: list[Any],
-    metrics: dict[str, Any],
-    postprocess_output: DiffusionPostprocessOutput,
-    is_audio_output: bool,
-    audio_sample_rate: int | None,
-) -> list[OmniRequestOutput]:
-    results = []
-    output_idx = 0
-    request_id = request.request_id
-
-    for prompt in request.prompts:
-        num_outputs = request.sampling_params.num_outputs_per_prompt
-        start_idx = output_idx
-        end_idx = start_idx + num_outputs
-        request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
-        output_idx = end_idx
-
-        if is_audio_output and not _has_non_audio_postprocess_payload(postprocess_output):
-            if postprocess_output.audio_payload is not None:
-                request_audio_payload = _slice_batch_payload(
-                    postprocess_output.audio_payload,
-                    start_idx,
-                    end_idx,
-                    num_outputs,
-                )
-            else:
-                request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
-            results.append(
-                OmniRequestOutput.from_diffusion(
-                    request_id=request_id,
-                    images=[],
-                    prompt=prompt,
-                    metrics=metrics,
-                    latents=diffusion_output.trajectory_latents,
-                    trajectory_latents=diffusion_output.trajectory_latents,
-                    trajectory_timesteps=diffusion_output.trajectory_timesteps,
-                    trajectory_log_probs=diffusion_output.trajectory_log_probs,
-                    trajectory_decoded=diffusion_output.trajectory_decoded,
-                    multimodal_output=_format_audio_multimodal_output(
-                        request_audio_payload,
-                        audio_sample_rate,
-                    ),
-                    final_output_type="audio",
-                    stage_durations=diffusion_output.stage_durations,
-                    peak_memory_mb=diffusion_output.peak_memory_mb,
-                ),
-            )
-            continue
-
-        mm_output: dict[str, Any] = {}
-        if postprocess_output.audio_payload is not None:
-            mm_output["audio"] = _slice_batch_payload(
-                postprocess_output.audio_payload,
-                start_idx,
-                end_idx,
-                num_outputs,
-            )
-        if audio_sample_rate is not None:
-            mm_output["audio_sample_rate"] = audio_sample_rate
-        if postprocess_output.fps is not None:
-            mm_output["fps"] = postprocess_output.fps
-        if postprocess_output.action_payload is not None:
-            mm_output["actions"] = _slice_batch_payload(
-                postprocess_output.action_payload,
-                start_idx,
-                end_idx,
-                num_outputs,
-            )
-
-        results.append(
-            OmniRequestOutput.from_diffusion(
-                request_id=request_id,
-                images=request_outputs,
-                prompt=prompt,
-                metrics=metrics,
-                latents=diffusion_output.trajectory_latents,
-                trajectory_latents=diffusion_output.trajectory_latents,
-                trajectory_timesteps=diffusion_output.trajectory_timesteps,
-                trajectory_log_probs=diffusion_output.trajectory_log_probs,
-                trajectory_decoded=diffusion_output.trajectory_decoded,
-                custom_output=postprocess_output.custom_output,
-                multimodal_output=mm_output,
-                stage_durations=diffusion_output.stage_durations,
-                peak_memory_mb=diffusion_output.peak_memory_mb,
-            ),
-        )
-
-    return results
-
-
-def _slice_batch_payload(payload: Any, start_idx: int, end_idx: int, num_outputs: int) -> Any:
-    sliced = payload
-    if isinstance(payload, (list, tuple)):
-        sliced = payload[start_idx:end_idx]
-        if len(sliced) == 1:
-            sliced = sliced[0]
-    elif hasattr(payload, "shape") and getattr(payload, "shape", None) is not None:
-        if len(payload.shape) > 0 and payload.shape[0] >= end_idx:
-            sliced = payload[start_idx:end_idx]
-            if num_outputs == 1:
-                sliced = sliced[0]
-    return sliced
