@@ -17,7 +17,7 @@ from typing import Any
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.cli.logo import log_logo
@@ -638,8 +638,9 @@ class OmniServeCommand(CLISubcommand):
         # Diffusion model mixed precision
         omni_config_group.add_argument(
             "--max-generated-image-size",
+            default=7680 * 4320,  # 8K resolution
             type=int,
-            help="The max size of generate image (height * width).",
+            help="Maximum generated image size in pixels (height * width).",
         )
 
         # TTS-specific parameters

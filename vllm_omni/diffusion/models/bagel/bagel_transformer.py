@@ -20,11 +20,11 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 from transformers.utils import ModelOutput
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization.base_config import (
@@ -45,8 +45,13 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sp_group,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.mot.mot_layernorm import MoTRMSNorm
+from vllm_omni.diffusion.layers.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
+from vllm_omni.diffusion.layers.mot.mot_row_parallel_linear import MoTRowParallelLinear
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
+
+logger = init_logger(__name__)
 
 
 def patchify(imgs, p):
@@ -203,6 +208,13 @@ class BagelRotaryEmbedding(nn.Module):
 
 
 class BagelMLP(nn.Module):
+    """FFN with Mixture-of-Tokens routing via MoT parallel linear layers.
+
+    gate_proj + up_proj are fused into a single MoTMergedColumnParallelLinear.
+    down_proj uses MoTRowParallelLinear.  Both layers hold text weights on self
+    and vae weights on self.gen_exp, routing by text_indices / vae_indices.
+    """
+
     def __init__(
         self,
         hidden_size: int,
@@ -212,29 +224,35 @@ class BagelMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+
+        self.intermediate_size = intermediate_size
+
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size, intermediate_size],
+            input_size=hidden_size,
+            output_sizes=[intermediate_size, intermediate_size],
             bias=False,
+            gather_output=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            input_is_parallel=True,
+            input_size=intermediate_size,
+            output_size=hidden_size,
             bias=False,
+            input_is_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported.")
-        self.act_fn = nn.SiLU()
+        self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = self.act_fn(gate) * up
+        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -328,12 +346,9 @@ class BaseNavitOutputWithPast(ModelOutput):
 class PackedAttentionMoT(nn.Module):
     """Packed attention with Mixture-of-Tokens routing for understanding/generation.
 
-    Uses vLLM's QKVParallelLinear and RowParallelLinear for tensor parallelism
-    support, following the same pattern as vLLM's Qwen2Attention.
-
-    The q/k/v projections are stacked into a single QKVParallelLinear:
-      - qkv_proj      : stacks q_proj + k_proj + v_proj  (understanding + gen text)
-      - qkv_proj_moe_gen : stacks q_proj_moe_gen + k_proj_moe_gen + v_proj_moe_gen (gen vae)
+    Uses MoTQKVParallelLinear and MoTRowParallelLinear for tensor parallelism.
+    Text and vae weights are held within the same MoT layer (text on self,
+    vae on self.gen_exp).  Token routing is driven by text_indices / vae_indices.
     """
 
     def __init__(
@@ -363,47 +378,26 @@ class PackedAttentionMoT(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
-        # Understanding mode projections (stacked q/k/v)
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = MoTQKVParallelLinear(
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=True,
+            vae_bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
+        self.o_proj = MoTRowParallelLinear(
+            input_size=self.total_num_heads * self.head_dim,
+            output_size=self.hidden_size,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
 
-        # Generation mode MoE projections (stacked q/k/v)
-        self.qkv_proj_moe_gen = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj_moe_gen",
-        )
-        self.o_proj_moe_gen = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj_moe_gen",
-        )
-
-        # QK normalization
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.q_norm_moe_gen = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm_moe_gen = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = MoTRMSNorm(self.head_dim, head_norm=True, eps=config.rms_norm_eps)
+        self.k_norm = MoTRMSNorm(self.head_dim, head_norm=True, eps=config.rms_norm_eps)
 
         self.rotary_op = RotaryEmbedding(is_neox_style=True)
 
@@ -455,51 +449,38 @@ class PackedAttentionMoT(nn.Module):
         Currently we shouldn't need it in the model, and it would be ideal to handle
         packing/batching etc in a more model agnostic way.
         """
+        text_indices = packed_text_indexes
+        vae_indices = packed_vae_token_indexes
+
         packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
-        packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-        packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
 
-        # Project text tokens through base qkv
-        text_qkv, _ = self.qkv_proj(packed_text_query_sequence)
-        text_q, text_k, text_v = text_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        # Project vae tokens through moe_gen qkv
-        vae_qkv, _ = self.qkv_proj_moe_gen(packed_vae_query_sequence)
-        vae_q, vae_k, vae_v = vae_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # MoT QKV projection routes text/vae tokens to the matching weights.
+        qkv, _ = self.qkv_proj(packed_query_sequence, text_indices, vae_indices)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Reshape to (tokens, heads, head_dim)
-        text_q = text_q.view(-1, self.num_heads, self.head_dim)
-        text_k = text_k.view(-1, self.num_kv_heads, self.head_dim)
-        text_v = text_v.view(-1, self.num_kv_heads, self.head_dim)
-        vae_q = vae_q.view(-1, self.num_heads, self.head_dim)
-        vae_k = vae_k.view(-1, self.num_kv_heads, self.head_dim)
-        vae_v = vae_v.view(-1, self.num_kv_heads, self.head_dim)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-        # Apply QK norms
-        text_q = self.q_norm(text_q.to(torch.float32))
-        text_k = self.k_norm(text_k.to(torch.float32))
-        vae_q = self.q_norm_moe_gen(vae_q.to(torch.float32))
-        vae_k = self.k_norm_moe_gen(vae_k.to(torch.float32))
+        # MoT QK norms route text/vae tokens to weight/gen_weight internally.
+        q = self.q_norm(q.to(torch.float32), text_indices, vae_indices)
+        k = self.k_norm(k.to(torch.float32), text_indices, vae_indices)
 
-        # Apply RoPE - need to build per-token cos/sin for text and vae separately
-        # packed_query_position_embeddings are ordered as the packed sequence
-        cos_full, sin_full = [x[..., : self.head_dim // 2] for x in packed_query_position_embeddings]
-        text_cos = cos_full[packed_text_indexes]
-        text_sin = sin_full[packed_text_indexes]
-        vae_cos = cos_full[packed_vae_token_indexes]
-        vae_sin = sin_full[packed_vae_token_indexes]
+        cos, sin = [x[..., : self.head_dim // 2] for x in packed_query_position_embeddings]
+        q = self.rotary_op(q.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
+        k = self.rotary_op(k.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
 
-        text_q = self.rotary_op(text_q.to(text_cos.dtype).unsqueeze(0), text_cos, text_sin).squeeze(0)
-        text_k = self.rotary_op(text_k.to(text_cos.dtype).unsqueeze(0), text_cos, text_sin).squeeze(0)
-        vae_q = self.rotary_op(vae_q.to(vae_cos.dtype).unsqueeze(0), vae_cos, vae_sin).squeeze(0)
-        vae_k = self.rotary_op(vae_k.to(vae_cos.dtype).unsqueeze(0), vae_cos, vae_sin).squeeze(0)
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
 
-        text_q = text_q.to(torch.bfloat16)
-        text_k = text_k.to(torch.bfloat16)
-        text_v = text_v.to(torch.bfloat16)
-        vae_q = vae_q.to(torch.bfloat16)
-        vae_k = vae_k.to(torch.bfloat16)
-        vae_v = vae_v.to(torch.bfloat16)
+        text_q = q[text_indices]
+        text_k = k[text_indices]
+        text_v = v[text_indices]
+        vae_q = q[vae_indices]
+        vae_k = k[vae_indices]
+        vae_v = v[vae_indices]
 
         # Build joint K/V: [kv_cache, text_markers] (replicated across SP ranks)
         if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
@@ -537,9 +518,13 @@ class PackedAttentionMoT(nn.Module):
         text_attn = attn_out[:text_len].reshape(text_len, self.q_size)
         vae_attn = attn_out[text_len:].reshape(-1, self.q_size)
 
-        # Apply output projections
-        text_out, _ = self.o_proj(text_attn)
-        vae_out, _ = self.o_proj_moe_gen(vae_attn)
+        # MoT output projection over local [text, vae] order.
+        local_packed = torch.cat([text_attn, vae_attn], dim=0)
+        local_text_idx = torch.arange(text_len, device=local_packed.device)
+        local_vae_idx = torch.arange(text_len, text_len + vae_attn.shape[0], device=local_packed.device)
+        local_out, _ = self.o_proj(local_packed, local_text_idx, local_vae_idx)
+        text_out = local_out[:text_len]
+        vae_out = local_out[text_len:]
 
         # Merge back into packed format
         total_len = packed_query_sequence.shape[0]
@@ -702,11 +687,14 @@ class Qwen2MoTDecoderLayer(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
         self.self_attn = attn_module(
             config, layer_idx, parallel_config=parallel_config, quant_config=quant_config, prefix=f"{prefix}.self_attn"
         )
+
+        self.input_layernorm = MoTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.mlp = BagelMLP(
             config.hidden_size,
@@ -722,10 +710,8 @@ class Qwen2MoTDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp_moe_gen",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.post_attention_layernorm = MoTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -743,18 +729,12 @@ class Qwen2MoTDecoderLayer(nn.Module):
     ) -> BaseNavitOutputWithPast:
         if packed_query_sequence is None:
             packed_query_sequence = hidden_states
+
+        text_indices = packed_text_indexes if mode == "gen" else None
+        vae_indices = packed_vae_token_indexes if mode == "gen" else None
+
         residual = packed_query_sequence
-        if mode == "und":
-            packed_query_sequence = self.input_layernorm(packed_query_sequence)
-        elif mode == "gen":
-            packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
-            packed_query_sequence_[packed_text_indexes] = self.input_layernorm(
-                packed_query_sequence[packed_text_indexes]
-            )
-            packed_query_sequence_[packed_vae_token_indexes] = self.input_layernorm_moe_gen(
-                packed_query_sequence[packed_vae_token_indexes]
-            )
-            packed_query_sequence = packed_query_sequence_
+        packed_query_sequence = self.input_layernorm(packed_query_sequence, text_indices, vae_indices)
 
         # Self Attention
         packed_query_sequence, past_key_values = self.self_attn(
@@ -776,13 +756,11 @@ class Qwen2MoTDecoderLayer(nn.Module):
             packed_query_sequence = self.post_attention_layernorm(packed_query_sequence)
             packed_query_sequence = self.mlp(packed_query_sequence)
         elif mode == "gen":
-            packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-            packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
-            packed_text_query_sequence = self.post_attention_layernorm(packed_text_query_sequence).to(torch.bfloat16)
-            packed_vae_query_sequence = self.post_attention_layernorm_moe_gen(packed_vae_query_sequence).to(
+            packed_normed = self.post_attention_layernorm(packed_query_sequence, text_indices, vae_indices).to(
                 torch.bfloat16
             )
-
+            packed_text_query_sequence = packed_normed[packed_text_indexes]
+            packed_vae_query_sequence = packed_normed[packed_vae_token_indexes]
             packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
             packed_query_sequence_[packed_text_indexes] = self.mlp(packed_text_query_sequence)
             packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence)
@@ -829,9 +807,7 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
             ]
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if self.use_moe:
-            self.norm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = MoTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = BagelRotaryEmbedding(config=config)
 
         # Initialize weights and apply final processing
@@ -895,18 +871,9 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
                 **extra_inputs,
             )
 
-        if self.use_moe:
-            if mode == "und":
-                packed_query_sequence = self.norm(packed_query_sequence)
-            elif mode == "gen":
-                packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
-                packed_query_sequence_[packed_text_indexes] = self.norm(packed_query_sequence[packed_text_indexes])
-                packed_query_sequence_[packed_vae_token_indexes] = self.norm_moe_gen(
-                    packed_query_sequence[packed_vae_token_indexes]
-                )
-                packed_query_sequence = packed_query_sequence_
-        else:
-            packed_query_sequence = self.norm(packed_query_sequence)
+        text_indices = packed_text_indexes if self.use_moe and mode == "gen" else None
+        vae_indices = packed_vae_token_indexes if self.use_moe and mode == "gen" else None
+        packed_query_sequence = self.norm(packed_query_sequence, text_indices, vae_indices)
 
         return BaseNavitOutputWithPast(
             packed_query_sequence=packed_query_sequence,
@@ -983,57 +950,87 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
         return outputs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights for vLLM parallel layers.
+        """Load weights for MoT parallel layers.
 
-        Handles stacked parameter remapping for QKVParallelLinear:
-          - q_proj, k_proj, v_proj -> qkv_proj (shard ids: q, k, v)
-          - q_proj_moe_gen, k_proj_moe_gen, v_proj_moe_gen -> qkv_proj_moe_gen
-        Other parallel layers (gate_proj, up_proj, down_proj, embed_tokens, etc.)
-        keep HF checkpoint names and use weight_loader for TP sharding.
+        Stacked parameter remapping (checkpoint name → model parameter):
+          - q/k/v_proj       → qkv_proj          (text, shard q/k/v)
+          - q/k/v_proj_moe_gen → qkv_proj.gen_exp (gen,  shard q/k/v)
+
+        Direct remapping (no shard dimension):
+          - o_proj_moe_gen   → o_proj.gen_exp
+          - {norm}_moe_gen.weight → {norm}.gen_weight  (all MoTRMSNorm layers)
+
+        Text norm weights (input_layernorm.weight, q_norm.weight, etc.) and
+        other names (embed_tokens, lm_head) pass through unchanged.
         """
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            # More specific _moe_gen patterns FIRST to avoid substring
-            # ambiguity (`.q_proj` is a substring of `.q_proj_moe_gen`).
-            (".qkv_proj_moe_gen", ".q_proj_moe_gen", "q"),
-            (".qkv_proj_moe_gen", ".k_proj_moe_gen", "k"),
-            (".qkv_proj_moe_gen", ".v_proj_moe_gen", "v"),
+            # (param_name, weight_name, shard_id)
+            # _moe_gen patterns MUST come first — `.q_proj` is a substring
+            # of `.q_proj_moe_gen`, so the more specific pattern must match first.
+            (".qkv_proj.gen_exp", ".q_proj_moe_gen", "q"),
+            (".qkv_proj.gen_exp", ".k_proj_moe_gen", "k"),
+            (".qkv_proj.gen_exp", ".v_proj_moe_gen", "v"),
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            # MLP gate/up projections — fused into MergedColumnParallelLinear.
-            # HF checkpoints store separate gate_proj / up_proj weights;
-            # these entries remap them to the fused gate_up_proj parameter.
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
+            (".mlp_moe_gen.gate_up_proj", ".mlp_moe_gen.gate_proj", 0),
+            (".mlp_moe_gen.gate_up_proj", ".mlp_moe_gen.up_proj", 1),
+            (".mlp.gate_up_proj", ".mlp.gate_proj", 0),
+            (".mlp.gate_up_proj", ".mlp.up_proj", 1),
         ]
-        self.stacked_params_mapping = stacked_params_mapping
+
+        direct_remap = [
+            (".o_proj_moe_gen.", ".o_proj.gen_exp."),
+            # Norm _moe_gen.weight → {norm_name}.gen_weight
+            (".input_layernorm_moe_gen.", ".input_layernorm.gen_"),
+            (".post_attention_layernorm_moe_gen.", ".post_attention_layernorm.gen_"),
+            (".q_norm_moe_gen.", ".q_norm.gen_"),
+            (".k_norm_moe_gen.", ".k_norm.gen_"),
+            (".norm_moe_gen.", ".norm.gen_"),
+        ]
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
+        def handle_weight(name, loaded_weight, shard_id=None):
+            param = params_dict.get(name)
+            if param is None:
+                logger.warning_once("Skipping weight %r: no matching parameter found in model.", name)
+                return
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if shard_id is not None:
+                weight_loader(param, loaded_weight, shard_id)
+            else:
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
         for name, loaded_weight in weights:
-            loaded = False
+            # match direct remap
+            handled = False
+            for old_substr, new_substr in direct_remap:
+                if old_substr in name:
+                    name = name.replace(old_substr, new_substr)
+                    handle_weight(name, loaded_weight)
+                    handled = True
+                    break
+
+            if handled:
+                continue
+
+            # match stacked params mapping
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                stacked_name = name.replace(weight_name, param_name)
-                param = params_dict.get(stacked_name)
-                if param is None:
-                    break
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                name = stacked_name
-                loaded = True
+                name = name.replace(weight_name, param_name)
+                handle_weight(name, loaded_weight, shard_id)
+                handled = True
                 break
 
-            if not loaded:
-                param = params_dict.get(name)
-                if param is None:
-                    continue
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+            if handled:
+                continue
 
-            loaded_params.add(name)
+            # no-name-match cases are handled here
+            handle_weight(name, loaded_weight)
 
         return loaded_params
 

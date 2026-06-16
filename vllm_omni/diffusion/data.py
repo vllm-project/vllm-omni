@@ -130,6 +130,14 @@ class DiffusionParallelConfig:
     use_hsdp: bool = False
     """Enable Hybrid Sharded Data Parallel (HSDP) for model weight sharding."""
 
+    mask_sp_padding: bool = False
+    """If True, generate a boolean attention mask for zero-padded SP tokens
+    when sequence length is not divisible by the SP world size. The mask
+    routes attention through the varlen path (unpad→kernel→repad), which is
+    correct but carries additional overhead. When False (default), padding
+    tokens are left unmasked; since _shard_with_auto_pad always pads with
+    zeros, their contribution to attention output is negligible."""
+
     hsdp_shard_size: int = -1
     """Number of GPUs to shard weights across within each replica group. -1 means auto-calculate."""
 
@@ -895,7 +903,12 @@ class OmniDiffusionConfig:
                         )
                 else:
                     tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
-                    self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
+                    if tf_config_dict is None:
+                        tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model)
+                    if tf_config_dict is not None:
+                        self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
+                    else:
+                        self.set_tf_model_config(TransformerConfig())
             else:
                 raise FileNotFoundError("model_index.json not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):

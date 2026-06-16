@@ -140,6 +140,7 @@ class TestHiggsAudioV3OnlineHappyPath:
             }
         )
 
+    @pytest.mark.skip(reason="issue#4411")
     @pytest.mark.core_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)

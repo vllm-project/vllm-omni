@@ -218,6 +218,8 @@ def spawn_stage_core(
     vllm_config: VllmConfig,
     executor_class: type[Executor],
     log_stats: bool = False,
+    omni_stage_id: int | None = None,
+    omni_replica_id: int = 0,
 ) -> tuple[EngineZmqAddresses, BaseProcess, str]:
     """Spawn a *StageEngineCoreProc* subprocess without performing the handshake.
 
@@ -241,6 +243,8 @@ def spawn_stage_core(
             "log_stats": log_stats,
             "dp_rank": 0,
             "local_dp_rank": 0,
+            "omni_stage_id": omni_stage_id,
+            "omni_replica_id": omni_replica_id,
         },
     )
     proc.start()

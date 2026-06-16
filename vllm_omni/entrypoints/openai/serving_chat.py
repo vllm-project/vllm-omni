@@ -23,7 +23,7 @@ from vllm.entrypoints.chat_utils import (
     make_tool_call_id,
 )
 
-from vllm_omni.diffusion.diffusion_engine import get_extra_body_params, get_extra_output_params
+from vllm_omni.diffusion.io_support import get_extra_body_params, get_extra_output_params
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
@@ -69,8 +69,8 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     parse_chat_output,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
-from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
-from vllm.entrypoints.utils import should_include_usage
+from vllm.entrypoints.serve.utils.api_utils import should_include_usage
+from vllm.entrypoints.serve.utils.tool_calls_utils import maybe_filter_parallel_tool_calls
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
@@ -842,6 +842,27 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         for key, value in kwargs.items():
             if value is not None and hasattr(obj, key):
                 setattr(obj, key, value)
+
+    def _should_check_for_unstreamed_tool_arg_tokens(
+        self,
+        delta_message: Any,
+        output: Any,
+    ) -> bool:
+        """Check whether the streaming generator should flush unstreamed
+        tool-arg tokens at finish-time.
+
+        This method was moved from OpenAIServingChat to the tool-parser layer
+        by upstream commit 9affc17a05.  Omni's independently-maintained
+        ``chat_completion_stream_generator`` still calls it, so we keep a
+        local copy with the pre-9affc17a05 semantics.
+        """
+        return (
+            output.finish_reason is not None
+            and self.enable_auto_tools
+            and self.tool_parser is not None
+            and delta_message is not None
+            and delta_message.tool_calls
+        )
 
     def _build_sampling_params_list_from_request(
         self,
@@ -2773,6 +2794,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         stage_durations = result.stage_durations
         peak_memory_mb = result.peak_memory_mb
         cot_output = None
+
+        req_out = getattr(result, "request_output", None)
+        if req_out:
+            prompt_obj = getattr(req_out, "prompt", None)
+            if isinstance(prompt_obj, dict):
+                extra = prompt_obj.get("extra", {})
+                if isinstance(extra, dict):
+                    ar_text = extra.get("ar_generated_text")
+                    if isinstance(ar_text, str) and ar_text.strip():
+                        cot_output = ar_text
 
         req_out = getattr(result, "request_output", None)
         if req_out:

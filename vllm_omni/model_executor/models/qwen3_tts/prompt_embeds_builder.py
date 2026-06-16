@@ -903,12 +903,12 @@ class Qwen3TTSPromptEmbedsBuilder:
 
             * ``talker_prompt``: ``[prompt_len, hidden]`` prefill embedding.
             * ``trailing_text_hidden``: ``[T, hidden]`` queue of text-side
-                embeddings consumed one-per-decode-step (streaming mode) or a
-                single pad row (non-streaming).
+                    embeddings consumed one-per-decode-step (streaming mode)
+                    or a single pad row (non-streaming).
             * ``ref_code_len``: Number of ref codec frames consumed when the
-                Base task ran in in-context mode (``None`` otherwise).
+                    Base task ran in in-context mode (``None`` otherwise).
             * ``ref_code``: The ``[T, Q]`` ref codec tensor used for ICL
-                (``None`` outside Base / ICL).
+                    (``None`` outside Base / ICL).
         """
         config = self._config
         talker_config = self._talker_config
