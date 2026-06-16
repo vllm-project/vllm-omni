@@ -53,6 +53,7 @@ def resolve_adapter(model_type: str | None) -> type[TTSModelAdapter] | None:
 from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     cosyvoice3,
     covo_audio,
+    csm,
     fish_speech,
     glm_tts,
     higgs_audio_v2,
