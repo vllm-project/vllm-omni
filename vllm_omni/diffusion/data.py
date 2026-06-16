@@ -610,6 +610,12 @@ class OmniDiffusionConfig:
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = 32
 
+    # Opt-in: route per-session world-model state through the shared
+    # SessionMemoryManager (RFC #4480) instead of the model's bespoke cache.
+    # Default off; the bespoke path remains the default. Can also be toggled via
+    # the OMNI_DIFFUSION_SESSION_MEMORY_MANAGER environment variable.
+    enable_session_memory_manager: bool = False
+
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
