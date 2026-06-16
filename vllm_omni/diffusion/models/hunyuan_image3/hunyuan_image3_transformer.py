@@ -27,7 +27,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from transformers.modeling_utils import PreTrainedModel
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
@@ -1563,6 +1563,7 @@ class HunYuanSparseMoeBlock(nn.Module):
         else:
             self.shared_mlp = None
 
+        enable_expert_parallel = get_current_vllm_config().parallel_config.enable_expert_parallel
         self.experts = HunyuanFusedMoE(
             shared_experts=self.shared_mlp,
             num_experts=self.n_routed_experts,
@@ -1574,6 +1575,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
+            pcp_size=None if enable_expert_parallel else 1,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
