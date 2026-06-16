@@ -1580,6 +1580,8 @@ class OpenAIClientHandler:
             extra_body["mm_processor_kwargs"] = mm
         if "sampling_params_list" in request_config:
             extra_body["sampling_params_list"] = request_config["sampling_params_list"]
+        if request_config.get("extra_body"):
+            extra_body.update(request_config["extra_body"])
 
         create_kwargs: dict[str, Any] = {
             "model": request_config.get("model"),

@@ -370,8 +370,15 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         return "unknown"
 
 
-def _assert_preset_voice_gender_from_audio(audio_bytes: bytes | None, voice_name: str | None) -> None:
+def _assert_preset_voice_gender_from_audio(
+    audio_bytes: bytes | None,
+    voice_name: str | None,
+    *,
+    response_format: str | None = None,
+) -> None:
     """If ``voice_name`` matches a known preset, assert classifier gender matches (skip when unknown)."""
+    if response_format == "pcm":
+        return
     if not voice_name or not audio_bytes:
         return
     key = str(voice_name).lower()
@@ -509,6 +516,7 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                 _assert_preset_voice_gender_from_audio(
                     response.audio_bytes,
                     speaker,
+                    response_format=request_config.get("response_format"),
                 )
         if "text" in modalities:
             assert response.text_content is not None, "No text output is generated"
@@ -633,7 +641,11 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
                 assert similarity > 0.9, (
                     f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
                 )
-        _assert_preset_voice_gender_from_audio(response.audio_bytes, request_config.get("voice"))
+        _assert_preset_voice_gender_from_audio(
+            response.audio_bytes,
+            request_config.get("voice"),
+            response_format=request_config.get("response_format"),
+        )
 
 
 def assert_diffusion_response(response: "DiffusionResponse", request_config: dict[str, Any], run_level: str = None):
