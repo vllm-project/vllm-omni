@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -180,6 +181,48 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
     assert events == ["accumulate:r1", "accumulate:r2", "connector"]
 
 
+def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatch):
+    runner = _make_async_output_runner(engine_output_type="latent")
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("latent", ["r2"]),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=6,
+            num_scheduled_tokens={"r1": 1, "r2": 2, "r3": 3},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0], [6.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={},
+        req_ids_output_copy=["r1", "r2", "r3"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1, "r3": 2},
+        valid_sampled_token_ids=[[], [], []],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        seq_len=6,
+        num_scheduled_tokens_np=np.array([1, 2, 3], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 3], dtype=torch.long),
+    )
+
+    assert output.multimodal_outputs is not None
+    assert output.multimodal_outputs[0] == {}
+    assert torch.equal(output.multimodal_outputs[1]["hidden"], torch.tensor([[2.0], [3.0]]))
+    assert output.multimodal_outputs[2] == {}
+
+
 def test_process_additional_information_uses_snapshot_request_order(monkeypatch):
     runner = _make_async_output_runner()
     seen = []
@@ -246,6 +289,67 @@ def test_async_omni_output_guard_requires_safe_conditions():
     runner.omni_prefix_cache = None
     runner.model.has_postprocess = True
     assert not GPUARModelRunner._should_use_async_omni_output(runner)
+
+    runner.model.eager_omni_postprocess_before_async_output = True
+    assert GPUARModelRunner._should_use_async_omni_output(runner)
+
+
+def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner.model.omni_pooler_payload_include_hidden = False
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("latent", req_ids),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=2,
+            num_scheduled_tokens={"r1": 2},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"codes": {"audio": torch.tensor([[7, 8], [9, 10]], dtype=torch.long)}},
+        req_ids_output_copy=["r1"],
+        req_id_to_index_output_copy={"r1": 0},
+        valid_sampled_token_ids=[[101]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        seq_len=2,
+        num_scheduled_tokens_np=np.array([2], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0], dtype=torch.long),
+    )
+
+    assert output.multimodal_outputs is not None
+    assert len(output.multimodal_outputs) == 1
+    assert "hidden" not in output.multimodal_outputs[0]
+    assert torch.equal(output.multimodal_outputs[0]["codes.audio"], torch.tensor([[7, 8], [9, 10]], dtype=torch.long))
+
+
+def test_async_snapshot_payload_omits_hidden_when_model_opts_out():
+    runner = _make_async_output_runner()
+    runner.model.omni_pooler_payload_include_hidden = False
+
+    payload = GPUARModelRunner._build_omni_async_snapshot_payload(
+        runner,
+        hidden_states=torch.tensor([[1.0], [2.0]]),
+        staged_hidden_states_cpu=torch.tensor([[3.0]]),
+        multimodal_outputs={"codes": {"audio": torch.tensor([[1]], dtype=torch.long)}},
+    )
+
+    assert set(payload.keys()) == {"multimodal_outputs"}
+    assert payload["multimodal_outputs"]["codes"]["audio"].tolist() == [[1]]
 
 
 @pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])
