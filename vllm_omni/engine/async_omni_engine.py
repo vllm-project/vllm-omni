@@ -921,6 +921,8 @@ class AsyncOmniEngine:
                                         vllm_config=vllm_config,
                                         executor_class=executor_class,
                                         log_stats=self._log_stats,
+                                        omni_stage_id=plan.metadata.stage_id,
+                                        omni_replica_id=plan.replica_id,
                                     )
                                 logger.info(
                                     "[AsyncOmniEngine] Stage %s engine launch started",
