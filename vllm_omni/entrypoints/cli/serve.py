@@ -638,8 +638,9 @@ class OmniServeCommand(CLISubcommand):
         # Diffusion model mixed precision
         omni_config_group.add_argument(
             "--max-generated-image-size",
+            default=7680 * 4320,  # 8K resolution
             type=int,
-            help="The max size of generate image (height * width).",
+            help="Maximum generated image size in pixels (height * width).",
         )
 
         # TTS-specific parameters
