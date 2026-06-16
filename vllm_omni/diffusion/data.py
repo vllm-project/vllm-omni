@@ -1157,7 +1157,15 @@ class OmniDiffusionConfig:
         valid_fields = {f.name for f in fields(cls)}
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
 
-        return cls(**filtered_kwargs)
+        instance = cls(**filtered_kwargs)
+        # Route per-model engines after model_class_name is finalized. This covers
+        # the explicit-model_class_name path (e.g. deploy configs) that the
+        # __post_init__ auto-detect branch does not reach.
+        if instance.engine_backend == "default":
+            backend = default_engine_backend_for_model(instance.model_class_name)
+            if backend is not None:
+                instance.engine_backend = backend
+        return instance
 
 
 @dataclass
