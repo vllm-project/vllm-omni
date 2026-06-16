@@ -15,6 +15,7 @@ list of supported architectures across all modalities, see
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
 |---|---|---|---|---|---|---|
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
+| CSM-1B | `sesame/csm-1b` | 2 (backbone + Mimi) | — | — | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
 | GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
 | Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | 2 (AR + audio VAE) | ✓ | ✓ | style / IP / dialect / TTA / podcast | 44.1 kHz |
