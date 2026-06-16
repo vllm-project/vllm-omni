@@ -807,14 +807,20 @@ class OmniStreamingVideoHandler:
         audio_data,
         chunks_drained: int,
     ) -> tuple[str | None, int]:
-        """Emit only tensors appended since the last call."""
-        # Single tensor: output_processor hands us one tensor before it becomes a
-        # list (see output_processor.py:89). Treat it as chunk #0.
+        # In DELTA mode the output processor pops the modality key after
+        # every emit (output_processor.py: _new_completion_output), so the
+        # single-tensor form is what we see on every step — not just the
+        # first one. We must encode every call and let chunks_drained grow
+        # monotonically; the previous `chunks_drained >= 1` guard caused
+        # all chunks after the first to be silently dropped.
         if not isinstance(audio_data, list):
-            if chunks_drained >= 1:
-                return None, chunks_drained
             tail_np = cls._tensor_to_1d_np(audio_data)
-            return cls._encode_tail(tail_np, chunks_drained, new_drained=1, is_first=True)
+            return cls._encode_tail(
+                tail_np,
+                chunks_drained,
+                new_drained=chunks_drained + 1,
+                is_first=(chunks_drained == 0),
+            )
 
         n = len(audio_data)
         if n <= chunks_drained:
@@ -832,14 +838,24 @@ class OmniStreamingVideoHandler:
         chunks_drained: int,
     ) -> tuple[str | None, int]:
         """Pre-fix behaviour: concat everything each call and slice on CPU."""
-        if isinstance(audio_data, list):
-            if not audio_data:
+        # In DELTA mode the output processor pops the modality key after
+        # every emit, so audio_data is a *single fresh tensor* on every step.
+        # Encode the entire tensor unconditionally and advance chunks_drained.
+        if not isinstance(audio_data, list):
+            full_np = cls._tensor_to_1d_np(audio_data)
+            if full_np is None:
                 return None, chunks_drained
-            audio_tensor = torch.cat(audio_data, dim=-1)
-            new_drained = len(audio_data)
-        else:
-            audio_tensor = audio_data
-            new_drained = 1
+            return cls._encode_tail(
+                full_np,
+                chunks_drained,
+                new_drained=chunks_drained + 1,
+                is_first=(chunks_drained == 0),
+            )
+
+        if not audio_data:
+            return None, chunks_drained
+        audio_tensor = torch.cat(audio_data, dim=-1)
+        new_drained = len(audio_data)
 
         full_np = cls._tensor_to_1d_np(audio_tensor)
         if full_np is None:
@@ -855,7 +871,7 @@ class OmniStreamingVideoHandler:
             # Recover prefix length by re-concatenating the already-drained
             # prefix tensors (cost intentionally identical to the baseline
             # implementation this was lifted from).
-            if isinstance(audio_data, list) and chunks_drained < len(audio_data):
+            if chunks_drained < len(audio_data):
                 prefix_len = sum(int(t.shape[-1]) for t in audio_data[:chunks_drained])
                 tail_np = full_np[prefix_len:]
             else:

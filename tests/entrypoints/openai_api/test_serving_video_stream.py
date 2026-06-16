@@ -12,10 +12,12 @@ import threading
 from typing import Any
 
 import pytest
+import torch
 from PIL import Image
 
 from vllm_omni.entrypoints.openai import serving_video_stream, video_stream_envs
 from vllm_omni.entrypoints.openai.serving_video_stream import (
+    _CODEC_FRAME_SAMPLES,
     OmniStreamingVideoHandler,
     StreamingVideoSessionConfig,
 )
@@ -648,3 +650,77 @@ def test_build_messages_keeps_recent_history_text_only():
     assert messages[1] == {"role": "assistant", "content": "recent answer"}
     assert messages[2] == user_message
     assert user_message["content"][-1] == {"type": "text", "text": "current question"}
+
+
+# ---------------------------------------------------------------------------
+# Regression: audio delta truncation under DELTA mode.
+#
+# In DELTA mode the MultimodalOutputProcessor pops mm_accumulated["audio"]
+# on every emit, so OmniRequestOutput.audio_data is a *single fresh tensor*
+# every step, not a growing list. The pre-fix _delta_fast had a
+# `if chunks_drained >= 1: return None` sentinel carried over from
+# CUMULATIVE-mode logic, which silently dropped every audio chunk after
+# the first. These tests pin _delta_fast's single-tensor branch.
+# ---------------------------------------------------------------------------
+
+
+def _fake_delta_tensor(num_samples: int) -> torch.Tensor:
+    """One step's worth of audio samples, shaped like talker output."""
+    return torch.linspace(-0.5, 0.5, steps=num_samples, dtype=torch.float32)
+
+
+def test_delta_fast_emits_every_call_under_delta_mode(monkeypatch):
+    """Multi-step assertion that DELTA-mode single-tensor branch emits b64
+    on every call — the exact truncation this PR fixes."""
+    monkeypatch.setenv("VLLM_VIDEO_AUDIO_DELTA_MODE", "fast")
+
+    # Enough samples so the first-call head-transient strip leaves a
+    # non-empty tail (_encode_tail strips _CODEC_FRAME_SAMPLES when
+    # len(tail) > 2 * _CODEC_FRAME_SAMPLES).
+    sample_count = _CODEC_FRAME_SAMPLES * 4
+
+    chunks_drained = 0
+    emitted_b64: list[str] = []
+    for step in range(5):
+        # DELTA mode: each step we get a fresh single tensor, not a list.
+        result = _audio_result(_fake_delta_tensor(sample_count))
+        b64, chunks_drained = OmniStreamingVideoHandler._extract_audio_delta_b64(result, chunks_drained)
+        assert b64 is not None, f"step={step} produced None (truncation bug)"
+        assert isinstance(b64, str) and b64, f"step={step} produced empty b64"
+        emitted_b64.append(b64)
+
+    # Counter advances monotonically, one per call.
+    assert chunks_drained == 5
+
+    # First call strips _CODEC_FRAME_SAMPLES of head transient, so its
+    # encoded payload is strictly shorter than subsequent ones.
+    assert len(emitted_b64[0]) < len(emitted_b64[1]), (
+        "first call should emit a shorter chunk due to head-transient strip"
+    )
+    # Same input size after the first call → identical encoded length.
+    assert len({len(b) for b in emitted_b64[1:]}) == 1, "post-first-call chunks should have identical encoded length"
+
+
+def test_delta_slow_emits_every_call_under_delta_mode(monkeypatch):
+    """Multi-step assertion that DELTA-mode single-tensor branch in _delta_slow
+    emits b64 on every call — mirrors the _delta_fast regression test."""
+    monkeypatch.setenv("VLLM_VIDEO_AUDIO_DELTA_MODE", "slow")
+
+    sample_count = _CODEC_FRAME_SAMPLES * 4
+
+    chunks_drained = 0
+    emitted_b64: list[str] = []
+    for step in range(5):
+        result = _audio_result(_fake_delta_tensor(sample_count))
+        b64, chunks_drained = OmniStreamingVideoHandler._extract_audio_delta_b64(result, chunks_drained)
+        assert b64 is not None, f"step={step} produced None (truncation bug)"
+        assert isinstance(b64, str) and b64, f"step={step} produced empty b64"
+        emitted_b64.append(b64)
+
+    assert chunks_drained == 5
+
+    # First call strips _CODEC_FRAME_SAMPLES of head transient
+    assert len(emitted_b64[0]) < len(emitted_b64[1]), (
+        "first call should emit a shorter chunk due to head-transient strip"
+    )
+    assert len({len(b) for b in emitted_b64[1:]}) == 1, "post-first-call chunks should have identical encoded length"
