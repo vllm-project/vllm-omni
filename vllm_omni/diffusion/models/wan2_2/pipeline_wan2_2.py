@@ -22,9 +22,11 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.metrics.perf import WanDiTForwardStats
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -413,6 +415,7 @@ class Wan22Pipeline(
         self._guidance_scale_2 = None
         self._num_timesteps = None
         self._current_timestep = None
+        self._last_dit_forward_stats: WanDiTForwardStats | None = None
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -438,6 +441,90 @@ class Wan22Pipeline(
     @property
     def current_timestep(self):
         return self._current_timestep
+
+    def _clear_dit_forward_stats(self) -> None:
+        self._last_dit_forward_stats = None
+
+    def _record_dit_forward_stats(
+        self,
+        *,
+        latents: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        timesteps: torch.Tensor,
+        do_true_cfg: bool,
+        guidance_low: float | None = None,
+        guidance_high: float | None = None,
+        boundary_timestep: float | None = None,
+        has_negative_prompt: bool | None = None,
+    ) -> None:
+        """Record Wan2.2 estimated/theoretical denoiser FLOPs inputs."""
+
+        try:
+            transformer = self.transformer if self.transformer is not None else self.transformer_2
+            if transformer is None:
+                self._last_dit_forward_stats = None
+                return
+
+            config = getattr(transformer, "config", self.transformer_config)
+            patch_size = tuple(int(v) for v in getattr(config, "patch_size"))
+            if len(patch_size) != 3:
+                self._last_dit_forward_stats = None
+                return
+
+            num_heads = int(getattr(config, "num_attention_heads"))
+            head_dim = int(getattr(config, "attention_head_dim"))
+            parallel_config = getattr(self.od_config, "parallel_config", None)
+            cfg_world_size = get_classifier_free_guidance_world_size() if do_true_cfg else 1
+            forwards_per_step_per_gpu = 2 if do_true_cfg and cfg_world_size == 1 else 1
+            num_forwards_per_gpu = None
+            if guidance_low is not None and guidance_high is not None and has_negative_prompt is not None:
+                cfg_world_size = (
+                    get_classifier_free_guidance_world_size()
+                    if has_negative_prompt and (guidance_low > 1.0 or guidance_high > 1.0)
+                    else 1
+                )
+                num_forwards_per_gpu = 0
+                for timestep in timesteps:
+                    timestep_value = float(timestep.item() if hasattr(timestep, "item") else timestep)
+                    current_guidance_scale = (
+                        guidance_high
+                        if (boundary_timestep is not None and timestep_value < boundary_timestep)
+                        else guidance_low
+                    )
+                    step_uses_cfg = current_guidance_scale > 1.0 and has_negative_prompt
+                    num_forwards_per_gpu += 2 if step_uses_cfg and cfg_world_size == 1 else 1
+                forwards_per_step_per_gpu = 1
+
+            self._last_dit_forward_stats = WanDiTForwardStats(
+                batch_size=int(latents.shape[0]),
+                latent_num_frames=int(latents.shape[2]),
+                latent_height=int(latents.shape[3]),
+                latent_width=int(latents.shape[4]),
+                patch_size=patch_size,
+                context_len=int(prompt_embeds.shape[1]),
+                hidden_dim=num_heads * head_dim,
+                ffn_dim=int(getattr(config, "ffn_dim")),
+                num_layers=int(getattr(transformer, "end_layer", 0)) - int(getattr(transformer, "start_layer", 0)),
+                num_steps=int(len(timesteps)),
+                forwards_per_step_per_gpu=forwards_per_step_per_gpu,
+                num_forwards_per_gpu=num_forwards_per_gpu,
+                tensor_parallel_size=int(getattr(parallel_config, "tensor_parallel_size", 1)),
+                sequence_parallel_size=int(getattr(parallel_config, "sequence_parallel_size", 1) or 1),
+                pipeline_parallel_size=int(getattr(parallel_config, "pipeline_parallel_size", 1)),
+            )
+        except Exception:
+            self._last_dit_forward_stats = None
+            logger.warning("Failed to collect Wan2.2 estimated DiT FLOPs inputs.", exc_info=True)
+
+    def get_dit_forward_stats(
+        self,
+        req: OmniDiffusionRequest,
+        output: DiffusionOutput,
+    ) -> WanDiTForwardStats | None:
+        """Return Wan2.2 estimated/theoretical DiT FLOPs inputs."""
+
+        del req, output
+        return getattr(self, "_last_dit_forward_stats", None)
 
     def diffuse(
         self,
@@ -555,6 +642,8 @@ class Wan22Pipeline(
         attention_kwargs: dict | None = None,
         **kwargs,
     ) -> DiffusionOutput:
+        self._clear_dit_forward_stats()
+
         # Get parameters from request or arguments
         if len(req.prompts) > 1:
             raise ValueError(
@@ -777,6 +866,18 @@ class Wan22Pipeline(
 
         if attention_kwargs is None:
             attention_kwargs = {}
+
+        if getattr(self, "collect_dit_mfu_stats", False):
+            self._record_dit_forward_stats(
+                latents=latents,
+                prompt_embeds=prompt_embeds,
+                timesteps=timesteps,
+                do_true_cfg=(guidance_low > 1.0 or guidance_high > 1.0) and negative_prompt_embeds is not None,
+                guidance_low=guidance_low,
+                guidance_high=guidance_high,
+                boundary_timestep=boundary_timestep,
+                has_negative_prompt=negative_prompt_embeds is not None,
+            )
 
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()

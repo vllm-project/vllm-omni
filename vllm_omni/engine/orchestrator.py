@@ -751,8 +751,23 @@ class Orchestrator:
     ) -> None:
         if self._stat_logger is None or output.perf_stats is None:
             return
-        engine_idx = self._stage_replica_to_engine_idx[(stage_id, replica_id)]
-        self._stat_logger.record_perf_stats(output.perf_stats, engine_idx=engine_idx)
+        engine_idx = self._stage_replica_to_engine_idx.get((stage_id, replica_id))
+        if engine_idx is None:
+            logger.warning(
+                "Skipping diffusion perf stats for stage %d replica %d: engine index is missing",
+                stage_id,
+                replica_id,
+            )
+            return
+        try:
+            self._stat_logger.record_perf_stats(output.perf_stats, engine_idx=engine_idx)
+        except Exception:
+            logger.warning(
+                "Failed to record diffusion perf stats for stage %d replica %d",
+                stage_id,
+                replica_id,
+                exc_info=True,
+            )
 
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""

@@ -24,7 +24,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.metrics.perf import DiTForwardStats, collect_flux_dit_forward_stats
+from vllm_omni.diffusion.metrics.perf import FluxDiTForwardStats, collect_flux_dit_forward_stats
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
@@ -501,6 +501,29 @@ class FluxPipeline(
             return False
         return True
 
+    def _clear_dit_forward_stats(self) -> None:
+        self._last_dit_forward_stats = None
+
+    def _record_dit_forward_stats(
+        self,
+        *,
+        latents: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        timesteps: torch.Tensor,
+        do_true_cfg: bool,
+    ) -> None:
+        """Record Flux-specific estimated/theoretical DiT FLOPs inputs."""
+
+        self._last_dit_forward_stats = collect_flux_dit_forward_stats(
+            latents=latents,
+            prompt_embeds=prompt_embeds,
+            timesteps=timesteps,
+            transformer=self.transformer,
+            do_true_cfg=do_true_cfg,
+            cfg_parallel_world_size=get_classifier_free_guidance_world_size(),
+            tensor_parallel_size=getattr(self.od_config.parallel_config, "tensor_parallel_size", 1),
+        )
+
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -528,7 +551,7 @@ class FluxPipeline(
         max_sequence_length: int = 512,
     ):
         """Forward pass for flux."""
-        self._last_dit_forward_stats = None
+        self._clear_dit_forward_stats()
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
@@ -634,13 +657,11 @@ class FluxPipeline(
         self._num_timesteps = len(timesteps)
 
         if getattr(self, "collect_dit_mfu_stats", False):
-            self._last_dit_forward_stats = collect_flux_dit_forward_stats(
+            self._record_dit_forward_stats(
                 latents=latents,
                 prompt_embeds=prompt_embeds,
                 timesteps=timesteps,
-                transformer=self.transformer,
                 do_true_cfg=do_true_cfg,
-                cfg_parallel_world_size=get_classifier_free_guidance_world_size(),
             )
 
         # handle guidance
@@ -682,7 +703,7 @@ class FluxPipeline(
             output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
         )
 
-    def get_dit_forward_stats(self, req: OmniDiffusionRequest, output: DiffusionOutput) -> DiTForwardStats | None:
+    def get_dit_forward_stats(self, req: OmniDiffusionRequest, output: DiffusionOutput) -> FluxDiTForwardStats | None:
         """Return cached coarse estimated/theoretical DiT stats for the last forward."""
 
         del req, output

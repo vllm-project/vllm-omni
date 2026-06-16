@@ -6,9 +6,16 @@ import torch
 
 from vllm_omni.diffusion.metrics.perf import (
     DiTForwardStats,
+    FluxDiTForwardStats,
+    HunyuanVideoDiTForwardStats,
+    WanDiTForwardStats,
     collect_flux_dit_forward_stats,
+    estimate_diffusion_forward_flops_per_gpu,
     estimate_dit_flops_per_gpu,
     estimate_dit_perf_stats,
+    estimate_flux_dit_forward_flops_per_gpu,
+    estimate_hunyuan_video_dit_forward_flops_per_gpu,
+    estimate_wan_dit_forward_flops_per_gpu,
     to_perf_stats,
 )
 
@@ -143,15 +150,17 @@ def test_flux_dit_stats_use_runtime_tensors_and_transformer_shape() -> None:
         cfg_parallel_world_size=1,
     )
 
-    assert stats == DiTForwardStats(
+    assert stats == FluxDiTForwardStats(
         batch_size=2,
-        seq_len=9,
-        context_len=5,
+        image_seq_len=9,
+        text_seq_len=5,
         hidden_dim=128,
         ffn_dim=512,
-        num_layers=7,
+        num_double_layers=3,
+        num_single_layers=4,
         num_steps=4,
         forwards_per_step_per_gpu=1,
+        tensor_parallel_size=1,
     )
 
 
@@ -217,6 +226,134 @@ def test_estimate_dit_perf_stats_wraps_estimated_flops_only() -> None:
     assert perf_stats.num_flops_per_gpu == estimate_dit_flops_per_gpu(stats).total_flops_per_gpu
     assert perf_stats.num_read_bytes_per_gpu == 0
     assert perf_stats.num_write_bytes_per_gpu == 0
+
+
+def test_estimate_flux_dit_forward_flops_per_gpu_counts_dual_and_single_blocks() -> None:
+    stats = FluxDiTForwardStats(
+        batch_size=2,
+        image_seq_len=3,
+        text_seq_len=5,
+        hidden_dim=7,
+        ffn_dim=11,
+        num_double_layers=2,
+        num_single_layers=3,
+        num_steps=4,
+        forwards_per_step_per_gpu=2,
+    )
+
+    joint_seq_len = 3 + 5
+    dual_layer_flops = 8 * 7 * 7 * (3 + 5) + 4 * 7 * 11 * (3 + 5) + 4 * joint_seq_len * joint_seq_len * 7
+    single_layer_flops = 8 * 7 * 7 * joint_seq_len + 4 * 7 * 11 * joint_seq_len + 4 * joint_seq_len * joint_seq_len * 7
+    expected = 2 * ((2 * dual_layer_flops) + (3 * single_layer_flops)) * 4 * 2
+
+    assert estimate_flux_dit_forward_flops_per_gpu(stats) == expected
+    assert estimate_diffusion_forward_flops_per_gpu(stats) == expected
+
+
+def test_estimate_wan_dit_forward_flops_per_gpu_uses_post_patch_local_sequence() -> None:
+    stats = WanDiTForwardStats(
+        batch_size=1,
+        latent_num_frames=5,
+        latent_height=8,
+        latent_width=10,
+        patch_size=(1, 2, 5),
+        context_len=6,
+        hidden_dim=4,
+        ffn_dim=8,
+        num_layers=7,
+        num_steps=3,
+        tensor_parallel_size=2,
+        sequence_parallel_size=2,
+    )
+
+    logical_seq_len = 5 * 4 * 2
+    local_seq_len = logical_seq_len // 2
+    per_layer_flops = (
+        8 * 4 * 4 * local_seq_len
+        + (4 * 4 * 4 * local_seq_len + 4 * 4 * 4 * 6)
+        + 4 * 4 * 8 * local_seq_len
+        + 4 * local_seq_len * logical_seq_len * 4
+        + 4 * local_seq_len * 6 * 4
+    )
+    expected = (per_layer_flops // 2) * 7 * 3
+
+    assert stats.logical_seq_len == logical_seq_len
+    assert stats.padded_seq_len == logical_seq_len
+    assert stats.local_seq_len == local_seq_len
+    assert estimate_wan_dit_forward_flops_per_gpu(stats) == expected
+
+
+def test_estimate_wan_dit_forward_flops_per_gpu_can_use_explicit_forward_count() -> None:
+    per_forward = WanDiTForwardStats(
+        batch_size=1,
+        latent_num_frames=1,
+        latent_height=2,
+        latent_width=2,
+        patch_size=(1, 1, 1),
+        context_len=2,
+        hidden_dim=4,
+        ffn_dim=8,
+        num_layers=1,
+        num_steps=1,
+        forwards_per_step_per_gpu=1,
+    )
+    mixed_cfg = WanDiTForwardStats(
+        batch_size=1,
+        latent_num_frames=1,
+        latent_height=2,
+        latent_width=2,
+        patch_size=(1, 1, 1),
+        context_len=2,
+        hidden_dim=4,
+        ffn_dim=8,
+        num_layers=1,
+        num_steps=3,
+        forwards_per_step_per_gpu=2,
+        num_forwards_per_gpu=5,
+    )
+
+    assert estimate_wan_dit_forward_flops_per_gpu(mixed_cfg) == (
+        5 * estimate_wan_dit_forward_flops_per_gpu(per_forward)
+    )
+
+
+def test_estimate_hunyuan_video_dit_forward_flops_per_gpu_uses_effective_context_len() -> None:
+    stats = HunyuanVideoDiTForwardStats(
+        batch_size=1,
+        latent_num_frames=4,
+        latent_height=6,
+        latent_width=8,
+        patch_size_t=2,
+        patch_size=2,
+        context_len=9,
+        hidden_dim=6,
+        ffn_dim=24,
+        num_layers=3,
+        num_steps=5,
+        forwards_per_step_per_gpu=2,
+        sequence_parallel_size=3,
+    )
+
+    assert stats.logical_seq_len == 2 * 3 * 4
+    assert stats.padded_seq_len == 24
+    assert stats.local_seq_len == 8
+    expected = estimate_wan_dit_forward_flops_per_gpu(
+        WanDiTForwardStats(
+            batch_size=1,
+            latent_num_frames=4,
+            latent_height=6,
+            latent_width=8,
+            patch_size=(2, 2, 2),
+            context_len=9,
+            hidden_dim=6,
+            ffn_dim=24,
+            num_layers=3,
+            num_steps=5,
+            forwards_per_step_per_gpu=2,
+            sequence_parallel_size=3,
+        )
+    )
+    assert estimate_hunyuan_video_dit_forward_flops_per_gpu(stats) == expected
 
 
 def test_flux_pipeline_get_dit_forward_stats_returns_cached_stats() -> None:
