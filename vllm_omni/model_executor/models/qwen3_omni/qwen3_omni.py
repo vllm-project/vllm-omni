@@ -154,6 +154,13 @@ class Qwen3OmniMoeForConditionalGeneration(
             multimodal_config.skip_mm_profiling = True
             self.has_preprocess = True
             self.has_postprocess = True
+            # Talker only ships codec codes to code2wav; skip latent hidden D2H.
+            # Defer Omni payload materialization like thinker (PR #4476), but run
+            # lightweight postprocess eagerly so hidden_states.last stays on GPU
+            # before the next decode step.
+            self.defer_async_omni_output_materialization = True
+            self.eager_omni_postprocess_before_defer = True
+            self.omni_pooler_payload_include_hidden = False
             self.set_custom_preprocess(self.talker_preprocess)
             self.set_custom_postprocess(self.talker_postprocess)
             self.thinker = None

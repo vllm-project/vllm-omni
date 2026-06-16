@@ -1204,6 +1204,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             getattr(self, "routed_experts_initialized", False)
         )
 
+    @staticmethod
+    def _model_omni_flag(model: Any, name: str, default: bool = False) -> bool:
+        return bool(getattr(model, name, default)) if model is not None else default
+
+    def _runner_model_omni_flag(self, name: str, default: bool = False) -> bool:
+        return self._model_omni_flag(getattr(self, "model", None), name, default)
+
+    def _model_omni_pooler_payload_include_hidden(self) -> bool:
+        return self._runner_model_omni_flag("omni_pooler_payload_include_hidden", default=True)
+
     def _should_defer_async_omni_output_materialization(self) -> bool:
         if not self.use_async_scheduling:
             return False
@@ -1221,9 +1231,62 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return False
 
         model = getattr(self, "model", None)
-        if not bool(getattr(model, "defer_async_omni_output_materialization", False)):
+        if not self._model_omni_flag(model, "defer_async_omni_output_materialization"):
             return False
-        return not bool(getattr(model, "has_postprocess", False))
+        if self._model_omni_flag(model, "has_postprocess") and not self._model_omni_flag(
+            model, "eager_omni_postprocess_before_defer"
+        ):
+            return False
+
+        return True
+
+    def _build_omni_deferred_snapshot_payload(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        staged_hidden_states_cpu: torch.Tensor | None,
+        multimodal_outputs: Any,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"multimodal_outputs": multimodal_outputs}
+        if self._model_omni_pooler_payload_include_hidden():
+            payload["hidden_states"] = hidden_states
+            payload["staged_hidden_states_cpu"] = staged_hidden_states_cpu
+        return payload
+
+    def _maybe_run_eager_omni_postprocess_before_defer(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: Any,
+        num_scheduled_tokens_np: np.ndarray,
+        scheduler_output: SchedulerOutput,
+        req_ids_output_copy: list[str],
+        query_start_loc_cpu: Any,
+    ) -> bool:
+        """Apply model postprocess on live GPU tensors before deferring payload D2H."""
+        model = getattr(self, "model", None)
+        if not self._model_omni_flag(model, "has_postprocess"):
+            return False
+        if not self._model_omni_flag(model, "eager_omni_postprocess_before_defer"):
+            return False
+
+        _, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        if not downstream_req_ids:
+            return False
+
+        with record_function_or_nullcontext("omni_output_builder:eager_postprocess"):
+            self._process_additional_information_updates(
+                hidden_states,
+                multimodal_outputs,
+                num_scheduled_tokens_np,
+                scheduler_output,
+                None,
+                None,
+                req_ids_filter=set(downstream_req_ids),
+                req_ids=req_ids_output_copy,
+                query_start_loc_cpu=query_start_loc_cpu,
+            )
+        return True
 
     def _get_or_create_omni_payload_copy_stream(self) -> torch.cuda.Stream:
         stream = getattr(self, "_omni_payload_copy_stream", None)
@@ -1252,6 +1315,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         seq_len: int,
         num_scheduled_tokens_np: np.ndarray,
         query_start_loc_cpu: Any,
+        postprocess_already_applied: bool = False,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
@@ -1267,8 +1331,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         audio_sparse_output = engine_output_type == "audio" and sparse_mm_req_ids is not None
-        needs_scheduled_hidden_payload = needs_pooler_payload and (
-            self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states()
+        include_hidden_payload = self._model_omni_pooler_payload_include_hidden()
+        needs_scheduled_hidden_payload = (
+            include_hidden_payload
+            and needs_pooler_payload
+            and (self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states())
         )
         if needs_scheduled_hidden_payload and self.omni_prefix_cache is not None:
             if staged_hidden_states_cpu is None:
@@ -1323,17 +1390,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
 
             with record_function_or_nullcontext("omni_output_builder:process_additional_information"):
-                self._process_additional_information_updates(
-                    hidden_states,
-                    multimodal_outputs,
-                    num_scheduled_tokens_np,
-                    scheduler_output,
-                    combined_hidden_states,
-                    combined_multimodal_outputs,
-                    req_ids_filter=downstream_req_id_set,
-                    req_ids=req_ids_output_copy,
-                    query_start_loc_cpu=query_start_loc_cpu,
-                )
+                if not postprocess_already_applied:
+                    self._process_additional_information_updates(
+                        hidden_states,
+                        multimodal_outputs,
+                        num_scheduled_tokens_np,
+                        scheduler_output,
+                        combined_hidden_states,
+                        combined_multimodal_outputs,
+                        req_ids_filter=downstream_req_id_set,
+                        req_ids=req_ids_output_copy,
+                        query_start_loc_cpu=query_start_loc_cpu,
+                    )
 
             if req_hidden_states_cpu is not None and combined_hidden_states is None:
                 with record_function_or_nullcontext("omni_output_builder:hidden_d2h/per_request"):
@@ -1614,7 +1682,38 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         )
 
         should_defer_output = self._should_defer_async_omni_output_materialization()
-        if _trace_deferred_output() and not getattr(self, "_omni_async_output_defer_trace_logged", False):
+        omni_postprocess_already_applied = False
+        if should_defer_output:
+            omni_postprocess_already_applied = self._maybe_run_eager_omni_postprocess_before_defer(
+                hidden_states=hidden_states,
+                multimodal_outputs=multimodal_outputs,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                scheduler_output=scheduler_output,
+                req_ids_output_copy=req_ids_output_copy,
+                query_start_loc_cpu=query_start_loc_cpu,
+            )
+        if not getattr(self, "_omni_async_output_defer_trace_logged", False):
+            model_config = getattr(self, "model_config", None)
+            if model_config is None:
+                model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+            model = getattr(self, "model", None)
+            logger.info(
+                "Omni async output defer decision: should_defer=%s use_async=%s async_chunk=%s "
+                "prefix_cache=%s speculative=%s return_routed_experts=%s model_opt_in=%s "
+                "eager_postprocess=%s has_postprocess=%s unsafe_refs=%s.",
+                should_defer_output,
+                self.use_async_scheduling,
+                bool(getattr(model_config, "async_chunk", False)),
+                self.omni_prefix_cache is not None,
+                self.speculative_config is not None,
+                bool(getattr(model_config, "enable_return_routed_experts", False)),
+                bool(getattr(model, "defer_async_omni_output_materialization", False)),
+                bool(getattr(model, "eager_omni_postprocess_before_defer", False)),
+                bool(getattr(model, "has_postprocess", False)),
+                _use_unsafe_deferred_tensor_refs(),
+            )
+            self._omni_async_output_defer_trace_logged = True
+        if _trace_deferred_output() and not getattr(self, "_omni_async_output_defer_verbose_logged", False):
             model_config = getattr(self, "model_config", None)
             if model_config is None:
                 model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
@@ -1633,8 +1732,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 bool(getattr(model, "has_postprocess", False)),
                 _use_unsafe_deferred_tensor_refs(),
             )
-            self._omni_async_output_defer_trace_logged = True
-        deferred_payload_snapshot: _AsyncCPUPayloadSnapshot | None = None
+            self._omni_async_output_defer_verbose_logged = True
         if should_defer_output:
             if _use_unsafe_deferred_tensor_refs():
                 hidden_states_snapshot = hidden_states
@@ -1643,17 +1741,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             else:
                 with record_function_or_nullcontext("omni_defer_snapshot:async_cpu_payload"):
                     deferred_payload_snapshot = _snapshot_tensor_payload_to_cpu_async(
-                        {
-                            "hidden_states": hidden_states,
-                            "staged_hidden_states_cpu": staged_hidden_states_cpu,
-                            "multimodal_outputs": multimodal_outputs,
-                        },
+                        self._build_omni_deferred_snapshot_payload(
+                            hidden_states=hidden_states,
+                            staged_hidden_states_cpu=staged_hidden_states_cpu,
+                            multimodal_outputs=multimodal_outputs,
+                        ),
                         copy_stream=self._get_or_create_omni_payload_copy_stream(),
                         pin_memory=bool(getattr(self, "pin_memory", False)),
                     )
                 payload = deferred_payload_snapshot.payload
-                hidden_states_snapshot = payload["hidden_states"]
-                staged_hidden_states_cpu_snapshot = payload["staged_hidden_states_cpu"]
+                hidden_states_snapshot = payload.get("hidden_states")
+                if hidden_states_snapshot is None:
+                    # Models that omit hidden from the deferred snapshot only
+                    # materialize multimodal payloads (e.g. talker codes.audio).
+                    hidden_states_snapshot = hidden_states[:0]
+                staged_hidden_states_cpu_snapshot = payload.get("staged_hidden_states_cpu")
                 multimodal_outputs_snapshot = payload["multimodal_outputs"]
         else:
             hidden_states_snapshot = hidden_states
@@ -1689,6 +1791,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     seq_len=seq_len,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
+                    postprocess_already_applied=omni_postprocess_already_applied,
                 )
 
         if not should_defer_output:
