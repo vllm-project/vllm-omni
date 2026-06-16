@@ -315,7 +315,6 @@ def main():
                 if text:
                     print(text, end="", flush=True)
             # Non-streaming: one shot with full text — emit a trailing newline.
-            # Streaming: newline comes naturally via "\n" before image save below.
             if not args.stream:
                 print(flush=True)
 
