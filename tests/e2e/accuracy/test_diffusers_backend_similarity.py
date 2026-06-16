@@ -338,7 +338,7 @@ def test_diffusers_backend_i2v_matches_diffusers(
 
 
 def _diffusers_dummy_run(pipe: DiffusionPipeline) -> None:
-    from vllm_omni.diffusion.diffusion_engine import supports_multimodal_input
+    from vllm_omni.diffusion.io_support import supports_multimodal_input
 
     supports_image_input, supports_audio_input = supports_multimodal_input(
         SimpleNamespace(
