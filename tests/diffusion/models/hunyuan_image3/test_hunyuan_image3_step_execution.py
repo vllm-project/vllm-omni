@@ -41,7 +41,7 @@ def _state(request_id: str, step_index: int) -> DiffusionRequestState:
     state = DiffusionRequestState(
         request_id=request_id,
         sampling=SimpleNamespace(),
-        prompts=["prompt"],
+        prompt="prompt",
     )
     state.step_index = step_index
     state.timesteps = torch.tensor([1.0, 0.5, 0.25, 0.0])
@@ -135,7 +135,7 @@ def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
     state = DiffusionRequestState(
         request_id="req-bot-task",
         sampling=sampling,
-        prompts=[prompt_item],
+        prompt=prompt_item,
     )
 
     with pytest.raises(RuntimeError, match="stop after prepare_model_inputs"):

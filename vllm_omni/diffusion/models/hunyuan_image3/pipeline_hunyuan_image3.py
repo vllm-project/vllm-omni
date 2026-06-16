@@ -487,9 +487,9 @@ class HunyuanImage3Pipeline(
         return self._pipeline
 
     def _validate_step_request(self, state: "DiffusionRequestState") -> None:
-        prompts = state.prompts or []
+        prompt = state.prompt
         sampling = state.sampling
-        if len(prompts) != 1:
+        if prompt is None:
             raise ValueError("HunyuanImage3 step execution currently requires exactly one prompt per request.")
         if sampling.timesteps is not None or sampling.sigmas is not None:
             raise ValueError("HunyuanImage3 step execution does not support custom timesteps or sigmas yet.")
@@ -588,7 +588,7 @@ class HunyuanImage3Pipeline(
     ) -> tuple[list[str], list[str | None], str | None, list[list[JointImageInfo]] | None, str]:
         sampling = state.sampling
         return self._extract_prompt_inputs(
-            state.prompts or [],
+            [state.prompt] if state.prompt is not None else [],
             getattr(sampling, "extra_args", {}) or {},
             request_id=state.request_id,
             allow_cond_image=False,

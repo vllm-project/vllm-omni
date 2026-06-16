@@ -475,7 +475,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     prompt=sched_new_req.req.prompt,
                     kv_sender_info=sched_new_req.req.kv_sender_info,
                 )
-                state_req = copy.copy(req)
+                state_req = copy.copy(sched_new_req.req)
                 state_req.sampling_params = new_state.sampling
                 self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                     state_req,

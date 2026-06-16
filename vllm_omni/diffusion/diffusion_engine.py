@@ -41,6 +41,7 @@ from vllm_omni.diffusion.output_formatter import (
     normalize_diffusion_postprocess_output,
 )
 from vllm_omni.diffusion.registry import (
+    DiffusionModelRegistry,
     get_diffusion_action_post_process_func,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,

@@ -911,7 +911,13 @@ class TestForwardRouting:
             AssertionError("RoboLab should not decode video")
         )
 
-        output = pipeline.forward(SimpleNamespace(prompts=["ignored"], sampling_params=make_sampling_params()))
+        outputs = pipeline.forward(
+            SimpleNamespace(
+                num_reqs=1,
+                prompts=["ignored"],
+                sampling_params=make_sampling_params(),
+            )
+        )
 
         assert captured["format"] == {
             "prompt": "Pick the cube.",
@@ -929,6 +935,8 @@ class TestForwardRouting:
         assert captured["prepare_action_video"]["kwargs"] == {"image_size": None}
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
         assert captured["diffuse_calls"][-1]["timesteps"].tolist() == [4, 3, 2, 1]
+        assert len(outputs) == 1
+        output = outputs[0]
         assert output.output == {}
         assert output.custom_output["action_only_output"] is True
         assert output.custom_output["action"].shape == (1, 2, 2)
