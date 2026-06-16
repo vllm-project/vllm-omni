@@ -179,17 +179,30 @@ steps:
             pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py tests/e2e/offline_inference/test_qwen3_tts_base.py -m "advanced_model" --run-level "advanced_model"
           '
 
-    - label: "Voxtral-TTS E2E Test"
+    # It is the whisper ASR validation step that is slow, not the Voxtral TTS generation.
+    # whisper ASR runs on CPU.
+    - label: "Voxtral-TTS E2E Test (Online Serving)"
       agent_pool: mi325_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
         - |
-          timeout 20m bash -c '
-            export VLLM_LOGGING_LEVEL=DEBUG
+          timeout 40m bash -c '
             export VLLM_WORKER_MULTIPROC_METHOD=spawn
-            pytest -s -v tests/e2e/online_serving/test_voxtral_tts.py tests/e2e/offline_inference/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
+            pytest -s -v tests/e2e/online_serving/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
+          '
+
+    - label: "Voxtral-TTS E2E Test (Offline Inference)"
+      agent_pool: mi325_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      commands:
+        - |
+          timeout 30m bash -c '
+            export VLLM_WORKER_MULTIPROC_METHOD=spawn
+            pytest -s -v tests/e2e/offline_inference/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
           '
 
 # TODO: Bagel test on ROCm is very unstable. @tjtanaa
