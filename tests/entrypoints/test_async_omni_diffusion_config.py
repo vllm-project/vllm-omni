@@ -33,6 +33,37 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["model_stage"] == "diffusion"
 
 
+def test_default_stage_config_forwards_quantization_config():
+    """Ensure API-provided quantization_config reaches the diffusion stage."""
+    quantization_config = {"method": "gguf", "gguf_model": "/tmp/model.gguf"}
+
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "diffusion_quantization_config": None,
+            "quantization_config": quantization_config,
+        }
+    )[0]
+
+    engine_args = stage_cfg["engine_args"]
+    assert engine_args["quantization_config"] is quantization_config
+
+
+def test_default_stage_config_prefers_diffusion_quantization_config():
+    """Ensure diffusion-specific config wins over generic quantization_config."""
+    generic_quantization_config = {"method": "fp8"}
+    diffusion_quantization_config = {"method": "gguf", "gguf_model": "/tmp/model.gguf"}
+
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "quantization_config": generic_quantization_config,
+            "diffusion_quantization_config": diffusion_quantization_config,
+        }
+    )[0]
+
+    engine_args = stage_cfg["engine_args"]
+    assert engine_args["quantization_config"] is diffusion_quantization_config
+
+
 def test_default_cache_config_used_when_missing():
     """Ensure default cache_config is synthesized when only backend is given."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
@@ -308,7 +339,39 @@ def test_serve_cli_accepts_additional_config():
     assert engine_args["additional_config"] == {"torchair_graph_config": {"enabled": True}}
 
 
-def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mocker):
+def test_resolve_stage_configs_injects_quantization_config_into_diffusion_stage(monkeypatch):
+    """Ensure YAML/deploy stage resolution forwards top-level quantization_config."""
+    quantization_config = {"method": "gguf", "gguf_model": "/tmp/model.gguf"}
+    fake_diffusion_stage = SimpleNamespace(
+        stage_type="diffusion",
+        engine_args=SimpleNamespace(),
+    )
+    fake_llm_stage = SimpleNamespace(
+        stage_type="llm",
+        engine_args=SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        lambda *args, **kwargs: ("dummy.yaml", [fake_llm_stage, fake_diffusion_stage]),
+    )
+
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    _, stage_configs = engine._resolve_stage_configs(
+        "dummy-model",
+        {
+            "stage_configs_path": "dummy.yaml",
+            "diffusion_quantization_config": None,
+            "quantization_config": quantization_config,
+        },
+    )
+
+    assert not hasattr(stage_configs[0].engine_args, "quantization_config")
+    assert stage_configs[1].engine_args.quantization_config is quantization_config
+
+
+def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(monkeypatch):
     """Ensure YAML/deploy stage resolution forwards top-level additional_config."""
     fake_diffusion_stage = SimpleNamespace(
         stage_type="diffusion",
@@ -318,9 +381,9 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
         stage_type="llm",
         engine_args=SimpleNamespace(),
     )
-    mocker.patch(
+    monkeypatch.setattr(
         "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
-        return_value=("dummy.yaml", [fake_llm_stage, fake_diffusion_stage]),
+        lambda *args, **kwargs: ("dummy.yaml", [fake_llm_stage, fake_diffusion_stage]),
     )
 
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)

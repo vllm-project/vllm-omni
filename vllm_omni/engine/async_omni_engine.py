@@ -1943,6 +1943,10 @@ class AsyncOmniEngine:
                 attention_backend=kwargs.get("diffusion_attention_backend"),
             )
 
+        quantization_config = kwargs.get("diffusion_quantization_config")
+        if quantization_config is None:
+            quantization_config = kwargs.get("quantization_config")
+
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
@@ -1972,6 +1976,7 @@ class AsyncOmniEngine:
             "prompt_embed_cache_size": kwargs.get("prompt_embed_cache_size", 32),
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
+            "quantization_config": quantization_config,
             "quantization": kwargs.get("quantization", None),
             "diffusion_kv_cache_dtype": kwargs.get("diffusion_kv_cache_dtype", None),
             "diffusion_kv_cache_skip_steps": kwargs.get("diffusion_kv_cache_skip_steps", None),
@@ -2137,6 +2142,8 @@ class AsyncOmniEngine:
                             attention_backend=kwargs.get("diffusion_attention_backend"),
                         )
                 quantization_config = kwargs.get("diffusion_quantization_config")
+                if quantization_config is None:
+                    quantization_config = kwargs.get("quantization_config")
                 if quantization_config is not None:
                     if (
                         not hasattr(cfg.engine_args, "quantization_config")
