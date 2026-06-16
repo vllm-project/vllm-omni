@@ -14,7 +14,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PerForwardState
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
@@ -224,6 +224,52 @@ class Attention(nn.Module):
         extra["kv_cache_dtype"] = kv_cache_dtype
         return replace(attn_metadata, extra=extra)
 
+    @staticmethod
+    def _with_per_forward_state(
+        attn_metadata: AttentionMetadata | None, query: torch.Tensor
+    ) -> AttentionMetadata | None:
+        """Surface framework step state from ForwardContext onto attn_metadata.
+
+        Reads ``denoise_step_idx`` / ``total_denoise_steps`` (set by the pipeline
+        per denoise step) and exposes them as per-sample tensors on
+        :attr:`AttentionMetadata.per_forward`, so any backend can read step state
+        without reaching into the global ForwardContext. No-op when neither is
+        set or no ForwardContext is active.
+
+        Source-isolated: this is the only place that reads ForwardContext for
+        per-forward state. A future continuous-batching runner would change only
+        this method (per-request step values) without touching
+        the PerForwardState contract or any backend consumer.
+        """
+        if not is_forward_context_available():
+            return attn_metadata
+        ctx = get_forward_context()
+        step_idx = ctx.denoise_step_idx
+        total = ctx.total_denoise_steps
+        frames = ctx.total_latent_frames
+        patches = ctx.patches_per_frame
+        if step_idx is None and total is None and frames is None and patches is None:
+            return attn_metadata
+
+        # Per-sample tensors on the sample axis. Layout is BSND, so query.shape[0]
+        # is the number of samples; a homogeneous batch yields equal entries.
+        num_samples = query.shape[0]
+
+        def _per_sample(v: int | None) -> torch.Tensor | None:
+            if v is None:
+                return None
+            return torch.full((num_samples,), v, dtype=torch.long, device=query.device)
+
+        state = PerForwardState(
+            denoise_step_idx=_per_sample(step_idx),
+            total_denoise_steps=_per_sample(total),
+            total_latent_frames=_per_sample(frames),
+            patches_per_frame=_per_sample(patches),
+        )
+        if attn_metadata is None:
+            return AttentionMetadata(per_forward=state)
+        return replace(attn_metadata, per_forward=state)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -268,6 +314,7 @@ class Attention(nn.Module):
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
 
         attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+        attn_metadata = self._with_per_forward_state(attn_metadata, query)
 
         # 2. Kernel Execution (Computation)
         if self.use_ring and strategy is not self._no_parallel_strategy:

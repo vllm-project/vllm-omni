@@ -67,6 +67,32 @@ def _cached_get_backend_cls(
     return _load_backend_cls(backend_cls_path)
 
 
+def _route_sparse_plugin_shorthand(spec: AttentionSpec) -> AttentionSpec:
+    """Route a sparse-kernel shorthand (``backend=<plugin>``) to SPARSE_ATTN.
+
+    A spec whose ``backend`` is not a built-in ``DiffusionAttentionBackendEnum``
+    member is treated as a sparse-kernel plugin name: it is rewritten onto the
+    ``SPARSE_ATTN`` dispatcher with the plugin name + the original ``extra``
+    moved into the dispatcher config. This makes
+    ``per_role.self.backend=dummy_sparse`` work directly once the plugin is
+    installed, without the verbose explicit form.
+
+    Built-in names (the dense backends *and* SPARSE_ATTN itself) are
+    returned unchanged. The enum membership check is the dynamic dense-name
+    exclusion -- it stays correct as built-in backends are added.
+    """
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.diffusion.data import AttentionSpec as _AttentionSpec
+
+    backend = spec.backend
+    if backend.upper() in DiffusionAttentionBackendEnum.__members__:
+        return spec
+    return _AttentionSpec(
+        backend=DiffusionAttentionBackendEnum.SPARSE_ATTN.name,
+        extra={"backend": backend, "params": dict(spec.extra or {})},
+    )
+
+
 @cache
 def _log_backend_resolution(
     role: str,
@@ -130,6 +156,7 @@ def get_attn_backend_for_role(
         )
 
     if spec is not None:
+        spec = _route_sparse_plugin_shorthand(spec)
         backend_cls = _cached_get_backend_cls(spec.backend, head_size)
         _log_backend_resolution(
             role=role,
