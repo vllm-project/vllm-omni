@@ -62,9 +62,9 @@ class BDEModelRunner(DiffusionModelRunner):
         # Built after the model is loaded (dimensions known); stays None while KV
         # management is disabled.
         self.kv_cache: BDEKVCache | None = None
-        # DreamZero KV is session-scoped (persists across forwards), so the BDE KV
-        # state is held on the runner and reused, not created per request.
-        self._bde_state: BDEKVState | None = None
+        # DreamZero KV is session-scoped (persists across a session's forwards),
+        # so BDE KV state is keyed by session_id and reused, not created per request.
+        self._bde_states: dict[str, BDEKVState] = {}
 
     def build_kv_cache(
         self,
@@ -167,17 +167,22 @@ class BDEModelRunner(DiffusionModelRunner):
             return super().execute_model(req)
 
         kv = self.kv_cache
-        # Reuse the session-scoped BDE KV state so KV persists across the session's
-        # forwards (Approach 1: the state holds the model's window per branch/layer).
-        if self._bde_state is None:
-            pos = kv.begin_request("bde")
-            neg = kv.begin_request("bde__neg")
-            self._bde_state = BDEKVState(kv, pos, neg, num_layers=kv.num_layers)
+        # DreamZero KV is session-scoped (the model state persists across a
+        # session's forwards), so the BDE KV state is keyed by session_id and
+        # reused — matching how pipeline.forward resolves the model-local state.
+        extra_args = req.sampling_params.extra_args or {}
+        session_id = str(extra_args.get("session_id") or "default")
+        state = self._bde_states.get(session_id)
+        if state is None:
+            pos = kv.begin_request(f"bde__{session_id}")
+            neg = kv.begin_request(f"bde__{session_id}__neg")
+            state = BDEKVState(kv, pos, neg, num_layers=kv.num_layers)
+            self._bde_states[session_id] = state
         logger.debug(
-            "BDE execute_model: req=%s chunk_size=%d window_chunks=%s num_blocks=%d",
-            req.request_id, kv.spec.chunk_size, kv.config.window_chunks, kv.num_blocks,
+            "BDE execute_model: req=%s session=%s chunk_size=%d window_chunks=%s num_blocks=%d",
+            req.request_id, session_id, kv.spec.chunk_size, kv.config.window_chunks, kv.num_blocks,
         )
-        self.pipeline._bde_kv_state = self._bde_state
+        self.pipeline._bde_kv_state = state
         try:
             return super().execute_model(req)
         finally:

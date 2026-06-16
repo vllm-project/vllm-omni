@@ -199,6 +199,25 @@ class BDEKVState:
     def commit_chunk(self) -> None:
         _log.info("BDE COMMIT (paged; resident window retained across forwards)")
 
+    def reset(self) -> None:
+        """Drop this session's KV — mirrors the model-local ``state.reset()``.
+
+        DreamZero resets at the attention-window boundary (``should_reset``); the
+        model starts a fresh sliding window, so BDE must free the resident pool
+        blocks and start a fresh adapter for each branch. The ``BDEKVState``
+        object (and thus ``pipeline._bde_kv_state``) is preserved across the reset
+        so the runner's session mapping stays valid — only the pool-backed state
+        is recycled.
+        """
+        pos_id, neg_id = self.pos.request_id, self.neg.request_id
+        self.kv_cache.end_request(self.pos)        # free resident blocks
+        self.kv_cache.end_request(self.neg)
+        self.pos = self.kv_cache.begin_request(pos_id)   # fresh, empty window
+        self.neg = self.kv_cache.begin_request(neg_id)
+        self._committed = {False: 0, True: 0}
+        self._pending = {False: [], True: []}
+        _log.info("BDE RESET [%s/%s] session KV cleared (window boundary)", pos_id, neg_id)
+
 
 class BDEPipelineMixin:
     """Mixin that replaces model-local KV state with pool-backed storage.

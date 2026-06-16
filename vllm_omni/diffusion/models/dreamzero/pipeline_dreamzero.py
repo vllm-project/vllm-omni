@@ -132,6 +132,18 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             _log.debug("BDE KV commit: pos=%d chunks neg=%d chunks", s.pos.completed_chunks, s.neg.completed_chunks)
             s.commit_chunk()
 
+    def _kv_reset(self, state):
+        """Reset model-local KV and, under BDE, the pooled session window too.
+
+        DreamZero resets its sliding window at the attention-window boundary; the
+        BDE pool must drop the same window so the next forward starts fresh and
+        stays parity-exact with the model-local path.
+        """
+        state.reset()
+        s = self._bde_kv_state
+        if s is not None:
+            s.reset()
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         """Initialize pipeline components.
 
@@ -853,10 +865,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # Explicit reset from OpenPI serving is carried by `extra_args["reset"]`
         # on the next inference request after websocket reset/session switch.
         if extra_args.get("reset", False):
-            state.reset()
+            self._kv_reset(state)
         # Auto-reset based on model state (before accumulation)
         if state.should_reset(text_tokens, 0, self.transformer.local_attn_size):
-            state.reset()
+            self._kv_reset(state)
         state.language = text_tokens
 
         # Frame accumulation: stitched single frame -> multi-frame video

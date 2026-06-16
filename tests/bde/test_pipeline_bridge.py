@@ -63,6 +63,28 @@ def test_branches_are_independent():
     assert st.get_kv_caches(False, lambda: ["X"])[0].shape[2] == BLOCK
 
 
+def test_reset_clears_session_window():
+    """reset() drops the resident window so the next forward starts fresh —
+    mirrors DreamZero's window-boundary state.reset()."""
+    kv, st = make_state(num_layers=1, window_chunks=4)
+    st.update_kv_cache(0, _window(2), False, seq_len=2 * BLOCK)
+    st.update_kv_cache(0, _window(1), True, seq_len=BLOCK)
+    assert st._committed[False] == 2 * BLOCK and st._committed[True] == BLOCK
+    free_before = kv.manager.block_pool.get_num_free_blocks()
+
+    st.reset()
+
+    # Both branches fall back to empty again, and pool blocks are freed.
+    assert st._committed == {False: 0, True: 0}
+    assert st._pending == {False: [], True: []}
+    assert st.get_kv_caches(False, lambda: ["EMPTY"]) == ["EMPTY"]
+    assert st.get_kv_caches(True, lambda: ["EMPTY"]) == ["EMPTY"]
+    assert kv.manager.block_pool.get_num_free_blocks() > free_before
+    # Adapters are live again under the same ids — a post-reset write works.
+    st.update_kv_cache(0, _window(1), False, seq_len=BLOCK)
+    assert st.get_kv_caches(False, lambda: ["X"])[0].shape[2] == BLOCK
+
+
 def test_commit_is_noop():
     _, st = make_state()
     st.commit_chunk()  # paged mode keeps resident windows; commit just logs

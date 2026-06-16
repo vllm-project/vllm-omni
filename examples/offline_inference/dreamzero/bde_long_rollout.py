@@ -34,6 +34,8 @@ def main() -> None:
     ap.add_argument("--session-id", default="long-rollout")
     ap.add_argument("--num-chunks", type=int, default=8)
     ap.add_argument("--output", type=Path, default=Path("outputs/bde_parity/long.mp4"))
+    ap.add_argument("--latents", type=Path, default=None,
+                    help="if set, torch.save the raw decoded latents here for exact parity checks")
     args = ap.parse_args()
 
     # base = [prefill_obs, chunk_obs]; extend the chunk into a long session.
@@ -43,6 +45,10 @@ def main() -> None:
 
     omni, outputs = E._run_generation(args.model, args.deploy_config, observations)
     latents = torch.cat([E._extract_latents(o) for o in outputs], dim=2)
+    if args.latents is not None:
+        args.latents.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(latents.detach().cpu(), args.latents)
+        print(f"SAVED_LATENTS={args.latents}  shape={tuple(latents.shape)}")
     frames = E._decode_with_worker(omni, latents)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
