@@ -23,7 +23,7 @@ from vllm.entrypoints.chat_utils import (
     make_tool_call_id,
 )
 
-from vllm_omni.diffusion.diffusion_engine import get_extra_body_params, get_extra_output_params
+from vllm_omni.diffusion.io_support import get_extra_body_params, get_extra_output_params
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
