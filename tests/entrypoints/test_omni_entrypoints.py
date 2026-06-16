@@ -18,6 +18,12 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
+from vllm_omni.errors import (
+    OmniClientError,
+    client_error_from_metadata,
+    client_error_metadata,
+    is_client_error_status,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -604,6 +610,71 @@ async def test_async_omni_propagates_fatal_error_context(monkeypatch: pytest.Mon
     assert getattr(exc_info.value, "error_stage_id") == 2
 
 
+def _enqueue_client_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    engine.output_q.put_nowait(
+        ErrorMessage(
+            request_id=msg["request_id"],
+            stage_id=2,
+            error="Input was blocked by Cosmos3 guardrails.",
+            status_code=400,
+            error_type="BadRequestError",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_omni_propagates_client_error_status(monkeypatch: pytest.MonkeyPatch):
+    """A non-fatal client error from the orchestrator must be routed to the
+    requesting generate() call (not raised in the shared dispatcher) and
+    surface as an OmniClientError carrying status_code/error_type."""
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_client_error_message)
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        with pytest.raises(OmniClientError) as exc_info:
+            async for _ in app.generate(prompt="blocked", request_id="req-1"):
+                pass
+    finally:
+        app.shutdown()
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "BadRequestError"
+    assert str(exc_info.value) == "Input was blocked by Cosmos3 guardrails."
+
+
+def _enqueue_server_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    engine.output_q.put_nowait(
+        ErrorMessage(
+            request_id=msg["request_id"],
+            stage_id=2,
+            error="GPU exploded",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_omni_propagates_server_error_as_runtime(monkeypatch: pytest.MonkeyPatch):
+    """A non-fatal error WITHOUT a 4xx status_code is a server fault: it must
+    surface as a RuntimeError (-> HTTP 500), not an OmniClientError (-> 400).
+    Guards against the fix over-broadly mapping every error to a client error."""
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_server_error_message)
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        # OmniClientError subclasses ValueError, not RuntimeError, so matching
+        # RuntimeError here also proves it was NOT raised as a client error.
+        with pytest.raises(RuntimeError) as exc_info:
+            async for _ in app.generate(prompt="boom", request_id="req-1"):
+                pass
+    finally:
+        app.shutdown()
+
+    assert not isinstance(exc_info.value, OmniClientError)
+    assert str(exc_info.value) == "GPU exploded"
+
+
 def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkeypatch: pytest.MonkeyPatch):
     sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
     engine = FakeAsyncOmniEngine(
@@ -759,6 +830,140 @@ def test_non_fatal_error_raises_runtime():
 
     with pytest.raises(RuntimeError, match="something wrong"):
         base._handle_output_message(msg)
+
+
+def test_non_fatal_client_error_raises_omni_client_error():
+    """A non-fatal ErrorMessage carrying a 4xx status_code (e.g. a guardrail
+    block) must surface as an OmniClientError with the metadata intact, not a
+    bare RuntimeError. This covers the offline/sync Omni consumer path."""
+    base = _make_base()
+    msg = ErrorMessage(
+        error="Input was blocked by Cosmos3 guardrails.",
+        status_code=400,
+        error_type="BadRequestError",
+    )
+
+    with pytest.raises(OmniClientError) as exc_info:
+        base._handle_output_message(msg)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "BadRequestError"
+    assert str(exc_info.value) == "Input was blocked by Cosmos3 guardrails."
+
+
+_NON_400_CLIENT_ERRORS = [
+    pytest.param(429, "RateLimitError", id="429-too-many-requests"),
+    pytest.param(413, "PayloadTooLargeError", id="413-payload-too-large"),
+    pytest.param(422, "UnprocessableEntityError", id="422-unprocessable-entity"),
+    pytest.param(403, "PermissionDeniedError", id="403-forbidden"),
+]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_type"), [pytest.param(400, "BadRequestError", id="400")] + _NON_400_CLIENT_ERRORS
+)
+def test_client_error_metadata_round_trip_preserves_4xx(status_code: int, error_type: str):
+    original = OmniClientError("blocked", status_code=status_code, error_type=error_type)
+
+    # Outbound: what the broad `except Exception` handlers serialize.
+    carried_status, carried_type = client_error_metadata(original)
+    assert carried_status == status_code
+    assert carried_type == error_type
+    assert is_client_error_status(carried_status)
+
+    # Inbound: reconstruction at the consuming end.
+    rebuilt = client_error_from_metadata("blocked", status_code=carried_status, error_type=carried_type)
+    assert isinstance(rebuilt, OmniClientError)
+    assert rebuilt.status_code == status_code
+    assert rebuilt.error_type == error_type
+    assert str(rebuilt) == "blocked"
+
+
+@pytest.mark.parametrize(("status_code", "error_type"), _NON_400_CLIENT_ERRORS)
+def test_non_fatal_client_error_preserves_non_400_status(status_code: int, error_type: str):
+    base = _make_base()
+    msg = ErrorMessage(
+        error="client side failure",
+        status_code=status_code,
+        error_type=error_type,
+    )
+
+    with pytest.raises(OmniClientError) as exc_info:
+        base._handle_output_message(msg)
+
+    assert exc_info.value.status_code == status_code
+    assert exc_info.value.error_type == error_type
+    assert str(exc_info.value) == "client side failure"
+
+
+@pytest.mark.parametrize(
+    "status_code",
+    [
+        pytest.param(None, id="no-status"),
+        pytest.param(399, id="399-below-4xx"),
+        pytest.param(500, id="500-server-error"),
+        pytest.param(503, id="503-service-unavailable"),
+    ],
+)
+def test_non_fatal_non_4xx_status_raises_runtime(status_code: int | None):
+    base = _make_base()
+    msg = ErrorMessage(
+        error="server side failure",
+        status_code=status_code,
+        error_type="ShouldBeIgnoredForNon4xx",
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        base._handle_output_message(msg)
+
+    assert not isinstance(exc_info.value, OmniClientError)
+    assert str(exc_info.value) == "server side failure"
+
+
+def _make_enqueue_client_error(
+    status_code: int,
+    error_type: str,
+    error_text: str,
+) -> Callable[[FakeAsyncOmniEngine, dict[str, Any]], None]:
+    def _enqueue(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+        engine.output_q.put_nowait(
+            ErrorMessage(
+                request_id=msg["request_id"],
+                stage_id=2,
+                error=error_text,
+                status_code=status_code,
+                error_type=error_type,
+            )
+        )
+
+    return _enqueue
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status_code", "error_type"), _NON_400_CLIENT_ERRORS)
+async def test_async_omni_propagates_non_400_client_error_status(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    error_type: str,
+):
+    error_text = f"blocked with {status_code}"
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_make_enqueue_client_error(status_code, error_type, error_text),
+    )
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        with pytest.raises(OmniClientError) as exc_info:
+            async for _ in app.generate(prompt="blocked", request_id="req-1"):
+                pass
+    finally:
+        app.shutdown()
+
+    assert exc_info.value.status_code == status_code
+    assert exc_info.value.error_type == error_type
+    assert str(exc_info.value) == error_text
 
 
 def test_async_omni_errored_property_alive():

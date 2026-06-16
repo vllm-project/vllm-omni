@@ -133,6 +133,14 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
+    non_streaming_mode: bool | None = Field(
+        default=None,
+        description=(
+            "Qwen3-TTS prompt construction mode override. This does not "
+            "control HTTP response streaming or async-chunk pipelining. "
+            "When null, use model defaults: Base=False, CustomVoice/VoiceDesign=True."
+        ),
+    )
     extra_params: dict[str, Any] | None = Field(
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
@@ -370,6 +378,7 @@ class SpeechBatchItem(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    non_streaming_mode: bool | None = None
 
 
 class BatchSpeechRequest(BaseModel):
@@ -389,6 +398,7 @@ class BatchSpeechRequest(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    non_streaming_mode: bool | None = None
 
 
 class SpeechBatchItemResult(BaseModel):
@@ -422,6 +432,14 @@ class StreamingSpeechSessionConfig(BaseModel):
         default=None,
         ge=0,
         description="Initial chunk size for reduced TTFA. Overrides stage config for this session.",
+    )
+    non_streaming_mode: bool | None = Field(
+        default=None,
+        description=(
+            "Qwen3-TTS prompt construction mode override. This does not "
+            "control WebSocket audio streaming or async-chunk pipelining. "
+            "When null, use model defaults: Base=False, CustomVoice/VoiceDesign=True."
+        ),
     )
     ref_audio: str | None = None
     ref_text: str | None = None

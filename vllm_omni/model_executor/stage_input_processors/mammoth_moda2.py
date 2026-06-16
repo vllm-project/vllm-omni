@@ -1,5 +1,6 @@
 """Stage input processor for MammothModa2 (AR -> DiT)."""
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -35,7 +36,7 @@ def ar2dit(
         full_token_ids = prompt_token_ids + gen_token_ids
 
         mm_output = getattr(completion_output, "multimodal_output", None)
-        if not isinstance(mm_output, dict) or "latent" not in mm_output:
+        if not isinstance(mm_output, Mapping) or "latent" not in mm_output:
             raise ValueError(
                 "AR stage output missing latent multimodal output. "
                 f"request_id={getattr(ar_output, 'request_id', None)}, "

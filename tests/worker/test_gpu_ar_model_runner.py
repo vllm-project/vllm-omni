@@ -92,6 +92,9 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     runner.supports_mm_inputs = False
     runner.use_async_scheduling = False
     runner._omni_num_scheduled_tokens_np = None
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type="audio"),
+    )
 
     monkeypatch.setattr(
         GPUARModelRunner, "_sample", lambda self, logits, spec_decode_metadata: SimpleNamespace(sampled_token_ids=[])
@@ -125,8 +128,8 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
 
     output = GPUARModelRunner.sample_tokens(runner, grammar_output=None)
 
-    assert torch.equal(output.pooler_output[0]["hidden"], torch.tensor([[1.0, 10.0]]))
+    assert torch.equal(output.multimodal_outputs[0]["hidden"], torch.tensor([[1.0, 10.0]]))
     assert torch.equal(
-        output.pooler_output[1]["hidden"],
+        output.multimodal_outputs[1]["hidden"],
         torch.tensor([[2.0, 20.0], [3.0, 30.0]]),
     )

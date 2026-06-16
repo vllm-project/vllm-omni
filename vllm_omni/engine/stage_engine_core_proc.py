@@ -14,6 +14,7 @@ from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
 
 import msgspec
+import vllm.v1.engine.core as _vllm_engine_core_module
 import zmq
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
@@ -36,6 +37,7 @@ from vllm.v1.engine.utils import (
 from vllm.v1.utils import shutdown
 
 from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
+from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.stage_init_utils import set_death_signal
 
 if TYPE_CHECKING:
@@ -122,6 +124,18 @@ class StageEngineCoreProc(EngineCoreProc):
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
             os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
 
+            # Patch the decoder type so process_input_sockets (started
+            # during __init__) decodes OmniEngineCoreRequest (which
+            # carries additional_information) instead of the base
+            # EngineCoreRequest.  Must happen BEFORE __init__ because
+            # the IO thread creates MsgpackDecoder(EngineCoreRequest)
+            # during __init__.
+            _vllm_engine_core_module.EngineCoreRequest = OmniEngineCoreRequest
+            logger.debug(
+                "[StageEngineCoreProc] Patched EngineCoreRequest -> OmniEngineCoreRequest: %s",
+                _vllm_engine_core_module.EngineCoreRequest,
+            )
+
             engine_core = StageEngineCoreProc(
                 *args,
                 engine_index=dp_rank,
@@ -204,6 +218,8 @@ def spawn_stage_core(
     vllm_config: VllmConfig,
     executor_class: type[Executor],
     log_stats: bool = False,
+    omni_stage_id: int | None = None,
+    omni_replica_id: int = 0,
 ) -> tuple[EngineZmqAddresses, BaseProcess, str]:
     """Spawn a *StageEngineCoreProc* subprocess without performing the handshake.
 
@@ -227,6 +243,8 @@ def spawn_stage_core(
             "log_stats": log_stats,
             "dp_rank": 0,
             "local_dp_rank": 0,
+            "omni_stage_id": omni_stage_id,
+            "omni_replica_id": omni_replica_id,
         },
     )
     proc.start()

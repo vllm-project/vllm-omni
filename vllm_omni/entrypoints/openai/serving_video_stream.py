@@ -32,6 +32,7 @@ import json
 import time as _time
 import uuid
 import wave
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -796,7 +797,7 @@ class OmniStreamingVideoHandler:
         if not isinstance(outputs, list) or not outputs:
             return None
         mm_output = getattr(outputs[0], "multimodal_output", None)
-        if not isinstance(mm_output, dict):
+        if not isinstance(mm_output, Mapping):
             return None
         return mm_output.get("audio")
 
