@@ -369,16 +369,13 @@ class StableDiffusionXLPipeline(
                 "time_ids": add_time_ids,
             }
 
-        # Prepare timesteps first (needed for init_noise_sigma in prepare_latents)
-        # EulerDiscreteScheduler.set_timesteps uses numpy internally,
-        # so we must keep internal tensors on CPU for the call, then move to device.
+        # XPU workaround: set_timesteps uses numpy internally and needs CPU tensors.
         for attr in ("alphas_cumprod", "sigmas", "timesteps"):
             if hasattr(self.scheduler, attr):
                 val = getattr(self.scheduler, attr)
                 if hasattr(val, "device") and val.device.type != "cpu":
                     setattr(self.scheduler, attr, val.cpu())
         self.scheduler.set_timesteps(num_inference_steps)
-        # Move scheduler tensors to device for arithmetic with XPU latents
         self.scheduler.sigmas = self.scheduler.sigmas.to(self.device)
         self.scheduler.timesteps = self.scheduler.timesteps.to(self.device)
         timesteps = self.scheduler.timesteps
