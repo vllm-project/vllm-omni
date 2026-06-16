@@ -768,11 +768,18 @@ def calculate_metrics(
             total_input += outputs[i].prompt_len
             tpot = 0
             if output_len > 1:
-                try:
-                    latency_minus_ttft = outputs[i].text_latency - outputs[i].ttft
-                except Exception:
-                    latency_minus_ttft = outputs[i].latency - outputs[i].ttft
-                tpot = latency_minus_ttft / (output_len - 1)
+                if outputs[i].itl:
+                    # Use mean(ITL) directly so per-request TPOT == mean(ITL).
+                    # The ITL list records one entry per SSE chunk; server may
+                    # bundle multiple tokens per chunk, so len(itl)+1 != output_len.
+                    # Using mean(itl) keeps TPOT and ITL on the same footing.
+                    tpot = sum(outputs[i].itl) / len(outputs[i].itl)
+                else:
+                    try:
+                        latency_minus_ttft = outputs[i].text_latency - outputs[i].ttft
+                    except Exception:
+                        latency_minus_ttft = outputs[i].latency - outputs[i].ttft
+                    tpot = latency_minus_ttft / (output_len - 1)
                 tpots.append(tpot)
             # Note: if output_len <= 1, we regard tpot as 0 for goodput
             all_tpots.append(tpot)
