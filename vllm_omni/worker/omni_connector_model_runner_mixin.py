@@ -46,6 +46,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def is_declared_full_payload_producer_stage(model_config: Any) -> bool:
+    """Stage declares a non-chunked full-payload producer hook in the pipeline."""
+    if getattr(model_config, "async_chunk", False):
+        return False
+    if getattr(model_config, "final_output", False):
+        return False
+    next_stage_proc = getattr(model_config, "custom_process_next_stage_input_func", None)
+    if not isinstance(next_stage_proc, str) or not next_stage_proc:
+        return False
+    return getattr(model_config, "model_stage", None) is not None
+
+
+def should_init_worker_omni_connector(model_config: Any) -> bool:
+    """Whether the worker should initialize ``init_omni_connectors`` for this stage."""
+    if getattr(model_config, "async_chunk", False):
+        return True
+    return is_declared_full_payload_producer_stage(model_config)
+
+
 def should_accumulate_full_payload_output(model_config, custom_process_func) -> bool:
     """Producer-side structural gate.
 
@@ -57,14 +76,7 @@ def should_accumulate_full_payload_output(model_config, custom_process_func) -> 
     """
     if custom_process_func is None:
         return False
-    if getattr(model_config, "async_chunk", False):
-        return False
-    if getattr(model_config, "final_output", False):
-        return False
-    next_stage_func = getattr(model_config, "custom_process_next_stage_input_func", None)
-    if not isinstance(next_stage_func, str) or not next_stage_func:
-        return False
-    return getattr(model_config, "model_stage", None) is not None
+    return is_declared_full_payload_producer_stage(model_config)
 
 
 class OmniConnectorModelRunnerMixin:

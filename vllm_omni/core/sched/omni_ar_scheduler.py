@@ -289,6 +289,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
+        inter_stage_outputs = getattr(model_runner_output, "inter_stage_outputs", None)
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
@@ -391,6 +392,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
+            inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
             kv_transfer_params = None
             status_before_stop = request.status
             finish_reason = None
@@ -465,7 +467,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+            if (
+                new_token_ids
+                or mm_output is not None
+                or inter_stage_output is not None
+                or pooler_output is not None
+                or kv_transfer_params
+                or stopped
+            ):
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     OmniEngineCoreOutput(
@@ -488,7 +497,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     )
                 )
                 if self.chunk_transfer_adapter is not None:
-                    self.chunk_transfer_adapter.save_async(mm_output, request, is_segment_finished)
+                    connector_mm_output = inter_stage_output if inter_stage_output is not None else mm_output
+                    if connector_mm_output is not None:
+                        self.chunk_transfer_adapter.save_async(
+                            connector_mm_output,
+                            request,
+                            is_segment_finished,
+                        )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors

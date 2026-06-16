@@ -9,6 +9,75 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Flat payload keys (``hidden_states.layer_0``, ``codes.audio``, …) partitioned
+# at worker ``sample_tokens`` into inter-stage vs client-facing wire channels.
+_INTER_STAGE_ROOT_KEYS: frozenset[str] = frozenset(
+    {
+        "hidden_states",
+        "hidden",
+        "embed",
+        "codes",
+        "latent",
+        "ids",
+        "meta",
+    }
+)
+_CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
+    {
+        "model_outputs",
+        "sr",
+        "audio",
+        "image",
+        "images",
+        "video",
+        "videos",
+        "trajectory_latents",
+        "latents",
+    }
+)
+
+
+def partition_flat_payload(
+    payload: Mapping[str, object],
+    *,
+    engine_output_type: str | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Split a flattened per-request payload into inter-stage vs client mm dicts."""
+    if not payload:
+        return {}, {}
+    inter_stage: dict[str, object] = {}
+    client_mm: dict[str, object] = {}
+    for key, value in payload.items():
+        root = key.split(".", 1)[0]
+        if root in _INTER_STAGE_ROOT_KEYS:
+            inter_stage[key] = value
+        elif root in _CLIENT_MM_ROOT_KEYS:
+            client_mm[key] = value
+        elif engine_output_type == "latent":
+            inter_stage[key] = value
+        elif engine_output_type in ("audio", "image", "video", "images", "videos"):
+            client_mm[key] = value
+        else:
+            client_mm[key] = value
+    return inter_stage, client_mm
+
+
+def partition_payload_list(
+    payloads: list[dict[str, object]],
+    *,
+    engine_output_type: str | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    inter_stage_list: list[dict[str, object]] = []
+    client_mm_list: list[dict[str, object]] = []
+    for payload in payloads:
+        inter_stage, client_mm = partition_flat_payload(
+            payload,
+            engine_output_type=engine_output_type,
+        )
+        inter_stage_list.append(inter_stage)
+        client_mm_list.append(client_mm)
+    return inter_stage_list, client_mm_list
+
 
 def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     """Pre-copies multimodal tensor to CPU once (not per-request) to avoid

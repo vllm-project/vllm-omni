@@ -39,11 +39,17 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.core.sched.omni_scheduling_coordinator import (
+    uses_full_payload_input_coordinator,
+)
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+from vllm_omni.worker.omni_connector_model_runner_mixin import (
+    OmniConnectorModelRunnerMixin,
+    should_init_worker_omni_connector,
+)
 
 logger = init_logger(__name__)
 
@@ -115,23 +121,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
-        # Worker-connector init is gated by a per-`model_arch` allowlist
-        # (covers both producer-side and consumer-side runners for the
-        # arches below).  Consumer-wait stages must be registered
-        # separately as `(model_arch, model_stage)` tuples in
-        # `omni_scheduling_coordinator._FULL_PAYLOAD_INPUT_STAGES`;
-        # forgetting that produces a Stage-1 hang on the consumer.
-        _OMNI_CONNECTOR_INIT_ARCHS = {
-            "Qwen3OmniMoeForConditionalGeneration",
-            "Qwen2_5OmniForConditionalGeneration",
-            "CovoAudioForConditionalGeneration",
-            "MiMoAudioModel",
-            "Qwen3TTSTalkerForConditionalGeneration",
-            "Qwen3TTSCode2Wav",
-            "CosyVoice3Model",
-            "DyninOmniForConditionalGeneration",
-        }
-        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+        if should_init_worker_omni_connector(self.model_config) or uses_full_payload_input_coordinator(
+            self.model_config
+        ):
             self.init_omni_connectors(
                 vllm_config=self.vllm_config,
                 model_config=self.model_config,
@@ -964,7 +956,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return None
         if per_req_payloads is None:
             return None
-        return [_ensure_tensor_values(payload) if payload else {} for payload in per_req_payloads]
+        wire: list[dict[str, torch.Tensor] | None] = []
+        for payload in per_req_payloads:
+            if not payload:
+                wire.append(None)
+            else:
+                wire.append(_ensure_tensor_values(payload))
+        if all(item is None for item in wire):
+            return None
+        return wire
 
     @torch.inference_mode()
     def sample_tokens(
@@ -1280,13 +1280,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))
 
-        if pooler_output and self._should_accumulate_full_payload_output():
+        engine_output_type = getattr(self.vllm_config.model_config, "engine_output_type", None)
+        pooler_inter, pooler_client = partition_payload_list(
+            pooler_output or [],
+            engine_output_type=engine_output_type,
+        )
+
+        if pooler_inter and self._should_accumulate_full_payload_output():
             for i, rid in enumerate(req_ids_output_copy):
                 req_state = self.requests.get(rid)
-                if req_state is not None and pooler_output[i]:
-                    self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
+                if req_state is not None and pooler_inter[i]:
+                    self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
 
-        multimodal_outputs = self._build_multimodal_outputs(pooler_output)
+        inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
+        multimodal_outputs = self._build_multimodal_outputs(pooler_client)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_lists = None
             if self.routed_experts_initialized:
@@ -1299,6 +1306,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 pooler_output=None,
                 multimodal_outputs=multimodal_outputs,
+                inter_stage_outputs=inter_stage_outputs,
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
