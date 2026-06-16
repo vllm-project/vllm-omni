@@ -114,7 +114,7 @@ pytest -s -v -m "advanced_model" --run-level=advanced_model
 
 ### L4 (nightly)
 
-**Function** (e2e expansion — default when user asks for “L4 功能用例”):
+**Function** (e2e expansion — default when user asks for “L4 functional cases”):
 
 ```bash
 cd tests
@@ -144,11 +144,11 @@ Nightly **L4** for a model is often **multiple jobs** in `test-nightly.yml`, not
 
 | Pillar | User says | Deliver | Nightly step |
 |--------|-----------|---------|--------------|
-| **Function** | “L4 功能用例” / “functional” / `*_expansion.py` | `tests/e2e/.../test_<model>_expansion.py` | `· Function Test with H100/L4` |
-| **Perf** | “性能” / “perf” / “benchmark” / “完整 L4” | `tests/dfx/perf/tests/test_<model>_vllm_omni.json` + runner | `· Perf Test · <Model>` |
-| **Accuracy** | “精度” / “accuracy” / “similarity” | `tests/e2e/accuracy/test_<model>*.py` | `· Accuracy Test` |
+| **Function** | “L4 functional cases” / “functional” / `*_expansion.py` | `tests/e2e/.../test_<model>_expansion.py` | `· Function Test with H100/L4` |
+| **Perf** | “performance” / “perf” / “benchmark” / “full L4” | `tests/dfx/perf/tests/test_<model>_vllm_omni.json` + runner | `· Perf Test · <Model>` |
+| **Accuracy** | “accuracy” / “similarity” | `tests/e2e/accuracy/test_<model>*.py` | `· Accuracy Test` |
 
-**Rule:** “L4 功能用例” → **Function only** by default. State that Perf/Accuracy are separate pillars; add them only when requested.
+**Rule:** “L4 functional cases” → **Function only** by default. State that Perf/Accuracy are separate pillars; add them only when requested.
 
 **Diffusion perf JSON** (`tests/dfx/perf/tests/test_<slug>_vllm_omni.json`): array of objects with `test_name`, `server_params` (`model`, `serve_args`), `benchmark_params[]`, and per-workload **`baseline`** (`throughput_qps`, `latency_mean`, `peak_memory_mb_mean`). Copy structure from `test_qwen_image_vllm_omni.json` in-tree.
 
@@ -185,7 +185,7 @@ Do **not** put throughput/latency baselines inside `test_*_expansion.py` — tha
 
 ## Invalid parameter validation (weekly / dfx)
 
-When the user’s test plan includes **异常参数校验**, **invalid request bodies**, or **HTTP 4xx** validation against a live server:
+When the user’s test plan includes **invalid parameter validation**, **invalid request bodies**, or **HTTP 4xx** validation against a live server:
 
 1. **Do not** author these in `tests/e2e/online_serving/test_*.py` or `*_expansion.py`. **Move** any drafted `test_*` into `tests/dfx/reliability/invalid_param_test/`.
 2. **Pick script by route** (extend in-tree file):
@@ -259,9 +259,9 @@ When adding or modifying tests, do not stop at “where the file lives” — al
 7. **Fixture scope**: default **`omni_server` + `openai_client`** / **`omni_runner` + `omni_runner_handler`** (module). Use **`omni_server_function` + `openai_client_function`** / **`omni_runner_function` + `omni_runner_handler_function`** only when each `test_*` must spawn a fresh instance. Parametrize name must match fixture (`omni_server` vs `omni_server_function`).
 8. **Type marker**: `omni`, `tts`, or `diffusion` on every model e2e module.
 9. **Diffusion L4 Function**: wire `*_expansion.py` into **X2I(&A&T)** or **X2V** **Function Test** in **`test-nightly.yml` only** — do not add `test-merge.yml` unless the user also requested L3.
-10. **Diffusion L4 Perf** (only when requested): add `tests/dfx/perf/tests/test_<slug>_vllm_omni.json` + **Perf Test · &lt;Model&gt;** step (artifact upload); not part of “L4 功能用例” by default.
+10. **Diffusion L4 Perf** (only when requested): add `tests/dfx/perf/tests/test_<slug>_vllm_omni.json` + **Perf Test · &lt;Model&gt;** step (artifact upload); not part of “L4 functional cases” by default.
 11. **E2E Buildkite (L2/L3 only)**: `test-ready.yml` / `test-merge.yml` steps need **`source_file_dependencies`** + full **`agents` + `plugins`**. **L4 nightly** uses explicit file lists or perf scripts in `test-nightly.yml` (no merge job).
-12. **Invalid param / 异常参数**: cases in **`tests/dfx/reliability/invalid_param_test/`** (route-matching script), `send_*_http_request` + `err_code`, `pytest.mark.slow` + `H100`/`L4`; CI = **`test-weekly.yml`** only — do not put in e2e or nightly.
+12. **Invalid param**: cases in **`tests/dfx/reliability/invalid_param_test/`** (route-matching script), `send_*_http_request` + `err_code`, `pytest.mark.slow` + `H100`/`L4`; CI = **`test-weekly.yml`** only — do not put in e2e or nightly.
 13. **Prerequisites**: GPU tier, HF cache/token, and any module `skipif` / platform-only YAML.
 
 ## Buildkite pipeline mapping

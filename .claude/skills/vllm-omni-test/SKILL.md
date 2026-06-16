@@ -100,7 +100,7 @@ Existing references: `tests/e2e/offline_inference/test_qwen2_5_omni.py` (L2-styl
 | **Performance / benchmark** | `tests/dfx/perf/tests/*.json` + `run_*_benchmark.py` | JSON or script-driven server + load config; assert explicit metrics / baselines | L4 Perf: `full_model` + `benchmark`; wire `test-nightly.yml` Perf steps |
 | **Invalid parameter / negative HTTP validation** | `tests/dfx/reliability/invalid_param_test/` | Live `omni_server` + low-level `send_*_http_request` with `err_code` / `err_message` | `pytest.mark.slow` + `omni` / `tts` / `diffusion` + `@hardware_marks` (`H100` or `L4`); CI in **`test-weekly.yml`** (not ready/merge/nightly) |
 
-**If the user’s test plan includes 异常参数校验 / invalid params / negative HTTP / 400 validation:** do **not** add those `test_*` functions to `tests/e2e/online_serving/test_*.py` or `*_expansion.py`. **Move or author them** under `tests/dfx/reliability/invalid_param_test/` in the **endpoint-matching script** (see **Invalid parameter validation** below). Success-path e2e and invalid-param dfx tests must stay in separate modules.
+**If the user’s test plan includes invalid parameter validation / invalid params / negative HTTP / 400 validation:** do **not** add those `test_*` functions to `tests/e2e/online_serving/test_*.py` or `*_expansion.py`. **Move or author them** under `tests/dfx/reliability/invalid_param_test/` in the **endpoint-matching script** (see **Invalid parameter validation** below). Success-path e2e and invalid-param dfx tests must stay in separate modules.
 
 **1b. Model type — `omni` vs `tts` vs `diffusion`**
 
@@ -429,7 +429,7 @@ L1 tests under `tests/entrypoints/` may use **FastAPI `TestClient`** or direct h
 
 #### Invalid parameter validation (`tests/dfx/reliability/invalid_param_test/`)
 
-When the user asks for **异常参数校验**, **invalid request bodies**, **HTTP 4xx contract tests**, or any case that sends **malformed / out-of-range / mismatched** API payloads against a **live** server:
+When the user asks for **invalid parameter validation**, **invalid request bodies**, **HTTP 4xx contract tests**, or any case that sends **malformed / out-of-range / mismatched** API payloads against a **live** server:
 
 1. **Do not** place these in `tests/e2e/online_serving/` or `*_expansion.py`. If already drafted there, **move** the `test_*` into the correct `invalid_param_test` script and delete the duplicate from e2e.
 2. **Pick the script by HTTP route** (extend an existing file; add a new `test_invalid_<area>.py` only when no in-tree script covers that route family):
@@ -587,7 +587,7 @@ Implementation strategy:
 | **Perf** | `· Perf Test · <Model>` | Throughput / latency / memory benchmarks | `tests/dfx/perf/tests/test_<model>_vllm_omni.json` + runner script |
 | **Doc** (optional) | `· Doc Test` | Runnable doc examples | `tests/examples/*/test_text_to_image.py`, … |
 
-**Default when the user asks for “L4 功能用例” / “L4 functional cases”:** deliver **Function** pillar only (`*_expansion.py` + Function Test shard in `test-nightly.yml`). **Do not** silently add Perf or Accuracy unless the user also asks for **性能** / **benchmark** / **accuracy** / **完整 L4** / **full L4 coverage**.
+**Default when the user asks for “L4 functional cases”:** deliver **Function** pillar only (`*_expansion.py` + Function Test shard in `test-nightly.yml`). **Do not** silently add Perf or Accuracy unless the user also asks for **performance** / **benchmark** / **accuracy** / **full L4** / **full L4 coverage**.
 
 **When the user explicitly asks for L4 perf (or full L4 including perf):**
 
@@ -637,7 +637,7 @@ If the test is not already collected by an existing pipeline command (for exampl
 | **L4** (`*_expansion.py`, `full_model`) | `test-nightly.yml` — append file to the matching nightly shard (X2I / X2V / Omni / TTS) **or** note it is already collected by an existing `-m` / `-k` sweep | `test-merge.yml` (L3 / `advanced_model`) or `test-ready.yml` (L2) |
 | **L3** | `test-merge.yml` with `advanced_model` + `source_file_dependencies` | `test-nightly.yml` unless user also wants nightly |
 | **L2** | `test-ready.yml` with `core_model` + `source_file_dependencies` | merge / nightly pipelines |
-| **Invalid param / 异常参数** | `test-weekly.yml` — **Invalid parameters Test** group (`-m "slow and H100"` / `-m "slow and L4"`). Usually **no YAML edit** when appending cases to existing `invalid_param_test` scripts | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml` |
+| **Invalid param** | `test-weekly.yml` — **Invalid parameters Test** group (`-m "slow and H100"` / `-m "slow and L4"`). Usually **no YAML edit** when appending cases to existing `invalid_param_test` scripts | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml` |
 
 `test-nightly.yml` shards use **explicit pytest file paths** in `commands` (and PR labels like `diffusion-x2iat-test`); they generally **do not** use `source_file_dependencies`. Only suggest merge/ready YAML when the requested level is L3/L2 (or the user explicitly asks for multi-level CI).
 
@@ -874,8 +874,8 @@ When completing a request, return:
    - **L4 Accuracy**: `test-nightly.yml` **Accuracy Test** step under the same model-type group.
    - **L3**: `test-merge.yml` + full `source_file_dependencies` + `agents` + `plugins`.
    - **L2**: `test-ready.yml` + same E2E block requirements.
-   - **Invalid param / 异常参数**: `test-weekly.yml` — note **Invalid parameters Test · H100/L4** group; usually **no YAML change** when only extending existing scripts.
-   If the user asked only for **L4 功能用例**, state explicitly that **Perf / Accuracy / Invalid param** were not included (offer to add if needed). If the plan mixes **success e2e** and **invalid param**, split deliverables across e2e vs `invalid_param_test/` and call out both CI files.
+   - **Invalid param**: `test-weekly.yml` — note **Invalid parameters Test · H100/L4** group; usually **no YAML change** when only extending existing scripts.
+   If the user asked only for **L4 functional cases**, state explicitly that **Perf / Accuracy / Invalid param** were not included (offer to add if needed). If the plan mixes **success e2e** and **invalid param**, split deliverables across e2e vs `invalid_param_test/` and call out both CI files.
 4. **Run commands (required)** — always include, in fenced `bash` blocks:
    - **Local — whole file**: `cd tests` then `pytest -s -v <path> …`
    - **Local — single test** (optional but preferred when the change is one function): `pytest -s -v path::test_func …`
