@@ -2,11 +2,8 @@ import os
 import warnings
 from typing import Annotated, Literal, TypeAlias
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-BASE_PREFIX = "VLLM_OMNI_SERVER"
-STORAGE_PREFIX = f"{BASE_PREFIX}_STORAGE__"
 
 
 def _resolve_deprecated_env(old_name: str, new_name: str, value):
@@ -21,9 +18,7 @@ def _resolve_deprecated_env(old_name: str, new_name: str, value):
     return value if new_name in os.environ else old
 
 
-class FileBackend(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix=STORAGE_PREFIX)
-
+class FileBackend(BaseModel):
     type: Literal["file"] = "file"
     path: str = Field(default="/tmp/storage", validate_default=True, description="Local path to store completed files.")
     file_concurrency: int = Field(
@@ -39,12 +34,14 @@ class FileBackend(BaseSettings):
     @field_validator("path", mode="before")
     @classmethod
     def _migrate_path(cls, value):
-        return _resolve_deprecated_env("VLLM_OMNI_STORAGE_PATH", f"{STORAGE_PREFIX}PATH", value)
+        return _resolve_deprecated_env("VLLM_OMNI_STORAGE_PATH", "VLLM_OMNI_SERVER_STORAGE__PATH", value)
 
     @field_validator("file_concurrency", mode="before")
     @classmethod
     def _migrate_file_concurrency(cls, value):
-        return _resolve_deprecated_env("VLLM_OMNI_STORAGE_MAX_CONCURRENCY", f"{STORAGE_PREFIX}FILE_CONCURRENCY", value)
+        return _resolve_deprecated_env(
+            "VLLM_OMNI_STORAGE_MAX_CONCURRENCY", "VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY", value
+        )
 
     @model_validator(mode="after")
     def set_default_ttl_sweep_interval(self) -> "FileBackend":
@@ -60,7 +57,7 @@ STORAGE_BACKENDS: TypeAlias = Annotated[
 
 
 class ServerSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix=BASE_PREFIX)
+    model_config = SettingsConfigDict(env_prefix="VLLM_OMNI_SERVER_", env_nested_delimiter="__")
     storage: STORAGE_BACKENDS = Field(default_factory=FileBackend)
 
 
