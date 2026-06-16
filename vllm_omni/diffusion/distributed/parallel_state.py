@@ -784,7 +784,7 @@ def initialize_model_parallel(
     )
     sp_group_ranks = rank_generator.get_ranks("sp")
     od_config: OmniDiffusionConfig | None = get_forward_context().omni_diffusion_config
-    use_moe_parallel_mapping = bool(od_config and od_config.is_moe)
+    use_moe_parallel_mapping = bool(enable_expert_parallel and od_config and od_config.is_moe)
     global _DP
     assert _DP is None, "data parallel group is already initialized"
     _DP = init_model_parallel_group(

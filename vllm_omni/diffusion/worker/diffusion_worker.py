@@ -229,7 +229,7 @@ class DiffusionWorker:
         parallel_config = self.od_config.parallel_config
         vllm_config.parallel_config.tensor_parallel_size = parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = parallel_config.data_parallel_size
-        if self.od_config.is_moe:
+        if self.od_config.is_moe and parallel_config.enable_expert_parallel:
             vllm_config.parallel_config.prefill_context_parallel_size = parallel_config.sequence_parallel_size
             vllm_config.parallel_config.data_parallel_size = (
                 parallel_config.data_parallel_size * parallel_config.cfg_parallel_size
