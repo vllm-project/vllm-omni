@@ -1,5 +1,5 @@
 """
-Tests for Stable Diffusion 3.5 medium model.
+E2E expansion tests for Stable Diffusion 3.5 medium model (nightly CI).
 """
 
 import pytest
@@ -18,13 +18,16 @@ FOUR_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
 POSITIVE_PROMPT = "A serene mountain landscape at sunset"
 NEGATIVE_PROMPT = "blurry, low quality, distorted"
 
+MODEL = "stabilityai/stable-diffusion-3.5-medium"
 
-# For now, we only test one or two good configurations for this model to keep
-# the CI light. The test cases focus on the most common feature combinations
-# that provide good performance improvements.
+
 def _get_diffusion_feature_cases(model: str):
     return [
-        # Cache-DiT + CFG Parallel + Tensor Parallel
+        pytest.param(
+            OmniServerParams(model=model),
+            id="default",
+            marks=FOUR_CARD_FEATURE_MARKS,
+        ),
         pytest.param(
             OmniServerParams(
                 model=model,
@@ -37,6 +40,7 @@ def _get_diffusion_feature_cases(model: str):
                     "2",
                 ],
             ),
+            id="cache_dit_cfg_tp",
             marks=[
                 *FOUR_CARD_FEATURE_MARKS,
                 pytest.mark.skip(reason="#3432"),
@@ -47,9 +51,7 @@ def _get_diffusion_feature_cases(model: str):
 
 @pytest.mark.parametrize(
     "omni_server",
-    _get_diffusion_feature_cases(
-        model="stabilityai/stable-diffusion-3.5-medium",
-    ),
+    _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
 def test_sd3_medium(omni_server: OmniServer, openai_client: OpenAIClientHandler):

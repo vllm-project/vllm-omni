@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Tests of common diffusion feature combinations in online serving mode
-for HunyuanVideo-1.5-T2V (480p).
+E2E expansion tests for HunyuanVideo-1.5-T2V (480p) online serving (nightly CI).
 
 Coverage (H100, since model cannot fit L4):
+- Default smoke (1 GPU)
 - CacheDiT + Layerwise CPU offloading (1 GPU)
 - CacheDiT + TP=2 + VAE patch parallel=2 (2 GPUs)
 """
@@ -26,12 +26,16 @@ PARALLEL_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
 def _get_diffusion_feature_cases(model: str):
-    """Return L4 diffusion feature cases for HunyuanVideo-1.5.
+    """Return diffusion feature cases for HunyuanVideo-1.5.
 
     Designed for 2x H100 environment per issue #1832.
     """
     return [
-        # (1 GPU) CacheDiT + Layerwise CPU offloading
+        pytest.param(
+            OmniServerParams(model=model),
+            id="default",
+            marks=SINGLE_CARD_MARKS,
+        ),
         pytest.param(
             OmniServerParams(
                 model=model,
@@ -44,7 +48,6 @@ def _get_diffusion_feature_cases(model: str):
             id="single_card_cachedit_layerwise",
             marks=SINGLE_CARD_MARKS,
         ),
-        # (2 GPUs) CacheDiT + TP=2 + VAE patch parallel=2
         pytest.param(
             OmniServerParams(
                 model=model,
@@ -73,7 +76,7 @@ def test_hunyuan_video_15_t2v(
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,
 ):
-    """L4 diffusion feature coverage for HunyuanVideo-1.5-T2V on H100."""
+    """Diffusion feature coverage for HunyuanVideo-1.5-T2V on H100."""
     form_data = {
         "prompt": PROMPT,
         "negative_prompt": NEGATIVE_PROMPT,

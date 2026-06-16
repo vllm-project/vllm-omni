@@ -3,6 +3,7 @@ Recommended tests of diffusion features that are available in online serving mod
 and are supported by the following model:
 - LongCat-Image: text-to-image with single prompt input
 Coverage:
+- Default smoke (1 GPU)
 - CPU offloading (model-level sequential offload via --enable-cpu-offload)
 - Cache-DiT
 - SP (Ulysses)
@@ -25,10 +26,17 @@ NEGATIVE_PROMPT = "blurry, low quality, distorted, oversaturated"
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
+MODEL = "meituan-longcat/LongCat-Image"
+
 
 def _get_diffusion_feature_cases(model: str):
     """Return diffusion feature cases for LongCat-Image."""
     return [
+        pytest.param(
+            OmniServerParams(model=model),
+            id="default",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
         pytest.param(
             OmniServerParams(
                 model=model,
@@ -55,7 +63,7 @@ def _get_diffusion_feature_cases(model: str):
 
 @pytest.mark.parametrize(
     "omni_server",
-    _get_diffusion_feature_cases("meituan-longcat/LongCat-Image"),
+    _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
 def test_longcat_image(omni_server: OmniServer, openai_client: OpenAIClientHandler):
