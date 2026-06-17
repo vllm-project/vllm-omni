@@ -60,6 +60,7 @@ _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 _FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
 _DIT: GroupCoordinator | None = None
+_EP_GROUP_RANKS: list[list[int]] | None = None
 
 
 def generate_masked_orthogonal_rank_groups(
@@ -307,6 +308,11 @@ def get_ring_parallel_world_size():
 
 def get_ring_parallel_rank():
     return get_sp_group().ring_rank
+
+
+def get_expert_parallel_group_ranks() -> list[list[int]]:
+    assert _EP_GROUP_RANKS is not None, "expert parallel group ranks are not initialized"
+    return _EP_GROUP_RANKS
 
 
 # PP
@@ -857,20 +863,24 @@ def initialize_model_parallel(
         parallel_mode="fully_shard",
     )
 
+    global _EP_GROUP_RANKS
     if use_moe_parallel_mapping:
+        _EP_GROUP_RANKS = rank_generator.get_ranks("tp-sp-cfg-dp")
         vllm_parallel_state._EP = init_model_parallel_group(
-            group_ranks=rank_generator.get_ranks("tp-sp-cfg-dp"),
+            group_ranks=_EP_GROUP_RANKS,
             local_rank=get_world_group().local_rank,
             backend=backend,
             parallel_mode="expert",
         )
+    else:
+        _EP_GROUP_RANKS = None
 
     init_dit_group(dit_parallel_size, backend)
 
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _DP, _CFG, _SP, _PP, _FS
+    global _DP, _CFG, _SP, _PP, _FS, _EP_GROUP_RANKS
 
     if vllm_parallel_state._DP and vllm_parallel_state._DP is not _DP:
         vllm_parallel_state._DP.destroy()
@@ -899,6 +909,7 @@ def destroy_model_parallel():
     if vllm_parallel_state._EP:
         vllm_parallel_state._EP.destroy()
     vllm_parallel_state._EP = None
+    _EP_GROUP_RANKS = None
 
     if _PP:
         _PP.destroy()

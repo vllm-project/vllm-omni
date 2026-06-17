@@ -18,6 +18,7 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_data_parallel_world_size,
+    get_expert_parallel_group_ranks,
     get_world_group,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context as omni_get_ctx
@@ -46,18 +47,24 @@ def _init_mc2_group_for_diffusion(
     expert_parallel_size: int,
     backend: str,
     local_rank: int,
+    group_ranks: list[list[int]] | None = None,
 ) -> None:
     import vllm_ascend.distributed.parallel_state as vllm_ascend_parallel_state
 
     if getattr(vllm_ascend_parallel_state, "_MC2", None) is not None:
         return
-    if world_size % expert_parallel_size != 0:
+    if group_ranks is None:
+        if world_size % expert_parallel_size != 0:
+            raise ValueError(
+                f"world_size ({world_size}) must be divisible by expert_parallel_size ({expert_parallel_size})"
+            )
+        all_ranks = torch.arange(world_size).reshape(-1, expert_parallel_size)
+        group_ranks = [x.tolist() for x in all_ranks.unbind(0)]
+    elif any(len(ranks) != expert_parallel_size for ranks in group_ranks):
         raise ValueError(
-            f"world_size ({world_size}) must be divisible by expert_parallel_size ({expert_parallel_size})"
+            f"All MC2 groups must have expert_parallel_size ({expert_parallel_size}) ranks, "
+            f"but got group_ranks={group_ranks}"
         )
-    all_ranks = torch.arange(world_size).reshape(-1, expert_parallel_size)
-    group_ranks = all_ranks.unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
     vllm_ascend_parallel_state._MC2 = vllm_init_model_parallel_group(
         group_ranks,
         local_rank,
@@ -117,6 +124,9 @@ def prepare_hunyuan_fused_moe_runtime() -> None:
         expert_parallel_size=expert_parallel_size,
         backend=backend,
         local_rank=local_rank,
+        group_ranks=get_expert_parallel_group_ranks()
+        if vllm_config.parallel_config.enable_expert_parallel
+        else None,
     )
 
     moe_comm_type = _select_moe_comm_method(vllm_config=vllm_config)

@@ -71,7 +71,7 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
     monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EP_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
@@ -116,6 +116,44 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
         25,
         26,
         27,
+    ]
+    assert parallel_state.get_expert_parallel_group_ranks() == [
+        [
+            0,
+            1,
+            2,
+            3,
+            8,
+            9,
+            10,
+            11,
+            16,
+            17,
+            18,
+            19,
+            24,
+            25,
+            26,
+            27,
+        ],
+        [
+            4,
+            5,
+            6,
+            7,
+            12,
+            13,
+            14,
+            15,
+            20,
+            21,
+            22,
+            23,
+            28,
+            29,
+            30,
+            31,
+        ],
     ]
 
     ep_groups = [group.local_group for group in created_groups if group.parallel_mode == "expert"]
