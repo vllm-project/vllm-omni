@@ -28,7 +28,7 @@ For HunyuanImage-3.0, stage wise metrics will be like:
 ==================================================
 </pre>
 
-The name of stages are fetched from `StagePipelineConfig.model_stage`, which are usually defined in `vllm_omni/model_executor/modes/<YOUR_MODEL>/pipeline.py`.
+The name of stages are fetched from `StagePipelineConfig.model_stage`, which are usually defined in `vllm_omni/model_executor/models/<YOUR_MODEL>/pipeline.py`.
 
 ## Core functions of stage benchmark
 
