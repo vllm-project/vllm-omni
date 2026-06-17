@@ -164,12 +164,12 @@
           "median_audio_ttfp_ms": [
             300,
             1000,
-            5000
+            6500
           ],
           "median_audio_rtf": [
             0.25,
             0.35,
-            1.10
+            1.30
           ],
           "audio_throughput": [
             30,
@@ -293,12 +293,12 @@
           "median_audio_ttfp_ms": [
             100,
             1000,
-            5000
+            5600
           ],
           "median_audio_rtf": [
             0.25,
             0.40,
-            1.20
+            1.40
           ],
           "audio_throughput": [
             30,
