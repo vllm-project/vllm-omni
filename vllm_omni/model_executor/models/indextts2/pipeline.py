@@ -26,6 +26,7 @@ INDEXTTS2_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             extras={"skip_tokenizer_init": True, "tokenizer": "gpt2"},
+            custom_process_next_stage_input_func=f"{_PROC}.talker2s2mel_full_payload",
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [8193],
@@ -40,7 +41,7 @@ INDEXTTS2_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="IndexTTS2S2MelDecoder",
-            sync_process_input_func=f"{_PROC}.talker2s2mel",
+            sync_process_input_func=f"{_PROC}.talker2s2mel_token_only",
             extras={"skip_tokenizer_init": True, "tokenizer": "gpt2"},
             sampling_constraints={"detokenize": True},
         ),

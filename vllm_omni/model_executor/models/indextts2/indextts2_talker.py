@@ -92,13 +92,12 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         self.has_postprocess = True
         self.requires_raw_input_tokens = True
         self.enable_update_additional_information = True
-        # Payload-at-finish: S2Mel consumes the complete code sequence only at
-        # request end (async_chunk=false), so per-step payload D2H+serialize
-        # (~1ms/step) is pure waste. The AR runner gates payload emission to
-        # the finishing step using these markers; make_omni_output then emits
-        # the full accumulated codes/latent (GPU refs, cheap every step).
-        self.omni_payload_at_request_end = True
-        self.omni_request_end_token_ids = (self.stop_mel_token,)
+        # S2Mel consumes the complete code sequence only at request end, but
+        # the connector accumulator needs to observe each appendable AR delta.
+        # Keep runner request-end gating disabled and emit per-step rows from
+        # make_omni_output; the full-payload builder reconstructs the sequence.
+        self.omni_payload_at_request_end = False
+        self.omni_request_end_token_ids = ()
         self._speaker_cache = get_speaker_cache()
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("codes", "mel"),
@@ -298,19 +297,17 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
         device = hidden.device
         latent_dim = hidden.shape[-1]
-        _zero_codes = torch.zeros(0, dtype=torch.long, device=device)
+        _zero_codes = torch.zeros(0, 1, dtype=torch.long, device=device)
         _zero_latent = torch.zeros(0, latent_dim, dtype=hidden.dtype, device=device)
 
         # Per-request lists: to_payload_element dispatches lists via
         # element[idx], giving correct per-request mapping even during
-        # mixed prefill+decode steps.  Zero-length placeholders for prefill
+        # mixed prefill+decode steps. Zero-length placeholders for prefill
         # requests are harmless — torch.cat ignores them in accumulation.
         #
-        # full_mode (payload-at-finish): emit the complete accumulated
-        # codes/latent every step as GPU refs. The runner only builds the
-        # CPU payload for requests finishing this step, so exactly one full
-        # payload per request reaches the engine (consolidation is a no-op).
-        full_mode = getattr(self, "omni_payload_at_request_end", False)
+        # Export semantics are appendable deltas for the existing full-payload
+        # accumulator: codes.mel is a 2-D row [1, 1], hidden_states.latent is
+        # the aligned one-row [1, D] slice from meta.latent_acc.
         mel_codes_list: list[torch.Tensor] = []
         latent_list: list[torch.Tensor] = []
         meta_list: list[dict[str, Any]] = []
@@ -325,32 +322,31 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             mc = codes.get("mel")
             mel_len = 0
             if isinstance(mc, torch.Tensor) and mc.numel() > 0:
-                mel_len = int(mc.shape[0])
-                mel_codes_list.append(mc if full_mode else mc[-1:].contiguous())
+                code_seq = mc.reshape(-1)
+                mel_len = int(code_seq.shape[0])
+                mel_codes_list.append(code_seq[-1:].reshape(1, 1).contiguous())
             else:
                 mel_codes_list.append(_zero_codes)
 
             meta = info.get("meta", {})
             lat_acc = meta.get("latent_acc")
             if isinstance(lat_acc, torch.Tensor) and lat_acc.numel() > 0 and mel_len > 0:
-                if full_mode:
-                    # Code i pairs with lat_acc row i (the hidden that
-                    # predicted it); postprocess for this step has not run
-                    # yet, so lat_acc has exactly mel_len rows.
-                    latent_list.append(lat_acc[:mel_len])
-                else:
-                    idx = min(max(mel_len - 1, 0), int(lat_acc.shape[0]) - 1)
-                    latent_list.append(lat_acc[idx : idx + 1].contiguous())
+                # Code i pairs with lat_acc row i (the hidden that predicted
+                # it). Emit the row aligned to the current last mel code.
+                lat_seq = lat_acc.reshape(-1, lat_acc.shape[-1]) if lat_acc.ndim != 2 else lat_acc
+                idx = min(max(mel_len - 1, 0), int(lat_seq.shape[0]) - 1)
+                latent_list.append(lat_seq[idx : idx + 1].contiguous())
             else:
                 hs = info.get("hidden_states", {})
                 lat = hs.get("latent")
                 if isinstance(lat, torch.Tensor) and lat.numel() > 0:
-                    latent_list.append(lat if full_mode else lat[-1:].contiguous())
+                    lat_seq = lat.reshape(-1, lat.shape[-1]) if lat.ndim != 2 else lat
+                    latent_list.append(lat_seq[-1:].contiguous())
                 else:
                     latent_list.append(_zero_latent)
 
             req_meta: dict[str, Any] = {}
-            if full_mode or mel_len <= 1:
+            if mel_len == 1:
                 s_ref = meta.get("S_ref")
                 ref_mel = meta.get("ref_mel")
                 style = meta.get("style")
@@ -502,8 +498,13 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             _cached = self._speaker_cache.get(_speaker_cache_key)
 
         # --- Load audio and extract features ---
-        wav_16k, wav_22k = load_reference_audio(voice_path, device, mode="speaker")
-        w2v_model, w2v_proc = load_wav2vec2(self.model_path, device)  # singleton; needed by emotion path too
+        # Keep the speaker-cache hit path truly lazy: cached speaker artifacts are
+        # sufficient for conditioning and same-speaker emotion reuse, so avoid
+        # loading/resampling reference audio and touching the Wav2Vec2 singleton
+        # unless a miss (or an uncached separate emotion audio) actually needs it.
+        wav_16k: torch.Tensor | None = None
+        w2v_model = None
+        w2v_proc = None
 
         if _cached is not None:
             s_ref = _cached["S_ref"].to(device)
@@ -512,6 +513,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             spk_cond_emb = _cached["spk_cond_emb"].to(device)
             logger.debug("[PREFILL_PP] speaker cache HIT for %s", _voice_name)
         else:
+            wav_16k, wav_22k = load_reference_audio(voice_path, device, mode="speaker")
+            w2v_model, w2v_proc = load_wav2vec2(self.model_path, device)
             self._ensure_w2v_stat_loaded(device)
             spk_cond_emb = wav2vec_extract(wav_16k, w2v_model, w2v_proc, device, self._w2v_stat)
 
@@ -684,7 +687,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
     def _compute_emotion_vector(
         self,
         *,
-        wav_16k: torch.Tensor,
+        wav_16k: torch.Tensor | None,
         speaker_audio_path: Any,
         emo_audio_path: str | None,
         emo_voice_name: str | None,
@@ -769,6 +772,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 logger.debug("[EMO] cache HIT for %s", emo_voice_name)
             else:
                 emo_wav_16k, _ = load_reference_audio(emo_audio_path, device, mode="emotion")
+                if w2v_model is None or w2v_proc is None:
+                    w2v_model, w2v_proc = load_wav2vec2(self.model_path, device)
                 self._ensure_w2v_stat_loaded(device)
                 emo_cond_emb = wav2vec_extract(emo_wav_16k, w2v_model, w2v_proc, device, self._w2v_stat)
                 if _emo_cache_key is not None:

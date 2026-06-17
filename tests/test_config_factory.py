@@ -1023,6 +1023,35 @@ class TestQwen3TTSPipeline:
         }
 
 
+class TestIndexTTS2Pipeline:
+    def test_registered(self):
+        p = _PIPELINE_REGISTRY.get("indextts2")
+        assert p is not None
+        assert p.model_arch == "IndexTTS2TalkerForConditionalGeneration"
+        assert len(p.stages) == 2
+        assert p.validate() == []
+
+    def test_full_payload_wiring(self):
+        p = _PIPELINE_REGISTRY["indextts2"]
+        s0 = p.get_stage(0)
+        s1 = p.get_stage(1)
+
+        assert s0.custom_process_next_stage_input_func is not None
+        assert s0.custom_process_next_stage_input_func.endswith("talker2s2mel_full_payload")
+        assert s1.sync_process_input_func is not None
+        assert s1.sync_process_input_func.endswith("talker2s2mel_token_only")
+        assert s1.execution_type == StageExecutionType.LLM_GENERATION
+        assert s1.final_output_type == "audio"
+
+    def test_deploy_merge_keeps_stage1_single_request(self):
+        deploy = load_deploy_config(get_deploy_config_path("indextts2.yaml"))
+        stages = merge_pipeline_deploy(_PIPELINE_REGISTRY["indextts2"], deploy)
+
+        assert stages[0].custom_process_next_stage_input_func.endswith("talker2s2mel_full_payload")
+        assert stages[1].sync_process_input_func.endswith("talker2s2mel_token_only")
+        assert stages[1].yaml_engine_args["max_num_seqs"] == 1
+
+
 class TestMingFlashOmniPipeline:
     def test_registered(self):
         p = _PIPELINE_REGISTRY.get("ming_flash_omni")
