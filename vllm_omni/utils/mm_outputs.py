@@ -61,24 +61,6 @@ def partition_flat_payload(
             client_mm[key] = value
     return inter_stage, client_mm
 
-
-def partition_payload_list(
-    payloads: list[dict[str, object]],
-    *,
-    engine_output_type: str | None = None,
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    inter_stage_list: list[dict[str, object]] = []
-    client_mm_list: list[dict[str, object]] = []
-    for payload in payloads:
-        inter_stage, client_mm = partition_flat_payload(
-            payload,
-            engine_output_type=engine_output_type,
-        )
-        inter_stage_list.append(inter_stage)
-        client_mm_list.append(client_mm)
-    return inter_stage_list, client_mm_list
-
-
 def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     """Pre-copies multimodal tensor to CPU once (not per-request) to avoid
     redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.

@@ -467,14 +467,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if (
-                new_token_ids
-                or mm_output is not None
-                or inter_stage_output is not None
-                or pooler_output is not None
-                or kv_transfer_params
-                or stopped
-            ):
+            if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     OmniEngineCoreOutput(
@@ -496,17 +489,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id, None),
                     )
                 )
-                if self.chunk_transfer_adapter is not None:
-                    connector_mm_output = inter_stage_output if inter_stage_output is not None else mm_output
-                    if connector_mm_output is not None:
-                        self.chunk_transfer_adapter.save_async(
-                            connector_mm_output,
-                            request,
-                            is_segment_finished,
-                        )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+            if self.chunk_transfer_adapter is not None and inter_stage_output is not None:
+                self.chunk_transfer_adapter.save_async(
+                    inter_stage_output,
+                    request,
+                    is_segment_finished,
+                )
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:

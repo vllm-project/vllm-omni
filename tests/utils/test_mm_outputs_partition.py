@@ -1,6 +1,6 @@
 import torch
 
-from vllm_omni.utils.mm_outputs import partition_flat_payload, partition_payload_list
+from vllm_omni.utils.mm_outputs import partition_flat_payload
 
 
 def test_partition_thinker_latent_payload():
@@ -33,16 +33,3 @@ def test_partition_code2wav_client_audio():
     assert inter == {}
     assert client == payload
 
-
-def test_partition_payload_list_preserves_length():
-    payloads = [
-        {"hidden_states.layer_0": torch.zeros(1, 2)},
-        {"model_outputs": torch.zeros(1, 10)},
-    ]
-    inter_list, client_list = partition_payload_list(payloads, engine_output_type="latent")
-    assert len(inter_list) == 2
-    assert len(client_list) == 2
-    assert "hidden_states.layer_0" in inter_list[0]
-    assert client_list[0] == {}
-    assert inter_list[1] == {}
-    assert "model_outputs" in client_list[1]

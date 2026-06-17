@@ -37,16 +37,10 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.core.sched.omni_scheduling_coordinator import (
-    uses_full_payload_input_coordinator,
-)
 from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-from vllm_omni.worker.omni_connector_model_runner_mixin import (
-    OmniConnectorModelRunnerMixin,
-    should_init_worker_omni_connector,
-)
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +55,18 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if should_init_worker_omni_connector(self.model_config) or uses_full_payload_input_coordinator(
-            self.model_config
-        ):
+        # Mirrors the init allowlist in gpu_ar_model_runner.py.
+        _OMNI_CONNECTOR_INIT_ARCHS = {
+            "Qwen3OmniMoeForConditionalGeneration",
+            "Qwen2_5OmniForConditionalGeneration",
+            "CovoAudioForConditionalGeneration",
+            "MiMoAudioModel",
+            "Qwen3TTSTalkerForConditionalGeneration",
+            "Qwen3TTSCode2Wav",
+            "CosyVoice3Model",
+            "DyninOmniForConditionalGeneration",
+        }
+        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(
                 vllm_config=self.vllm_config,
                 model_config=self.model_config,
