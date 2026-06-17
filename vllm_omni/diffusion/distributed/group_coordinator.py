@@ -80,6 +80,7 @@ class GroupCoordinator:
 
     # available attributes:
     rank: int  # global rank
+    group_ranks: list[list[int]]  # global ranks for all groups
     ranks: list[int]  # global ranks in the group
     world_size: int  # size of the group
     # difference between `local_rank` and `rank_in_group`:
@@ -102,6 +103,7 @@ class GroupCoordinator:
     ):
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
+        self.group_ranks = group_ranks
         self.device_group = None
         self.cpu_group = None
         self.shm_broadcaster = None
@@ -622,6 +624,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
     """
     available attributes:
     rank: int  # global rank
+    group_ranks: list[list[int]]  # global ranks for all groups
     ranks: list[int]  # global ranks in the group
     world_size: int  # size of the group
     difference between `local_rank` and `rank_in_group`:
@@ -645,6 +648,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
     ):
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
+        self.group_ranks = group_ranks
         self.device_group = None
         self.cpu_group = None
         self.cpu_groups = []
