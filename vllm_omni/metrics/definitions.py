@@ -114,6 +114,10 @@ E2E_REQUEST_LATENCY_S = METRIC_PREFIX + "e2e_request_latency_s"
 # ``_total`` at exposition time.
 REQUESTS_SUCCESS = METRIC_PREFIX + "requests_success"
 
+# Token counters — aggregated across all pipeline stages per request.
+PROMPT_TOKENS = METRIC_PREFIX + "prompt_tokens"
+GENERATION_TOKENS = METRIC_PREFIX + "generation_tokens"
+
 
 # ============================================================================
 # Audio family (per-stage + per-replica audio path metrics)
