@@ -2261,7 +2261,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             sample_rate=sample_rate,
             response_format="wav",
             speed=1.0,
-            stream_format="audio",
             base64_encode=True,
         )
 
@@ -3220,7 +3219,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     sample_rate=sample_rate,
                     response_format="wav",
                     speed=1.0,
-                    stream_format="audio",
                     base64_encode=True,
                 )
                 audio_response: AudioResponse = self.create_audio(audio_obj)
