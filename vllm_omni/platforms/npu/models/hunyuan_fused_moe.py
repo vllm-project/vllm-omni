@@ -124,9 +124,7 @@ def prepare_hunyuan_fused_moe_runtime() -> None:
         expert_parallel_size=expert_parallel_size,
         backend=backend,
         local_rank=local_rank,
-        group_ranks=get_expert_parallel_group_ranks()
-        if vllm_config.parallel_config.enable_expert_parallel
-        else None,
+        group_ranks=get_expert_parallel_group_ranks() if vllm_config.parallel_config.enable_expert_parallel else None,
     )
 
     moe_comm_type = _select_moe_comm_method(vllm_config=vllm_config)

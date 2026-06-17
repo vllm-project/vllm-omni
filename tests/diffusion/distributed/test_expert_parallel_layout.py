@@ -40,9 +40,7 @@ def _install_fake_vllm_ascend(monkeypatch):
         "vllm_ascend.ops": ModuleType("vllm_ascend.ops"),
         "vllm_ascend.ops.fused_moe": ModuleType("vllm_ascend.ops.fused_moe"),
         "vllm_ascend.ops.fused_moe.fused_moe": ModuleType("vllm_ascend.ops.fused_moe.fused_moe"),
-        "vllm_ascend.ops.fused_moe.moe_comm_method": ModuleType(
-            "vllm_ascend.ops.fused_moe.moe_comm_method"
-        ),
+        "vllm_ascend.ops.fused_moe.moe_comm_method": ModuleType("vllm_ascend.ops.fused_moe.moe_comm_method"),
         "vllm_ascend.utils": ModuleType("vllm_ascend.utils"),
     }
 
@@ -73,14 +71,10 @@ def _install_fake_vllm_ascend(monkeypatch):
     fake_modules["vllm_ascend.utils"].get_ascend_device_type = lambda: FakeAscendDeviceType.A2
 
     fake_modules["vllm_ascend"].distributed = fake_modules["vllm_ascend.distributed"]
-    fake_modules["vllm_ascend.distributed"].parallel_state = fake_modules[
-        "vllm_ascend.distributed.parallel_state"
-    ]
+    fake_modules["vllm_ascend.distributed"].parallel_state = fake_modules["vllm_ascend.distributed.parallel_state"]
     fake_modules["vllm_ascend"].ops = fake_modules["vllm_ascend.ops"]
     fake_modules["vllm_ascend.ops"].fused_moe = fake_modules["vllm_ascend.ops.fused_moe"]
-    fake_modules["vllm_ascend.ops.fused_moe"].fused_moe = fake_modules[
-        "vllm_ascend.ops.fused_moe.fused_moe"
-    ]
+    fake_modules["vllm_ascend.ops.fused_moe"].fused_moe = fake_modules["vllm_ascend.ops.fused_moe.fused_moe"]
     fake_modules["vllm_ascend.ops.fused_moe"].moe_comm_method = fake_modules[
         "vllm_ascend.ops.fused_moe.moe_comm_method"
     ]
