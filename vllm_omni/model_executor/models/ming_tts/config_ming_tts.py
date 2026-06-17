@@ -182,6 +182,7 @@ def _coerce_bailing_moe_config(value: Any) -> BailingMoeConfig:
     # standard 1D RoPE (all three position dims are equal). Strip rope_scaling
     # so vLLM's get_rope uses plain RoPE — it has no "3D" scaling type.
     cfg.rope_scaling = None
+    cfg.rope_parameters = {"rope_type": "default", "rope_theta": cfg.rope_theta}
     return cfg
 
 
