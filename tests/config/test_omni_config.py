@@ -26,6 +26,7 @@ from vllm_omni.config.omni_config import (
 from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     _PIPELINE_REGISTRY,
+    _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
     PipelineConfig,
@@ -107,6 +108,11 @@ def test_stage_by_id_raises_for_unknown_stage():
         omni_config.stage_by_id(99)
 
 
+def test_resolve_execution_mode_rejects_unknown_execution_type():
+    with pytest.raises(ValueError, match="Unsupported stage execution type"):
+        omni_config_module._resolve_execution_mode("unknown_execution_type")
+
+
 def test_from_registry_preserves_current_pipeline_config_object():
     omni_config = VllmOmniConfig.from_registry("minicpmo_4_5")
 
@@ -144,16 +150,44 @@ def test_from_registry_applies_cli_overrides_without_stage_config_runtime_bridge
     assert stage1.parallel_config.tensor_parallel_size == 2
 
 
+def test_from_registry_does_not_route_server_cli_keys_to_diffusion_stage():
+    omni_config = VllmOmniConfig.from_registry(
+        "dreamzero",
+        deploy_config_path="dreamzero_tp1_cfg2",
+        cli_overrides={
+            "host": "0.0.0.0",
+            "port": 8000,
+            "api_key": "secret",
+            "stage_0_host": "127.0.0.1",
+            "stage_0_port": 23456,
+        },
+    )
+
+    stage = omni_config.stage_by_id(0)
+
+    assert stage.diffusion_config is not None
+    assert stage.diffusion_config.host == "127.0.0.1"
+    assert stage.diffusion_config.port == 23456
+    assert not hasattr(stage.diffusion_config, "api_key")
+
+
 def test_pipeline_deploy_cli_fields_reuse_legacy_pipeline_wide_engine_fields():
     assert omni_config_module._PIPELINE_DEPLOY_CLI_FIELDS is PIPELINE_WIDE_ENGINE_FIELDS
     assert "active_stream_window" in omni_config_module._PIPELINE_DEPLOY_CLI_FIELDS
     assert "custom_voice_dir" in omni_config_module._PIPELINE_DEPLOY_CLI_FIELDS
 
 
+def test_stage_deploy_engine_fields_reuse_legacy_stage_deploy_fields():
+    assert omni_config_module._STAGE_DEPLOY_ENGINE_FIELDS == tuple(_STAGE_DEPLOY_FIELDS)
+    assert "tensor_parallel_size" in omni_config_module._STAGE_DEPLOY_ENGINE_FIELDS
+    assert "stage_id" not in omni_config_module._STAGE_DEPLOY_ENGINE_FIELDS
+
+
 def test_from_registry_keeps_worker_backend_separate_from_distributed_executor_backend():
     omni_config = VllmOmniConfig.from_registry("dreamzero", deploy_config_path="dreamzero_tp1_cfg2")
 
-    assert omni_config.stage_by_id(0).parallel_config.distributed_executor_backend == "mp"
+    assert omni_config.stage_by_id(0).diffusion_config is not None
+    assert omni_config.stage_by_id(0).diffusion_config.distributed_executor_backend == "mp"
     assert omni_config.orchestrator_config.worker_backend == "multi_process"
 
 

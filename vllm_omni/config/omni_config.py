@@ -10,18 +10,19 @@ so parity can be proven before later PRs cut consumers over to these classes.
 from __future__ import annotations
 
 import copy
-import re
 from collections.abc import Mapping
-from dataclasses import field, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, cast
 
 from pydantic import ConfigDict, Field
 from vllm.config.utils import config
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     _PIPELINE_REGISTRY,
+    _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
     PipelineConfig,
@@ -29,10 +30,13 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     StageType,
+    _apply_platform_overrides,
+    _resolve_scheduler,
+    _scheduler_path,
+    _select_processor_funcs,
+    build_stage_runtime_overrides,
     load_deploy_config,
 )
-
-_STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
 _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
     StageExecutionType.LLM_AR: (StageType.LLM, "ar"),
@@ -40,47 +44,123 @@ _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str |
     StageExecutionType.DIFFUSION: (StageType.DIFFUSION, None),
 }
 
-_ASYNC_AR_SCHEDULER = "vllm_omni.core.sched.omni_ar_scheduler.OmniARAsyncScheduler"
-_SYNC_AR_SCHEDULER = "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler"
-_GENERATION_SCHEDULER = "vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler"
-
-_ORCHESTRATOR_ONLY_CLI_KEYS = frozenset(
-    {
-        "api_key",
-        "allowed_local_media_path",
-        "allowed_media_domains",
-        "chat_template",
-        "chat_template_content_format",
-        "deploy_config_path",
-        "disable_frontend_multiprocessing",
-        "enable_auto_tool_choice",
-        "enable_prompt_tokens_details",
-        "enable_request_id_headers",
-        "enable_server_load_tracking",
-        "enable_ssl_refresh",
-        "enable_tokenizer_info_endpoint",
-        "enable_tool_server",
-        "enable_tool_template",
-        "enable_log_outputs",
-        "host",
-        "port",
-        "root_path",
-        "served_model_name",
-        "ssl_ca_certs",
-        "ssl_cert_reqs",
-        "ssl_certfile",
-        "ssl_keyfile",
-        "tool_call_parser",
-        "tool_parser_plugin",
-        "uvicorn_log_level",
-    }
-)
-
 _PIPELINE_DEPLOY_CLI_FIELDS = PIPELINE_WIDE_ENGINE_FIELDS
+
+
+class _QuantizationEngineOverrides(TypedDict, total=False):
+    quantization_config: Any
+    quantization: str
+
+
+class _ModelEngineOverrides(TypedDict, total=False):
+    enable_sleep_mode: bool
+    subtalker_sampling_params: dict[str, Any]
+    has_sampling_extra_args: bool
+    task_type: str
+    codec_frame_rate_hz: float
+    enforce_eager: bool
+    enable_flashinfer_autotune: bool
+    compilation_config: dict[str, Any]
+    enable_multithread_weight_load: bool
+    num_weight_load_threads: int
+    disable_autocast: bool
+
+
+class _LoadEngineOverrides(TypedDict, total=False):
+    load_format: str
+    tokenizer_mode: str
+    config_format: str
+    skip_mm_profiling: bool
+
+
+class _CacheEngineOverrides(TypedDict, total=False):
+    gpu_memory_utilization: float
+    enable_prefix_caching: bool
+    disable_hybrid_kv_cache_manager: bool
+    mm_processor_cache_gb: float
+
+
+class _SchedulerEngineOverrides(TypedDict, total=False):
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    max_model_len: int
+    enable_chunked_prefill: bool
+    async_scheduling: bool
+
+
+class _RuntimeEngineOverrides(TypedDict, total=False):
+    devices: str
+    num_replicas: int
+    env: dict[str, Any]
+    num_gpus: int
+    log_level: str
+    log_stats: bool
+    profiler_config: dict[str, Any]
+
+
+class _ParallelConfigEngineOverrides(TypedDict, total=False):
+    pipeline_parallel_size: int
+    data_parallel_size: int
+    tensor_parallel_size: int
+    sequence_parallel_size: int
+    ulysses_degree: int
+    ring_degree: int
+    ulysses_mode: str
+    cfg_parallel_size: int
+    vae_patch_parallel_size: int
+    use_hsdp: bool
+    hsdp_shard_size: int
+    hsdp_replicate_size: int
+    enable_expert_parallel: bool
+
+
+class _ParallelEngineOverrides(_ParallelConfigEngineOverrides, total=False):
+    parallel_config: _ParallelConfigEngineOverrides | Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _StageEngineValues:
+    """Typed projections of legacy flat per-stage ``yaml_engine_args``."""
+
+    quantization: _QuantizationEngineOverrides
+    model: _ModelEngineOverrides
+    load: _LoadEngineOverrides
+    cache: _CacheEngineOverrides
+    scheduler: _SchedulerEngineOverrides
+    runtime: _RuntimeEngineOverrides
+    parallel: _ParallelEngineOverrides
+    diffusion: _DiffusionEngineOverrides
+
+
+@dataclass(frozen=True)
+class _DiffusionEngineOverrides:
+    """Validated diffusion projection of legacy flat per-stage engine args."""
+
+    _values: dict[str, Any]
+
+    @classmethod
+    def from_engine(cls, engine: Mapping[str, Any]) -> _DiffusionEngineOverrides:
+        return cls(_select_engine_overrides(engine, _DIFFUSION_STAGE_ENGINE_FIELDS))
+
+    def to_kwargs(self) -> dict[str, Any]:
+        return {name: _copy_value(value) for name, value in self._values.items()}
+
+
+_IMMUTABLE_CONFIG_VALUE_TYPES = (str, int, float, bool, bytes, type(None))
+
+
+def _can_share_config_value(value: Any) -> bool:
+    if isinstance(value, _IMMUTABLE_CONFIG_VALUE_TYPES):
+        return True
+    if isinstance(value, tuple):
+        return all(_can_share_config_value(item) for item in value)
+    return False
 
 
 def _copy_value(value: Any) -> Any:
     """Copy nested config values so the structured view owns its data."""
+    if _can_share_config_value(value):
+        return value
     return copy.deepcopy(value)
 
 
@@ -88,11 +168,15 @@ def _copy_if_not_none(value: Any) -> Any:
     return None if value is None else _copy_value(value)
 
 
-def _first_defined(*values: Any, default: Any = None) -> Any:
+def _config_kwargs(overrides: Mapping[str, Any]) -> dict[str, Any]:
+    return {name: _copy_value(value) for name, value in overrides.items() if value is not None}
+
+
+def _first_defined(*values: Any) -> Any:
     for value in values:
         if value is not None:
             return _copy_value(value)
-    return default
+    return None
 
 
 def _validate_async_chunk_support(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
@@ -109,134 +193,23 @@ def _validate_async_chunk_support(pipeline: PipelineConfig, deploy: DeployConfig
 
 
 def _resolve_execution_mode(execution_type: StageExecutionType) -> tuple[StageType, str | None]:
-    return _EXECUTION_TYPE_TO_STAGE_WORKER.get(execution_type, (StageType.LLM, None))
+    try:
+        return _EXECUTION_TYPE_TO_STAGE_WORKER[execution_type]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported stage execution type: {execution_type!r}") from exc
 
 
 def _resolve_scheduler_path(execution_type: StageExecutionType, async_scheduling: bool = True) -> str | None:
-    if execution_type == StageExecutionType.LLM_AR:
-        return _ASYNC_AR_SCHEDULER if async_scheduling else _SYNC_AR_SCHEDULER
-    if execution_type == StageExecutionType.LLM_GENERATION:
-        return _GENERATION_SCHEDULER
-    return None
-
-
-def _select_processor_funcs(
-    topology: StagePipelineConfig,
-    async_chunk: bool,
-) -> tuple[str | None, str | None]:
-    input_proc = topology.custom_process_input_func
-    next_stage_proc = topology.custom_process_next_stage_input_func
-    if async_chunk and topology.async_chunk_process_next_stage_input_func:
-        next_stage_proc = topology.async_chunk_process_next_stage_input_func
-    elif not async_chunk and topology.sync_process_input_func:
-        input_proc = topology.sync_process_input_func
-    return input_proc, next_stage_proc
-
-
-def _get_recursively_merged_dict(original: Mapping[str, Any], update: Mapping[str, Any]) -> dict[str, Any]:
-    merged = dict(original)
-    for key, update_value in update.items():
-        original_value = merged.get(key)
-        if isinstance(original_value, Mapping) and isinstance(update_value, Mapping):
-            merged[key] = _get_recursively_merged_dict(original_value, update_value)
-        else:
-            merged[key] = _copy_value(update_value)
-    return merged
-
-
-_PLATFORM_DEEP_MERGE_KEYS = frozenset(
-    {
-        "default_sampling_params",
-        "subtalker_sampling_params",
-        "engine_extras",
-        "engine_args",
-    }
-)
-
-
-def _platform_stage_overrides(
-    stage_data: Mapping[str, Any],
-) -> tuple[dict[str, Any], str | None, dict[str, Any] | None]:
-    runtime_cfg = _mapping_or_empty(stage_data.get("runtime"))
-    if "engine_args" in stage_data:
-        overrides = dict(_mapping_or_empty(stage_data.get("engine_args")))
-        if "num_replicas" in runtime_cfg:
-            overrides["num_replicas"] = runtime_cfg["num_replicas"]
-        return overrides, runtime_cfg.get("devices"), runtime_cfg.get("env")
-
-    overrides = {
-        key: _copy_value(value) for key, value in stage_data.items() if key not in ("stage_id", "devices", "env")
-    }
-    return overrides, stage_data.get("devices"), stage_data.get("env")
-
-
-def _apply_platform_overrides_to_deploy(
-    deploy: DeployConfig,
-    platform: str | None = None,
-) -> DeployConfig:
-    if platform is None:
-        from vllm_omni.platforms import current_omni_platform
-
-        device_name = getattr(current_omni_platform, "device_name", None)
-        platform = device_name.lower() if isinstance(device_name, str) else None
-    if platform is None or deploy.platforms is None:
-        return deploy
-
-    platform_section = deploy.platforms.get(platform)
-    if platform_section is None:
-        return deploy
-
-    stage_by_id = {stage.stage_id: stage for stage in deploy.stages}
-    for stage_data in platform_section.get("stages", []):
-        stage_id = stage_data.get("stage_id")
-        stage_deploy = stage_by_id.get(stage_id)
-        if stage_deploy is None:
-            continue
-
-        overrides, devices, env = _platform_stage_overrides(stage_data)
-        if devices is not None:
-            stage_deploy.devices = devices
-        if env is not None:
-            if isinstance(stage_deploy.env, Mapping) and isinstance(env, Mapping):
-                stage_deploy.env = {**stage_deploy.env, **env}
-            else:
-                stage_deploy.env = env
-
-        for key, value in overrides.items():
-            if hasattr(stage_deploy, key):
-                if key in _PLATFORM_DEEP_MERGE_KEYS and isinstance(value, Mapping):
-                    base_value = getattr(stage_deploy, key, None)
-                    if isinstance(base_value, Mapping):
-                        setattr(stage_deploy, key, _get_recursively_merged_dict(base_value, value))
-                        continue
-                setattr(stage_deploy, key, value)
-            else:
-                stage_deploy.engine_extras[key] = _copy_value(value)
-
-    return deploy
+    return _scheduler_path(_resolve_scheduler(execution_type, async_scheduling))
 
 
 def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dict[str, Any]:
+    runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
+    global_stage_fields = _global_stage_cli_fields()
     result: dict[str, Any] = {}
-    for key, value in cli_overrides.items():
-        if value is None or key in _ORCHESTRATOR_ONLY_CLI_KEYS:
-            continue
-
-        match = _STAGE_OVERRIDE_PATTERN.match(key)
-        if match is not None:
-            override_stage_id = int(match.group(1))
-            if override_stage_id == stage_id:
-                result[match.group(2)] = _copy_value(value)
-            continue
-
-        if key in {
-            "model",
-            "stage_id",
-            "stage_configs_path",
-            "async_chunk",
-        }:
-            continue
-        result[key] = _copy_value(value)
+    for key, value in runtime_overrides.items():
+        if key in global_stage_fields or f"stage_{stage_id}_{key}" in cli_overrides:
+            result[key] = _copy_value(value)
     return result
 
 
@@ -285,7 +258,11 @@ class LoadConfig:
 
 @config
 class CacheConfig:
-    """Per-stage cache and memory behavior."""
+    """Per-stage engine cache and memory behavior.
+
+    This is separate from ``DiffusionConfig.cache_config``, which configures
+    vLLM-Omni diffusion-specific cache backends such as TeaCache and Cache-DiT.
+    """
 
     gpu_memory_utilization: float = Field(default=0.90, gt=0.0, le=1.0)
     enable_prefix_caching: bool = False
@@ -460,8 +437,8 @@ class DiffusionConfig:
     extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-
+        # Keep diffusion imports lazy so importing vllm_omni.config does not
+        # pull in the full diffusion stack unless a diffusion stage is built.
         from vllm_omni.diffusion.data import (
             AttentionConfig,
             DiffusionCacheConfig,
@@ -484,6 +461,7 @@ class DiffusionConfig:
             raise TypeError(f"additional_config must be a mapping or None, got {type(self.additional_config)!r}")
 
         if isinstance(self.dtype, str):
+            # Import torch only when string dtype normalization is needed.
             import torch
 
             dtype_map = {
@@ -657,41 +635,38 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
 )
 
 
-_STAGE_DEPLOY_TYPED_ENGINE_FIELDS: tuple[str, ...] = (
-    "subtalker_sampling_params",
-    "tensor_parallel_size",
-    "gpu_memory_utilization",
-    "max_num_seqs",
-    "max_num_batched_tokens",
-    "max_model_len",
-    "enforce_eager",
-    "async_scheduling",
-    "disable_hybrid_kv_cache_manager",
-    "mm_processor_cache_gb",
-    "enable_expert_parallel",
-    "ulysses_degree",
-    "ulysses_mode",
-    "ring_degree",
-    "sequence_parallel_size",
-    "cfg_parallel_size",
-    "vae_patch_parallel_size",
-    "use_hsdp",
-    "hsdp_shard_size",
-    "hsdp_replicate_size",
-    "compilation_config",
-    "profiler_config",
-    "skip_mm_profiling",
-    "enable_flashinfer_autotune",
-    "config_format",
-    "load_format",
-    "tokenizer_mode",
-)
+_STAGE_DEPLOY_ENGINE_FIELDS: tuple[str, ...] = tuple(_STAGE_DEPLOY_FIELDS)
 
 _DIFFUSION_STAGE_ENGINE_FIELDS = _DIFFUSION_CONFIG_FIELDS - {"model", "stage_id"}
+
+_QUANTIZATION_ENGINE_FIELDS = frozenset(_QuantizationEngineOverrides.__annotations__)
+_MODEL_ENGINE_FIELDS = frozenset(_ModelEngineOverrides.__annotations__)
+_LOAD_ENGINE_FIELDS = frozenset(_LoadEngineOverrides.__annotations__)
+_CACHE_ENGINE_FIELDS = frozenset(_CacheEngineOverrides.__annotations__)
+_SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
+_RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
+_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_ParallelConfigEngineOverrides.__annotations__)
+_PARALLEL_ENGINE_FIELDS = _PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
+
+
+def _global_stage_cli_fields() -> frozenset[str]:
+    # Lazy import avoids vllm_omni.config -> omni_config -> engine.arg_utils ->
+    # vllm_omni.config during package-level config imports.
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+
+    return (
+        frozenset(f.name for f in fields(OmniEngineArgs))
+        | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
+        | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
+    ) - {"model", "stage_id", "stage_configs_path", "async_chunk"}
 
 
 def _mapping_or_empty(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _select_engine_overrides(engine: Mapping[str, Any], keys: set[str] | frozenset[str]) -> dict[str, Any]:
+    return {name: _copy_value(engine[name]) for name in keys if name in engine and engine[name] is not None}
 
 
 def _stage_engine_overrides(stage_deploy: StageDeployConfig | None) -> dict[str, Any]:
@@ -699,7 +674,7 @@ def _stage_engine_overrides(stage_deploy: StageDeployConfig | None) -> dict[str,
         return {}
 
     overrides: dict[str, Any] = {}
-    for name in _STAGE_DEPLOY_TYPED_ENGINE_FIELDS:
+    for name in _STAGE_DEPLOY_ENGINE_FIELDS:
         value = getattr(stage_deploy, name)
         if value is not None:
             overrides[name] = _copy_value(value)
@@ -710,11 +685,26 @@ def _stage_engine_overrides(stage_deploy: StageDeployConfig | None) -> dict[str,
 def _stage_engine_values(
     stage_deploy: StageDeployConfig | None,
     stage_cli_overrides: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> _StageEngineValues:
     engine = _stage_engine_overrides(stage_deploy)
     if stage_cli_overrides:
         engine.update(_copy_value(stage_cli_overrides))
-    return engine
+    return _StageEngineValues(
+        quantization=cast(
+            _QuantizationEngineOverrides,
+            _select_engine_overrides(engine, _QUANTIZATION_ENGINE_FIELDS),
+        ),
+        model=cast(_ModelEngineOverrides, _select_engine_overrides(engine, _MODEL_ENGINE_FIELDS)),
+        load=cast(_LoadEngineOverrides, _select_engine_overrides(engine, _LOAD_ENGINE_FIELDS)),
+        cache=cast(_CacheEngineOverrides, _select_engine_overrides(engine, _CACHE_ENGINE_FIELDS)),
+        scheduler=cast(
+            _SchedulerEngineOverrides,
+            _select_engine_overrides(engine, _SCHEDULER_ENGINE_FIELDS),
+        ),
+        runtime=cast(_RuntimeEngineOverrides, _select_engine_overrides(engine, _RUNTIME_ENGINE_FIELDS)),
+        parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
+        diffusion=_DiffusionEngineOverrides.from_engine(engine),
+    )
 
 
 def _stage_sampling_params(
@@ -855,28 +845,28 @@ def _build_stage_config(
     deploy: DeployConfig,
     topology: StagePipelineConfig,
     stage_deploy: StageDeployConfig | None,
-    engine: Mapping[str, Any],
+    engine: _StageEngineValues,
     *,
     model: str | None,
 ) -> VllmOmniStageConfig:
     input_proc, next_stage_proc = _select_processor_funcs(topology, bool(deploy.async_chunk))
-    quantization_config = _build_quantization_config(deploy, engine)
-    parallel_config = _build_parallel_config(deploy, engine)
+    quantization_config = _build_quantization_config(deploy, engine.quantization)
+    parallel_config = _build_parallel_config(deploy, engine.parallel)
 
     stage_config = VllmOmniStageConfig(
         stage_pipeline_config=topology,
-        model_config=_build_model_config(topology, stage_deploy, engine),
-        load_config=_build_load_config(engine),
-        cache_config=_build_cache_config(deploy, engine),
-        scheduler_config=_build_scheduler_config(deploy, engine),
+        model_config=_build_model_config(topology, stage_deploy, engine.model),
+        load_config=_build_load_config(engine.load),
+        cache_config=_build_cache_config(deploy, engine.cache),
+        scheduler_config=_build_scheduler_config(deploy, engine.scheduler),
         connector_config=_build_connector_config(stage_deploy),
-        runtime_config=_build_runtime_config(stage_deploy, engine),
+        runtime_config=_build_runtime_config(stage_deploy, engine.runtime),
         parallel_config=parallel_config,
         diffusion_config=_build_diffusion_config(
             pipeline,
             deploy,
             topology,
-            engine,
+            engine.diffusion,
             model=model,
             quantization_config=quantization_config,
         ),
@@ -887,7 +877,7 @@ def _build_stage_config(
     return stage_config
 
 
-def _build_quantization_config(deploy: DeployConfig, engine: Mapping[str, Any]) -> Any:
+def _build_quantization_config(deploy: DeployConfig, engine: _QuantizationEngineOverrides) -> Any:
     return _first_defined(
         engine.get("quantization_config"),
         engine.get("quantization"),
@@ -898,70 +888,36 @@ def _build_quantization_config(deploy: DeployConfig, engine: Mapping[str, Any]) 
 def _build_model_config(
     topology: StagePipelineConfig,
     stage_deploy: StageDeployConfig | None,
-    engine: Mapping[str, Any],
+    engine: _ModelEngineOverrides,
 ) -> ModelConfig:
     return ModelConfig(
-        enable_sleep_mode=_first_defined(engine.get("enable_sleep_mode"), default=False),
         default_sampling_params=_stage_sampling_params(stage_deploy, topology),
-        subtalker_sampling_params=_copy_if_not_none(engine.get("subtalker_sampling_params")),
-        has_sampling_extra_args=_first_defined(engine.get("has_sampling_extra_args"), default=False),
-        task_type=_copy_if_not_none(engine.get("task_type")),
-        codec_frame_rate_hz=_copy_if_not_none(engine.get("codec_frame_rate_hz")),
-        enforce_eager=_first_defined(engine.get("enforce_eager"), default=False),
-        enable_flashinfer_autotune=_copy_if_not_none(engine.get("enable_flashinfer_autotune")),
-        compilation_config=_copy_if_not_none(engine.get("compilation_config")),
-        enable_multithread_weight_load=_first_defined(engine.get("enable_multithread_weight_load"), default=True),
-        num_weight_load_threads=_first_defined(engine.get("num_weight_load_threads"), default=4),
-        disable_autocast=_first_defined(engine.get("disable_autocast"), default=False),
+        **_config_kwargs(engine),
     )
 
 
-def _build_load_config(engine: Mapping[str, Any]) -> LoadConfig:
-    return LoadConfig(
-        load_format=_first_defined(engine.get("load_format"), default="auto"),
-        tokenizer_mode=_first_defined(engine.get("tokenizer_mode"), default="auto"),
-        config_format=_copy_if_not_none(engine.get("config_format")),
-        skip_mm_profiling=_copy_if_not_none(engine.get("skip_mm_profiling")),
-    )
+def _build_load_config(engine: _LoadEngineOverrides) -> LoadConfig:
+    return LoadConfig(**_config_kwargs(engine))
 
 
 def _build_cache_config(
     deploy: DeployConfig,
-    engine: Mapping[str, Any],
+    engine: _CacheEngineOverrides,
 ) -> CacheConfig:
-    return CacheConfig(
-        gpu_memory_utilization=_first_defined(
-            engine.get("gpu_memory_utilization"),
-            default=0.90,
-        ),
-        enable_prefix_caching=_first_defined(
-            engine.get("enable_prefix_caching"),
-            deploy.enable_prefix_caching,
-            default=False,
-        ),
-        disable_hybrid_kv_cache_manager=_first_defined(
-            engine.get("disable_hybrid_kv_cache_manager"),
-            default=False,
-        ),
-        mm_processor_cache_gb=_copy_if_not_none(engine.get("mm_processor_cache_gb")),
-    )
+    kwargs = _config_kwargs(engine)
+    if "enable_prefix_caching" not in kwargs and deploy.enable_prefix_caching is not None:
+        kwargs["enable_prefix_caching"] = _copy_value(deploy.enable_prefix_caching)
+    return CacheConfig(**kwargs)
 
 
 def _build_scheduler_config(
     deploy: DeployConfig,
-    engine: Mapping[str, Any],
+    engine: _SchedulerEngineOverrides,
 ) -> SchedulerConfig:
-    return SchedulerConfig(
-        max_num_seqs=_first_defined(engine.get("max_num_seqs"), default=128),
-        max_num_batched_tokens=_copy_if_not_none(engine.get("max_num_batched_tokens")),
-        max_model_len=_copy_if_not_none(engine.get("max_model_len")),
-        enable_chunked_prefill=_first_defined(
-            engine.get("enable_chunked_prefill"),
-            deploy.enable_chunked_prefill,
-            default=False,
-        ),
-        async_scheduling=_first_defined(engine.get("async_scheduling"), default=True),
-    )
+    kwargs = _config_kwargs(engine)
+    if "enable_chunked_prefill" not in kwargs and deploy.enable_chunked_prefill is not None:
+        kwargs["enable_chunked_prefill"] = _copy_value(deploy.enable_chunked_prefill)
+    return SchedulerConfig(**kwargs)
 
 
 def _build_connector_config(stage_deploy: StageDeployConfig | None) -> ConnectorConfig:
@@ -973,112 +929,50 @@ def _build_connector_config(stage_deploy: StageDeployConfig | None) -> Connector
     )
 
 
-def _build_runtime_config(stage_deploy: StageDeployConfig | None, engine: Mapping[str, Any]) -> RuntimeConfig:
-    devices = _first_defined(engine.get("devices"), stage_deploy.devices if stage_deploy is not None else None)
-    num_replicas = _first_defined(
-        engine.get("num_replicas"),
-        stage_deploy.num_replicas if stage_deploy is not None else 1,
-    )
-    env = _first_defined(engine.get("env"), stage_deploy.env if stage_deploy is not None else None)
-    return RuntimeConfig(
-        devices=_copy_if_not_none(devices),
-        num_replicas=int(num_replicas),
-        env=_copy_if_not_none(env),
-        num_gpus=_first_defined(engine.get("num_gpus"), default=1),
-        log_level=_first_defined(engine.get("log_level"), default="info"),
-        log_stats=_first_defined(engine.get("log_stats"), default=False),
-        profiler_config=_copy_if_not_none(engine.get("profiler_config")),
-    )
+def _build_runtime_config(stage_deploy: StageDeployConfig | None, engine: _RuntimeEngineOverrides) -> RuntimeConfig:
+    kwargs = _config_kwargs(engine)
+    if "devices" not in kwargs and stage_deploy is not None and stage_deploy.devices is not None:
+        kwargs["devices"] = _copy_value(stage_deploy.devices)
+    if "num_replicas" not in kwargs and stage_deploy is not None:
+        kwargs["num_replicas"] = stage_deploy.num_replicas
+    if "env" not in kwargs and stage_deploy is not None and stage_deploy.env is not None:
+        kwargs["env"] = _copy_value(stage_deploy.env)
+    return RuntimeConfig(**kwargs)
 
 
 def _build_parallel_config(
     deploy: DeployConfig,
-    engine: Mapping[str, Any],
+    engine: _ParallelEngineOverrides,
 ) -> ParallelConfig:
     parallel_config = _mapping_or_empty(engine.get("parallel_config"))
-    ulysses_degree = _first_defined(parallel_config.get("ulysses_degree"), engine.get("ulysses_degree"), default=1)
-    ring_degree = _first_defined(parallel_config.get("ring_degree"), engine.get("ring_degree"), default=1)
-    sequence_parallel_size = _first_defined(
-        parallel_config.get("sequence_parallel_size"),
-        engine.get("sequence_parallel_size"),
-        default=ulysses_degree * ring_degree,
-    )
-    return ParallelConfig(
-        pipeline_parallel_size=_first_defined(
-            parallel_config.get("pipeline_parallel_size"),
-            engine.get("pipeline_parallel_size"),
-            deploy.pipeline_parallel_size,
-            default=1,
-        ),
-        data_parallel_size=_first_defined(
-            parallel_config.get("data_parallel_size"),
-            engine.get("data_parallel_size"),
-            deploy.data_parallel_size,
-            default=1,
-        ),
-        tensor_parallel_size=_first_defined(
-            parallel_config.get("tensor_parallel_size"),
-            engine.get("tensor_parallel_size"),
-            default=1,
-        ),
-        sequence_parallel_size=sequence_parallel_size,
-        ulysses_degree=ulysses_degree,
-        ring_degree=ring_degree,
-        ulysses_mode=_first_defined(
-            parallel_config.get("ulysses_mode"),
-            engine.get("ulysses_mode"),
-            default="strict",
-        ),
-        cfg_parallel_size=_first_defined(
-            parallel_config.get("cfg_parallel_size"),
-            engine.get("cfg_parallel_size"),
-            default=1,
-        ),
-        vae_patch_parallel_size=_first_defined(
-            parallel_config.get("vae_patch_parallel_size"),
-            engine.get("vae_patch_parallel_size"),
-            default=1,
-        ),
-        use_hsdp=_first_defined(
-            parallel_config.get("use_hsdp"),
-            engine.get("use_hsdp"),
-            default=False,
-        ),
-        hsdp_shard_size=_first_defined(
-            parallel_config.get("hsdp_shard_size"),
-            engine.get("hsdp_shard_size"),
-            default=-1,
-        ),
-        hsdp_replicate_size=_first_defined(
-            parallel_config.get("hsdp_replicate_size"),
-            engine.get("hsdp_replicate_size"),
-            default=1,
-        ),
-        enable_expert_parallel=_first_defined(
-            parallel_config.get("enable_expert_parallel"),
-            engine.get("enable_expert_parallel"),
-            default=False,
-        ),
-    )
+    kwargs = {
+        name: _copy_value(value) for name in _PARALLEL_CONFIG_ENGINE_FIELDS if (value := engine.get(name)) is not None
+    }
+    kwargs.update(_config_kwargs(parallel_config))
+    if "pipeline_parallel_size" not in kwargs and deploy.pipeline_parallel_size is not None:
+        kwargs["pipeline_parallel_size"] = _copy_value(deploy.pipeline_parallel_size)
+    if "data_parallel_size" not in kwargs and deploy.data_parallel_size is not None:
+        kwargs["data_parallel_size"] = _copy_value(deploy.data_parallel_size)
+    if "sequence_parallel_size" not in kwargs and ("ulysses_degree" in kwargs or "ring_degree" in kwargs):
+        base_parallel = ParallelConfig()
+        kwargs["sequence_parallel_size"] = kwargs.get("ulysses_degree", base_parallel.ulysses_degree) * kwargs.get(
+            "ring_degree", base_parallel.ring_degree
+        )
+    return ParallelConfig(**kwargs)
 
 
 def _build_diffusion_config(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
     topology: StagePipelineConfig,
-    engine: Mapping[str, Any],
+    engine: _DiffusionEngineOverrides,
     *,
     model: str | None,
     quantization_config: Any,
 ) -> DiffusionConfig | None:
     if topology.execution_type != StageExecutionType.DIFFUSION:
         return None
-
-    diffusion_kwargs = {
-        name: _copy_value(engine[name])
-        for name in _DIFFUSION_STAGE_ENGINE_FIELDS
-        if name in engine and engine[name] is not None
-    }
+    diffusion_kwargs = engine.to_kwargs()
     diffusion_kwargs["stage_id"] = topology.stage_id
     diffusion_kwargs["model_arch"] = _first_defined(
         diffusion_kwargs.get("model_arch"),
@@ -1147,7 +1041,7 @@ class VllmOmniConfig:
             if cli_overrides.get(name) is not None:
                 setattr(deploy_for_registry, name, _copy_value(cli_overrides[name]))
 
-        deploy_for_registry = _apply_platform_overrides_to_deploy(deploy_for_registry)
+        deploy_for_registry = _apply_platform_overrides(deploy_for_registry)
         _validate_async_chunk_support(pipeline, deploy_for_registry)
         deploy_by_id = {stage.stage_id: stage for stage in deploy_for_registry.stages}
         model = cli_overrides.get("model")
