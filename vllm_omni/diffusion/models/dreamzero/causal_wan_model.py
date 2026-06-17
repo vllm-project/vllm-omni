@@ -290,6 +290,18 @@ class WanT2VCrossAttention(nn.Module):
         x = self.o(x)
         return x
 
+    def project_kv(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project encoder hidden states to cross-attn K/V (for eager caching).
+
+        Returns ``(k, v)`` where each has shape
+        ``(B, text_len, tp_num_heads, head_dim)`` — the same tensors the
+        ``forward`` method would compute on first call.
+        """
+        n, d = self.tp_num_heads, self.head_dim
+        k = self.norm_k(self.k(context)).unflatten(2, (n, d))
+        v = self.v(context).unflatten(2, (n, d))
+        return k, v
+
 
 class WanI2VCrossAttention(nn.Module):
     """Image-to-video cross-attention (splits first 257 image tokens).
@@ -359,6 +371,18 @@ class WanI2VCrossAttention(nn.Module):
         x = x + img_x
         x = self.o(x)
         return x
+
+    def project_kv(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project encoder hidden states to cross-attn K/V for the text part only.
+
+        Image tokens (first 257) are *not* cached — they are always recomputed.
+        Returns ``(k, v)`` for the text tokens.
+        """
+        context = context[:, 257:]  # strip image tokens; cache text only
+        n, d = self.tp_num_heads, self.head_dim
+        k = self.norm_k(self.k(context)).unflatten(2, (n, d))
+        v = self.v(context).unflatten(2, (n, d))
+        return k, v
 
 
 WAN_CROSSATTENTION_CLASSES = {
@@ -835,6 +859,7 @@ class CausalWanModel(nn.Module):
         state: torch.Tensor | None,
         kv_cache: list[torch.Tensor],
         current_start_frame: int,
+        crossattn_cache: list[dict] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
         x = x.flatten(start_dim=2).transpose(1, 2)
         B = x.shape[0]
@@ -884,6 +909,7 @@ class CausalWanModel(nn.Module):
                 context=context,
                 action_register_length=action_register_length,
                 kv_cache=kv_cache[block_index] if kv_cache else None,
+                crossattn_cache=crossattn_cache[block_index] if crossattn_cache else None,
                 current_start_frame=current_start_frame,
             )
             updated_kv_caches.append(updated_kv_cache)
@@ -907,8 +933,8 @@ class CausalWanModel(nn.Module):
         context: torch.Tensor,
         seq_len: int,
         kv_cache: list[torch.Tensor],
-        crossattn_cache: list[torch.Tensor],
         current_start_frame: int,
+        crossattn_cache: list[dict] | None = None,
         y: torch.Tensor | None = None,
         clip_feature: torch.Tensor | None = None,
         action: torch.Tensor | None = None,
@@ -941,6 +967,7 @@ class CausalWanModel(nn.Module):
             timestep_action=timestep_action,
             state=state,
             kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
             current_start_frame=current_start_frame,
         )
 

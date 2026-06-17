@@ -141,6 +141,10 @@ class BDEKVState:
         # the pool per branch; ``_pending`` holds this forward's new-chunk slot maps.
         self._committed: dict[bool, int] = {False: 0, True: 0}
         self._pending: dict[bool, list] = {False: [], True: []}
+        # Cross-attn KV is populated once after text encoding (eager), then
+        # read every denoising step.  Reset clears these flags so the next
+        # forward repopulates from the new text encoding.
+        self._cross_populated: dict[bool, bool] = {False: False, True: False}
 
     def _adapter(self, is_negative: bool):
         return self.neg if is_negative else self.pos
@@ -159,6 +163,12 @@ class BDEKVState:
             len(self.kv_cache.window_block_ids(adapter)), self.kv_cache.spec.window_chunks,
         )
         return windows
+
+    def get_cross_kv_caches(self, is_negative: bool, fallback) -> list[dict]:
+        """Return pool-backed cross-attn cache dicts, or fallback if not populated."""
+        if self._cross_populated[is_negative] and self.kv_cache.cross_attn_length > 0:
+            return [self.kv_cache.read_cross_kv(i, is_negative) for i in range(self.num_layers)]
+        return fallback()
 
     def update_kv_cache(self, layer_idx: int, updated_kv: torch.Tensor, is_negative: bool, seq_len) -> None:
         branch = "neg" if is_negative else "pos"
@@ -216,6 +226,7 @@ class BDEKVState:
         self.neg = self.kv_cache.begin_request(neg_id)
         self._committed = {False: 0, True: 0}
         self._pending = {False: [], True: []}
+        self._cross_populated = {False: False, True: False}
         _log.info("BDE RESET [%s/%s] session KV cleared (window boundary)", pos_id, neg_id)
 
 

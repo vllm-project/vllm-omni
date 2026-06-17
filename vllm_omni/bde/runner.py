@@ -76,6 +76,7 @@ class BDEModelRunner(DiffusionModelRunner):
         block_size: int,
         max_model_len: int,
         available_bytes: int,
+        cross_attn_length: int = 0,
     ) -> None:
         """Construct the BDEKVCache (preallocating GPU pools on ``self.device``).
 
@@ -92,11 +93,12 @@ class BDEModelRunner(DiffusionModelRunner):
             block_size=block_size,
             max_model_len=max_model_len,
             available_bytes=available_bytes,
+            cross_attn_length=cross_attn_length,
             device=self.device,
         )
         logger.info(
             "BDE KV cache enabled: %d blocks, chunk_size=%d, window_chunks=%s, "
-            "layers=%d kv_heads=%d head_dim=%d block_size=%d device=%s",
+            "layers=%d kv_heads=%d head_dim=%d block_size=%d cross_attn_len=%d device=%s",
             self.kv_cache.num_blocks,
             self.bde_kv_config.chunk_size,
             self.bde_kv_config.window_chunks,
@@ -104,6 +106,7 @@ class BDEModelRunner(DiffusionModelRunner):
             num_kv_heads,
             head_size,
             block_size,
+            cross_attn_length,
             self.device,
         )
 
@@ -134,6 +137,11 @@ class BDEModelRunner(DiffusionModelRunner):
         # The model's own attention window, in tokens (= the [-max_attention_size:]
         # slice it applies). Read it directly rather than recomputing.
         max_attention_size = int(t.blocks[0].self_attn.max_attention_size)
+        # Cross-attn text length — static pool for the text-encoder output.
+        # The cached k/v spans the full text sequence (the image tokens
+        # prepended in _forward_blocks are stripped inside the cross-attn
+        # forward but are not part of the cached k/v).
+        cross_attn_length = int(getattr(t, "text_len", 0))
 
         # Frame-granular paging: 1 block = 1 frame = frame_seqlen tokens, so the
         # resident window matches max_attention_size exactly (it need not be a whole
@@ -159,6 +167,7 @@ class BDEModelRunner(DiffusionModelRunner):
             block_size=chunk_size,  # one pool block per chunk
             max_model_len=1 << 20,
             available_bytes=free_bytes,
+            cross_attn_length=cross_attn_length,
         )
 
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:

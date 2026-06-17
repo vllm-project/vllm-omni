@@ -113,9 +113,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return state.get_kv_caches(is_negative)
 
     def _kv_create(self, state, batch_size, dtype, device, num_layers, num_heads, head_dim):
-        # Always create the model-local caches so cross-attention (which BDE does
-        # NOT manage) is initialized. Under BDE the self-attn kv_cache created here
-        # is unused — _kv_get / _kv_update route self-attn KV through the pool.
+        # Always create the model-local caches for the non-BDE fallback path.
+        # Under BDE both self-attn and cross-attn KV are pool-backed — the
+        # state caches created here are unused when _bde_kv_state is set.
+        # Cross-attn is populated eagerly in _kv_populate_cross after text
+        # encoding; self-attn is routed through _kv_get / _kv_update.
         state.create_kv_caches(batch_size, dtype, device, num_layers, num_heads, head_dim)
 
     def _kv_update(self, state, layer_idx, updated_kv, is_negative, seq_len=None):
@@ -131,6 +133,52 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if s is not None:
             _log.debug("BDE KV commit: pos=%d chunks neg=%d chunks", s.pos.completed_chunks, s.neg.completed_chunks)
             s.commit_chunk()
+
+    def _kv_get_cross(self, state, is_negative):
+        """Cross-attn cache: pool-backed when BDE active, model-local otherwise."""
+        s = self._bde_kv_state
+        if s is not None:
+            return s.get_cross_kv_caches(
+                is_negative, lambda: state.get_crossattn_caches(is_negative)
+            )
+        return state.get_crossattn_caches(is_negative)
+
+    def _kv_populate_cross(self, context: torch.Tensor, is_negative: bool) -> None:
+        """Eagerly project cross-attn K/V for all layers into the BDE pool.
+
+        Called once per branch after text encoding (before the first denoising
+        step), and again after each window-boundary reset.  The attention
+        forward never writes to the cross-attn pool — it only reads.
+
+        The raw encoder output is projected through ``text_embedding`` first
+        so it matches the shape the cross-attn linear layers expect (the same
+        projection ``_forward_blocks`` applies internally).
+        """
+        s = self._bde_kv_state
+        if s is None:
+            return
+        # Only populate once per branch per session — reset clears this flag.
+        if s._cross_populated.get(is_negative, False):
+            return
+        projected = self.transformer.text_embedding(context)
+        for i, block in enumerate(self.transformer.blocks):
+            # The cross-attn forward caches text-only k/v — the image tokens
+            # (first 257, prepended inside _forward_blocks via img_emb) are
+            # always recomputed.  project_kv for I2V strips those image tokens,
+            # but we are feeding raw projected text (no image prepend), so
+            # compute k/v directly from the full projected text.
+            ca = block.cross_attn
+            n, d = ca.tp_num_heads, ca.head_dim
+            k = ca.norm_k(ca.k(projected)).unflatten(2, (n, d))
+            v = ca.v(projected).unflatten(2, (n, d))
+            s.kv_cache.write_cross_kv(i, is_negative, k, v)
+        s._cross_populated[is_negative] = True
+        _log.info(
+            "BDE CROSS POPULATE [%s]: %d layers, context=%s",
+            "neg" if is_negative else "pos",
+            len(self.transformer.blocks),
+            tuple(context.shape),
+        )
 
     def _kv_reset(self, state):
         """Reset model-local KV and, under BDE, the pooled session window too.
@@ -579,7 +627,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             positive_kwargs = dict(
                 encoder_hidden_states=prompt_embeds,
                 kv_cache=self._kv_get(state, False),
-                crossattn_cache=state.get_crossattn_caches(False),
+                crossattn_cache=self._kv_get_cross(state, False),
                 is_negative=False,
                 **common,
             )
@@ -587,7 +635,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 dict(
                     encoder_hidden_states=negative_prompt_embeds,
                     kv_cache=self._kv_get(state, True),
-                    crossattn_cache=state.get_crossattn_caches(True),
+                    crossattn_cache=self._kv_get_cross(state, True),
                     is_negative=True,
                     **common,
                 )
@@ -629,7 +677,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             positive_kwargs = dict(
                 encoder_hidden_states=prompt_embeds,
                 kv_cache=self._kv_get(state, False),
-                crossattn_cache=state.get_crossattn_caches(False),
+                crossattn_cache=self._kv_get_cross(state, False),
                 is_negative=False,
                 **common,
             )
@@ -637,7 +685,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 dict(
                     encoder_hidden_states=negative_prompt_embeds,
                     kv_cache=self._kv_get(state, True),
-                    crossattn_cache=state.get_crossattn_caches(True),
+                    crossattn_cache=self._kv_get_cross(state, True),
                     is_negative=True,
                     **common,
                 )
@@ -723,7 +771,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 timestep_video=timestep,
                 encoder_hidden_states=prompt_embeds,
                 kv_cache=self._kv_get(state, False),
-                crossattn_cache=state.get_crossattn_caches(False),
+                crossattn_cache=self._kv_get_cross(state, False),
                 y=y,
                 clip_feature=state.clip_feas,
                 action=noisy_input_action,
@@ -739,7 +787,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     timestep_video=timestep,
                     encoder_hidden_states=negative_prompt_embeds,
                     kv_cache=self._kv_get(state, True),
-                    crossattn_cache=state.get_crossattn_caches(True),
+                    crossattn_cache=self._kv_get_cross(state, True),
                     y=y,
                     clip_feature=state.clip_feas,
                     action=noisy_input_action,
@@ -894,6 +942,14 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 neg_inputs["input_ids"].to(device),
                 neg_inputs["attention_mask"].to(device),
             )
+
+        # -- Eager cross-attn population (BDE only) ----------------------------
+        # Project encoder hidden states to K/V once and store in the BDE pool
+        # so every denoising step reads without recomputing.  Re-populated after
+        # each window-boundary reset (_cross_populated clears → guard re-triggers).
+        self._kv_populate_cross(prompt_embeds, is_negative=False)
+        if negative_prompt_embeds is not None:
+            self._kv_populate_cross(negative_prompt_embeds, is_negative=True)
 
         # Extract first/last frame for CLIP + VAE encoding
         if num_frames_raw == 4 or num_frames_raw == 9:

@@ -45,6 +45,7 @@ class BDEKVCache:
         block_size: int,
         max_model_len: int,
         available_bytes: int,
+        cross_attn_length: int = 0,
         device: torch.device | None = None,
     ) -> None:
         if not config.enable:
@@ -56,6 +57,45 @@ class BDEKVCache:
 
         self.config = config
         self.block_size = block_size
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.dtype = dtype
+        self.cross_attn_length = cross_attn_length
+        self.device = device or torch.device("cpu")
+        self._adapters: dict[str, BDERequestAdapter] = {}
+
+        # -- cross-attention pool (static, one-time-fill) -----------------------
+        # Cross-attn KV is computed once from the text encoder and never changes.
+        # Allocate a per-layer contiguous tensor for each branch: (2, text_len,
+        # kv_heads, head_dim) where dim-0 = [pos, neg].  Allocated separately
+        # from the self-attn block pool (static, small — ~400 MiB for
+        # DreamZero I2V).  Both pools draw from the same GPU free memory but
+        # the cross-attn pool is sized directly rather than via the block pool
+        # budget (no eviction/chunk lifecycle needed).
+        self._cross_k: list[torch.Tensor] = []
+        self._cross_v: list[torch.Tensor] = []
+        if device is not None and cross_attn_length > 0:
+            cross_shape = (2, cross_attn_length, num_kv_heads, head_size)
+            bytes_per_element = dtype.itemsize
+            cross_bytes = (
+                2           # K + V
+                * 2         # pos + neg
+                * cross_attn_length
+                * num_kv_heads
+                * head_size
+                * bytes_per_element
+                * num_layers
+            )
+            for _ in range(num_layers):
+                self._cross_k.append(torch.empty(cross_shape, dtype=dtype, device=device))
+                self._cross_v.append(torch.empty(cross_shape, dtype=dtype, device=device))
+            _log.info(
+                "BDE cross-attn pool: %d layers × (%d tok × %d heads × %d) = %.1f MiB",
+                num_layers, cross_attn_length, num_kv_heads, head_size,
+                cross_bytes / (1024 * 1024),
+            )
+
         self.spec = ChunkWindowSpec(
             block_size=block_size,
             num_kv_heads=num_kv_heads,
@@ -78,20 +118,44 @@ class BDEKVCache:
         self.manager = build_kv_manager(self.spec, layer_names, num_blocks, max_model_len)
         self.num_blocks = num_blocks
         self.null_block_id = self.manager.block_pool.null_block.block_id
-        self._adapters: dict[str, BDERequestAdapter] = {}
 
         # Allocate the per-layer paged K/V pools on the given device.
-        self.num_layers = num_layers
-        self.num_kv_heads = num_kv_heads
-        self.head_size = head_size
-        self.dtype = dtype
-        self.device = device or torch.device("cpu")
         self._k_pools: list[torch.Tensor] = []
         self._v_pools: list[torch.Tensor] = []
         if device is not None:
             self._k_pools, self._v_pools = allocate_kv_pool(
                 num_blocks, block_size, num_layers, num_kv_heads, head_size, dtype, device
             )
+
+    # -- cross-attention pool access -------------------------------------------
+    # Cross-attn KV is static once populated — write once (from text encoder),
+    # read many (every denoising step). Not managed through the paged block pool.
+
+    def write_cross_kv(
+        self, layer_idx: int, is_negative: bool,
+        k: torch.Tensor, v: torch.Tensor,
+    ) -> None:
+        """Write one layer's cross-attn K/V into the pool.
+
+        ``k`` / ``v``: ``(B, text_len, tp_num_heads, head_dim)``; only batch-0
+        is copied (B=1 for inference). The ``is_negative`` flag selects the
+        correct CFG branch slot.
+        """
+        branch = 1 if is_negative else 0
+        self._cross_k[layer_idx][branch].copy_(k[0])
+        self._cross_v[layer_idx][branch].copy_(v[0])
+
+    def read_cross_kv(self, layer_idx: int, is_negative: bool) -> dict:
+        """Return a pool-backed cross-attn cache dict for one layer.
+
+        The dict matches the ``{"is_init": True, "k": Tensor, "v": Tensor}``
+        convention the cross-attention module expects — it reads from the pool
+        slice rather than from the lazy-initialised model-local dict.
+        """
+        branch = 1 if is_negative else 0
+        k = self._cross_k[layer_idx][branch].unsqueeze(0)   # (1, L, heads, dim)
+        v = self._cross_v[layer_idx][branch].unsqueeze(0)
+        return {"is_init": True, "k": k, "v": v}
 
     # -- request lifecycle ---------------------------------------------------
 
