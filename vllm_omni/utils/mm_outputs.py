@@ -9,19 +9,9 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Flat payload keys (``hidden_states.layer_0``, ``codes.audio``, …) partitioned
-# at worker ``sample_tokens`` into inter-stage vs client-facing wire channels.
-_INTER_STAGE_ROOT_KEYS: frozenset[str] = frozenset(
-    {
-        "hidden_states",
-        "hidden",
-        "embed",
-        "codes",
-        "latent",
-        "ids",
-        "meta",
-    }
-)
+# Flat payload keys partitioned at worker output into inter-stage connector
+# payloads vs client-facing multimodal outputs.  Only final output roots are
+# listed here; everything else remains available for stage-to-stage transport.
 _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
     {
         "model_outputs",
@@ -39,8 +29,6 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
 
 def partition_flat_payload(
     payload: Mapping[str, object],
-    *,
-    engine_output_type: str | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Split a flattened per-request payload into inter-stage vs client mm dicts."""
     if not payload:
@@ -49,16 +37,10 @@ def partition_flat_payload(
     client_mm: dict[str, object] = {}
     for key, value in payload.items():
         root = key.split(".", 1)[0]
-        if root in _INTER_STAGE_ROOT_KEYS:
-            inter_stage[key] = value
-        elif root in _CLIENT_MM_ROOT_KEYS:
-            client_mm[key] = value
-        elif engine_output_type == "latent":
-            inter_stage[key] = value
-        elif engine_output_type in ("audio", "image", "video", "images", "videos"):
+        if root in _CLIENT_MM_ROOT_KEYS:
             client_mm[key] = value
         else:
-            client_mm[key] = value
+            inter_stage[key] = value
     return inter_stage, client_mm
 
 def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:

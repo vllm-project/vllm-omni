@@ -9,7 +9,7 @@ def test_partition_thinker_latent_payload():
         "hidden_states.layer_24": torch.zeros(2, 8),
         "embed.tts_bos": [torch.zeros(1, 1, 4)],
     }
-    inter, client = partition_flat_payload(payload, engine_output_type="latent")
+    inter, client = partition_flat_payload(payload)
     assert inter == payload
     assert client == {}
 
@@ -19,7 +19,7 @@ def test_partition_talker_intermediate_codes():
         "codes.audio": torch.zeros(3, 2),
         "hidden": torch.zeros(3, 16),
     }
-    inter, client = partition_flat_payload(payload, engine_output_type="latent")
+    inter, client = partition_flat_payload(payload)
     assert inter == payload
     assert client == {}
 
@@ -29,7 +29,7 @@ def test_partition_code2wav_client_audio():
         "model_outputs": torch.zeros(1, 2400),
         "sr": torch.tensor(24000, dtype=torch.int32),
     }
-    inter, client = partition_flat_payload(payload, engine_output_type="audio")
+    inter, client = partition_flat_payload(payload)
     assert inter == {}
     assert client == payload
 

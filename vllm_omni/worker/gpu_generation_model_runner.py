@@ -454,14 +454,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         else:
             raise RuntimeError("Unsupported diffusion output type")
 
-        engine_output_type = getattr(self.vllm_config.model_config, "engine_output_type", None)
         inter_stage_outputs: list[dict[str, object] | None] = []
         client_mm_outputs: list[dict[str, object] | None] = []
         for mm_payload in multimodal_outputs:
-            inter_payload, client_payload = partition_flat_payload(
-                mm_payload,
-                engine_output_type=engine_output_type,
-            )
+            inter_payload, client_payload = partition_flat_payload(mm_payload)
             inter_stage_outputs.append(inter_payload or None)
             client_mm_outputs.append(client_payload or None)
 

@@ -1288,14 +1288,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))
 
-        engine_output_type = getattr(self.vllm_config.model_config, "engine_output_type", None)
         pooler_inter: list[dict[str, object]] = []
         pooler_client: list[dict[str, object]] = []
         for payload in pooler_output or []:
-            inter_payload, client_payload = partition_flat_payload(
-                payload,
-                engine_output_type=engine_output_type,
-            )
+            inter_payload, client_payload = partition_flat_payload(payload)
             pooler_inter.append(inter_payload)
             pooler_client.append(client_payload)
 
