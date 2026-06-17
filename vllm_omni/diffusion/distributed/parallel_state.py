@@ -191,7 +191,6 @@ class RankGenerator:
         self.fs = fs
         self.rank_offset = rank_offset
         self.world_size = tp * sp * pp * cfg * dp
-        self.ep = tp * sp * cfg * dp  # EP level exclude PP
 
         self.name_to_size = {
             "tp": self.tp,
@@ -252,15 +251,6 @@ class RankGenerator:
             for i in range(num_groups):
                 group = list(range(i * self.fs + self.rank_offset, (i + 1) * self.fs + self.rank_offset))
                 ranks.append(group)
-            return ranks
-
-        if token == "ep":
-            ranks = []
-            num_pp_stages = self.pp
-            for i in range(num_pp_stages):
-                start = i * self.ep + self.rank_offset
-                end = start + self.ep
-                ranks.append(list(range(start, end)))
             return ranks
 
         mask = self.get_mask(self.order, token)
