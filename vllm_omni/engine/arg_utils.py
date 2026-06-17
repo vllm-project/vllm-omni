@@ -183,13 +183,6 @@ class OmniEngineArgs(EngineArgs):
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
 
-    # Forced aligner / word timestamps. ``--forced-aligner`` is the opt-in
-    # toggle; heavier knobs (gpu_memory_utilization, dtype, max_model_len)
-    # live in the deploy YAML passed via ``--forced-aligner-config`` instead
-    # of bespoke top-level flags.
-    forced_aligner: str | None = None
-    forced_aligner_config: str | None = None
-
     def __post_init__(self) -> None:
         if self.worker_cls is None:
             if self.worker_type == "ar":
