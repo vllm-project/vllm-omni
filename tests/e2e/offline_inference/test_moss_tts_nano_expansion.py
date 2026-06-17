@@ -3,21 +3,21 @@
 """E2E offline inference tests for MOSS-TTS-Nano single-stage pipeline.
 
 Every request needs a reference audio clip. We test upstream's
-recommended ``voice_clone`` mode (no transcript needed). We fetch the
-upstream sample (assets/audio/zh_1.wav, ~50 KB) once per test session
-and reuse it for all cases.
+recommended ``voice_clone`` mode (no transcript needed). The reference clip is
+resolved from a local override, vendored asset, persistent cache, or remote
+fallback.
 """
 
 from __future__ import annotations
 
 import os
-import urllib.request
 
 import pytest
 import torch
 from vllm import SamplingParams
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import resolve_test_audio_file
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
@@ -52,29 +52,21 @@ DEFAULT_SAMPLING = SamplingParams(
 
 
 @pytest.fixture(scope="session")
-def ref_audio_path(tmp_path_factory) -> str:
-    """Download the upstream reference clip once per test session.
-
-    Bounded with a 30 s timeout (urlretrieve has no timeout kwarg, so we use
-    urlopen + write ourselves). Fetch failures are hard failures, not skips,
-    so a broken network path can't silently mask regressions. Set
-    ``MOSS_TTS_NANO_SKIP_ON_NET_FAIL=1`` to opt into skipping for air-gapped
-    environments.
-    """
-    cache_dir = tmp_path_factory.mktemp("moss_tts_nano_ref")
-    target = cache_dir / "zh_1.wav"
+def ref_audio_path() -> str:
+    """Resolve the MOSS-TTS-Nano reference clip, preferring local/cache."""
     try:
-        with urllib.request.urlopen(REF_AUDIO_URL, timeout=30) as resp:
-            data = resp.read()
-        target.write_bytes(data)
-    except Exception as e:
-        msg = f"Cannot fetch upstream reference clip {REF_AUDIO_URL}: {e}"
+        return str(
+            resolve_test_audio_file(
+                env_var="MOSS_TTS_NANO_REF_AUDIO_PATH",
+                asset_relative_path="moss_tts_nano/zh_1.wav",
+                cache_name="moss_tts_nano_zh_1.wav",
+                url=REF_AUDIO_URL,
+            )
+        )
+    except RuntimeError as exc:
         if os.environ.get("MOSS_TTS_NANO_SKIP_ON_NET_FAIL"):
-            pytest.skip(msg)
-        pytest.fail(msg)
-    if not target.exists() or os.path.getsize(target) == 0:
-        pytest.fail(f"Reference clip empty after download: {target}")
-    return str(target)
+            pytest.skip(str(exc))
+        pytest.fail(str(exc))
 
 
 def _build_request(

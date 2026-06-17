@@ -15,6 +15,7 @@ import re
 import subprocess
 import tempfile
 import time
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -523,6 +524,67 @@ def load_test_audio_data_url(relative_path: str | os.PathLike) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
+def _is_non_empty_file(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
+
+
+def _test_asset_cache_dir() -> Path:
+    env_path = os.environ.get("VLLM_OMNI_TEST_ASSET_CACHE")
+    if env_path:
+        return Path(env_path).expanduser().resolve()
+    return Path(tempfile.gettempdir()) / "vllm_omni_test_assets"
+
+
+def resolve_test_audio_file(
+    *,
+    env_var: str,
+    asset_relative_path: str | os.PathLike | None,
+    cache_name: str,
+    url: str,
+    timeout_s: float = 30.0,
+) -> Path:
+    """Resolve a reference audio file, preferring local/cache before remote.
+
+    Lookup order: explicit env path, vendored ``tests/assets`` file, persistent
+    test cache, then remote download.
+    """
+    if env_path := os.environ.get(env_var):
+        path = Path(env_path).expanduser().resolve()
+        if _is_non_empty_file(path):
+            return path
+        raise RuntimeError(f"{env_var} points to a missing or empty file: {path}")
+
+    if asset_relative_path is not None:
+        asset_path = get_asset_path(asset_relative_path)
+        if _is_non_empty_file(asset_path):
+            return asset_path
+
+    cache_path = _test_asset_cache_dir() / cache_name
+    if _is_non_empty_file(cache_path):
+        return cache_path
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = tempfile.NamedTemporaryFile(
+        delete=False,
+        dir=cache_path.parent,
+        prefix=f"{cache_path.name}.",
+        suffix=".tmp",
+    )
+    tmp_path = Path(tmp_file.name)
+    tmp_file.close()
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+            tmp_path.write_bytes(resp.read())
+        if not _is_non_empty_file(tmp_path):
+            raise RuntimeError(f"Downloaded reference audio is empty: {url}")
+        tmp_path.replace(cache_path)
+    except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Cannot fetch reference audio {url}: {exc}") from exc
+
+    return cache_path
+
+
 def decode_b64_image(b64: str):
     img = Image.open(io.BytesIO(base64.b64decode(b64)))
     img.load()
@@ -705,4 +767,5 @@ __all__ = [
     "get_asset_path",
     "load_test_audio_data_url",
     "preprocess_text",
+    "resolve_test_audio_file",
 ]

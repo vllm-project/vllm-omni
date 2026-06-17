@@ -17,13 +17,13 @@ triggers mid-module teardown races (see skill invariant I4).
 from __future__ import annotations
 
 import os
-import urllib.request
 
 import pytest
 import torch
 from vllm import SamplingParams
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import resolve_test_audio_file
 from vllm_omni import Omni
 
 # ---------------------------------------------------------------------------
@@ -54,24 +54,21 @@ _DEFAULT_SAMPLING = SamplingParams(
 
 
 @pytest.fixture(scope="session")
-def ref_audio_path(tmp_path_factory) -> str:
-    """Download the upstream reference clip once per session.
-
-    Set ``MOSS_TTS_SKIP_ON_NET_FAIL=1`` to skip in air-gapped environments.
-    """
-    cache_dir = tmp_path_factory.mktemp("moss_tts_ref")
-    target = cache_dir / "zh_1.wav"
+def ref_audio_path() -> str:
+    """Resolve the MOSS-TTS reference clip, preferring local/cache."""
     try:
-        with urllib.request.urlopen(REF_AUDIO_URL, timeout=30) as resp:
-            target.write_bytes(resp.read())
-    except Exception as exc:
-        msg = f"Cannot fetch reference clip {REF_AUDIO_URL}: {exc}"
+        return str(
+            resolve_test_audio_file(
+                env_var="MOSS_TTS_REF_AUDIO_PATH",
+                asset_relative_path="moss_tts/reference_zh_1.wav",
+                cache_name="moss_tts_reference_zh_1.wav",
+                url=REF_AUDIO_URL,
+            )
+        )
+    except RuntimeError as exc:
         if os.environ.get("MOSS_TTS_SKIP_ON_NET_FAIL"):
-            pytest.skip(msg)
-        pytest.fail(msg)
-    if not target.exists() or target.stat().st_size == 0:
-        pytest.fail(f"Reference clip empty after download: {target}")
-    return str(target)
+            pytest.skip(str(exc))
+        pytest.fail(str(exc))
 
 
 # ---------------------------------------------------------------------------
