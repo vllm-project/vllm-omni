@@ -54,6 +54,30 @@ def test_decode_timestamps_repairs_non_monotonic_bins():
     ]
 
 
+def test_decode_timestamps_clamps_to_audio_duration_and_stays_ordered():
+    # Bins run past the 1000 ms audio; the decoder must cap each bound at the
+    # audio length and keep words non-overlapping (start <= end, monotonic).
+    logits = np.zeros((4, 5), dtype=np.float32)
+    logits[0, 0] = 1.0  # word0 start -> bin 0
+    logits[1, 3] = 1.0  # word0 end   -> bin 3 (1200 ms, past audio)
+    logits[2, 3] = 1.0  # word1 start -> bin 3 (1200 ms, past audio)
+    logits[3, 4] = 1.0  # word1 end   -> bin 4 (1600 ms, past audio)
+
+    timestamps = forced_aligner._decode_timestamps(
+        logits=logits,
+        words=["a", "b"],
+        timestamp_positions=[0, 1, 2, 3],
+        classify_num=5,
+        timestamp_segment_time_ms=400,
+        audio_duration_ms=1000,
+    )
+
+    assert timestamps == [
+        forced_aligner.WordTimestamp("a", 0, 1000),
+        forced_aligner.WordTimestamp("b", 1000, 1000),
+    ]
+
+
 def test_decode_timestamps_rejects_marker_count_mismatch():
     logits = np.zeros((2, 5), dtype=np.float32)
 

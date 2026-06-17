@@ -2,21 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Shared forced aligner for streaming TTS word timestamps.
 
-Hosts one in-process ``vllm.LLM(runner="pooling")`` (upstream's
-``Qwen3ASRForcedAlignerForTokenClassification``), shared by the whole TTS
-frontend and lazy-loaded on first use. ``llm.encode`` is sync/blocking, so
-:func:`align` wraps it in ``asyncio.to_thread`` to keep the event loop free.
-
-Public API:
-* :func:`build_forced_aligner_config` — CLI args -> ``ForcedAlignerConfig``
-  (``None`` means the feature is off).
-* :func:`align` — returns ``list[WordTimestamp]`` on success, ``[]`` for
-  silence / no aligned tokens, ``None`` on a per-request decode failure
-  (the streaming layer maps ``None`` to JSON ``timestamps: null`` and keeps
-  audio flowing; ``None`` vs ``[]`` lets clients tell "failed" from "no
-  speech"). Raises :class:`ForcedAlignerLoadError` if the model/config can't
-  be loaded, so callers report that once instead of degrading every request.
-  Calls serialize on an internal lock (the offline LLM isn't thread-safe).
+Hosts one lazy-loaded, in-process pooling ``vllm.LLM`` shared by the TTS
+frontend. ``llm.encode`` is sync/blocking, so :func:`align` runs it in
+``asyncio.to_thread``, serialized on a lock since the offline LLM is not
+thread-safe. See :func:`align` for the return-value contract.
 """
 
 from __future__ import annotations
@@ -53,14 +42,7 @@ class WordTimestamp:
 
 @dataclass(frozen=True, slots=True)
 class ForcedAlignerConfig:
-    """Plain-data config built from CLI args at server startup.
-
-    Captures only the fields needed to construct the ``vllm.LLM``
-    instance; the LLM itself is lazy-loaded inside :func:`align`.
-    Override defaults by setting the matching CLI flag (currently only
-    ``--forced-aligner``; the rest follow conservative defaults that
-    are enough for Qwen/Qwen3-ForcedAligner-0.6B on a 24GB GPU).
-    """
+    """Plain-data config for constructing the aligner ``vllm.LLM`` (lazy-loaded)."""
 
     model: str
     runner: str | None = None
@@ -157,9 +139,6 @@ async def align(
         ForcedAlignerLoadError: the model/config could not be loaded. This is
             permanent until restart, so callers surface it once instead of
             degrading every request to ``None``.
-
-    Calls serialize on ``_encode_lock``: the offline ``vllm.LLM.encode`` is a
-    sync batch interface and is not safe to run from multiple threads at once.
     """
     async with _encode_lock:
         try:
@@ -198,8 +177,6 @@ def _align_sync(
         "multi_modal_data": {"audio": (audio_arr, sample_rate)},
     }
 
-    # Lazy import so ``vllm.pooling_params`` doesn't hit the parent
-    # process until alignment is actually invoked.
     from vllm.pooling_params import PoolingParams
 
     outputs = _llm.encode(  # type: ignore[union-attr]
@@ -327,8 +304,8 @@ def _ensure_loaded(config: ForcedAlignerConfig) -> None:
 #
 # Word segmentation, prompt building, timestamp repair and marker-token
 # lookup are Qwen-specific and live in
-# :mod:`vllm_omni.utils.qwen3_force_align_processor` (the model-agnostic seam
-# the issue asks for). This module owns only the generic vLLM orchestration.
+# :mod:`vllm_omni.utils.qwen3_force_align_processor`. This module owns only
+# the generic vLLM orchestration.
 
 
 def _pcm_bytes_to_float32(audio: bytes) -> np.ndarray:
@@ -387,18 +364,21 @@ def _decode_timestamps(
     )
 
     # Repair non-monotonic bins across the whole start/end sequence before
-    # pairing, mirroring the official decoder. This keeps each (start, end)
-    # pair ordered and stops one bad bin from corrupting neighbours.
+    # pairing, so each (start, end) pair stays ordered and one bad bin can't
+    # corrupt its neighbours.
     marker_ms = _processor.fix_timestamp([int(round(int(b) * bin_size_ms)) for b in bin_idx])
 
-    # The aligner can emit a final bin slightly past the real audio length;
-    # clamp so a word never reports an end beyond the sentence audio.
+    # Pair markers into per-word intervals, enforcing the wire contract here so
+    # callers don't have to: monotonic and non-overlapping across words, with
+    # start <= end and nothing past the audio length.
     duration_ms = int(round(audio_duration_ms))
     out: list[WordTimestamp] = []
+    prev_end_ms = 0
     for i, word in enumerate(words):
-        start_ms = min(marker_ms[i * 2], duration_ms)
+        start_ms = min(max(marker_ms[i * 2], prev_end_ms), duration_ms)
         end_ms = min(max(marker_ms[i * 2 + 1], start_ms), duration_ms)
         out.append(WordTimestamp(word=word, start_ms=start_ms, end_ms=end_ms))
+        prev_end_ms = end_ms
     return out
 
 

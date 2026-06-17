@@ -243,9 +243,9 @@ class TestStreamingSpeechWebSocket:
         assert captured_requests[0].word_timestamps is True
         assert mock_align.await_count == 1
 
-    def test_word_timestamps_overlapping_intervals_stay_ordered(self, mocker: MockerFixture):
-        # Regression: clamping an overlapping start must not leave end_ms behind
-        # it, or the frame would carry end_ms < start_ms.
+    def test_word_timestamps_emit_word_dicts(self, mocker: MockerFixture):
+        # The streaming layer forwards the aligner's (already monotonic,
+        # non-overlapping) words as JSON dicts in the trailing frame.
         speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
         speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"", "audio/wav"))
         speech_service.engine_client = mocker.MagicMock()
@@ -258,11 +258,10 @@ class TestStreamingSpeechWebSocket:
             yield (chunk, 1000) if include_sample_rate else chunk
 
         speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
-        # Second word fully precedes the first word's end.
         mock_align = mocker.AsyncMock(
             return_value=[
                 WordTimestamp("Hello", 0, 1000),
-                WordTimestamp("world", 900, 950),
+                WordTimestamp("world", 1000, 1200),
             ]
         )
         mocker.patch.object(streaming_speech_module, "forced_align", mock_align)
@@ -289,7 +288,7 @@ class TestStreamingSpeechWebSocket:
                 timestamps = final["timestamps"]
                 assert timestamps == [
                     {"word": "Hello", "start_ms": 0, "end_ms": 1000},
-                    {"word": "world", "start_ms": 1000, "end_ms": 1000},
+                    {"word": "world", "start_ms": 1000, "end_ms": 1200},
                 ]
                 for ts in timestamps:
                     assert ts["end_ms"] >= ts["start_ms"]

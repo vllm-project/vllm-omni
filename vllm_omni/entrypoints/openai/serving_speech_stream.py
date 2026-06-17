@@ -54,6 +54,7 @@ logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0  # seconds
 _DEFAULT_CONFIG_TIMEOUT = 10.0  # seconds
 _PCM_SAMPLE_RATE = 24000
+_BYTES_PER_SAMPLE = 2  # 16-bit mono PCM
 _MAX_CONFIG_MESSAGE_SIZE = 4 * 1024 * 1024  # allow large ref_audio payloads
 _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
 
@@ -268,6 +269,8 @@ class OmniStreamingSpeechHandler:
             "format": response_format,
         }
         if config.stream_audio and response_format == "pcm":
+            # Nominal stream rate; each audio.chunk carries the authoritative
+            # per-chunk sample_rate.
             start_payload["sample_rate"] = _PCM_SAMPLE_RATE
         if config.word_timestamps:
             start_payload["word_timestamps"] = True
@@ -378,9 +381,9 @@ class OmniStreamingSpeechHandler:
         ) as stream:
             async for chunk, chunk_sample_rate in stream:
                 sample_rate = chunk_sample_rate
-                chunk_start_ms = int(round((len(sentence_audio) / 2 / sample_rate) * 1000.0))
+                chunk_start_ms = int(round((len(sentence_audio) / _BYTES_PER_SAMPLE / sample_rate) * 1000.0))
                 sentence_audio.extend(chunk)
-                chunk_end_ms = int(round((len(sentence_audio) / 2 / sample_rate) * 1000.0))
+                chunk_end_ms = int(round((len(sentence_audio) / _BYTES_PER_SAMPLE / sample_rate) * 1000.0))
                 total_bytes += len(chunk)
                 # Audio first, timestamps after the whole sentence is aligned.
                 await send_chunk(chunk, chunk_sample_rate, None, chunk_start_ms, chunk_end_ms)
@@ -399,7 +402,7 @@ class OmniStreamingSpeechHandler:
         except ForcedAlignerLoadError as exc:
             await self._send_error(websocket, f"forced aligner unavailable: {exc}")
             timestamps_payload = None
-        sentence_end_ms = int(round((len(sentence_audio) / 2 / sample_rate) * 1000.0))
+        sentence_end_ms = int(round((len(sentence_audio) / _BYTES_PER_SAMPLE / sample_rate) * 1000.0))
         await send_chunk(b"", sample_rate, timestamps_payload, 0, sentence_end_ms)
 
         return total_bytes
@@ -413,10 +416,11 @@ class OmniStreamingSpeechHandler:
         config,
         language: str | None = None,
     ) -> list[dict] | None:
-        """Align a whole sentence into monotonic word timestamps.
+        """Convert a sentence alignment into JSON word-timestamp dicts.
 
-        Returns ``None`` on aligner failure, ``[]`` when it ran but produced
-        no tokens. ``language`` is forwarded to word segmentation.
+        Returns ``None`` on aligner failure, ``[]`` when it ran but produced no
+        tokens. Monotonic, non-overlapping bounds are guaranteed by the decoder.
+        ``language`` is forwarded to word segmentation.
         """
         aligned = await forced_align(
             audio=audio,
@@ -427,23 +431,7 @@ class OmniStreamingSpeechHandler:
         )
         if aligned is None:
             return None
-
-        timestamps_payload: list[dict] = []
-        for ts in aligned:
-            # Clamp so intervals stay non-overlapping and end_ms >= start_ms,
-            # even if the aligner emits a word behind the previous one.
-            start_ms = ts.start_ms
-            if timestamps_payload and start_ms < timestamps_payload[-1]["end_ms"]:
-                start_ms = timestamps_payload[-1]["end_ms"]
-            end_ms = max(ts.end_ms, start_ms)
-            timestamps_payload.append(
-                {
-                    "word": ts.word,
-                    "start_ms": start_ms,
-                    "end_ms": end_ms,
-                }
-            )
-        return timestamps_payload
+        return [{"word": ts.word, "start_ms": ts.start_ms, "end_ms": ts.end_ms} for ts in aligned]
 
     @staticmethod
     async def _send_error(websocket: WebSocket, message: str) -> None:
