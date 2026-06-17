@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import requests
 import json
 import time
 import uuid
@@ -3022,10 +3023,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # Decode reference images if provided
             pil_images: list[Image.Image] = []
-            for img_b64 in reference_images:
+            for img_str in reference_images:
                 try:
-                    img_bytes = base64.b64decode(img_b64)
-                    pil_images.append(Image.open(BytesIO(img_bytes)))
+                    if img_str.startswith(("http://", "https://")):
+                        logger.info(f"img_str is {img_str}")
+                        resp = requests.get(img_str, timeout=10)
+                        resp.raise_for_status()
+                        img_bytes = resp.content
+                        pil_images.append(Image.open(BytesIO(img_bytes)))
+                    else:
+                        img_bytes = base64.b64decode(img_str)
+                        pil_images.append(Image.open(BytesIO(img_bytes)))
                 except Exception as e:
                     logger.warning("Failed to decode reference image: %s", e)
 
@@ -3373,6 +3381,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                     images.append(b64_data)
                                 except ValueError:
                                     logger.warning("Invalid data URL format")
+                            elif url.startswith(("http://", "https://")):
+                                images.append(url)
                         elif item.get("type") == "video_url":
                             url = item.get("video_url", {}).get("url", "")
                             if isinstance(url, str) and url:
