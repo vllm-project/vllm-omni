@@ -143,8 +143,6 @@ def prepare_hunyuan_fused_moe_runtime() -> None:
 # shared_experts= as a kwarg.
 class AscendHunyuanFusedMoE(AscendFusedMoE):
     def __init__(self, *, prefix: str = "", **kwargs: Any) -> None:
-        if omni_get_ctx().vllm_config.parallel_config.enable_expert_parallel:
-            _sync_ascend_ep_group_for_diffusion()
         super().__init__(prefix=prefix, **kwargs)
         self._prefix = prefix
 
