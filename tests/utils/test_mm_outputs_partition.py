@@ -42,4 +42,3 @@ def test_partition_payload_list_preserves_request_alignment():
     inter_list, client_list = partition_payload_list(payloads)
     assert inter_list == [payloads[0], None]
     assert client_list == [None, payloads[1]]
-

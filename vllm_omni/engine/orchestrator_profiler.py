@@ -12,8 +12,9 @@ import os
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 _ENABLED = os.environ.get("VLLM_OMNI_ORCH_PROFILE", "").lower() in ("1", "true", "yes")
 _OUTPUT_PATH = os.environ.get(
