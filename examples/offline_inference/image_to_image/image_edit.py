@@ -283,8 +283,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resolution",
         type=int,
-        default=640,
-        help="Bucket in (640, 1024) to determine the condition and output resolution",
+        default=None,
+        help="Bucket in (640, 1024) to determine the condition and output resolution. If width and height are not provided, this will be set to default 640.",
     )
 
     parser.add_argument(
@@ -441,13 +441,13 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    if args.resolution and (args.width or args.height):
+    if args.resolution is not None and (args.width is not None or args.height is not None):
         raise ValueError("--resolution and --width/--height cannot be specified together")
     if args.width is not None and args.width <= 0:
         raise ValueError("--width must be a positive integer")
     if args.height is not None and args.height <= 0:
         raise ValueError("--height must be a positive integer")
-    if not args.width and not args.height and not args.resolution:
+    if args.width is None and args.height is None and args.resolution is None:
         args.resolution = 640
 
     # Validate input images exist and load them
