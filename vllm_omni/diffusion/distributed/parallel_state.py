@@ -301,7 +301,9 @@ def get_ring_parallel_rank():
 
 def get_expert_parallel_group_ranks() -> list[list[int]]:
     assert vllm_parallel_state._EP is not None, "expert parallel group is not initialized"
-    return vllm_parallel_state._EP.group_ranks
+    group_ranks = getattr(vllm_parallel_state._EP, "group_ranks", None)
+    assert group_ranks is not None, "expert parallel group ranks are not initialized"
+    return group_ranks
 
 
 # PP
@@ -860,6 +862,7 @@ def initialize_model_parallel(
             backend=backend,
             parallel_mode="expert",
         )
+        vllm_parallel_state._EP.group_ranks = ep_group_ranks
 
     init_dit_group(dit_parallel_size, backend)
 
