@@ -296,8 +296,34 @@ class OmniBase(PDDisaggregationMixin):
         try:
             if req_state is None or req_state.metrics is None:
                 return
-            if str(request_id) not in req_state.metrics.e2e_done:
-                self.prom_metrics.request_failed()
+            rid_key = str(request_id)
+            if rid_key not in req_state.metrics.e2e_done:
+                # Fallback finalize for paths where the in-flight guard
+                # in _process_single_result did not fire (e.g. async_chunk
+                # TTS where engine_outputs.finished propagation differs).
+                # stage_events are already populated by on_stage_metrics,
+                # so we can still emit e2e + token counters.
+                _has_stage_events = bool(req_state.metrics.stage_events.get(rid_key))
+                if _has_stage_events:
+                    _final_sid = req_state.metrics.final_stage_id_for_e2e
+                    if isinstance(_final_sid, dict):
+                        _final_sid = _final_sid.get("*", max(_final_sid.values()))
+                    req_state.metrics.on_finalize_request(
+                        _final_sid,
+                        request_id,
+                        req_state.metrics.wall_start_ts,
+                    )
+                    e2e_seconds = time.time() - req_state.metrics.wall_start_ts
+                    self.prom_metrics.request_succeeded(e2e_seconds, finished_reason="stop")
+                    _prompt_tok = 0
+                    _gen_tok = 0
+                    for evt in req_state.metrics.stage_events.get(rid_key, []):
+                        if evt.stage_id == 0:
+                            _prompt_tok += int(evt.num_tokens_in)
+                        _gen_tok += int(evt.num_tokens_out)
+                    self.prom_metrics.observe_tokens(_prompt_tok, _gen_tok)
+                else:
+                    self.prom_metrics.request_failed()
             if self.log_stats:
                 # Emit per-request orchestrator timing (including e2e_total_ms)
                 # before dropping request state.
