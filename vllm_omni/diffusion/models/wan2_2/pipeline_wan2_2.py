@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import PIL.Image
 import torch
@@ -28,6 +28,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
@@ -257,8 +258,17 @@ def get_wan22_pre_process_func(
 
 
 class Wan22Pipeline(
-    nn.Module, PipelineParallelMixin, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    PipelineParallelMixin,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
+    _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     def __init__(
         self,
         *,

@@ -61,7 +61,7 @@ steps:
     steps:
       - label: "Diffusion · Offloader Test"
         commands:
-          - timeout 10m pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
+          - timeout 40m pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:

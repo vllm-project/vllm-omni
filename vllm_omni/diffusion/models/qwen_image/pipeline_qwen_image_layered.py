@@ -7,7 +7,7 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -25,7 +25,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.qwen_image.autoencoder_kl_qwenimage import (
     AutoencoderKLQwenImage,
 )
@@ -203,7 +203,13 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin):
+class QwenImageLayeredPipeline(
+    nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     color_format = "RGBA"
 
     def __init__(
