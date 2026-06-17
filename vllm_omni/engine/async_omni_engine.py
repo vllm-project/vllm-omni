@@ -172,7 +172,7 @@ def _weak_shutdown_async_omni_engine(
 
     try:
         if orchestrator_thread is not None and orchestrator_thread.is_alive():
-            orchestrator_thread.join(timeout=10)
+            orchestrator_thread.join()
     except Exception:
         pass
 
@@ -1469,15 +1469,10 @@ class AsyncOmniEngine:
             finalizer.detach()
 
         logger.info("[AsyncOmniEngine] Shutting down Orchestrator")
-        try:
-            if self.request_queue is not None:
-                self.request_queue.sync_q.put_nowait(ShutdownRequestMessage())
-        except Exception:
-            pass
+        if self.request_queue is not None:
+            self.request_queue.sync_q.put_nowait(ShutdownRequestMessage())
         if self.is_alive():
-            self.orchestrator_thread.join(timeout=10)
-            if self.orchestrator_thread.is_alive():
-                logger.warning("[AsyncOmniEngine] Orchestrator thread did not exit in time")
+            self.orchestrator_thread.join()
 
         for q in (self.request_queue, self.output_queue, self.rpc_output_queue):
             try:

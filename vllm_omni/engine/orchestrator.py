@@ -351,7 +351,8 @@ class Orchestrator:
                     for client in pool.clients:
                         if hasattr(client, "_shutting_down"):
                             client._shutting_down = True
-                self._shutdown_stages()
+                # Stage teardown runs once in run()'s finally after the
+                # orchestration loop observes _shutdown_event and exits.
                 break
             else:
                 logger.warning("[Orchestrator] Unknown message type: %s", msg_type)
