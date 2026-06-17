@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import json
 import multiprocessing.connection
 import os
 import socket
@@ -44,6 +45,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 SHUTDOWN_TIMEOUT_S = 5
+
+
+def _coerce_zmq_port_list(raw_ports: Any) -> list[int] | None:
+    if raw_ports is None:
+        return None
+    if isinstance(raw_ports, str):
+        try:
+            raw_ports = json.loads(raw_ports)
+        except json.JSONDecodeError:
+            raw_ports = [part.strip() for part in raw_ports.split(",") if part.strip()]
+    if not isinstance(raw_ports, (list, tuple)):
+        return None
+    return [int(os.path.expandvars(str(port))) for port in raw_ports]
 
 
 def _default_process_engine_inputs(
@@ -380,36 +394,43 @@ class StageEngineCoreClientBase(StageClientBase):
 
         connector_type = connector_config.get("type")
         sender_port = connector_config.get("sender_zmq_port")
+        sender_port_list = _coerce_zmq_port_list(
+            connector_config.get("zmq_port_list") or connector_config.get("port_list")
+        )
+        if sender_port is None and sender_port_list:
+            sender_port = sender_port_list[0]
         if connector_type in TRANSFER_ENGINE_CONNECTOR_NAMES or sender_port is None:
             base_port = connector_config.get("zmq_port")
-            if base_port is None:
+            if base_port is None and sender_port is None:
                 return
-            base_port = os.path.expandvars(str(base_port))
 
-            omni_kv_config = getattr(self, "_omni_kv_config", None)
-            from_stage = self.stage_id
-            if isinstance(omni_kv_config, dict):
-                from_stage = omni_kv_config.get("omni_from_stage", from_stage)
+            if sender_port is None:
+                base_port = os.path.expandvars(str(base_port))
 
-            try:
-                # Orchestrator always reports rank-0's port; receiver
-                # workers add their own local_rank * KV_RANK_PORT_STRIDE.
-                sender_port = kv_zmq_port(
-                    int(base_port),
-                    int(from_stage),
-                    local_rank=0,
-                    replica_id=self.replica_id,
-                )
-            except (TypeError, ValueError):
-                logger.warning(
-                    "[StageEngineCoreClient] stage-%s [rep-%s] could not resolve sender_zmq_port "
-                    "from base_port=%s and from_stage=%s",
-                    self.stage_id,
-                    self.replica_id,
-                    base_port,
-                    from_stage,
-                )
-                return
+                omni_kv_config = getattr(self, "_omni_kv_config", None)
+                from_stage = self.stage_id
+                if isinstance(omni_kv_config, dict):
+                    from_stage = omni_kv_config.get("omni_from_stage", from_stage)
+
+                try:
+                    # Orchestrator always reports rank-0's port; receiver
+                    # workers add their own local_rank * KV_RANK_PORT_STRIDE.
+                    sender_port = kv_zmq_port(
+                        int(base_port),
+                        int(from_stage),
+                        local_rank=0,
+                        replica_id=self.replica_id,
+                    )
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "[StageEngineCoreClient] stage-%s [rep-%s] could not resolve sender_zmq_port "
+                        "from base_port=%s and from_stage=%s",
+                        self.stage_id,
+                        self.replica_id,
+                        base_port,
+                        from_stage,
+                    )
+                    return
 
         if self._kv_sender_host is None:
             return
@@ -418,6 +439,8 @@ class StageEngineCoreClientBase(StageClientBase):
             "host": str(self._kv_sender_host),
             "zmq_port": int(sender_port),
         }
+        if sender_port_list:
+            self._kv_sender_info["zmq_port_list"] = sender_port_list
 
     def get_kv_sender_info(
         self,

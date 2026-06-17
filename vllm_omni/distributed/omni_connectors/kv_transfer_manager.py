@@ -32,6 +32,13 @@ from .utils.kv_utils import (
     slice_layer_blocks,
     slice_received_rank_shard,
 )
+from .utils.parallel_plan import (
+    KVParallelRankCoord,
+    KVReceiveDistributionPlan,
+    ParallelAxis,
+    build_kv_receive_distribution_plan,
+    select_connector_port_from_list,
+)
 
 logger = init_logger(__name__)
 
@@ -335,6 +342,7 @@ class OmniKVTransferManager:
         # per-rank metadata for heterogeneous TP without querying a registry.
         self._sender_base_host: str | None = None
         self._sender_base_zmq_port: int | None = None
+        self._sender_zmq_port_list: list[int] | None = None
 
         if config.need_send_cache and config.connector_config:
             try:
@@ -425,12 +433,26 @@ class OmniKVTransferManager:
                         except (TypeError, ValueError):
                             stage_int = 0
                         replica_id = get_omni_replica_id()
-                        zmq_port = kv_zmq_port(
-                            base_port,
-                            stage_int,
-                            self._tp_topo.local_rank,
-                            replica_id=replica_id,
-                        )
+                        port_list = self._coerce_port_list(c_extra.get("zmq_port_list") or c_extra.get("port_list"))
+                        if port_list:
+                            coord = self._build_connector_port_coord(
+                                tp_size=self._tp_topo.source_tp_size,
+                                tp_rank=self._tp_topo.local_rank,
+                            )
+                            zmq_port, port_rank, port_axes = select_connector_port_from_list(port_list, coord)
+                            logger.info(
+                                "Selected KV sender port %s from list index=%s axes=%s",
+                                zmq_port,
+                                port_rank,
+                                port_axes,
+                            )
+                        else:
+                            zmq_port = kv_zmq_port(
+                                base_port,
+                                stage_int,
+                                self._tp_topo.local_rank,
+                                replica_id=replica_id,
+                            )
 
                         if self.config.need_send_cache:
                             c_extra["role"] = "sender"
@@ -458,6 +480,117 @@ class OmniKVTransferManager:
         return self._connector if self._connector else None
 
     get_connector = property(lambda self: self.connector)
+
+    @staticmethod
+    def _coerce_port_list(raw_ports: Any) -> list[int] | None:
+        if raw_ports is None:
+            return None
+        if isinstance(raw_ports, str):
+            try:
+                parsed = json.loads(raw_ports)
+            except json.JSONDecodeError:
+                parsed = [part.strip() for part in raw_ports.split(",") if part.strip()]
+            raw_ports = parsed
+        if not isinstance(raw_ports, (list, tuple)):
+            return None
+        ports: list[int] = []
+        for idx, raw_port in enumerate(raw_ports):
+            ports.append(expand_env_int(raw_port, f"zmq_port_list[{idx}]"))
+        return ports
+
+    def _build_connector_port_coord(self, *, tp_size: int, tp_rank: int) -> KVParallelRankCoord:
+        from vllm.distributed.parallel_state import get_ep_group
+
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_classifier_free_guidance_rank,
+            get_classifier_free_guidance_world_size,
+            get_data_parallel_rank,
+            get_data_parallel_world_size,
+            get_fully_shard_rank,
+            get_fully_shard_world_size,
+            get_pipeline_parallel_rank,
+            get_pipeline_parallel_world_size,
+            get_ring_parallel_rank,
+            get_ring_parallel_world_size,
+            get_sequence_parallel_rank,
+            get_sequence_parallel_world_size,
+            get_ulysses_parallel_rank,
+            get_ulysses_parallel_world_size,
+        )
+
+        ep_group = self._safe_parallel_group(get_ep_group)
+        return KVParallelRankCoord(
+            axes=(
+                ParallelAxis("tp", max(int(tp_size), 1), int(tp_rank), "tensor_shard"),
+                ParallelAxis(
+                    "pp",
+                    self._safe_parallel_int(get_pipeline_parallel_world_size),
+                    self._safe_parallel_int(get_pipeline_parallel_rank, 0),
+                    "tensor_shard",
+                ),
+                ParallelAxis(
+                    "cfg",
+                    self._safe_parallel_int(get_classifier_free_guidance_world_size),
+                    self._safe_parallel_int(get_classifier_free_guidance_rank, 0),
+                    "branch",
+                ),
+                ParallelAxis(
+                    "ulysses",
+                    self._safe_parallel_int(get_ulysses_parallel_world_size),
+                    self._safe_parallel_int(get_ulysses_parallel_rank, 0),
+                    "tensor_shard",
+                ),
+                ParallelAxis(
+                    "ring",
+                    self._safe_parallel_int(get_ring_parallel_world_size),
+                    self._safe_parallel_int(get_ring_parallel_rank, 0),
+                    "tensor_shard",
+                ),
+                ParallelAxis(
+                    "sp",
+                    self._safe_parallel_int(get_sequence_parallel_world_size),
+                    self._safe_parallel_int(get_sequence_parallel_rank, 0),
+                    "container",
+                ),
+                ParallelAxis(
+                    "dp",
+                    self._safe_parallel_int(get_data_parallel_world_size),
+                    self._safe_parallel_int(get_data_parallel_rank, 0),
+                    "replica",
+                ),
+                ParallelAxis("ep", self._group_world_size(ep_group), self._group_rank(ep_group), "replica"),
+                ParallelAxis(
+                    "fs",
+                    self._safe_parallel_int(get_fully_shard_world_size),
+                    self._safe_parallel_int(get_fully_shard_rank, 0),
+                    "tensor_shard",
+                ),
+            )
+        )
+
+    def _sender_port_for_source_rank(self, from_rank: int) -> int | None:
+        if self._sender_zmq_port_list:
+            try:
+                coord = self._build_connector_port_coord(
+                    tp_size=self._tp_topo.source_tp_size,
+                    tp_rank=from_rank,
+                )
+                port, port_rank, port_axes = select_connector_port_from_list(self._sender_zmq_port_list, coord)
+                logger.debug(
+                    "Selected KV source port %s from list index=%s axes=%s for source_rank=%s",
+                    port,
+                    port_rank,
+                    port_axes,
+                    from_rank,
+                )
+                return port
+            except Exception:
+                logger.exception("Failed to select KV source port from sender port list")
+                return None
+
+        if self._sender_base_zmq_port is None:
+            return None
+        return self._sender_base_zmq_port + from_rank * KV_RANK_PORT_STRIDE
 
     def _resolve_sender_info(
         self, sender_info: dict[str, Any], sender_stage_id: str | int | None = None
@@ -689,9 +822,9 @@ class OmniKVTransferManager:
     def update_sender_info(self, sender_info: dict[str, Any], sender_stage_id: str | int | None = None) -> None:
         """Update receiver-side sender info before loading remote KV cache.
 
-        The orchestrator always reports rank-0's ZMQ port.  When TP > 1 the
-        receiver must offset the port so that each TP rank connects to the
-        corresponding sender rank's port.
+        The orchestrator may report either rank-0's ZMQ port or an explicit
+        ZMQ port list.  When no list is present, the receiver preserves the
+        legacy rank-stride offset behavior.
 
         The base host/port are also stored so that the receive path can
         construct per-rank metadata for heterogeneous TP scenarios.
@@ -706,20 +839,31 @@ class OmniKVTransferManager:
 
         sender_host = actual_info.get("host")
         base_zmq_port = actual_info.get("zmq_port")
+        sender_port_list = self._coerce_port_list(
+            actual_info.get("zmq_port_list")
+            or actual_info.get("sender_zmq_port_list")
+            or actual_info.get("port_list")
+        )
 
         # Store base sender info for per-rank metadata construction.
         self._sender_base_host = sender_host
+        self._sender_zmq_port_list = sender_port_list
         if base_zmq_port is not None:
             self._sender_base_zmq_port = int(base_zmq_port)
 
         # --- Default sender: offset to match this receiver's corresponding sender rank ---
         zmq_port = base_zmq_port
-        if zmq_port is not None and self._tp_topo.local_rank > 0:
+        if sender_port_list:
+            source_rank = min(self._tp_topo.local_rank, self._tp_topo.source_tp_size - 1)
+            zmq_port = self._sender_port_for_source_rank(source_rank)
+        elif zmq_port is not None and self._tp_topo.local_rank > 0:
             zmq_port = int(zmq_port) + self._tp_topo.local_rank * KV_RANK_PORT_STRIDE
 
         if self.config.connector_config:
             self.config.connector_config["sender_host"] = sender_host
             self.config.connector_config["sender_zmq_port"] = zmq_port
+            if sender_port_list:
+                self.config.connector_config["sender_zmq_port_list"] = sender_port_list
 
         if self._connector and hasattr(self._connector, "update_sender_info"):
             try:
@@ -731,11 +875,13 @@ class OmniKVTransferManager:
                     self._connector.sender_zmq_port = zmq_port
 
         logger.info(
-            "Sender info updated: host=%s, base_port=%s, adjusted_port=%s (local_rank=%s)",
+            "Sender info updated: host=%s, base_port=%s, adjusted_port=%s "
+            "(local_rank=%s, port_list=%s)",
             sender_host,
             base_zmq_port,
             zmq_port,
             self._tp_topo.local_rank,
+            bool(sender_port_list),
         )
 
     def handle_finished_requests_kv_transfer(
@@ -1049,11 +1195,13 @@ class OmniKVTransferManager:
                     # When from_rank is None (TP<=1), metadata stays None
                     # and the connector falls back to its default sender.
                     rank_metadata: dict[str, Any] | None = None
-                    if from_rank is not None and self._sender_base_host and self._sender_base_zmq_port is not None:
-                        rank_metadata = {
-                            "source_host": self._sender_base_host,
-                            "source_port": self._sender_base_zmq_port + from_rank * KV_RANK_PORT_STRIDE,
-                        }
+                    if from_rank is not None and self._sender_base_host:
+                        source_port = self._sender_port_for_source_rank(from_rank)
+                        if source_port is not None:
+                            rank_metadata = {
+                                "source_host": self._sender_base_host,
+                                "source_port": source_port,
+                            }
 
                     result = self.connector.get(
                         from_stage=from_stage,
@@ -1246,6 +1394,140 @@ class OmniKVTransferManager:
 
         return primary_ok
 
+    @staticmethod
+    def _safe_parallel_int(getter: Callable[[], Any] | None, default: int = 1) -> int:
+        if getter is None:
+            return default
+        try:
+            return int(getter())
+        except Exception:
+            return default
+
+    @staticmethod
+    def _safe_parallel_group(getter: Callable[[], Any] | None) -> Any | None:
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
+
+    def _build_receive_parallel_coord(
+        self,
+        *,
+        cfg_size: int,
+        cfg_rank: int,
+        sp_size: int,
+        sp_rank: int,
+        ring_size: int,
+        ring_rank: int,
+        ulysses_size: int,
+        ulysses_rank: int,
+        pp_size: int,
+        pp_rank: int,
+        dp_size: int,
+        dp_rank: int,
+        ep_size: int,
+        ep_rank: int,
+    ) -> KVParallelRankCoord:
+        topo = self._tp_topo
+        return KVParallelRankCoord(
+            axes=(
+                ParallelAxis("tp", topo.target_tp_size, topo.local_rank, "tensor_shard"),
+                ParallelAxis("pp", pp_size, pp_rank, "tensor_shard"),
+                ParallelAxis("ring", ring_size, ring_rank, "tensor_shard"),
+                ParallelAxis("ulysses", ulysses_size, ulysses_rank, "tensor_shard"),
+                ParallelAxis("cfg", cfg_size, cfg_rank, "branch"),
+                ParallelAxis("sp", sp_size, sp_rank, "container"),
+                ParallelAxis("dp", dp_size, dp_rank, "replica"),
+                ParallelAxis("ep", ep_size, ep_rank, "replica"),
+            )
+        )
+
+    @staticmethod
+    def _group_world_size(group: Any | None) -> int:
+        if group is None:
+            return 1
+        return int(getattr(group, "world_size", 1) or 1)
+
+    @staticmethod
+    def _group_rank(group: Any | None) -> int:
+        if group is None:
+            return 0
+        return int(getattr(group, "rank_in_group", 0) or 0)
+
+    def _replica_fanout_peer_ranks(
+        self,
+        *,
+        plan: KVReceiveDistributionPlan,
+        replica_group: Any | None,
+        participates: bool,
+    ) -> tuple[int, tuple[int, ...]] | None:
+        """Return owner and peer ranks for same-KV replica fanout."""
+        if not plan.uses_replica_fanout or replica_group is None:
+            return None
+        if self._group_world_size(replica_group) <= 1:
+            return None
+
+        rank_in_group = self._group_rank(replica_group)
+        local_identity = plan.replica_fanout_identity
+        local_member = {
+            "rank": rank_in_group,
+            "identity": local_identity,
+            "participates": participates,
+        }
+        members: list[dict[str, object] | None] = [None] * self._group_world_size(replica_group)
+        torch.distributed.all_gather_object(
+            members,
+            local_member,
+            group=replica_group.cpu_group,
+        )
+
+        peer_ranks = tuple(
+            sorted(
+                int(member["rank"])
+                for member in members
+                if member is not None
+                and bool(member.get("participates"))
+                and tuple(member.get("identity", ())) == local_identity
+            )
+        )
+        if len(peer_ranks) <= 1:
+            return None
+        return peer_ranks[0], peer_ranks
+
+    def _receive_remote_kv_payload_from_replica_fanout(
+        self,
+        *,
+        req: Any,
+        replica_group: Any | None,
+        fanout: tuple[int, tuple[int, ...]],
+        cfg_kv_collect_func: Callable | None,
+    ) -> dict[str, object] | None:
+        """Receive KV payload once per replica-equivalent rank set.
+
+        Fanout is only an optimization around the remote connector receive.  It
+        does not change the caller's CFG/SP/world distribution semantics.
+        """
+        owner_rank, peer_ranks = fanout
+        rank_in_group = self._group_rank(replica_group)
+        if rank_in_group == owner_rank:
+            received = self.receive_multi_kv_cache(
+                req,
+                cfg_kv_collect_func,
+                torch.device("cpu"),
+            )
+            kv_payload = self._collect_request_kv_payload(req) if received else None
+            for dst_rank in peer_ranks:
+                if dst_rank != owner_rank:
+                    replica_group.send_object(kv_payload, dst_rank)
+            return kv_payload
+
+        kv_payload = replica_group.recv_object(owner_rank)
+        if kv_payload:
+            self._apply_request_kv_payload(req, kv_payload, torch.device("cpu"))
+        return kv_payload
+
     def receive_multi_kv_cache_distributed(
         self,
         req: Any,
@@ -1254,20 +1536,35 @@ class OmniKVTransferManager:
     ) -> bool:
         """Distributed wrapper around :meth:`receive_multi_kv_cache`.
 
-        TP-aware path selection:
+        Plan-driven path selection:
         - world size 1: direct receive
-        - TP active, cfg size 1: each rank independently receives
-        - TP active, cfg size > 1: cfg-rank 0 receives, then broadcasts to
-          peers that share the same TP rank
+        - KV-sharding axes (TP/PP/Ring/Ulysses): each shard owner receives
+          independently unless a branch/local-distribution axis also applies
+        - CFG: cfg-rank 0 receives for that shard coordinate, then sends
+          branch-local payloads to CFG peers
+        - legacy SP without Ring/Ulysses: sp-rank 0 receives, then broadcasts
+          the same payload inside the SP group
+        - EP: does not shard KV; equal KV identities may fan out an owner
+          rank's remote receive through point-to-point local object transfer
         - TP inactive: legacy rank-0 receive then world broadcast
         """
+        from vllm.distributed.parallel_state import get_ep_group
+
         from vllm_omni.diffusion.distributed.parallel_state import (
             get_cfg_group,
             get_classifier_free_guidance_rank,
             get_classifier_free_guidance_world_size,
+            get_data_parallel_rank,
+            get_data_parallel_world_size,
+            get_pipeline_parallel_rank,
+            get_pipeline_parallel_world_size,
+            get_ring_parallel_rank,
+            get_ring_parallel_world_size,
             get_sequence_parallel_rank,
             get_sequence_parallel_world_size,
             get_sp_group,
+            get_ulysses_parallel_rank,
+            get_ulysses_parallel_world_size,
             get_world_group,
         )
 
@@ -1277,75 +1574,142 @@ class OmniKVTransferManager:
             return self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
 
         topo = self._tp_topo
-        tp_active = topo.source_tp_size > 1 or topo.target_tp_size > 1
-        cfg_size = 1
-        cfg_rank = 0
-        cfg_group = None
-        sp_size = 1
-        sp_rank = 0
-        sp_group = None
-        try:
-            cfg_size = get_classifier_free_guidance_world_size()
-            cfg_rank = get_classifier_free_guidance_rank()
-            cfg_group = get_cfg_group()
-        except Exception:
-            cfg_size = 1
-            cfg_rank = 0
-            cfg_group = None
+        cfg_size = self._safe_parallel_int(get_classifier_free_guidance_world_size)
+        cfg_rank = self._safe_parallel_int(get_classifier_free_guidance_rank, 0)
+        cfg_group = self._safe_parallel_group(get_cfg_group) if cfg_size > 1 else None
+        sp_size = self._safe_parallel_int(get_sequence_parallel_world_size)
+        sp_rank = self._safe_parallel_int(get_sequence_parallel_rank, 0)
+        sp_group = self._safe_parallel_group(get_sp_group) if sp_size > 1 else None
+        ring_size = self._safe_parallel_int(get_ring_parallel_world_size)
+        ring_rank = self._safe_parallel_int(get_ring_parallel_rank, 0)
+        ulysses_size = self._safe_parallel_int(get_ulysses_parallel_world_size)
+        ulysses_rank = self._safe_parallel_int(get_ulysses_parallel_rank, 0)
+        pp_size = self._safe_parallel_int(get_pipeline_parallel_world_size)
+        pp_rank = self._safe_parallel_int(get_pipeline_parallel_rank, 0)
+        dp_size = self._safe_parallel_int(get_data_parallel_world_size)
+        dp_rank = self._safe_parallel_int(get_data_parallel_rank, 0)
+        ep_group = self._safe_parallel_group(get_ep_group)
+        ep_size = self._group_world_size(ep_group)
+        ep_rank = self._group_rank(ep_group)
 
-        try:
-            sp_size = get_sequence_parallel_world_size()
-            sp_rank = get_sequence_parallel_rank()
-            sp_group = get_sp_group()
-        except Exception:
-            sp_size = 1
-            sp_rank = 0
-            sp_group = None
+        coord = self._build_receive_parallel_coord(
+            cfg_size=cfg_size,
+            cfg_rank=cfg_rank,
+            sp_size=sp_size,
+            sp_rank=sp_rank,
+            ring_size=ring_size,
+            ring_rank=ring_rank,
+            ulysses_size=ulysses_size,
+            ulysses_rank=ulysses_rank,
+            pp_size=pp_size,
+            pp_rank=pp_rank,
+            dp_size=dp_size,
+            dp_rank=dp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+        )
+        plan: KVReceiveDistributionPlan = build_kv_receive_distribution_plan(
+            coord=coord,
+            world_size=world.world_size,
+            world_rank=world.rank_in_group,
+            source_tp_size=topo.source_tp_size,
+            target_tp_size=topo.target_tp_size,
+        )
 
-        if tp_active and (cfg_size <= 1 and sp_size <= 1):
+        if plan.independently_receives_remote:
             logger.info(
-                "Rank-aware KV receive: rank %s independently receiving (from_tp=%s, to_tp=%s)",
+                "KV receive plan=%s: rank independently receiving (tp=%s/%s, pp=%s/%s, ring=%s/%s, ulysses=%s/%s)",
+                plan.mode,
                 topo.local_rank,
-                topo.source_tp_size,
                 topo.target_tp_size,
+                pp_rank,
+                pp_size,
+                ring_rank,
+                ring_size,
+                ulysses_rank,
+                ulysses_size,
             )
+            if plan.uses_replica_fanout:
+                fanout = self._replica_fanout_peer_ranks(
+                    plan=plan,
+                    replica_group=ep_group,
+                    participates=True,
+                )
+                if fanout is None:
+                    return self.receive_multi_kv_cache(
+                        req,
+                        cfg_kv_collect_func,
+                        target_device,
+                    )
+                kv_payload = self._receive_remote_kv_payload_from_replica_fanout(
+                    req=req,
+                    replica_group=ep_group,
+                    fanout=fanout,
+                    cfg_kv_collect_func=cfg_kv_collect_func,
+                )
+                if not kv_payload:
+                    return False
+                self._apply_request_kv_payload(req, kv_payload, target_device)
+                return True
             return self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
 
-        if tp_active and (cfg_size > 1 or sp_size > 1):
+        if plan.uses_local_distribution:
             kv_payload: dict[str, object] | None = None
-            is_owner = cfg_rank == 0 and sp_rank == 0
+            remote_kv_payload: dict[str, object] | None = None
+            fanout_attempted = False
+
+            if plan.uses_replica_fanout:
+                fanout = self._replica_fanout_peer_ranks(
+                    plan=plan,
+                    replica_group=ep_group,
+                    participates=plan.owner_receives,
+                )
+                if plan.owner_receives and fanout is not None:
+                    fanout_attempted = True
+                    remote_kv_payload = self._receive_remote_kv_payload_from_replica_fanout(
+                        req=req,
+                        replica_group=ep_group,
+                        fanout=fanout,
+                        cfg_kv_collect_func=cfg_kv_collect_func,
+                    )
 
             # step1: only owner need to receive
-            if is_owner:
-                received = self.receive_multi_kv_cache(
-                    req,
-                    cfg_kv_collect_func,
-                    torch.device("cpu"),
-                )
-                if received:
-                    if cfg_size > 1:  # build cfg-local payloads
+            if plan.owner_receives:
+                if remote_kv_payload is None and not fanout_attempted:
+                    received = self.receive_multi_kv_cache(
+                        req,
+                        cfg_kv_collect_func,
+                        torch.device("cpu"),
+                    )
+                    remote_kv_payload = self._collect_request_kv_payload(req) if received else None
+                if remote_kv_payload:
+                    if plan.cfg_active:  # build cfg-local payloads
                         cfg_rank_payloads = self._build_cfg_rank_local_payloads(
                             req,
                             cfg_size,
                         )
                         kv_payload = cfg_rank_payloads[0]
                         # send to other cfg
-                        for dst_cfg_rank in range(1, cfg_size):
-                            cfg_group.send_object(
-                                cfg_rank_payloads[dst_cfg_rank],
-                                dst_cfg_rank,
-                            )
-                    elif sp_size > 1:
-                        kv_payload = self._collect_request_kv_payload(req)
+                        if cfg_group is not None:
+                            for dst_cfg_rank in range(1, cfg_size):
+                                cfg_group.send_object(
+                                    cfg_rank_payloads[dst_cfg_rank],
+                                    dst_cfg_rank,
+                                )
+                    elif plan.sp_broadcast_enabled:
+                        kv_payload = remote_kv_payload
                 else:
                     # Owner receive failed: send None sentinel to CFG followers to avoid deadlock
-                    if cfg_size > 1:
+                    if plan.cfg_active and cfg_group is not None:
                         for dst_cfg_rank in range(1, cfg_size):
-                            cfg_group.send_object(None, dst_cfg_rank)
-            elif sp_rank == 0 and cfg_size > 1:
+                            cfg_group.send_object(
+                                None,
+                                dst_cfg_rank,
+                            )
+            elif plan.cfg_follower_receives_from_cfg_leader and cfg_group is not None:
                 kv_payload = cfg_group.recv_object(0)
             # sp broadcast
-            if sp_size > 1 and sp_group is not None:
+            if plan.sp_broadcast_enabled and sp_group is not None:
                 kv_payload = sp_group.broadcast_object(
                     kv_payload,
                     src=0,
@@ -1358,7 +1722,7 @@ class OmniKVTransferManager:
             return True
 
         kv_payload: dict[str, object] | None = None
-        if world.rank_in_group == 0:
+        if plan.owner_receives:
             received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, torch.device("cpu"))
             if received:
                 kv_payload = self._collect_request_kv_payload(req)
