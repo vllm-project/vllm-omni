@@ -841,7 +841,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
-    if use_moe_parallel_mapping and cfg_parallel_size > 1:
+    if cfg_parallel_size > 1:
         vllm_parallel_state._DP = init_model_parallel_group(
             group_ranks=rank_generator.get_ranks("cfg-dp"),
             local_rank=get_world_group().local_rank,
