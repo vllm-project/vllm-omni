@@ -154,13 +154,7 @@ def parse_args() -> Any:
     parser.add_argument(
         "--forced-aligner-config",
         default=None,
-        help="Optional YAML file for forced aligner settings",
-    )
-    parser.add_argument(
-        "--forced-aligner-gpu-memory-utilization",
-        type=float,
-        default=None,
-        help="Optional gpu_memory_utilization override for the forced aligner",
+        help="Optional YAML file for forced aligner settings (incl. gpu_memory_utilization)",
     )
     parser.add_argument("--stage-configs-path", default=None, help="Qwen3-TTS deploy YAML")
     parser.add_argument("--text", default="Hello world.", help="Text to synthesize and align")

@@ -109,15 +109,16 @@ def test_build_config_cli_model_overrides_yaml(tmp_path):
         {
             "forced_aligner": "new",
             "forced_aligner_config": str(cfg),
-            "forced_aligner_gpu_memory_utilization": 0.55,
         },
     )()
 
     out = forced_aligner.build_forced_aligner_config(args)
 
     assert out is not None
+    # --forced-aligner overrides the YAML model; gpu_memory_utilization/dtype
+    # come from the user YAML (there is no longer a CLI flag for gpu mem).
     assert out.model == "new"
-    assert out.gpu_memory_utilization == 0.55
+    assert out.gpu_memory_utilization == 0.2
     assert out.dtype == "float16"
     assert out.runner == "pooling"
 
@@ -129,7 +130,6 @@ def test_build_config_from_cli_model_uses_default_yaml():
         {
             "forced_aligner": "local-aligner",
             "forced_aligner_config": None,
-            "forced_aligner_gpu_memory_utilization": None,
         },
     )()
 

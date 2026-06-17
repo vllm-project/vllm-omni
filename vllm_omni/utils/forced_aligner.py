@@ -80,25 +80,23 @@ def _load_forced_aligner_yaml(path: str | Path) -> dict[str, Any]:
 
 
 def build_forced_aligner_config(args: Any) -> ForcedAlignerConfig | None:
-    """Build a config from CLI args, or ``None`` when the flag is off.
+    """Build a config from CLI args, or ``None`` when the feature is off.
 
-    Mirrors @Dmaner's #3804 helper of the same name so test fixtures
-    that target either implementation port unchanged.
+    Precedence (lowest to highest): the packaged default YAML
+    (:data:`_DEFAULT_CONFIG_PATH`, Qwen deploy defaults) -> a user YAML passed
+    via ``--forced-aligner-config`` -> the ``--forced-aligner`` model path. The
+    feature is off (returns ``None``) unless a model resolves from this chain.
+    Per-field overrides such as ``gpu_memory_utilization`` live in the YAML.
     """
     config_path = getattr(args, "forced_aligner_config", None)
     config_data: dict[str, Any] = {}
     model = getattr(args, "forced_aligner", None)
     if config_path or model:
-        # The default YAML owns Qwen-specific deployment defaults. A user YAML
-        # can override any subset, and CLI flags override both.
         config_data.update(_load_forced_aligner_yaml(_DEFAULT_CONFIG_PATH))
     if config_path:
         config_data.update(_load_forced_aligner_yaml(config_path))
     if model:
         config_data["model"] = str(model)
-    gpu_mem = getattr(args, "forced_aligner_gpu_memory_utilization", None)
-    if gpu_mem is not None:
-        config_data["gpu_memory_utilization"] = float(gpu_mem)
     model = config_data.get("model")
     if not model:
         return None
