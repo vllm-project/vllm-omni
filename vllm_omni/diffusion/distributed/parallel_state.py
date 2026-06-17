@@ -782,7 +782,6 @@ def initialize_model_parallel(
         order="tp-sp-pp-cfg-dp",
     )
     sp_group_ranks = rank_generator.get_ranks("sp")
-    use_moe_parallel_mapping = enable_expert_parallel
     global _DP
     assert _DP is None, "data parallel group is already initialized"
     _DP = init_model_parallel_group(
@@ -828,7 +827,7 @@ def initialize_model_parallel(
         ulysses_group=ulysses_pg,
         ring_group=ring_pg,
     )
-    if use_moe_parallel_mapping:
+    if enable_expert_parallel:
         vllm_parallel_state._PCP = _SP
 
     assert vllm_parallel_state._TP is None, "Tensor parallel group is already initialized"
@@ -856,7 +855,7 @@ def initialize_model_parallel(
     )
 
     _MOE_EP_GROUP_RANKS = None
-    if use_moe_parallel_mapping:
+    if enable_expert_parallel:
         ep_group_ranks = rank_generator.get_ranks("tp-sp-cfg-dp")
         vllm_parallel_state._EP = init_model_parallel_group(
             group_ranks=ep_group_ranks,
