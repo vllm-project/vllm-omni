@@ -88,39 +88,6 @@ def register_omni_models_to_vllm():
     import vllm_omni.reasoning  # noqa: F401
 
 
-def add_forced_aligner_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Register the forced-aligner CLI flags (single source of truth).
-
-    Shared by the ``vllm-omni serve`` subparser (``cli/serve.py``) and the
-    engine-args path (``_add_omni_specific_args``) so the two cannot drift.
-    ``--forced-aligner`` is the opt-in toggle; heavier knobs
-    (gpu_memory_utilization, dtype, max_model_len) live in the deploy YAML
-    passed via ``--forced-aligner-config`` rather than as bespoke top-level
-    flags.
-    """
-    parser.add_argument(
-        "--forced-aligner",
-        type=str,
-        default=None,
-        help=(
-            "Enable streaming TTS word timestamps via a forced aligner. "
-            "Pass the aligner model path/name, e.g. 'Qwen/Qwen3-ForcedAligner-0.6B'. "
-            "Disabled when omitted."
-        ),
-    )
-    parser.add_argument(
-        "--forced-aligner-config",
-        type=str,
-        default=None,
-        help=(
-            "Optional YAML file for forced aligner settings (model, runner, "
-            "gpu_memory_utilization, dtype, max_model_len). The --forced-aligner "
-            "flag, when set, overrides the YAML model field."
-        ),
-    )
-    return parser
-
-
 @dataclass
 class OmniEngineArgs(EngineArgs):
     """Engine arguments for omni models, extending base EngineArgs.
@@ -202,10 +169,6 @@ class OmniEngineArgs(EngineArgs):
             )
         except argparse.ArgumentError:
             pass
-        # Forced aligner / word timestamps — single source of truth, shared
-        # with cli/serve.py. No try/except so a genuine double-registration
-        # fails loudly rather than being silently swallowed.
-        add_forced_aligner_cli_args(parser)
         return parser
 
     omni_master_address: str | None = None

@@ -20,7 +20,6 @@ from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_se
 from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
-from vllm_omni.engine.arg_utils import add_forced_aligner_cli_args
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
@@ -220,8 +219,29 @@ class OmniServeCommand(CLISubcommand):
             help="Default task type for TTS models (CustomVoice, VoiceDesign, or Base). "
             "If not specified, will be inferred from model path.",
         )
-        # Forced aligner / word timestamps — single source of truth in arg_utils.
-        add_forced_aligner_cli_args(omni_config_group)
+        # Forced aligner / word timestamps. --forced-aligner is the opt-in
+        # toggle; heavier knobs (gpu_memory_utilization, dtype, max_model_len)
+        # live in the deploy YAML passed via --forced-aligner-config.
+        omni_config_group.add_argument(
+            "--forced-aligner",
+            type=str,
+            default=None,
+            help=(
+                "Enable streaming TTS word timestamps via a forced aligner. "
+                "Pass the aligner model path/name, e.g. 'Qwen/Qwen3-ForcedAligner-0.6B'. "
+                "Disabled when omitted."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--forced-aligner-config",
+            type=str,
+            default=None,
+            help=(
+                "Optional YAML file for forced aligner settings (model, runner, "
+                "gpu_memory_utilization, dtype, max_model_len). The --forced-aligner "
+                "flag, when set, overrides the YAML model field."
+            ),
+        )
         # TODO(@lishunyang12): deprecate once all models migrate to --deploy-config
         omni_config_group.add_argument(
             "--stage-configs-path",
