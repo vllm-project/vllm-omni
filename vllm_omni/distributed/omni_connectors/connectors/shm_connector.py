@@ -116,6 +116,14 @@ class SharedMemoryConnector(OmniConnectorBase):
             return result
         except FileNotFoundError:
             return None
+        except ValueError as e:
+            # A receiver can observe a newly-created POSIX SHM object before
+            # the writer has finished sizing it. Treat that as "not ready yet"
+            # so async polling can retry without a traceback.
+            if "empty file" in str(e):
+                return None
+            logger.debug("_get_by_key: unexpected error reading SHM segment %s", get_key, exc_info=True)
+            return None
         except Exception:
             logger.debug("_get_by_key: unexpected error reading SHM segment %s", get_key, exc_info=True)
             return None

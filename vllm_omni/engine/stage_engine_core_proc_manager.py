@@ -47,7 +47,7 @@ except ImportError:  # pragma: no cover - depends on vLLM build
     set_device_control_env_var = None  # type: ignore[assignment]
 
 
-class OmniCoreEngineProcManager(CoreEngineProcManager):
+class StageEngineCoreProcManager(CoreEngineProcManager):
     """Spawn :class:`StageEngineCoreProc` subprocesses with omni kwargs.
 
     The body mirrors :class:`CoreEngineProcManager.__init__` because the
@@ -102,7 +102,7 @@ class OmniCoreEngineProcManager(CoreEngineProcManager):
         # Intra-replica vLLM DP mesh (i.e. ``data_parallel_size`` ranks sharing
         # one engine, one DPCoordinator, one set of weights). Distinct from
         # the omni-level notion of multiple independent replicas of a stage —
-        # those each spawn their own OmniCoreEngineProcManager and never join
+        # those each spawn their own StageEngineCoreProcManager and never join
         # a vLLM DP group across replicas.
         has_intra_replica_dp = vllm_config.parallel_config.data_parallel_size > 1
 
