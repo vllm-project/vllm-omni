@@ -129,7 +129,7 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
     monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_MOE_EP_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
