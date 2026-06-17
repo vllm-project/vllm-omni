@@ -86,6 +86,22 @@ class PydanticMagicMock(MagicMock):
 # --- Static extraction for CLI argument docs ---
 
 
+def _extract_module_function(rel_path: str, func_name: str):
+    """Statically extract a module-level function so subparser_init's helpers
+    resolve during doc generation without importing vllm/torch.
+    """
+    path = ROOT_DIR / rel_path
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=str(path))
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            code = compile(ast.Module(body=[node], type_ignores=[]), filename=str(path), mode="exec")
+            ns = {"argparse": __import__("argparse")}
+            exec(code, ns)
+            return ns[func_name]
+    raise RuntimeError(f"Could not statically extract {func_name} from {rel_path}")
+
+
 def extract_omni_serve_subparser_init():
     """
     Statically parse vllm_omni/entrypoints/cli/serve.py to extract the subparser_init method
@@ -129,6 +145,9 @@ def extract_omni_serve_subparser_init():
                         "argparse": __import__("argparse"),
                         "json": __import__("json"),
                         "DESCRIPTION": DESCRIPTION,
+                        "add_forced_aligner_cli_args": _extract_module_function(
+                            "vllm_omni/engine/arg_utils.py", "add_forced_aligner_cli_args"
+                        ),
                     }
                     exec(code, exec_globals, local_vars)
                     # Get the function
