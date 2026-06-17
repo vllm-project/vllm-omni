@@ -107,6 +107,9 @@ from tqdm.asyncio import tqdm
 
 logger = logging.getLogger(__name__)
 
+_STAGE_METRICS_ENDPOINTS = {"/v1/chat/completions"}
+_RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
+
 
 class BaseDataset(ABC):
     def __init__(self, args, api_url: str, model: str):
@@ -1163,6 +1166,10 @@ async def benchmark(args):
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 
+    if args.return_stage_metrics and args.endpoint in _STAGE_METRICS_ENDPOINTS:
+        for req in requests_list:
+            req.extra_body.setdefault(_RETURN_STAGE_METRICS_FIELD, True)
+
     if args.endpoint == "/v1/images/edits":
         for req in requests_list:
             req.default_bot_task = args.bot_task
@@ -1442,6 +1449,11 @@ if __name__ == "__main__":
         type=str,
         default="think",
         help=("bot_task form field for --endpoint /v1/images/edits (think, recaption, think_recaption, vanilla)."),
+    )
+    parser.add_argument(
+        "--return-stage-metrics",
+        action="store_true",
+        help="Request stage duration metrics from endpoints that support return_stage_metrics.",
     )
 
     args = parser.parse_args()
