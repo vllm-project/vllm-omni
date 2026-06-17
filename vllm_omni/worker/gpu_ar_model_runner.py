@@ -41,7 +41,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_flat_payload, to_payload_element
+from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -948,8 +948,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def _build_multimodal_outputs(
         self,
-        per_req_payloads: list[dict[str, object]] | None,
-    ) -> list[dict[str, torch.Tensor]] | None:
+        per_req_payloads: list[dict[str, object] | None] | None,
+    ) -> list[dict[str, torch.Tensor] | None] | None:
         """Build per-request multimodal output payloads (dedicated channel).
 
         Reuses the per-request payloads assembled by the pooler-payload loop
@@ -1288,12 +1288,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))
 
-        pooler_inter: list[dict[str, object]] = []
-        pooler_client: list[dict[str, object]] = []
-        for payload in pooler_output or []:
-            inter_payload, client_payload = partition_flat_payload(payload)
-            pooler_inter.append(inter_payload)
-            pooler_client.append(client_payload)
+        pooler_inter, pooler_client = partition_payload_list(pooler_output or [])
 
         if pooler_inter and self._should_accumulate_full_payload_output():
             for i, rid in enumerate(req_ids_output_copy):
