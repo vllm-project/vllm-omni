@@ -63,6 +63,7 @@ WebSocket /v1/video/chat/stream
 | `sampling_params_list` | list or null | null | Optional per-stage sampling parameter overrides. |
 | `enable_frame_filter` | bool | `true` | Enable EVS near-duplicate frame filtering. |
 | `frame_filter_threshold` | float, 0.0-1.0 | `0.95` | EVS similarity threshold. Higher keeps more frames; lower drops more near-duplicates. |
+| `speaker` | string or null | null | TTS speaker/voice name (e.g. `ethan`, `chelsie`, `aiden`). Applies to the whole session. Uses the model default when unset; an unsupported name returns an `error` on the first query. |
 
 ### Legacy Aliases
 
