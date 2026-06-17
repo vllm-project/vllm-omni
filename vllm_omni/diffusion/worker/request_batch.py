@@ -64,6 +64,9 @@ class DiffusionRequestBatch:
     def kv_sender_info(self) -> dict | None:
         return self.requests[0].kv_sender_info
 
+    def is_dummy_run(self) -> bool:
+        return self.requests[0].is_dummy_run_request_id(self.request_id)
+
     def get(self, request_id: str) -> OmniDiffusionRequest | None:
         for req in self.requests:
             if req.request_id == request_id:

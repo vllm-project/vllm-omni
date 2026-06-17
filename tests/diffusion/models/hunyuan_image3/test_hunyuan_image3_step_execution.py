@@ -19,6 +19,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     HunyuanImage3Pipeline,
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -160,10 +161,14 @@ def test_forward_uses_same_hunyuan_bot_task_semantics(monkeypatch):
 
     monkeypatch.setattr(hy3_module, "get_system_prompt", fake_get_system_prompt)
     pipeline.prepare_model_inputs = fake_prepare_model_inputs
-    req = SimpleNamespace(
-        request_id="req-forward-bot-task",
-        sampling_params=_sampling_params(bot_task="think_recaption", use_system_prompt="dynamic"),
-        prompts=[{"prompt": "prompt", "bot_task": "vanilla"}],
+    req = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="req-forward-bot-task",
+                sampling_params=_sampling_params(bot_task="think_recaption", use_system_prompt="dynamic"),
+                prompt={"prompt": "prompt", "bot_task": "vanilla"},
+            )
+        ]
     )
 
     with pytest.raises(RuntimeError, match="stop after prepare_model_inputs"):

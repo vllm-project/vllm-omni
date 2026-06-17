@@ -22,7 +22,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.sdxl.sdxl_unet import SDXLUNet2DConditionModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +297,7 @@ class StableDiffusionXLPipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] = "",
         negative_prompt: str | list[str] = "",
         height: int | None = None,
@@ -306,7 +306,10 @@ class StableDiffusionXLPipeline(
         num_images_per_prompt: int = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
+        if req.num_reqs != 1:
+            raise ValueError("StableDiffusionXLPipeline currently supports single-request forward.")
+
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
         negative_prompt = [
             "" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts
@@ -412,10 +415,12 @@ class StableDiffusionXLPipeline(
             latents = latents / self.vae.config.scaling_factor
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(
-            output=image,
-            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-        )
+        return [
+            DiffusionOutput(
+                output=image,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+        ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

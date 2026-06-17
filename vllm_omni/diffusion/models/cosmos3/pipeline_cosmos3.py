@@ -297,95 +297,91 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         action_mode = _request_action_mode(request)
         if is_guardrails_enabled(od_config, request.sampling_params):
-            for prompt in request.prompts:
-                text = prompt if isinstance(prompt, str) else prompt.get("prompt", "")
-                check_text_safety(text)
+            prompt = request.prompt
+            text = prompt if isinstance(prompt, str) else prompt.get("prompt", "")
+            check_text_safety(text)
 
-        for i, prompt in enumerate(request.prompts):
-            if isinstance(prompt, str):
-                continue
-            multi_modal_data = prompt.get("multi_modal_data", {}) or {}
-            raw_image = multi_modal_data.get("image")
-            raw_video = multi_modal_data.get("video")
-            if raw_image is None and raw_video is None:
-                continue
-            if raw_image is not None and raw_video is not None and action_mode is None:
-                raise ValueError("Cosmos3 non-action generation accepts either image or video input, not both.")
+        prompt = request.prompt
+        if isinstance(prompt, str):
+            return request
 
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        multi_modal_data = prompt.get("multi_modal_data", {}) or {}
+        raw_image = multi_modal_data.get("image")
+        raw_video = multi_modal_data.get("video")
+        if raw_image is None and raw_video is None:
+            return request
+        if raw_image is not None and raw_video is not None and action_mode is None:
+            raise ValueError("Cosmos3 non-action generation accepts either image or video input, not both.")
 
-            raw_video_frames: list[Any] | None = None
-            if raw_video is not None:
-                raw_video_frames = _video_payload_to_frames(raw_video)
-                if not raw_video_frames:
-                    raise TypeError("Cosmos3 video input must be a non-empty list of PIL images or image paths.")
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            if raw_image is None:
-                assert raw_video_frames is not None  # raw_image and raw_video can't both be None here
-                image = _pil_to_rgb(raw_video_frames[0])
-            else:
-                image = _pil_to_rgb(raw_image)
+        raw_video_frames: list[Any] | None = None
+        if raw_video is not None:
+            raw_video_frames = _video_payload_to_frames(raw_video)
+            if not raw_video_frames:
+                raise TypeError("Cosmos3 video input must be a non-empty list of PIL images or image paths.")
 
-            # Auto-calculate H/W from aspect ratio (720p max area)
-            if request.sampling_params.height is None or request.sampling_params.width is None:
-                if action_mode is not None:
-                    _set_action_size_from_image(request, image)
-                else:
-                    max_area = 720 * 1280
-                    aspect_ratio = image.height / image.width
-                    mod_value = 16
-                    height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-                    width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
-                    if request.sampling_params.height is None:
-                        request.sampling_params.height = height
-                    if request.sampling_params.width is None:
-                        request.sampling_params.width = width
+        if raw_image is None:
+            assert raw_video_frames is not None  # raw_image and raw_video can't both be None here
+            image = _pil_to_rgb(raw_video_frames[0])
+        else:
+            image = _pil_to_rgb(raw_image)
 
-            target_w = request.sampling_params.width
-            target_h = request.sampling_params.height
+        # Auto-calculate H/W from aspect ratio (720p max area)
+        if request.sampling_params.height is None or request.sampling_params.width is None:
             if action_mode is not None:
-                prompt["additional_information"]["preprocessed_image"] = _preprocess_action_image(
-                    image,
-                    int(target_h),
-                    int(target_w),
-                )
-            elif raw_video is None:
-                prompt["additional_information"]["preprocessed_image"] = _preprocess_condition_image(
-                    image,
-                    int(target_h),
-                    int(target_w),
-                )
+                _set_action_size_from_image(request, image)
             else:
-                assert raw_video_frames is not None
-                extra = _extra_args(request)
-                condition_frame_indexes_vision = normalize_condition_frame_indexes_vision(
-                    extra.get(
-                        "condition_frame_indexes_vision",
-                        prompt.get("condition_frame_indexes_vision"),
-                    )
+                max_area = 720 * 1280
+                aspect_ratio = image.height / image.width
+                mod_value = 16
+                height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+                width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+                if request.sampling_params.height is None:
+                    request.sampling_params.height = height
+                if request.sampling_params.width is None:
+                    request.sampling_params.width = width
+
+        target_w = request.sampling_params.width
+        target_h = request.sampling_params.height
+        if action_mode is not None:
+            prompt["additional_information"]["preprocessed_image"] = _preprocess_action_image(
+                image,
+                int(target_h),
+                int(target_w),
+            )
+        elif raw_video is None:
+            prompt["additional_information"]["preprocessed_image"] = _preprocess_condition_image(
+                image,
+                int(target_h),
+                int(target_w),
+            )
+        else:
+            assert raw_video_frames is not None
+            extra = _extra_args(request)
+            condition_frame_indexes_vision = normalize_condition_frame_indexes_vision(
+                extra.get(
+                    "condition_frame_indexes_vision",
+                    prompt.get("condition_frame_indexes_vision"),
                 )
-                keep = normalize_condition_video_keep(
-                    extra.get("condition_video_keep", prompt.get("condition_video_keep"))
-                )
-                max_frames = condition_pixel_frame_count(condition_frame_indexes_vision)
-                prompt["additional_information"]["preprocessed_video"] = _preprocess_condition_video(
-                    raw_video_frames,
-                    int(target_h),
-                    int(target_w),
-                    max_frames,
-                    keep,
-                )
-                prompt["additional_information"]["condition_frame_indexes_vision"] = list(
-                    condition_frame_indexes_vision
-                )
-            if action_mode is not None and raw_video_frames is not None:
-                prompt["additional_information"]["preprocessed_video"] = _preprocess_action_video(
-                    raw_video_frames,
-                    int(target_h),
-                    int(target_w),
-                )
-            request.prompts[i] = prompt
+            )
+            keep = normalize_condition_video_keep(extra.get("condition_video_keep", prompt.get("condition_video_keep")))
+            max_frames = condition_pixel_frame_count(condition_frame_indexes_vision)
+            prompt["additional_information"]["preprocessed_video"] = _preprocess_condition_video(
+                raw_video_frames,
+                int(target_h),
+                int(target_w),
+                max_frames,
+                keep,
+            )
+            prompt["additional_information"]["condition_frame_indexes_vision"] = list(condition_frame_indexes_vision)
+        if action_mode is not None and raw_video_frames is not None:
+            prompt["additional_information"]["preprocessed_video"] = _preprocess_action_video(
+                raw_video_frames,
+                int(target_h),
+                int(target_w),
+            )
 
         return request
 

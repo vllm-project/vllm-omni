@@ -21,7 +21,7 @@ from tests.e2e.offline_inference.custom_pipeline.flow_match_sde_scheduler import
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 
 def _maybe_to_cpu(v):
@@ -213,7 +213,7 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt_ids: torch.Tensor | list[int] | None = None,
         prompt_mask: torch.Tensor | None = None,
         negative_prompt_ids: torch.Tensor | list[int] | None = None,
@@ -240,9 +240,13 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         sde_window_range: tuple[int, int] = (0, 5),
         sde_type: Literal["sde", "cps"] = "sde",
         logprobs: bool = True,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
+        if req.num_reqs != 1:
+            raise ValueError("QwenImagePipelineWithLogProbForTest supports only single-request forward.")
+        request = req.requests[0]
+
         # Extract prompt data from OmniCustomPrompt in req.prompt
-        custom_prompt = req.prompt if req.prompt is not None else {}
+        custom_prompt = request.prompt if request.prompt is not None else {}
         if isinstance(custom_prompt, dict):
             prompt_ids = custom_prompt.get("prompt_ids", prompt_ids)
             prompt_mask = custom_prompt.get("prompt_mask", prompt_mask)
@@ -250,7 +254,7 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
             negative_prompt_mask = custom_prompt.get("negative_prompt_mask", negative_prompt_mask)
 
         # Read sampling params from req.sampling_params
-        sp = req.sampling_params
+        sp = request.sampling_params
         height = sp.height or self.default_sample_size * self.vae_scale_factor
         width = sp.width or self.default_sample_size * self.vae_scale_factor
         num_inference_steps = sp.num_inference_steps or num_inference_steps
@@ -284,7 +288,7 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         else:
             # Both prompt_ids and prompt_embeds are None (e.g. during warmup/dummy run).
             # Return a minimal dummy output to avoid crashing.
-            return DiffusionOutput(output=None, custom_output={})
+            return [DiffusionOutput(output=None, custom_output={})]
 
         if isinstance(negative_prompt_ids, list):
             negative_prompt_ids = torch.tensor(negative_prompt_ids, device=self.device)
@@ -394,15 +398,17 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
             latents = latents / latents_std + latents_mean
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
 
-        return DiffusionOutput(
-            output=_maybe_to_cpu(image),
-            trajectory_latents=_maybe_to_cpu(all_latents),
-            trajectory_log_probs=_maybe_to_cpu(all_log_probs),
-            trajectory_timesteps=_maybe_to_cpu(all_timesteps),
-            custom_output={
-                "prompt_embeds": _maybe_to_cpu(prompt_embeds),
-                "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
-                "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
-                "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
-            },
-        )
+        return [
+            DiffusionOutput(
+                output=_maybe_to_cpu(image),
+                trajectory_latents=_maybe_to_cpu(all_latents),
+                trajectory_log_probs=_maybe_to_cpu(all_log_probs),
+                trajectory_timesteps=_maybe_to_cpu(all_timesteps),
+                custom_output={
+                    "prompt_embeds": _maybe_to_cpu(prompt_embeds),
+                    "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
+                    "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
+                    "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
+                },
+            )
+        ]

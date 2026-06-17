@@ -377,34 +377,34 @@ def test_preprocess_i2v_image_and_action_video_inputs() -> None:
 
     preprocess = get_cosmos3_pre_process_func(SimpleNamespace())
     i2v = SimpleNamespace(
-        prompts=[{"prompt": "A slow camera push.", "multi_modal_data": {"image": Image.new("RGB", (320, 160))}}],
-        sampling_params=SimpleNamespace(height=None, width=None, extra_args={}),
+        prompt={"prompt": "A slow camera push.", "multi_modal_data": {"image": Image.new("RGB", (320, 160))}},
+        sampling_params=make_sampling_params(height=None, width=None, extra_args={}),
     )
 
     result = preprocess(i2v)
     assert (result.sampling_params.height, result.sampling_params.width) == (672, 1344)
-    assert tuple(result.prompts[0]["additional_information"]["preprocessed_image"].shape[-2:]) == (672, 1344)
+    assert tuple(result.prompt["additional_information"]["preprocessed_image"].shape[-2:]) == (672, 1344)
 
     frames = [Image.new("RGB", (8, 4), color) for color in ("red", "green", "blue")]
     action = SimpleNamespace(
-        prompts=[{"prompt": "Move.", "multi_modal_data": {"video": frames}}],
-        sampling_params=SimpleNamespace(height=16, width=32, extra_args={"action_mode": "forward_dynamics"}),
+        prompt={"prompt": "Move.", "multi_modal_data": {"video": frames}},
+        sampling_params=make_sampling_params(height=16, width=32, extra_args={"action_mode": "forward_dynamics"}),
     )
 
-    additional = preprocess(action).prompts[0]["additional_information"]
+    additional = preprocess(action).prompt["additional_information"]
     assert tuple(additional["preprocessed_image"].shape) == (1, 3, 16, 32)
     assert tuple(additional["preprocessed_video"].shape) == (1, 3, 3, 16, 32)
 
     frames = [Image.new("RGB", (8, 4), color) for color in ("red", "green", "blue", "yellow", "purple", "black")]
     v2v = SimpleNamespace(
-        prompts=[{"prompt": "Continue.", "multi_modal_data": {"video": frames}}],
-        sampling_params=SimpleNamespace(
+        prompt={"prompt": "Continue.", "multi_modal_data": {"video": frames}},
+        sampling_params=make_sampling_params(
             height=16,
             width=32,
             extra_args={"condition_frame_indexes_vision": [0, 1], "condition_video_keep": "last"},
         ),
     )
-    additional = preprocess(v2v).prompts[0]["additional_information"]
+    additional = preprocess(v2v).prompt["additional_information"]
     assert tuple(additional["preprocessed_video"].shape) == (1, 3, 5, 16, 32)
     assert additional["condition_frame_indexes_vision"] == [0, 1]
 
@@ -911,13 +911,7 @@ class TestForwardRouting:
             AssertionError("RoboLab should not decode video")
         )
 
-        outputs = pipeline.forward(
-            SimpleNamespace(
-                num_reqs=1,
-                prompts=["ignored"],
-                sampling_params=make_sampling_params(),
-            )
-        )
+        outputs = pipeline.forward(make_request_batch("ignored", make_sampling_params()))
 
         assert captured["format"] == {
             "prompt": "Pick the cube.",

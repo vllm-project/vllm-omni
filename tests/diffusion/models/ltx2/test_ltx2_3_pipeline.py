@@ -474,6 +474,7 @@ class TestCFGParallelForwardPath:
     ):
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         pipe = object.__new__(ltx23.LTX23Pipeline)
@@ -606,7 +607,7 @@ class TestCFGParallelForwardPath:
         video_latents = torch.tensor([[[1.0, -2.0]]])
         audio_latents = torch.tensor([[[0.5, 3.0]]])
         req = OmniDiffusionRequest(
-            prompts=[{"prompt": "prompt", "negative_prompt": "negative"}],
+            prompt={"prompt": "prompt", "negative_prompt": "negative"},
             sampling_params=OmniDiffusionSamplingParams(
                 height=32,
                 width=32,
@@ -621,7 +622,7 @@ class TestCFGParallelForwardPath:
             request_id="ltx23-cfg-parallel-forward-test",
         )
 
-        output = pipe.forward(req)
+        output = pipe.forward(DiffusionRequestBatch(requests=[req]))[0]
 
         expected_video_noise = ltx23.LTX23Pipeline._combine_x0_space_cfg(
             video_latents,

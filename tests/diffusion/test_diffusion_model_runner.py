@@ -83,6 +83,8 @@ def _noop_forward_context(*args, **kwargs):
 
 
 class _DummyPipeline:
+    supports_request_batch = True
+
     def __init__(self, output):
         self._output = output
         self.forward_calls = 0
@@ -91,6 +93,13 @@ class _DummyPipeline:
         del req
         self.forward_calls += 1
         return [self._output]
+
+
+class _SingleRequestBatchPipeline:
+    supports_request_batch = False
+
+    def forward(self, req):
+        return [SimpleNamespace(output=req.prompts[0])]
 
 
 def _make_request(skip_cache_refresh: bool = True):
@@ -181,6 +190,33 @@ def test_pipeline_forward_contract_uses_request_batch_static_contract():
 
 
 @pytest.mark.core_model
+@pytest.mark.cpu
+def test_e2e_custom_qwen_pipeline_uses_request_batch_contract():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "e2e"
+        / "offline_inference"
+        / "custom_pipeline"
+        / "qwen_image_pipeline_with_logprob.py"
+    )
+    tree = ast.parse(path.read_text(), filename=str(path))
+    class_def = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "QwenImagePipelineWithLogProbForTest"
+    )
+    forward = next(
+        item
+        for item in class_def.body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "forward"
+    )
+    req_arg = next(arg for arg in forward.args.args if arg.arg == "req")
+
+    assert _annotation_text(req_arg.annotation) == "DiffusionRequestBatch"
+    assert _return_annotation_is_diffusion_output_list(forward.returns)
+
+
+@pytest.mark.core_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypatch):
     """Guard cache diagnostics with runtime backend state to avoid stale-config crashes."""
@@ -225,6 +261,21 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
 
     assert output.output == "ok"
     assert cache_summary_calls == [(runner.pipeline, True)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_passes_single_request_batch_to_non_admission_pipeline(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.pipeline = _SingleRequestBatchPipeline()
+    runner._record_peak_memory = lambda output: None
+    req = _make_request(skip_cache_refresh=True)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    output = DiffusionModelRunner.execute_model(runner, req)
+
+    assert output.output == "a prompt"
 
 
 class _BatchPipeline:
