@@ -36,7 +36,7 @@ def test_speech_english_basic(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(
         {
             "model": omni_server.model,
-            "input": "Hello, how are you?",
+            "input": "how are you",
             "voice": "casual_female",
             "language": "English",
             "response_format": "wav",

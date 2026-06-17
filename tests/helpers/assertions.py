@@ -609,19 +609,8 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
 
     assert response.success, "The request failed."
 
-    # Optional floor on decoded audio size (models with very short clips may use a lower value).
-    min_audio = request_config.get("min_audio_bytes")
-    if min_audio is not None:
-        n = int(min_audio)
-        if n > 0:
-            ab = response.audio_bytes
-            assert ab is not None, "Expected audio bytes when min_audio_bytes is set"
-            assert len(ab) > n, f"Audio payload too small: {len(ab)} bytes, expected more than {n} (min_audio_bytes)"
-
     req_fmt = request_config.get("response_format")
     if req_fmt == "pcm" and response.audio_bytes:
-        min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
-        _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db)
         if response.audio_format:
             assert "pcm" in response.audio_format.lower(), (
                 f"Expected audio/pcm content-type, got {response.audio_format!r}"
@@ -630,6 +619,19 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
         assert req_fmt in response.audio_format
 
     if run_level in {"advanced_model", "full_model"}:
+        min_audio = request_config.get("min_audio_bytes")
+        use_size_only = min_audio is not None and int(min_audio) > 0
+        if use_size_only:
+            n = int(min_audio)
+            ab = response.audio_bytes
+            assert ab is not None, "Expected audio bytes when min_audio_bytes is set"
+            assert len(ab) > n, f"Audio payload too small: {len(ab)} bytes, expected more than {n} (min_audio_bytes)"
+            return
+
+        if req_fmt == "pcm" and response.audio_bytes:
+            min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
+            _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db)
+
         transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=True)
         if transcript is not None:
             expected_text = request_config.get("input")

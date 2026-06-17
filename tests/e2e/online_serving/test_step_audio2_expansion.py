@@ -22,6 +22,9 @@ MODEL = "stepfun-ai/Step-Audio-2-mini"
 STAGE_CONFIG = str(Path(__file__).parent / "stage_configs" / "step_audio2_ci.yaml")
 SAMPLE_RATE = 16000
 SEED = 42
+# pyttsx3 synthetic input phrase; Step-Audio2 text output includes codec tokens
+# (<audio_NNNN>) so we validate audio only, not text↔audio similarity.
+SYNTH_PHRASE = "how are you"
 
 TEST_PARAMS = [
     pytest.param(
@@ -42,7 +45,12 @@ pytestmark = [
 
 
 def _synthetic_audio_base64(duration_sec: int = 2) -> str:
-    return generate_synthetic_audio(duration_sec, 1, SAMPLE_RATE)["base64"]
+    return generate_synthetic_audio(
+        duration_sec,
+        1,
+        SAMPLE_RATE,
+        phrase_text=SYNTH_PHRASE,
+    )["base64"]
 
 
 def _default_sampling_params_list() -> list[dict]:
@@ -91,7 +99,9 @@ def _build_s2st_request_config(omni_server, audio_base64: str) -> dict:
             },
             {"role": "assistant", "content": "<tts_start>"},
         ],
-        "modalities": ["text", "audio"],
+        # Thinker text includes undetokenized audio codec placeholders; assert audio only.
+        "modalities": ["audio"],
+        "audio_ref_text": SYNTH_PHRASE,
         "sampling_params_list": _default_sampling_params_list(),
         "extra_body": {
             "continue_final_message": True,
