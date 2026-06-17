@@ -40,18 +40,18 @@
                 "percentile-metrics": "ttft,tpot,itl,e2el",
                 "baseline": {
                     "mean_ttft_ms": [
-                        300,
-                        300,
-                        1000,
-                        600,
-                        800
+                        69.1276,
+                        255.1882,
+                        310.639,
+                        422.0337,
+                        532.0582
                     ],
                     "mean_e2el_ms": [
-                        6000,
-                        8000,
-                        11000,
-                        13000,
-                        17000
+                        4382.7211,
+                        7510.3815,
+                        9440.4854,
+                        12553.0186,
+                        16932.6065
                     ]
                 }
             },
@@ -86,10 +86,10 @@
                 "percentile-metrics": "ttft,tpot,itl,e2el",
                 "baseline": {
                     "mean_ttft_ms": [
-                        30
+                        26.3381
                     ],
                     "mean_e2el_ms": [
-                        540
+                        485.2436
                     ]
                 }
             },
@@ -126,10 +126,10 @@
                 "percentile-metrics": "ttft,tpot,itl,e2el",
                 "baseline": {
                     "mean_ttft_ms": [
-                        30
+                        26.4517
                     ],
                     "mean_e2el_ms": [
-                        600
+                        517.2017
                     ]
                 }
             },
@@ -168,10 +168,10 @@
                 "percentile-metrics": "ttft,tpot,itl,e2el",
                 "baseline": {
                     "mean_ttft_ms": [
-                        40
+                        27.6972
                     ],
                     "mean_e2el_ms": [
-                        700
+                        561.3684
                     ]
                 }
             }
