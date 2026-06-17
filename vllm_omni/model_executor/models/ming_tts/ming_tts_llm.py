@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.bailing_moe import BailingMoeModel
 from vllm.model_executor.models.qwen2 import Qwen2Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
 from vllm.sequence import IntermediateTensors
@@ -73,6 +72,8 @@ class MingLLMModel(nn.Module):
         self.prefix = prefix
         self.fm_dtype = _resolve_ming_runtime_dtype(vllm_config)
         if self.ming_config.model_variant == "moe":
+            from vllm.model_executor.models.bailing_moe import BailingMoeModel
+
             # BailingMoeModel reads ``vllm_config.model_config.hf_config`` directly
             # (no get_text_config()), so re-wrap with the nested bailing_moe config.
             llm_config = vllm_config.model_config.hf_config.get_text_config()
