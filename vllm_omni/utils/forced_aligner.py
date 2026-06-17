@@ -181,7 +181,9 @@ def _align_sync(
     config: ForcedAlignerConfig,
     language: str | None = None,
 ) -> list[WordTimestamp]:
-    _ensure_loaded(config)
+    # Precondition: align() has already run _ensure_loaded(config) under
+    # _encode_lock and owns the load-failure -> ForcedAlignerLoadError mapping.
+    # Don't reload here, so a load error can't be swallowed as a per-request None.
     audio_arr = _pcm_bytes_to_float32(audio)
     if audio_arr.size == 0:
         return []
