@@ -530,6 +530,15 @@ class OmniBase(PDDisaggregationMixin):
                     finished_reason=fr,
                 )
 
+                # Token counters — aggregate across all stages for this request.
+                _prompt_tok = 0
+                _gen_tok = 0
+                for evt in metrics.stage_events.get(rid_key, []):
+                    if evt.stage_id == 0:
+                        _prompt_tok += int(evt.num_tokens_in)
+                    _gen_tok += int(evt.num_tokens_out)
+                self.prom_metrics.observe_tokens(_prompt_tok, _gen_tok)
+
                 # Modality observe inside the same finalize guard so it fires
                 # once per request and inherits the try/except isolation.
                 observe_modality_at_finalize(
@@ -578,9 +587,8 @@ class OmniBase(PDDisaggregationMixin):
             if current_stage_metrics is not None:
                 response_metrics["stage_id"] = current_stage_metrics["stage_id"]
                 response_metrics["final_output_type"] = current_stage_metrics["final_output_type"]
-                if current_stage_metrics["final_output_type"] == "text":
-                    response_metrics["num_tokens_in"] = current_stage_metrics["num_tokens_in"]
-                    response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
+                response_metrics["num_tokens_in"] = current_stage_metrics["num_tokens_in"]
+                response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
         return OmniRequestOutput(
             request_id=req_id or "",
             stage_id=stage_id,

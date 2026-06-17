@@ -625,11 +625,11 @@ class TestStageDiffusionClientErrorPropagation:
         client._tasks = {}
         client._shutting_down = False
         client._engine_dead = engine_dead
-        client._owns_process = True
-        client._proc = MagicMock(
+        proc = MagicMock(
             is_alive=MagicMock(return_value=proc_alive),
             exitcode=1,
         )
+        client._proc_manager = SimpleNamespace(proc=proc)
         client._request_socket = MagicMock()
         client._response_socket = MagicMock()
         client._encoder = MagicMock()
@@ -672,7 +672,7 @@ class TestStageDiffusionClientErrorPropagation:
         assert client.get_diffusion_output_nowait() is None
 
     def test_check_health_raises_when_proc_dead(self):
-        """``check_health`` detects a dead subprocess via ``_proc.is_alive()``
+        """``check_health`` detects a dead subprocess via the manager's proc
         and raises ``EngineDeadError``, setting ``_engine_dead`` as a
         side effect."""
         client = self._make_client(proc_alive=False)
@@ -699,7 +699,7 @@ class TestStageDiffusionClientErrorPropagation:
         ``get_diffusion_output_nowait`` returns ``None`` and sets
         ``_shutting_down`` instead of raising."""
         client = self._make_client(proc_alive=False)
-        client._proc.exitcode = 137  # SIGKILL (128 + 9)
+        client._proc_manager.proc.exitcode = 137  # SIGKILL (128 + 9)
         client._response_socket.recv.side_effect = zmq.Again
 
         result = client.get_diffusion_output_nowait()
@@ -727,7 +727,6 @@ class TestStageDiffusionClientErrorPropagation:
                 metadata,
                 "tcp://req",
                 "tcp://resp",
-                proc=None,
                 batch_size=1,
             )
 
@@ -836,7 +835,7 @@ class TestStageDiffusionClientProcMonitor:
         client._engine_dead = False
 
         proc = _make_short_lived_process()
-        client._proc = proc
+        client._proc_manager = SimpleNamespace(proc=proc)
 
         client._start_proc_monitor()
         proc.join(5)

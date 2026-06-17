@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -28,7 +28,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
@@ -143,6 +143,7 @@ class Wan22I2VPipeline(
     CFGParallelMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
     """
     Wan2.2 Image-to-Video Pipeline.
@@ -150,6 +151,10 @@ class Wan22I2VPipeline(
     Supports both Wan2.1-style I2V (with CLIP image embeddings) and
     Wan2.2-style I2V (with expand_timesteps for TI2V-5B).
     """
+
+    _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "image_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     def __init__(
         self,
