@@ -529,7 +529,7 @@ def test_qwen_prompt_embeds_casts_processor_pixel_values_to_encoder_dtype():
     assert prompt_mask.dtype == torch.long
 
 
-def test_prepare_latents_casts_encoded_image_latents_to_requested_dtype():
+def test_prepare_latents_casts_vae_encoded_latents_to_requested_dtype():
     pipeline = object.__new__(JoyImageEditPipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.latent_channels = 4
@@ -541,7 +541,7 @@ def test_prepare_latents_casts_encoded_image_latents_to_requested_dtype():
 
     pipeline._encode_vae_image = fake_encode
 
-    latents, image_latents = JoyImageEditPipeline.prepare_latents(
+    latents, image_latents = JoyImageEditPipeline._prepare_latents(
         pipeline,
         image=torch.zeros(1, 3, 1, 64, 64, dtype=torch.float32),
         batch_size=1,
@@ -708,10 +708,11 @@ def test_prepare_latents_stacks_reference_first_target_last():
     pipeline.latent_channels = 4
     image_latents = torch.ones(1, 4, 1, 2, 2)
     noise_latents = torch.zeros(1, 1, 4, 1, 2, 2)
+    pipeline._encode_vae_image = lambda image, generator: image_latents
 
-    latents, reference_latents = JoyImageEditPipeline.prepare_latents(
+    latents, reference_latents = JoyImageEditPipeline._prepare_latents(
         pipeline,
-        image=image_latents,
+        image=torch.zeros(1, 3, 1, 16, 16),
         batch_size=1,
         num_channels_latents=4,
         height=16,
@@ -732,11 +733,12 @@ def test_prepare_latents_validates_generator_and_latent_shapes():
     pipeline.vae_scale_factor = 8
     pipeline.latent_channels = 4
     image_latents = torch.ones(1, 4, 1, 2, 2)
+    pipeline._encode_vae_image = lambda image, generator: image_latents
 
     with pytest.raises(ValueError, match="Generator list length"):
-        JoyImageEditPipeline.prepare_latents(
+        JoyImageEditPipeline._prepare_latents(
             pipeline,
-            image=image_latents,
+            image=torch.zeros(1, 3, 1, 16, 16),
             batch_size=2,
             num_channels_latents=4,
             height=16,
@@ -747,9 +749,9 @@ def test_prepare_latents_validates_generator_and_latent_shapes():
         )
 
     with pytest.raises(ValueError, match="noise latents must have shape"):
-        JoyImageEditPipeline.prepare_latents(
+        JoyImageEditPipeline._prepare_latents(
             pipeline,
-            image=image_latents,
+            image=torch.zeros(1, 3, 1, 16, 16),
             batch_size=1,
             num_channels_latents=4,
             height=16,
@@ -765,11 +767,12 @@ def test_prepare_latents_validates_image_latent_shape():
     pipeline = object.__new__(JoyImageEditPipeline)
     pipeline.vae_scale_factor = 8
     pipeline.latent_channels = 4
+    pipeline._encode_vae_image = lambda image, generator: torch.ones(1, 4, 2, 2)
 
     with pytest.raises(ValueError, match="image latents must have shape"):
-        JoyImageEditPipeline.prepare_latents(
+        JoyImageEditPipeline._prepare_latents(
             pipeline,
-            image=torch.ones(1, 4, 2, 2),
+            image=torch.zeros(1, 3, 1, 16, 16),
             batch_size=1,
             num_channels_latents=4,
             height=16,
@@ -837,7 +840,7 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
         encode_calls.append(prompt)
         return torch.zeros(1, 3, 4), torch.ones(1, 3, dtype=torch.long)
 
-    def prepare_latents(**kwargs):
+    def fake_prepare_latents(**kwargs):
         latents = torch.zeros(1, 2, 4, 1, 2, 2)
         image_latents = torch.ones(1, 1, 4, 1, 2, 2)
         return latents, image_latents
@@ -847,7 +850,7 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
         return kwargs["latents"]
 
     pipeline.encode_prompt = encode_prompt
-    pipeline.prepare_latents = prepare_latents
+    pipeline._prepare_latents = fake_prepare_latents
     pipeline.diffuse = diffuse
     pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 2, 2)
     pipeline.check_cfg_parallel_validity = lambda scale: cfg_checks.append(scale) or True
@@ -895,7 +898,7 @@ def test_forward_skips_decode_for_dummy_warmup_request(monkeypatch):
         torch.zeros(1, 3, 4),
         torch.ones(1, 3, dtype=torch.long),
     )
-    pipeline.prepare_latents = lambda **kwargs: (
+    pipeline._prepare_latents = lambda **kwargs: (
         torch.zeros(1, 2, 4, 1, 2, 2),
         torch.ones(1, 1, 4, 1, 2, 2),
     )

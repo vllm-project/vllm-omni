@@ -607,7 +607,7 @@ class JoyImageEditPipeline(
         latents_mean, latents_std = self._latent_stats(image_latents.device, image_latents.dtype)
         return (image_latents - latents_mean) / latents_std
 
-    def prepare_latents(
+    def _prepare_latents(
         self,
         image: torch.Tensor,
         batch_size: int,
@@ -633,7 +633,7 @@ class JoyImageEditPipeline(
             raise ValueError(f"Generator list length {len(generator)} must match effective batch size {batch_size}.")
 
         image = image.to(device=device, dtype=dtype)
-        image_latents = image if image.shape[1] == self.latent_channels else self._encode_vae_image(image, generator)
+        image_latents = self._encode_vae_image(image, generator)
         image_latents = image_latents.to(device=device, dtype=dtype)
         expected_image_tail = (
             num_channels_latents,
@@ -791,7 +791,7 @@ class JoyImageEditPipeline(
 
         # Step 3: VAE-encode the reference image and create the target noise
         # latent; the latent stack is [reference image latents, target noise].
-        latents, image_latents = self.prepare_latents(
+        latents, image_latents = self._prepare_latents(
             image=image,
             batch_size=batch_size,
             num_channels_latents=self.latent_channels,
