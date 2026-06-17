@@ -530,6 +530,53 @@ def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
     return max(fallback_tokens, default=None)
 
 
+def _apply_usage_to_output(output: MixRequestFuncOutput, usage: dict[str, Any]) -> int | None:
+    """Apply OpenAI ``usage`` fields to the benchmark output."""
+    if (pt := _coerce_positive_int(usage.get("prompt_tokens"))) is not None:
+        output.prompt_len = pt
+    completion_tokens = _coerce_positive_int(usage.get("completion_tokens"))
+    if completion_tokens is not None:
+        output.output_tokens = max(int(output.output_tokens or 0), completion_tokens)
+    return completion_tokens
+
+
+def _resolve_token_delta_from_usage(
+    completion_tokens: int | None,
+    completion_tokens_seen: int,
+) -> tuple[int, int]:
+    if completion_tokens is None or completion_tokens <= completion_tokens_seen:
+        return 0, completion_tokens_seen
+    delta = completion_tokens - completion_tokens_seen
+    return delta, completion_tokens
+
+
+def _record_text_token_stream_intervals(
+    output: MixRequestFuncOutput,
+    *,
+    timestamp: float,
+    start_time: float,
+    token_delta: int,
+    most_recent_timestamp: float,
+) -> float:
+    """Record TTFT/ITL for ``token_delta`` newly generated text tokens."""
+    if token_delta <= 0:
+        return most_recent_timestamp
+
+    if output.ttft == 0.0:
+        output.ttft = timestamp - start_time
+        output.text_latency = timestamp - start_time
+        most_recent_timestamp = timestamp
+        if token_delta > 1:
+            output.itl.extend([0.0] * (token_delta - 1))
+        return most_recent_timestamp
+
+    interval = max(timestamp - most_recent_timestamp, 0.0)
+    per_token = interval / token_delta
+    output.itl.extend([per_token] * token_delta)
+    output.text_latency = timestamp - start_time
+    return timestamp
+
+
 def _update_output_stage_metrics_from_payload(
     output: MixRequestFuncOutput,
     data: dict[str, Any],
@@ -541,7 +588,7 @@ def _update_output_stage_metrics_from_payload(
         return
     if update_output_tokens:
         if (num_tokens_out := _extract_output_tokens_from_metrics(metrics)) is not None:
-            output.output_tokens = num_tokens_out
+            output.output_tokens = max(int(output.output_tokens or 0), num_tokens_out)
     if isinstance(sid := metrics.get("stage_id"), int):
         output.stage_id = sid
     if isinstance(final_output_type := metrics.get("final_output_type"), str):
@@ -624,6 +671,14 @@ async def async_request_openai_chat_omni_completions(
         "stream": True,
         "stream_options": {
             "include_usage": True,
+            # Per-chunk completion_tokens lets _resolve_token_delta_from_usage
+            # compute the exact token count for each SSE flush.  Without this,
+            # one SSE chunk can carry multiple tokens (asyncio coalescing), so
+            # len(itl)+1 < actual_tokens and ITL measures per-chunk latency
+            # (~1.74× tokens_per_chunk) rather than true per-token latency.
+            # NOTE: the vLLM StreamOptions field is "continuous_usage_stats",
+            # NOT "include_continuous_usage".
+            "continuous_usage_stats": True,
         },
     }
     _update_payload_common(payload, request_func_input)
@@ -661,7 +716,6 @@ async def async_request_openai_chat_omni_completions(
         first_inconsistent_wav_params: tuple[int, int, int] | None = None
         # For non-wav responses, accumulate encoded bytes then decode once.
         audio_bytes_buffer = bytearray()
-        ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
@@ -685,6 +739,7 @@ async def async_request_openai_chat_omni_completions(
         output.image_generation_time_ms = 0.0
         output.image_pixels = 0
         output.denoise_step_latency_ms = 0.0
+        completion_tokens_seen = 0
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
@@ -712,22 +767,45 @@ async def async_request_openai_chat_omni_completions(
                             if chunk != "[DONE]":
                                 timestamp = time.perf_counter()
                                 data = json.loads(chunk)
+                                _update_output_stage_metrics_from_payload(output, data)
+                                usage = data.get("usage")
+                                completion_tokens = None
+                                if isinstance(usage, dict):
+                                    completion_tokens = _apply_usage_to_output(output, usage)
+
                                 if choices := data.get("choices"):
                                     modality = data.get("modality")
-                                    delta = choices[0].get("delta") or {}
+                                    choice = choices[0]
+                                    delta = choice.get("delta") or {}
                                     content = delta.get("content")
                                     if not content and isinstance(delta.get("audio"), dict):
                                         content = delta["audio"].get("data")
                                     if modality == "text":
-                                        # First token
-                                        if ttft == 0.0:
-                                            ttft = timestamp - st
-                                            output.ttft = ttft
-                                        else:
-                                            output.itl.append(timestamp - most_recent_timestamp)
-                                        generated_text += content or ""
-                                        most_recent_timestamp = timestamp
-                                        output.text_latency = timestamp - st
+                                        token_delta, completion_tokens_seen = _resolve_token_delta_from_usage(
+                                            completion_tokens,
+                                            completion_tokens_seen,
+                                        )
+                                        token_ids = choice.get("token_ids")
+                                        if token_delta == 0 and token_ids:
+                                            token_delta = len(token_ids)
+                                            if completion_tokens is not None:
+                                                completion_tokens_seen = max(
+                                                    completion_tokens_seen,
+                                                    completion_tokens,
+                                                )
+                                        has_text_content = bool(content)
+                                        if token_delta == 0 and has_text_content and completion_tokens is None:
+                                            token_delta = 1
+                                        if token_delta > 0:
+                                            most_recent_timestamp = _record_text_token_stream_intervals(
+                                                output,
+                                                timestamp=timestamp,
+                                                start_time=st,
+                                                token_delta=token_delta,
+                                                most_recent_timestamp=most_recent_timestamp,
+                                            )
+                                        if has_text_content:
+                                            generated_text += content
                                     elif modality == "audio":
                                         if output.audio_ttfp == 0.0:
                                             output.audio_ttfp = timestamp - st
@@ -762,7 +840,6 @@ async def async_request_openai_chat_omni_completions(
                                         if content_image_ms > 0:
                                             output.image_generation_time_ms += content_image_ms
 
-                                _update_output_stage_metrics_from_payload(output, data)
                                 (
                                     metrics_image_count,
                                     metrics_image_ms,
@@ -778,10 +855,6 @@ async def async_request_openai_chat_omni_completions(
                                 if metrics_denoise_step_ms > output.denoise_step_latency_ms:
                                     output.denoise_step_latency_ms = metrics_denoise_step_ms
 
-                                if usage := data.get("usage"):
-                                    if (pt := usage.get("prompt_tokens")) is not None:
-                                        output.prompt_len = pt
-
                     if wav_inconsistent_chunk_count > 0:
                         logger.warning(
                             "Dropped %d wav chunks with inconsistent params during benchmark "
@@ -794,6 +867,12 @@ async def async_request_openai_chat_omni_completions(
 
                     output.latency = timestamp - st
                     output.generated_text = generated_text
+                    if output.itl:
+                        # Align text_latency with ITL so TPOT formula and
+                        # mean(ITL) are consistent.  Do NOT infer output_tokens
+                        # from len(itl)+1: one SSE chunk may carry multiple
+                        # tokens, so the ITL count understates the real count.
+                        output.text_latency = output.ttft + sum(output.itl)
                     audio_duration_sec = 0.0
                     audio_frames = 0
                     if response_format == "wav" and wav_pcm_buffer and wav_audio_params is not None:
