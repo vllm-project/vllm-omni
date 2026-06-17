@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import requests
 import json
 import time
 import uuid
@@ -11,6 +10,7 @@ from io import BytesIO
 from typing import Any, Final, cast
 
 import jinja2
+import requests
 import torch
 from fastapi import Request
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
