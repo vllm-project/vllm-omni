@@ -92,6 +92,18 @@ def _metadata(
     )()
 
 
+def _decode_kv_cache(
+    *,
+    num_blocks: int = 8,
+    block_size: int = 16,
+    num_kv_heads: int = 8,
+    head_size: int = 128,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    # vLLM >=0.23.0 KV cache layout: key/value live on dim 1.
+    return torch.zeros((num_blocks, 2, block_size, num_kv_heads, head_size), dtype=dtype)
+
+
 def test_fish_kvcache_enabled_by_default(monkeypatch):
     monkeypatch.delenv("VLLM_OMNI_FISH_KVCACHE_ATTN", raising=False)
 
@@ -182,7 +194,7 @@ def test_fish_kvcache_backend_wraps_only_model_instance(monkeypatch):
     metadata = _metadata()
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     result = model.layers[0].self_attn.attn.impl.forward(
         None,
@@ -215,7 +227,7 @@ def test_fish_kvcache_backend_install_is_idempotent(monkeypatch):
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     model.layers[0].self_attn.attn.impl.forward(
         None,
@@ -250,7 +262,7 @@ def test_fish_kvcache_backend_falls_back_to_original_forward_on_guard_miss(monke
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     result = model.layers[0].self_attn.attn.impl.forward(
         None,
@@ -297,7 +309,7 @@ def test_fish_kvcache_backend_uses_decode_seq_lens_upper_bound(monkeypatch):
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     model.layers[0].self_attn.attn.impl.forward(
         None,
@@ -340,7 +352,7 @@ def test_fish_kvcache_backend_uses_cpu_upper_bound_above_metadata_max(monkeypatc
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     model.layers[0].self_attn.attn.impl.forward(
         None,
@@ -383,7 +395,7 @@ def test_fish_kvcache_backend_slices_upper_bound_by_active_batch(monkeypatch):
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     model.layers[0].self_attn.attn.impl.forward(
         None,
@@ -428,7 +440,7 @@ def test_fish_kvcache_backend_falls_back_on_short_upper_bound_shape(monkeypatch)
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     result = model.layers[0].self_attn.attn.impl.forward(
         None,
@@ -475,7 +487,7 @@ def test_fish_kvcache_backend_falls_back_on_non_cpu_upper_bound(monkeypatch):
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     result = model.layers[0].self_attn.attn.impl.forward(
         None,
@@ -509,7 +521,7 @@ def test_fish_kvcache_backend_required_rejects_non_cpu_upper_bound(monkeypatch):
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     with pytest.raises(RuntimeError, match="must be a CPU tensor"):
         model.layers[0].self_attn.attn.impl.forward(
@@ -539,7 +551,7 @@ def test_fish_kvcache_backend_required_rejects_underestimated_upper_bound(monkey
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     with pytest.raises(RuntimeError, match="underestimates"):
         model.layers[0].self_attn.attn.impl.forward(
@@ -569,7 +581,7 @@ def test_fish_kvcache_backend_required_rejects_missing_upper_bound(monkeypatch):
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     with pytest.raises(RuntimeError, match="requires seq_lens_cpu_upper_bound"):
         model.layers[0].self_attn.attn.impl.forward(
@@ -603,7 +615,7 @@ def test_fish_kvcache_backend_required_raises_on_guard_miss(monkeypatch):
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     with pytest.raises(RuntimeError, match="required"):
         model.layers[0].self_attn.attn.impl.forward(
@@ -629,7 +641,7 @@ def test_fish_kvcache_backend_required_allows_prefill_fallback(monkeypatch):
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     result = model.layers[0].self_attn.attn.impl.forward(
         None,
@@ -675,7 +687,7 @@ def test_fish_kvcache_backend_falls_back_without_cpu_upper_bound(monkeypatch):
 
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+    kv_cache = _decode_kv_cache()
 
     result = model.layers[0].self_attn.attn.impl.forward(
         None,
