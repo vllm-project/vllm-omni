@@ -16,7 +16,7 @@
 # limitations under the License.
 
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -40,11 +40,31 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+
+def _safe_quant_config(quant_config: "QuantizationConfig | None") -> "QuantizationConfig | None":
+    """Return quant_config only if it is safe to propagate here, else None.
+
+    Dual-stream transformer_blocks, norm modulation layers, and norm_out are
+    kept at full precision for FP8 (see #2728). Offline quantization (e.g.
+    INC/AutoRound W4A16) needs the config propagated so packed weights load
+    correctly.
+    """
+    if quant_config is None:
+        return None
+    from vllm.model_executor.layers.quantization.inc import INCConfig
+
+    if isinstance(quant_config, INCConfig):
+        return quant_config
+    return None
 
 
 class AdaLayerNormZero(nn.Module):
@@ -56,7 +76,15 @@ class AdaLayerNormZero(nn.Module):
         num_embeddings (`int`): The size of the embeddings dictionary.
     """
 
-    def __init__(self, embedding_dim: int, num_embeddings: int | None = None, norm_type="layer_norm", bias=True):
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_embeddings: int | None = None,
+        norm_type="layer_norm",
+        bias=True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
         super().__init__()
         if num_embeddings is not None:
             self.emb = CombinedTimestepLabelEmbeddings(num_embeddings, embedding_dim)
@@ -64,7 +92,9 @@ class AdaLayerNormZero(nn.Module):
             self.emb = None
 
         self.silu = nn.SiLU()
-        self.linear = ReplicatedLinear(embedding_dim, 6 * embedding_dim, bias=bias)
+        self.linear = ReplicatedLinear(
+            embedding_dim, 6 * embedding_dim, bias=bias, quant_config=quant_config, prefix=f"{prefix}.linear"
+        )
         if norm_type == "layer_norm":
             self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
         else:
@@ -92,9 +122,18 @@ class AdaLayerNormZero(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, dim_in: int, inner_dim: int, bias: bool = True):
+    def __init__(
+        self,
+        dim_in: int,
+        inner_dim: int,
+        bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
         super().__init__()
-        self.proj = ColumnParallelLinear(dim_in, inner_dim * 2, bias=bias, gather_output=False)
+        self.proj = ColumnParallelLinear(
+            dim_in, inner_dim * 2, bias=bias, gather_output=False, quant_config=quant_config, prefix=f"{prefix}.proj"
+        )
         self.activation = nn.SiLU()
 
     def forward(self, hidden_states):
@@ -116,6 +155,8 @@ class FeedForward(nn.Module):
         final_dropout: bool = False,
         inner_dim=None,
         bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         if inner_dim is None:
@@ -123,25 +164,38 @@ class FeedForward(nn.Module):
         dim_out = dim_out if dim_out is not None else dim
 
         if activation_fn == "swiglu":
-            act_fn = SwiGLU(dim, inner_dim, bias=bias)
+            act_fn = SwiGLU(dim, inner_dim, bias=bias, quant_config=quant_config, prefix=f"{prefix}.net.0")
         else:
             raise ValueError(f"Unsupported activation function type: {activation_fn}")
 
         self.net = nn.ModuleList([])
         self.net.append(act_fn)
         self.net.append(nn.Dropout(dropout))
-        self.net.append(RowParallelLinear(inner_dim, dim_out, bias=bias))
+        self.net.append(
+            RowParallelLinear(
+                inner_dim,
+                dim_out,
+                bias=bias,
+                input_is_parallel=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.2",
+            )
+        )
 
         if final_dropout:
             self.net.append(nn.Dropout(dropout))
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         for layer in self.net:
-            output = layer(hidden_states)
-            if isinstance(output, tuple):
-                hidden_states = output[0]
+            if isinstance(layer, RowParallelLinear):
+                # Contiguous for FP8 quantization in RowParallelLinear
+                hidden_states, _ = layer(hidden_states.contiguous())
             else:
-                hidden_states = output
+                output = layer(hidden_states)
+                if isinstance(output, tuple):
+                    hidden_states = output[0]
+                else:
+                    hidden_states = output
         return hidden_states
 
 
@@ -160,6 +214,8 @@ class OvisImageAttention(nn.Module):
         out_dim: int = None,
         context_pre_only: bool | None = None,
         pre_only: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -183,11 +239,22 @@ class OvisImageAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.heads,
             bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv",
         )
 
         if not self.pre_only:
             self.to_out = nn.ModuleList([])
-            self.to_out.append(RowParallelLinear(self.inner_dim, self.out_dim, bias=out_bias, input_is_parallel=True))
+            self.to_out.append(
+                RowParallelLinear(
+                    self.inner_dim,
+                    self.out_dim,
+                    bias=out_bias,
+                    input_is_parallel=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0",
+                )
+            )
             self.to_out.append(nn.Dropout(dropout))
 
         if self.added_kv_proj_dim is not None:
@@ -199,10 +266,17 @@ class OvisImageAttention(nn.Module):
                 head_size=self.head_dim,
                 total_num_heads=self.heads,
                 bias=added_proj_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.add_kv_proj",
             )
 
             self.to_add_out = RowParallelLinear(
-                input_size=self.inner_dim, output_size=query_dim, bias=out_bias, input_is_parallel=True
+                input_size=self.inner_dim,
+                output_size=query_dim,
+                bias=out_bias,
+                input_is_parallel=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out",
             )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
@@ -220,6 +294,8 @@ class OvisImageAttention(nn.Module):
         image_rotary_emb: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        # Ensure contiguous for FP8 quantized linear layers
+        hidden_states = hidden_states.contiguous()
         qkv, _ = self.to_qkv(hidden_states)
 
         local_num_heads = self.to_qkv.num_heads
@@ -234,6 +310,7 @@ class OvisImageAttention(nn.Module):
         key = self.norm_k(key)
 
         if self.added_kv_proj_dim is not None:
+            encoder_hidden_states = encoder_hidden_states.contiguous()
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
             encoder_query, encoder_key, encoder_value = encoder_qkv.chunk(3, dim=-1)
 
@@ -268,9 +345,10 @@ class OvisImageAttention(nn.Module):
                 hidden_states[:, :enc_len],
                 hidden_states[:, enc_len:],
             )
-            hidden_states, _ = self.to_out[0](hidden_states)
+            # Contiguous for FP8 quantization in RowParallelLinear
+            hidden_states, _ = self.to_out[0](hidden_states.contiguous())
             hidden_states = self.to_out[1](hidden_states)
-            encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
+            encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states.contiguous())
 
             return hidden_states, encoder_hidden_states
         else:
@@ -278,14 +356,36 @@ class OvisImageAttention(nn.Module):
 
 
 class OvisImageSingleTransformerBlock(nn.Module):
-    def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0):
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        mlp_ratio: float = 4.0,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         self.norm = AdaLayerNormZeroSingle(dim)
-        self.proj_mlp = ColumnParallelLinear(dim, self.mlp_hidden_dim * 2, bias=True, gather_output=False)
+        self.proj_mlp = ColumnParallelLinear(
+            dim,
+            self.mlp_hidden_dim * 2,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj_mlp",
+        )
         self.act_mlp = nn.SiLU()
-        self.proj_out = RowParallelLinear(dim + self.mlp_hidden_dim, dim, bias=True, input_is_parallel=True)
+        self.proj_out = RowParallelLinear(
+            dim + self.mlp_hidden_dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj_out",
+        )
 
         self.attn = OvisImageAttention(
             query_dim=dim,
@@ -295,6 +395,8 @@ class OvisImageSingleTransformerBlock(nn.Module):
             bias=True,
             eps=1e-6,
             pre_only=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -324,7 +426,8 @@ class OvisImageSingleTransformerBlock(nn.Module):
         )
 
         combined_features = torch.cat([attn_output, mlp_hidden_states], dim=-1)
-        proj_output, _ = self.proj_out(combined_features)
+        # Contiguous for FP8 quantization in RowParallelLinear
+        proj_output, _ = self.proj_out(combined_features.contiguous())
 
         proj_output = gate.unsqueeze(1) * proj_output
 
@@ -345,11 +448,15 @@ class OvisImageTransformerBlock(nn.Module):
         attention_head_dim: int,
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
-        self.norm1 = AdaLayerNormZero(dim)
-        self.norm1_context = AdaLayerNormZero(dim)
+        self.norm1 = AdaLayerNormZero(dim, quant_config=_safe_quant_config(quant_config), prefix=f"{prefix}.norm1")
+        self.norm1_context = AdaLayerNormZero(
+            dim, quant_config=_safe_quant_config(quant_config), prefix=f"{prefix}.norm1_context"
+        )
 
         self.attn = OvisImageAttention(
             query_dim=dim,
@@ -360,13 +467,19 @@ class OvisImageTransformerBlock(nn.Module):
             context_pre_only=False,
             bias=True,
             eps=eps,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="swiglu")
+        self.ff = FeedForward(
+            dim=dim, dim_out=dim, activation_fn="swiglu", quant_config=quant_config, prefix=f"{prefix}.ff"
+        )
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="swiglu")
+        self.ff_context = FeedForward(
+            dim=dim, dim_out=dim, activation_fn="swiglu", quant_config=quant_config, prefix=f"{prefix}.ff_context"
+        )
 
     def forward(
         self,
@@ -483,6 +596,10 @@ class OvisImageTransformer2DModel(nn.Module):
 
     _repeated_blocks = ["OvisImageTransformerBlock", "OvisImageSingleTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
+    }
 
     def __init__(
         self,
@@ -496,6 +613,7 @@ class OvisImageTransformer2DModel(nn.Module):
         num_attention_heads: int = 24,
         joint_attention_dim: int = 2048,
         axes_dims_rope: tuple[int] = (16, 56, 56),
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         model_config = od_config.tf_model_config
@@ -518,8 +636,10 @@ class OvisImageTransformer2DModel(nn.Module):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    quant_config=_safe_quant_config(quant_config),
+                    prefix=f"transformer_blocks.{i}",
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 
@@ -529,8 +649,10 @@ class OvisImageTransformer2DModel(nn.Module):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    quant_config=quant_config,
+                    prefix=f"single_transformer_blocks.{i}",
                 )
-                for _ in range(num_single_layers)
+                for i in range(num_single_layers)
             ]
         )
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
