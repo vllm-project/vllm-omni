@@ -126,7 +126,7 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
     monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_MOE_EP_GROUP_RANKS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
@@ -251,7 +251,7 @@ def test_cfg_parallel_maps_to_vllm_dp_without_moe_ep(monkeypatch):
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
     monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_MOE_EP_GROUP_RANKS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
@@ -274,7 +274,7 @@ def test_cfg_parallel_maps_to_vllm_dp_without_moe_ep(monkeypatch):
     assert parallel_state.vllm_parallel_state._DP.local_group == [0, 2, 4, 6]
     assert parallel_state.vllm_parallel_state._PCP is None
     assert parallel_state.vllm_parallel_state._EP is None
-    assert parallel_state._MOE_EP_GROUP_RANKS is None
+    assert parallel_state._EXPERT_PARALLEL_GROUP_RANKS is None
 
 
 @pytest.mark.cpu

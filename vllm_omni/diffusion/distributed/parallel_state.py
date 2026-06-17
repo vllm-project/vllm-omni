@@ -59,10 +59,10 @@ _DP: GroupCoordinator | None = None
 _FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
 _DIT: GroupCoordinator | None = None
 
-# Rank-layout metadata for MoE expert parallelism. This is not a process
-# group; it is reused by platform-specific runtimes that must build companion
-# groups with the same rank layout as vLLM EP.
-_MOE_EP_GROUP_RANKS: list[list[int]] | None = None
+# Rank-layout metadata for expert parallelism. This is not a process group;
+# it is reused by platform-specific runtimes that must build companion groups
+# with the same rank layout as vLLM EP.
+_EXPERT_PARALLEL_GROUP_RANKS: list[list[int]] | None = None
 
 
 def generate_masked_orthogonal_rank_groups(
@@ -304,8 +304,8 @@ def get_ring_parallel_rank():
 
 def get_expert_parallel_group_ranks() -> list[list[int]]:
     assert vllm_parallel_state._EP is not None, "expert parallel group is not initialized"
-    assert _MOE_EP_GROUP_RANKS is not None, "expert parallel group ranks are not initialized"
-    return _MOE_EP_GROUP_RANKS
+    assert _EXPERT_PARALLEL_GROUP_RANKS is not None, "expert parallel group ranks are not initialized"
+    return _EXPERT_PARALLEL_GROUP_RANKS
 
 
 # PP
@@ -845,7 +845,7 @@ def initialize_model_parallel(
             parallel_mode="data",
         )
 
-    global _FS, _MOE_EP_GROUP_RANKS
+    global _FS, _EXPERT_PARALLEL_GROUP_RANKS
     assert _FS is None, "fully shard group is already initialized"
     _FS = init_model_parallel_group(
         group_ranks=rank_generator.get_ranks("fs", independent_ranks=True),
@@ -854,7 +854,7 @@ def initialize_model_parallel(
         parallel_mode="fully_shard",
     )
 
-    _MOE_EP_GROUP_RANKS = None
+    _EXPERT_PARALLEL_GROUP_RANKS = None
     if enable_expert_parallel:
         ep_group_ranks = rank_generator.get_ranks("tp-sp-cfg-dp")
         vllm_parallel_state._EP = init_model_parallel_group(
@@ -863,14 +863,14 @@ def initialize_model_parallel(
             backend=backend,
             parallel_mode="expert",
         )
-        _MOE_EP_GROUP_RANKS = ep_group_ranks
+        _EXPERT_PARALLEL_GROUP_RANKS = ep_group_ranks
 
     init_dit_group(dit_parallel_size, backend)
 
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _DP, _CFG, _SP, _PP, _FS, _MOE_EP_GROUP_RANKS
+    global _DP, _CFG, _SP, _PP, _FS, _EXPERT_PARALLEL_GROUP_RANKS
 
     if vllm_parallel_state._DP and vllm_parallel_state._DP is not _DP:
         vllm_parallel_state._DP.destroy()
@@ -899,7 +899,7 @@ def destroy_model_parallel():
     if vllm_parallel_state._EP:
         vllm_parallel_state._EP.destroy()
     vllm_parallel_state._EP = None
-    _MOE_EP_GROUP_RANKS = None
+    _EXPERT_PARALLEL_GROUP_RANKS = None
 
     if _PP:
         _PP.destroy()
