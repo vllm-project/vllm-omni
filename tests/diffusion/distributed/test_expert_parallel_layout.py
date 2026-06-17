@@ -118,14 +118,11 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
         local_rank=local_rank,
         device_group=object(),
     )
-    fake_forward_context = SimpleNamespace(omni_diffusion_config=SimpleNamespace(is_moe=True))
-
     monkeypatch.setattr(parallel_state.torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(parallel_state.torch.distributed, "get_world_size", lambda: world_size)
     monkeypatch.setattr(parallel_state.torch.distributed, "get_backend", lambda *_args, **_kwargs: "gloo")
     monkeypatch.setattr(parallel_state.torch.distributed, "new_group", lambda ranks: tuple(ranks))
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
-    monkeypatch.setattr(parallel_state, "get_forward_context", lambda: fake_forward_context)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
     monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
@@ -246,14 +243,11 @@ def test_cfg_parallel_maps_to_vllm_dp_without_moe_ep(monkeypatch):
         local_rank=local_rank,
         device_group=object(),
     )
-    fake_forward_context = SimpleNamespace(omni_diffusion_config=SimpleNamespace(is_moe=False))
-
     monkeypatch.setattr(parallel_state.torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(parallel_state.torch.distributed, "get_world_size", lambda: world_size)
     monkeypatch.setattr(parallel_state.torch.distributed, "get_backend", lambda *_args, **_kwargs: "gloo")
     monkeypatch.setattr(parallel_state.torch.distributed, "new_group", lambda ranks: tuple(ranks))
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
-    monkeypatch.setattr(parallel_state, "get_forward_context", lambda: fake_forward_context)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
     monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 

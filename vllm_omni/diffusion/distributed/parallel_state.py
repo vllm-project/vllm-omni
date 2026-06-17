@@ -35,8 +35,6 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
-from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.platforms import current_omni_platform
 
 from .group_coordinator import (
@@ -784,8 +782,7 @@ def initialize_model_parallel(
         order="tp-sp-pp-cfg-dp",
     )
     sp_group_ranks = rank_generator.get_ranks("sp")
-    od_config: OmniDiffusionConfig | None = get_forward_context().omni_diffusion_config
-    use_moe_parallel_mapping = bool(enable_expert_parallel and od_config and od_config.is_moe)
+    use_moe_parallel_mapping = enable_expert_parallel
     global _DP
     assert _DP is None, "data parallel group is already initialized"
     _DP = init_model_parallel_group(
