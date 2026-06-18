@@ -88,6 +88,10 @@ The test sends a synthetic two-frame DROID observation and checks:
 
 ## Notes
 
+- **Do not change the model-specific `policy_server_config` values.** `action_horizon`,
+  `action_keys`, and `supported_embodiments` are fixed by the GR00T-N1.7 checkpoint and
+  are validated against the loaded policy at startup (the server refuses to start on a
+  mismatch). Only `image_resolution` and `needs_session_id` are deployment knobs.
 - To switch embodiment, edit `embodiment_tag` under both `model_config` and
   `policy_server_config` in `vllm_omni/deploy/Gr00tN1d7.yaml`. Supported values:
   `OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT` (default), `XDOF`, `XDOF_SUBTASK`,

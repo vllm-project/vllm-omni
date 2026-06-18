@@ -4,7 +4,8 @@
 # This default uses one GPU with TP=1 and CFG parallel disabled.
 
 pipeline: Gr00tN1d7
-# Single stage: the deploy parser defaults async_chunk to True, so set it false explicitly.
+# Required: async_chunk defaults to True, which the deploy validator rejects for a
+# single-stage pipeline (no next-stage processor). Must be false here.
 async_chunk: false
 
 stages:
@@ -14,7 +15,9 @@ stages:
     model_class_name: Gr00tN1d7Pipeline
     model_config:
       embodiment_tag: OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT
-      # Sent verbatim to the OpenPI client as the handshake metadata contract.
+      # OpenPI client handshake — model/embodiment-specific values for GR00T-N1.7.
+      # Sent verbatim to the client (the pipeline never reads these); they describe the
+      # action space / inputs the client must produce for this checkpoint + embodiment.
       policy_server_config:
         image_resolution: [180, 320]
         needs_session_id: true

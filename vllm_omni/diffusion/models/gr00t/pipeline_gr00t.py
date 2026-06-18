@@ -48,6 +48,37 @@ class Gr00tN1d7Pipeline(nn.Module):
             device=self.device,
             strict=self.strict,
         )
+        self._validate_policy_server_config(model_config.get("policy_server_config"))
+
+    def _validate_policy_server_config(self, psc: Mapping[str, Any] | None) -> None:
+        """Fail fast if the deploy handshake drifts from the loaded checkpoint.
+
+        ``policy_server_config`` is sent verbatim to the OpenPI client, so its
+        model/embodiment-specific values must match what the loaded policy actually
+        produces; otherwise the client is handed the wrong action contract.
+        """
+        if not isinstance(psc, Mapping):
+            return
+        action_config = self.policy.modality_configs["action"]
+        expected_horizon = len(action_config.delta_indices)
+        expected_keys = set(action_config.modality_keys)
+
+        if "action_horizon" in psc and psc["action_horizon"] != expected_horizon:
+            raise ValueError(
+                f"policy_server_config.action_horizon={psc['action_horizon']} != loaded model's "
+                f"action horizon {expected_horizon}."
+            )
+        if "action_keys" in psc and set(psc["action_keys"]) != expected_keys:
+            raise ValueError(
+                f"policy_server_config.action_keys={list(psc['action_keys'])} != loaded model's "
+                f"action keys {sorted(expected_keys)}."
+            )
+        psc_embodiment = psc.get("embodiment_tag")
+        if psc_embodiment is not None and psc_embodiment != self.embodiment_tag:
+            raise ValueError(
+                f"policy_server_config.embodiment_tag={psc_embodiment!r} != "
+                f"model_config.embodiment_tag={self.embodiment_tag!r}."
+            )
 
     def reset(self) -> dict[str, Any]:
         return self.policy.reset() or {}
