@@ -198,7 +198,8 @@ class OrchestratorMonitor:
             inflight_avg = sum(inflight_values) / float(len(inflight_values)) if inflight_values else 0.0
             inflight_max = max(inflight_values) if inflight_values else 0
             logger.info(
-                "[OrchestratorMonitor] %s outputs_queue_avg=%.2f outputs_queue_max=%d inflight_avg=%.2f inflight_max=%d",
+                "[OrchestratorMonitor] %s outputs_queue_avg=%.2f outputs_queue_max=%d "
+                "inflight_avg=%.2f inflight_max=%d",
                 key,
                 queue_avg,
                 queue_max,
