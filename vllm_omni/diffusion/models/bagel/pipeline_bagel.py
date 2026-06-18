@@ -869,18 +869,34 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         tp_aware_params = {name for name, p in self.named_parameters() if hasattr(p, "weight_loader")}
 
         # Expand allowed/tp_aware_params with stacked param source names.
-        # QKVParallelLinear merges q_proj+k_proj+v_proj into qkv_proj; the
-        # checkpoint stores the original separate names.  We must recognise
-        # those names so _filtered_weights does not drop them.
+        # The model fuses several checkpoint projections into merged layers:
+        #   QKV: q/k/v_proj → qkv_proj, q/k/v_proj_moe_gen → qkv_proj.gen_exp
+        # and remaps non-stacked weights like:
+        #   {norm}_moe_gen.weight → {norm}.gen_weight  (MoTRMSNorm layers)
+        # We expand allowed names so _filtered_weights does not drop them.
         _stacked_expansions = [
+            # text QKV
             (".qkv_proj", ".q_proj"),
             (".qkv_proj", ".k_proj"),
             (".qkv_proj", ".v_proj"),
-            (".qkv_proj_moe_gen", ".q_proj_moe_gen"),
-            (".qkv_proj_moe_gen", ".k_proj_moe_gen"),
-            (".qkv_proj_moe_gen", ".v_proj_moe_gen"),
-            (".gate_up_proj", ".gate_proj"),
-            (".gate_up_proj", ".up_proj"),
+            # gen QKV
+            (".qkv_proj.gen_exp", ".q_proj_moe_gen"),
+            (".qkv_proj.gen_exp", ".k_proj_moe_gen"),
+            (".qkv_proj.gen_exp", ".v_proj_moe_gen"),
+            # gen o_proj (non-stacked, but still remapped)
+            (".o_proj.gen_exp", ".o_proj_moe_gen"),
+            # text FFN gate+up
+            (".mlp.gate_up_proj", ".mlp.gate_proj"),
+            (".mlp.gate_up_proj", ".mlp.up_proj"),
+            # gen FFN gate+up
+            (".mlp_moe_gen.gate_up_proj", ".mlp_moe_gen.gate_proj"),
+            (".mlp_moe_gen.gate_up_proj", ".mlp_moe_gen.up_proj"),
+            # MoTRMSNorm gen_weight ← checkpoint _moe_gen.weight
+            (".input_layernorm.gen_", ".input_layernorm_moe_gen."),
+            (".post_attention_layernorm.gen_", ".post_attention_layernorm_moe_gen."),
+            (".q_norm.gen_", ".q_norm_moe_gen."),
+            (".k_norm.gen_", ".k_norm_moe_gen."),
+            (".norm.gen_", ".norm_moe_gen."),
         ]
         stacked_source_names: set[str] = set()
         for name in list(allowed):

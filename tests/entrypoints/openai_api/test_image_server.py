@@ -11,10 +11,11 @@ import base64
 import io
 import json
 from argparse import Namespace
+from http import HTTPStatus
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
@@ -23,7 +24,7 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels, router
+from vllm_omni.entrypoints.openai.api_server import _check_max_generated_image_size, _DiffusionServingModels, router
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
@@ -1977,6 +1978,56 @@ def test_extract_images_from_result():
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
     assert images[0].size == (32, 32)
+
+
+# ---------------------------------------------------------------------------
+# _check_max_generated_image_size unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_width_height_within_limit_passes():
+    args = SimpleNamespace(max_generated_image_size=1024 * 1024)
+    # Exactly at limit is allowed (> not >=)
+    _check_max_generated_image_size(args, 1024, 1024)
+    # Below limit
+    _check_max_generated_image_size(args, 512, 512)
+
+
+def test_width_height_exceeds_limit_raises_400():
+    limit = 1024 * 1024
+    args = SimpleNamespace(max_generated_image_size=limit)
+    with pytest.raises(HTTPException) as exc_info:
+        _check_max_generated_image_size(args, 1025, 1024)
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
+    assert "1025x1024" in exc_info.value.detail
+    assert str(limit) in exc_info.value.detail
+
+
+def test_width_height_error_message_contains_size_hint():
+    args = SimpleNamespace(max_generated_image_size=512 * 512)
+    with pytest.raises(HTTPException) as exc_info:
+        _check_max_generated_image_size(args, 1024, 512)
+    assert "--max-generated-image-size" in exc_info.value.detail
+
+
+def test_resolution_within_limit_passes():
+    args = SimpleNamespace(max_generated_image_size=1024 * 1024)
+    # Exactly at limit is allowed (> not >=): 1024*1024 == limit
+    _check_max_generated_image_size(args, None, None, resolution=1024)
+    # Below limit
+    _check_max_generated_image_size(args, None, None, resolution=512)
+
+
+def test_resolution_exceeds_limit_raises_400():
+    limit = 1024 * 1024
+    args = SimpleNamespace(max_generated_image_size=limit)
+    with pytest.raises(HTTPException) as exc_info:
+        _check_max_generated_image_size(args, None, None, resolution=1025)
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
+    detail = exc_info.value.detail
+    assert "1025" in detail
+    assert "1025x1025" in detail
+    assert str(limit) in detail
 
 
 def test_image_edits_size_auto_preserves_bridge_size(async_omni_stage_configs_only_client):
