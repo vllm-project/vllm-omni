@@ -103,3 +103,23 @@ def test_stable_audio_quantization_and_teacache() -> None:
         )
     finally:
         m.close()
+
+
+@hardware_test(res={"cuda": "L4", "xpu": "B60"})
+def test_stable_audio_cpu_offload() -> None:
+    """Stable Audio Open with FP8 + CPU offload."""
+    m = Omni(
+        model="stabilityai/stable-audio-open-1.0",
+        quantization="fp8",
+        enable_cpu_offload=True,
+    )
+    try:
+        audio = generate_stable_audio_short_clip(m)
+        assert_audio_valid(
+            audio,
+            sample_rate=_SAMPLE_RATE,
+            channels=2,
+            duration_s=_CLIP_DURATION_S,
+        )
+    finally:
+        m.close()
