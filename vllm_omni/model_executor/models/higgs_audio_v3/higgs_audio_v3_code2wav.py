@@ -35,6 +35,7 @@ __all__ = [
 
 logger = init_logger(__name__)
 
+
 # Prefix under which codec weights are stored in the v3 checkpoint.
 _CODEC_PREFIX = "tied.embedding.modality_embeddings.0.model."
 

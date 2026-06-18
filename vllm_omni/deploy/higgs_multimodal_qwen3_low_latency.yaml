@@ -1,0 +1,85 @@
+# Higgs-audio v3 deploy, low-latency profile.
+#
+# Use this profile for low-concurrency serving (for example c1-c4) where Stage 0
+# decode launch overhead dominates. Stage 0 enables vLLM FULL_DECODE_ONLY CUDA
+# graph through YAML configuration:
+#
+#   enforce_eager: false
+#   compilation_config.cudagraph_mode: FULL_DECODE_ONLY
+#
+# This is not controlled by an environment variable. The Higgs talker disables
+# its local MLP CUDA graph automatically when the external decode graph is active,
+# because the two graph paths are mutually exclusive.
+#
+# Plain TTS only (no voice cloning). async_chunk streams codec chunks from
+# Stage 0 to Stage 1 as they are produced (TTFA approaches one AR loop's
+# worth of work). Stage 1 honors meta.left_context_size + meta.right_holdback_size
+# so the per-chunk codec windows stitch into a coherent PCM stream.
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      # Stream PCM bytes back to the client as Stage 1 emits each chunk.
+      codec_streaming: true
+      # Streaming chunk shape for talker2code2wav_async_chunk:
+      #   codec_chunk_frames        steady-state new frames per emit
+      #   codec_left_context_frames sliding past context to avoid leading-edge artifacts
+      #   codec_right_holdback_frames trailing frames held back so the codec
+      #                              has future context for emit-region tail samples
+      #   initial_codec_chunk_frames smaller first chunk to minimize TTFA
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+      codec_right_holdback_frames: 4
+      initial_codec_chunk_frames: 1
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 5000
+      connector_get_max_wait: 500
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.6
+    enforce_eager: false
+    attention_backend: FLASHINFER
+    trust_remote_code: true
+    enable_prefix_caching: true
+    async_scheduling: false
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16]
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_num_of_warmups: 1
+    max_num_batched_tokens: 4096
+    max_model_len: 8192
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.25
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0

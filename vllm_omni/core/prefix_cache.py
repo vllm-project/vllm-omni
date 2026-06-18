@@ -10,9 +10,6 @@ from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
 
 logger = init_logger(__name__)
 
-# Skip oversized per-key caches; otherwise hidden_states.layer_N can OOM on big models.
-_MAX_MM_CACHE_BYTES_PER_KEY = 512 * 1024 * 1024
-
 
 class OmniTensorPrefixCache:
     """Prefix cache for hidden states (model outputs) and model specific
@@ -49,7 +46,6 @@ class OmniTensorPrefixCache:
         # actually see mm output tensors dependent on num tokens.
         self.mm_outputs_cache = {}
         self.mm_cache_keys = set()
-        self._mm_oversized_keys: set[str] = set()
         self._new_req_cache_hit_ids: set[str] = set()
         self._deferred_mm_outputs: dict[str, dict[str, list[tuple[int, torch.Tensor]]]] = {}
 
@@ -79,17 +75,6 @@ class OmniTensorPrefixCache:
                 and key not in self.mm_cache_keys
             ):
                 feat_dim = val.shape[-1]
-                # Bound per-key cache to avoid OOM on wide per-token features.
-                key_bytes = self.num_blocks * self.block_size * feat_dim * val.element_size()
-                if key_bytes > _MAX_MM_CACHE_BYTES_PER_KEY:
-                    logger.warning_once(
-                        "Skipping mm prefix cache key '%s': %.1f MiB > %.1f MiB cap.",
-                        key,
-                        key_bytes / 2**20,
-                        _MAX_MM_CACHE_BYTES_PER_KEY / 2**20,
-                    )
-                    self._mm_oversized_keys.add(key)
-                    continue
                 self.mm_outputs_cache[key] = self._get_cache_tensor(
                     dtype=val.dtype,
                     hidden_size=feat_dim,
@@ -432,18 +417,7 @@ class OmniTensorPrefixCache:
         # tensors similarly to the non prefix cached path, and then populate
         # the subdicts mapping request IDs -> payload objects
         passthrough_keys = set(mm_outputs.keys()) - self.mm_cache_keys
-        total_scheduled_tokens = sum(int(num_scheduled_tokens[r]) for r in input_batch.req_ids)
-        passthrough_mm_data: dict[str, object] = {}
-        for k in passthrough_keys:
-            v = mm_outputs[k]
-            if (
-                k in self._mm_oversized_keys
-                and isinstance(v, torch.Tensor)
-                and v.dim() >= 2
-                and v.shape[0] >= total_scheduled_tokens
-            ):
-                v = v[:total_scheduled_tokens]
-            passthrough_mm_data[k] = v
+        passthrough_mm_data = {k: v for k, v in mm_outputs.items() if k in passthrough_keys}
         mm_cpu = build_mm_cpu(multimodal_outputs=passthrough_mm_data)
 
         for mm_key, mm_val in mm_cpu.items():
