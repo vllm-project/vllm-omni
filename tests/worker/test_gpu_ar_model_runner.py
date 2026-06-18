@@ -105,7 +105,7 @@ def test_omni_async_gpu_model_runner_output_reraises_background_exception():
     assert async_output._background_thread is None
 
 
-def _make_materialization_runner(engine_output_type: str = "audio"):
+def _make_async_output_runner(engine_output_type: str = "audio"):
     runner = object.__new__(GPUARModelRunner)
     model_config = SimpleNamespace(
         engine_output_type=engine_output_type,
@@ -128,7 +128,7 @@ def _make_materialization_runner(engine_output_type: str = "audio"):
 
 
 def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monkeypatch):
-    runner = _make_materialization_runner()
+    runner = _make_async_output_runner()
     events = []
 
     monkeypatch.setattr(
@@ -181,7 +181,7 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
 
 
 def test_process_additional_information_uses_snapshot_request_order(monkeypatch):
-    runner = _make_materialization_runner()
+    runner = _make_async_output_runner()
     seen = []
 
     class PostprocessModel:
@@ -232,20 +232,20 @@ def test_process_additional_information_uses_snapshot_request_order(monkeypatch)
     assert torch.equal(seen[1], torch.tensor([[2.0], [3.0]]))
 
 
-def test_deferred_omni_output_materialization_guard_requires_safe_conditions():
-    runner = _make_materialization_runner()
+def test_async_omni_output_guard_requires_safe_conditions():
+    runner = _make_async_output_runner()
     runner.use_async_scheduling = True
     runner.speculative_config = None
-    runner.model.defer_async_omni_output_materialization = True
+    runner.model.use_async_omni_output = True
 
-    assert GPUARModelRunner._should_defer_async_omni_output_materialization(runner)
+    assert GPUARModelRunner._should_use_async_omni_output(runner)
 
     runner.omni_prefix_cache = object()
-    assert not GPUARModelRunner._should_defer_async_omni_output_materialization(runner)
+    assert not GPUARModelRunner._should_use_async_omni_output(runner)
 
     runner.omni_prefix_cache = None
     runner.model.has_postprocess = True
-    assert not GPUARModelRunner._should_defer_async_omni_output_materialization(runner)
+    assert not GPUARModelRunner._should_use_async_omni_output(runner)
 
 
 @pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])

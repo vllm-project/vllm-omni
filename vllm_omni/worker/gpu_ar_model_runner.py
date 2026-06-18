@@ -7,7 +7,6 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
-import os
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
@@ -49,35 +48,6 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 
 logger = init_logger(__name__)
 
-_UNSAFE_DEFER_OUTPUT_TENSOR_REF_ENV = "VLLM_OMNI_UNSAFE_DEFER_OUTPUT_TENSOR_REF"
-_TRACE_DEFER_OUTPUT_ENV = "VLLM_OMNI_TRACE_ASYNC_OUTPUT"
-_BACKGROUND_DEFER_OUTPUT_ENV = "VLLM_OMNI_BACKGROUND_ASYNC_OUTPUT"
-
-
-def _use_unsafe_deferred_tensor_refs() -> bool:
-    return os.environ.get(_UNSAFE_DEFER_OUTPUT_TENSOR_REF_ENV, "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _trace_deferred_output() -> bool:
-    return os.environ.get(_TRACE_DEFER_OUTPUT_ENV, "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _background_deferred_output_enabled() -> bool:
-    value = os.environ.get(_BACKGROUND_DEFER_OUTPUT_ENV)
-    if value is None:
-        return True
-    return value.lower() not in {"0", "false", "no", "off"}
-
 
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     tensor = tensor.detach()
@@ -89,7 +59,7 @@ def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
 def _clone_cuda_tensor_payload(value: Any, sources: list[torch.Tensor]) -> Any:
     """Clone CUDA tensors on the current stream before async CPU copies.
 
-    The clone protects deferred output materialization from CUDA graph output
+    The clone protects async Omni output snapshots from CUDA graph output
     buffers that may be reused by subsequent decode steps. CPU tensors are
     cloned synchronously because they are already host-owned snapshots.
     """
@@ -170,7 +140,6 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self,
         *,
         model_runner_output_builder: Callable[[], OmniModelRunnerOutput],
-        materialize_in_background: bool = False,
         cuda_device: torch.device | int | str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -197,8 +166,8 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
             async_output_copy_stream.wait_stream(default_stream)
             # Keep sampled-token feedback identical to upstream async
             # scheduling. This tensor drives the next decode step, so avoid
-            # changing its host-copy allocation semantics while deferring Omni
-            # payload materialization.
+            # changing its host-copy allocation semantics while building Omni
+            # output asynchronously.
             self.sampled_token_ids_cpu = self._sampled_token_ids.to("cpu", non_blocking=True)
             self._logprobs_tensors_cpu = self._logprobs_tensors.to_cpu_nonblocking() if self._logprobs_tensors else None
             self._routed_experts_cpu = (
@@ -210,24 +179,21 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self._background_exception: BaseException | None = None
         self._background_thread: threading.Thread | None = None
         self._cuda_device = cuda_device
-        if materialize_in_background:
-            self._background_thread = threading.Thread(
-                target=self._materialize_in_background,
-                daemon=True,
-                name="omni-async-output-builder",
-            )
-            self._background_thread.start()
+        self._background_thread = threading.Thread(
+            target=self._build_output_in_background,
+            daemon=True,
+            name="omni-async-output-builder",
+        )
+        self._background_thread.start()
 
     def _build_model_runner_output_once(self) -> None:
         if self._model_runner_output is not None:
             return
-        if _trace_deferred_output():
-            logger.info("Omni async output materializing deferred ModelRunnerOutput.")
         with record_function_or_nullcontext("omni_async_output:get_output/build_model_runner_output"):
             self._model_runner_output = self._model_runner_output_builder()
         self._model_runner_output_builder = None
 
-    def _materialize_in_background(self) -> None:
+    def _build_output_in_background(self) -> None:
         try:
             if self._cuda_device is not None:
                 torch.cuda.set_device(self._cuda_device)
@@ -1201,7 +1167,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return query_start_loc_cpu
 
     @staticmethod
-    def _snapshot_scheduler_output_for_omni_materialization(
+    def _snapshot_scheduler_output_for_async_omni_output(
         scheduler_output: SchedulerOutput,
     ) -> SchedulerOutput:
         updates: dict[str, Any] = {}
@@ -1226,7 +1192,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             getattr(self, "routed_experts_initialized", False)
         )
 
-    def _should_defer_async_omni_output_materialization(self) -> bool:
+    def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
             return False
         if self.omni_prefix_cache is not None:
@@ -1243,7 +1209,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return False
 
         model = getattr(self, "model", None)
-        if not bool(getattr(model, "defer_async_omni_output_materialization", False)):
+        if not bool(getattr(model, "use_async_omni_output", False)):
             return False
         return not bool(getattr(model, "has_postprocess", False))
 
@@ -1308,18 +1274,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     hidden_states_cpu = _to_cpu_contiguous(hidden_states[:num_valid_tokens])
             else:
                 req_hidden_states_cpu = {}
-        if self.omni_prefix_cache is not None:
-            deferred_mm_cache_keys = self._deferred_prefix_cache_mm_keys()
-            if deferred_mm_cache_keys:
-                self.omni_prefix_cache.stage_deferred_mm_outputs(
-                    query_start_loc=query_start_loc_cpu,
-                    input_batch=self.input_batch,
-                    multimodal_outputs=(
-                        flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
-                    ),
-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    deferred_mm_cache_keys=deferred_mm_cache_keys,
-                )
 
         # NOTE: pooler_output here is used only for the full-payload accumulation
         # path (accumulate_full_payload_output) and is NOT passed on the wire via
@@ -1621,8 +1575,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
         else:
             num_scheduled_tokens_np = np.asarray(num_scheduled_tokens_np, dtype=np.int32).copy()
+
         query_start_loc_cpu = self._snapshot_query_start_loc_cpu()
-        scheduler_output_snapshot = self._snapshot_scheduler_output_for_omni_materialization(scheduler_output)
+        scheduler_output_snapshot = self._snapshot_scheduler_output_for_async_omni_output(scheduler_output)
         req_ids_output_snapshot = list(req_ids_output_copy)
         req_id_to_index_output_snapshot = dict(req_id_to_index_output_copy)
         valid_sampled_token_ids_snapshot = [list(token_ids) for token_ids in valid_sampled_token_ids]
@@ -1632,63 +1587,32 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             dict(num_nans_in_logits) if isinstance(num_nans_in_logits, dict) else num_nans_in_logits
         )
 
-        should_defer_output = self._should_defer_async_omni_output_materialization()
-        if _trace_deferred_output() and not getattr(self, "_omni_async_output_defer_trace_logged", False):
-            model_config = getattr(self, "model_config", None)
-            if model_config is None:
-                model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
-            model = getattr(self, "model", None)
-            logger.info(
-                "Omni async output defer decision: should_defer=%s use_async=%s async_chunk=%s "
-                "prefix_cache=%s speculative=%s return_routed_experts=%s model_opt_in=%s "
-                "has_postprocess=%s unsafe_refs=%s.",
-                should_defer_output,
-                self.use_async_scheduling,
-                bool(getattr(model_config, "async_chunk", False)),
-                self.omni_prefix_cache is not None,
-                self.speculative_config is not None,
-                bool(getattr(model_config, "enable_return_routed_experts", False)),
-                bool(getattr(model, "defer_async_omni_output_materialization", False)),
-                bool(getattr(model, "has_postprocess", False)),
-                _use_unsafe_deferred_tensor_refs(),
-            )
-            self._omni_async_output_defer_trace_logged = True
-        deferred_payload_snapshot: _AsyncCPUPayloadSnapshot | None = None
-        if should_defer_output:
-            if _use_unsafe_deferred_tensor_refs():
-                hidden_states_snapshot = hidden_states
-                staged_hidden_states_cpu_snapshot = staged_hidden_states_cpu
-                multimodal_outputs_snapshot = multimodal_outputs
-            else:
-                with record_function_or_nullcontext("omni_defer_snapshot:async_cpu_payload"):
-                    deferred_payload_snapshot = _snapshot_tensor_payload_to_cpu_async(
-                        {
-                            "hidden_states": hidden_states,
-                            "staged_hidden_states_cpu": staged_hidden_states_cpu,
-                            "multimodal_outputs": multimodal_outputs,
-                        },
-                        copy_stream=self._get_or_create_omni_payload_copy_stream(),
-                        pin_memory=bool(getattr(self, "pin_memory", False)),
-                    )
-                payload = deferred_payload_snapshot.payload
-                hidden_states_snapshot = payload["hidden_states"]
-                staged_hidden_states_cpu_snapshot = payload["staged_hidden_states_cpu"]
-                multimodal_outputs_snapshot = payload["multimodal_outputs"]
+        use_async_omni_output = self._should_use_async_omni_output()
+        async_payload_snapshot: _AsyncCPUPayloadSnapshot | None = None
+        if use_async_omni_output:
+            with record_function_or_nullcontext("omni_async_output:snapshot_cpu_payload"):
+                async_payload_snapshot = _snapshot_tensor_payload_to_cpu_async(
+                    {
+                        "hidden_states": hidden_states,
+                        "staged_hidden_states_cpu": staged_hidden_states_cpu,
+                        "multimodal_outputs": multimodal_outputs,
+                    },
+                    copy_stream=self._get_or_create_omni_payload_copy_stream(),
+                    pin_memory=bool(getattr(self, "pin_memory", False)),
+                )
+            payload = async_payload_snapshot.payload
+            hidden_states_snapshot = payload["hidden_states"]
+            staged_hidden_states_cpu_snapshot = payload["staged_hidden_states_cpu"]
+            multimodal_outputs_snapshot = payload["multimodal_outputs"]
         else:
             hidden_states_snapshot = hidden_states
             staged_hidden_states_cpu_snapshot = staged_hidden_states_cpu
             multimodal_outputs_snapshot = multimodal_outputs
 
         def output_builder() -> OmniModelRunnerOutput:
-            if deferred_payload_snapshot is not None:
-                with record_function_or_nullcontext("omni_output_builder:wait_async_cpu_payload"):
-                    deferred_payload_snapshot.wait()
-            if _trace_deferred_output():
-                logger.info(
-                    "Omni async output builder executing: req_count=%d unsafe_refs=%s.",
-                    len(req_ids_output_snapshot),
-                    _use_unsafe_deferred_tensor_refs(),
-                )
+            if async_payload_snapshot is not None:
+                with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
+                    async_payload_snapshot.wait()
             with record_function_or_nullcontext("omni_output_builder:total"):
                 return self._build_omni_model_runner_output_from_snapshot(
                     scheduler_output=scheduler_output_snapshot,
@@ -1710,13 +1634,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     query_start_loc_cpu=query_start_loc_cpu,
                 )
 
-        if not should_defer_output:
+        if not use_async_omni_output:
             output = output_builder()
 
             if not self.use_async_scheduling:
                 return output
         with record_function_or_nullcontext("gpu_model_runner: AsyncGPUModelRunnerOutput"):
-            async_output_cls = OmniAsyncGPUModelRunnerOutput if should_defer_output else AsyncGPUModelRunnerOutput
+            async_output_cls = OmniAsyncGPUModelRunnerOutput if use_async_omni_output else AsyncGPUModelRunnerOutput
             async_output_kwargs = dict(
                 sampled_token_ids=sampler_output.sampled_token_ids,
                 logprobs_tensors=sampler_output.logprobs_tensors,
@@ -1724,10 +1648,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
             )
-            if should_defer_output:
+            if use_async_omni_output:
                 async_output = async_output_cls(
                     model_runner_output_builder=output_builder,
-                    materialize_in_background=_background_deferred_output_enabled(),
                     cuda_device=self.device,
                     **async_output_kwargs,
                 )
