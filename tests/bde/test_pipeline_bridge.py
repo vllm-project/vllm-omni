@@ -47,6 +47,34 @@ def test_paged_write_then_gather_roundtrips():
     assert torch.allclose(got[1, 0], win[1, 0], atol=0)
 
 
+def test_gather_is_memoized_within_a_forward():
+    """The resident window is frozen across a forward's denoise steps, so repeated
+    get_kv_caches must reuse one gather; a write-back (layer 0) invalidates it."""
+    _, st = make_state(num_layers=2)
+    st.update_kv_cache(0, _window(2), False, seq_len=2 * BLOCK)  # commit one chunk
+    first = st.get_kv_caches(False, lambda: ["X"])
+    again = st.get_kv_caches(False, lambda: ["X"])
+    assert again is first  # cache HIT: identical object, no re-gather
+    # A new write-back grows the window -> next get must re-gather a fresh object.
+    st.update_kv_cache(0, _window(1), False, seq_len=BLOCK)
+    after = st.get_kv_caches(False, lambda: ["X"])
+    assert after is not first
+    # Negative branch is cached independently.
+    st.update_kv_cache(0, _window(1), True, seq_len=BLOCK)
+    neg1 = st.get_kv_caches(True, lambda: ["X"])
+    assert st.get_kv_caches(True, lambda: ["X"]) is neg1
+    assert neg1 is not after
+
+
+def test_reset_clears_gather_cache():
+    _, st = make_state(num_layers=1)
+    st.update_kv_cache(0, _window(2), False, seq_len=2 * BLOCK)
+    st.get_kv_caches(False, lambda: ["X"])
+    assert st._gather_cache[False] is not None
+    st.reset()
+    assert st._gather_cache == {False: None, True: None}
+
+
 def test_eviction_bounds_resident_window():
     kv, st = make_state(num_layers=1, window_chunks=3)
     st.update_kv_cache(0, _window(3), False, seq_len=3 * BLOCK)          # resident 3/3

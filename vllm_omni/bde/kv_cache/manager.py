@@ -21,7 +21,12 @@ from vllm_omni.bde.kv_cache.chunk_window import ChunkWindowSpec
 from vllm_omni.bde.kv_cache.config import BDEKVConfig
 from vllm_omni.bde.kv_cache.pool import build_kv_manager, compute_num_blocks
 from vllm_omni.bde.kv_cache.slot_mapping import chunk_slot_mapping, resident_block_ids
-from vllm_omni.bde.kv_cache.gather import allocate_kv_pool, pool_gather_window, pool_write_chunk
+from vllm_omni.bde.kv_cache.gather import (
+    allocate_kv_pool,
+    build_window_slots,
+    pool_gather_window,
+    pool_write_chunk,
+)
 
 _log = init_logger(__name__)
 
@@ -257,3 +262,26 @@ class BDEKVCache:
                     adapter.request_id, layer_index, window_ids,
                     tuple(window.shape), window.device)
         return window
+
+    def gather_window_all_layers(self, adapter: BDERequestAdapter) -> list[torch.Tensor]:
+        """Gather the resident-window K/V for every layer in one shot.
+
+        The window's block table is identical across layers within a forward, so
+        the block-id lookup and the flat slot index are computed **once** and shared
+        across all per-layer gathers — removing the per-layer Python work that the
+        single-layer ``gather_window`` repeats. Returns one
+        ``(2, 1, window, n_heads, head_dim)`` tensor per layer.
+        """
+        window_ids = self.window_block_ids(adapter)
+        slots = build_window_slots(window_ids, self.block_size, self._k_pools[0].device)
+        windows = [
+            pool_gather_window(
+                self._k_pools[i], self._v_pools[i], window_ids,
+                self.block_size, self.spec.sliding_window, slots=slots,
+            )
+            for i in range(self.num_layers)
+        ]
+        _log.debug("BDE gather-all: req=%s layers=%d blocks=%d window=%s",
+                    adapter.request_id, self.num_layers, len(window_ids),
+                    tuple(windows[0].shape))
+        return windows

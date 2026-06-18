@@ -69,29 +69,41 @@ def pool_write_chunk(
     v_pool[slot_mapping] = new_v[0]
 
 
+def build_window_slots(
+    window_block_ids: list[int], block_size: int, device: torch.device
+) -> torch.Tensor:
+    """Flat slot index covering all resident blocks, in table order.
+
+    Vectorized (no Python loop): ``slot = block_id * block_size + offset`` for every
+    ``offset in [0, block_size)``. The window's blocks are identical across all layers
+    within a forward, so this is built once per forward and shared.
+    """
+    if not window_block_ids:
+        raise ValueError("window_block_ids is empty — no blocks are resident")
+    starts = torch.tensor(window_block_ids, dtype=torch.long, device=device) * block_size
+    offsets = torch.arange(block_size, device=device)
+    return (starts[:, None] + offsets[None, :]).reshape(-1)
+
+
 def pool_gather_window(
     k_pool: torch.Tensor,
     v_pool: torch.Tensor,
     window_block_ids: list[int],
     block_size: int,
     max_attention_size: int,
+    *,
+    slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Materialize the resident window K/V as a contiguous tensor.
 
     Gathers all slots belonging to ``window_block_ids`` (in table order), trims to
     the last ``max_attention_size`` tokens (matching the existing ``cat`` + slice),
     and returns a ``(2, batch, window_tokens, n_heads, head_dim)`` tensor — exactly
-    the format DreamZero's attention expects as ``kv_cache``.
+    the format DreamZero's attention expects as ``kv_cache``. Pass a precomputed
+    ``slots`` (from :func:`build_window_slots`) to share the index across layers.
     """
-    if not window_block_ids:
-        raise ValueError("window_block_ids is empty — no blocks are resident")
-    # Build flat slot range covering all resident blocks in table order.
-    starts = torch.tensor(
-        [b * block_size for b in window_block_ids],
-        dtype=torch.long,
-        device=k_pool.device,
-    )
-    slots = torch.cat([torch.arange(s, s + block_size, device=k_pool.device) for s in starts])
+    if slots is None:
+        slots = build_window_slots(window_block_ids, block_size, k_pool.device)
     # Gather then trim to the attention window.
     wk = k_pool[slots]  # (window_slots, n_heads, head_dim)
     wv = v_pool[slots]
@@ -141,6 +153,11 @@ class BDEKVState:
         # the pool per branch; ``_pending`` holds this forward's new-chunk slot maps.
         self._committed: dict[bool, int] = {False: 0, True: 0}
         self._pending: dict[bool, list] = {False: [], True: []}
+        # The resident window is frozen across a forward's denoise steps (KV is
+        # only written back after the last step), so the per-step gather is
+        # re-materializing the same tensors ~16x. Memoize the gathered window per
+        # branch; invalidate on write-back (window grows) and on reset.
+        self._gather_cache: dict[bool, list | None] = {False: None, True: None}
         # Cross-attn KV is populated once after text encoding (eager), then
         # read every denoising step.  Reset clears these flags so the next
         # forward repopulates from the new text encoding.
@@ -155,8 +172,12 @@ class BDEKVState:
             out = fallback()
             _log.info("BDE GET   [%s] source=model-local-empty layers=%d", branch, len(out))
             return out
+        cached = self._gather_cache[is_negative]
+        if cached is not None:  # window unchanged this forward -> reuse (no re-gather)
+            return cached
         adapter = self._adapter(is_negative)
-        windows = [self.kv_cache.gather_window(i, adapter) for i in range(self.num_layers)]
+        windows = self.kv_cache.gather_window_all_layers(adapter)
+        self._gather_cache[is_negative] = windows
         _log.info(
             "BDE GET   [%s] source=paged-gather layers=%d window0=%s resident_blocks=%d/%d",
             branch, self.num_layers, tuple(windows[0].shape),
@@ -187,6 +208,9 @@ class BDEKVState:
                 adapter.on_chunk_committed()
             self._pending[is_negative] = slots
             self._committed[is_negative] += new_count
+            # The window just grew; the memoized gather is stale -> force re-gather
+            # on the next forward's first read of this branch.
+            self._gather_cache[is_negative] = None
             _log.info(
                 "BDE WRITE [%s] new_tokens=%d -> %d frame-chunks  resident=%d/%d  storing %d layers",
                 branch, new_count, n_chunks,
@@ -226,6 +250,7 @@ class BDEKVState:
         self.neg = self.kv_cache.begin_request(neg_id)
         self._committed = {False: 0, True: 0}
         self._pending = {False: [], True: []}
+        self._gather_cache = {False: None, True: None}
         self._cross_populated = {False: False, True: False}
         _log.info("BDE RESET [%s/%s] session KV cleared (window boundary)", pos_id, neg_id)
 
