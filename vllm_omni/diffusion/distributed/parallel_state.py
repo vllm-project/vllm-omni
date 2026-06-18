@@ -828,6 +828,8 @@ def initialize_model_parallel(
         ring_group=ring_pg,
     )
     if enable_expert_parallel:
+        # Diffusion normally uses its own SP group. Map it to vLLM PCP only for
+        # expert-parallel runtimes that rely on vLLM FusedMoE group semantics.
         vllm_parallel_state._PCP = _SP
 
     assert vllm_parallel_state._TP is None, "Tensor parallel group is already initialized"
@@ -837,7 +839,9 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
-    if cfg_parallel_size > 1:
+    if enable_expert_parallel and cfg_parallel_size > 1:
+        # CFG is a diffusion-specific replica dimension. Fold it into vLLM DP
+        # only when constructing the vLLM EP layout for expert-parallel paths.
         vllm_parallel_state._DP = init_model_parallel_group(
             group_ranks=rank_generator.get_ranks("cfg-dp"),
             local_rank=get_world_group().local_rank,

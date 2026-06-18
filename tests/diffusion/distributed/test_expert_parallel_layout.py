@@ -217,8 +217,8 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
 
 @pytest.mark.cpu
 @pytest.mark.core_model
-def test_cfg_parallel_maps_to_vllm_dp_without_moe_ep(monkeypatch):
-    """vLLM DP should include CFG even when MoE expert parallelism is not enabled."""
+def test_cfg_parallel_keeps_diffusion_dp_without_ep(monkeypatch):
+    """vLLM DP should keep diffusion DP when expert parallelism is not enabled."""
     local_rank = 0
     world_size = 8
 
@@ -269,9 +269,9 @@ def test_cfg_parallel_maps_to_vllm_dp_without_moe_ep(monkeypatch):
     )
 
     assert parallel_state._DP.world_size == 2
-    assert parallel_state.vllm_parallel_state._DP is not parallel_state._DP
-    assert parallel_state.vllm_parallel_state._DP.world_size == 4
-    assert parallel_state.vllm_parallel_state._DP.local_group == [0, 2, 4, 6]
+    assert parallel_state.vllm_parallel_state._DP is parallel_state._DP
+    assert parallel_state.vllm_parallel_state._DP.world_size == 2
+    assert parallel_state.vllm_parallel_state._DP.local_group == [0, 4]
     assert parallel_state.vllm_parallel_state._PCP is None
     assert parallel_state.vllm_parallel_state._EP is None
     assert parallel_state._EXPERT_PARALLEL_GROUP_RANKS is None
