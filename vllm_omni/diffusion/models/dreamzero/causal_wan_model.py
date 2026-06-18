@@ -21,11 +21,12 @@ import torch.nn as nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    get_tp_group,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.utils import set_weight_attrs
@@ -174,22 +175,82 @@ class DistributedRMSNorm(nn.Module):
             raise ValueError(f"RMSNorm shard shape mismatch: param={tuple(param.shape)}, shard={tuple(shard.shape)}.")
         param.data.copy_(shard)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        tp_size = get_tensor_model_parallel_world_size()
+    def _local_sum_sq(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Per-rank float32 activation, local sum-of-squares, and local width."""
         x_float = x.float()
         local_sum_sq = x_float.pow(2).sum(dim=-1, keepdim=True)
-        local_count = x.shape[-1]
+        return x_float, local_sum_sq, x.shape[-1]
+
+    def _scale(
+        self,
+        x_float: torch.Tensor,
+        global_sum_sq: torch.Tensor,
+        global_count: int,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the (already reduced) RMS and the per-rank weight shard."""
+        mean_sq = global_sum_sq / global_count
+        return (x_float * torch.rsqrt(mean_sq + self.eps)).type_as(x) * self.weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tp_size = get_tensor_model_parallel_world_size()
+        x_float, local_sum_sq, local_count = self._local_sum_sq(x)
 
         if tp_size > 1:
-            global_sum_sq = local_sum_sq.clone()
-            torch.distributed.all_reduce(global_sum_sq, group=get_tp_group().device_group)
+            # Use vLLM's collective (custom all-reduce / symmetric-mem fast path
+            # for small tensors) instead of raw torch.distributed.all_reduce, and
+            # take the return value so the custom-AR path (which may return a new
+            # buffer) is handled correctly. No .clone() needed.
+            global_sum_sq = tensor_model_parallel_all_reduce(local_sum_sq)
             global_count = local_count * tp_size
         else:
             global_sum_sq = local_sum_sq
             global_count = local_count
 
-        mean_sq = global_sum_sq / global_count
-        return (x_float * torch.rsqrt(mean_sq + self.eps)).type_as(x) * self.weight
+        return self._scale(x_float, global_sum_sq, global_count, x)
+
+
+def fused_qk_rms_norm(
+    norm_q: nn.Module,
+    norm_k: nn.Module,
+    q: torch.Tensor,
+    k: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply q/k :class:`DistributedRMSNorm` with a SINGLE fused TP all-reduce.
+
+    WHY: self-attention norms q and k every step; on TP each norm issues its own
+    tiny all-reduce of the per-token sum-of-squares. For DreamZero's decode-like
+    per-step forward these latency-bound micro-collectives dominate, so we pack
+    both sum-of-squares into one tensor and reduce once (2 collectives → 1).
+
+    NUMERICALLY IDENTICAL to ``norm_q(q), norm_k(k)``: all-reduce is elementwise,
+    so packing along the last dim reduces each slice independently with the same
+    fp32 accumulation. Requires q and k to share the same shape (true for
+    self-attention — both come from the same hidden states). Falls back to
+    independent application when either norm is not a DistributedRMSNorm
+    (e.g. nn.Identity when qk_norm=False).
+    """
+    if not (isinstance(norm_q, DistributedRMSNorm) and isinstance(norm_k, DistributedRMSNorm)):
+        return norm_q(q), norm_k(k)
+
+    # The fused path reduces one packed sum-of-squares and reuses q's token width
+    # as the RMS count for BOTH q and k, so q and k must share the same shape.
+    # (Self-attention guarantees this: q and k are projected from the same x.)
+    assert q.shape == k.shape, "fused_qk_rms_norm requires q and k to have the same shape."
+
+    tp_size = get_tensor_model_parallel_world_size()
+    q_float, q_sum_sq, count = norm_q._local_sum_sq(q)
+    k_float, k_sum_sq, _ = norm_k._local_sum_sq(k)
+
+    if tp_size > 1:
+        packed = torch.cat([q_sum_sq, k_sum_sq], dim=-1)
+        packed = tensor_model_parallel_all_reduce(packed)
+        q_sum_sq, k_sum_sq = packed[..., 0:1], packed[..., 1:2]
+        count = count * tp_size
+
+    q_out = norm_q._scale(q_float, q_sum_sq, count, q)
+    k_out = norm_k._scale(k_float, k_sum_sq, count, k)
+    return q_out, k_out
 
 
 # ── Projections ─────────────────────────────────────────────────────
@@ -337,22 +398,35 @@ class WanI2VCrossAttention(nn.Module):
         context = context[:, 257:]
         n, d = self.tp_num_heads, self.head_dim
         q = self.norm_q(self.q(x)).unflatten(2, (n, d))
+        # context (text) and context_img (clip features) are constant within a
+        # session, so k/v and k_img/v_img are cached on first call and reused.
+        # context_img == img_emb(clip feature) is session-invariant (state.clip_feas
+        # is set once at current_start_frame==0 and only cleared on reset, which also
+        # rebuilds crossattn_cache). Caching k_img/v_img removes a per-step
+        # norm_k_img all-reduce plus the k_img/v_img projection GEMMs in steady state.
+        # Only q depends on the per-step x and is always recomputed.
         if crossattn_cache is not None:
             if not crossattn_cache["is_init"]:
                 crossattn_cache["is_init"] = True
                 k = self.norm_k(self.k(context)).unflatten(2, (n, d))
                 v = self.v(context).unflatten(2, (n, d))
+                k_img = self.norm_k_img(self.k_img(context_img)).unflatten(2, (n, d))
+                v_img = self.v_img(context_img).unflatten(2, (n, d))
                 crossattn_cache["k"] = k
                 crossattn_cache["v"] = v
+                crossattn_cache["k_img"] = k_img
+                crossattn_cache["v_img"] = v_img
             else:
                 k = crossattn_cache["k"]
                 v = crossattn_cache["v"]
+                k_img = crossattn_cache["k_img"]
+                v_img = crossattn_cache["v_img"]
         else:
             k = self.norm_k(self.k(context)).unflatten(2, (n, d))
             v = self.v(context).unflatten(2, (n, d))
+            k_img = self.norm_k_img(self.k_img(context_img)).unflatten(2, (n, d))
+            v_img = self.v_img(context_img).unflatten(2, (n, d))
         x = self.attn(q, k, v)
-        k_img = self.norm_k_img(self.k_img(context_img)).unflatten(2, (n, d))
-        v_img = self.v_img(context_img).unflatten(2, (n, d))
         img_x = self.attn(q, k_img, v_img)
         x = x.flatten(2)
         img_x = img_x.flatten(2)
@@ -403,9 +477,21 @@ class CausalWanSelfAttention(nn.Module):
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
         self.max_attention_size = 21 * frame_seqlen if local_attn_size == -1 else local_attn_size * frame_seqlen
-        self.q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
-        self.k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
-        self.v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
+        # Fused QKV projection: q/k/v all come from x, so a single column-parallel
+        # GEMM replaces three (fewer launches / better GEMM util in the decode-like
+        # per-step forward). No GQA here: total_num_kv_heads defaults to num_heads.
+        self.qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=num_heads,
+            bias=True,
+        )
+        # The forward splits qkv into three equal q/k/v shards, which is only
+        # correct without GQA. total_num_kv_heads defaults to total_num_heads
+        # here; fail loud if a future checkpoint introduces GQA so the equal
+        # split does not silently misalign k/v.
+        if self.qkv.total_num_kv_heads != self.qkv.total_num_heads:
+            raise ValueError("Self-attn QKV fusion requires no GQA (total_num_kv_heads == total_num_heads).")
         self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
         self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
@@ -431,9 +517,15 @@ class CausalWanSelfAttention(nn.Module):
         """Inference-only forward (KV cache path)."""
         n, d = self.tp_num_heads, self.head_dim
 
-        q = self.norm_q(self.q(x)).unflatten(2, (n, d))
-        k = self.norm_k(self.k(x)).unflatten(2, (n, d))
-        v = self.v(x).unflatten(2, (n, d))
+        # Single fused QKV GEMM, then split into the per-rank q/k/v shards.
+        qkv, _ = self.qkv(x)
+        qk_size = self.tp_num_heads * self.head_dim
+        q, k, v = qkv.split([qk_size, qk_size, qk_size], dim=-1)
+        # Fuse q/k qk-norm into a single TP all-reduce (both come from x, same shape).
+        q, k = fused_qk_rms_norm(self.norm_q, self.norm_k, q, k)
+        q = q.unflatten(2, (n, d))
+        k = k.unflatten(2, (n, d))
+        v = v.unflatten(2, (n, d))
 
         updated_kv_cache: torch.Tensor | None = None
 
@@ -834,6 +926,7 @@ class CausalWanModel(nn.Module):
         timestep_action: torch.Tensor | None,
         state: torch.Tensor | None,
         kv_cache: list[torch.Tensor],
+        crossattn_cache: list[dict] | None,
         current_start_frame: int,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
         x = x.flatten(start_dim=2).transpose(1, 2)
@@ -884,6 +977,7 @@ class CausalWanModel(nn.Module):
                 context=context,
                 action_register_length=action_register_length,
                 kv_cache=kv_cache[block_index] if kv_cache else None,
+                crossattn_cache=crossattn_cache[block_index] if crossattn_cache else None,
                 current_start_frame=current_start_frame,
             )
             updated_kv_caches.append(updated_kv_cache)
@@ -941,6 +1035,7 @@ class CausalWanModel(nn.Module):
             timestep_action=timestep_action,
             state=state,
             kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
             current_start_frame=current_start_frame,
         )
 

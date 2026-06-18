@@ -131,8 +131,12 @@ class DreamZeroState:
             torch.zeros(2, batch_size, 0, num_heads, head_dim, dtype=dtype, device=device) for _ in range(num_layers)
         ]
 
-        self.crossattn_cache = [{"is_init": False, "k": None, "v": None} for _ in range(num_layers)]
-        self.crossattn_cache_neg = [{"is_init": False, "k": None, "v": None} for _ in range(num_layers)]
+        self.crossattn_cache = [
+            {"is_init": False, "k": None, "v": None, "k_img": None, "v_img": None} for _ in range(num_layers)
+        ]
+        self.crossattn_cache_neg = [
+            {"is_init": False, "k": None, "v": None, "k_img": None, "v_img": None} for _ in range(num_layers)
+        ]
 
     def update_kv_cache(
         self,
