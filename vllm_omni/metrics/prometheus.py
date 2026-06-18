@@ -42,9 +42,8 @@ _generation_tokens_family = Counter(
 class OmniPrometheusMetrics:
     """Label-bound wrapper around the raw Prometheus metrics.
 
-    Metric collectors use the ``vllm:omni_`` prefix to avoid being
-    removed by upstream vLLM's ``unregister_vllm_metrics()``, which
-    strips every collector whose ``_name`` contains ``"vllm"``.
+    Metric collectors use the ``vllm_omni:`` prefix, distinct from the
+    upstream ``vllm:*`` families.
     """
 
     def __init__(self, model_name: str, log_stats: bool = True) -> None:
