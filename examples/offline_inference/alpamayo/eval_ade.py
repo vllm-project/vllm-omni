@@ -13,7 +13,6 @@ the HTTP path.
 from __future__ import annotations
 
 import os
-import pickle
 import sys
 import time
 
@@ -47,9 +46,16 @@ def main() -> int:
         dtype="bfloat16",
         enforce_eager=True,
         gpu_memory_utilization=0.5,
+        # Cap context so KV-cache sizing stays bounded; the model-config default
+        # (262144) needs ~36 GiB KV and can fail engine init when profiling
+        # leaves less. Alpamayo prompts are a few thousand tokens.
+        max_model_len=32768,
     )
 
-    data = pickle.load(open(CLIP_PKL, "rb"))
+    # pandas.read_pickle loads the clip dict without a direct pickle import here.
+    import pandas as pd
+
+    data = pd.read_pickle(CLIP_PKL)
     frames = data["image_frames"].flatten(0, 1)
     pil_images = [Image.fromarray(f.permute(1, 2, 0).numpy()) for f in frames]
 
@@ -102,6 +108,14 @@ def main() -> int:
         sampling_params_list=sp,
     )
     print(f"[gen] {time.time() - t:.1f}s")
+
+    # Print the chain-of-thought reasoning the VLM generated.
+    for ro in outs:
+        req_out = getattr(ro, "request_output", None)
+        text = "".join(o.text or "" for o in getattr(req_out, "outputs", []) or [])
+        if text.strip():
+            print(f"[reasoning] {text.strip()}")
+            break
 
     # The model's forward() returns OmniOutput; the runner routes its
     # multimodal_outputs payload through the engine output processor and the

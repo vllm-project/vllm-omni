@@ -1089,21 +1089,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 ec_connector_output,
             ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
 
-        # Stash per-request sampling_params.extra_args so models that override
-        # ``prepare_runner_inputs`` can use them for input-token mutation
-        # (e.g. Alpamayo fuses ``extra_args["robot_obs"]`` into <|traj_history|>
-        # placeholder positions before the VLM forward).
-        if hasattr(self.model, "set_runner_extra_args"):
-            self.model.set_runner_extra_args(
-                [
-                    (
-                        self.requests[rid].sampling_params.extra_args
-                        if rid in self.requests and self.requests[rid].sampling_params is not None
-                        else None
-                    )
-                    for rid in req_ids[:num_reqs]
-                ]
-            )
         # Let the model adjust inputs before forward (e.g. restore input_ids
         # for multimodal position detection, fix decode position offsets).
         if hasattr(self.model, "prepare_runner_inputs"):

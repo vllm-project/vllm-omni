@@ -55,20 +55,19 @@ tokenizer and append Alpamayo's 4000 discrete trajectory tokens
 `<|traj_future_start|>`, `<|cot_start|>`, ...) to it, then save the
 extended tokenizer to a fresh dir.
 
-```bash
-python3 $ALPAMAYO_REPO/scripts/build_alpamayo_tokenizer.py \
-  --src $ALPAMAYO_VLM_BASE \
-  --dst $ALPAMAYO_TOKENIZER_DIR
+```python
+import os
+from transformers import AutoProcessor
+from vllm_omni.model_executor.models.alpamayo.processing import add_alpamayo_tokens
+
+processor = AutoProcessor.from_pretrained(os.environ["ALPAMAYO_VLM_BASE"], trust_remote_code=True)
+info = add_alpamayo_tokens(processor.tokenizer)  # +4000 <i*> traj tokens + ~28 special tokens
+processor.save_pretrained(os.environ["ALPAMAYO_TOKENIZER_DIR"])
+print("vocab is now", len(processor.tokenizer), "| future_start id:", info["traj_token_ids"]["future_start"])
 ```
 
-Expected:
-```
-added Alpamayo tokens; vocab is now 155697
-  future_start id: 155681
-  history    id:   155684
-  traj_token_start_idx: 151669
-wrote extended tokenizer/processor to /tmp/alpamayo-tokenizer
-```
+Expected: `vocab is now 155697 | future_start id: 155681` (and `traj_token_start_idx` 151669),
+written to `$ALPAMAYO_TOKENIZER_DIR`.
 
 Run once per host. Output is self-contained (does NOT touch the base
 tokenizer directory).

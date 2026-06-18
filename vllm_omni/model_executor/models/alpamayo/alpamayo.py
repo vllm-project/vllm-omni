@@ -171,8 +171,8 @@ class Alpamayo15ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         # History-fusion plumbing: each request's prompt arrives with
         # ``tokens_per_history_traj`` (=48) copies of ``<|traj_history|>``
-        # as placeholders; ``prepare_runner_inputs`` substitutes them with
-        # delta-encoded ego_history tokens read from
+        # as placeholders; ``_fuse_history_inplace`` (called from forward())
+        # substitutes them with delta-encoded ego_history tokens read from
         # ``sampling_params.extra_args["robot_obs"]``.
         from vllm_omni.model_executor.models.alpamayo.action_space import (
             DeltaTrajectoryTokenizer,
@@ -273,79 +273,64 @@ class Alpamayo15ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     # ------------------------------------------------------------------ #
     # Server-side history fusion: substitute <|traj_history|> placeholders
     # in the prompt with delta-encoded ego_history tokens from extra_args.
+    #
+    # Runs inside forward() (before the VLM backbone), NOT via a model-runner
+    # hook: the per-request ``sampling_params.extra_args["robot_obs"]`` arrives
+    # through the engine's generic ``sampling_extra_args`` forward kwarg
+    # (enabled by ``has_sampling_extra_args`` in the deploy config). Per-request
+    # token boundaries come from the attention metadata's ``query_start_loc``.
     # ------------------------------------------------------------------ #
-    def set_runner_extra_args(self, extra_args_per_req: list[dict | None]) -> None:
-        """Worker hook (see ``gpu_ar_model_runner.py``): stash per-request
-        ``sampling_params.extra_args`` so ``prepare_runner_inputs`` can pull
-        ``robot_obs`` out of it without touching the runner directly."""
-        self._extra_args_per_req = extra_args_per_req
-
-    def prepare_runner_inputs(
+    def _fuse_history_inplace(
         self,
         input_ids: torch.Tensor | None,
-        positions: torch.Tensor | None,
         inputs_embeds: torch.Tensor | None,
-        req_ids: list[str],
-        num_computed_tokens: list[int],
-        num_scheduled_tokens: list[int],
-        input_ids_buffer: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Replace each prefill request's 48 ``<|traj_history|>`` placeholder
-        token ids in-place with delta-encoded ego_history tokens, read from
-        ``sampling_params.extra_args["robot_obs"]`` (which carries
-        ``ego_history_xyz`` / ``ego_history_rot``).
+        sampling_extra_args: list[dict | None] | None,
+    ) -> None:
+        if input_ids is None or not sampling_extra_args:
+            return
+        import json
 
-        Equivalent to what the client used to do via ``fuse_traj_tokens`` —
-        moved server-side so HTTP clients can be tokenizer-free.
-        """
-        if input_ids is None or not self._extra_args_per_req:
-            return input_ids, positions
+        import numpy as np
+        from vllm.forward_context import get_forward_context
+
         from vllm_omni.model_executor.models.alpamayo.processing import (
             tokenize_history_trajectory,
         )
 
-        offset = 0
-        for i, n_tokens in enumerate(num_scheduled_tokens):
-            ea = self._extra_args_per_req[i] if i < len(self._extra_args_per_req) else None
-            # Fusion only makes sense at the FIRST prefill chunk that contains
-            # the placeholders (placeholders sit near the prompt start; later
-            # chunks / decode steps have no placeholders to mutate).
-            if ea is None or num_computed_tokens[i] != 0 or n_tokens == 0:
-                offset += n_tokens
+        # Per-request query boundaries in the flat token stream. Decode steps
+        # carry no placeholders, so their slices simply find no mask hits.
+        try:
+            meta = get_forward_context().attn_metadata[self._vlm_layer_names[0]]
+            qsl = [int(v) for v in meta.query_start_loc.tolist()]
+        except Exception:
+            qsl = [0, int(input_ids.shape[0])]
+
+        for i in range(len(qsl) - 1):
+            ea = sampling_extra_args[i] if i < len(sampling_extra_args) else None
+            if not ea:
                 continue
-            # ``robot_obs`` carries ego_history. Accept either:
-            #   - a dict directly (Python clients passing SamplingParams.extra_args)
-            #   - a JSON string (HTTP clients via vllm_xargs, whose protocol
-            #     restricts values to flat primitives so nested dicts must be
-            #     JSON-encoded by the caller).
-            # No separate ``robot_obs_json`` key — single API.
+            # ``robot_obs`` carries ego_history as a dict (Python clients) or a
+            # JSON string (HTTP clients, whose vllm_xargs values must be flat).
             robot_obs = ea.get("robot_obs")
             if isinstance(robot_obs, str):
-                import json
-
                 try:
                     robot_obs = json.loads(robot_obs)
                 except Exception as je:
                     logger.warning("Alpamayo15: bad robot_obs JSON string: %s", je)
-                    robot_obs = None
+                    continue
             if not robot_obs:
-                offset += n_tokens
                 continue
             hx = robot_obs.get("ego_history_xyz")
             hr = robot_obs.get("ego_history_rot")
             if hx is None or hr is None:
-                offset += n_tokens
                 continue
 
-            req_slice = input_ids[offset : offset + n_tokens]
+            lo, hi = qsl[i], qsl[i + 1]
+            req_slice = input_ids[lo:hi]
             mask = req_slice == self._history_placeholder_id
             n_placeholders = int(mask.sum().item())
             if n_placeholders == 0:
-                offset += n_tokens
                 continue
-
-            # Normalize history tensors to [B=1, n_traj, T, 3] / [B=1, n_traj, T, 3, 3].
-            import numpy as np
 
             hx_t = torch.as_tensor(hx) if isinstance(hx, (list, np.ndarray)) else hx
             hr_t = torch.as_tensor(hr) if isinstance(hr, (list, np.ndarray)) else hr
@@ -362,41 +347,26 @@ class Alpamayo15ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 .flatten()
                 .to(device=req_slice.device, dtype=req_slice.dtype)
             )
-
             if delta_ids.numel() != n_placeholders:
                 logger.warning(
-                    "Alpamayo15: history fusion size mismatch — %d placeholders vs "
-                    "%d delta tokens for req %s; skipping fusion.",
+                    "Alpamayo15: history fusion size mismatch — %d placeholders vs %d delta tokens; skipping.",
                     n_placeholders,
                     delta_ids.numel(),
-                    req_ids[i] if i < len(req_ids) else "?",
                 )
-                offset += n_tokens
                 continue
 
             req_slice[mask] = delta_ids
-            # ALSO mutate inputs_embeds at placeholder positions: vLLM's
-            # multimodal preprocessor computes inputs_embeds from input_ids
-            # BEFORE this hook runs, so the embeds reflect placeholder-token
-            # vectors (not delta-token vectors). Forward consumes inputs_embeds
-            # for attention, not input_ids; without this swap the model
-            # attends to "unknown history" and ADE regresses ~3× (proven by
-            # client-fuse vs server-fuse A/B: 0.43m vs 1.20m on clip 030c760c).
+            # ALSO mutate inputs_embeds at placeholder positions: vLLM computes
+            # inputs_embeds from input_ids before forward, so they reflect the
+            # placeholder vectors, not the delta tokens. Forward attends over
+            # inputs_embeds; without this swap the model attends to "unknown
+            # history" and ADE regresses ~3× (client-fuse vs server-fuse A/B:
+            # 0.43m vs 1.20m on clip 030c760c).
             if inputs_embeds is not None:
-                req_embed_slice = inputs_embeds[offset : offset + n_tokens]
+                emb_slice = inputs_embeds[lo:hi]
                 new_embeds = self.language_model.model.embed_tokens(delta_ids)
-                req_embed_slice[mask] = new_embeds.to(req_embed_slice.dtype)
-            logger.info(
-                "Alpamayo15: history fusion done for req %s (%d delta tokens)",
-                req_ids[i] if i < len(req_ids) else "?",
-                n_placeholders,
-            )
-            offset += n_tokens
-        # Mirror to the shared input_ids buffer when we mutated input_ids
-        # in-place (the runner reads back from this buffer on the GPU side).
-        if input_ids_buffer is not None and input_ids is not input_ids_buffer:
-            input_ids_buffer[: input_ids.numel()].copy_(input_ids)
-        return input_ids, positions
+                emb_slice[mask] = new_embeds.to(emb_slice.dtype)
+            logger.info("Alpamayo15: history fusion done (%d delta tokens)", n_placeholders)
 
     # ------------------------------------------------------------------ #
     # Forward override — AR decode + trigger detection + inline flow matching.
@@ -419,6 +389,15 @@ class Alpamayo15ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         paged KV via the forward-context's no_compile_layers registry and
         running FA3 over [cached_prefix; action_tokens].
         """
+        # Per-request ``sampling_params.extra_args`` arrives via the engine's
+        # generic ``sampling_extra_args`` forward kwarg (has_sampling_extra_args,
+        # set from the deploy config's default extra_args) — no model-runner
+        # hook. Pop it so the base VLM forward doesn't see the extra kwarg.
+        sampling_extra_args = kwargs.pop("sampling_extra_args", None)
+        self._extra_args_per_req = sampling_extra_args
+        # Fuse ego-history into <|traj_history|> placeholders before the VLM.
+        self._fuse_history_inplace(input_ids, inputs_embeds, sampling_extra_args)
+
         hidden_states = super().forward(
             input_ids=input_ids,
             positions=positions,
@@ -426,7 +405,11 @@ class Alpamayo15ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
-        multimodal_outputs: dict | None = None
+        # Default to an empty dict (not None): the worker's
+        # extract_multimodal_outputs warns "not a dict" for non-Mapping values,
+        # which would fire on every CoT decode step (no trigger yet). An empty
+        # Mapping is silently skipped — only the trigger step carries actions.
+        multimodal_outputs: dict = {}
         if input_ids is not None and input_ids.dim() == 1 and input_ids.numel() > 0:
             triggered = self.find_trigger_indices(
                 input_ids,

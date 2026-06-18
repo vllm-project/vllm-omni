@@ -19,11 +19,6 @@ ALLOWED_FILES = {
     "tests/helpers/process.py",
     "vllm_omni/diffusion/distributed/group_coordinator.py",
     "tests/diffusion/attention/test_attention_sp.py",
-    # Alpamayo manual-eval examples: load local sglang clip .pkl fixtures
-    # only (no untrusted data); kept tracked so the manual-test guide
-    # stays runnable.
-    "examples/offline_inference/alpamayo/eval_ade.py",
-    "examples/online_serving/alpamayo/http_client.py",
 }
 
 PICKLE_RE = re.compile(

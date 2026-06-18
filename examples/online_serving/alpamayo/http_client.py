@@ -45,7 +45,6 @@ import base64
 import io
 import json
 import os
-import pickle
 import sys
 import time
 
@@ -135,7 +134,10 @@ def encode_image(pil_img: Image.Image) -> str:
 
 def main() -> int:
     # --- Load clip (for images + ego_history) -------------------------------
-    data = pickle.load(open(CLIP_PKL, "rb"))
+    # pandas.read_pickle loads the clip dict without a direct pickle import here.
+    import pandas as pd
+
+    data = pd.read_pickle(CLIP_PKL)
     frames = data["image_frames"].flatten(0, 1)
     pil_images = [Image.fromarray(f.permute(1, 2, 0).numpy()) for f in frames]
     cam_ids = data["camera_indices"].tolist()
@@ -194,11 +196,17 @@ def main() -> int:
         print("ERROR body:", resp.text[:500], file=sys.stderr)
         return 1
     body = resp.json()
+    choices = body.get("choices", [])
+
+    # --- Print the chain-of-thought reasoning the VLM generated -------------
+    msg0 = choices[0].get("message", {}) if choices else {}
+    reasoning = (msg0.get("reasoning") or msg0.get("content") or "").strip()
+    if reasoning:
+        print(f"[reasoning] {reasoning}")
 
     # --- Extract actions from multimodal_output ----------------------------
     # Chat completion shape: choices[*].message.multimodal_output["actions"]
     # (vs the completion shape with choices[*].multimodal_output)
-    choices = body.get("choices", [])
     actions_raw = None
     for ch in choices:
         for src in (ch.get("message", {}), ch):
