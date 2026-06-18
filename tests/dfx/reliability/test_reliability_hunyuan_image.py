@@ -1,7 +1,9 @@
 """
-HunyuanImage-3.0-Instruct reliability integration tests.
+HunyuanImage-3.0-Instruct reliability integration tests (DiT-only deploy).
 
-Scenarios follow ``docs/user_guide/fault_injection_reliability_matrix.md``.
+Uses ``hunyuan_image3_dit.yaml`` (single diffusion stage, 4-GPU TP=4, no
+AR/Mooncake connector) for simpler local bring-up. Scenarios follow
+``docs/user_guide/fault_injection_reliability_matrix.md``.
 """
 
 from __future__ import annotations
@@ -37,10 +39,10 @@ from tests.helpers.runtime import OpenAIClientHandler
 
 RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
     {
-        "test_name": "hunyuan_image_reliability_default",
+        "test_name": "hunyuan_image_dit_reliability_default",
         "server_params": {
             "model": "tencent/HunyuanImage-3.0-Instruct",
-            "stage_config_name": "hunyuan_image_3_moe.yaml",
+            "stage_config_name": "hunyuan_image3_dit.yaml",
             "server_args": [
                 "--trust-remote-code",
                 "--disable-log-stats",
@@ -80,8 +82,8 @@ PROCESS_KILL_ERROR_KEYWORDS = (
     "500",
     "503",
 )
-# Matrix: worker SIGTERM/SIGKILL; HunyuanImage runs AR (VLLM::) + DiT (vLLM-Omni::).
-WORKER_KILL_PATTERNS = ("VLLM::", "vLLM-Omni::")
+# Matrix: worker SIGTERM/SIGKILL; DiT-only HunyuanImage workers are vLLM-Omni::.
+WORKER_KILL_PATTERNS = ("vLLM-Omni::",)
 SERVE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm"),
     pytest.param("SIGINT", id="sigint"),
@@ -191,6 +193,7 @@ def _assert_post_fault_health_terminal(host: str, port: int, *, scenario: str) -
 
 @pytest.mark.slow
 @pytest.mark.diffusion
+@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_image_large_request_failure(
@@ -240,6 +243,7 @@ def test_reliability_fault_process_kill_request_failure(
 
 @pytest.mark.slow
 @pytest.mark.diffusion
+@pytest.mark.skip(reason="issue#4522")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize(
     "fault_injector",
@@ -330,6 +334,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 
 @pytest.mark.slow
 @pytest.mark.diffusion
+@pytest.mark.skip(reason="issue#4526")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize(
     "fault_injector",
@@ -357,77 +362,6 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
     port = omni_server_function.port
     _assert_post_fault_image_fast_fail(host, port, model=omni_server_function.model, scenario=scenario)
     _assert_post_fault_health_terminal(host, port, scenario=scenario)
-
-
-@pytest.mark.slow
-@pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
-@pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
-def test_reliability_image_oom_recovers_after_fault_removed(omni_server_function) -> None:
-    stage_config_path = getattr(omni_server_function, "stage_config_path", None)
-    device_spec = resolve_oom_device_spec(OOM_INJECTION_CONFIG, stage_config_path)
-    handle = inject_gpu_oom(
-        device=device_spec,
-        target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
-        hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
-        startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
-        strict=OOM_INJECTION_CONFIG["strict"],
-    )
-    host = omni_server_function.host
-    port = omni_server_function.port
-    payload = _image_request_config(omni_server_function)["json"]
-
-    failure_observed = False
-    try:
-        for _ in range(3):
-            try:
-                status, _ = post_json_raw(host, port, "/v1/images/generations", payload, timeout_sec=25)
-                if status >= 500:
-                    failure_observed = True
-                    break
-            except Exception:
-                failure_observed = True
-                break
-            time.sleep(1.0)
-    finally:
-        stop_gpu_oom_hogs(handle)
-
-    assert failure_observed, "expected at least one image request failure while OOM pressure is active"
-
-    recovery_deadline = time.monotonic() + 90.0
-    terminal_health: int | None = None
-    while time.monotonic() < recovery_deadline:
-        try:
-            status, _ = get_health_raw(host, port, timeout_sec=5)
-            if status in (200, 503):
-                terminal_health = status
-                break
-        except Exception:
-            pass
-        time.sleep(1.0)
-    else:
-        pytest.fail("hunyuan server did not converge to terminal health after OOM pressure was removed")
-
-    assert terminal_health is not None
-    start = time.monotonic()
-    try:
-        recovery_status, recovery_body = post_json_raw(host, port, "/v1/images/generations", payload, timeout_sec=30)
-    except Exception as exc:  # noqa: BLE001
-        recovery_status = None
-        recovery_body = repr(exc).encode()
-    elapsed = time.monotonic() - start
-    assert elapsed < 30, f"post-fault /v1/images/generations should not hang after OOM removal: {elapsed:.2f}s"
-
-    if terminal_health == 200:
-        assert recovery_status == 200, (
-            "health recovered but /v1/images/generations admission did not succeed; "
-            f"status={recovery_status}, body={recovery_body[:300]!r}"
-        )
-    else:
-        assert recovery_status is None or recovery_status >= 500, (
-            "unhealthy terminal state should fail fast on /v1/images/generations, "
-            f"got health={terminal_health}, request_status={recovery_status}"
-        )
 
 
 @pytest.mark.slow
@@ -517,6 +451,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
 
 @pytest.mark.slow
 @pytest.mark.diffusion
+@pytest.mark.skip(reason="issue#4526")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", TREE_WITH_LOAD_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)

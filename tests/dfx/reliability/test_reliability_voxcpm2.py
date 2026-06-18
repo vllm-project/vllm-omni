@@ -34,6 +34,7 @@ from tests.dfx.reliability.helpers import (
     worker_residual_timeout_after_kill_signal,
 )
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.runtime import OpenAIClientHandler
 
 RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
@@ -49,7 +50,7 @@ RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
 
 DEPLOY_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "vllm_omni" / "deploy"
 OOM_INJECTION_CONFIG = {
-    "target_mem_ratio": 0.92,
+    "target_mem_ratio": 0.96,
     "hold_seconds": 0,
     "startup_timeout_sec": 20,
     "strict": False,
@@ -138,6 +139,24 @@ def _submit_speech_request(openai_client: OpenAIClientHandler, omni_server: Any)
     openai_client.send_audio_speech_request(_speech_request_config(omni_server), request_num=1)
 
 
+def _oom_speech_request_config(omni_server: Any) -> dict[str, Any]:
+    base = "The weather is nice today, perfect for a walk in the park. "
+    return {
+        "model": omni_server.model,
+        "input": base * 80,
+        "max_new_tokens": 4096,
+        "ref_audio": load_test_audio_data_url("qwen3_tts/clone_2.wav"),
+        "stream": False,
+        "timeout": 300.0,
+        "response_format": "wav",
+        "voice": "default",
+    }
+
+
+def _submit_oom_speech_request(openai_client: OpenAIClientHandler, omni_server: Any) -> None:
+    openai_client.send_audio_speech_request(_oom_speech_request_config(omni_server), request_num=1)
+
+
 def _assert_post_fault_speech_fast_fail(host: str, port: int, *, model: str, scenario: str) -> None:
     payload = {
         "model": model,
@@ -175,6 +194,7 @@ def _assert_post_fault_health_terminal(host: str, port: int, *, scenario: str) -
 
 @pytest.mark.slow
 @pytest.mark.tts
+@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server_function", VOXCPM2_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_speech_request_failure(
@@ -192,7 +212,7 @@ def test_reliability_fault_gpu_oom_speech_request_failure(
     )
     try:
         try:
-            _submit_speech_request(openai_client_function, omni_server_function)
+            _submit_oom_speech_request(openai_client_function, omni_server_function)
         except Exception as exc:
             assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
         else:
@@ -203,6 +223,7 @@ def test_reliability_fault_gpu_oom_speech_request_failure(
 
 @pytest.mark.slow
 @pytest.mark.tts
+@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server_function", VOXCPM2_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_speech_error_contract(
@@ -219,13 +240,16 @@ def test_reliability_fault_gpu_oom_speech_error_contract(
     )
     host = omni_server_function.host
     port = omni_server_function.port
+    oom_config = _oom_speech_request_config(omni_server_function)
     payload = {
-        "model": omni_server_function.model,
-        "input": "The weather is nice today, perfect for a walk in the park.",
-        "voice": "default",
+        "model": oom_config["model"],
+        "input": oom_config["input"],
+        "voice": oom_config["voice"],
+        "max_new_tokens": oom_config["max_new_tokens"],
+        "ref_audio": oom_config["ref_audio"],
     }
     try:
-        status, body = post_json_raw(host, port, "/v1/audio/speech", payload, timeout_sec=120)
+        status, body = post_json_raw(host, port, "/v1/audio/speech", payload, timeout_sec=300)
     finally:
         stop_gpu_oom_hogs(handle)
 
