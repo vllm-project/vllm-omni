@@ -1313,6 +1313,20 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             traceback.print_exc()
 
+        # Per-request (start, end) hidden-row spans so make_omni_output can map
+        # flat hidden rows to the right request in mixed prefill+decode steps,
+        # instead of assuming an equal rows-per-request split (which samples the
+        # wrong rows whenever per-request token counts differ).
+        nstp = self._omni_num_scheduled_tokens_np
+        if nstp is not None and len(nstp) == len(self.input_batch.req_ids):
+            try:
+                model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(nstp)
+            except Exception as e:
+                # Visible on purpose: the fallback is the equal rows-per-request
+                # split, which can re-introduce the cross-request corruption this
+                # plumbing fixes — a silent failure here must not pass unnoticed.
+                logger.warning("[OMNI] Failed to compute request_token_spans: %s", e)
+
         if self._omni_query_start_loc_model_kwarg:
             try:
                 num_reqs = len(self.input_batch.req_ids)

@@ -1129,6 +1129,13 @@ class Bagel(nn.Module):
     config_class = BagelConfig
     base_model_prefix = "bagel"
 
+    # Flow-matching denoise schedule convention. Official BAGEL samples
+    # ``num_timesteps`` points over [1, 0] and drops the terminal t=0, yielding
+    # ``num_timesteps - 1`` Euler steps. Lance samples one extra point
+    # (``num_timesteps + 1``) for ``num_timesteps`` steps; ``LanceBagel`` flips
+    # this on. See https://github.com/vllm-project/vllm-omni/issues/4470.
+    _denoise_schedule_extra_step: bool = False
+
     def __init__(
         self,
         language_model,
@@ -1690,11 +1697,11 @@ class Bagel(nn.Module):
             frame_condition_token_indexes = frame_condition_token_indexes.to(x_t.device).long()
             pinned_x_t = x_t[frame_condition_token_indexes].clone()
 
-        # Use num_timesteps + 1 sample points so we get `num_timesteps` denoise
-        # steps after dropping the terminal t=0 (which has no dt).  Upstream
-        # Lance / BAGEL both use this convention; without the +1 we silently
-        # run one fewer denoise iteration than the user asked for.
-        timesteps = torch.linspace(1, 0, num_timesteps + 1, device=x_t.device)
+        # Build the flow-matching schedule. BAGEL drops the terminal t=0 for
+        # ``num_timesteps - 1`` Euler steps; Lance keeps it for ``num_timesteps``.
+        # ``_denoise_schedule_extra_step`` (overridden by ``LanceBagel``) selects which.
+        num_sample_points = num_timesteps + 1 if self._denoise_schedule_extra_step else num_timesteps
+        timesteps = torch.linspace(1, 0, num_sample_points, device=x_t.device)
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]

@@ -500,6 +500,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             if hasattr(self.model, "_clear_warmup_state"):
                 self.model._clear_warmup_state()
 
+        # Async-write pipeline: apply any pending GPU->CPU prefix-cache writes
+        # whose copy event has already fired. Non-blocking — entries whose D2H
+        # is still in flight stay queued and will be picked up on the next
+        # step's drain. This guarantees any downstream read of
+        # ``omni_prefix_cache.hidden_states_cache`` /
+        # ``omni_prefix_cache.mm_outputs_cache`` in this step sees the
+        # state produced no later than the previous forward step.
+        if self.omni_prefix_cache is not None:
+            self.omni_prefix_cache.drain_ready_async_writes()
+
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
         finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
         if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
@@ -796,18 +806,30 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             hidden_states_cpu = None
-            if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
-                hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
 
-            # Cache hidden states & multimodal outputs if we've enabled hidden state
-            # prefix caching unless this isn't the last pipeline parallelism rank.
-            self._maybe_update_prefix_cache(
-                hidden_states=hidden_states,
-                hidden_states_cpu=hidden_states_cpu,
-                multimodal_outputs=multimodal_outputs,
-                num_tokens_unpadded=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded,
-            )
+            # Async-write pipeline (replaces the per-step blocking
+            # ``.to("cpu")`` + ``aten::index_put_`` on pageable host memory).
+            # Schedules non-blocking GPU->CPU copies on a dedicated stream;
+            # the actual CPU scatter into ``hidden_states_cache`` /
+            # ``mm_outputs_cache`` happens in ``drain_ready_async_writes``
+            # at the top of subsequent execute_model() calls.
+            if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
+                hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
+                # Some models (e.g. qwen3-tts-talker) opt out of full-hidden-state
+                # prefix caching but the downstream pooler payload path still
+                # needs a CPU hidden-states view. Materialize it synchronously
+                # in that case; the legacy behavior is preserved.
+                if hs_for_cache is None:
+                    hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
+                slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
+                self.omni_prefix_cache.schedule_async_write(
+                    hidden_states_gpu=hs_for_cache,
+                    multimodal_outputs_gpu=(flatten_payload(multimodal_outputs) if multimodal_outputs else None),
+                    slot_mapping_gpu=slot_mapping_gpu,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                    skip_mm_cache_keys=self._deferred_prefix_cache_mm_keys(),
+                )
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -1052,10 +1074,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
-            input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
-                spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
-                <= self.effective_drafter_max_model_len
-            )
+            input_fits_in_drafter = self._input_fits_in_drafter(spec_decode_common_attn_metadata)
             use_gpu_toks = (
                 spec_config.use_eagle() or spec_config.uses_draft_model() or spec_config.uses_extract_hidden_states()
             ) and not spec_config.disable_padded_drafter_batch

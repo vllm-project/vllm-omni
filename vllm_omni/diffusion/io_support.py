@@ -47,31 +47,3 @@ def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) 
     if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
         return int(getattr(model_cls, "dummy_run_num_frames"))
     return 2 if supports_audio_input or supports_audio_output(model_class_name) else 1
-
-
-def get_extra_body_params(model_class_name: str) -> frozenset[str]:
-    """Return the set of extra_body keys accepted by a pipeline.
-
-    Each pipeline can declare ``EXTRA_BODY_PARAMS: ClassVar[frozenset[str]]``
-    to advertise which request-level parameters should be forwarded from
-    ``extra_body`` to ``OmniDiffusionSamplingParams.extra_args``.
-    Returns an empty frozenset when the pipeline does not declare any.
-    """
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return frozenset()
-    return frozenset(getattr(model_cls, "EXTRA_BODY_PARAMS", frozenset()))
-
-
-def get_extra_output_params(model_class_name: str) -> frozenset[str]:
-    """Return the set of custom_output keys to expose in API response metrics.
-
-    Each pipeline can declare ``EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]]``
-    to advertise which ``DiffusionOutput.custom_output`` keys should be
-    copied into the response ``metrics`` dict.
-    Returns an empty frozenset when the pipeline does not declare any.
-    """
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return frozenset()
-    return frozenset(getattr(model_cls, "EXTRA_OUTPUT_PARAMS", frozenset()))

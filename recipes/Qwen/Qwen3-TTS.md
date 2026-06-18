@@ -28,11 +28,9 @@ Smaller 0.6B variants are also available for `CustomVoice` and `Base`.
 
 ## References
 
-- Upstream or canonical docs:
-  [`docs/user_guide/examples/online_serving/qwen3_tts.md`](../../docs/user_guide/examples/online_serving/qwen3_tts.md)
 - Related examples under `examples/`:
-  [`examples/online_serving/qwen3_tts/`](../../examples/online_serving/qwen3_tts/),
-  [`examples/offline_inference/qwen3_tts/`](../../examples/offline_inference/qwen3_tts/)
+  [`examples/online_serving/text_to_speech/qwen3_tts/`](../../examples/online_serving/text_to_speech/qwen3_tts/),
+  [`examples/offline_inference/text_to_speech/qwen3_tts/`](../../examples/offline_inference/text_to_speech/qwen3_tts/)
 - Related issue or discussion:
   [RFC: add recipes folder](https://github.com/vllm-project/vllm-omni/issues/2645)
 
@@ -67,9 +65,9 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
 Alternatively, use the convenience script:
 
 ```bash
-./examples/online_serving/qwen3_tts/run_server.sh                  # Default: CustomVoice
-./examples/online_serving/qwen3_tts/run_server.sh VoiceDesign      # VoiceDesign
-./examples/online_serving/qwen3_tts/run_server.sh Base             # Base (voice clone)
+./examples/online_serving/text_to_speech/qwen3_tts/run_server.sh                  # Default: CustomVoice
+./examples/online_serving/text_to_speech/qwen3_tts/run_server.sh VoiceDesign      # VoiceDesign
+./examples/online_serving/text_to_speech/qwen3_tts/run_server.sh Base             # Base (voice clone)
 ```
 
 The bundled deploy config (`vllm_omni/deploy/qwen3_tts.yaml`) enables async
@@ -117,7 +115,7 @@ curl http://localhost:8091/v1/audio/voices
 **Using the Python client:**
 
 ```bash
-cd examples/online_serving/qwen3_tts
+cd examples/online_serving/text_to_speech/qwen3_tts
 
 # CustomVoice
 python openai_speech_client.py \
@@ -157,8 +155,8 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 **Offline inference (no server needed):**
 
 ```bash
-python examples/offline_inference/qwen3_tts/end2end.py --query-type CustomVoice
-python examples/offline_inference/qwen3_tts/end2end.py --query-type CustomVoice --streaming
+python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-type CustomVoice
+python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-type CustomVoice --streaming
 ```
 
 ## Notes
@@ -168,3 +166,88 @@ python examples/offline_inference/qwen3_tts/end2end.py --query-type CustomVoice 
 - Async chunking: Enabled by default in `qwen3_tts.yaml` for streaming-friendly first-audio latency. Streaming requires `stream=true` with `response_format="pcm"`.
 - Task/model matching: Each task type requires its matching model checkpoint. Using a CustomVoice model for a Base (voice clone) request will fail.
 - Known limitations: The server serves one model variant at a time. To switch task types (e.g., CustomVoice to Base), restart the server with the corresponding model.
+
+## Hardware Support
+
+## GPU
+
+### 1x RTX 4090 24GB (0.6B CustomVoice)
+
+#### Environment
+
+- OS: Ubuntu 24.04 LTS
+- Python: 3.12.3
+- PyTorch: 2.11.0+cu130
+- Driver / runtime: NVIDIA 580.126.09 / CUDA 13.0
+- GPU: NVIDIA GeForce RTX 4090, 24 GB
+- vLLM version: 0.21.0
+- vLLM-Omni version or commit: 0.21.0rc3.dev91+gd4c13950
+
+#### Command
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
+    --omni --port 8091
+```
+
+The default deploy config (`qwen3_tts.yaml`) works without modification on the
+RTX 4090. Both stages (talker + code2wav) share GPU 0 with
+`gpu_memory_utilization: 0.3` each.
+
+#### Verification
+
+**English synthesis:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is Qwen3-TTS running on RTX 4090.",
+        "voice": "vivian",
+        "language": "English"
+    }' --output test_english.wav
+```
+
+**Chinese synthesis:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "你好，这是在RTX 4090上运行的语音合成测试。",
+        "voice": "vivian",
+        "language": "Chinese"
+    }' --output test_chinese.wav
+```
+
+**With emotion instruction:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "I am so excited about this!",
+        "voice": "vivian",
+        "language": "English",
+        "instructions": "Speak with great enthusiasm"
+    }' --output test_emotion.wav
+```
+
+#### Notes
+
+- Memory usage: **~13.5 GiB / 24 GiB** at idle with the default deploy config
+  (`gpu_memory_utilization: 0.3` per stage). The 0.6B model weights occupy only
+  ~2.4 GiB (Stage 0: 1.91 GiB, Stage 1: 0.45 GiB); the remainder is KV cache
+  pre-allocated at startup. To reduce idle footprint to ~5 GiB, use a custom
+  deploy config with lower utilization (inference peak ~10 GiB):
+
+  ```yaml
+  # Custom deploy config for Qwen3-TTS-12Hz-0.6B on RTX 4090
+  # Copy vllm_omni/deploy/qwen3_tts.yaml and override gpu_memory_utilization:
+  stages:
+    - stage_id: 0
+      gpu_memory_utilization: 0.15
+    - stage_id: 1
+      gpu_memory_utilization: 0.15
+  ```

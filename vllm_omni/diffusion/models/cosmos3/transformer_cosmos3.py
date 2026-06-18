@@ -976,6 +976,12 @@ class Cosmos3VFMTransformer(nn.Module):
 
     _hsdp_shard_conditions = [_is_transformer_block]
 
+    # Modules whose parameters must NOT be FSDP-sharded at the root level.
+    # time_embedder is cast to fp32 by post_load_weights for precision; if it
+    # were swept into the root flat-parameter under MixedPrecisionPolicy(param_dtype=bf16),
+    # the dtype upcast would be silently reverted, causing dtype mismatch in forward.
+    _hsdp_ignored_modules = ["time_embedder"]
+
     _sp_plan = {
         "gen_sp_prepare": {
             0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),

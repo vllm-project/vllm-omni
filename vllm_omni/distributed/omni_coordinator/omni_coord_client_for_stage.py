@@ -230,3 +230,30 @@ class OmniCoordClientForStage:
             except zmq.ZMQError:
                 pass
             self._closed = True
+
+
+def create_stage_coord_client(
+    *,
+    coord_zmq_addr: str,
+    input_addr: str,
+    output_addr: str,
+    stage_id: int,
+    queue_length_getter: Callable[[], int] | None = None,
+) -> OmniCoordClientForStage:
+    """Create a stage coordinator client with an optional heartbeat hook."""
+    client = OmniCoordClientForStage(
+        coord_zmq_addr=coord_zmq_addr,
+        input_addr=input_addr,
+        output_addr=output_addr,
+        stage_id=stage_id,
+    )
+    if queue_length_getter is not None:
+
+        def _refresh_queue_length() -> None:
+            try:
+                client._queue_length = max(int(queue_length_getter()), 0)
+            except Exception:
+                pass
+
+        client._on_heartbeat = _refresh_queue_length
+    return client
