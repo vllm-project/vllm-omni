@@ -29,7 +29,6 @@ import os
 
 from PIL import Image
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -168,7 +167,6 @@ def parse_args():
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
 
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

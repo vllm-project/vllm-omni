@@ -21,7 +21,6 @@ import os
 import numpy as np
 import soundfile as sf
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -86,7 +85,6 @@ def run_e2e():
         default=None,
         help="Random seed for generation",
     )
-    nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
 
     if not os.path.exists(args.stage_config):

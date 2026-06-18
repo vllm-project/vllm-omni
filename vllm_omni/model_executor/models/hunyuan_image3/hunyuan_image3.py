@@ -23,7 +23,9 @@ from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
@@ -1041,6 +1043,9 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
         images = mm_data.get("images", [])
         logger.debug(f"process image count: {len(images)}")
         batch_feature = image_processor(prompt, images, **tok_kwargs)
+        vae_generator_seed = mm_kwargs.get("vae_generator_seed")
+        if vae_generator_seed is not None and images:
+            batch_feature["vae_generator_seed"] = torch.full((len(images),), int(vae_generator_seed), dtype=torch.long)
         return batch_feature
 
     def _hf_processor_applies_updates(
@@ -1078,6 +1083,8 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             config["base_size"] = MultiModalFieldConfig.batched("image")
         if "ratio_index" in hf_inputs:
             config["ratio_index"] = MultiModalFieldConfig.batched("image")
+        if "vae_generator_seed" in hf_inputs:
+            config["vae_generator_seed"] = MultiModalFieldConfig.batched("image")
         return config
 
     def _get_prompt_updates(
@@ -1450,6 +1457,13 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     HunyuanImage3Inputs: TypeAlias = HunyuanImage3PixelInputs
 
     prefer_model_sampler = True
+    logitsprocs_need_output_token_ids = True
+
+    # Siglip2 ViT supports data-parallel encoding (mm_encoder_tp_mode="data"):
+    # weights are replicated and the image batch is sharded across TP ranks.
+    # Without this flag, vLLM silently falls back to "weights" (TP). See
+    # _vit_encode_dp.
+    supports_encoder_tp_data = True
 
     packed_modules_mapping = {
         "qkv_proj": [
@@ -1519,7 +1533,14 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self.time_embed = TimestepEmbedder(hidden_size=config.hidden_size)
 
         # vision
-        self.vision_model = Siglip2VisionTransformer(config.vit)
+        multimodal_config = vllm_config.model_config.multimodal_config
+        self.multimodal_config = multimodal_config
+        self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+        self.vision_model = Siglip2VisionTransformer(
+            config.vit,
+            quant_config=quant_config,
+            prefix="vision_model",
+        )
         self.vision_aligner = LightProjector(config.vit_aligner)
 
         # Used to embed timestep information into the input sequence.
@@ -1717,6 +1738,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # we reconstruct per-image shapes from vae_token_grid_hw below.
         kwargs.pop("vae_pixel_size", None)
         vae_token_grid_hw = kwargs.pop("vae_token_grid_hw", None)
+        vae_generator_seed = kwargs.pop("vae_generator_seed", None)
 
         if vit_pixel_values is None or vae_pixel_values is None:
             return None
@@ -1756,6 +1778,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 "vit_spatial_shapes": vit_spatial_shapes,
                 "vae_pixel_values": vae_image_list,
                 "vae_token_grid_hw": vae_token_grid_hw,
+                "vae_generator_seed": vae_generator_seed,
             },
         )
 
@@ -1763,6 +1786,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self,
         images: torch.Tensor,
         cfg_factor: int = 1,
+        generator: torch.Generator | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         """
         Encode images through VAE encoder.
@@ -1782,11 +1806,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             images = images.to(dtype=self.vae.dtype)
 
         vae_encode_result = self.vae.encode(images)
-        # Match HunyuanImage-3's cond encode path: sample the posterior, but
-        # use a fixed generator so online requests do not consume the global
-        # RNG and drift across a long-running server.
-        _cond_vae_gen = torch.Generator(device=images.device).manual_seed(0)
-        latents = vae_encode_result.latent_dist.sample(_cond_vae_gen)
+        latents = vae_encode_result.latent_dist.sample(generator)
 
         # Apply shift and scaling factors if present
         if hasattr(config, "shift_factor") and config.shift_factor:
@@ -1825,16 +1845,68 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         """
         Encode pixel_values through ViT encoder (vision_model and vision_aligner).
         """
-        # Handle empty batch
+        # Handle empty batch. Multimodal inputs are identical across TP ranks,
+        # so this returns on all ranks together without collective-op deadlock.
         if pixel_values.shape[0] == 0:
             return None
 
-        vision_output = self.vision_model(
-            pixel_values, attention_mask=vit_attention_mask, spatial_shapes=vit_spatial_shapes
-        )
-        image_embed = vision_output.last_hidden_state
+        if self.use_data_parallel:
+            # ViT weights are replicated (disable_tp on every linear); shard the
+            # image batch across ranks instead of doing redundant full-batch
+            # work on each one.
+            image_embed = self._vit_encode_dp(pixel_values, vit_attention_mask, vit_spatial_shapes)
+        else:
+            image_embed = self.vision_model(
+                pixel_values,
+                attention_mask=vit_attention_mask,
+                spatial_shapes=vit_spatial_shapes,
+            )
         image_embed = self.vision_aligner(image_embed)
         return image_embed
+
+    def _vit_encode_dp(
+        self,
+        pixel_values: torch.Tensor,
+        vit_attention_mask: torch.Tensor,
+        vit_spatial_shapes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Data-parallel ViT: each rank runs a slice of the image batch, then
+        outputs are all-gathered. Mirrors ``run_dp_sharded_vision_model`` but
+        shards the three batched ViT inputs together (pixel_values /
+        attention_mask / spatial_shapes) instead of a single tensor.
+        """
+        num_images = pixel_values.shape[0]
+        world_size = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
+        num_per_rank = (num_images + world_size - 1) // world_size
+        num_padded = num_per_rank * world_size - num_images
+
+        if num_padded > 0:
+            # Pad the batch so every rank gets an equal slice (required for
+            # all_gather). Dummy images use spatial_shapes (1, 1) with a single
+            # valid patch: Siglip2 interpolates position embeddings per image
+            # and rejects size 0, so (0, 0) padding would crash. Their outputs
+            # are dropped after the gather.
+            pad_pixels = pixel_values.new_zeros((num_padded, *pixel_values.shape[1:]))
+            pixel_values = torch.cat([pixel_values, pad_pixels], dim=0)
+
+            pad_mask = vit_attention_mask.new_zeros((num_padded, *vit_attention_mask.shape[1:]))
+            pad_mask[:, 0] = 1
+            vit_attention_mask = torch.cat([vit_attention_mask, pad_mask], dim=0)
+
+            pad_shapes = vit_spatial_shapes.new_ones((num_padded, *vit_spatial_shapes.shape[1:]))
+            vit_spatial_shapes = torch.cat([vit_spatial_shapes, pad_shapes], dim=0)
+
+        start = rank * num_per_rank
+        end = start + num_per_rank
+        image_embed = self.vision_model(
+            pixel_values[start:end],
+            attention_mask=vit_attention_mask[start:end],
+            spatial_shapes=vit_spatial_shapes[start:end],
+        )
+        # max_patches (dim 1) is identical across ranks, so dim-0 gather is safe.
+        image_embed = tensor_model_parallel_all_gather(image_embed.contiguous(), dim=0)
+        return image_embed[:num_images]
 
     def _timestep_encode(
         self,
@@ -1866,6 +1938,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vit_pixel_attention_mask = pixel_values["vit_pixel_attention_mask"]
         vit_spatial_shapes = pixel_values["vit_spatial_shapes"]
         vae_pixel_values = pixel_values["vae_pixel_values"]
+        vae_generator_seed = pixel_values.get("vae_generator_seed")
+        vae_generator = None
+        if vae_generator_seed is not None and vae_generator_seed.numel() > 0:
+            vae_generator = torch.Generator(device=vae_pixel_values[0].device).manual_seed(
+                int(vae_generator_seed.reshape(-1)[0].item())
+            )
 
         # Perform ViT encoding
         vit_embeddings = self._vit_encode(vit_pixel_values, vit_pixel_attention_mask, vit_spatial_shapes)
@@ -1874,7 +1952,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # `reso_group` bucket so shapes are ragged across the image-batch dim.
         vae_token_embeddings = []
         for vae_image_i in vae_pixel_values:
-            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor)
+            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor, generator=vae_generator)
             t_emb = self.time_embed(t_i[0])
             vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
             vae_token_embeddings.append(vae_tokens)

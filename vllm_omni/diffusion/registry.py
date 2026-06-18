@@ -266,6 +266,11 @@ _DIFFUSION_MODELS = {
         "pipeline_omnivoice",
         "OmniVoicePipeline",
     ),
+    "Cosmos3OmniDiffusersPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3",
+        "Cosmos3OmniDiffusersPipeline",
+    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
@@ -275,6 +280,16 @@ _DIFFUSION_MODELS = {
         "hidream_image",
         "pipeline_hidream_image",
         "HiDreamImagePipeline",
+    ),
+    "DreamZeroPipeline": (
+        "dreamzero",
+        "pipeline_dreamzero",
+        "DreamZeroPipeline",
+    ),
+    "StableDiffusionXLPipeline": (
+        "sdxl",
+        "pipeline_sdxl",
+        "StableDiffusionXLPipeline",
     ),
 }
 
@@ -498,7 +513,23 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
+    "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
+}
+
+_DIFFUSION_ACTION_POST_PROCESS_FUNCS = {
+    # arch: action_post_process_func
+    # `action_post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
+    # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_action_post_process_func",
+}
+
+_DIFFUSION_IR_OP_PRIORITY_FUNCS = {
+    # arch: ir_op_priority_func
+    # `ir_op_priority_func` function must be placed in {mod_folder}/{mod_relname}.py,
+    # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -522,6 +553,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
 }
 
 
@@ -531,6 +563,8 @@ def register_diffusion_model(
     class_name: str,
     pre_process_func_name: str | None = None,
     post_process_func_name: str | None = None,
+    action_post_process_func_name: str | None = None,
+    ir_op_priority_func_name: str | None = None,
 ) -> None:
     """Register a diffusion model pipeline from an out-of-tree plugin.
 
@@ -549,6 +583,12 @@ def register_diffusion_model(
         post_process_func_name: Optional name of the post-process function
             located in *module_name*.  Pass ``None`` to keep the existing
             entry when replacing a built-in model.
+        action_post_process_func_name: Optional name of the action post-process
+            function located in *module_name*.  Pass ``None`` to keep the
+            existing entry when replacing a built-in model.
+        ir_op_priority_func_name: Optional name of the IR op priority merge
+            function located in *module_name*. Pass ``None`` to keep the
+            existing entry when replacing a built-in model.
     """
     # Register model class in DiffusionModelRegistry
     DiffusionModelRegistry.register_model(
@@ -566,6 +606,10 @@ def register_diffusion_model(
         _DIFFUSION_PRE_PROCESS_FUNCS[model_arch] = pre_process_func_name
     if post_process_func_name is not None:
         _DIFFUSION_POST_PROCESS_FUNCS[model_arch] = post_process_func_name
+    if action_post_process_func_name is not None:
+        _DIFFUSION_ACTION_POST_PROCESS_FUNCS[model_arch] = action_post_process_func_name
+    if ir_op_priority_func_name is not None:
+        _DIFFUSION_IR_OP_PRIORITY_FUNCS[model_arch] = ir_op_priority_func_name
 
     logger.info(
         "Registered diffusion model %s -> %s.%s",
@@ -593,6 +637,20 @@ def get_diffusion_post_process_func(od_config: OmniDiffusionConfig):
     if od_config.model_class_name not in _DIFFUSION_POST_PROCESS_FUNCS:
         return None
     func_name = _DIFFUSION_POST_PROCESS_FUNCS[od_config.model_class_name]
+    return _load_process_func(od_config, func_name)
+
+
+def get_diffusion_action_post_process_func(od_config: OmniDiffusionConfig):
+    if od_config.model_class_name not in _DIFFUSION_ACTION_POST_PROCESS_FUNCS:
+        return None
+    func_name = _DIFFUSION_ACTION_POST_PROCESS_FUNCS[od_config.model_class_name]
+    return _load_process_func(od_config, func_name)
+
+
+def get_diffusion_ir_op_priority_func(od_config: OmniDiffusionConfig):
+    if od_config.model_class_name not in _DIFFUSION_IR_OP_PRIORITY_FUNCS:
+        return None
+    func_name = _DIFFUSION_IR_OP_PRIORITY_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)
 
 

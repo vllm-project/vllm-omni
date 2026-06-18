@@ -5,19 +5,14 @@ Runs inside a background thread with its own asyncio event loop.
 Owns logical request progression across stage pools and handles
 stage-to-stage transfer logic.
 
-In distributed mode (``coordinator_pub_address`` provided), it also
-owns the single :class:`OmniCoordClientForHub`, runs a
-:meth:`_watch_replica_list` task that converts replica disappearances
-into ``unregister_remote_replica`` control messages, and handles the
-``register_remote_replica`` / ``unregister_remote_replica`` flow that
-attaches / detaches head-side stage clients for headless replicas.
+Distributed membership (replica attach/detach, hub monitoring) is
+handled by :class:`MembershipController`, which is injected optionally.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time as _time
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,15 +24,11 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.metrics.stats import IterationStats
 
-from vllm_omni.distributed.omni_coordinator import (
-    LoadBalancer,
-    OmniCoordClientForHub,
-    RandomBalancer,
-    ReplicaStatus,
-)
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
@@ -54,17 +45,9 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
-
-# Factory signature for building a head-side stage client for a
-# *dynamically attached* (auto-assigned) remote replica.
-#
-# Receives ``(stage_id, replica_id)`` and returns an awaitable yielding the
-# constructed client (any type — it must satisfy the shape expected by the
-# matching :class:`StagePool`, i.e. expose ``client_addresses["input_address"]``
-# or ``request_address``, plus the usual ``add_request_async`` /
-# ``get_output_async`` / ``shutdown`` surface).
-RemoteReplicaFactory = Callable[[int, int], Awaitable[Any]]
 
 logger = init_logger(__name__)
 
@@ -123,6 +106,11 @@ class OrchestratorRequestState:
     prompt: Any = None
     sampling_params_list: list[Any] = field(default_factory=list)
     final_stage_id: int = -1
+    final_output_stage_ids: set[int] = field(default_factory=set)
+    finished_final_output_stage_ids: set[int] = field(default_factory=set)
+
+    # Wall-clock timestamp when the client-facing engine request was accepted.
+    request_timestamp: float = 0.0
 
     # Metrics: timestamp when request was submitted to each stage.
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
@@ -151,9 +139,11 @@ class StreamingInputState:
 class Orchestrator:
     """Runs inside a background thread's asyncio event loop."""
 
-    # Cadence at which the replica-list watcher polls for disappearances.
-    _WATCH_REPLICA_INTERVAL_S: float = 0.5
-    _WATCH_REPLICA_IDLE_INTERVAL_S: float = 1.0
+    # Class-level defaults so tests that bypass __init__ via object.__new__
+    # don't AttributeError when transfer / counter emit paths access them.
+    _running_counter: OmniRequestCounter | None = None
+    _transfer_emitter: Any = None
+    _stat_logger: OmniPrometheusStatLogger | None = None
 
     def __init__(
         self,
@@ -164,9 +154,10 @@ class Orchestrator:
         *,
         async_chunk: bool = False,
         pd_config: dict[str, Any] | None = None,
-        coordinator_pub_address: str | None = None,
-        load_balancer_factory: Callable[[], LoadBalancer] | None = None,
-        remote_replica_factory: RemoteReplicaFactory | None = None,
+        membership_controller: MembershipController | None = None,
+        running_counter: OmniRequestCounter | None = None,
+        transfer_emitter: Any = None,
+        log_stats: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -186,6 +177,8 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
+        self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
+
         self._cfg_tracker = CfgCompanionTracker()
 
         self._shutdown_event = asyncio.Event()
@@ -193,27 +186,73 @@ class Orchestrator:
         self._fatal_error: str | None = None
         self._fatal_error_stage_id: int | None = None
 
-        # Background tasks for fire-and-forget message handlers (currently
-        # only ``register_remote_replica`` and ``unregister_remote_replica``).
-        # Held as a set so each task's reference survives the loop and the
-        # task can self-deregister on completion.
-        self._membership_tasks: set[asyncio.Task[None]] = set()
+        # Distributed membership (optional, injected by DistStageRuntime)
+        self._membership = membership_controller
 
-        # Distributed-mode wiring. The hub is constructed on the
-        # orchestrator's asyncio loop because it spawns a SUB background
-        # thread; building it from another thread would race the
-        # ``_init_done`` event.
-        self._hub: OmniCoordClientForHub | None = (
-            OmniCoordClientForHub(coordinator_pub_address) if coordinator_pub_address is not None else None
+    def _init_metrics_state(
+        self,
+        stage_pools: list[StagePool],
+        running_counter: OmniRequestCounter | None,
+        transfer_emitter: Any,
+        log_stats: bool = False,
+    ) -> None:
+        """Wire up all metric-related orchestrator state.
+
+        Sets ``self._running_counter`` and ``self._transfer_emitter``
+        (both optional, used by request-add / forward paths), builds the
+        ``(stage_id, replica_id) ↔ engine_idx`` lookup used at record() time,
+        and best-effort constructs the ``OmniPrometheusStatLogger`` wrap
+        that exposes ~37 upstream ``vllm:*`` families with per-(stage,
+        replica) labels. Failure to build the wrap is logged and metrics
+        are simply disabled — orchestrator construction continues so unit
+        tests with a minimal ``vllm_config`` still pass.
+
+        ``log_stats=False`` short-circuits the wrap entirely so the
+        ~65 upstream ``vllm:*`` families are not registered in the
+        Prometheus default registry at all. The per-step record() path
+        already no-ops on ``scheduler_stats is None`` (which is what
+        the upstream scheduler returns when its own log_stats is False),
+        so this gate is mainly to keep the ``/metrics`` surface clean
+        when the user did not request stats.
+        """
+        self._running_counter = running_counter
+        self._transfer_emitter = transfer_emitter
+
+        # Flat engine_idx ↔ (stage, replica) maps. The reverse map is
+        # consulted at record() time to translate the orchestrator's
+        # (stage_id, replica_id) loop variables into an engine_idx the
+        # underlying PrometheusStatLogger can address.
+        stage_replica_map: dict[int, tuple[str, str]] = {}
+        self._stage_replica_to_engine_idx: dict[tuple[int, int], int] = {}
+        flat_idx = 0
+        for stage_id, pool in enumerate(stage_pools):
+            for replica_id in range(pool.num_replicas):
+                stage_replica_map[flat_idx] = (str(stage_id), str(replica_id))
+                self._stage_replica_to_engine_idx[(stage_id, replica_id)] = flat_idx
+                flat_idx += 1
+
+        if not log_stats:
+            self._stat_logger = None
+            return
+
+        vllm_config_for_stats = next(
+            (p.stage_vllm_config for p in stage_pools if p.stage_vllm_config is not None),
+            None,
         )
-        self._remote_replica_factory = remote_replica_factory
-        # Inject hub + per-pool LB into each StagePool so they can run
-        # distributed dispatch via ``StagePool.pick``.
-        if self._hub is not None:
-            factory = load_balancer_factory or RandomBalancer
-            for pool in self.stage_pools:
-                pool.attach_hub(self._hub)
-                pool.attach_load_balancer(factory())
+        if vllm_config_for_stats is None:
+            self._stat_logger = None
+            return
+        try:
+            self._stat_logger = OmniPrometheusStatLogger(
+                vllm_config=vllm_config_for_stats,
+                stage_replica_map=stage_replica_map,
+            )
+        except Exception:
+            # Minimal vllm_config in unit-test contexts can lack fields the
+            # upstream PrometheusStatLogger expects. Skip wrap rather than
+            # break orchestrator construction.
+            logger.exception("[Orchestrator] OmniPrometheusStatLogger init failed; metrics wrap disabled")
+            self._stat_logger = None
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -224,16 +263,22 @@ class Orchestrator:
             self._orchestration_output_handler(),
             name="orchestrator-stage-output-handler",
         )
-        # The replica watcher only runs in distributed mode. It's still
-        # created in both cases so ``run()`` has a uniform task graph;
-        # ``_watch_replica_list`` is a no-op poll when ``self._hub`` is None.
-        watch_task = asyncio.create_task(
-            self._watch_replica_list(),
-            name="orchestrator-replica-watcher",
-        )
+
+        # Start membership watcher if distributed mode is active.
+        membership_watcher: asyncio.Task[None] | None = None
+        if self._membership is not None:
+            self._membership.install_unregister_handlers(
+                output_queue=self.output_async_queue,
+                cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True),
+            )
+            membership_watcher = self._membership.start()
+
+        tasks = [request_task, output_task]
+        if membership_watcher is not None:
+            tasks.append(membership_watcher)
 
         try:
-            await asyncio.gather(request_task, output_task, watch_task)
+            await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             raise
         except EngineDeadError as e:
@@ -248,45 +293,22 @@ class Orchestrator:
             raise
         finally:
             self._shutdown_event.set()
-            for task in (request_task, output_task, watch_task):
+            for task in tasks:
                 if not task.done():
                     task.cancel()
             try:
-                await asyncio.gather(request_task, output_task, watch_task, return_exceptions=True)
+                await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
                 pass
 
-            # If a fatal error caused the shutdown, drain any pending
-            # add_request messages that were never processed and broadcast
-            # fatal error responses so callers are not left hanging.
             if self._fatal_error is not None:
                 await self._drain_pending_requests_on_fatal()
 
-            # Wait briefly for any in-flight membership handlers (register /
-            # unregister remote replica) to finish so they don't leave the
-            # head-side pool in a half-attached state. Cancel anything that
-            # hasn't completed in time; the generic pending-task sweep below
-            # will collect the cancellations.
-            if self._membership_tasks:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*self._membership_tasks, return_exceptions=True),
-                        timeout=10.0,
-                    )
-                except (asyncio.TimeoutError, Exception):
-                    for t in self._membership_tasks:
-                        if not t.done():
-                            t.cancel()
+            if self._membership is not None:
+                await self._membership.drain_tasks(timeout=10.0)
+                self._membership.shutdown()
 
             self._shutdown_stages()
-
-            # Close the hub last so any in-flight dispatch still has access.
-            if self._hub is not None:
-                try:
-                    self._hub.close()
-                except RuntimeError:
-                    pass
-                self._hub = None
 
             loop = asyncio.get_running_loop()
             pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task() and not t.done()]
@@ -294,27 +316,6 @@ class Orchestrator:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
-
-    # ---- Background task helpers ----
-
-    def _spawn_membership_task(self, coro: Awaitable[None], *, label: str) -> None:
-        """Run a fire-and-forget membership-change coroutine.
-
-        Holds a strong reference until completion (asyncio would otherwise
-        garbage-collect a bare task), and logs any uncaught exception.
-        """
-        task = asyncio.create_task(coro, name=f"orchestrator-{label}")
-        self._membership_tasks.add(task)
-
-        def _on_done(t: asyncio.Task[None]) -> None:
-            self._membership_tasks.discard(t)
-            if t.cancelled():
-                return
-            exc = t.exception()
-            if exc is not None:
-                logger.error("[Orchestrator] %s task crashed", label, exc_info=exc)
-
-        task.add_done_callback(_on_done)
 
     # ---- Request handling ----
 
@@ -335,18 +336,11 @@ class Orchestrator:
             elif msg_type == "collective_rpc":
                 await self._handle_collective_rpc(msg)
             elif isinstance(msg, RegisterRemoteReplicaMessage):
-                # Dynamic-attach involves a ~5s blocking handshake (run in a
-                # thread by ``_build_remote_replica``); ``await`` here would
-                # block the queue and stall the next ``add_request`` until
-                # the attach finishes. Dispatch as a background task so the
-                # main message loop keeps draining.
-                self._spawn_membership_task(self._handle_register_remote_replica(msg), label="register_remote_replica")
+                if self._membership is not None:
+                    await self._membership.handle_register(msg.stage_id, msg.replica_id)
             elif isinstance(msg, UnregisterRemoteReplicaMessage):
-                # Symmetric with register: keep the main queue flowing.
-                self._spawn_membership_task(
-                    self._handle_unregister_remote_replica(msg),
-                    label="unregister_remote_replica",
-                )
+                if self._membership is not None:
+                    await self._membership.handle_unregister(msg.stage_id, msg.input_addr)
             elif isinstance(msg, ShutdownRequestMessage):
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
@@ -357,7 +351,8 @@ class Orchestrator:
                     for client in pool.clients:
                         if hasattr(client, "_shutting_down"):
                             client._shutting_down = True
-                self._shutdown_stages()
+                # Stage teardown runs once in run()'s finally after the
+                # orchestration loop observes _shutdown_event and exits.
                 break
             else:
                 logger.warning("[Orchestrator] Unknown message type: %s", msg_type)
@@ -372,6 +367,7 @@ class Orchestrator:
         if not sampling_params_list:
             raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
         final_stage_id = msg.final_stage_id
+        final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
 
         logger.debug(
             "[Orchestrator] _handle_add_request: stage=%s req=%s "
@@ -390,9 +386,13 @@ class Orchestrator:
             prompt=original_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
+            request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
         )
         self.request_states[request_id] = req_state
+        if self._running_counter is not None:
+            self._running_counter.increment()
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
@@ -431,7 +431,9 @@ class Orchestrator:
                 output_prompt_text=msg.output_prompt_text,
                 sampling_params_list=msg.sampling_params_list,
                 final_stage_id=msg.final_stage_id,
+                final_output_stage_ids=msg.final_output_stage_ids,
                 preprocess_ms=msg.preprocess_ms,
+                request_timestamp=msg.request_timestamp,
                 enqueue_ts=msg.enqueue_ts,
             )
             await self._handle_add_request(fallback_msg)
@@ -477,6 +479,8 @@ class Orchestrator:
             prompt=companion_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=0,
+            final_output_stage_ids={0},
+            request_timestamp=parent_state.request_timestamp,
         )
         self.request_states[companion_id] = companion_state
         companion_state.stage_submit_ts[0] = _time.time()
@@ -584,6 +588,7 @@ class Orchestrator:
                         if output is None:
                             continue
 
+                        pool.record_output_timestamps([output])
                         await self._handle_processed_outputs(stage_id, replica_id, [output])
                         idle = False
                     else:
@@ -595,7 +600,7 @@ class Orchestrator:
                             await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
                             for eco in raw_outputs.outputs:
                                 req_state = self.request_states.get(getattr(eco, "request_id", None))
-                                if req_state is None:
+                                if req_state is None or not req_state.streaming.enabled:
                                     continue
                                 req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
                                 req_state.streaming.new_prompt_len_snapshot = getattr(
@@ -603,7 +608,26 @@ class Orchestrator:
                                     "new_prompt_len_snapshot",
                                     None,
                                 )
-                            raw_output = await pool.process_llm_raw_outputs(replica_id, raw_outputs)
+                                if req_state.streaming.enabled:
+                                    await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
+                            # OmniSchedulerMixin.make_stats() already throttles
+                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
+                            # being non-None means this replica passed its own gate.
+                            # A second global throttle here would drop stats for
+                            # other (stage, replica) pairs in the same 1s window.
+                            record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
+                            iteration_stats = IterationStats() if record_stats else None
+                            raw_output = await pool.process_llm_raw_outputs(
+                                replica_id,
+                                raw_outputs,
+                                iteration_stats=iteration_stats,
+                            )
+                            if record_stats:
+                                self._stat_logger.record(
+                                    raw_outputs.scheduler_stats,
+                                    iteration_stats,
+                                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                                )
                         except asyncio.CancelledError:
                             raise
                         except EngineDeadError as e:
@@ -677,11 +701,13 @@ class Orchestrator:
                 stage_metrics = pool.build_stage_metrics(
                     [output],
                     submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
+                    request_timestamp=req_state.request_timestamp,
                     replica_id=replica_id,
+                    sampling_params=req_state.sampling_params_list[stage_id],
                 )
                 stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
-            await self._route_output(stage_id, output, req_state, stage_metrics)
+            await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
     async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
         """Emit a frontend-visible error and clean up request state."""
@@ -694,6 +720,8 @@ class Orchestrator:
                 request_id=parent_id,
                 stage_id=stage_id,
                 error=output.error,
+                status_code=getattr(output, "error_status_code", None),
+                error_type=getattr(output, "error_type", None),
             )
         )
         await self._cleanup_request_ids(
@@ -713,7 +741,36 @@ class Orchestrator:
         self._release_request_bindings(request_ids)
         for request_id in request_ids:
             self._pd_kv_params.pop(request_id, None)
-            self.request_states.pop(request_id, None)
+            if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
+                self._running_counter.decrement()
+
+    async def _apply_raw_terminal_stage_finish(
+        self,
+        stage_id: int,
+        eco: Any,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Record session-level finish markers dropped by the streaming output processor.
+
+        Streaming segment stops set ``is_segment_finished=True`` and are handled
+        via processed outputs. Session termination (e.g. ``finish_requests`` after
+        ``resumable=False``) emits a terminal ``finish_reason`` with
+        ``is_segment_finished=False``, but vLLM's output processor may remove the
+        request state before that EngineCoreOutput is processed.
+
+        Only update ``finished_final_output_stage_ids`` here. Request cleanup stays
+        in ``_route_output`` so downstream async-chunk stages can still deliver
+        outputs after stage-0 session end.
+        """
+        if getattr(eco, "finish_reason", None) is None:
+            return
+        if getattr(eco, "is_segment_finished", False):
+            return
+
+        final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+        if stage_id not in final_output_stage_ids:
+            return
+        req_state.finished_final_output_stage_ids.add(stage_id)
 
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""
@@ -735,6 +792,7 @@ class Orchestrator:
     async def _route_output(
         self,
         stage_id: int,
+        replica_id: int,
         output: Any,
         req_state: OrchestratorRequestState,
         stage_metrics: Any,
@@ -752,14 +810,20 @@ class Orchestrator:
             await self._cleanup_request_ids([req_id])
             return
 
+        request_finished = False
+        if finished and self.stage_pools[stage_id].final_output:
+            req_state.finished_final_output_stage_ids.add(stage_id)
+            final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+            request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
         if self.stage_pools[stage_id].final_output:
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=stage_id,
+                    replica_id=replica_id,
                     engine_outputs=output,
                     metrics=stage_metrics,
-                    finished=finished and stage_id == req_state.final_stage_id,
+                    finished=request_finished,
                     stage_submit_ts=submit_ts,
                 )
             )
@@ -768,6 +832,7 @@ class Orchestrator:
                 StageMetricsMessage(
                     request_id=req_id,
                     stage_id=stage_id,
+                    replica_id=replica_id,
                     metrics=stage_metrics,
                     stage_submit_ts=submit_ts,
                 )
@@ -797,6 +862,7 @@ class Orchestrator:
                     stage_id,
                     output,
                     req_state,
+                    src_replica_id=replica_id,
                     is_streaming_session=req_state.streaming.enabled,
                     is_final_update=False,
                 )
@@ -807,11 +873,12 @@ class Orchestrator:
                         stage_id,
                         output,
                         req_state,
+                        src_replica_id=replica_id,
                         is_streaming_session=True,
                         is_final_update=True,
                     )
 
-        if finished and stage_id == req_state.final_stage_id:
+        if request_finished:
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
@@ -918,6 +985,41 @@ class Orchestrator:
         )
         return sp
 
+    def _emit_tx_edge(
+        self,
+        *,
+        from_stage: int,
+        from_replica: int,
+        to_stage: int,
+        to_pool: StagePool,
+        request_id: str,
+        tx_ms: float,
+    ) -> None:
+        """Emit per-edge transfer_tx_s + transfer_size_bytes histograms.
+
+        ``tx_ms`` is the orchestrator-side wall-clock spent in ``next_pool.
+        submit_*`` (serialize + queue submit to the receiving worker). Best-
+        effort size_bytes left at 0 — orchestrator doesn't have a cheap handle
+        on the serialized payload size; a follow-up can plumb that from the
+        connector adapter.
+        """
+        if self._transfer_emitter is None:
+            return
+        to_replica = to_pool.get_bound_replica_id(request_id)
+        if to_replica is None:
+            return
+        try:
+            self._transfer_emitter.observe_size(from_stage, from_replica, to_stage, to_replica, 0)
+            self._transfer_emitter.observe_tx_time(from_stage, from_replica, to_stage, to_replica, tx_ms / 1000.0)
+        except Exception:
+            logger.debug(
+                "[Orchestrator] transfer_tx emit failed for edge %d->%d req=%s",
+                from_stage,
+                to_stage,
+                request_id,
+                exc_info=True,
+            )
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -925,6 +1027,7 @@ class Orchestrator:
         output: Any,
         req_state: OrchestratorRequestState,
         *,
+        src_replica_id: int | None = None,
         is_streaming_session: bool = False,
         is_final_update: bool = False,
     ) -> None:
@@ -937,6 +1040,7 @@ class Orchestrator:
         next_stage_resumable = is_streaming_session and not is_final_update
         already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
+        _t_submit_start = _time.perf_counter()
 
         if next_pool.stage_type == "diffusion":
             companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
@@ -1024,6 +1128,15 @@ class Orchestrator:
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
             req_state.stage_submit_ts[next_logical] = _time.time()
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            self._emit_tx_edge(
+                from_stage=src_stage_id,
+                from_replica=src_replica_id if src_replica_id is not None else 0,
+                to_stage=next_logical,
+                to_pool=next_pool,
+                request_id=req_id,
+                tx_ms=_tx_ms,
+            )
             return
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
@@ -1063,6 +1176,15 @@ class Orchestrator:
                     await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
             req_state.stage_submit_ts[next_logical] = _time.time()
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            self._emit_tx_edge(
+                from_stage=src_stage_id,
+                from_replica=src_replica_id if src_replica_id is not None else 0,
+                to_stage=next_logical,
+                to_pool=next_pool,
+                request_id=req_id,
+                tx_ms=_tx_ms,
+            )
             return
 
         if req_state.pd_prefill_multimodal_output is not None:
@@ -1089,7 +1211,7 @@ class Orchestrator:
         for next_input in next_inputs:
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
-            model_stage = getattr(next_client, "model_stage", None)
+            model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,
@@ -1107,6 +1229,15 @@ class Orchestrator:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
         req_state.stage_submit_ts[next_logical] = _time.time()
+        _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+        self._emit_tx_edge(
+            from_stage=src_stage_id,
+            from_replica=src_replica_id if src_replica_id is not None else 0,
+            to_stage=next_logical,
+            to_pool=next_pool,
+            request_id=req_id,
+            tx_ms=_tx_ms,
+        )
 
     async def _prewarm_async_chunk_stages(
         self,
@@ -1131,6 +1262,7 @@ class Orchestrator:
             params = req_state.sampling_params_list[next_stage_id]
 
             req_state.stage_submit_ts[next_stage_id] = _time.time()
+            _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
                 await next_pool.submit_initial(
@@ -1172,7 +1304,26 @@ class Orchestrator:
                     resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id
-                await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)
+                await next_pool.submit_initial(
+                    request_id,
+                    req_state,
+                    request,
+                    prompt_text=None,
+                )
+
+            # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
+            # replica is stage 0's bound replica (single-replica thinker in
+            # all current configs); fall back to 0 if unknown.
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            src_replica = self.stage_pools[next_stage_id - 1].get_bound_replica_id(request_id)
+            self._emit_tx_edge(
+                from_stage=next_stage_id - 1,
+                from_replica=src_replica if src_replica is not None else 0,
+                to_stage=next_stage_id,
+                to_pool=next_pool,
+                request_id=request_id,
+                tx_ms=_tx_ms,
+            )
 
     def _build_kv_sender_info(
         self,
@@ -1254,129 +1405,6 @@ class Orchestrator:
                     )
                 )
             self.request_states.pop(req_id, None)
-
-    # ---- Distributed-mode replica attach / detach ----
-
-    async def _watch_replica_list(self) -> None:
-        """Convert hub replica disappearances into unregister control messages."""
-        last_up: set[tuple[int, str]] = set()
-        while not self._shutdown_event.is_set():
-            if self._hub is None:
-                # No coordinator wired up; sleep coarsely and re-check shutdown.
-                try:
-                    await asyncio.sleep(self._WATCH_REPLICA_IDLE_INTERVAL_S)
-                except asyncio.CancelledError:
-                    raise
-                continue
-
-            try:
-                snap = self._hub.get_replica_list()
-                current = {(rep.stage_id, rep.input_addr) for rep in snap.replicas if rep.status == ReplicaStatus.UP}
-                for stage_id, addr in last_up - current:
-                    await self.request_async_queue.put(
-                        UnregisterRemoteReplicaMessage(
-                            stage_id=stage_id,
-                            input_addr=addr,
-                        )
-                    )
-                last_up = current
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("[Orchestrator] _watch_replica_list iteration failed")
-
-            try:
-                await asyncio.sleep(self._WATCH_REPLICA_INTERVAL_S)
-            except asyncio.CancelledError:
-                raise
-
-    async def _handle_register_remote_replica(self, msg: RegisterRemoteReplicaMessage) -> None:
-        """Bind a head-side client for a newly registered remote replica."""
-        stage_id = int(msg.stage_id)
-        replica_id = int(msg.replica_id)
-        if not (0 <= stage_id < self.num_stages):
-            logger.warning(
-                "[Orchestrator] register_remote_replica: stage_id %d out of range (num_stages=%d)",
-                stage_id,
-                self.num_stages,
-            )
-            return
-        if self._remote_replica_factory is None:
-            logger.warning(
-                "[Orchestrator] register_remote_replica received for stage=%d replica=%d but no factory installed",
-                stage_id,
-                replica_id,
-            )
-            return
-
-        try:
-            await self._attach_remote_replica(stage_id, replica_id)
-        except Exception:
-            logger.exception(
-                "[Orchestrator] failed to attach remote replica stage=%d replica=%d",
-                stage_id,
-                replica_id,
-            )
-
-    async def _handle_unregister_remote_replica(self, msg: UnregisterRemoteReplicaMessage) -> None:
-        """Tear down the head-side client for a vanished remote replica."""
-        stage_id = int(msg.stage_id)
-        input_addr = str(msg.input_addr)
-        if not (0 <= stage_id < self.num_stages):
-            return
-        pool = self.stage_pools[stage_id]
-        affected = pool.invalidate_addr(input_addr)
-        self._detach_remote_replica(stage_id, input_addr)
-        if affected:
-            await self._cleanup_request_ids(affected, abort=True)
-            for req_id in affected:
-                await self.output_async_queue.put(
-                    ErrorMessage(
-                        error="stage replica disappeared",
-                        request_id=req_id,
-                        stage_id=stage_id,
-                    )
-                )
-
-    async def _attach_remote_replica(self, stage_id: int, replica_id: int) -> None:
-        """Build a head-side stage client via the injected factory and register it."""
-        factory = self._remote_replica_factory
-        if factory is None:
-            return
-        pool = self.stage_pools[stage_id]
-        client = await factory(stage_id, replica_id)
-        input_addr = StagePool._client_input_addr(client)
-        if input_addr is None:
-            raise RuntimeError(
-                f"remote replica factory for stage {stage_id} produced a client without a discoverable input address"
-            )
-        pool.add_client(input_addr, client)
-        logger.info(
-            "[Orchestrator] attached remote replica stage=%d replica=%d addr=%s",
-            stage_id,
-            replica_id,
-            input_addr,
-        )
-
-    def _detach_remote_replica(self, stage_id: int, input_addr: str) -> None:
-        """Shut down + remove the head-side client at ``input_addr``."""
-        pool = self.stage_pools[stage_id]
-        client = pool.remove_client(input_addr)
-        if client is None:
-            return
-        try:
-            client.shutdown()
-        except Exception:
-            logger.exception(
-                "[Orchestrator] failed to shutdown client for stage=%d addr=%s",
-                stage_id,
-                input_addr,
-            )
-        logger.info(
-            "[Orchestrator] detached remote replica stage=%d addr=%s",
-            stage_id,
-            input_addr,
-        )
 
     def _shutdown_stages(self) -> None:
         """Shutdown all stage pools."""

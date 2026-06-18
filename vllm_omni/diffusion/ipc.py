@@ -18,6 +18,7 @@ import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 
 _SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
+DIFFUSION_RPC_RESULT_ENVELOPE = "diffusion_rpc_result"
 
 
 def _tensor_to_shm(tensor: torch.Tensor) -> dict[str, Any]:
@@ -85,16 +86,42 @@ def _pack_tensor_if_large(val: torch.Tensor) -> torch.Tensor | dict:
     return val
 
 
+def _pack_value_if_large(val: object) -> object:
+    """Recursively replace large tensors with SHM handles.
+
+    Walks the container shapes pipelines return as ``DiffusionOutput.output``:
+    bare tensors, dicts (e.g. Cosmos3 ``{"image"/"video": ...}``), and
+    tuples/lists (e.g. LTX2 and DreamID ``(video, audio)``). Other values pass
+    through unchanged. ``_unpack_if_shm_handle`` must mirror these shapes — keep
+    the two in sync.
+    """
+    if isinstance(val, torch.Tensor):
+        return _pack_tensor_if_large(val)
+    if isinstance(val, dict):
+        return {key: _pack_value_if_large(value) for key, value in val.items()}
+    if isinstance(val, list):
+        return [_pack_value_if_large(item) for item in val]
+    if isinstance(val, tuple):
+        return tuple(_pack_value_if_large(item) for item in val)
+    return val
+
+
 def _unpack_if_shm_handle(val: object) -> object:
-    """Reconstruct a tensor from an SHM handle dict, or return as-is."""
+    """Reconstruct tensors from SHM handles, mirroring ``_pack_value_if_large``."""
     if isinstance(val, dict) and val.get("__tensor_shm__"):
         return _tensor_from_shm(val)
+    if isinstance(val, dict):
+        return {key: _unpack_if_shm_handle(value) for key, value in val.items()}
+    if isinstance(val, list):
+        return [_unpack_if_shm_handle(item) for item in val]
+    if isinstance(val, tuple):
+        return tuple(_unpack_if_shm_handle(item) for item in val)
     return val
 
 
 def _pack_diffusion_fields(output: DiffusionOutput) -> DiffusionOutput:
-    if output.output is not None and isinstance(output.output, torch.Tensor):
-        output.output = _pack_tensor_if_large(output.output)
+    if output.output is not None:
+        output.output = _pack_value_if_large(output.output)
     if output.trajectory_latents is not None and isinstance(output.trajectory_latents, torch.Tensor):
         output.trajectory_latents = _pack_tensor_if_large(output.trajectory_latents)
     if output.trajectory_timesteps is not None and isinstance(output.trajectory_timesteps, torch.Tensor):
@@ -104,14 +131,25 @@ def _pack_diffusion_fields(output: DiffusionOutput) -> DiffusionOutput:
     return output
 
 
+def _is_rpc_result_envelope(output: object) -> bool:
+    return isinstance(output, dict) and output.get("type") == DIFFUSION_RPC_RESULT_ENVELOPE
+
+
 def pack_diffusion_output_shm(output: object) -> object:
     """Replace large tensors in diffusion worker outputs with SHM handles.
 
     Supports either a bare ``DiffusionOutput`` or a wrapper object carrying one
-    in ``.result`` (for example ``RunnerOutput``).
+    in ``.result`` (for example ``RunnerOutput``), or an RPC result envelope
+    carrying the diffusion output in ``["result"]``.
     """
     if isinstance(output, DiffusionOutput):
         return _pack_diffusion_fields(output)
+
+    if _is_rpc_result_envelope(output):
+        result = output.get("result")
+        if isinstance(result, DiffusionOutput):
+            output["result"] = _pack_diffusion_fields(result)
+        return output
 
     result = getattr(output, "result", None)
     if isinstance(result, DiffusionOutput):
@@ -131,6 +169,12 @@ def unpack_diffusion_output_shm(output: object) -> object:
     """Reconstruct tensors from SHM handles in diffusion worker outputs."""
     if isinstance(output, DiffusionOutput):
         return _unpack_diffusion_fields(output)
+
+    if _is_rpc_result_envelope(output):
+        result = output.get("result")
+        if isinstance(result, DiffusionOutput):
+            output["result"] = _unpack_diffusion_fields(result)
+        return output
 
     result = getattr(output, "result", None)
     if isinstance(result, DiffusionOutput):
