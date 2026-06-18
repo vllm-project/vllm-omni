@@ -53,9 +53,11 @@ class _QuantizationEngineOverrides(TypedDict, total=False):
 
 
 class _ModelEngineOverrides(TypedDict, total=False):
+    active_stream_window: int
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
     has_sampling_extra_args: bool
+    custom_voice_dir: str
     task_type: str
     codec_frame_rate_hz: float
     enforce_eager: bool
@@ -232,10 +234,12 @@ def _resolve_deploy_path(model_type: str, deploy_config_path: str | None = None)
 class ModelConfig:
     """Per-stage model behavior."""
 
+    active_stream_window: int = Field(default=0, ge=0)
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
+    custom_voice_dir: str | None = None
     task_type: str | None = None
     codec_frame_rate_hz: float | None = None
     enforce_eager: bool = False
@@ -342,20 +346,46 @@ class ParallelConfig:
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
 
-        base_world_size = (
+        other_parallel_world_size = (
             self.pipeline_parallel_size
             * self.data_parallel_size
             * self.tensor_parallel_size
             * self.sequence_parallel_size
             * self.cfg_parallel_size
-            * self.vae_patch_parallel_size
         )
         if self.use_hsdp:
-            if self.hsdp_shard_size <= 0:
-                raise ValueError("hsdp_shard_size must be set when use_hsdp=True")
-            self.world_size = self.hsdp_replicate_size * self.hsdp_shard_size
+            if self.tensor_parallel_size > 1 or self.data_parallel_size > 1:
+                raise ValueError(
+                    "HSDP (use_hsdp=True) cannot be used with TP or DP "
+                    f"(tensor_parallel_size={self.tensor_parallel_size}, "
+                    f"data_parallel_size={self.data_parallel_size})"
+                )
+            if self.hsdp_shard_size == -1:
+                if other_parallel_world_size == 1:
+                    raise ValueError("Cannot auto-calculate hsdp_shard_size when other parallelism is all 1")
+                if other_parallel_world_size % self.hsdp_replicate_size != 0:
+                    raise ValueError(
+                        f"hsdp_replicate_size ({self.hsdp_replicate_size}) must evenly divide "
+                        f"world_size ({other_parallel_world_size}) when hsdp_shard_size is -1"
+                    )
+                self.hsdp_shard_size = other_parallel_world_size // self.hsdp_replicate_size
+                self.world_size = other_parallel_world_size
+            else:
+                if self.hsdp_shard_size <= 0:
+                    raise ValueError("hsdp_shard_size must be > 0 when use_hsdp=True")
+                hsdp_world_size = self.hsdp_replicate_size * self.hsdp_shard_size
+                if other_parallel_world_size == 1:
+                    self.world_size = hsdp_world_size
+                else:
+                    if hsdp_world_size != other_parallel_world_size:
+                        raise ValueError(
+                            f"HSDP dimensions ({self.hsdp_replicate_size} x {self.hsdp_shard_size} = "
+                            f"{hsdp_world_size}) must equal world_size from other parallelism "
+                            f"({other_parallel_world_size})"
+                        )
+                    self.world_size = other_parallel_world_size
         else:
-            self.world_size = base_world_size
+            self.world_size = other_parallel_world_size
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -381,7 +411,6 @@ class DiffusionConfig:
     master_port: int | None = None
     host: str | None = None
     port: int | None = None
-    scheduler_port: int = 5555
     model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: Any = None
     diffusion_attention_config: Any = None
@@ -435,6 +464,14 @@ class DiffusionConfig:
     prompt_file_path: str | None = None
     quantization_config: Any = None
     extras: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_kwargs(cls, **kwargs: Any) -> DiffusionConfig:
+        from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
+
+        normalized_kwargs = normalize_omni_diffusion_kwargs(kwargs)
+        valid_fields = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in normalized_kwargs.items() if k in valid_fields})
 
     def __post_init__(self) -> None:
         # Keep diffusion imports lazy so importing vllm_omni.config does not
@@ -602,7 +639,6 @@ _DIFFUSION_RUNTIME_CONFIG_FIELDS = frozenset(
     {
         "host",
         "port",
-        "scheduler_port",
         "nccl_port",
         "master_port",
         "worker_extension_cls",
@@ -637,7 +673,19 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
 
 _STAGE_DEPLOY_ENGINE_FIELDS: tuple[str, ...] = tuple(_STAGE_DEPLOY_FIELDS)
 
-_DIFFUSION_STAGE_ENGINE_FIELDS = _DIFFUSION_CONFIG_FIELDS - {"model", "stage_id"}
+_DIFFUSION_BACKCOMPAT_ENGINE_FIELDS = frozenset(
+    {
+        "diffusion_attention_backend",
+        "kv_cache_dtype",
+        "kv_cache_skip_layers",
+        "kv_cache_skip_steps",
+        "static_lora_scale",
+    }
+)
+_DIFFUSION_STAGE_ENGINE_FIELDS = (_DIFFUSION_CONFIG_FIELDS | _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS) - {
+    "model",
+    "stage_id",
+}
 
 _QUANTIZATION_ENGINE_FIELDS = frozenset(_QuantizationEngineOverrides.__annotations__)
 _MODEL_ENGINE_FIELDS = frozenset(_ModelEngineOverrides.__annotations__)
@@ -759,6 +807,7 @@ class VllmOmniStageConfig:
     connector_config: ConnectorConfig = field(default_factory=ConnectorConfig)
     runtime_config: RuntimeConfig = field(default_factory=RuntimeConfig)
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
+    # Only populated for stages whose execution type is DIFFUSION.
     diffusion_config: DiffusionConfig | None = None
     quantization_config: Any = None
 
@@ -890,9 +939,13 @@ def _build_model_config(
     stage_deploy: StageDeployConfig | None,
     engine: _ModelEngineOverrides,
 ) -> ModelConfig:
+    default_sampling_params = _stage_sampling_params(stage_deploy, topology)
+    kwargs = _config_kwargs(engine)
+    if "has_sampling_extra_args" not in kwargs:
+        kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))
     return ModelConfig(
-        default_sampling_params=_stage_sampling_params(stage_deploy, topology),
-        **_config_kwargs(engine),
+        default_sampling_params=default_sampling_params,
+        **kwargs,
     )
 
 
@@ -990,7 +1043,7 @@ def _build_diffusion_config(
     if quantization_config is not None:
         diffusion_kwargs["quantization_config"] = _copy_value(quantization_config)
 
-    return DiffusionConfig(**{k: v for k, v in diffusion_kwargs.items() if v is not None})
+    return DiffusionConfig.from_kwargs(**{k: v for k, v in diffusion_kwargs.items() if v is not None})
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))

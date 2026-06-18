@@ -39,31 +39,36 @@ from vllm_omni.config.yaml_util import (
 )
 
 __all__ = [
-    "OmniModelConfig",
+    # Legacy model-level configs.
     "LoRAConfig",
+    "OmniModelConfig",
+    # Structured Omni config entry points.
     "VllmOmniConfig",
     "VllmOmniStageConfig",
-    "ModelConfig",
-    "LoadConfig",
+    # Structured Omni sub-configs.
     "CacheConfig",
-    "SchedulerConfig",
     "ConnectorConfig",
-    "RuntimeConfig",
-    "ParallelConfig",
     "DiffusionConfig",
+    "LoadConfig",
+    "ModelConfig",
     "OrchestratorConfig",
+    "ParallelConfig",
+    "RuntimeConfig",
+    "SchedulerConfig",
+    # Legacy pipeline/stage deploy config surface.
+    "PIPELINE_WIDE_ENGINE_FIELDS",
+    "DeployConfig",
+    "PipelineConfig",
     "StageConfig",
     "StageConfigFactory",
-    "StageType",
+    "StageDeployConfig",
     "StageExecutionType",
     "StagePipelineConfig",
-    "PipelineConfig",
-    "StageDeployConfig",
-    "DeployConfig",
-    "PIPELINE_WIDE_ENGINE_FIELDS",
+    "StageType",
     "load_deploy_config",
     "merge_pipeline_deploy",
     "register_pipeline",
+    # YAML utility helpers.
     "create_config",
     "load_yaml_config",
     "merge_configs",

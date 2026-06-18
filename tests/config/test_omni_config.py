@@ -177,6 +177,20 @@ def test_pipeline_deploy_cli_fields_reuse_legacy_pipeline_wide_engine_fields():
     assert "custom_voice_dir" in omni_config_module._PIPELINE_DEPLOY_CLI_FIELDS
 
 
+def test_pipeline_wide_model_fields_are_retained_on_structured_stage_configs(tmp_path):
+    custom_voice_dir = tmp_path / "voices"
+    omni_config = VllmOmniConfig.from_registry(
+        "qwen3_tts",
+        cli_overrides={
+            "active_stream_window": 2,
+            "custom_voice_dir": str(custom_voice_dir),
+        },
+    )
+
+    assert {stage.model_config.active_stream_window for stage in omni_config.stage_configs} == {2}
+    assert {stage.model_config.custom_voice_dir for stage in omni_config.stage_configs} == {str(custom_voice_dir)}
+
+
 def test_stage_deploy_engine_fields_reuse_legacy_stage_deploy_fields():
     assert omni_config_module._STAGE_DEPLOY_ENGINE_FIELDS == tuple(_STAGE_DEPLOY_FIELDS)
     assert "tensor_parallel_size" in omni_config_module._STAGE_DEPLOY_ENGINE_FIELDS
@@ -279,10 +293,12 @@ def test_runtime_config_fields_match_rfc_runtime_scope():
 
 def test_sub_config_fields_match_rfc_scopes():
     assert {f.name for f in fields(ModelConfig)} == {
+        "active_stream_window",
         "enable_sleep_mode",
         "default_sampling_params",
         "subtalker_sampling_params",
         "has_sampling_extra_args",
+        "custom_voice_dir",
         "task_type",
         "codec_frame_rate_hz",
         "enforce_eager",
@@ -346,6 +362,39 @@ def test_parallel_config_keeps_current_diffusion_parallel_surface():
     assert cfg.data_parallel_size == 3
     assert cfg.cfg_parallel_size == 3
     assert cfg.world_size == 72
+
+
+def test_parallel_config_matches_diffusion_parallel_world_size_for_vae_patch_parallel():
+    cfg = ParallelConfig(
+        tensor_parallel_size=2,
+        cfg_parallel_size=2,
+        vae_patch_parallel_size=4,
+    )
+
+    assert cfg.vae_patch_parallel_size == 4
+    assert cfg.world_size == 4
+
+
+def test_parallel_config_supports_diffusion_hsdp_auto_sharding():
+    cfg = ParallelConfig(
+        pipeline_parallel_size=2,
+        sequence_parallel_size=2,
+        ulysses_degree=2,
+        use_hsdp=True,
+        hsdp_shard_size=-1,
+        hsdp_replicate_size=2,
+    )
+
+    assert cfg.hsdp_shard_size == 2
+    assert cfg.world_size == 4
+
+
+def test_parallel_config_rejects_diffusion_hsdp_with_tp_or_dp():
+    with pytest.raises(ValueError, match="cannot be used with TP or DP"):
+        ParallelConfig(tensor_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
+
+    with pytest.raises(ValueError, match="cannot be used with TP or DP"):
+        ParallelConfig(data_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
 
 
 def test_from_registry_preserves_legacy_pp_dp_for_world_size():
@@ -429,6 +478,14 @@ def test_from_registry_matches_build_engine_args_dict_behavior_for_representativ
     assert legacy_engine_args["has_sampling_extra_args"] == bool(
         (omni_stage.model_config.default_sampling_params or {}).get("extra_args")
     )
+    assert omni_stage.model_config.has_sampling_extra_args == legacy_engine_args["has_sampling_extra_args"]
+
+
+def test_from_registry_derives_has_sampling_extra_args_from_stage_defaults():
+    stage = VllmOmniConfig.from_registry("voxtral_tts").stage_by_id(0)
+
+    assert (stage.model_config.default_sampling_params or {}).get("extra_args")
+    assert stage.model_config.has_sampling_extra_args is True
 
 
 def test_diffusion_config_preserves_existing_coercion_hooks():
@@ -451,6 +508,52 @@ def test_diffusion_config_preserves_existing_coercion_hooks():
     assert cfg.diffusion_kv_cache_skip_step_indices == {0, 1, 2, 4}
     assert cfg.diffusion_kv_cache_skip_layer_indices == {1, 3}
     assert cfg.max_cpu_loras == 1
+
+
+def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
+    monkeypatch.setenv("DIFFUSION_CACHE_BACKEND", "TEA_CACHE")
+
+    cfg = DiffusionConfig.from_kwargs(
+        diffusion_attention_backend="flash_attn",
+        kv_cache_dtype="fp8",
+        kv_cache_skip_steps="0-1",
+        kv_cache_skip_layers=[2],
+        static_lora_scale=0.25,
+        diffusers_load_kwargs=None,
+        diffusers_call_kwargs=None,
+    )
+
+    assert cfg.diffusion_attention_config.default.backend == "flash_attn"
+    assert cfg.diffusion_kv_cache_dtype == "fp8"
+    assert cfg.diffusion_kv_cache_skip_step_indices == {0, 1}
+    assert cfg.diffusion_kv_cache_skip_layer_indices == {2}
+    assert cfg.lora_scale == 0.25
+    assert cfg.cache_backend == "tea_cache"
+    assert cfg.diffusers_load_kwargs == {}
+    assert cfg.diffusers_call_kwargs == {}
+
+
+def test_from_registry_normalizes_diffusion_config_aliases_from_engine_args(tmp_path):
+    deploy_path = tmp_path / "dreamzero_diffusion_aliases.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    diffusion_attention_backend: flash_attn",
+            ]
+        )
+    )
+
+    stage = VllmOmniConfig.from_registry(
+        "dreamzero",
+        deploy_config_path=str(deploy_path),
+    ).stage_by_id(0)
+
+    assert stage.diffusion_config is not None
+    assert stage.diffusion_config.diffusion_attention_config.default.backend == "flash_attn"
 
 
 def test_diffusion_config_field_classification_covers_current_fields():
