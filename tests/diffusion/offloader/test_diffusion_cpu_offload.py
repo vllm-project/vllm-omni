@@ -25,7 +25,6 @@ IMAGE_VIDEO_MODELS = {
 MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
 
 _GATED_MODELS = {"stabilityai/stable-audio-open-1.0"}
-_SKIP_MODELS = {"OmniGen2/OmniGen2"}
 
 # Aliased for backward compatibility (imported by test_diffusion_layerwise_offload.py).
 _skip_if_gated_repo_inaccessible = skip_if_gated_repo_inaccessible
