@@ -89,10 +89,53 @@ and
 | Model | Scope | Status |
 |-------|-------|--------|
 | Qwen3-Omni | Thinker language-model stage | ModelOpt FP8 checkpoint path |
+| Qwen3-Omni | Thinker language-model stage (W4A4 NVFP4) | Validated; see [Qwen3-Omni NVFP4 W4A4](#qwen3-omni-nvfp4-w4a4-thinker) below |
 | Qwen3-TTS | TTS language-model stage | Not validated |
 
 Audio encoder, vision encoder, talker, and code2wav stages stay in BF16 unless
 a model-specific guide documents otherwise.
+
+#### Qwen3-Omni NVFP4 W4A4 (thinker)
+
+vLLM-Omni serves ModelOpt NVFP4 W4A4 quantizations of the
+Qwen3-Omni-30B-A3B-Instruct thinker language model. The thinker text body
+(attention + MoE experts) is quantized to NVFP4 with FP8 per-tensor input
+scales; the audio encoder, vision encoder, talker, and code2wav stay in BF16.
+
+| Variant | HF checkpoint | Hardware |
+|---------|---------------|----------|
+| W4A4 NVFP4 (full thinker) | `YihongJin/Qwen3-Omni-30B-A3B-Instruct-NVFP4-W4A4-full-thinker-awqclip` | sm_100+ (Blackwell, FlashInfer FP4 GEMM) |
+
+Calibration uses ModelOpt `mtq.NVFP4_DEFAULT_CFG` with the `awq_clip` algorithm
+on 1024 ultrachat samples chat-templated through the Qwen3-Omni tokenizer.
+Excluded modules: `*audio_tower*`, `*visual*`, `*talker*`, `*code2wav*`,
+`*lm_head*`, `*mlp.gate*`. See `scripts/nvfp4/calibrate.py` for the reference
+recipe.
+
+!!! note "ModelOpt 0.44 NaN regression workaround"
+    ModelOpt 0.44's float32 -> FP8 E4M3 cast of per-block weight scales
+    occasionally emits literal NaN bytes (E4M3 encoding 0x7F / 0xFF) for
+    blocks whose pre-cast scale rounds above the FP8 max of 448 after the
+    global-scale division. A single NaN byte in any `weight_scale`
+    propagates through the FP4 GEMM and collapses the served model output
+    to `!!!!`. vLLM-Omni's `vllm_omni.patch` installs a defensive override
+    of `ModelOptNvFp4LinearMethod.process_weights_after_loading` that
+    clamps these bytes to the FP8 E4M3 max at load time. The override
+    self-extinguishes once vllm-omni's vllm pin moves to a release
+    containing the upstream fix. Set `VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP=1`
+    to disable the override for diagnostics.
+
+Serving:
+
+```bash
+vllm serve YihongJin/Qwen3-Omni-30B-A3B-Instruct-NVFP4-W4A4-full-thinker-awqclip \
+    --omni --port 8000
+```
+
+> Do **not** pass `--enforce-eager` for production / benchmarks. CUDA graphs
+> amortize launch overhead and unlock the FP4 throughput wins; with
+> `--enforce-eager` set, W4A4 TPOT degrades ~10x relative to the CUDA-graph
+> configuration.
 
 ### Multi-Stage Diffusion Model
 
