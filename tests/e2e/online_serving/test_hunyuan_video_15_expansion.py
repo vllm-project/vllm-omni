@@ -31,6 +31,17 @@ def _get_diffusion_feature_cases(model: str):
     Designed for 2x H100 environment per issue #1832.
     """
     return [
+        # (1 GPU) CPU offload
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-cpu-offload",
+                ],
+            ),
+            id="single_card_cpu_offload",
+            marks=SINGLE_CARD_MARKS,
+        ),
         # (1 GPU) CacheDiT + Layerwise CPU offloading
         pytest.param(
             OmniServerParams(

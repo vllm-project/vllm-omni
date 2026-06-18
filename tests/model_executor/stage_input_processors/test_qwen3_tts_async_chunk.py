@@ -14,6 +14,7 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
 from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
     talker2code2wav,
     talker2code2wav_async_chunk,
+    talker2code2wav_full_payload,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -56,7 +57,7 @@ def _call(tm, rid, *, n_frames, finished=False, req_ic=None):
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(n_frames)]
     return talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.zeros((0,))}},
+        multimodal_output={"codes": {"audio": torch.zeros((0,))}},
         request=_req(rid, finished=finished, initial_codec_chunk_frames=req_ic),
         is_finished=finished,
     )
@@ -66,7 +67,7 @@ def test_empty_returns_none():
     tm = _tm()
     p = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.zeros((0,))}},
+        multimodal_output={"codes": {"audio": torch.zeros((0,))}},
         request=_req("r", finished=False),
     )
     assert p is None
@@ -76,7 +77,7 @@ def test_eof_marker_when_finished_empty():
     tm = _tm()
     p = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output=None,
+        multimodal_output=None,
         request=_req("r", finished=True),
         is_finished=True,
     )
@@ -89,7 +90,7 @@ def test_flush_on_finish():
     tm.code_prompt_token_ids["r"] = [_FRAME[:] for _ in range(24)]
     p = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output=None,
+        multimodal_output=None,
         request=_req("r", finished=True),
         is_finished=True,
     )
@@ -262,7 +263,7 @@ def test_first_streaming_chunk_prepends_ref_code_context():
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+        multimodal_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
@@ -286,7 +287,7 @@ def test_followup_ref_code_context_is_sent_as_metadata_handle():
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+        multimodal_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
@@ -319,7 +320,7 @@ def test_streaming_ref_code_context_is_bounded_for_batchable_shapes():
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+        multimodal_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
         request=_req(rid, finished=False),
         is_finished=False,
     )
@@ -338,7 +339,7 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
 
     first_payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]]), "ref": ref_code}},
+        multimodal_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]]), "ref": ref_code}},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
@@ -348,14 +349,14 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
     for _ in range(8):
         talker2code2wav_async_chunk(
             transfer_manager=tm,
-            pooling_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]])}},
+            multimodal_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]])}},
             request=_req(rid, finished=False, initial_codec_chunk_frames=10),
             is_finished=False,
         )
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]])}},
+        multimodal_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]])}},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
@@ -439,3 +440,49 @@ def test_non_async_processor_filters_out_of_range_codec_values():
     # Only ref_code (1 frame) + 2 valid frames = 3 frames * 4 quantizers = 12 codes
     assert len(prompt["prompt_token_ids"]) == 4 * 3
     assert prompt["additional_information"] == {"meta": {"left_context_size": 1}}
+
+
+def test_full_payload_emits_left_context_size_for_ref_clone():
+    """Regression for #4421.
+
+    The worker-side ``talker2code2wav_full_payload`` producer is the
+    authoritative channel that prepends ``ref_code`` to the codec stream.
+    The orchestrator-side ``talker2code2wav_token_only`` can no longer derive
+    ``left_context_size`` (the stage-0 RequestOutput multimodal_output no longer
+    carries the talker codec since the separated mm-output channel landed), so
+    full_payload MUST emit the matching ``left_context_size`` in its connector
+    meta or Code2Wav trims nothing and the reference audio leaks into the
+    output.
+    """
+    ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)  # 2 ref frames
+    audio_codes = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8], [1, 1, 1, 1]], dtype=torch.long)  # 3 generated frames
+    pooling_output = {
+        "codes.audio": audio_codes,
+        "codes.ref": ref_code,
+        "meta.ref_code_len": 2,
+    }
+    request = SimpleNamespace(request_id="r", output_token_ids=list(range(4)))  # seq_len=3
+
+    payload = talker2code2wav_full_payload(transfer_manager=None, pooling_output=pooling_output, request=request)
+
+    assert payload is not None
+    assert payload["meta"]["finished"].item() is True
+    # The fix: trim length is co-located with the ref prepend it describes.
+    assert payload["meta"]["left_context_size"] == 2
+    # ref(2) + generated(3) frames, codebook-major flat = Q * 5.
+    assert len(payload["codes"]["audio"]) == _Q * 5
+
+
+def test_full_payload_omits_left_context_size_without_ref():
+    """Without a reference (non-clone tasks) nothing is prepended, so no
+    ``left_context_size`` is emitted and Code2Wav trims nothing."""
+    audio_codes = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.long)
+    pooling_output = {"codes.audio": audio_codes}
+    request = SimpleNamespace(request_id="r", output_token_ids=list(range(3)))  # seq_len=2
+
+    payload = talker2code2wav_full_payload(transfer_manager=None, pooling_output=pooling_output, request=request)
+
+    assert payload is not None
+    assert payload["meta"]["finished"].item() is True
+    assert "left_context_size" not in payload["meta"]
+    assert len(payload["codes"]["audio"]) == _Q * 2

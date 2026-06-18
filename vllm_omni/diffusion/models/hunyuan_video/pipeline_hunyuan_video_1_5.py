@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -27,6 +27,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15Transformer3DModel
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -86,7 +87,13 @@ def get_hunyuan_video_15_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin):
+class HunyuanVideo15Pipeline(
+    nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     def __init__(
         self,
         *,
@@ -143,7 +150,9 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Diff
             self.scheduler._shift = od_config.flow_shift
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, HunyuanVideo15Transformer3DModel)
-        self.transformer = HunyuanVideo15Transformer3DModel(od_config=od_config, **transformer_kwargs)
+        self.transformer = HunyuanVideo15Transformer3DModel(
+            od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
+        )
 
         # Check if model uses meanflow (distilled variants)
         self.use_meanflow = getattr(od_config.tf_model_config, "use_meanflow", False)

@@ -20,6 +20,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.progress_bar import _is_rank_zero
+from vllm_omni.errors import GuardrailViolationError
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -67,7 +68,7 @@ def _build_text_guardrail(checker: Any) -> TextGuardrailFn:
     def text_guardrail(prompt: str) -> None:
         if not checker.check_text_safety(prompt):
             # CosmosSafetyChecker logs the specific reason at CRITICAL.
-            raise ValueError("Guardrail blocked prompt")
+            raise GuardrailViolationError("Input was blocked by Cosmos3 guardrails.")
 
     return text_guardrail
 

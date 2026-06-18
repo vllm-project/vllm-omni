@@ -88,7 +88,7 @@ ENV UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE="copy"
 
-ARG VLLM_VERSION=v0.22.0
+ARG VLLM_VERSION=v0.23.0
 RUN git clone -b ${VLLM_VERSION} https://github.com/vllm-project/vllm
 WORKDIR /workspace/vllm
 
@@ -142,15 +142,12 @@ WORKDIR /workspace/vllm-omni
 COPY . .
 
 ENV VLLM_OMNI_TARGET_DEVICE=xpu
-RUN uv pip install --no-cache-dir ".[dev]" --no-build-isolation
-
-# FIX triton
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip uninstall triton triton-xpu && \
-    uv pip install triton-xpu==3.7.0
-
-# remove torch bundled oneccl to avoid conflicts
-RUN --mount=type=cache,target=/root/.cache/uv \
+    echo "triton @ https://example.com/blocked" > /tmp/vllm_omni_constraints.txt && \
+    PIP_CONSTRAINT=/tmp/vllm_omni_constraints.txt \
+    uv pip install --no-build-isolation \
+    --extra-index-url https://mirrors.ustc.edu.cn/pypi/simple/ \
+    ".[dev]" && \
     uv pip uninstall oneccl oneccl-devel
 
 FROM vllm-omni AS vllm-omni-openai

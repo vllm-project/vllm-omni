@@ -16,8 +16,8 @@ from datetime import datetime
 from typing import Any, Literal
 
 import aiohttp
+import numpy as np
 import pybase64 as base64
-from pydub import AudioSegment
 from tqdm.asyncio import tqdm
 from vllm.benchmarks import datasets
 from vllm.benchmarks.datasets import SampleRequest
@@ -530,6 +530,53 @@ def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
     return max(fallback_tokens, default=None)
 
 
+def _apply_usage_to_output(output: MixRequestFuncOutput, usage: dict[str, Any]) -> int | None:
+    """Apply OpenAI ``usage`` fields to the benchmark output."""
+    if (pt := _coerce_positive_int(usage.get("prompt_tokens"))) is not None:
+        output.prompt_len = pt
+    completion_tokens = _coerce_positive_int(usage.get("completion_tokens"))
+    if completion_tokens is not None:
+        output.output_tokens = max(int(output.output_tokens or 0), completion_tokens)
+    return completion_tokens
+
+
+def _resolve_token_delta_from_usage(
+    completion_tokens: int | None,
+    completion_tokens_seen: int,
+) -> tuple[int, int]:
+    if completion_tokens is None or completion_tokens <= completion_tokens_seen:
+        return 0, completion_tokens_seen
+    delta = completion_tokens - completion_tokens_seen
+    return delta, completion_tokens
+
+
+def _record_text_token_stream_intervals(
+    output: MixRequestFuncOutput,
+    *,
+    timestamp: float,
+    start_time: float,
+    token_delta: int,
+    most_recent_timestamp: float,
+) -> float:
+    """Record TTFT/ITL for ``token_delta`` newly generated text tokens."""
+    if token_delta <= 0:
+        return most_recent_timestamp
+
+    if output.ttft == 0.0:
+        output.ttft = timestamp - start_time
+        output.text_latency = timestamp - start_time
+        most_recent_timestamp = timestamp
+        if token_delta > 1:
+            output.itl.extend([0.0] * (token_delta - 1))
+        return most_recent_timestamp
+
+    interval = max(timestamp - most_recent_timestamp, 0.0)
+    per_token = interval / token_delta
+    output.itl.extend([per_token] * token_delta)
+    output.text_latency = timestamp - start_time
+    return timestamp
+
+
 def _update_output_stage_metrics_from_payload(
     output: MixRequestFuncOutput,
     data: dict[str, Any],
@@ -541,7 +588,7 @@ def _update_output_stage_metrics_from_payload(
         return
     if update_output_tokens:
         if (num_tokens_out := _extract_output_tokens_from_metrics(metrics)) is not None:
-            output.output_tokens = num_tokens_out
+            output.output_tokens = max(int(output.output_tokens or 0), num_tokens_out)
     if isinstance(sid := metrics.get("stage_id"), int):
         output.stage_id = sid
     if isinstance(final_output_type := metrics.get("final_output_type"), str):
@@ -624,6 +671,14 @@ async def async_request_openai_chat_omni_completions(
         "stream": True,
         "stream_options": {
             "include_usage": True,
+            # Per-chunk completion_tokens lets _resolve_token_delta_from_usage
+            # compute the exact token count for each SSE flush.  Without this,
+            # one SSE chunk can carry multiple tokens (asyncio coalescing), so
+            # len(itl)+1 < actual_tokens and ITL measures per-chunk latency
+            # (~1.74× tokens_per_chunk) rather than true per-token latency.
+            # NOTE: the vLLM StreamOptions field is "continuous_usage_stats",
+            # NOT "include_continuous_usage".
+            "continuous_usage_stats": True,
         },
     }
     _update_payload_common(payload, request_func_input)
@@ -653,16 +708,14 @@ async def async_request_openai_chat_omni_completions(
         # Reset per-attempt state so that retries do not mix partial
         # outputs or metrics from previous attempts.
         generated_text = ""
-        generated_audio = None
         # For wav responses, accumulate decoded PCM bytes per chunk
-        # to avoid repeated AudioSegment decode/concat.
+        # to avoid repeated decode/concat.
         wav_pcm_buffer = bytearray()
         wav_audio_params: tuple[int, int, int] | None = None
         wav_inconsistent_chunk_count = 0
         first_inconsistent_wav_params: tuple[int, int, int] | None = None
         # For non-wav responses, accumulate encoded bytes then decode once.
         audio_bytes_buffer = bytearray()
-        ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
@@ -686,6 +739,7 @@ async def async_request_openai_chat_omni_completions(
         output.image_generation_time_ms = 0.0
         output.image_pixels = 0
         output.denoise_step_latency_ms = 0.0
+        completion_tokens_seen = 0
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
@@ -713,22 +767,45 @@ async def async_request_openai_chat_omni_completions(
                             if chunk != "[DONE]":
                                 timestamp = time.perf_counter()
                                 data = json.loads(chunk)
+                                _update_output_stage_metrics_from_payload(output, data)
+                                usage = data.get("usage")
+                                completion_tokens = None
+                                if isinstance(usage, dict):
+                                    completion_tokens = _apply_usage_to_output(output, usage)
+
                                 if choices := data.get("choices"):
                                     modality = data.get("modality")
-                                    delta = choices[0].get("delta") or {}
+                                    choice = choices[0]
+                                    delta = choice.get("delta") or {}
                                     content = delta.get("content")
                                     if not content and isinstance(delta.get("audio"), dict):
                                         content = delta["audio"].get("data")
                                     if modality == "text":
-                                        # First token
-                                        if ttft == 0.0:
-                                            ttft = timestamp - st
-                                            output.ttft = ttft
-                                        else:
-                                            output.itl.append(timestamp - most_recent_timestamp)
-                                        generated_text += content or ""
-                                        most_recent_timestamp = timestamp
-                                        output.text_latency = timestamp - st
+                                        token_delta, completion_tokens_seen = _resolve_token_delta_from_usage(
+                                            completion_tokens,
+                                            completion_tokens_seen,
+                                        )
+                                        token_ids = choice.get("token_ids")
+                                        if token_delta == 0 and token_ids:
+                                            token_delta = len(token_ids)
+                                            if completion_tokens is not None:
+                                                completion_tokens_seen = max(
+                                                    completion_tokens_seen,
+                                                    completion_tokens,
+                                                )
+                                        has_text_content = bool(content)
+                                        if token_delta == 0 and has_text_content and completion_tokens is None:
+                                            token_delta = 1
+                                        if token_delta > 0:
+                                            most_recent_timestamp = _record_text_token_stream_intervals(
+                                                output,
+                                                timestamp=timestamp,
+                                                start_time=st,
+                                                token_delta=token_delta,
+                                                most_recent_timestamp=most_recent_timestamp,
+                                            )
+                                        if has_text_content:
+                                            generated_text += content
                                     elif modality == "audio":
                                         if output.audio_ttfp == 0.0:
                                             output.audio_ttfp = timestamp - st
@@ -763,7 +840,6 @@ async def async_request_openai_chat_omni_completions(
                                         if content_image_ms > 0:
                                             output.image_generation_time_ms += content_image_ms
 
-                                _update_output_stage_metrics_from_payload(output, data)
                                 (
                                     metrics_image_count,
                                     metrics_image_ms,
@@ -779,10 +855,6 @@ async def async_request_openai_chat_omni_completions(
                                 if metrics_denoise_step_ms > output.denoise_step_latency_ms:
                                     output.denoise_step_latency_ms = metrics_denoise_step_ms
 
-                                if usage := data.get("usage"):
-                                    if (pt := usage.get("prompt_tokens")) is not None:
-                                        output.prompt_len = pt
-
                     if wav_inconsistent_chunk_count > 0:
                         logger.warning(
                             "Dropped %d wav chunks with inconsistent params during benchmark "
@@ -795,30 +867,39 @@ async def async_request_openai_chat_omni_completions(
 
                     output.latency = timestamp - st
                     output.generated_text = generated_text
+                    if output.itl:
+                        # Align text_latency with ITL so TPOT formula and
+                        # mean(ITL) are consistent.  Do NOT infer output_tokens
+                        # from len(itl)+1: one SSE chunk may carry multiple
+                        # tokens, so the ITL count understates the real count.
+                        output.text_latency = output.ttft + sum(output.itl)
+                    audio_duration_sec = 0.0
+                    audio_frames = 0
                     if response_format == "wav" and wav_pcm_buffer and wav_audio_params is not None:
                         channels, sample_width, frame_rate = wav_audio_params
-                        generated_audio = AudioSegment(
-                            data=bytes(wav_pcm_buffer),
-                            sample_width=sample_width,
-                            frame_rate=frame_rate,
-                            channels=channels,
-                        )
+                        frame_width = sample_width * channels
+                        if frame_width > 0:
+                            audio_frames = len(wav_pcm_buffer) // frame_width
+                            audio_duration_sec = audio_frames / frame_rate
+                        else:
+                            logger.warning("Audio frame width is zero")
                     elif audio_bytes_buffer:
                         try:
-                            generated_audio = AudioSegment.from_file(
+                            from vllm.multimodal.audio import get_audio_duration
+                            from vllm.multimodal.media.audio import load_audio
+
+                            waveform, sr = load_audio(
                                 io.BytesIO(bytes(audio_bytes_buffer)),
-                                format=response_format,
+                                sr=None,
+                                mono=False,
                             )
+                            audio_duration_sec = get_audio_duration(y=waveform, sr=sr)
+                            audio_frames = int(audio_duration_sec * sr)
                         except Exception as ex:
                             logger.warning("Failed to decode accumulated audio bytes: %s", ex)
-                    if generated_audio is not None:
-                        output.audio_duration = len(generated_audio) / 1000.0
-                        frame_width = generated_audio.frame_width
-                        if frame_width > 0:
-                            output.audio_frames = len(generated_audio.raw_data) // frame_width
-                        else:
-                            output.audio_frames = 0
-                            logger.warning("Audio frame width is zero")
+                    if audio_duration_sec > 0 or audio_frames > 0:
+                        output.audio_duration = audio_duration_sec
+                        output.audio_frames = audio_frames
                         audio_duration = output.audio_duration
                         if audio_duration > 0:
                             output.audio_rtf = audio_generate_time / output.audio_duration
@@ -827,8 +908,29 @@ async def async_request_openai_chat_omni_completions(
                             logger.warning("Audio duration is zero")
                         if _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False):
                             try:
-                                seg = generated_audio.set_frame_rate(24000).set_channels(1).set_sample_width(2)
-                                output.tts_output_pcm_bytes = bytes(seg.raw_data)
+                                if response_format == "wav" and wav_pcm_buffer and wav_audio_params is not None:
+                                    from vllm.multimodal.audio import AudioResampler
+
+                                    pcm_channels, pcm_sw, pcm_rate = wav_audio_params
+                                    pcm = np.frombuffer(
+                                        bytes(wav_pcm_buffer), dtype=np.int16 if pcm_sw == 2 else np.float32
+                                    )
+                                    if pcm_channels > 1:
+                                        pcm = pcm.reshape(-1, pcm_channels).mean(axis=1).astype(pcm.dtype)
+                                    pcm_f32 = pcm.astype(np.float32) / 32767.0 if pcm.dtype == np.int16 else pcm
+                                    if pcm_rate != 24000:
+                                        resampler = AudioResampler(target_sr=24000)
+                                        pcm_f32 = resampler.resample(pcm_f32, orig_sr=pcm_rate)
+                                    output.tts_output_pcm_bytes = (pcm_f32 * 32767).astype(np.int16).tobytes()
+                                elif audio_bytes_buffer:
+                                    from vllm.multimodal.media.audio import load_audio
+
+                                    waveform, _ = load_audio(
+                                        io.BytesIO(bytes(audio_bytes_buffer)),
+                                        sr=24000,
+                                        mono=True,
+                                    )
+                                    output.tts_output_pcm_bytes = (waveform * 32767).astype(np.int16).tobytes()
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
                     output.success = True
@@ -1170,6 +1272,7 @@ async def benchmark(
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
+    self_timed: bool = False,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -1332,6 +1435,7 @@ async def benchmark(
         ramp_up_strategy,
         ramp_up_start_rps,
         ramp_up_end_rps,
+        self_timed,
     ):
         if ramp_up_strategy is not None:
             current_int_rps = int(current_request_rate)
@@ -1420,6 +1524,7 @@ async def benchmark(
             defs.AVERAGE_PIXELS_PER_IMAGE: getattr(metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
             defs.MEAN_DENOISE_STEP_LATENCY_MS: getattr(metrics, defs.MEAN_DENOISE_STEP_LATENCY_MS),
             "input_lens": [output.prompt_len for output in outputs],
+            "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,
             "ttfts": [output.ttft for output in outputs],
             "itls": [output.itl for output in outputs],

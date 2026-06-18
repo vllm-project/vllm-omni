@@ -62,6 +62,7 @@ stages:
       max_tokens: 8192
       detokenize: true
       skip_special_tokens: false
+      include_stop_str_in_output: true,
 
   - stage_id: 1
     max_num_seqs: 1

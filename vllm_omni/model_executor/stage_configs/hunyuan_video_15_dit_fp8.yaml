@@ -1,0 +1,38 @@
+# Stage config for running HunyuanVideo-1.5 DiT with ModelOpt FP8 auto-detect.
+# Single GPU. Bump `tensor_parallel_size` and `devices` for multi-GPU TP.
+#
+# Use with a ModelOpt FP8 checkpoint (e.g. produced by
+# examples/quantization/quantize_hunyuanvideo_15_modelopt_fp8.py).
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dit
+      model_class_name: HunyuanVideo15Pipeline
+      max_num_seqs: 1
+      enforce_eager: true
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+      # HunyuanVideo-1.5 peak VRAM is dominated by the single-shot VAE decode of
+      # the full video (the DiT contributes little), so tiling the decode is the
+      # main memory lever — far more than FP8 (e.g. 480x832x33: ~117 -> ~47 GiB).
+      # Default it on here; override with --vae-use-tiling/false if you have headroom.
+      vae_use_tiling: true
+      parallel_config:
+        tensor_parallel_size: 1
+
+    final_output: true
+    final_output_type: video
+    is_comprehension: false
+    default_sampling_params:
+      seed: 42
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1

@@ -49,6 +49,7 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
 )
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
@@ -363,12 +364,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         latents: tuple[torch.Tensor, torch.Tensor],
         do_true_cfg: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Post-step sync: .contiguous() + cuda.synchronize()"""
+        """Post-step sync: .contiguous() + platform synchronize."""
         latents = tuple(t.contiguous() for t in latents)
         if do_true_cfg and get_classifier_free_guidance_world_size() > 1:
-            device = next((t.device for t in latents if t.is_cuda), None)
-            if device is not None:
-                torch.cuda.current_stream(device).synchronize()
+            current_omni_platform.synchronize()
         return latents
 
     # -----------------------------------------------------------------------
@@ -1105,10 +1104,27 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     .replace("img_emb.proj.3.", "img_emb.fc2.")
                     .replace("img_emb.proj.4.", "img_emb.norm2.")
                 )
+
+                # Self-attn q/k/v are fused into a single QKVParallelLinear; route
+                # each separate checkpoint weight/bias to the packed `qkv` param
+                # with its shard id. cross_attn keeps separate q/k/v (q from x,
+                # k/v from context — not fusible), so it is left untouched here.
+                qkv_shard_id: str | None = None
+                for shard_id in ("q", "k", "v"):
+                    needle = f".self_attn.{shard_id}."
+                    if needle in new_name:
+                        new_name = new_name.replace(needle, ".self_attn.qkv.")
+                        qkv_shard_id = shard_id
+                        break
+
                 if new_name in params:
                     param = params[new_name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, tensor)
+                    if qkv_shard_id is not None:
+                        # QKVParallelLinear.weight_loader needs the shard id.
+                        param.weight_loader(param, tensor, qkv_shard_id)
+                    else:
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, tensor)
                     loaded.add(new_name)
                 elif new_name in buffers:
                     buffers[new_name].data.copy_(tensor)
