@@ -228,6 +228,7 @@ markers = [
     "tts: TTS model tests",
     "cache: Cache backend tests",
     "parallel: Parallelism/distributed tests",
+    "sp: Sequence parallelism tests",
     "example: Doc example code tests",
     # platform markers
     "cpu: Tests that run on CPU",

@@ -903,7 +903,12 @@ class OmniDiffusionConfig:
                         )
                 else:
                     tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
-                    self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
+                    if tf_config_dict is None:
+                        tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model)
+                    if tf_config_dict is not None:
+                        self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
+                    else:
+                        self.set_tf_model_config(TransformerConfig())
             else:
                 raise FileNotFoundError("model_index.json not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
