@@ -423,6 +423,67 @@ class DiffusionCacheConfig:
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{item}'")
 
 
+def resolve_model_class_name(model: str | None, diffusion_load_format: str = "default") -> str | None:
+    """Resolve the diffusion pipeline class name from the model config.
+
+    Read-only counterpart of ``OmniDiffusionConfig.enrich_config``, safe to call
+    client-side. Returns ``None`` if the pipeline can't be determined.
+    """
+    from vllm.transformers_utils.config import get_hf_file_to_dict
+
+    if not model:
+        return None
+
+    is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
+
+    # Diffusers models: read _class_name from model_index.json.
+    try:
+        model_index = get_hf_file_to_dict("model_index.json", model)
+    except Exception:
+        model_index = None
+    if model_index is not None:
+        return model_index.get("_class_name")
+    if diffusion_load_format == "diffusers":
+        return "DiffusersAdapterPipeline"
+
+    # Other models: map model_type / architecture from config.json.
+    try:
+        cfg = get_hf_file_to_dict("config.json", model) or {}
+    except Exception:
+        cfg = {}
+    model_type = cfg.get("model_type")
+    architectures = cfg.get("architectures") or []
+
+    if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+        return "BagelPipeline"
+    if (
+        model_type == "lance"
+        or "LancePipeline" in architectures
+        or cfg.get("model_name") == "Lance"
+        or is_lance_subfolder
+    ):
+        return "LancePipeline"
+    if model_type == "neo_chat":
+        return "SenseNovaU1Pipeline"
+    if "BailingMM2NativeForConditionalGeneration" in architectures or model_type in (
+        "bailingmm_moe_v2_lite",
+        "ming_flash_omni",
+        "ming_flash_omni_thinker",
+    ):
+        return "MingImagePipeline"
+    if model_type == "nextstep":
+        return "NextStep11Pipeline"
+    if model_type == "s2v":
+        return "WanS2VPipeline"
+    if model_type == "vla":
+        from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
+
+        return "DreamZeroPipeline" if _looks_like_dreamzero(model) else None
+    if len(architectures) == 1:
+        return architectures[0]
+    return None
+
+
 @dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)

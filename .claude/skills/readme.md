@@ -30,6 +30,12 @@ include:
 - `precheck-pr`: self-check a branch before creating a PR — validates PR title
   format, catches dead code, verifies accuracy/perf claims, and confirms merge
   readiness
+- `vllm-omni-test`: guides generation and execution of CI-aligned tests (L1–L4),
+  pytest marker selection (`core_model` / `advanced_model` / `full_model`,
+  `omni` / `tts` / `diffusion`), Buildkite wiring (`test-ready.yml`,
+  `test-merge.yml`, `test-nightly.yml`, `test-weekly.yml`), and copy-paste
+  local plus CI-like `pytest` commands; see `references/test-routing.md` for
+  level-to-command mapping
 - `review-pr`: provides a structured workflow for reviewing pull requests
 - `vllm-omni-npu-model-runner-upgrade`: upgrades NPU model runners to align with the
   latest vllm-ascend NPUModelRunner

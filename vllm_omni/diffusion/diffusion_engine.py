@@ -27,8 +27,6 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.io_support import (
     get_dummy_run_num_frames,
-    get_extra_body_params,
-    get_extra_output_params,
     image_color_format,
     supports_audio_output,
     supports_multimodal_input,
@@ -61,8 +59,6 @@ __all__ = [
     "_RpcTask",
     "_move_tensor_tree_to_cpu",
     "get_dummy_run_num_frames",
-    "get_extra_body_params",
-    "get_extra_output_params",
     "image_color_format",
     "supports_audio_output",
     "supports_multimodal_input",
