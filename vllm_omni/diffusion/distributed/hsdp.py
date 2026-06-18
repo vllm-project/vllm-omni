@@ -88,6 +88,7 @@ def _create_hsdp_mesh(
 def apply_hsdp_to_model(
     model: nn.Module,
     hsdp_config: HSDPInferenceConfig,
+    target_device: torch.device | None = None,
 ) -> nn.Module:
     """
     Apply HSDP sharding to a model that already has weights loaded.
@@ -98,6 +99,10 @@ def apply_hsdp_to_model(
     Args:
         model: Model instance with weights already loaded
         hsdp_config: HSDP configuration with HSDP mesh dimensions
+        target_device: Worker's execution device. When the model declares
+            _hsdp_ignored_modules, those modules are excluded from FSDP's
+            mesh-driven device placement, so the caller must specify where to
+            put them. Optional only when there are no ignored modules.
 
     Returns:
         HSDP-wrapped model ready for inference
@@ -158,6 +163,40 @@ def apply_hsdp_to_model(
     if not hsdp_shard_conditions or len(hsdp_shard_conditions) == 0:
         raise ValueError(f"Model {type(model).__name__} has no _hsdp_shard_conditions defined")
 
+    # Collect parameters of any modules the model wants excluded from FSDP sharding.
+    # See _hsdp_ignored_modules on each model class. These params keep their
+    # original dtype/storage and are not subject to MixedPrecisionPolicy on the root
+    # FSDP wrap. Useful for small auxiliary modules (e.g., timestep embedders) that
+    # need to stay in a higher-precision dtype than the bulk of the model.
+    ignored_module_names = getattr(model, "_hsdp_ignored_modules", []) or []
+    ignored_params: set[nn.Parameter] = set()
+    # FSDP wraps move sharded params to mesh devices automatically, but
+    # ignored modules stay wherever load_weights left them (CPU under HSDP).
+    # The caller (diffusers_loader / similar) is responsible for telling us
+    # which device the worker should run on, matching the convention used
+    # for VAEs / encoders / resident_modules.
+    if ignored_module_names and target_device is None:
+        raise ValueError(
+            f"Model {type(model).__name__} declares _hsdp_ignored_modules="
+            f"{ignored_module_names} but apply_hsdp_to_model was called "
+            "without target_device. The caller must pass target_device so "
+            "the ignored modules can be placed on the worker's execution device."
+        )
+    for mod_name in ignored_module_names:
+        sub_mod = getattr(model, mod_name, None)
+        if sub_mod is None:
+            logger.warning("_hsdp_ignored_modules entry %r not found on model", mod_name)
+            continue
+        sub_mod.to(target_device)
+        ignored_params.update(sub_mod.parameters())
+    if ignored_params:
+        logger.info(
+            "HSDP excluding %d parameter tensors from sharding (modules: %s, moved to %s)",
+            len(ignored_params),
+            ignored_module_names,
+            target_device,
+        )
+
     # Apply HSDP sharding, this will automatically handle weight distribution
     shard_model(
         model,
@@ -165,6 +204,7 @@ def apply_hsdp_to_model(
         mp_policy=mp_policy,
         mesh=device_mesh,
         hsdp_shard_conditions=hsdp_shard_conditions,
+        ignored_params=ignored_params if ignored_params else None,
     )
 
     for param in model.parameters():
@@ -181,8 +221,17 @@ def shard_model(
     mp_policy: MixedPrecisionPolicy | None = None,
     mesh: DeviceMesh | None = None,
     hsdp_shard_conditions: list[Callable[[str, nn.Module], bool]],
+    ignored_params: set[nn.Parameter] | None = None,
 ) -> None:
-    """Apply HSDP sharding to model modules based on shard conditions."""
+    """Apply HSDP sharding to model modules based on shard conditions.
+
+    ignored_params (if provided) are excluded from the root fully_shard
+    wrap, so they are not collected into the root flat-parameter, are not
+    subject to MixedPrecisionPolicy, and retain their original dtype.
+    Per-submodule shard wraps do not receive ignored_params because the
+    ignored modules are expected to live at the root level, not inside any
+    block matched by hsdp_shard_conditions.
+    """
     hsdp_kwargs: dict[str, Any] = {
         "reshard_after_forward": reshard_after_forward,
         "mesh": mesh,
@@ -198,5 +247,12 @@ def shard_model(
     if num_sharded == 0:
         raise ValueError("No modules were sharded")
 
-    fully_shard(model, **hsdp_kwargs)
-    logger.info("Sharded %d modules + root", num_sharded)
+    root_kwargs = dict(hsdp_kwargs)
+    if ignored_params:
+        root_kwargs["ignored_params"] = ignored_params
+    fully_shard(model, **root_kwargs)
+    logger.info(
+        "Sharded %d modules + root (ignored_params=%d)",
+        num_sharded,
+        len(ignored_params) if ignored_params else 0,
+    )

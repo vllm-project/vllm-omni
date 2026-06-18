@@ -22,6 +22,21 @@ from transformers import AutoFeatureExtractor, AutoProcessor
 from transformers.feature_extraction_utils import BatchFeature, FeatureExtractionMixin
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+from transformers.utils import logging
+
+try:
+    from transformers import AutoVideoProcessor
+except ImportError:
+    AutoVideoProcessor = None
+
+_HAS_VIDEO_PROCESSOR = AutoVideoProcessor is not None
+
+logger = logging.get_logger(__name__)
+
+
+def raise_missing_video_processor():
+    raise ValueError("Ming Flash Omni video inputs require a Transformers 5.x `video_processor`.")
+
 
 DEFAULT_IMAGE_PATCH_TOKEN = "<imagePatch>"
 DEFAULT_IM_START_TOKEN = "<image>"
@@ -156,6 +171,8 @@ class MingFlashOmniProcessor(ProcessorMixin):
 
     attributes = ["image_processor", "audio_processor", "tokenizer"]
     image_processor_class = "AutoImageProcessor"
+    if _HAS_VIDEO_PROCESSOR:
+        video_processor_class = "AutoVideoProcessor"
     audio_processor_class = "AutoFeatureExtractor"
     tokenizer_class = "AutoTokenizer"
 
@@ -167,6 +184,7 @@ class MingFlashOmniProcessor(ProcessorMixin):
         merge_size: int = 2,
         **kwargs,
     ):
+        video_processor = kwargs.pop("video_processor", None)
         # Enforce that all sub-processors exist
         # Keep None defaults in the signature for HF ProcessorMixin compatibility
         if image_processor is None:
@@ -180,15 +198,46 @@ class MingFlashOmniProcessor(ProcessorMixin):
         self.image_token = PLACEHOLDER_IMAGE_TOKEN_IN_TEXT
         self.video_token = PLACEHOLDER_VIDEO_TOKEN_IN_TEXT
         self.audio_token = PLACEHOLDER_AUDIO_TOKEN_IN_TEXT
+        if video_processor is not None and not _HAS_VIDEO_PROCESSOR:
+            raise ValueError("`video_processor` requires transformers with `AutoVideoProcessor` support.")
+
         super().__init__(
             image_processor=image_processor,
             audio_processor=audio_processor,
             tokenizer=tokenizer,
         )
+        self.video_processor = video_processor
 
         # Fall back to the tokenizer's own chat_template.
         if self.chat_template is None:
             self.chat_template = getattr(tokenizer, "chat_template", None)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+        video_processor = kwargs.pop("video_processor", None)
+        processor = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        if video_processor is not None:
+            processor.video_processor = video_processor
+        elif _HAS_VIDEO_PROCESSOR:
+            try:
+                processor.video_processor = AutoVideoProcessor.from_pretrained(
+                    pretrained_model_name_or_path,
+                    *args,
+                    **kwargs,
+                )
+            except OSError:
+                processor.video_processor = None
+            except (ValueError, KeyError) as exc:
+                logger.warning("Failed to load optional Ming video processor: %s", exc)
+                processor.video_processor = None
+        return processor
+
+    def save_pretrained(self, save_directory, push_to_hub: bool = False, **kwargs):
+        output = super().save_pretrained(save_directory, push_to_hub=push_to_hub, **kwargs)
+        video_processor = getattr(self, "video_processor", None)
+        if video_processor is not None:
+            video_processor.save_pretrained(save_directory)
+        return output
 
     def __call__(
         self,
@@ -211,7 +260,6 @@ class MingFlashOmniProcessor(ProcessorMixin):
         if images is not None:
             image_outputs = self.image_processor(
                 images=images,
-                videos=None,
                 return_tensors="pt",
                 **kwargs.get("images_kwargs", {}),
             )
@@ -220,12 +268,15 @@ class MingFlashOmniProcessor(ProcessorMixin):
                 text = self._expand_image_tokens(text, image_outputs["image_grid_thw"])
 
         if videos is not None:
-            video_outputs = self.image_processor(
-                images=None,
-                videos=videos,
-                return_tensors="pt",
-                **kwargs.get("videos_kwargs", {}),
-            )
+            video_processor = getattr(self, "video_processor", None)
+            if video_processor is not None:
+                video_outputs = video_processor(
+                    videos=videos,
+                    return_tensors="pt",
+                    **kwargs.get("videos_kwargs", {}),
+                )
+            else:
+                raise_missing_video_processor()
             if "pixel_values" in video_outputs:
                 video_outputs["pixel_values_videos"] = video_outputs.pop("pixel_values")
             if "image_grid_thw" in video_outputs:
@@ -423,6 +474,9 @@ class MingFlashOmniProcessor(ProcessorMixin):
             + self.image_processor.model_input_names
             + self.audio_processor.model_input_names
         )
+        video_processor = getattr(self, "video_processor", None)
+        if video_processor is not None:
+            names += video_processor.model_input_names
         return list(dict.fromkeys(names))
 
 

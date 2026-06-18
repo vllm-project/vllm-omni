@@ -241,7 +241,7 @@ class OmniPlatform(Platform):
 class UnspecifiedOmniPlatform(OmniPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED
     _enum = PlatformEnum.UNSPECIFIED
-    device_type = ""
+    device_type = "cpu"
 
     @classmethod
     def get_device_count(cls) -> int:

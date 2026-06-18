@@ -27,6 +27,7 @@ logger = logging.get_logger(__name__)
 
 class BailingMoeV2Config(PretrainedConfig):
     model_type = "bailing_moe_v2"
+    ignore_keys_at_rope_validation = {"mrope_section"}
 
     def __init__(
         self,
@@ -237,6 +238,7 @@ class WhisperEncoderConfig(PretrainedConfig):
 
 class BailingMM2Config(PretrainedConfig):
     model_type = "bailingmm_moe_v2_lite"
+    ignore_keys_at_rope_validation = {"mrope_section"}
     is_composition = True
     sub_configs: ClassVar = {"llm_config": AutoConfig}
 
@@ -352,9 +354,13 @@ class MingFlashOmniTalkerConfig(PretrainedConfig):
         self.campplus_model = campplus_model
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
-        if isinstance(self.llm_config, dict):
-            return PretrainedConfig.from_dict(self.llm_config)
-        return self.llm_config
+        # NOTE: transformers v5 runs validators (e.g. validate_token_ids -> get_text_config)
+        # during PretrainedConfig.__init__, before llm_config is assigned
+        llm_config = getattr(self, "llm_config", None)
+        if isinstance(llm_config, dict):
+            return PretrainedConfig.from_dict(llm_config)
+
+        return llm_config
 
 
 class MingFlashOmniConfig(PretrainedConfig):

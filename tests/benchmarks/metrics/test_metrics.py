@@ -14,6 +14,37 @@ from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
 
+def test_tpot_matches_mean_itl_per_request():
+    """TPOT and pooled ITL should agree when output_len tracks ITL samples."""
+    output = MixRequestFuncOutput()
+    output.success = True
+    output.prompt_len = 100
+    # Simulate server reporting more tokens than SSE chunks (bundled tokens).
+    # len(itl)=2 → 2 inter-chunk intervals, but server generated 10 tokens.
+    output.output_tokens = 10
+    output.generated_text = "hello world"
+    output.ttft = 0.05
+    output.text_latency = 0.25
+    output.latency = 0.30
+    output.itl = [0.10, 0.10]
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[output],
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[50.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["tpot", "itl"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+
+    assert metrics.mean_tpot_ms == pytest.approx(metrics.mean_itl_ms, rel=1e-6, abs=1e-6)
+
+
 def _make_output(prompt_len: int, output_tokens: int = 10) -> MixRequestFuncOutput:
     """Build a minimal successful MixRequestFuncOutput for metrics aggregation."""
     output = MixRequestFuncOutput()
