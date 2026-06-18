@@ -53,7 +53,7 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
     UnregisterRemoteReplicaMessage,
 )
-from vllm_omni.engine.orchestrator_profiler import get_orchestrator_profiler
+from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
@@ -185,7 +185,7 @@ class Orchestrator:
         remote_replica_factory: RemoteReplicaFactory | None = None,
         transfer_emitter: Any = None,
         log_stats: bool = False,
-        enable_orch_profiler: bool = False,
+        enable_orch_monitor: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -194,10 +194,13 @@ class Orchestrator:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
-        self._profiler = get_orchestrator_profiler(enabled=enable_orch_profiler)
+        self._orch_monitor = create_orch_monitor(
+            enabled=enable_orch_monitor,
+            replica_sampler=self._sample_replica_metrics,
+        )
         for stage_id, pool in enumerate(self.stage_pools):
             for replica_id in pool.live_replica_ids():
-                self._profiler.register_replica(stage_id, replica_id)
+                self._orch_monitor.register_replica(stage_id, replica_id)
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
@@ -368,8 +371,8 @@ class Orchestrator:
                         if not t.done():
                             t.cancel()
 
+            self._orch_monitor.flush()
             self._shutdown_stages()
-            self._profiler.flush()
 
             # Close the hub last so any in-flight dispatch still has access.
             if self._hub is not None:
@@ -448,6 +451,7 @@ class Orchestrator:
                     for client in pool.clients:
                         if hasattr(client, "_shutting_down"):
                             client._shutting_down = True
+                self._orch_monitor.flush()
                 self._shutdown_stages()
                 break
             else:
@@ -661,6 +665,17 @@ class Orchestrator:
 
     # ---- Orchestration loop ----
 
+    def _sample_replica_metrics(self) -> dict[str, tuple[int, int]]:
+        samples: dict[str, tuple[int, int]] = {}
+        for stage_id, pool in enumerate(self.stage_pools):
+            for replica_id in pool.live_replica_ids():
+                key = replica_key(stage_id, replica_id)
+                samples[key] = (
+                    pool.replica_outputs_queue_size(replica_id),
+                    pool.replica_inflight_count(replica_id),
+                )
+        return samples
+
     async def _orchestration_output_handler(self) -> None:
         """Poll all stages, handle transfers, send final outputs to main."""
         try:
@@ -678,8 +693,6 @@ class Orchestrator:
                 for replica_id in pool.live_replica_ids():
                     if self._shutdown_event.is_set():
                         return
-                    self._profiler.register_replica(stage_id, replica_id)
-                    self._profiler.record_queue(stage_id, replica_id, pool.replica_queue_size(replica_id))
 
                     if pool.stage_type == "diffusion":
                         output = pool.poll_diffusion_output(replica_id)
@@ -688,7 +701,6 @@ class Orchestrator:
 
                         pool.record_output_timestamps([output])
                         await self._handle_processed_outputs(stage_id, replica_id, [output])
-                        self._profiler.record_outputs(stage_id, replica_id, [output])
                         idle = False
                     else:
                         try:
@@ -770,10 +782,9 @@ class Orchestrator:
                             raise
 
                         await self._handle_processed_outputs(stage_id, replica_id, raw_output)
-                        self._profiler.record_outputs(stage_id, replica_id, raw_output)
                         idle = False
 
-            self._profiler.note_loop(idle=idle, active_requests=len(self.request_states))
+            self._orch_monitor.note_loop(idle=idle)
             if idle:
                 await asyncio.sleep(0.001)
             else:

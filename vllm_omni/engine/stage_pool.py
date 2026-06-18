@@ -429,14 +429,20 @@ class StagePool:
             return None
         return cast(StagePoolLLMClient, client)
 
-    def replica_queue_size(self, replica_id: int) -> int:
-        """Best-effort queue/backlog size for profiler sampling.
+    def replica_outputs_queue_size(self, replica_id: int) -> int:
+        """Depth of the EngineCore async client's outputs_queue (MP receive backlog)."""
+        if replica_id < 0 or replica_id >= len(self.clients) or self.clients[replica_id] is None:
+            return 0
+        outputs_queue = getattr(self.clients[replica_id], "outputs_queue", None)
+        if outputs_queue is None:
+            return 0
+        try:
+            return max(int(outputs_queue.qsize()), 0)
+        except (AttributeError, NotImplementedError, RuntimeError, ValueError):
+            return 0
 
-        Distributed replicas publish scheduler queue length via coordinator
-        heartbeats. Local/in-process stages do not expose that value cheaply,
-        so fall back to the number of logical requests currently bound to the
-        replica in this stage.
-        """
+    def replica_inflight_count(self, replica_id: int) -> int:
+        """Number of logical requests currently bound/routed to this replica."""
         if replica_id < 0 or replica_id >= len(self.clients) or self.clients[replica_id] is None:
             return 0
         if self._hub is not None:
