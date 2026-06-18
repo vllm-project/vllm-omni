@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import types
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -230,6 +231,8 @@ def test_pipeline_registered_and_exported() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
     from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
     from vllm_omni.diffusion.registry import (
+        _DIFFUSION_ACTION_POST_PROCESS_FUNCS,
+        _DIFFUSION_IR_OP_PRIORITY_FUNCS,
         _DIFFUSION_MODELS,
         _DIFFUSION_POST_PROCESS_FUNCS,
         _DIFFUSION_PRE_PROCESS_FUNCS,
@@ -245,6 +248,10 @@ def test_pipeline_registered_and_exported() -> None:
     )
     assert _DIFFUSION_PRE_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_pre_process_func"
     assert _DIFFUSION_POST_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_post_process_func"
+    assert (
+        _DIFFUSION_ACTION_POST_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_action_post_process_func"
+    )
+    assert _DIFFUSION_IR_OP_PRIORITY_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_ir_op_priority_func"
     assert "Cosmos3OmniDiffusersPipeline" in CUSTOM_DIT_ENABLERS
     assert "Cosmos3OmniDiffusersPipeline" in cosmos3.__all__
 
@@ -411,6 +418,73 @@ def test_postprocess_handles_image_video_audio_and_validation() -> None:
         func({"image": torch.zeros(1, 3, 2, 4, 4)})
     with pytest.raises(ValueError, match="both image and video"):
         func({"image": video, "video": video})
+
+
+def test_action_postprocess_handles_robolab_policy_outputs() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        RoboLabPolicyInputs,
+        get_cosmos3_action_post_process_func,
+        make_robolab_action_postprocess_inputs,
+    )
+
+    func = get_cosmos3_action_post_process_func(SimpleNamespace())
+    inputs = RoboLabPolicyInputs(
+        prompt="Pick the cube.",
+        video_tensor=torch.zeros(1, 3, 3, 16, 16),
+        action_tensor=torch.zeros(2, 2),
+        action_condition_indexes=[0],
+        action_start_frame_offset=1,
+        raw_action_dim=2,
+        domain_id=7,
+        fps=15.0,
+        height=16,
+        width=16,
+        image_size=None,
+        num_frames=3,
+        num_inference_steps=4,
+        guidance_scale=3.0,
+        flow_shift=5.0,
+        seed=11,
+        history_length=1,
+        action_space="joint_pos",
+        observation={},
+    )
+
+    action = torch.tensor([[[0.0, 0.25], [1.0, 0.75]]])
+    custom_output = {"robolab_action_postprocess": make_robolab_action_postprocess_inputs(inputs)}
+    processed = func(action, custom_output=custom_output)
+
+    assert processed.shape == (1, 2)
+    assert processed.dtype == torch.zeros((), dtype=torch.float32).numpy().dtype
+    torch.testing.assert_close(torch.from_numpy(processed), torch.tensor([[1.0, 0.25]]))
+    assert "robolab_action_postprocess" not in custom_output
+
+
+def test_ir_op_priority_hook_preserves_platform_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_ir_op_priority_func
+
+    @dataclass
+    class FakeIrOpPriorityConfig:
+        rms_norm: list[str]
+        fused_add_rms_norm: list[str]
+        custom_op: list[str]
+
+    fake_kernel = types.ModuleType("vllm.config.kernel")
+    fake_kernel.IrOpPriorityConfig = FakeIrOpPriorityConfig
+    monkeypatch.setitem(sys.modules, fake_kernel.__name__, fake_kernel)
+
+    func = get_cosmos3_ir_op_priority_func(SimpleNamespace())
+    default_priority = FakeIrOpPriorityConfig(
+        rms_norm=["vllm_c", "native"],
+        fused_add_rms_norm=["vllm_c", "native"],
+        custom_op=["platform_kernel", "native"],
+    )
+
+    merged = func(default_priority, vllm_config=SimpleNamespace())
+
+    assert merged.rms_norm == ["native"]
+    assert merged.fused_add_rms_norm == ["native"]
+    assert merged.custom_op == ["platform_kernel", "native"]
 
 
 def test_prompt_formatting_and_checkpoint_key_remap(make_cosmos3_pipeline) -> None:
@@ -762,6 +836,95 @@ class TestForwardRouting:
         )
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
         assert output.custom_output["action"].shape == (1, 2, 2)
+        assert "action_only_output" not in output.custom_output
+
+    def test_forward_dispatches_robolab_policy_flow(
+        self,
+        make_cosmos3_pipeline,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+        pipeline = make_cosmos3_pipeline()
+        pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, action_gen=True, action_dim=4)
+        captured = self._install_forward_stubs(pipeline)
+        video_latents = torch.zeros(1, 2, 1, 1, 1)
+        velocity_mask = torch.ones(1, 1, 1, 1, 1)
+        condition_latents = torch.zeros_like(video_latents)
+
+        inputs = pipeline_cosmos3.RoboLabPolicyInputs(
+            prompt="Pick the cube.",
+            video_tensor=torch.zeros(1, 3, 3, 16, 16),
+            action_tensor=torch.zeros(2, 2),
+            action_condition_indexes=[0],
+            action_start_frame_offset=1,
+            raw_action_dim=2,
+            domain_id=7,
+            fps=15.0,
+            height=16,
+            width=16,
+            image_size=None,
+            num_frames=3,
+            num_inference_steps=4,
+            guidance_scale=3.0,
+            flow_shift=5.0,
+            seed=11,
+            history_length=1,
+            action_space="joint_pos",
+            observation={},
+        )
+
+        def fake_prepare_action_latents(**kwargs):
+            captured["prepare_action"] = kwargs
+            action_chunk_size = kwargs["action_chunk_size"]
+            raw_action_dim = int(kwargs["raw_action_dim"])
+            return (
+                torch.zeros(1, action_chunk_size, 4),
+                torch.ones(1, action_chunk_size, 1),
+                torch.zeros(1, action_chunk_size, 4),
+                raw_action_dim,
+            )
+
+        def fake_prepare_action_video(*args, **kwargs):
+            captured["prepare_action_video"] = {"args": args, "kwargs": kwargs}
+            return video_latents, velocity_mask, condition_latents
+
+        monkeypatch.setattr(
+            pipeline_cosmos3,
+            "build_robolab_unipc_scheduler",
+            lambda num_steps, shift, device: StubScheduler(list(range(num_steps, 0, -1)), flow_shift=shift),
+        )
+        pipeline._build_robolab_policy_inputs = lambda sp, prompt_data, request_id=None: inputs
+        pipeline._prepare_action_latents = fake_prepare_action_latents
+        pipeline._prepare_latents_action_video = fake_prepare_action_video
+        pipeline._decode_latents = lambda latents: (_ for _ in ()).throw(
+            AssertionError("RoboLab should not decode video")
+        )
+
+        output = pipeline.forward(SimpleNamespace(prompts=["ignored"], sampling_params=make_sampling_params()))
+
+        assert captured["format"] == {
+            "prompt": "Pick the cube.",
+            "negative_prompt": "",
+            "num_frames": 3,
+            "frame_rate": 15.0,
+            "height": 16,
+            "width": 16,
+            "is_t2i": False,
+        }
+        assert "flow_shifts" not in captured
+        assert pipeline.scheduler.set_timesteps_calls == []
+        assert captured["prepare_action"]["clean_action"] is inputs.action_tensor
+        assert captured["prepare_action"]["condition_indexes"] == [0]
+        assert captured["prepare_action_video"]["kwargs"] == {"image_size": None}
+        assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
+        assert captured["diffuse_calls"][-1]["timesteps"].tolist() == [4, 3, 2, 1]
+        assert output.output == {}
+        assert output.custom_output["action_only_output"] is True
+        assert output.custom_output["action"].shape == (1, 2, 2)
+        assert "actions" not in output.custom_output
+        assert "robolab_action_postprocess" in output.custom_output
+        assert "robolab_policy_inputs" not in output.custom_output
 
     @pytest.mark.parametrize(
         ("prompt", "sampling_params", "message"),

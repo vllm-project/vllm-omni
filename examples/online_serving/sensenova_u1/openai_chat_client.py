@@ -48,7 +48,7 @@ def generate(
     forwarded as top-level fields in the request payload.  The serving layer
     maps standard keys (height, width, seed, num_inference_steps) to sampling
     params and forwards model-specific keys (think, cfg_norm, img_cfg_scale,
-    …) to ``extra_args`` based on the pipeline's ``EXTRA_BODY_PARAMS``.
+    …) to ``extra_args`` based on the model extra registry.
 
     Returns:
         Image bytes (for image outputs) or text string (for text outputs).
@@ -131,7 +131,7 @@ def main():
     parser.add_argument("--width", type=int, default=2048, help="Image width")
     parser.add_argument("--num-steps", type=int, default=50, help="Inference steps")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    # Model-specific parameters (forwarded via EXTRA_BODY_PARAMS)
+    # Model-specific parameters forwarded via the model extra registry.
     parser.add_argument("--cfg-scale", type=float, default=4.0, help="CFG scale")
     parser.add_argument("--img-cfg-scale", type=float, help="Image CFG scale (img2img)")
     parser.add_argument("--cfg-norm", type=str, help="CFG normalization mode")

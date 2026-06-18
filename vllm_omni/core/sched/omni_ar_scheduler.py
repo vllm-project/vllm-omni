@@ -712,6 +712,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
 
+        # [Upstream compat] Discard request from in-flight prefills set added
+        # upstream for routed-experts in-flight reservation tracking.
+        # Use getattr for safety with test __new__ code paths.
+        getattr(self, "_inflight_prefills", set()).discard(request)
+
         # 1. Standard cleanup parts from base _free_request
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 

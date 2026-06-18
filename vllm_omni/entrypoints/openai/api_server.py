@@ -34,7 +34,6 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http, terminate_if_errored
-from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
 from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
@@ -56,10 +55,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.openai.orca_metrics import metrics_header
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
-from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
-from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
 from vllm.entrypoints.pooling.pooling.serving import ServingPooling
@@ -71,18 +67,22 @@ from vllm.entrypoints.serve.disagg.serving import ServingTokens
 from vllm.entrypoints.serve.instrumentator.basic import base
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
+from vllm.entrypoints.serve.utils.api_utils import (
+    load_aware_call,
+    process_lora_modules,
+    validate_json_request,
+    with_cancellation,
+)
+from vllm.entrypoints.serve.utils.error_response import create_error_response
+from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
 )
 from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
-)
-from vllm.entrypoints.utils import (
-    create_error_response,
-    load_aware_call,
-    process_lora_modules,
-    with_cancellation,
 )
 from vllm.logger import init_logger
 from vllm.tasks import POOLING_TASKS
@@ -132,7 +132,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
     ReferenceImage,
     ReferenceVideo,
 )
-from vllm_omni.entrypoints.openai.serving_video_stream import OmniStreamingVideoHandler
+from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
@@ -646,6 +646,7 @@ async def build_async_omni_from_stage_config(
     try:
         kwargs = args.get_explicit_kwargs_dict()
         model = kwargs.pop("model", None) or args.model
+        kwargs.setdefault("log_stats", not args.disable_log_stats)
         async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
@@ -1069,7 +1070,7 @@ async def omni_init_app_state(
         speech_service=state.openai_serving_speech,
     )
     state.openai_streaming_video = (
-        OmniStreamingVideoHandler(
+        create_streaming_video_handler(
             chat_service=state.openai_serving_chat,
             engine_client=engine_client,
         )
@@ -2333,7 +2334,8 @@ def _check_max_generated_image_size(
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
-                f"size of {max_generated_image_size} pixels.",
+                f"size of {max_generated_image_size} pixels. You can reduce the requested size "
+                f"or increase the server's --max-generated-image-size limit.",
             )
     elif resolution is not None:
         # When resolution is set, the output size is resolution * resolution
@@ -2341,7 +2343,8 @@ def _check_max_generated_image_size(
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
-                f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
+                f"exceeds the maximum allowed size of {max_generated_image_size} pixels. "
+                f"You can reduce the requested size or increase the server's --max-generated-image-size limit.",
             )
 
 

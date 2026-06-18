@@ -24,12 +24,15 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --deploy-config /path/to/your_deploy_config.yaml
 ```
 
-For the bundled 3x-GPU multi-replica layout (talker/code2wav scale-out),
-use:
+For a 3x-GPU multi-replica layout (talker/code2wav scale-out on cuda:1,2),
+use `--stage-overrides` on top of the default config:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-    --deploy-config vllm_omni/deploy/qwen3_omni_moe_multi_replicas.yaml
+    --stage-overrides '{
+        "1": {"num_replicas": 2, "devices": "1,2"},
+        "2": {"num_replicas": 2, "devices": "1,2"}
+    }'
 ```
 
 ### Launch individual stages (stage-based CLI)

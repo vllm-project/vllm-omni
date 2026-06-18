@@ -550,7 +550,7 @@ class TestDiffusionEngine:
             request_id="req-batch",
         )
 
-        mocker.patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False)
+        mocker.patch("vllm_omni.diffusion.output_formatter.supports_audio_output", return_value=False)
         outputs = await engine.step(request)
 
         assert len(outputs) == 2
@@ -566,6 +566,78 @@ class TestDiffusionEngine:
             outputs[1].multimodal_output["actions"],
             torch.tensor([3.0, 4.0]),
         )
+
+    @pytest.mark.asyncio
+    async def test_step_empty_dict_output_still_runs_postprocess(self, mocker: MockerFixture) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(
+            model_class_name="mock_model",
+            enable_cpu_offload=False,
+        )
+        engine.pre_process_func = None
+        engine.post_process_func = mocker.Mock(return_value={"video": ["processed"]})
+        engine._post_process_accepts_sampling_params = False
+        engine._check_and_start_background_loop = mocker.AsyncMock()
+        engine.async_add_req_and_wait_for_response = mocker.AsyncMock(
+            return_value=DiffusionOutput(
+                output={},
+                custom_output={"actions": torch.tensor([[1.0, 2.0]])},
+            )
+        )
+
+        request = OmniDiffusionRequest(
+            prompts=["prompt"],
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+            request_id="req-action",
+        )
+
+        mocker.patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False)
+        outputs = await engine.step(request)
+
+        engine.post_process_func.assert_called_once_with({})
+        assert outputs[0].images == ["processed"]
+        torch.testing.assert_close(outputs[0].multimodal_output["actions"], torch.tensor([[1.0, 2.0]]))
+
+    @pytest.mark.asyncio
+    async def test_step_action_only_flag_skips_postprocess(self, mocker: MockerFixture) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(
+            model_class_name="mock_model",
+            enable_cpu_offload=False,
+        )
+        engine.pre_process_func = None
+        engine.post_process_func = mocker.Mock(side_effect=AssertionError("postprocess should be skipped"))
+        engine.action_post_process_func = mocker.Mock(return_value=torch.tensor([[3.0, 4.0]]))
+        engine._post_process_accepts_sampling_params = False
+        engine._action_post_process_accepts_custom_output = True
+        engine._action_post_process_accepts_sampling_params = False
+        engine._check_and_start_background_loop = mocker.AsyncMock()
+        raw_action = torch.tensor([[1.0, 2.0]])
+        engine.async_add_req_and_wait_for_response = mocker.AsyncMock(
+            return_value=DiffusionOutput(
+                output={},
+                custom_output={
+                    "action": raw_action,
+                    "action_only_output": True,
+                },
+            )
+        )
+
+        request = OmniDiffusionRequest(
+            prompts=["prompt"],
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+            request_id="req-action",
+        )
+
+        mocker.patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False)
+        outputs = await engine.step(request)
+
+        engine.post_process_func.assert_not_called()
+        engine.action_post_process_func.assert_called_once()
+        assert engine.action_post_process_func.call_args.args[0] is raw_action
+        assert "custom_output" in engine.action_post_process_func.call_args.kwargs
+        assert outputs[0].images == []
+        torch.testing.assert_close(outputs[0].multimodal_output["actions"], torch.tensor([[3.0, 4.0]]))
 
 
 class TestStepScheduler:
