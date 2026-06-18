@@ -220,12 +220,15 @@ class VoxtralTTSForConditionalGeneration(
 
     def tts_postprocess(self, hidden_states: torch.Tensor, multimodal_outputs: object, **info_dict: object | None):
         update_dict = {}
-        if isinstance(multimodal_outputs, Mapping) and "audio" in multimodal_outputs:
-            assert self.post_process_idx < len(multimodal_outputs["audio"]), (
-                f"Expect {self.post_process_idx=} < {len(multimodal_outputs['audio'])=}"
-            )
-            update_dict["audio"] = multimodal_outputs["audio"][self.post_process_idx]
-            self.post_process_idx += 1
+        if isinstance(multimodal_outputs, Mapping):
+            codes = multimodal_outputs.get("codes")
+            if isinstance(codes, Mapping) and "audio" in codes:
+                audio_frames = codes["audio"]
+                assert self.post_process_idx < len(audio_frames), (
+                    f"Expect {self.post_process_idx=} < {len(audio_frames)=}"
+                )
+                update_dict["codes"] = {"audio": audio_frames[self.post_process_idx]}
+                self.post_process_idx += 1
         return update_dict
 
     def embed_input_ids(
