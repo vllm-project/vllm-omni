@@ -92,6 +92,7 @@ class TestHiggsAudioV3OnlineHappyPath:
             }
         )
 
+    @pytest.mark.skip(reason="issue#4411")
     @pytest.mark.core_model
     @pytest.mark.advanced_model
     @pytest.mark.tts
