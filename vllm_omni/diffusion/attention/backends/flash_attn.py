@@ -11,6 +11,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
+from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
 )
@@ -309,6 +310,13 @@ class FlashAttentionImpl(AttentionImpl):
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
+
+        # NPU aclnnFlashAttentionScore requires mask shape to be one of:
+        # [B, N, Sq, Skv], [B, 1, Sq, Skv], [1, 1, Sq, Skv], or [Sq, Skv]
+        # But the incoming mask is 2D [B, S] — reshape to [B, 1, 1, S]
+        # So reuse SDPA's mask reshape logic: [B, S] -> [B, 1, Sq, Skv]
+        attention_mask = _maybe_reshape_attn_mask(query, key, attention_mask, mask_mode="full_qk")
+
         layout = self.qkv_layout or "BNSD"
         return attention_forward(
             query,

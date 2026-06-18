@@ -1,7 +1,63 @@
 from collections.abc import Callable
+from contextlib import contextmanager
 
 import torch
 from vllm.model_executor.models.utils import maybe_prefix
+
+
+@contextmanager
+def transformers_keys_to_ignore_compat():
+    """Make ``trust_remote_code`` weight loading robust to the transformers 5.9
+    ``_keys_to_ignore_on_load_unexpected`` list-vs-set change.
+
+    transformers 5.9 rewrote ``PreTrainedModel._adjust_missing_and_unexpected_keys``
+    from ``(attr or []) + patterns`` (list concatenation) to
+    ``(attr or set()) | patterns`` (set union). Remote-code models such as
+    ``OpenMOSS-Team/MOSS-TTS-Nano`` still declare
+    ``_keys_to_ignore_on_load_unexpected`` as a *list*, so ``list | set`` raises
+    ``TypeError: unsupported operand type(s) for |: 'list' and 'set'`` and the
+    engine core dies during model load.
+
+    Wrap any ``from_pretrained(..., trust_remote_code=True)`` call whose remote
+    code may declare the attribute as a list. The guard keeps such models
+    loadable regardless of which transformers version is installed, while
+    preserving the model's ignore patterns.
+    """
+    try:
+        from transformers.modeling_utils import PreTrainedModel
+    except Exception:  # pragma: no cover - transformers is always present here
+        yield
+        return
+
+    orig = getattr(PreTrainedModel, "_adjust_missing_and_unexpected_keys", None)
+    if orig is None:
+        yield
+        return
+
+    def _wrapper(self, *args, **kwargs):
+        try:
+            return orig(self, *args, **kwargs)
+        except TypeError as exc:
+            if "unsupported operand type" not in str(exc):
+                raise
+            attr = getattr(self, "_keys_to_ignore_on_load_unexpected", None)
+            if not isinstance(attr, (list, tuple)):
+                raise
+            # transformers >=5.9 combines patterns with ``set | ...``. The
+            # ignore-pattern combine runs before any mutation of ``loading_info``
+            # (see PreTrainedModel._adjust_missing_and_unexpected_keys), so it is
+            # safe to coerce the list to a set and re-run the original once.
+            self._keys_to_ignore_on_load_unexpected = set(attr)
+            try:
+                return orig(self, *args, **kwargs)
+            finally:
+                self._keys_to_ignore_on_load_unexpected = attr
+
+    PreTrainedModel._adjust_missing_and_unexpected_keys = _wrapper
+    try:
+        yield
+    finally:
+        PreTrainedModel._adjust_missing_and_unexpected_keys = orig
 
 
 def add_prefix_to_loaded_weights(weights: set[str], prefix: str) -> set[str]:

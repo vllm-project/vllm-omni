@@ -198,10 +198,21 @@ class Qwen3TTSTokenizerV2CausalConvNet(nn.Module):
         self.padding = self.kernel_size - self.stride
 
     def _get_extra_padding_for_conv1d(self, hidden_state: torch.Tensor) -> int:
+        # Cache the result per input length — under cudagraph capture the set of lengths
+        # is fixed, so the LUT converges quickly and replaces the math.ceil call per replay.
         length = hidden_state.shape[-1]
+        cache = self.__dict__.get("_pad_lut")
+        if cache is None:
+            cache = {}
+            self.__dict__["_pad_lut"] = cache
+        cached = cache.get(length)
+        if cached is not None:
+            return cached
         n_frames = (length - self.kernel_size + self.padding) / self.stride + 1
         ideal_length = (math.ceil(n_frames) - 1) * self.stride + (self.kernel_size - self.padding)
-        return ideal_length - length
+        extra_padding = ideal_length - length
+        cache[length] = extra_padding
+        return extra_padding
 
     def forward(self, hidden_state):
         extra_padding = self._get_extra_padding_for_conv1d(hidden_state)
