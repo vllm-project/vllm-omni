@@ -34,8 +34,12 @@ def main() -> None:
     ap.add_argument("--session-id", default="long-rollout")
     ap.add_argument("--num-chunks", type=int, default=8)
     ap.add_argument("--output", type=Path, default=Path("outputs/bde_parity/long.mp4"))
-    ap.add_argument("--latents", type=Path, default=None,
-                    help="if set, torch.save the raw decoded latents here for exact parity checks")
+    ap.add_argument(
+        "--latents",
+        type=Path,
+        default=None,
+        help="if set, torch.save the raw decoded latents here for exact parity checks",
+    )
     args = ap.parse_args()
 
     # base = [prefill_obs, chunk_obs]; extend the chunk into a long session.

@@ -68,9 +68,7 @@ def test_blocktable_build_single_request():
     real = set(resident_block_ids(block_ids, null_id))
     assert real, "expected at least one real block after allocation"
 
-    slots = chunk_slot_mapping(
-        block_ids, adapter.num_computed_tokens, spec.chunk_size, spec.block_size
-    )
+    slots = chunk_slot_mapping(block_ids, adapter.num_computed_tokens, spec.chunk_size, spec.block_size)
     # Each slot resolves to a real allocated block, none to null_block.
     blocks_used = {int(s) // spec.block_size for s in slots}
     assert blocks_used <= real

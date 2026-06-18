@@ -65,12 +65,19 @@ def run_export(model: str, deploy_config, session_id: str, out_stem, *, extra=()
     out_stem = Path(out_stem)
     out_stem.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        sys.executable, EXPORT_SCRIPT,
-        "--model", model,
-        "--deploy-config", str(deploy_config),
-        "--session-id", session_id,
-        "--output-stem", str(out_stem),
-        "--save-gif", "--save-input-video", "--save-actions",
+        sys.executable,
+        EXPORT_SCRIPT,
+        "--model",
+        model,
+        "--deploy-config",
+        str(deploy_config),
+        "--session-id",
+        session_id,
+        "--output-stem",
+        str(out_stem),
+        "--save-gif",
+        "--save-input-video",
+        "--save-actions",
         *extra,
     ]
     subprocess.run(cmd, check=True)

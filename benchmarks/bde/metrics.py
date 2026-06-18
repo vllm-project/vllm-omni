@@ -89,9 +89,7 @@ def tensor_parity(ref, test, *, atol: float = 1e-4, rtol: float = 1e-4) -> dict:
     }
 
 
-def check_gates(
-    metrics: dict, *, psnr_min: float = 40.0, ssim_min: float = 0.99, lpips_max: float = 0.01
-) -> dict:
+def check_gates(metrics: dict, *, psnr_min: float = 40.0, ssim_min: float = 0.99, lpips_max: float = 0.01) -> dict:
     """Apply the §5 acceptance gates to a ``frame_metrics`` result."""
 
     def gate(value, threshold, ok):

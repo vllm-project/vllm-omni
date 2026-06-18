@@ -8,7 +8,6 @@ KV stack on CPU (block bookkeeping only, no GPU tensors).
 
 import pytest
 import torch
-
 from vllm.v1.kv_cache_interface import KVCacheSpecKind, get_kv_cache_spec_kind
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import RequestStatus
@@ -72,9 +71,9 @@ def test_spec_rejects_inconsistent_window():
 def test_sliding_replace_keeps_window():
     # window = 2 chunks * 16 = 32. Base sliding formula keeps `window` tokens;
     # the snap is to chunk boundaries.
-    skip = lambda n: chunk_window_skipped_tokens(
-        n, chunk_size=16, sliding_window=32, sink_chunks=0, reset_at_boundary=False
-    )
+    def skip(n):
+        return chunk_window_skipped_tokens(n, chunk_size=16, sliding_window=32, sink_chunks=0, reset_at_boundary=False)
+
     assert skip(32) == 0  # nothing past the window yet
     assert skip(48) == 16  # one chunk fell out of the window
     assert skip(64) == 32
@@ -82,25 +81,19 @@ def test_sliding_replace_keeps_window():
 
 def test_sliding_replace_snaps_to_chunk_boundary():
     # A non-chunk-aligned overflow must snap down so a chunk is never half-evicted.
-    skip = chunk_window_skipped_tokens(
-        50, chunk_size=16, sliding_window=32, sink_chunks=0, reset_at_boundary=False
-    )
+    skip = chunk_window_skipped_tokens(50, chunk_size=16, sliding_window=32, sink_chunks=0, reset_at_boundary=False)
     assert skip % 16 == 0 and skip == 16
 
 
 def test_sink_chunks_protected():
     # sink = 1 chunk (16 tokens) is never skipped.
-    skip = chunk_window_skipped_tokens(
-        80, chunk_size=16, sliding_window=32, sink_chunks=1, reset_at_boundary=False
-    )
+    skip = chunk_window_skipped_tokens(80, chunk_size=16, sliding_window=32, sink_chunks=1, reset_at_boundary=False)
     # raw overflow = 80 - 32 - 16 = 32 -> snapped 32
     assert skip == 32
 
 
 def test_reset_at_boundary_drops_completed_past_sink():
-    skip = chunk_window_skipped_tokens(
-        48, chunk_size=16, sliding_window=32, sink_chunks=1, reset_at_boundary=True
-    )
+    skip = chunk_window_skipped_tokens(48, chunk_size=16, sliding_window=32, sink_chunks=1, reset_at_boundary=True)
     # completed = 48; sink = 16 -> drop 32
     assert skip == 32
 

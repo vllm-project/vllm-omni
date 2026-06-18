@@ -446,8 +446,7 @@ class DiffusionEngine:
                 engine_class = resolve_obj_by_qualname(backend)
             except (ImportError, ValueError) as e:
                 raise ValueError(
-                    f"Failed to load engine_backend '{backend}'. Ensure it is a valid "
-                    f"python path. Error: {e}"
+                    f"Failed to load engine_backend '{backend}'. Ensure it is a valid python path. Error: {e}"
                 ) from e
             if not issubclass(engine_class, DiffusionEngine):
                 raise TypeError(f"engine_backend must resolve to a DiffusionEngine subclass. Got {engine_class}.")

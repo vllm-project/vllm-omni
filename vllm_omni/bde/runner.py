@@ -22,7 +22,7 @@ from vllm.logger import init_logger
 from vllm_omni.bde.kv_cache.config import BDEKVConfig
 from vllm_omni.bde.kv_cache.gather import BDEKVState
 from vllm_omni.bde.kv_cache.manager import BDEKVCache
-from vllm_omni.diffusion.data import OmniDiffusionConfig, DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
@@ -149,15 +149,17 @@ class BDEModelRunner(DiffusionModelRunner):
         chunk_size = frame_seqlen
         window_chunks = self.bde_kv_config.window_chunks or (max_attention_size // frame_seqlen)
 
-        self.bde_kv_config = dataclasses.replace(
-            self.bde_kv_config, chunk_size=chunk_size, window_chunks=window_chunks
-        )
+        self.bde_kv_config = dataclasses.replace(self.bde_kv_config, chunk_size=chunk_size, window_chunks=window_chunks)
         free_bytes = torch.cuda.mem_get_info(self.device)[0]
         logger.info(
             "BDE preallocating (paged): frame_seqlen=%d num_frame_per_block=%d "
             "local_attn_size=%d -> chunk_size=%d window_chunks=%d (window=%d tokens)",
-            frame_seqlen, num_frame_per_block, local_attn_size,
-            chunk_size, window_chunks, window_chunks * chunk_size,
+            frame_seqlen,
+            num_frame_per_block,
+            local_attn_size,
+            chunk_size,
+            window_chunks,
+            window_chunks * chunk_size,
         )
         self.build_kv_cache(
             num_layers=num_layers,
@@ -189,7 +191,11 @@ class BDEModelRunner(DiffusionModelRunner):
             self._bde_states[session_id] = state
         logger.debug(
             "BDE execute_model: req=%s session=%s chunk_size=%d window_chunks=%s num_blocks=%d",
-            req.request_id, session_id, kv.spec.chunk_size, kv.config.window_chunks, kv.num_blocks,
+            req.request_id,
+            session_id,
+            kv.spec.chunk_size,
+            kv.config.window_chunks,
+            kv.num_blocks,
         )
         self.pipeline._bde_kv_state = state
         try:

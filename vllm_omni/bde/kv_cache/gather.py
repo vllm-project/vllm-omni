@@ -36,16 +36,8 @@ def allocate_kv_pool(
     k_pools: list[torch.Tensor] = []
     v_pools: list[torch.Tensor] = []
     for _ in range(num_layers):
-        k_pools.append(
-            torch.empty(
-                num_blocks * block_size, num_kv_heads, head_dim, dtype=dtype, device=device
-            )
-        )
-        v_pools.append(
-            torch.empty(
-                num_blocks * block_size, num_kv_heads, head_dim, dtype=dtype, device=device
-            )
-        )
+        k_pools.append(torch.empty(num_blocks * block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
+        v_pools.append(torch.empty(num_blocks * block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
     return k_pools, v_pools
 
 
@@ -69,9 +61,7 @@ def pool_write_chunk(
     v_pool[slot_mapping] = new_v[0]
 
 
-def build_window_slots(
-    window_block_ids: list[int], block_size: int, device: torch.device
-) -> torch.Tensor:
+def build_window_slots(window_block_ids: list[int], block_size: int, device: torch.device) -> torch.Tensor:
     """Flat slot index covering all resident blocks, in table order.
 
     Vectorized (no Python loop): ``slot = block_id * block_size + offset`` for every
@@ -180,8 +170,11 @@ class BDEKVState:
         self._gather_cache[is_negative] = windows
         _log.info(
             "BDE GET   [%s] source=paged-gather layers=%d window0=%s resident_blocks=%d/%d",
-            branch, self.num_layers, tuple(windows[0].shape),
-            len(self.kv_cache.window_block_ids(adapter)), self.kv_cache.spec.window_chunks,
+            branch,
+            self.num_layers,
+            tuple(windows[0].shape),
+            len(self.kv_cache.window_block_ids(adapter)),
+            self.kv_cache.spec.window_chunks,
         )
         return windows
 
@@ -203,7 +196,7 @@ class BDEKVState:
             n_chunks = new_count // cs
             slots = []
             for _ in range(n_chunks):
-                self.kv_cache.allocate_chunk(adapter)        # allocate + evict old
+                self.kv_cache.allocate_chunk(adapter)  # allocate + evict old
                 slots.append(self.kv_cache.chunk_write_slots(adapter))
                 adapter.on_chunk_committed()
             self._pending[is_negative] = slots
@@ -213,8 +206,11 @@ class BDEKVState:
             self._gather_cache[is_negative] = None
             _log.info(
                 "BDE WRITE [%s] new_tokens=%d -> %d frame-chunks  resident=%d/%d  storing %d layers",
-                branch, new_count, n_chunks,
-                len(self.kv_cache.window_block_ids(adapter)), self.kv_cache.spec.window_chunks,
+                branch,
+                new_count,
+                n_chunks,
+                len(self.kv_cache.window_block_ids(adapter)),
+                self.kv_cache.spec.window_chunks,
                 self.num_layers,
             )
         slots = self._pending[is_negative]
@@ -244,9 +240,9 @@ class BDEKVState:
         is recycled.
         """
         pos_id, neg_id = self.pos.request_id, self.neg.request_id
-        self.kv_cache.end_request(self.pos)        # free resident blocks
+        self.kv_cache.end_request(self.pos)  # free resident blocks
         self.kv_cache.end_request(self.neg)
-        self.pos = self.kv_cache.begin_request(pos_id)   # fresh, empty window
+        self.pos = self.kv_cache.begin_request(pos_id)  # fresh, empty window
         self.neg = self.kv_cache.begin_request(neg_id)
         self._committed = {False: 0, True: 0}
         self._pending = {False: [], True: []}

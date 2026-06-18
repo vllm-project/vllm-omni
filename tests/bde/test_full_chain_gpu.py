@@ -16,7 +16,7 @@ import pytest
 import torch
 
 requires_gpus_2_3 = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    not torch.cuda.is_available() or torch.accelerator.device_count() < 2,
     reason="requires >= 2 GPUs",
 )
 
@@ -30,9 +30,7 @@ def _worker_entry(rank: int, od_config, q) -> None:
     try:
         from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
-        worker = DiffusionWorker(
-            local_rank=rank, rank=rank, od_config=od_config, skip_load_model=True
-        )
+        worker = DiffusionWorker(local_rank=rank, rank=rank, od_config=od_config, skip_load_model=True)
         device = str(worker.device)
         runner_name = type(worker.model_runner).__name__
 
@@ -41,9 +39,15 @@ def _worker_entry(rank: int, od_config, q) -> None:
 
         cfg = BDEKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2)
         kv = BDEKVCache(
-            cfg, num_layers=1, num_kv_heads=N_HEADS, head_size=HEAD_DIM,
-            dtype=torch.float32, block_size=BLOCK, max_model_len=512,
-            available_bytes=1 << 28, device=worker.device,
+            cfg,
+            num_layers=1,
+            num_kv_heads=N_HEADS,
+            head_size=HEAD_DIM,
+            dtype=torch.float32,
+            block_size=BLOCK,
+            max_model_len=512,
+            available_bytes=1 << 28,
+            device=worker.device,
         )
 
         # Verify pools are on the worker's GPU.
@@ -64,8 +68,8 @@ def _worker_entry(rank: int, od_config, q) -> None:
         # Read back from the pool at the write slots.
         pool_read_k = kv._k_pools[0][write_slots]
         pool_read_v = kv._v_pools[0][write_slots]
-        assert torch.allclose(pool_read_k, new_k[0], atol=1e-5), "gathered K ≠ written (rank {})".format(rank)
-        assert torch.allclose(pool_read_v, new_v[0], atol=1e-5), "gathered V ≠ written (rank {})".format(rank)
+        assert torch.allclose(pool_read_k, new_k[0], atol=1e-5), f"gathered K ≠ written (rank {rank})"
+        assert torch.allclose(pool_read_v, new_v[0], atol=1e-5), f"gathered V ≠ written (rank {rank})"
 
         # Allocate a second chunk then gather the window.
         kv.allocate_chunk(adapter)
@@ -76,6 +80,7 @@ def _worker_entry(rank: int, od_config, q) -> None:
         q.put((rank, device, runner_name, "pool_roundtrip_ok", None))
     except Exception:  # pragma: no cover - reported to the parent
         import traceback
+
         q.put((rank, None, None, None, traceback.format_exc()))
 
 

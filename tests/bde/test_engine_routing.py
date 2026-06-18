@@ -11,7 +11,6 @@ from dataclasses import fields
 from types import SimpleNamespace
 
 import pytest
-
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.bde.engine import (

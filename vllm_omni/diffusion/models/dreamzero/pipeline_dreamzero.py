@@ -23,8 +23,6 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-_log = logging.getLogger(__name__)
-
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
     DistributedAutoencoderKLWan,
@@ -54,6 +52,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
+_log = logger
 MAX_DREAMZERO_SESSIONS = 64
 
 
@@ -138,9 +137,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         """Cross-attn cache: pool-backed when BDE active, model-local otherwise."""
         s = self._bde_kv_state
         if s is not None:
-            return s.get_cross_kv_caches(
-                is_negative, lambda: state.get_crossattn_caches(is_negative)
-            )
+            return s.get_cross_kv_caches(is_negative, lambda: state.get_crossattn_caches(is_negative))
         return state.get_crossattn_caches(is_negative)
 
     def _kv_populate_cross(self, context: torch.Tensor, is_negative: bool) -> None:
@@ -421,9 +418,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             is_neg = kwargs.get("is_negative", False)
             if self._bde_kv_state is not None:
                 _log.info(
-                    "BDE pipeline predict_noise -> write-back: is_neg=%s seq_len=%s "
-                    "current_start_frame=%s layers=%d",
-                    is_neg, kwargs.get("seq_len"), kwargs.get("current_start_frame"),
+                    "BDE pipeline predict_noise -> write-back: is_neg=%s seq_len=%s current_start_frame=%s layers=%d",
+                    is_neg,
+                    kwargs.get("seq_len"),
+                    kwargs.get("current_start_frame"),
                     len(updated_kv_caches),
                 )
             for i, kv in enumerate(updated_kv_caches):
@@ -601,7 +599,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         head_dim = self.transformer.dim // self.transformer.num_heads
 
         if state.current_start_frame == 0:
-            self._kv_create(state,
+            self._kv_create(
+                state,
                 batch_size,
                 dtype,
                 device,

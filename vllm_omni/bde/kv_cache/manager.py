@@ -13,20 +13,19 @@ thin.
 from __future__ import annotations
 
 import torch
-
 from vllm.logger import init_logger
 
 from vllm_omni.bde.kv_cache.adapter import BDERequestAdapter
 from vllm_omni.bde.kv_cache.chunk_window import ChunkWindowSpec
 from vllm_omni.bde.kv_cache.config import BDEKVConfig
-from vllm_omni.bde.kv_cache.pool import build_kv_manager, compute_num_blocks
-from vllm_omni.bde.kv_cache.slot_mapping import chunk_slot_mapping, resident_block_ids
 from vllm_omni.bde.kv_cache.gather import (
     allocate_kv_pool,
     build_window_slots,
     pool_gather_window,
     pool_write_chunk,
 )
+from vllm_omni.bde.kv_cache.pool import build_kv_manager, compute_num_blocks
+from vllm_omni.bde.kv_cache.slot_mapping import chunk_slot_mapping, resident_block_ids
 
 _log = init_logger(__name__)
 
@@ -84,8 +83,8 @@ class BDEKVCache:
             cross_shape = (2, cross_attn_length, num_kv_heads, head_size)
             bytes_per_element = dtype.itemsize
             cross_bytes = (
-                2           # K + V
-                * 2         # pos + neg
+                2  # K + V
+                * 2  # pos + neg
                 * cross_attn_length
                 * num_kv_heads
                 * head_size
@@ -97,7 +96,10 @@ class BDEKVCache:
                 self._cross_v.append(torch.empty(cross_shape, dtype=dtype, device=device))
             _log.info(
                 "BDE cross-attn pool: %d layers × (%d tok × %d heads × %d) = %.1f MiB",
-                num_layers, cross_attn_length, num_kv_heads, head_size,
+                num_layers,
+                cross_attn_length,
+                num_kv_heads,
+                head_size,
                 cross_bytes / (1024 * 1024),
             )
 
@@ -137,8 +139,11 @@ class BDEKVCache:
     # read many (every denoising step). Not managed through the paged block pool.
 
     def write_cross_kv(
-        self, layer_idx: int, is_negative: bool,
-        k: torch.Tensor, v: torch.Tensor,
+        self,
+        layer_idx: int,
+        is_negative: bool,
+        k: torch.Tensor,
+        v: torch.Tensor,
     ) -> None:
         """Write one layer's cross-attn K/V into the pool.
 
@@ -158,15 +163,13 @@ class BDEKVCache:
         slice rather than from the lazy-initialised model-local dict.
         """
         branch = 1 if is_negative else 0
-        k = self._cross_k[layer_idx][branch].unsqueeze(0)   # (1, L, heads, dim)
+        k = self._cross_k[layer_idx][branch].unsqueeze(0)  # (1, L, heads, dim)
         v = self._cross_v[layer_idx][branch].unsqueeze(0)
         return {"is_init": True, "k": k, "v": v}
 
     # -- request lifecycle ---------------------------------------------------
 
-    def begin_request(
-        self, request_id: str, *, prefill_prefix_tokens: int = 0
-    ) -> BDERequestAdapter:
+    def begin_request(self, request_id: str, *, prefill_prefix_tokens: int = 0) -> BDERequestAdapter:
         adapter = BDERequestAdapter(
             request_id,
             chunk_size=self.spec.chunk_size,
@@ -177,9 +180,12 @@ class BDEKVCache:
         return adapter
 
     def end_request(self, adapter: BDERequestAdapter) -> None:
-        _log.debug("BDE end_request: req=%s chunks=%d free=%d",
-                    adapter.request_id, adapter.completed_chunks,
-                    self.manager.block_pool.get_num_free_blocks())
+        _log.debug(
+            "BDE end_request: req=%s chunks=%d free=%d",
+            adapter.request_id,
+            adapter.completed_chunks,
+            self.manager.block_pool.get_num_free_blocks(),
+        )
         self.manager.free(adapter)
         self._adapters.pop(adapter.request_id, None)
 
@@ -195,9 +201,14 @@ class BDEKVCache:
             raise RuntimeError("BDE KV pool exhausted while allocating a chunk")
         table = self.block_table(adapter)
         resident = resident_block_ids(table, self.null_block_id)
-        _log.debug("BDE allocate_chunk: req=%s chunk=%d table_len=%d resident=%d free=%d",
-                    adapter.request_id, adapter.completed_chunks, len(table),
-                    len(resident), self.manager.block_pool.get_num_free_blocks())
+        _log.debug(
+            "BDE allocate_chunk: req=%s chunk=%d table_len=%d resident=%d free=%d",
+            adapter.request_id,
+            adapter.completed_chunks,
+            len(table),
+            len(resident),
+            self.manager.block_pool.get_num_free_blocks(),
+        )
         return table
 
     def block_table(self, adapter: BDERequestAdapter) -> list[int]:
@@ -233,9 +244,14 @@ class BDEKVCache:
     ) -> None:
         """Write one layer's committed-chunk K/V into the pool."""
         slots = self.chunk_write_slots(adapter)
-        _log.debug("BDE write: req=%s layer=%d chunk=%d shapes=%s dev=%s",
-                    adapter.request_id, layer_index, adapter.completed_chunks,
-                    (tuple(new_k.shape), tuple(new_v.shape)), slots.device)
+        _log.debug(
+            "BDE write: req=%s layer=%d chunk=%d shapes=%s dev=%s",
+            adapter.request_id,
+            layer_index,
+            adapter.completed_chunks,
+            (tuple(new_k.shape), tuple(new_v.shape)),
+            slots.device,
+        )
         pool_write_chunk(
             self._k_pools[layer_index],
             self._v_pools[layer_index],
@@ -258,9 +274,14 @@ class BDEKVCache:
             self.block_size,
             self.spec.sliding_window,
         )
-        _log.debug("BDE gather: req=%s layer=%d blocks=%s window=%s dev=%s",
-                    adapter.request_id, layer_index, window_ids,
-                    tuple(window.shape), window.device)
+        _log.debug(
+            "BDE gather: req=%s layer=%d blocks=%s window=%s dev=%s",
+            adapter.request_id,
+            layer_index,
+            window_ids,
+            tuple(window.shape),
+            window.device,
+        )
         return window
 
     def gather_window_all_layers(self, adapter: BDERequestAdapter) -> list[torch.Tensor]:
@@ -276,12 +297,20 @@ class BDEKVCache:
         slots = build_window_slots(window_ids, self.block_size, self._k_pools[0].device)
         windows = [
             pool_gather_window(
-                self._k_pools[i], self._v_pools[i], window_ids,
-                self.block_size, self.spec.sliding_window, slots=slots,
+                self._k_pools[i],
+                self._v_pools[i],
+                window_ids,
+                self.block_size,
+                self.spec.sliding_window,
+                slots=slots,
             )
             for i in range(self.num_layers)
         ]
-        _log.debug("BDE gather-all: req=%s layers=%d blocks=%d window=%s",
-                    adapter.request_id, self.num_layers, len(window_ids),
-                    tuple(windows[0].shape))
+        _log.debug(
+            "BDE gather-all: req=%s layers=%d blocks=%d window=%s",
+            adapter.request_id,
+            self.num_layers,
+            len(window_ids),
+            tuple(windows[0].shape),
+        )
         return windows

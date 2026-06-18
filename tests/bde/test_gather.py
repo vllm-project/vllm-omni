@@ -2,10 +2,10 @@
 """Tests for pool write + window gather (Step 4)."""
 
 import torch
+
 from vllm_omni.bde.kv_cache import (
     BDEKVCache,
     BDEKVConfig,
-    BDERequestAdapter,
     allocate_kv_pool,
     pool_gather_window,
     pool_write_chunk,
@@ -79,8 +79,15 @@ def test_bde_kv_cache_write_gather_integration():
     """BDEKVCache.write_chunk_kv → gather_window roundtrip through a real manager."""
     cfg = BDEKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2)
     kv = BDEKVCache(
-        cfg, num_layers=1, num_kv_heads=N_HEADS, head_size=HEAD_DIM, dtype=torch.float32,
-        block_size=BLOCK, max_model_len=512, available_bytes=1 << 24, device=torch.device("cpu"),
+        cfg,
+        num_layers=1,
+        num_kv_heads=N_HEADS,
+        head_size=HEAD_DIM,
+        dtype=torch.float32,
+        block_size=BLOCK,
+        max_model_len=512,
+        available_bytes=1 << 24,
+        device=torch.device("cpu"),
     )
     adapter = kv.begin_request("r")
     kv.allocate_chunk(adapter)

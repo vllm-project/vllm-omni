@@ -128,9 +128,7 @@ def test_kv_memory_plateau(tmp_path):
     from benchmarks.bde.profile import kv_memory_plateau, plot_memory
 
     cfg = bde_config_for_dreamzero(num_frame_per_block=1, frame_seqlen=16, local_attn_size=2)
-    prof = kv_memory_plateau(
-        cfg, num_chunks=10, num_layers=2, num_kv_heads=4, head_size=64, block_size=16
-    )
+    prof = kv_memory_plateau(cfg, num_chunks=10, num_layers=2, num_kv_heads=4, head_size=64, block_size=16)
     # Usage plateaus once the window fills; resident bounded by window + 1.
     assert prof["plateaued"] is True
     assert max(prof["resident_blocks"]) <= cfg.window_chunks + 1

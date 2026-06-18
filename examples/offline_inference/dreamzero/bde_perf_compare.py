@@ -44,8 +44,10 @@ def main() -> None:
     _, base = E._build_observations(args.video_dir, prompt=args.prompt, session_id=args.session_id)
     observations = [base[0]] + [base[1]] * args.num_chunks
     n = len(observations)
-    print(f"[perf:{args.tag}] {n} forwards (1 prefill + {args.num_chunks} chunk) "
-          f"BDE_KV_ENABLE={os.environ.get('BDE_KV_ENABLE', '0')}")
+    print(
+        f"[perf:{args.tag}] {n} forwards (1 prefill + {args.num_chunks} chunk) "
+        f"BDE_KV_ENABLE={os.environ.get('BDE_KV_ENABLE', '0')}"
+    )
 
     t0 = time.perf_counter()
     omni = E.Omni(
@@ -70,7 +72,7 @@ def main() -> None:
             raise RuntimeError(f"No output for forward {index}")
         outputs.append(result[0])
         per_forward.append(dt)
-        print(f"[perf:{args.tag}] forward {index:2d} ({'prefill' if index == 0 else 'chunk'}): {dt*1000:8.1f} ms")
+        print(f"[perf:{args.tag}] forward {index:2d} ({'prefill' if index == 0 else 'chunk'}): {dt * 1000:8.1f} ms")
 
     prefill = per_forward[0]
     steady = per_forward[2:] if len(per_forward) > 2 else per_forward[1:]  # drop prefill + 1 warmup
@@ -87,8 +89,10 @@ def main() -> None:
         "total_gen_s": sum(per_forward),
         "per_forward_s": per_forward,
     }
-    print(f"[perf:{args.tag}] prefill={prefill*1000:.1f}ms  "
-          f"steady_mean={mean_steady*1000:.1f}ms (n={len(steady)})  total={sum(per_forward):.2f}s")
+    print(
+        f"[perf:{args.tag}] prefill={prefill * 1000:.1f}ms  "
+        f"steady_mean={mean_steady * 1000:.1f}ms (n={len(steady)})  total={sum(per_forward):.2f}s"
+    )
 
     # Decode once (after timing) so latents + the final video are both saved.
     latents = torch.cat([E._extract_latents(o) for o in outputs], dim=2)

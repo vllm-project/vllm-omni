@@ -2,6 +2,7 @@
 """Tests for the BDEKVState pipeline bridge (Step 5)."""
 
 import torch
+
 from vllm_omni.bde.kv_cache import BDEKVCache, BDEKVConfig
 from vllm_omni.bde.kv_cache.gather import BDEKVState
 
@@ -12,9 +13,17 @@ HEAD_DIM = 64
 
 def make_state(num_layers=1, window_chunks=4):
     cfg = BDEKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks)
-    kv = BDEKVCache(cfg, num_layers=num_layers, num_kv_heads=N_HEADS, head_size=HEAD_DIM,
-                    dtype=torch.float32, block_size=BLOCK, max_model_len=4096,
-                    available_bytes=1 << 24, device=torch.device("cpu"))
+    kv = BDEKVCache(
+        cfg,
+        num_layers=num_layers,
+        num_kv_heads=N_HEADS,
+        head_size=HEAD_DIM,
+        dtype=torch.float32,
+        block_size=BLOCK,
+        max_model_len=4096,
+        available_bytes=1 << 24,
+        device=torch.device("cpu"),
+    )
     pos = kv.begin_request("r-pos")
     neg = kv.begin_request("r-neg")
     return kv, BDEKVState(kv, pos, neg, num_layers=num_layers)
@@ -77,8 +86,8 @@ def test_reset_clears_gather_cache():
 
 def test_eviction_bounds_resident_window():
     kv, st = make_state(num_layers=1, window_chunks=3)
-    st.update_kv_cache(0, _window(3), False, seq_len=3 * BLOCK)          # resident 3/3
-    st.update_kv_cache(0, _window(5), False, seq_len=2 * BLOCK)          # +2 -> evict to 3
+    st.update_kv_cache(0, _window(3), False, seq_len=3 * BLOCK)  # resident 3/3
+    st.update_kv_cache(0, _window(5), False, seq_len=2 * BLOCK)  # +2 -> evict to 3
     got = st.get_kv_caches(False, lambda: ["X"])[0]
     assert got.shape[2] <= 3 * BLOCK  # window bounded
 
@@ -123,6 +132,7 @@ def test_kv_state_noop():
     the existing tests passing unchanged (the pipeline's default __init__
     sets _bde_kv_state = None)."""
     from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
+
     p = DreamZeroPipeline.__new__(DreamZeroPipeline)
     assert p._bde_kv_state is None
     for attr in ("_kv_get", "_kv_create", "_kv_update", "_kv_commit"):
@@ -133,6 +143,7 @@ def test_kv_create_always_initializes_model_local():
     """_kv_create must call state.create_kv_caches (no recursion), and must do so
     even under BDE so cross-attention (not managed by BDE) is initialized."""
     from unittest.mock import MagicMock
+
     from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
 
     p = DreamZeroPipeline.__new__(DreamZeroPipeline)
