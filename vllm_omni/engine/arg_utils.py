@@ -422,6 +422,7 @@ class OrchestratorArgs:
 
     # === Observability ===
     log_stats: bool = False
+    enable_orch_profiler: bool = False
 
     # === Headless Mode (also forwarded to engine — see SHARED_FIELDS) ===
     stage_id: int | None = None

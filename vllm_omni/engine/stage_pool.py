@@ -429,6 +429,29 @@ class StagePool:
             return None
         return cast(StagePoolLLMClient, client)
 
+    def replica_queue_size(self, replica_id: int) -> int:
+        """Best-effort queue/backlog size for profiler sampling.
+
+        Distributed replicas publish scheduler queue length via coordinator
+        heartbeats. Local/in-process stages do not expose that value cheaply,
+        so fall back to the number of logical requests currently bound to the
+        replica in this stage.
+        """
+        if replica_id < 0 or replica_id >= len(self.clients) or self.clients[replica_id] is None:
+            return 0
+        if self._hub is not None:
+            client = self.clients[replica_id]
+            input_addr = self._client_input_addr(client)
+            if input_addr is not None:
+                for replica in self._hub.get_replicas_for_stage(self.stage_id).replicas:
+                    if replica.input_addr == input_addr:
+                        return max(int(replica.queue_length), 0)
+        bound_legacy = sum(1 for bound_replica_id in self._request_bindings.values() if bound_replica_id == replica_id)
+        bound_affinity = sum(
+            1 for input_addr in self._affinity.values() if self._addr_to_replica_id.get(input_addr) == replica_id
+        )
+        return max(bound_legacy, bound_affinity)
+
     def release_binding(self, request_id: str) -> None:
         """Drop the route binding for *request_id* in this stage."""
         self._request_bindings.pop(request_id, None)

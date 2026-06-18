@@ -1,156 +1,228 @@
-"""Optional orchestrator phase profiler (diagnostic only).
+"""Optional orchestrator window profiler (diagnostic only).
 
 Enable with:
-  export VLLM_OMNI_ORCH_PROFILE=1
-  export VLLM_OMNI_ORCH_PROFILE_PATH=/path/to/orch_profile.jsonl
+  --enable-orch-profiler
 """
 
 from __future__ import annotations
 
 import json
-import os
-import threading
 import time
-from collections import defaultdict
-from collections.abc import Iterator
-from contextlib import contextmanager
-from typing import Any
+from dataclasses import dataclass
+from pathlib import Path
 
-_ENABLED = os.environ.get("VLLM_OMNI_ORCH_PROFILE", "").lower() in ("1", "true", "yes")
-_OUTPUT_PATH = os.environ.get(
-    "VLLM_OMNI_ORCH_PROFILE_PATH",
-    "/tmp/vllm_omni_orch_profile.jsonl",
-)
-_FLUSH_INTERVAL_S = float(os.environ.get("VLLM_OMNI_ORCH_PROFILE_FLUSH_S", "1.0"))
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+_DEFAULT_OUTPUT_PREFIX = "vllm_omni_orch_profile"
+_WINDOW_S = 1.0
+
+
+def _default_output_path() -> str:
+    timestamp = time.strftime("%m%d%H%M", time.localtime())
+    return str(Path.cwd() / f"{_DEFAULT_OUTPUT_PREFIX}_{timestamp}.json")
+
+
+@dataclass
+class _ReplicaWindow:
+    queue_size_sum: float = 0.0
+    queue_size_samples: int = 0
+    queue_size_max: int = 0
+    outputs: int = 0
+    finished_outputs: int = 0
 
 
 class OrchestratorProfiler:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._totals_s: dict[str, float] = defaultdict(float)
-        self._counts: dict[str, int] = defaultdict(int)
-        self._value_sums: dict[str, float] = defaultdict(float)
-        self._value_counts: dict[str, int] = defaultdict(int)
-        self._value_max: dict[str, float] = defaultdict(float)
-        self._value_last: dict[str, float] = {}
-        self._window_start = time.monotonic()
-        self._last_flush = self._window_start
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+    ) -> None:
+        self._enabled = bool(enabled)
+        self._output_path = _default_output_path()
+        self._dumped = False
+        self._started_at_wall = time.time()
+        self._window_start_wall = self._started_at_wall
+        self._window_start_mono = time.monotonic()
         self._loop_iterations = 0
         self._loop_idle_iterations = 0
+        self._active_requests = 0
+        self._replica_windows: dict[str, _ReplicaWindow] = {}
+        self._replica_keys: set[str] = set()
+        self._windows: dict[str, list[float | int]] = {
+            "start_ts": [],
+            "end_ts": [],
+            "duration_s": [],
+            "active_requests": [],
+            "loop_iterations": [],
+            "loop_idle": [],
+            "loop_running": [],
+        }
+        self._replicas: dict[str, dict[str, list[float | int]]] = {}
 
     @property
     def enabled(self) -> bool:
-        return _ENABLED
+        return self._enabled
 
-    def record(self, phase: str, elapsed_s: float, **tags: Any) -> None:
-        if not _ENABLED or elapsed_s < 0:
+    @staticmethod
+    def _replica_key(stage_id: int, replica_id: int) -> str:
+        return f"stage={stage_id},replica={replica_id}"
+
+    def register_replica(self, stage_id: int, replica_id: int) -> None:
+        if not self._enabled:
             return
-        key = phase
-        if tags:
-            tag_str = ",".join(f"{k}={v}" for k, v in sorted(tags.items()))
-            key = f"{phase}|{tag_str}"
-        with self._lock:
-            self._totals_s[key] += elapsed_s
-            self._counts[key] += 1
-            now = time.monotonic()
-            if now - self._last_flush >= _FLUSH_INTERVAL_S:
-                self._flush_locked(now)
+        self._ensure_replica(self._replica_key(stage_id, replica_id))
 
-    def record_value(self, name: str, value: float, **tags: Any) -> None:
-        if not _ENABLED:
+    def note_loop(self, *, idle: bool, active_requests: int) -> None:
+        if not self._enabled:
             return
-        key = name
-        if tags:
-            tag_str = ",".join(f"{k}={v}" for k, v in sorted(tags.items()))
-            key = f"{name}|{tag_str}"
-        with self._lock:
-            self._value_sums[key] += float(value)
-            self._value_counts[key] += 1
-            self._value_max[key] = max(self._value_max[key], float(value))
-            self._value_last[key] = float(value)
-            now = time.monotonic()
-            if now - self._last_flush >= _FLUSH_INTERVAL_S:
-                self._flush_locked(now)
+        self._roll_window_if_needed(time.monotonic())
+        self._loop_iterations += 1
+        if idle:
+            self._loop_idle_iterations += 1
+        self._active_requests = int(active_requests)
 
-    def note_loop(self, *, idle: bool) -> None:
-        if not _ENABLED:
+    def record_queue(self, stage_id: int, replica_id: int, queue_size: int) -> None:
+        if not self._enabled:
             return
-        with self._lock:
-            self._loop_iterations += 1
-            if idle:
-                self._loop_idle_iterations += 1
+        self._roll_window_if_needed(time.monotonic())
+        key = self._replica_key(stage_id, replica_id)
+        self._ensure_replica(key)
+        window = self._replica_windows.setdefault(key, _ReplicaWindow())
+        queue_size = max(int(queue_size), 0)
+        window.queue_size_sum += float(queue_size)
+        window.queue_size_samples += 1
+        window.queue_size_max = max(window.queue_size_max, queue_size)
 
-    def _flush_locked(self, now: float) -> None:
-        window_s = max(now - self._window_start, 1e-9)
-        profiled_s = sum(self._totals_s.values()) or 1e-9
-        payload = {
-            "ts": time.time(),
-            "window_s": window_s,
-            "loop_iterations": self._loop_iterations,
-            "loop_idle_iterations": self._loop_idle_iterations,
-            "phases": {
-                key: {
-                    "total_ms": totals * 1000.0,
-                    "count": self._counts[key],
-                    "avg_ms": (totals / self._counts[key]) * 1000.0 if self._counts[key] else 0.0,
-                    "pct": (totals / profiled_s) * 100.0,
-                }
-                for key, totals in self._totals_s.items()
-            },
-            "values": {
-                key: {
-                    "count": self._value_counts[key],
-                    "avg": self._value_sums[key] / self._value_counts[key] if self._value_counts[key] else 0.0,
-                    "max": self._value_max[key],
-                    "last": self._value_last.get(key, 0.0),
-                }
-                for key in self._value_counts
-            },
+    def record_outputs(self, stage_id: int, replica_id: int, outputs: list[object]) -> None:
+        if not self._enabled:
+            return
+        self._roll_window_if_needed(time.monotonic())
+        key = self._replica_key(stage_id, replica_id)
+        self._ensure_replica(key)
+        window = self._replica_windows.setdefault(key, _ReplicaWindow())
+        window.outputs += len(outputs)
+        window.finished_outputs += sum(1 for output in outputs if bool(getattr(output, "finished", False)))
+
+    def _ensure_replica(self, key: str) -> None:
+        if key in self._replica_keys:
+            return
+        self._replica_keys.add(key)
+        window_count = len(self._windows["start_ts"])
+        self._replicas[key] = {
+            "queue_size_avg": [0.0] * window_count,
+            "queue_size_max": [0] * window_count,
+            "outputs": [0] * window_count,
+            "finished_outputs": [0] * window_count,
         }
-        try:
-            with open(_OUTPUT_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, sort_keys=True) + "\n")
-        except OSError:
-            pass
-        self._totals_s.clear()
-        self._counts.clear()
-        self._value_sums.clear()
-        self._value_counts.clear()
-        self._value_max.clear()
-        self._value_last.clear()
+
+    def _roll_window_if_needed(self, now_mono: float) -> None:
+        if now_mono - self._window_start_mono >= _WINDOW_S:
+            self._roll_window(now_mono)
+
+    def _roll_window(self, now_mono: float) -> None:
+        end_wall = time.time()
+        duration_s = max(now_mono - self._window_start_mono, 1e-9)
+        self._windows["start_ts"].append(self._window_start_wall)
+        self._windows["end_ts"].append(end_wall)
+        self._windows["duration_s"].append(duration_s)
+        self._windows["active_requests"].append(self._active_requests)
+        self._windows["loop_iterations"].append(self._loop_iterations)
+        self._windows["loop_idle"].append(self._loop_idle_iterations)
+        self._windows["loop_running"].append(self._loop_iterations - self._loop_idle_iterations)
+
+        for key in sorted(self._replica_keys):
+            metrics = self._replicas[key]
+            window = self._replica_windows.get(key, _ReplicaWindow())
+            queue_avg = window.queue_size_sum / float(window.queue_size_samples) if window.queue_size_samples else 0.0
+            metrics["queue_size_avg"].append(queue_avg)
+            metrics["queue_size_max"].append(window.queue_size_max)
+            metrics["outputs"].append(window.outputs)
+            metrics["finished_outputs"].append(window.finished_outputs)
+
+        self._replica_windows.clear()
         self._loop_iterations = 0
         self._loop_idle_iterations = 0
-        self._window_start = now
-        self._last_flush = now
+        self._window_start_wall = end_wall
+        self._window_start_mono = now_mono
+
+    def dump(self) -> None:
+        if not self._enabled:
+            return
+        output_path = self._output_path
+        if self._dumped:
+            return
+        self._roll_window(time.monotonic())
+        self._dumped = True
+        payload = {
+            "started_at": self._started_at_wall,
+            "ended_at": time.time(),
+            "configured_window_s": _WINDOW_S,
+            "windows": self._windows,
+            "replicas": self._replicas,
+        }
+        summary = self._build_summary()
+        try:
+            parent = Path(output_path).expanduser().parent
+            parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, sort_keys=True)
+                f.write("\n")
+            self._log_summary(output_path, summary)
+        except OSError:
+            logger.exception("[OrchestratorProfiler] Failed to write profile to %s", output_path)
 
     def flush(self) -> None:
-        if not _ENABLED:
-            return
-        with self._lock:
-            self._flush_locked(time.monotonic())
+        self.dump()
+
+    def _build_summary(self) -> dict[str, float | int]:
+        duration_s = sum(float(x) for x in self._windows["duration_s"])
+        loop_iterations = sum(int(x) for x in self._windows["loop_iterations"])
+        loop_idle = sum(int(x) for x in self._windows["loop_idle"])
+        loop_running = sum(int(x) for x in self._windows["loop_running"])
+        active_values = [int(x) for x in self._windows["active_requests"]]
+        return {
+            "windows": len(self._windows["duration_s"]),
+            "duration_s": duration_s,
+            "loop_iterations": loop_iterations,
+            "loop_idle": loop_idle,
+            "loop_running": loop_running,
+            "loop_running_pct": (float(loop_running) / float(loop_iterations) * 100.0) if loop_iterations else 0.0,
+            "active_requests_avg": (sum(active_values) / float(len(active_values))) if active_values else 0.0,
+            "active_requests_max": max(active_values) if active_values else 0,
+        }
+
+    def _log_summary(self, output_path: str, summary: dict[str, float | int]) -> None:
+        logger.info(
+            "[OrchestratorProfiler] wrote %s windows=%d duration=%.3fs loop_running=%.1f%% "
+            "active_avg=%.2f active_max=%d",
+            output_path,
+            int(summary["windows"]),
+            float(summary["duration_s"]),
+            float(summary["loop_running_pct"]),
+            float(summary["active_requests_avg"]),
+            int(summary["active_requests_max"]),
+        )
+        for key, metrics in sorted(self._replicas.items()):
+            queue_avg_values = [float(x) for x in metrics["queue_size_avg"]]
+            queue_max_values = [int(x) for x in metrics["queue_size_max"]]
+            outputs = sum(int(x) for x in metrics["outputs"])
+            finished_outputs = sum(int(x) for x in metrics["finished_outputs"])
+            queue_avg = sum(queue_avg_values) / float(len(queue_avg_values)) if queue_avg_values else 0.0
+            queue_max = max(queue_max_values) if queue_max_values else 0
+            logger.info(
+                "[OrchestratorProfiler] %s queue_avg=%.2f queue_max=%d outputs=%d finished_outputs=%d",
+                key,
+                queue_avg,
+                queue_max,
+                outputs,
+                finished_outputs,
+            )
 
 
-_profiler: OrchestratorProfiler | None = None
-_profiler_lock = threading.Lock()
-
-
-def get_orchestrator_profiler() -> OrchestratorProfiler:
-    global _profiler
-    if _profiler is None:
-        with _profiler_lock:
-            if _profiler is None:
-                _profiler = OrchestratorProfiler()
-    return _profiler
-
-
-@contextmanager
-def profile_phase(phase: str, **tags: Any) -> Iterator[None]:
-    prof = get_orchestrator_profiler()
-    if not prof.enabled:
-        yield
-        return
-    t0 = time.perf_counter()
-    try:
-        yield
-    finally:
-        prof.record(phase, time.perf_counter() - t0, **tags)
+def get_orchestrator_profiler(
+    *,
+    enabled: bool = False,
+) -> OrchestratorProfiler:
+    return OrchestratorProfiler(enabled=enabled)

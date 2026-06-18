@@ -53,6 +53,7 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
     UnregisterRemoteReplicaMessage,
 )
+from vllm_omni.engine.orchestrator_profiler import get_orchestrator_profiler
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
@@ -184,6 +185,7 @@ class Orchestrator:
         remote_replica_factory: RemoteReplicaFactory | None = None,
         transfer_emitter: Any = None,
         log_stats: bool = False,
+        enable_orch_profiler: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -192,6 +194,10 @@ class Orchestrator:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        self._profiler = get_orchestrator_profiler(enabled=enable_orch_profiler)
+        for stage_id, pool in enumerate(self.stage_pools):
+            for replica_id in pool.live_replica_ids():
+                self._profiler.register_replica(stage_id, replica_id)
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
@@ -363,6 +369,7 @@ class Orchestrator:
                             t.cancel()
 
             self._shutdown_stages()
+            self._profiler.flush()
 
             # Close the hub last so any in-flight dispatch still has access.
             if self._hub is not None:
@@ -671,6 +678,8 @@ class Orchestrator:
                 for replica_id in pool.live_replica_ids():
                     if self._shutdown_event.is_set():
                         return
+                    self._profiler.register_replica(stage_id, replica_id)
+                    self._profiler.record_queue(stage_id, replica_id, pool.replica_queue_size(replica_id))
 
                     if pool.stage_type == "diffusion":
                         output = pool.poll_diffusion_output(replica_id)
@@ -679,6 +688,7 @@ class Orchestrator:
 
                         pool.record_output_timestamps([output])
                         await self._handle_processed_outputs(stage_id, replica_id, [output])
+                        self._profiler.record_outputs(stage_id, replica_id, [output])
                         idle = False
                     else:
                         try:
@@ -760,8 +770,10 @@ class Orchestrator:
                             raise
 
                         await self._handle_processed_outputs(stage_id, replica_id, raw_output)
+                        self._profiler.record_outputs(stage_id, replica_id, raw_output)
                         idle = False
 
+            self._profiler.note_loop(idle=idle, active_requests=len(self.request_states))
             if idle:
                 await asyncio.sleep(0.001)
             else:
