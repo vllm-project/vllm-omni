@@ -21,6 +21,7 @@ For the full list of supported architectures across all modalities, see
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` | ✓ (`ref_audio`+`ref_text`) | ✓ (codec_streaming) | — | — |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
+| Irodori-TTS v3 | `Aratako/Irodori-TTS-500M-v3` | ✓ (`ref_wav`) | — | — | — |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
@@ -269,6 +270,45 @@ bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
 - Output: 24 kHz mono WAV via HiFT vocoder.
 - `ref_audio` + `ref_text` are **required** together on every request. Reference audio should be 3-10 seconds.
 - Voice cloning feature extraction (WhisperVQ, CampPlus, mel) runs on the model side — no external dependency on the serving layer.
+
+---
+
+## Irodori-TTS v3
+
+Flow Matching TTS over continuous DACVAE latents at 48 kHz. Supports zero-shot voice cloning.
+
+> "Irodori-TTS-500M-v3 is a Japanese Text-to-Speech model based on a Rectified Flow Diffusion Transformer (RF-DiT) architecture." — [Aratako/Irodori-TTS-500M-v3](https://huggingface.co/Aratako/Irodori-TTS-500M-v3)
+
+### Prerequisites
+
+```bash
+uv pip install -e ".[irodori-tts]"
+```
+
+### Launch
+```bash
+vllm serve Aratako/Irodori-TTS-500M-v3 --omni --port 8091
+```
+
+### Sending requests
+```bash
+# Voice cloning via OpenAI-compatible endpoint
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "こんにちは、これは私のクローンされた声です。",
+        "voice": "default",
+        "response_format": "wav",
+        "extra_args": {
+            "ref_wav": "/path/to/reference.wav"
+        }
+    }' --output cloned.wav
+```
+
+### Notes
+- Output: 48 kHz mono WAV.
+- Uses `Aratako/Semantic-DACVAE-Japanese-32dim` for high-fidelity audio decoding.
+- Automatically estimates speech frame length using an integrated duration predictor.
 
 ---
 

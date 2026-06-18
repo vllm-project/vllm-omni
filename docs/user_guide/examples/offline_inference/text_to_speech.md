@@ -20,6 +20,7 @@ list of supported architectures across all modalities, see
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ (`async_chunk: true` default) | — | 22.05 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ (`--streaming`) | — | 44.1 kHz |
 | GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
+| Irodori-TTS v3 | `Aratako/Irodori-TTS-500M-v3` | single (pure DiT) | ✓ | — | — | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design (`--instruct`), language (`--lang`) | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants (`--query-type`) | 24 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets (`--voice`) | 24 kHz |
@@ -186,6 +187,39 @@ Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24
 - First run may be slow due to lazy loading of WhisperVQ tokenizer and CampPlus ONNX speaker embedder.
 - Default sampling: temperature=1.0, top_k=25, top_p=0.8 (RAS method).
 - The `--model` path should point to the repository root (not `llm/` subdirectory).
+
+---
+
+## Irodori-TTS v3
+
+Single-stage Flow Matching DiT text-to-speech model at 48 kHz. Supports high-fidelity voice cloning.
+
+> "Irodori-TTS-500M-v3 is a Japanese Text-to-Speech model based on a Rectified Flow Diffusion Transformer (RF-DiT) architecture." — [Aratako/Irodori-TTS-500M-v3](https://huggingface.co/Aratako/Irodori-TTS-500M-v3)
+
+### Prerequisites
+
+```bash
+uv pip install -e ".[irodori-tts]"
+```
+
+### Offline Stage Configuration
+The offline pipeline is configured using the stage config at `vllm_omni/model_executor/stage_configs/irodori_tts.yaml` (default):
+```yaml
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dit
+      model_class_name: IrodoriTTSPipeline
+```
+
+### Notes
+- Output: 48 kHz mono WAV.
+- Voice cloning works with automatic duration prediction, producing standard mono waveform audio outputs.
+- High-fidelity decoding is handled via `Aratako/Semantic-DACVAE-Japanese-32dim`.
 
 ---
 

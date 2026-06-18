@@ -291,6 +291,11 @@ _DIFFUSION_MODELS = {
         "pipeline_sdxl",
         "StableDiffusionXLPipeline",
     ),
+    "IrodoriTTSPipeline": (
+        "irodori_tts",
+        "pipeline_irodori_tts",
+        "IrodoriTTSPipeline",
+    ),
 }
 
 
@@ -516,6 +521,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
+    "IrodoriTTSPipeline": "get_irodori_tts_post_process_func",
 }
 
 _DIFFUSION_ACTION_POST_PROCESS_FUNCS = {
