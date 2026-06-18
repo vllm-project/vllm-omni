@@ -278,6 +278,11 @@ class LanceBagel(Bagel):
     ``forward_cache_update_vae`` — is reused unchanged.
     """
 
+    # Upstream Lance samples ``num_timesteps + 1`` schedule points (one extra
+    # over official BAGEL) so the denoise loop runs exactly ``num_timesteps``
+    # Euler steps. See Bagel.generate_image and issue #4470.
+    _denoise_schedule_extra_step: bool = True
+
     @staticmethod
     def _lance_compute_vit_buckets():
         """Replicate upstream Lance's ``BucketResize.init_buckets`` for the ViT path.

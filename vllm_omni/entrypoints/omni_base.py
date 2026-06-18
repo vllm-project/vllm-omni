@@ -20,6 +20,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
+from vllm_omni.errors import raise_client_error_or
 from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator
@@ -372,7 +373,7 @@ class OmniBase(PDDisaggregationMixin):
                     msg.error,
                     error_stage_id=msg.stage_id,
                 )
-            raise RuntimeError(msg.error)
+            self._raise_nonfatal_error_message(msg)
 
         if not isinstance(msg, OutputMessage):
             logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg.type)
@@ -408,6 +409,15 @@ class OmniBase(PDDisaggregationMixin):
 
         return False, req_id, stage_id, req_state
 
+    def _raise_nonfatal_error_message(self, msg: ErrorMessage) -> None:
+        """Raise the exception for a non-fatal, request-scoped error message."""
+        raise_client_error_or(
+            msg.error,
+            status_code=msg.status_code,
+            error_type=msg.error_type,
+            fallback=RuntimeError,
+        )
+
     def _check_engine_output_error(
         self,
         result: OutputMessage,
@@ -424,6 +434,8 @@ class OmniBase(PDDisaggregationMixin):
         error_text = getattr(engine_outputs, "error", None)
         if error_text is None:
             return
+        status_code = engine_outputs.error_status_code
+        error_type = engine_outputs.error_type
         logger.error(
             "[%s] Stage error for req=%s stage-%s: %s",
             self.__class__.__name__,
@@ -437,7 +449,12 @@ class OmniBase(PDDisaggregationMixin):
                 error_text,
                 error_stage_id=stage_id,
             )
-        raise EngineGenerateError(error_text)
+        raise_client_error_or(
+            error_text,
+            status_code=status_code,
+            error_type=error_type,
+            fallback=EngineGenerateError,
+        )
 
     def _process_single_result(
         self,
@@ -513,6 +530,15 @@ class OmniBase(PDDisaggregationMixin):
                     finished_reason=fr,
                 )
 
+                # Token counters — aggregate across all stages for this request.
+                _prompt_tok = 0
+                _gen_tok = 0
+                for evt in metrics.stage_events.get(rid_key, []):
+                    if evt.stage_id == 0:
+                        _prompt_tok += int(evt.num_tokens_in)
+                    _gen_tok += int(evt.num_tokens_out)
+                self.prom_metrics.observe_tokens(_prompt_tok, _gen_tok)
+
                 # Modality observe inside the same finalize guard so it fires
                 # once per request and inherits the try/except isolation.
                 observe_modality_at_finalize(
@@ -561,9 +587,8 @@ class OmniBase(PDDisaggregationMixin):
             if current_stage_metrics is not None:
                 response_metrics["stage_id"] = current_stage_metrics["stage_id"]
                 response_metrics["final_output_type"] = current_stage_metrics["final_output_type"]
-                if current_stage_metrics["final_output_type"] == "text":
-                    response_metrics["num_tokens_in"] = current_stage_metrics["num_tokens_in"]
-                    response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
+                response_metrics["num_tokens_in"] = current_stage_metrics["num_tokens_in"]
+                response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
         return OmniRequestOutput(
             request_id=req_id or "",
             stage_id=stage_id,

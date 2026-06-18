@@ -11,10 +11,11 @@ import base64
 import io
 import json
 from argparse import Namespace
+from http import HTTPStatus
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
@@ -23,12 +24,13 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels, router
+from vllm_omni.entrypoints.openai.api_server import _check_max_generated_image_size, _DiffusionServingModels, router
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -587,6 +589,24 @@ def test_generate_single_image(test_client):
     assert test_client.app.state.engine_client.captured_prompt["modalities"] == ["image"]
 
 
+def test_generate_images_guardrail_error_returns_400(test_client, mock_async_diffusion):
+    async def blocked_generate(**kwargs):
+        raise GuardrailViolationError("Input was blocked by Cosmos3 guardrails.")
+        yield MockGenerationResult([])  # pragma: no cover
+
+    mock_async_diffusion.generate = blocked_generate
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "blocked prompt",
+            "n": 1,
+            "size": "1024x1024",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Input was blocked by Cosmos3 guardrails."
+
+
 def test_generate_images_async_omni_sampling_params(async_omni_test_client):
     """Test AsyncOmni path uses per-stage sampling params."""
     response = async_omni_test_client.post(
@@ -889,6 +909,31 @@ def test_image_edits_streaming_errors_on_empty_final_image(streaming_image_edit_
     assert payloads[1]["object"] == "error"
     assert "empty final image" in payloads[1]["error"]["message"]
     assert payloads[2] == "[DONE]"
+
+
+def test_image_edits_streaming_guardrail_error_uses_400(streaming_image_edit_client):
+    async def generate_guardrail_error(prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
+        raise GuardrailViolationError("Input was blocked by Cosmos3 guardrails.")
+        yield MockStageResult(stage_id=1, final_output_type="image", images=[])  # pragma: no cover
+
+    streaming_image_edit_client.app.state.engine_client.generate = generate_guardrail_error
+    img_bytes = make_test_image_bytes((16, 16))
+    response = streaming_image_edit_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "blocked prompt",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _parse_sse_payloads(response.text)
+    assert payloads[0]["object"] == "error"
+    assert payloads[0]["error"]["message"] == "Input was blocked by Cosmos3 guardrails."
+    assert payloads[0]["error"]["type"] == "BadRequestError"
+    assert payloads[0]["error"]["code"] == 400
+    assert payloads[1] == "[DONE]"
 
 
 def test_image_edits_streaming_rejects_single_stage(test_client):
@@ -1933,6 +1978,56 @@ def test_extract_images_from_result():
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
     assert images[0].size == (32, 32)
+
+
+# ---------------------------------------------------------------------------
+# _check_max_generated_image_size unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_width_height_within_limit_passes():
+    args = SimpleNamespace(max_generated_image_size=1024 * 1024)
+    # Exactly at limit is allowed (> not >=)
+    _check_max_generated_image_size(args, 1024, 1024)
+    # Below limit
+    _check_max_generated_image_size(args, 512, 512)
+
+
+def test_width_height_exceeds_limit_raises_400():
+    limit = 1024 * 1024
+    args = SimpleNamespace(max_generated_image_size=limit)
+    with pytest.raises(HTTPException) as exc_info:
+        _check_max_generated_image_size(args, 1025, 1024)
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
+    assert "1025x1024" in exc_info.value.detail
+    assert str(limit) in exc_info.value.detail
+
+
+def test_width_height_error_message_contains_size_hint():
+    args = SimpleNamespace(max_generated_image_size=512 * 512)
+    with pytest.raises(HTTPException) as exc_info:
+        _check_max_generated_image_size(args, 1024, 512)
+    assert "--max-generated-image-size" in exc_info.value.detail
+
+
+def test_resolution_within_limit_passes():
+    args = SimpleNamespace(max_generated_image_size=1024 * 1024)
+    # Exactly at limit is allowed (> not >=): 1024*1024 == limit
+    _check_max_generated_image_size(args, None, None, resolution=1024)
+    # Below limit
+    _check_max_generated_image_size(args, None, None, resolution=512)
+
+
+def test_resolution_exceeds_limit_raises_400():
+    limit = 1024 * 1024
+    args = SimpleNamespace(max_generated_image_size=limit)
+    with pytest.raises(HTTPException) as exc_info:
+        _check_max_generated_image_size(args, None, None, resolution=1025)
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
+    detail = exc_info.value.detail
+    assert "1025" in detail
+    assert "1025x1025" in detail
+    assert str(limit) in detail
 
 
 def test_image_edits_size_auto_preserves_bridge_size(async_omni_stage_configs_only_client):

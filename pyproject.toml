@@ -65,7 +65,9 @@ dev = [
     "orjson>=3.11.7", # to make v1/embeddings API fast
     "voxcpm>=2.0.2", # for VoxCPM2 path-locating in tests
     "torchdiffeq>=0.2.5", # for covo_audio Test
-    "FlagEmbedding" # for hunyuan_image3 tests
+    "FlagEmbedding", # for hunyuan_image3 tests
+    "kernels<0.15.0", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
+    "s3tokenizer>=0.3.0" # for tts test
 ]
 
 demo = [
@@ -87,6 +89,12 @@ local = [
 # who only need other models; opt in with `pip install vllm-omni[minicpmo]`.
 minicpmo = [
     "stepaudio2-minicpmo",
+]
+
+# Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
+# as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
+quack = [
+    "quack-kernels>=0.3.11",
 ]
 
 docs = [
@@ -220,6 +228,7 @@ markers = [
     "tts: TTS model tests",
     "cache: Cache backend tests",
     "parallel: Parallelism/distributed tests",
+    "sp: Sequence parallelism tests",
     "example: Doc example code tests",
     # platform markers
     "cpu: Tests that run on CPU",
@@ -273,6 +282,7 @@ extend-ignore-identifiers-re = [
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
     ".*[Nn][Dd]3.*",
+    ".*updator.*",
     "byt5.*",
 ]
 extend-ignore-re = [
@@ -285,5 +295,9 @@ fullset = "fullset"
 Vai = "Vai"
 tockens = "tockens"
 CANN = "CANN"
+# Step-Audio reasoning parser streams `</think>` tokens split across chunks
+# (e.g. "</" + "thi" + "nk>"). The fragment "thi" appears literally in its
+# parser logic and tests and is not a typo of "the"/"this".
+thi = "thi"
 ND = "ND"
 byt5 = "byt5"

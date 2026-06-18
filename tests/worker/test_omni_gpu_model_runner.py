@@ -22,6 +22,7 @@ class DummyInputBatch:
 
     def __init__(self, req_ids):
         self.req_ids = req_ids
+        self.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
 
 
 class DummyReqState:

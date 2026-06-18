@@ -38,6 +38,7 @@ def edit_image(
     guidance_scale: float | None = None,
     seed: int | None = None,
     negative_prompt: str | None = None,
+    extra_body: dict | None = None,
 ) -> bytes | None:
     """Edit an image using the chat completions API.
 
@@ -51,6 +52,7 @@ def edit_image(
         guidance_scale: CFG guidance scale
         seed: Random seed
         negative_prompt: Negative prompt
+        extra_body: Additional model-specific params (e.g. cfg_text_scale for BAGEL)
 
     Returns:
         Edited image bytes or None if failed
@@ -75,24 +77,26 @@ def edit_image(
     ]
 
     # Build extra_body with generation parameters
-    extra_body = {}
+    merged_extra_body: dict[str, object] = {}
     if height is not None:
-        extra_body["height"] = height
+        merged_extra_body["height"] = height
     if width is not None:
-        extra_body["width"] = width
+        merged_extra_body["width"] = width
     if steps is not None:
-        extra_body["num_inference_steps"] = steps
+        merged_extra_body["num_inference_steps"] = steps
     if guidance_scale is not None:
-        extra_body["guidance_scale"] = guidance_scale
+        merged_extra_body["guidance_scale"] = guidance_scale
     if seed is not None:
-        extra_body["seed"] = seed
+        merged_extra_body["seed"] = seed
     if negative_prompt:
-        extra_body["negative_prompt"] = negative_prompt
+        merged_extra_body["negative_prompt"] = negative_prompt
+    if extra_body:
+        merged_extra_body.update(extra_body)
 
     # Build request payload
-    payload = {"messages": messages}
-    if extra_body:
-        payload["extra_body"] = extra_body
+    payload: dict[str, object] = {"messages": messages}
+    if merged_extra_body:
+        payload["extra_body"] = merged_extra_body
 
     # Send request
     try:
@@ -121,6 +125,19 @@ def edit_image(
         return None
 
 
+def parse_extra_body(value: str) -> dict:
+    """Parse a JSON string into a dict for --extra-body."""
+    import json
+
+    try:
+        obj = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--extra-body must be valid JSON: {e}") from e
+    if not isinstance(obj, dict):
+        raise argparse.ArgumentTypeError("--extra-body must be a JSON object")
+    return obj
+
+
 def main():
     parser = argparse.ArgumentParser(description="Qwen-Image-Edit chat client")
     parser.add_argument("--input", "-i", required=True, nargs="+", help="Input image path(s)")
@@ -133,6 +150,12 @@ def main():
     parser.add_argument("--guidance", type=float, default=7.5, help="Guidance scale")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
+    parser.add_argument(
+        "--extra-body",
+        type=parse_extra_body,
+        default=None,
+        help="JSON object merged into request extra_body, e.g. '{\"cfg_text_scale\": 4.0}'.",
+    )
 
     args = parser.parse_args()
 
@@ -152,6 +175,7 @@ def main():
         guidance_scale=args.guidance,
         seed=args.seed,
         negative_prompt=args.negative,
+        extra_body=args.extra_body,
     )
 
     if image_bytes:
