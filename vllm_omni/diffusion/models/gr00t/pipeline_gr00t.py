@@ -12,7 +12,6 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.gr00t.policy import Gr00tPolicy
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
-from vllm_omni.utils import msgpack_numpy
 
 logger = init_logger(__name__)
 
@@ -22,11 +21,6 @@ def _to_float32_action_dict(actions: Mapping[str, Any]) -> dict[str, np.ndarray]
     if not converted:
         raise RuntimeError("GR00T policy returned an empty action dict.")
     return converted
-
-
-def _pack_actions(action_dict: dict[str, np.ndarray]) -> bytes:
-    """Pack action arrays to bytes so they survive serialization; serving unpacks them."""
-    return msgpack_numpy.packb(action_dict)
 
 
 class Gr00tN1d7Pipeline(nn.Module):
@@ -88,12 +82,9 @@ class Gr00tN1d7Pipeline(nn.Module):
         del kwargs
         extra_args = req.sampling_params.extra_args or {}
         robot_obs = extra_args.get("robot_obs")
-        if isinstance(robot_obs, (bytes, bytearray)):
-            # Serving packs obs to bytes to survive serialization; unpack here.
-            robot_obs = msgpack_numpy.unpackb(robot_obs)
         if robot_obs is None:
             if req.request_id == DUMMY_DIFFUSION_REQUEST_ID:
-                return DiffusionOutput(output={"actions": _pack_actions(self._dummy_actions())})
+                return DiffusionOutput(output={"actions": self._dummy_actions()})
             return DiffusionOutput(error="Gr00tN1d7Pipeline.forward expects sampling_params.extra_args['robot_obs'].")
         if not isinstance(robot_obs, Mapping):
             return DiffusionOutput(error=f"robot_obs must be a dict, got {type(robot_obs).__name__}.")
@@ -107,8 +98,8 @@ class Gr00tN1d7Pipeline(nn.Module):
         if not isinstance(actions, Mapping):
             return DiffusionOutput(error=f"GR00T policy returned {type(actions).__name__}; expected dict actions.")
         # Return actions via output.output (like the DreamZero OpenPI policy) so the engine's
-        # empty-output guard passes; packed to bytes so the arrays survive serialization.
-        return DiffusionOutput(output={"actions": _pack_actions(_to_float32_action_dict(actions))})
+        # empty-output guard passes.
+        return DiffusionOutput(output={"actions": _to_float32_action_dict(actions)})
 
 
 def _normalize_observation(robot_obs: Mapping[str, Any], *, language_key: str) -> dict[str, Any]:

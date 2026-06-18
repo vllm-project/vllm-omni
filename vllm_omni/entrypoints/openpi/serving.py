@@ -18,8 +18,6 @@ import numpy as np
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
 
-from vllm_omni.utils import msgpack_numpy
-
 logger = init_logger(__name__)
 
 ActionOutput = np.ndarray | dict[str, np.ndarray]
@@ -155,8 +153,7 @@ class ServingRealtimeRobotOpenPI:
         extra_args = {
             "reset": reset,
             "session_id": session_id,
-            # Pack obs to bytes so its numpy arrays survive the engine request serialization.
-            "robot_obs": msgpack_numpy.packb(obs),
+            "robot_obs": obs,
         }
 
         prompt = obs.get("prompt", "")
@@ -176,9 +173,6 @@ class ServingRealtimeRobotOpenPI:
         actions = multimodal_output.get("actions")
         if actions is None:
             raise RuntimeError("Missing multimodal_output['actions'] in robot policy result")
-        if isinstance(actions, (bytes, bytearray)):
-            # Pipeline packs actions to bytes to survive serialization; unpack here.
-            actions = msgpack_numpy.unpackb(actions)
         if isinstance(actions, Mapping):
             return {str(key): np.asarray(value, dtype=np.float32) for key, value in actions.items()}
         return np.asarray(actions, dtype=np.float32)
