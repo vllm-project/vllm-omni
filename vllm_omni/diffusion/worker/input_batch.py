@@ -253,8 +253,15 @@ def _prepare_request_prompt_field(
                 f"{embeds_attr} for request {state.request_id} requires seq_len "
                 f"{max_actual_seq_len}, got target {target_seq_len}."
             )
-        return embeds[:, :target_seq_len], None if mask is None else mask[:, :target_seq_len]
+        embeds = embeds[:, :target_seq_len]
+        mask = None if mask is None else mask[:, :target_seq_len]
+        setattr(state, embeds_attr, embeds)
+        if mask is not None:
+            setattr(state, mask_attr, mask)
+        setattr(state, seq_lens_attr, [int(embeds.shape[1])] * int(embeds.shape[0]))
+        return embeds, mask
 
+    setattr(state, seq_lens_attr, [int(embeds.shape[1])] * int(embeds.shape[0]))
     return embeds, mask
 
 

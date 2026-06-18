@@ -18,6 +18,8 @@ AUDIO_MODEL = {
 
 IMAGE_VIDEO_MODELS = {
     "riverclouds/qwen_image_random": {"cuda": 2200, "rocm": 2100},
+    "Tongyi-MAI/Z-Image-Turbo": {"cuda": 2500, "rocm": 2100},
+    "OmniGen2/OmniGen2": {"cuda": 2500, "rocm": 2100},
 }
 
 MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}

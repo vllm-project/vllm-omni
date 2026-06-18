@@ -19,7 +19,7 @@ import json
 import math
 import os
 from collections.abc import Callable, Iterable
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -43,7 +43,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
 )
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
@@ -181,8 +181,14 @@ def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     return float(mu)
 
 
-class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, DiffusionPipelineProfilerMixin):
+class Flux2KleinPipeline(
+    nn.Module, CFGParallelMixin, SupportImageInput, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+):
     """Flux2 klein pipeline for text-to-image generation."""
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     support_image_input = True
 

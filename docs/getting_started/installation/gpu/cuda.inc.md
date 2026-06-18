@@ -110,3 +110,53 @@ docker run --runtime nvidia --gpus 2 \
     The CUDA image does not define a default entrypoint, so include `vllm serve ... --omni` after the image name.
 
 # --8<-- [end:pre-built-images]
+
+# --8<-- [start:build-docker]
+
+#### Build docker image
+
+```bash
+DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.cuda -t vllm-omni-cuda .
+```
+
+If you want to specify the base vLLM version:
+
+```bash
+DOCKER_BUILDKIT=1 docker build \
+  -f docker/Dockerfile.cuda \
+  --build-arg BASE_IMAGE=vllm/vllm-openai:v0.22.1 \
+  -t vllm-omni-cuda .
+```
+
+#### Launch the docker image
+
+##### Launch with OpenAI API Server
+
+!!! note
+    The model `Qwen/Qwen3-Omni-30B-A3B-Instruct` requires significant GPU memory. The example below has been verified on 2 x H100's.
+
+```bash
+docker run --runtime nvidia --gpus 2 \
+  -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface \
+  --env "HF_TOKEN=$HF_TOKEN" \
+  -p 8091:8091 \
+  --ipc=host \
+  vllm-omni-cuda \
+  vllm serve --omni --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
+```
+
+By default, this mounts `$HOME/.cache/huggingface` as the model cache directory. To use a custom location, set the `HF_HOME` environment variable before running the command (e.g., `export HF_HOME=/data/models`).
+
+##### Launch with interactive session for development
+
+```bash
+docker run --runtime nvidia --gpus all -it --rm \
+  -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface \
+  --env "HF_TOKEN=$HF_TOKEN" \
+  -p 8091:8091 \
+  --ipc=host \
+  --entrypoint bash \
+  vllm-omni-cuda
+```
+
+# --8<-- [end:build-docker]

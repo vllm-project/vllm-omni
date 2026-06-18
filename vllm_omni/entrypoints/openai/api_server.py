@@ -132,7 +132,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
     ReferenceImage,
     ReferenceVideo,
 )
-from vllm_omni.entrypoints.openai.serving_video_stream import OmniStreamingVideoHandler
+from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
@@ -646,6 +646,7 @@ async def build_async_omni_from_stage_config(
     try:
         kwargs = args.get_explicit_kwargs_dict()
         model = kwargs.pop("model", None) or args.model
+        kwargs.setdefault("log_stats", not args.disable_log_stats)
         async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
@@ -1069,7 +1070,7 @@ async def omni_init_app_state(
         speech_service=state.openai_serving_speech,
     )
     state.openai_streaming_video = (
-        OmniStreamingVideoHandler(
+        create_streaming_video_handler(
             chat_service=state.openai_serving_chat,
             engine_client=engine_client,
         )
@@ -2333,7 +2334,8 @@ def _check_max_generated_image_size(
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
-                f"size of {max_generated_image_size} pixels.",
+                f"size of {max_generated_image_size} pixels. You can reduce the requested size "
+                f"or increase the server's --max-generated-image-size limit.",
             )
     elif resolution is not None:
         # When resolution is set, the output size is resolution * resolution
@@ -2341,7 +2343,8 @@ def _check_max_generated_image_size(
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
-                f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
+                f"exceeds the maximum allowed size of {max_generated_image_size} pixels. "
+                f"You can reduce the requested size or increase the server's --max-generated-image-size limit.",
             )
 
 

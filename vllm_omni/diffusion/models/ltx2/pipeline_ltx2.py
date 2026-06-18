@@ -157,7 +157,11 @@ class _VideoAudioScheduler:
         return ((video_out, audio_out),)
 
 
-class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
+class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsComponentDiscovery):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae"]
+
     # Audio is diffused jointly with video; warmup must size audio tokens.
     dummy_run_num_frames = 2
 
