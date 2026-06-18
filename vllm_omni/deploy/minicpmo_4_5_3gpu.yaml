@@ -1,0 +1,48 @@
+# MiniCPM-o 4.5 deploy: 3-GPU layout (thinker TP=2 + talker on GPU 2).
+#
+# Stage 0 (thinker): GPU 0,1 — 2-way tensor parallel, ~70% mem each.
+# Stage 1 (talker) : GPU 2   — MiniCPMTTS + Token2Wav, ~75% mem
+#                              (covers both the talker LM and the in-process
+#                              Token2Wav vocoder that emits the waveform).
+pipeline: minicpmo_4_5
+async_chunk: false
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.7
+    enforce_eager: true
+    tensor_parallel_size: 2
+    max_num_batched_tokens: 16384
+    devices: "0,1"
+    limit_mm_per_prompt:
+      video: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    # Talker only consumes runtime_additional_information[0]; any value > 1
+    # makes concurrent requests share request-0's audio (mm_outputs fallback).
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.75
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    devices: "2"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false
+
+platforms: {}

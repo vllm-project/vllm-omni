@@ -13,6 +13,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ResponseFormat,
 )
 from vllm_omni.entrypoints.openai.protocol.videos import (
+    VideoAction,
     VideoData,
     VideoGenerationRequest,
     VideoGenerationResponse,
@@ -27,6 +28,7 @@ __all__ = [
     "ImageGenerationRequest",
     "ImageGenerationResponse",
     "ResponseFormat",
+    "VideoAction",
     "VideoData",
     "VideoGenerationRequest",
     "VideoGenerationResponse",

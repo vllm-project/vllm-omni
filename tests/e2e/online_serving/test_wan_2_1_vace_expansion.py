@@ -37,6 +37,18 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 def _get_vace_feature_cases():
     return [
+        # Single GPU: CPU offload
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=[
+                    "--enable-cpu-offload",
+                    "--vae-use-tiling",
+                ],
+            ),
+            id="single_card_cpu_offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
         # Single GPU: Cache-DiT + layerwise CPU offload
         pytest.param(
             OmniServerParams(

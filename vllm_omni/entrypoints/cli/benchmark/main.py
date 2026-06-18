@@ -4,12 +4,12 @@ import argparse
 import typing
 
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 
 from vllm_omni.entrypoints.cli.benchmark.base import OmniBenchmarkSubcommandBase
 
 if typing.TYPE_CHECKING:
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 
 class OmniBenchmarkSubcommand(CLISubcommand):
@@ -25,7 +25,7 @@ class OmniBenchmarkSubcommand(CLISubcommand):
     def validate(self, args: argparse.Namespace) -> None:
         pass
 
-    def subparser_init(self, subparsers: argparse._SubParsersAction) -> FlexibleArgumentParser:
+    def subparser_init(self, subparsers: argparse._SubParsersAction) -> TrackingArgumentParser:
         bench_parser = subparsers.add_parser(
             self.name, description=self.help, usage=f"vllm {self.name} <bench_type> [options]"
         )

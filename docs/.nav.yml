@@ -87,6 +87,8 @@ nav:
       - AutoRound: user_guide/quantization/autoround.md
       - msModelSlim: user_guide/quantization/msmodelslim.md
     - ComfyUI: features/comfyui.md
+  - Fault Tolerance:
+    - Failure Modes: user_guide/fault_injection_reliability_matrix.md
 - Developer Guide:
   - General:
     - contributing/README.md

@@ -94,7 +94,13 @@ def _format_table(
         if isinstance(value, float):
             return f"{value:,.3f}"
         if isinstance(value, list):
-            return ", ".join(str(f"{v:,.3f}") for v in value)
+            if not value:
+                return ""
+            try:
+                avg = sum(float(v) for v in value) / len(value)
+                return f"{avg:,.3f} (n={len(value)})"
+            except (TypeError, ValueError):
+                return ", ".join(str(v) for v in value)
         return str(value)
 
     table = PrettyTable()
@@ -117,6 +123,17 @@ def _format_table(
         if column_key is None:
             raise ValueError("column_key is required for multi-column mode")
         col_headers = [f"{column_prefix}{row.get(column_key, '?')}" for row in data]
+        # PrettyTable requires unique field names.  When the same column key
+        # appears more than once (e.g. two events with the same stage_id),
+        # deduplicate by appending _2, _3, … to the later occurrences.
+        if len(col_headers) != len(set(col_headers)):
+            seen: dict[str, int] = {}
+            deduped: list[str] = []
+            for h in col_headers:
+                n = seen.get(h, 0)
+                seen[h] = n + 1
+                deduped.append(h if n == 0 else f"{h}_{n + 1}")
+            col_headers = deduped
         table.field_names = ["Field"] + col_headers
         table.align["Field"] = "l"
         for col in col_headers:
@@ -134,9 +151,15 @@ def count_tokens_from_outputs(engine_outputs: list[Any]) -> int:
         try:
             outs = getattr(_ro, "outputs", None)
             if outs and len(outs) > 0:
-                tokens = getattr(outs[0], "token_ids", None)
-                if tokens is not None:
-                    total += len(tokens)
+                for output in outs:
+                    # In DELTA mode token_ids only contains the latest chunk.
+                    # Omni's output processor attaches the cumulative sequence
+                    # for inter-stage routing and accurate metrics.
+                    tokens = getattr(output, "cumulative_token_ids", None)
+                    if tokens is None:
+                        tokens = getattr(output, "token_ids", None)
+                    if tokens is not None:
+                        total += len(tokens)
         except Exception:
             # Ignore any issues with individual outputs to keep token counting best-effort.
             pass

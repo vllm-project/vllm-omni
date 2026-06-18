@@ -12,17 +12,16 @@ from pathlib import Path
 
 import soundfile as sf
 import torch
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import Omni
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SAMPLE_RATE = 48_000
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Offline VoxCPM2 native AR inference")
+    parser = TrackingArgumentParser(description="Offline VoxCPM2 native AR inference")
     parser.add_argument(
         "--model",
         type=str,
@@ -60,7 +59,6 @@ def parse_args():
         default=None,
         help="Optional transcript of --ref-audio (enables continuation mode).",
     )
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

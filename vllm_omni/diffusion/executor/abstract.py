@@ -6,8 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -67,11 +66,6 @@ class DiffusionExecutor(ABC):
     @abstractmethod
     def _init_executor(self) -> None:
         """Initialize the executor (e.g., launch workers, setup IPC)."""
-        pass
-
-    @abstractmethod
-    def add_req(self, requests: OmniDiffusionRequest) -> DiffusionOutput:
-        """Add requests to the execution queue."""
         pass
 
     @abstractmethod

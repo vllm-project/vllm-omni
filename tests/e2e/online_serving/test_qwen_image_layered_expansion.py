@@ -35,6 +35,14 @@ FEATURE_CASES = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
+            server_args=["--enable-cpu-offload"],
+        ),
+        id="cpu_offload",
+        marks=SINGLE_CARD_FEATURE_MARKS,
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
             server_args=[
                 "--cache-backend",
                 "cache_dit",
