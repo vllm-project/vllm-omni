@@ -22,6 +22,7 @@ from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
+from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -143,11 +144,13 @@ class InlineStageDiffusionClient(StageClientBase):
             logger.info("request_id: %s aborted: %s", request_id, str(e))
         except Exception as e:
             logger.exception("Diffusion request %s failed: %s", request_id, e)
-            error_output = OmniRequestOutput.from_diffusion(
+            status_code, error_type = client_error_metadata(e)
+            error_output = OmniRequestOutput.from_error(
                 request_id=request_id,
-                images=[],
+                error_message=str(e),
+                status_code=status_code,
+                error_type=error_type,
             )
-            error_output.error = str(e)
             self._output_queue.put_nowait(error_output)
         finally:
             self._tasks.pop(request_id, None)
@@ -248,11 +251,13 @@ class InlineStageDiffusionClient(StageClientBase):
             logger.info("request_id: %s aborted: %s", request_id, str(e))
         except Exception as e:
             logger.exception("Batch diffusion request %s failed: %s", request_id, e)
-            error_output = OmniRequestOutput.from_diffusion(
+            status_code, error_type = client_error_metadata(e)
+            error_output = OmniRequestOutput.from_error(
                 request_id=request_id,
-                images=[],
+                error_message=str(e),
+                status_code=status_code,
+                error_type=error_type,
             )
-            error_output.error = str(e)
             self._output_queue.put_nowait(error_output)
         finally:
             self._tasks.pop(request_id, None)

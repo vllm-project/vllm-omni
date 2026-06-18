@@ -12,7 +12,7 @@ step, and step outputs are scattered back into request states by
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -253,8 +253,15 @@ def _prepare_request_prompt_field(
                 f"{embeds_attr} for request {state.request_id} requires seq_len "
                 f"{max_actual_seq_len}, got target {target_seq_len}."
             )
-        return embeds[:, :target_seq_len], None if mask is None else mask[:, :target_seq_len]
+        embeds = embeds[:, :target_seq_len]
+        mask = None if mask is None else mask[:, :target_seq_len]
+        setattr(state, embeds_attr, embeds)
+        if mask is not None:
+            setattr(state, mask_attr, mask)
+        setattr(state, seq_lens_attr, [int(embeds.shape[1])] * int(embeds.shape[0]))
+        return embeds, mask
 
+    setattr(state, seq_lens_attr, [int(embeds.shape[1])] * int(embeds.shape[0]))
     return embeds, mask
 
 
@@ -496,7 +503,7 @@ def _prepare_prompt_embeds(
     *,
     embeds_out: torch.Tensor | None = None,
     mask_out: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     prompt_embeds, prompt_embeds_mask = _prepare_padded_prompt_fields(
         states,
         embeds_attr="prompt_embeds",
@@ -505,8 +512,6 @@ def _prepare_prompt_embeds(
         embeds_out=embeds_out,
         mask_out=mask_out,
     )
-    if prompt_embeds is None:
-        raise ValueError("All requests must have `prompt_embeds` initialized.")
     return prompt_embeds, prompt_embeds_mask
 
 
@@ -581,6 +586,10 @@ class InputBatch:
     source of truth. ``InputBatch`` only assembles a contiguous view for the
     current step and refreshes dynamic fields in-place when composition is
     unchanged.
+
+    ``states`` is a narrow escape hatch for Hunyuan-style state-driven
+    pipelines that need request-private KV/cache metadata during denoise.
+    Other pipelines should continue to use the standard batch fields.
     """
 
     request_ids: list[str]
@@ -591,7 +600,7 @@ class InputBatch:
 
     latents: torch.Tensor
     timesteps: torch.Tensor
-    prompt_embeds: torch.Tensor
+    prompt_embeds: torch.Tensor | None
     prompt_embeds_mask: torch.Tensor | None
     negative_prompt_embeds: torch.Tensor | None
     negative_prompt_embeds_mask: torch.Tensor | None
@@ -604,6 +613,7 @@ class InputBatch:
     img_shapes: list | None = None
     txt_seq_lens: list[int] | None = None
     negative_txt_seq_lens: list[int] | None = None
+    states: Sequence[DiffusionRequestState] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if len(self.request_ids) != int(self.idx_mapping.numel()):
@@ -648,6 +658,9 @@ class InputBatch:
         self,
         selected_states: Sequence[DiffusionRequestState],
     ) -> None:
+        # Same-composition cache hits reuse static prompt fields; request ids
+        # must keep the same encoded prompt metadata for the batch lifetime.
+        self.states = tuple(selected_states)
         self._refresh_dynamic_fields(selected_states)
 
     def _rebuild(
@@ -662,6 +675,7 @@ class InputBatch:
         self.num_reqs_after_padding = len(request_ids)
         self.idx_mapping = idx_mapping
         self.idx_mapping_np = idx_mapping_np
+        self.states = tuple(selected_states)
         self.latents = _prepare_latents(selected_states, out=self.latents)
         self.timesteps = _prepare_timesteps(selected_states, out=self.timesteps)
         self._refresh_static_fields(selected_states)
@@ -718,6 +732,7 @@ class InputBatch:
                 selected_states,
                 "negative_txt_seq_lens",
             ),
+            states=tuple(selected_states),
         )
 
 

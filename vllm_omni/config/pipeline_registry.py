@@ -101,6 +101,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.mimo_audio.pipeline",
         "MIMO_AUDIO_PIPELINE",
     ),
+    "ming_tts": (
+        "vllm_omni.model_executor.models.ming_tts.pipeline",
+        "MING_TTS_PIPELINE",
+    ),
     "voxtral_tts": (
         "vllm_omni.model_executor.models.voxtral_tts.pipeline",
         "VOXTRAL_TTS_PIPELINE",

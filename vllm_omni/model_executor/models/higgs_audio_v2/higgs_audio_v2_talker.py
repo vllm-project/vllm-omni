@@ -887,7 +887,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # single step at a time; cleared in :meth:`sample` after consumption
         # so a missed call doesn't leak stale tensors.
         self._last_logits_hidden = hidden_states
-        return self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
+        return self.logits_processor(self.lm_head, hidden_states)
 
     def audio_codebook_logits(
         self,
