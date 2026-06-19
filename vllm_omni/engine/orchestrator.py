@@ -57,6 +57,7 @@ def _build_terminal_empty_output(
     request_id: str,
     *,
     final_output_type: str | None,
+    audio_sample_rate: int = 24000,
 ) -> RequestOutput:
     """Build a terminal empty output when no downstream stage input exists."""
     completion = CompletionOutput(
@@ -71,7 +72,7 @@ def _build_terminal_empty_output(
     if final_output_type == "audio":
         completion.multimodal_output = {
             "audio": torch.zeros((0,), dtype=torch.float32),
-            "sr": 24000,
+            "sr": audio_sample_rate,
         }
     return RequestOutput(
         request_id=request_id,
@@ -81,6 +82,37 @@ def _build_terminal_empty_output(
         outputs=[completion],
         finished=True,
     )
+
+
+def _coerce_int_scalar(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            coerced = _coerce_int_scalar(item)
+            if coerced > 0:
+                return coerced
+        return 0
+    if hasattr(value, "item"):
+        value = value.item()
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return coerced if coerced > 0 else 0
+
+
+def _infer_stage_audio_sample_rate(stage_pool: StagePool, default: int = 24000) -> int:
+    """Infer the final audio stage sample rate from stage metadata when possible."""
+    sample_rate_attrs = ("audio_sample_rate", "sample_rate", "sampling_rate", "output_sample_rate", "sr")
+    stage_client = getattr(stage_pool, "stage_client", None)
+    stage_config = getattr(stage_pool, "_stage_vllm_config", None)
+    for source in (stage_client, stage_config):
+        for attr in sample_rate_attrs:
+            sample_rate = _coerce_int_scalar(getattr(source, attr, None))
+            if sample_rate > 0:
+                return sample_rate
+    return default
 
 
 def build_engine_core_request_from_tokens(
@@ -1326,6 +1358,7 @@ class Orchestrator:
             terminal_output = _build_terminal_empty_output(
                 req_id,
                 final_output_type=final_output_type,
+                audio_sample_rate=_infer_stage_audio_sample_rate(final_pool),
             )
             submit_ts = _time.time()
             req_state.stage_submit_ts[final_stage_id] = submit_ts

@@ -713,27 +713,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         additional_information = getattr(request, "additional_information", None)
         if isinstance(additional_information, dict):
-            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
-                engine_prompt["additional_information"] = {}
-            engine_prompt["additional_information"].update(additional_information)
+            prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
+            prompt_additional_information.update(additional_information)
 
         if deferred_multi_modal_data:
-            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
-                engine_prompt["additional_information"] = {}
-            engine_prompt["additional_information"]["deferred_multi_modal_data"] = deferred_multi_modal_data
+            prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
+            prompt_additional_information["deferred_multi_modal_data"] = deferred_multi_modal_data
 
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
         if normalized is not None:
-            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
-                engine_prompt["additional_information"] = {}
-            engine_prompt["additional_information"]["speaker"] = [normalized]
+            prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
+            prompt_additional_information["speaker"] = [normalized]
 
         language = getattr(request, "language", None)
         if language is not None and isinstance(language, str) and language.strip():
-            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
-                engine_prompt["additional_information"] = {}
-            engine_prompt["additional_information"]["language"] = [language.strip()]
+            prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
+            prompt_additional_information["language"] = [language.strip()]
 
         # Style instruction — used by Ming-flash-omni instruct TTS path
         # (ming_task="instruct").  For the omni speech path the thinker2talker
@@ -741,11 +737,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # which hardcodes instruction=None.
         instructions = getattr(request, "instructions", None)
         if instructions is not None and isinstance(instructions, str) and instructions.strip():
-            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
-                engine_prompt["additional_information"] = {}
-            engine_prompt["additional_information"]["instruction"] = instructions.strip()
+            prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
+            prompt_additional_information["instruction"] = instructions.strip()
 
         return conversation, [engine_prompt]
+
+    @staticmethod
+    def _ensure_prompt_additional_information(engine_prompt: dict[str, Any]) -> dict[str, Any]:
+        additional_information = engine_prompt.get("additional_information")
+        if not isinstance(additional_information, dict):
+            additional_information = {}
+            engine_prompt["additional_information"] = additional_information
+        return additional_information
 
     def _needs_multistage_multimodal_split(self) -> bool:
         return bool(self._deferred_multimodal_modalities())

@@ -92,6 +92,9 @@ def _extract_output(source_output: Any) -> Any:
 
 def _extract_text(source_output: Any) -> str:
     output = _extract_output(source_output)
+    cumulative_text = getattr(output, "cumulative_text", None)
+    if isinstance(cumulative_text, str) and cumulative_text:
+        return cumulative_text
     text = getattr(output, "text", None)
     if isinstance(text, str):
         return text

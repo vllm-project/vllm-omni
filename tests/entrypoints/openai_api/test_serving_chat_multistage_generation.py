@@ -134,6 +134,39 @@ def test_prepare_multistage_multimodal_inputs_defers_downstream_modalities(servi
     assert {"type": "text", "text": "What changed?"} in stripped_content
 
 
+def test_needs_multistage_multimodal_split_noops_for_single_stage(serving_chat):
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(model_stage="thinker", requires_multimodal_data=True),
+        ]
+    )
+
+    assert serving_chat._needs_multistage_multimodal_split() is False
+
+
+def test_needs_multistage_multimodal_split_noops_for_qwen3_omni(serving_chat):
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(model_stage="thinker", requires_multimodal_data=True),
+            SimpleNamespace(model_stage="talker", requires_multimodal_data=False),
+            SimpleNamespace(model_stage="code2wav", requires_multimodal_data=False),
+        ]
+    )
+
+    assert serving_chat._needs_multistage_multimodal_split() is False
+
+
+def test_needs_multistage_multimodal_split_detects_aura_handoff(serving_chat):
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(model_stage="asr", requires_multimodal_data=True),
+            SimpleNamespace(model_stage="aura", requires_multimodal_data=True),
+        ]
+    )
+
+    assert serving_chat._needs_multistage_multimodal_split() is True
+
+
 def test_build_multistage_generation_inputs_multi_image_emits_n_img_placeholders(serving_chat):
     """N reference images with bot_task set must emit N <img> placeholders.
 

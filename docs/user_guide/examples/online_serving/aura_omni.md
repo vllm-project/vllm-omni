@@ -22,7 +22,7 @@ Configure local checkpoints by editing per-stage `model` values in
 `pipeline: aura_omni`, so the four-stage topology is used even if the
 command-line `--model` points at one of the component checkpoints.
 
-Send requests with `"model": "aura_omni"`. The ASR, AURA, and Qwen3-TTS
+Send requests with `"model": "aurateam/AURA"`. The ASR, AURA, and Qwen3-TTS
 checkpoint paths are internal stage models from the deploy YAML, not the
 OpenAI-facing served model name.
 

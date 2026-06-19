@@ -1404,7 +1404,8 @@ class TestAuraOmniDeploy:
             "qwen3_tts",
             "code2wav",
         ]
-        assert [stage.final_output_type for stage in stages] == ["text", "text", None, "audio"]
+        assert [stage.final_output for stage in stages] == [False, True, False, True]
+        assert [stage.final_output_type for stage in stages] == [None, "text", None, "audio"]
         assert stages[0].yaml_engine_args["model_arch"] == "Qwen3ASRForConditionalGeneration"
         assert stages[1].yaml_engine_args["model_arch"] == "AuraQwen3VLForConditionalGeneration"
         assert stages[2].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"

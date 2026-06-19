@@ -106,6 +106,22 @@ def test_aura2tts_builds_qwen3_tts_prompt_information():
     assert tts_input["additional_information"]["instruct"] == ["Calm voice."]
 
 
+def test_aura2tts_prefers_streaming_cumulative_text():
+    prompt = {
+        "additional_information": {
+            "tts_ref_audio": ["ref.wav"],
+            "tts_ref_text": ["Reference transcript sample."],
+        }
+    }
+
+    [tts_input] = aura2tts(
+        [_source_delta_final_output("The complete AURA reply.")],
+        prompt=[prompt],
+    )
+
+    assert tts_input["additional_information"]["text"] == ["The complete AURA reply."]
+
+
 def test_aura2tts_supports_base_ref_audio_override():
     prompt = {
         "additional_information": {

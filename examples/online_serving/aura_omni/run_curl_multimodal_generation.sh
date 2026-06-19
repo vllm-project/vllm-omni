@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PORT="${PORT:-8091}"
-MODEL="${MODEL:-aura_omni}"
+MODEL="${MODEL:-aurateam/AURA}"
 OUTPUT_DIR="${OUTPUT_DIR:-output_aura_omni_online}"
 TTS_PASS_TOKEN_IDS="${TTS_PASS_TOKEN_IDS:-false}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
