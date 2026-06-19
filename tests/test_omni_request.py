@@ -7,7 +7,8 @@ time (see ``vllm_omni/patch.py``). vLLM core constructs ``Request`` positionally
 in some paths (notably ``vllm/v1/worker/gpu/warmup.py::warmup_kernels`` for V2
 model-runner architectures like Qwen3ForCausalLM). The omni-specific params
 must therefore be keyword-only so positional construction stays Liskov-
-substitutable with the base class.
+substitutable with the base class — including base-style calls that pass
+``prompt_embeds`` (itself a positional-capable base param) positionally.
 """
 
 import inspect
@@ -46,6 +47,26 @@ def test_positional_construction_matches_base_request():
     assert req.external_req_id is None
     assert req.additional_information is None
     assert req.prompt_embeds_payload is None
+
+
+def test_positional_prompt_embeds_does_not_collide():
+    """Base-style positional call that includes ``prompt_embeds``.
+
+    ``prompt_embeds`` is a positional-capable base param (after
+    ``arrival_time``). A base-style call must not trip
+    ``got multiple values for argument 'prompt_embeds'`` — the subclass must
+    not also inject its keyword override when the value arrived positionally.
+    Positional order: request_id, prompt_token_ids, sampling_params,
+    pooling_params, client_index, arrival_time, prompt_embeds.
+    """
+    embeds = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    req = OmniRequest("req-pe", [1, 2], SamplingParams(), None, 0, None, embeds)
+
+    assert isinstance(req, Request)
+    assert torch.equal(req.prompt_embeds, embeds)
+    # Positional tensor is not a serialized payload.
+    assert req.prompt_embeds_payload is None
+    assert req.external_req_id is None
 
 
 def test_keyword_omni_params_round_trip():
