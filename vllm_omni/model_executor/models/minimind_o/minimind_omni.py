@@ -67,8 +67,9 @@ class MiniMindOmniForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             self.requires_raw_input_tokens = True
             self.mtp_hidden_size = self.talker.mtp_hidden_size
             self.talker_mtp_output_key = self.talker.talker_mtp_output_key
+            self.talker_mtp_active_mask_size = self.talker.talker_mtp_active_mask_size
             self.gpu_resident_buffer_keys = self.talker.gpu_resident_buffer_keys
-            self.talker_mtp_graph_safe = False
+            self.talker_mtp_graph_safe = True
         elif self.model_stage == "code2wav":
             self.multimodal_config.skip_mm_profiling = True
             self.thinker = None

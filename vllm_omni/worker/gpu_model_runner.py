@@ -181,7 +181,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         assert cudagraph_mode is not None
         has_separate_talker = getattr(self.model, "talker", None) is not None
         talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
-        if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker and talker_mtp_graph_safe):
+        if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
             graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
             self.talker_mtp = graph_wrapper_cls(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
         # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
@@ -193,6 +193,16 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.talker_mtp_inputs_embeds = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+        active_mask_size = int(getattr(self.model, "talker_mtp_active_mask_size", 0) or 0)
+        self.talker_mtp_active_mask = (
+            self._make_buffer(max_batch_size, active_mask_size, dtype=torch.bool, numpy=False)
+            if active_mask_size > 0
+            else None
+        )
+
+    def _talker_mtp_active_mask_kwargs(self, num_rows: int) -> dict[str, torch.Tensor]:
+        buffer = getattr(self, "talker_mtp_active_mask", None)
+        return {} if buffer is None else {"active_mask": buffer.gpu[:num_rows]}
 
     def _prewarm_attention_capture_workspaces(self) -> None:
         capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
@@ -1110,6 +1120,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                         self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded_talker_mtp],
                         self.last_talker_hidden.gpu[:num_tokens_padded_talker_mtp],
                         self.text_step.gpu[:num_tokens_padded_talker_mtp],
+                        **self._talker_mtp_active_mask_kwargs(num_tokens_padded_talker_mtp),
                     )
                     self.compilation_config.cache_dir = None
                 outputs = self.model(
@@ -1658,6 +1669,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.talker_mtp_inputs_embeds.gpu[dst].copy_(req_embeds)
                 self.last_talker_hidden.gpu[dst].copy_(last_talker_hidden)
                 self.text_step.gpu[dst].copy_(text_step)
+                if self.talker_mtp_active_mask is not None:
+                    active_mask = torch.cat([update.pop("mtp_inputs")[2] for update in updates], dim=0)
+                    self.talker_mtp_active_mask.gpu[dst].copy_(active_mask)
 
                 for req_id_b, update_dict_b in zip(req_ids_b, updates, strict=True):
                     self._merge_additional_information_update(req_id_b, update_dict_b)
@@ -1705,12 +1719,17 @@ class OmniGPUModelRunner(GPUModelRunner):
                     )
 
                 if self.has_talker_mtp and span_len == 1 and not is_prefill:
-                    last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
+                    if self.talker_mtp_active_mask is not None:
+                        last_talker_hidden, text_step, active_mask = update_dict.pop("mtp_inputs")
+                    else:
+                        last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
                     decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
                     self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
                     self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
                     self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
                     self.text_step.gpu[decode_slice].copy_(text_step)
+                    if self.talker_mtp_active_mask is not None:
+                        self.talker_mtp_active_mask.gpu[decode_slice].copy_(active_mask)
                     decode_req_ids.append(req_id)
                     decode_start_offsets.append(s)
 
@@ -1767,6 +1786,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
         last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
         text_step = self.text_step.gpu[:num_tokens_padded]
+        active_mask_kwargs = self._talker_mtp_active_mask_kwargs(num_tokens_padded)
         subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
         if not isinstance(subtalker_params, dict):
             subtalker_params = {}
@@ -1785,12 +1805,18 @@ class OmniGPUModelRunner(GPUModelRunner):
             saved_embeds = self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].clone()
             saved_hidden = self.last_talker_hidden.gpu[:decode_batch_size].clone()
             saved_text = self.text_step.gpu[:decode_batch_size].clone()
+            active_mask_buffer = getattr(self, "talker_mtp_active_mask", None)
+            saved_active_mask = (
+                active_mask_buffer.gpu[:decode_batch_size].clone() if active_mask_buffer is not None else None
+            )
             try:
                 for row, req_id in enumerate(decode_req_ids):
                     self.talker_mtp_input_ids.gpu[:1].copy_(saved_input_ids[row : row + 1])
                     self.talker_mtp_inputs_embeds.gpu[:1].copy_(saved_embeds[row : row + 1])
                     self.last_talker_hidden.gpu[:1].copy_(saved_hidden[row : row + 1])
                     self.text_step.gpu[:1].copy_(saved_text[row : row + 1])
+                    if saved_active_mask is not None:
+                        active_mask_buffer.gpu[:1].copy_(saved_active_mask[row : row + 1])
                     row_offsets = None if start_offsets is None else [start_offsets[row]]
                     self._talker_mtp_forward([req_id], inputs_embeds, row_offsets)
             finally:
@@ -1798,6 +1824,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].copy_(saved_embeds)
                 self.last_talker_hidden.gpu[:decode_batch_size].copy_(saved_hidden)
                 self.text_step.gpu[:decode_batch_size].copy_(saved_text)
+                if saved_active_mask is not None:
+                    active_mask_buffer.gpu[:decode_batch_size].copy_(saved_active_mask)
             return
 
         generator = None
@@ -1822,6 +1850,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         }
         if generator is not None:
             talker_kwargs["generator"] = generator
+        talker_kwargs.update(active_mask_kwargs)
         with current_omni_platform.set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):

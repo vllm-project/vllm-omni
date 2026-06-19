@@ -160,6 +160,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.mtp_hidden_size = int(talker_config.hidden_size)
         self.talker_mtp_output_key = ("codes", "audio")
+        self.talker_mtp_active_mask_size = self.num_code_layers
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("hidden_states", "bridge"),
             ("hidden_states", "last"),
@@ -249,7 +250,6 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         )
         self.prefer_model_sampler = True
         self.sampler = Sampler()
-        self._pending_audio_steps: list[int] = []
         self._stop_pending_by_req: dict[str, bool] = {}
         self.make_empty_intermediate_tensors = lambda: None
 
@@ -416,13 +416,19 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
                     dtype=embeds.dtype,
                 )
             text_step = self.embed_proj(bridge_states.to(device=embeds.device, dtype=embeds.dtype))
+            audio_step = max(0, num_computed - prompt_len) - 1
+            mask_idx = max(0, min(audio_step + 1, self.num_code_layers))
+            active_mask = self._code_layer_masks[mask_idx : mask_idx + 1].to(device=embeds.device)
             update["mtp_inputs"] = (
                 last_hidden.reshape(1, -1).to(device=embeds.device, dtype=embeds.dtype),
                 text_step.reshape(1, -1),
+                active_mask,
             )
             if not is_prefill:
-                self._pending_audio_steps.append(max(0, num_computed - prompt_len) - 1)
                 request_id = info_dict.get("request_id")
+                # Watchdog for cases where the thinker stops at max_tokens
+                # without emitting EOS; cap only the talker tail after the
+                # final thinker bridge state, not the total audio length.
                 steps_after_last_thinker = max(0, num_computed - bridge_len + 1)
                 if (
                     isinstance(request_id, str)
@@ -503,6 +509,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         input_embeds: torch.Tensor,
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
         do_sample: bool | None = None,
         temperature: float | None = None,
         top_k: int | None = None,
@@ -521,13 +528,11 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         )
         audio_codes = torch.cat((layer0.unsqueeze(-1), residual_codes), dim=-1)
 
-        pending_steps = self._pending_audio_steps[:batch]
-        del self._pending_audio_steps[:batch]
-        if len(pending_steps) == batch:
-            mask_idx = torch.tensor(pending_steps, device=audio_codes.device, dtype=torch.long).add_(1)
-            mask_idx.clamp_(0, self.num_code_layers)
-            active = self._code_layer_masks.index_select(0, mask_idx).to(device=audio_codes.device)
-            audio_codes = audio_codes.masked_fill(~active, self.audio_pad_token)
+        if active_mask is not None:
+            active = active_mask.to(device=audio_codes.device, dtype=torch.bool)
+            if active.ndim == 1:
+                active = active.unsqueeze(0)
+            audio_codes = audio_codes.masked_fill(~active[:, : audio_codes.shape[-1]], self.audio_pad_token)
 
         code_embeds = self.codec_proj(self.embed_tokens(audio_codes.unsqueeze(-1)).reshape(batch, -1))
         next_embeds = (

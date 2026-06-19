@@ -359,6 +359,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     emb = self.talker_mtp_inputs_embeds.gpu[:n]
                     hid = self.last_talker_hidden.gpu[:n]
                     ts = self.text_step.gpu[:n]
+                    active_mask_kwargs = self._talker_mtp_active_mask_kwargs(n)
 
                     for _ in range(num_warmups):
                         with set_forward_context(
@@ -367,7 +368,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                             cudagraph_runtime_mode=CUDAGraphMode.NONE,
                             batch_descriptor=batch_desc,
                         ):
-                            self.talker_mtp(ids, emb, hid, ts)
+                            self.talker_mtp(ids, emb, hid, ts, **active_mask_kwargs)
 
                     with set_forward_context(
                         None,
@@ -375,7 +376,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         cudagraph_runtime_mode=CUDAGraphMode.FULL,
                         batch_descriptor=batch_desc,
                     ):
-                        self.talker_mtp(ids, emb, hid, ts)
+                        self.talker_mtp(ids, emb, hid, ts, **active_mask_kwargs)
                     torch.accelerator.synchronize()
 
             logger.info("Captured talker_mtp graphs for %d sizes", len(capture_sizes))
