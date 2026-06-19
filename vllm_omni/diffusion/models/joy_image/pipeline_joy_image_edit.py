@@ -48,7 +48,6 @@ from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHo
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
-from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -160,13 +159,6 @@ def _raise_if_unsupported_hsdp(od_config: OmniDiffusionConfig) -> None:
             "JoyImageEditPipeline does not support HSDP yet. "
             "Please disable `use_hsdp`, or add `_hsdp_shard_conditions` and HSDP parity tests."
         )
-
-
-def _is_dummy_request(req: Any) -> bool:
-    is_dummy_run = getattr(req, "is_dummy_run", None)
-    if callable(is_dummy_run):
-        return bool(is_dummy_run())
-    return getattr(req, "request_id", None) == DUMMY_DIFFUSION_REQUEST_ID
 
 
 def _format_qwen_multimodal_prompt(prompt: str) -> str:
@@ -767,9 +759,12 @@ class JoyImageEditPipeline(
         generator = req.sampling_params.generator or generator
         num_images_per_prompt = max(req.sampling_params.num_outputs_per_prompt, 1)
         true_cfg_scale = self.resolve_effective_true_cfg_scale(req)
-        do_true_cfg = true_cfg_scale > 1.0
-        self.check_cfg_parallel_validity(true_cfg_scale)
         negative_prompt = "" if isinstance(first_prompt, str) else first_prompt.get("negative_prompt") or ""
+        has_neg_prompt = negative_prompt is not None or (
+            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
+        )
+        do_true_cfg = true_cfg_scale > 1.0 and has_neg_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
 
         self._current_timestep = None
         self._interrupt = False
@@ -828,7 +823,7 @@ class JoyImageEditPipeline(
             true_cfg_scale=true_cfg_scale,
             cfg_normalize=True,
         )
-        if output_type == "latent" or _is_dummy_request(req):
+        if output_type == "latent" or req.is_dummy_run():
             self._offload_transformer_if_deferred()
             return DiffusionOutput(output=latents[:, -1].detach().cpu())
         # Step 6: decode only the target latent back to image space.

@@ -503,7 +503,6 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
         enable_cpu_offload=args.enable_cpu_offload,
-        pin_cpu_memory=not args.disable_pin_cpu_memory,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
         init_timeout=args.init_timeout,

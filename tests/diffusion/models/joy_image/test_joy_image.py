@@ -30,7 +30,7 @@ from vllm_omni.diffusion.models.joy_image.pipeline_joy_image_edit import (
     get_joy_image_edit_pre_process_func,
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
-from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -80,6 +80,8 @@ def _make_params(**overrides):
         "generator": None,
         "seed": None,
         "cfg_normalize": False,
+        "guidance_scale_2": None,
+        "do_classifier_free_guidance": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -91,7 +93,11 @@ def _make_request(*, prompt=None, params=None):
         "multi_modal_data": {"image": Image.new("RGB", (2048, 1024), color="white")},
     }
     params = params or _make_params()
-    return SimpleNamespace(prompts=[prompt], sampling_params=params, request_id="joy-test")
+    return OmniDiffusionRequest(
+        prompts=[prompt],
+        sampling_params=params,
+        request_id="joy-test",
+    )
 
 
 def test_joy_registry_and_metadata_entries(tmp_path):
@@ -855,7 +861,9 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
     pipeline._prepare_latents = fake_prepare_latents
     pipeline.diffuse = diffuse
     pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 2, 2)
-    pipeline.check_cfg_parallel_validity = lambda scale: cfg_checks.append(scale) or True
+    pipeline.check_cfg_parallel_validity = lambda scale, has_neg_prompt: cfg_checks.append(
+        (scale, has_neg_prompt)
+    ) or True
 
     request = _make_request(
         prompt={
@@ -873,7 +881,7 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
     output = JoyImageEditPipeline.forward(pipeline, request)
 
     assert output.output.shape == (1, 3, 2, 2)
-    assert cfg_checks == [2.0]
+    assert cfg_checks == [(2.0, True)]
     assert encode_calls == ["make it brighter", ""]
     assert diffuse_calls[0]["do_true_cfg"] is True
     assert diffuse_calls[0]["true_cfg_scale"] == 2.0
@@ -905,7 +913,7 @@ def test_forward_skips_decode_for_dummy_warmup_request(monkeypatch):
         torch.ones(1, 1, 4, 1, 2, 2),
     )
     pipeline.diffuse = lambda **kwargs: kwargs["latents"] + 1.0
-    pipeline.check_cfg_parallel_validity = lambda scale: True
+    pipeline.check_cfg_parallel_validity = lambda scale, has_neg_prompt: True
 
     def decode_should_not_run(latents):
         raise AssertionError("dummy warmup should not decode latents")

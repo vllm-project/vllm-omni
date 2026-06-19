@@ -74,10 +74,16 @@ class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                 pbar.update()
         return latents
 
-    def check_cfg_parallel_validity(self, true_cfg_scale: float) -> bool:
+    def check_cfg_parallel_validity(self, true_cfg_scale: float, has_neg_prompt: bool) -> bool:
         if get_classifier_free_guidance_world_size() == 1:
             return True
         if true_cfg_scale <= 1:
             logger.warning("CFG parallel is enabled but Joy true_cfg_scale <= 1, so only the positive branch is used.")
+            return False
+        if not has_neg_prompt:
+            logger.warning(
+                "CFG parallel is enabled but Joy has no negative prompt or negative prompt embeddings, "
+                "so only the positive branch is used."
+            )
             return False
         return True
