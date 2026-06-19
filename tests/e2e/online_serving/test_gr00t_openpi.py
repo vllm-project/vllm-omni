@@ -15,7 +15,9 @@ from tests.helpers.stage_config import get_deploy_config_path
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "nvidia/GR00T-N1.7-3B"
-openpi_client.require_dependencies()
+
+pytest.importorskip("websockets")
+pytest.importorskip("openpi_client.msgpack_numpy")
 
 test_params = [
     pytest.param(

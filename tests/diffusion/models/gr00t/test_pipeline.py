@@ -81,7 +81,7 @@ def test_pipeline_initializes_local_policy():
     assert pipeline.load_weights(iter(())) == set()
 
 
-def test_forward_returns_dict_actions_in_multimodal_output():
+def test_forward_returns_dict_actions_in_output():
     pipeline = _pipeline()
     req = OmniDiffusionRequest(
         prompts=["pick"],
@@ -102,8 +102,7 @@ def test_forward_returns_dict_actions_in_multimodal_output():
     output = pipeline.forward(req)
 
     assert output.error is None
-    assert output.output is None
-    actions = output.multimodal_output["actions"]
+    actions = output.output["actions"]
     assert set(actions) == {"arm", "gripper"}
     assert actions["arm"].dtype == np.float32
     np.testing.assert_allclose(actions["arm"], np.array([[[1.0, 2.0]]], dtype=np.float32))
@@ -127,7 +126,7 @@ def test_dummy_warmup_returns_shape_correct_zero_actions():
     output = pipeline.forward(req)
 
     assert output.error is None
-    actions = output.multimodal_output["actions"]
+    actions = output.output["actions"]
     assert set(actions) == {"arm", "gripper"}
     assert actions["arm"].shape == (1, 2, 2)
     assert actions["gripper"].shape == (1, 2, 1)

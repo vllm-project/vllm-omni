@@ -9,9 +9,6 @@ import torch
 from torch import nn
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 from transformers.feature_extraction_utils import BatchFeature
-from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    Qwen3VLForConditionalGeneration as _Qwen3VLForConditionalGeneration,
-)
 
 from vllm_omni.diffusion.models.gr00t.configs.gr00t_n1d7 import Gr00tN1d7Config
 from vllm_omni.diffusion.models.gr00t.modeling.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
@@ -291,6 +288,18 @@ class Gr00tN1d7ActionHead(nn.Module):
         return BatchFeature(data=batch)
 
 
+def _load_qwen3_vl_cls() -> type:
+    """Import Qwen3-VL lazily so the missing-dep failure is clear and deferred."""
+    try:
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+    except ImportError as exc:
+        raise ImportError(
+            "GR00T-N1.7 requires transformers>=4.57.1 for transformers.models.qwen3_vl "
+            "(the repo's declared floor is 4.56.0). Please upgrade transformers."
+        ) from exc
+    return Qwen3VLForConditionalGeneration
+
+
 class _Qwen3VLBackbone(nn.Module):
     """GR00T adapter around the shared Qwen3-VL implementation."""
 
@@ -308,7 +317,7 @@ class _Qwen3VLBackbone(nn.Module):
         )
         backbone_config.text_config._attn_implementation = "sdpa"
         backbone_config.vision_config._attn_implementation = "sdpa"
-        self.model = _Qwen3VLForConditionalGeneration(backbone_config).eval()
+        self.model = _load_qwen3_vl_cls()(backbone_config).eval()
         if load_bf16:
             self.model.to(dtype=torch.bfloat16)
 
