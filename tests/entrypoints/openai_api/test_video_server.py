@@ -1217,8 +1217,8 @@ def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: Moc
 def test_download_completed_job_uses_storage_open_and_download_name(test_client, mocker: MockerFixture):
     video_bytes = b"stored-video-data"
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
-        return_value=base64.b64encode(video_bytes).decode("utf-8"),
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=video_bytes,
     )
     create_resp = test_client.post("/v1/videos", data={"prompt": "Download this video"})
     assert create_resp.status_code == 200
