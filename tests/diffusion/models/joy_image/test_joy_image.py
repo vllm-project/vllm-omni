@@ -861,9 +861,9 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
     pipeline._prepare_latents = fake_prepare_latents
     pipeline.diffuse = diffuse
     pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 2, 2)
-    pipeline.check_cfg_parallel_validity = lambda scale, has_neg_prompt: cfg_checks.append(
-        (scale, has_neg_prompt)
-    ) or True
+    pipeline.check_cfg_parallel_validity = (
+        lambda scale, has_neg_prompt: cfg_checks.append((scale, has_neg_prompt)) or True
+    )
 
     request = _make_request(
         prompt={

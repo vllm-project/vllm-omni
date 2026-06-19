@@ -441,13 +441,13 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    if args.resolution is not None and (args.width is not None or args.height is not None):
+    if args.resolution and (args.width or args.height):
         raise ValueError("--resolution and --width/--height cannot be specified together")
     if args.width is not None and args.width <= 0:
         raise ValueError("--width must be a positive integer")
     if args.height is not None and args.height <= 0:
         raise ValueError("--height must be a positive integer")
-    if args.width is None and args.height is None and args.resolution is None:
+    if not args.width and not args.height and not args.resolution:
         args.resolution = 640
 
     # Validate input images exist and load them
