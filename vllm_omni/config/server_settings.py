@@ -1,6 +1,6 @@
 import os
 import warnings
-from typing import Annotated, Literal, TypeAlias
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -50,15 +50,9 @@ class FileBackend(BaseModel):
         return self
 
 
-STORAGE_BACKENDS: TypeAlias = Annotated[
-    FileBackend,  # Should always be left last in the union list
-    Field(discriminator="type"),
-]
-
-
 class ServerSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="VLLM_OMNI_SERVER_", env_nested_delimiter="__")
-    storage: STORAGE_BACKENDS = Field(default_factory=FileBackend)
+    storage: FileBackend = Field(default_factory=FileBackend)
 
 
 SERVER_SETTINGS_CONFIG = ServerSettings()

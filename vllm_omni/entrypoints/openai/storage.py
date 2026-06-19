@@ -10,7 +10,7 @@ from typing import Generic, Literal, TypeVar
 
 from vllm.logger import init_logger
 
-from vllm_omni.config.server_settings import SERVER_SETTINGS_CONFIG, STORAGE_BACKENDS, FileBackend
+from vllm_omni.config.server_settings import SERVER_SETTINGS_CONFIG, FileBackend
 
 logger = init_logger(__name__)
 
@@ -188,7 +188,7 @@ class LocalStorageTTLManager(LocalStorageManager):
         self._sweeper_task = None
 
 
-def get_storage_manager(storage_config: STORAGE_BACKENDS) -> StorageBaseManager[FileStorageHandle]:
+def get_storage_manager(storage_config: FileBackend) -> StorageBaseManager[FileStorageHandle]:
     if isinstance(storage_config, FileBackend):
         if storage_config.file_ttl is not None and storage_config.ttl_sweep_interval is not None:
             manager = LocalStorageTTLManager(
