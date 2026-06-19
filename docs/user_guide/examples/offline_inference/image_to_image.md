@@ -29,15 +29,16 @@ python image_edit.py \
 ### JoyAI-Image-Edit
 
 JoyAI-Image-Edit uses the same `image_edit.py` CLI and supports one input
-image per request:
+image per request. Requested dimensions are snapped to the nearest supported
+Joy bucket; for square outputs, use `1024x1024`.
 
 ```bash
 python image_edit.py \
   --model jdopensource/JoyAI-Image-Edit-Diffusers \
   --image input.png \
   --prompt "Change the background to a clean studio while preserving the subject." \
-  --height 512 \
-  --width 512 \
+  --height 1024 \
+  --width 1024 \
   --num-inference-steps 50 \
   --cfg-scale 4.0 \
   --output output_joyai_edit.png
