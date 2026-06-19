@@ -9,6 +9,53 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 UNSET = object()
 
 
+class _UnsetList(list):
+    """Sentinel default for ``append``/``append_const``/``extend`` shadow args.
+
+    argparse's append/extend actions do ``_copy_items(default).append(...)``,
+    which raises ``AttributeError: 'object' object has no attribute 'append'``
+    when the default is the bare ``object()`` sentinel (UNSET). An empty list
+    subclass keeps those actions working while staying distinguishable from a
+    real value: an untouched shadow default remains an empty ``_UnsetList``;
+    once the arg is passed it becomes a non-empty list.
+    """
+
+
+class _UnsetCount(int):
+    """Sentinel default (0) for the ``count`` shadow action.
+
+    ``count`` computes ``(default or 0) + 1``; the bare ``object()`` sentinel
+    would raise ``TypeError``. A zero-valued ``int`` subclass increments
+    normally, while an untouched default stays an ``_UnsetCount`` equal to 0.
+    """
+
+
+def _shadow_default(kwargs: dict[str, Any]) -> Any:
+    """Pick a shadow default that survives in-place argparse actions.
+
+    Most actions tolerate the ``UNSET`` sentinel, but the ones that mutate the
+    existing namespace value in place (append/extend/count) need a default that
+    supports that mutation. See ``_UnsetList`` / ``_UnsetCount`` for why.
+    """
+    action = kwargs.get("action")
+    if action in ("append", "append_const", "extend"):
+        return _UnsetList()
+    if action == "count":
+        return _UnsetCount()
+    return UNSET
+
+
+def _is_shadow_unset(value: Any) -> bool:
+    """Whether a shadow namespace value was left at its default (not passed)."""
+    if value is UNSET:
+        return True
+    if isinstance(value, _UnsetList):
+        return len(value) == 0
+    if isinstance(value, _UnsetCount):
+        return value == 0
+    return False
+
+
 class TrackingNamespace(argparse.Namespace):
     """Proxy that wraps an argparse namespace with explicit keys, which
     can be filtered down to a dict containing only explicitly passed values.
@@ -58,7 +105,7 @@ class TrackingGroup:
     def add_argument(self, *args: Any, **kwargs: Any) -> argparse.Action:
         """Add an argument to the real group and to the shadow group."""
         action = self._real.add_argument(*args, **kwargs)
-        default_kwargs = {**kwargs, "default": UNSET}
+        default_kwargs = {**kwargs, "default": _shadow_default(kwargs)}
         self._shadow.add_argument(*args, **default_kwargs)
         return action
 
@@ -115,7 +162,7 @@ class TrackingArgumentParser(FlexibleArgumentParser):
     def add_argument(self, *args: Any, **kwargs: Any) -> argparse.Action:
         """Add an arg to the parser & the shadow, where the latter has UNSET for the default."""
         action = super().add_argument(*args, **kwargs)
-        shadow_kwargs = {**kwargs, "default": UNSET}
+        shadow_kwargs = {**kwargs, "default": _shadow_default(kwargs)}
         self._shadow.add_argument(*args, **shadow_kwargs)
         return action
 
@@ -136,7 +183,7 @@ class TrackingArgumentParser(FlexibleArgumentParser):
 
     def build_tracking_namespace(self, real_ns: argparse.Namespace, shadow_ns: argparse.Namespace) -> TrackingNamespace:
         """Build a tracking namespace for the real / shadow namespaces."""
-        explicit_keys = frozenset(k for k, v in vars(shadow_ns).items() if v is not UNSET)
+        explicit_keys = frozenset(k for k, v in vars(shadow_ns).items() if not _is_shadow_unset(v))
         return TrackingNamespace(real_ns, explicit_keys)
 
     def parse_args(

@@ -326,6 +326,101 @@ def test_omitted_nargs():
     assert ns.items is None
 
 
+### Tests for in-place mutating actions (append / extend / count).
+# These actions make argparse mutate the shadow default in place, so the
+# shadow default cannot be the bare ``object()`` sentinel (it would raise
+# AttributeError/TypeError). See _UnsetList / _UnsetCount in tracking_parser.
+def test_append_action_omitted():
+    """Omitted append args parse without error and aren't marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("--tag", action="append")
+    ns = p.parse_args([])
+    assert ns.explicit_keys == set()
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.tag is None
+
+
+def test_append_action_explicit():
+    """Repeated append args are collected and marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("--tag", action="append")
+    ns = p.parse_args(["--tag", "a", "--tag", "b"])
+    assert ns.explicit_keys == {"tag"}
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.tag == ["a", "b"]
+
+
+def test_append_const_action_omitted():
+    """Omitted append_const args aren't marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("--dbg", action="append_const", const="x", dest="flags")
+    ns = p.parse_args([])
+    assert ns.explicit_keys == set()
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.flags is None
+
+
+def test_append_const_action_explicit():
+    """Repeated append_const args accumulate the const and are explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("--dbg", action="append_const", const="x", dest="flags")
+    ns = p.parse_args(["--dbg", "--dbg"])
+    assert ns.explicit_keys == {"flags"}
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.flags == ["x", "x"]
+
+
+def test_extend_action_omitted():
+    """Omitted extend args parse without error and aren't marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("--items", action="extend", nargs="+")
+    ns = p.parse_args([])
+    assert ns.explicit_keys == set()
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.items is None
+
+
+def test_extend_action_explicit():
+    """Repeated extend args are flattened into one list and marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("--items", action="extend", nargs="+")
+    ns = p.parse_args(["--items", "a", "b", "--items", "c"])
+    assert ns.explicit_keys == {"items"}
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.items == ["a", "b", "c"]
+
+
+def test_count_action_omitted():
+    """Omitted count args keep their default and aren't marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    ns = p.parse_args([])
+    assert ns.explicit_keys == set()
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.verbose == 0
+
+
+def test_count_action_explicit():
+    """Repeated count flags increment and are marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    ns = p.parse_args(["-vv"])
+    assert ns.explicit_keys == {"verbose"}
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.verbose == 2
+
+
+def test_group_append_action_explicit():
+    """append args added via a group go through the same shadow-default path."""
+    p = TrackingArgumentParser()
+    g = p.add_argument_group("TestGroup")
+    g.add_argument("--tag", action="append")
+    ns = p.parse_args(["--tag", "a", "--tag", "b"])
+    assert ns.explicit_keys == {"tag"}
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.tag == ["a", "b"]
+
+
 def test_parse_known_args_tracking():
     """Ensure parse_known_args is also trackable"""
     p = TrackingArgumentParser()
