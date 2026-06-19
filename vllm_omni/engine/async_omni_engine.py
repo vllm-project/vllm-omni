@@ -682,6 +682,22 @@ class AsyncOmniEngine:
             raise ValueError(
                 f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
+        if final_stage_id < 0:
+            raise ValueError(
+                f"[{request_id}] final_stage_id must be >= 0, got {final_stage_id}."
+            )
+        if final_stage_id >= self.num_stages:
+            raise ValueError(
+                f"[{request_id}] final_stage_id={final_stage_id} exceeds "
+                f"num_stages={self.num_stages}."
+            )
+        if len(effective_sampling_params_list) <= final_stage_id:
+            raise ValueError(
+                f"[{request_id}] sampling_params_list has "
+                f"{len(effective_sampling_params_list)} entries but "
+                f"final_stage_id={final_stage_id} requires at least "
+                f"{final_stage_id + 1}."
+            )
         params = effective_sampling_params_list[0]
 
         # Keep the original prompt for downstream stages (they need the raw
