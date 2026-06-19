@@ -26,9 +26,11 @@ class StageClient(Protocol):
     stage_id: int
     replica_id: int
     stage_type: str
+    model_stage: str | None
     final_output: bool
     final_output_type: FinalOutputModalityType | None
     default_sampling_params: OmniSamplingParams
+    prompt_expand_func: Any | None
     requires_multimodal_data: bool
     custom_process_input_func: Any | None
     engine_input_source: Sequence[int]
@@ -65,8 +67,6 @@ class StagePoolClient(StageClient, Protocol):
 
 class StagePoolLLMClient(StagePoolClient, Protocol):
     """Pool-facing API for LLM-style stages."""
-
-    model_stage: str | None
 
     async def add_request_async(self, request: EngineCoreRequest) -> None: ...
 

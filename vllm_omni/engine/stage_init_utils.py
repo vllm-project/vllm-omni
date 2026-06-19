@@ -51,6 +51,7 @@ class ReplicaInitPlan:
     omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
     stage_vllm_config: Any | None = None
     executor_class: type | None = None
+    engine_args_dict: dict[str, Any] | None = None
 
 
 @dataclass
@@ -58,65 +59,8 @@ class LogicalStageInitPlan:
     """Startup plan for one logical stage."""
 
     stage_idx: int
-    configured_stage_id: int
-    replicas: list[ReplicaInitPlan]
-
-
-@dataclass
-class StageRemoteFactoryContext:
-    """Per-stage context cached by AsyncOmniEngine for dynamic replica attach.
-
-    Populated once during ``_bootstrap_orchestrator`` from the per-stage
-    init plans. ``_build_remote_replica`` consumes it to construct the
-    right head-side stage client when a headless replica registers.
-    """
-
     stage_id: int
-    stage_type: str
-    stage_cfg: Any
-    base_metadata: Any
-    # LLM-only fields:
-    vllm_config: Any | None = None
-    executor_class: type | None = None
-    # Diffusion-only fields:
-    diffusion_batch_size: int = 1
-
-
-def capture_stage_factory_contexts(
-    stage_plans: Sequence[LogicalStageInitPlan],
-    diffusion_batch_size: int,
-) -> dict[int, StageRemoteFactoryContext]:
-    """Snapshot per-stage construction context for dynamic replica attach.
-
-    Called once after ``_initialize_stages`` finishes. The captured
-    context holds everything ``_build_remote_replica`` needs to build a
-    fresh head-side client when a new headless replica registers
-    (vllm_config / executor_class for LLM, batch_size for diffusion,
-    plus the base stage metadata).
-
-    Per-replica fields like ``replica_id`` are filled in at build time,
-    not at capture time.
-    """
-    contexts: dict[int, StageRemoteFactoryContext] = {}
-    for plan in stage_plans:
-        if not plan.replicas:
-            # Stage was declared but has zero replicas locally; we still
-            # want to be able to attach incoming headless ones, so use
-            # the stage_cfg-derived context if any replica plan exists.
-            continue
-        template = plan.replicas[0]
-        stage_id = int(plan.configured_stage_id)
-        stage_type = template.metadata.stage_type or "llm"
-        contexts[stage_id] = StageRemoteFactoryContext(
-            stage_id=stage_id,
-            stage_type=stage_type,
-            stage_cfg=template.stage_cfg,
-            base_metadata=template.metadata,
-            vllm_config=template.stage_vllm_config,
-            executor_class=template.executor_class,
-            diffusion_batch_size=diffusion_batch_size,
-        )
-    return contexts
+    replicas: list[ReplicaInitPlan]
 
 
 def _resolve_model_to_local_path(model: str) -> str:
@@ -357,6 +301,26 @@ def inject_kv_stage_info(stage_cfg: Any, stage_id: int, stage_configs: Sequence[
             )
     except Exception as e:
         logger.debug("Failed to inject stage info into omni_kv_config: %s", e)
+
+
+def inject_omni_kv_connector_config(
+    engine_args_dict: dict[str, Any],
+    omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None],
+    stage_id: int,
+) -> None:
+    """Inject resolved connector config into a stage engine-args dict."""
+    omni_conn_cfg, omni_from, omni_to = omni_kv_connector
+    if not omni_conn_cfg:
+        return
+
+    omni_kv = engine_args_dict.get("omni_kv_config") or {}
+    if not isinstance(omni_kv, dict):
+        omni_kv = dict(omni_kv)
+    omni_kv["connector_config"] = omni_conn_cfg
+    omni_kv["omni_from_stage"] = omni_from
+    omni_kv["omni_to_stage"] = omni_to
+    omni_kv.setdefault("stage_id", stage_id)
+    engine_args_dict["omni_kv_config"] = omni_kv
 
 
 @dataclass
@@ -1059,32 +1023,6 @@ def release_device_locks(lock_fds: list[int]) -> None:
             logger.debug("Released initialization lock (fd=%s)", lock_fd)
         except (OSError, ValueError):
             pass
-
-
-def acquire_diffusion_device_locks(
-    stage_id: int,
-    od_config: Any,
-    stage_init_timeout: int,
-) -> list[int]:
-    """Acquire init locks for the GPU set used by a diffusion stage.
-
-    Diffusion stages express their device count via ``OmniDiffusionConfig``'s
-    ``parallel_config.world_size`` rather than the LLM-style
-    ``tensor_parallel_size`` knob, so adapt to the shape that
-    ``acquire_device_locks`` understands.
-    """
-    parallel_config = getattr(od_config, "parallel_config", None)
-    world_size = getattr(parallel_config, "world_size", 1)
-    try:
-        world_size = max(1, int(world_size))
-    except (TypeError, ValueError):
-        world_size = 1
-
-    return acquire_device_locks(
-        stage_id,
-        {"tensor_parallel_size": world_size},
-        stage_init_timeout,
-    )
 
 
 def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:

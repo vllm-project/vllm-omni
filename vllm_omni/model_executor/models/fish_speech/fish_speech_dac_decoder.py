@@ -348,18 +348,16 @@ class FishSpeechDACDecoder(nn.Module):
 
             if req_ids.numel() < 1:
                 continue
-            flat = req_ids
-            n = flat.numel()
-            if n == 0 or n % q != 0:
-                if n > 0:
-                    logger.warning(
-                        "DAC decoder input_ids length %d not divisible by num_codebooks %d; returning empty audio.",
-                        n,
-                        q,
-                    )
+            n = req_ids.numel()
+            if n % q != 0:
+                logger.warning(
+                    "DAC decoder input_ids length %d not divisible by num_codebooks %d; returning empty audio.",
+                    n,
+                    q,
+                )
                 continue
             frames = n // q
-            codes_qf = flat.reshape(q, frames)
+            codes_qf = req_ids.reshape(q, frames)
             parsed_ctx_frames[i] = ctx_frames
             parsed_total_frames[i] = frames
             valid_codes_qf.append(codes_qf)

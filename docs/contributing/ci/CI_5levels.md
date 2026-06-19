@@ -11,6 +11,10 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <th>Level</th>
       <th>Scope & Focus</th>
+      <th>Model Coverage Strategy</th>
+      <th>Feature Coverage Strategy</th>
+      <th>Interface Coverage Strategy</th>
+      <th>Tags</th>
       <th>Time Cost</th>
       <th>Test Dir</th>
       <th>Doc</th>
@@ -24,12 +28,20 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>Contribution Guideline & PR checklist</td>
       <td>/</td>
       <td>/</td>
+      <td>/</td>
+      <td>/</td>
+      <td>/</td>
+      <td>/</td>
       <td>.github/PULL_REQUEST_TEMPLATE.md <a href="../tests_style/"> Test Style (PR Checklist)</a></td>
       <td>/</td>
       <td>/</td>
     </tr>
     <tr>
       <td>CI Failure Description</td>
+      <td>/</td>
+      <td>/</td>
+      <td>/</td>
+      <td>/</td>
       <td>/</td>
       <td>/</td>
       <td><a href="../failures/"> CI Failures</a></td>
@@ -39,6 +51,10 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L1</strong><br>(Unit & Logic)</td>
       <td>Unit tests for components like entrypoints, models</td>
+      <td>/</td>
+      <td>/</td>
+      <td>/</td>
+      <td><code>core_model and cpu</code></td>
       <td rowspan="2">&lt;15min</td>
       <td>/tests/{component_name}/test_xxx</td>
       <td>
@@ -50,10 +66,18 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     </tr>
     <tr>
       <td><strong>L2</strong><br>(E2E across models & GPU-required UT)</td>
-      <td>Online & Offline (basic deployment scenarios):<br>dummy, normal inference function (output format, stream), some instance startup UT</td>
+      <td>Online (basic deployment scenarios):<br>dummy, normal inference function (output format, stream), some instance startup UT</td>
+      <td>High-priority models + online basic scenarios + request success validation</td>
+      <td>High-priority features (using random lightweight models)</td>
+      <td>High-priority interfaces (using random lightweight models)</td>
+      <td><code>core_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>
+        <strong>Model tests:</strong><br>
         /tests/e2e/online_serving/test_{model_name}.py<br>
-        /tests/e2e/offline_inference/test_{model_name}.py
+        <strong>Feature tests:</strong><br>
+        /tests/{component_name}/test_xxx<br>
+        <strong>Interface tests:</strong><br>
+        /tests/entrypoints/test_xxx
       </td>
       <td>
         <a href="#chapter-1-l1-l2-level-testing-unit-testing-and-basic-end-to-end-verification">Chapter 1</a><br>
@@ -65,10 +89,19 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L3</strong><br>(Important Perf & Integration & Accuracy)</td>
       <td>Online & Offline (multiple deployment scenarios):<br>real model, normal inference function, normal accuracy</td>
+      <td>High/medium-priority models with real weights + online/offline key scenarios + basic accuracy validation</td>
+      <td>Medium-priority features (using random lightweight models)</td>
+      <td>Medium-priority interfaces (using random lightweight models)</td>
+      <td><code>advanced_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>&lt;30min</td>
       <td>
+        <strong>Model tests:</strong><br>
         /tests/e2e/online_serving/test_{model_name}.py<br>
-        /tests/e2e/offline_inference/test_{model_name}.py
+        /tests/e2e/offline_inference/test_{model_name}.py<br>
+        <strong>Feature tests:</strong><br>
+        /tests/{component_name}/test_xxx<br>
+        <strong>Interface tests:</strong><br>
+        /tests/entrypoints/test_xxx
       </td>
       <td>
         <a href="#chapter-2-l3-level-testing-core-integration-performance-and-accuracy-verification">Chapter 2</a><br>
@@ -79,18 +112,27 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     </tr>
     <tr>
       <td><strong>L4</strong><br>(Perf & Integration & Accuracy)</td>
-      <td>Online & Offline: full functional scenarios + performance test + doc test</td>
+      <td>Online: full functional scenarios + performance test + doc test + accuracy test</td>
+      <td>High-priority models: function, performance, accuracy, and doc testing<br>Medium/low-priority models: function and doc testing</td>
+      <td>Low-priority features (using random lightweight models)</td>
+      <td>Low-priority interfaces (using random lightweight models)</td>
+      <td><code>full_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>&lt;3 hour</td>
       <td>
-        <strong>Full Function:</strong><br>
+        <strong>Model tests:</strong><br>
         /tests/e2e/online_serving/test_{model_name}_expansion.py<br>
-        /tests/e2e/offline_inference/test_{model_name}_expansion.py<br>
+        <strong>Feature tests:</strong><br>
+        /tests/{component_name}/test_xxx<br>
+        <strong>Interface tests:</strong><br>
+        /tests/entrypoints/test_xxx<br>
         <strong>Performance:</strong><br>
         /tests/dfx/perf/tests/test_qwen_omni.json (Omni), test_tts.json (TTS),<br>
         and /tests/dfx/perf/tests/test_{diffusion_model}_vllm_omni.json (Diffusion)<br>
         <strong>Doc Test:</strong><br>
         tests/example/online_serving/test_{model_name}.py<br>
-        tests/example/offline_inference/test_{model_name}.py
+        tests/example/offline_inference/test_{model_name}.py<br>
+        <strong>Accuracy Test:</strong><br>
+        /tests/e2e/accuracy/test_{model_name}.py
       </td>
       <td>
         <a href="#chapter-3-l4-level-testing-full-functionality-performance-and-documentation-testing">Chapter 3</a><br>
@@ -101,7 +143,11 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     </tr>
     <tr>
       <td><strong>L5</strong><br>(Stability & Reliability)</td>
-      <td>Online & Offline: long-term stability test + reliability test</td>
+      <td>Online: long-term stability test + reliability test</td>
+      <td>Long-term stability and reliability testing for high-priority models</td>
+      <td>/</td>
+      <td>Invalid-parameter validation for high-priority interfaces</td>
+      <td><code>slow and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td> Depends on reality </td>
       <td>
         <strong>Stability:</strong><br>

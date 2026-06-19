@@ -26,7 +26,6 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 # ``omni`` for all tests; 001/002 also get ``full_model`` via ``TestMossTtsNanoFull`` (003 is core+advanced only, no full_model).
 pytestmark = [
-    pytest.mark.skip(reason="issue#4361"),
     pytest.mark.full_model,
     pytest.mark.tts,
 ]

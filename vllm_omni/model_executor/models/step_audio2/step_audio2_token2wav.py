@@ -94,8 +94,6 @@ class StepAudio2Token2WavCore(nn.Module):
         self.mel_cache_len = DEFAULT_STREAM_CONFIG.mel_cache_len
         self.source_cache_len = STREAM_SOURCE_CACHE_LEN
         self.speech_window: torch.Tensor | None = None  # created lazily on device
-        self.stream_cache: dict | None = None  # flow model causal cache
-        self.hift_cache_dict: dict = {}  # HiFT vocoder overlap cache
 
     def _ensure_models_loaded(self):
         """Lazy load models on first use"""
@@ -252,125 +250,6 @@ class StepAudio2Token2WavCore(nn.Module):
             return output.getvalue()
         else:
             return wav
-
-    # ------------------------------------------------------------------
-    # Streaming (chunked) inference
-    # ------------------------------------------------------------------
-
-    def setup_stream(self, prompt_wav: str) -> None:
-        """Initialize flow + HiFT caches for chunked streaming inference.
-
-        Must be called once before the first ``stream_chunk()`` call for a
-        given utterance.
-        """
-        if prompt_wav not in self.cache:
-            self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
-        (
-            prompt_speech_tokens,
-            _,
-            spk_emb,
-            prompt_mels,
-            _,
-        ) = self.cache[prompt_wav]
-
-        # Lazily create the Hamming window on the correct device
-        if self.speech_window is None or self.speech_window.device != self.device:
-            self.speech_window = torch.from_numpy(np.hamming(2 * self.source_cache_len)).to(
-                device=self.device, dtype=torch.float32
-            )
-
-        # Flow model: setup causal cache with prompt tokens + lookahead
-        pre_lookahead = DEFAULT_STREAM_CONFIG.pre_lookahead_len
-        self.stream_cache = self.flow.setup_cache(
-            torch.cat([prompt_speech_tokens, prompt_speech_tokens[:, :pre_lookahead]], dim=1),
-            prompt_mels,
-            spk_emb,
-            n_timesteps=self.n_timesteps,
-        )
-
-        # HiFT vocoder: empty overlap buffers
-        self.hift_cache_dict = {
-            "mel": torch.zeros(1, prompt_mels.shape[2], 0, device=self.device),
-            "source": torch.zeros(1, 1, 0, device=self.device),
-            "speech": torch.zeros(1, 0, device=self.device),
-        }
-
-    def stream_chunk(
-        self,
-        audio_tokens: list[int],
-        prompt_wav: str,
-        last_chunk: bool = False,
-    ) -> torch.Tensor:
-        """Process one chunk of audio tokens and return a waveform segment.
-
-        Args:
-            audio_tokens: Token IDs for this chunk (includes lookahead for
-                non-last chunks).
-            prompt_wav: Path to the prompt wav (for cached speaker embeddings).
-            last_chunk: Whether this is the final chunk of the utterance.
-
-        Returns:
-            1-D float tensor of audio samples (24 kHz).
-        """
-        if self.stream_cache is None:
-            raise ValueError("stream_cache not initialised – call setup_stream() first")
-
-        if prompt_wav not in self.cache:
-            self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
-        _, _, spk_emb, prompt_mels, _ = self.cache[prompt_wav]
-
-        token_tensor = torch.tensor([audio_tokens], dtype=torch.int32, device=self.device)
-
-        with torch.amp.autocast(
-            str(self.device.type),
-            dtype=torch.float16 if self.float16 else torch.float32,
-        ):
-            chunk_mel, self.stream_cache = self.flow.inference_chunk(
-                token=token_tensor,
-                spk=spk_emb,
-                cache=self.stream_cache,
-                last_chunk=last_chunk,
-                n_timesteps=self.n_timesteps,
-            )
-
-        # Trim estimator attention cache to avoid unbounded growth
-        keep = DEFAULT_STREAM_CONFIG.estimator_cache_keep
-        est_att = self.stream_cache.get("estimator_att_cache")
-        if est_att is not None and est_att.shape[4] > (prompt_mels.shape[1] + keep):
-            self.stream_cache["estimator_att_cache"] = torch.cat(
-                [est_att[:, :, :, :, : prompt_mels.shape[1]], est_att[:, :, :, :, -keep:]],
-                dim=4,
-            )
-
-        # ---- HiFT vocoder with overlap-add ----
-        hift_cache_mel = self.hift_cache_dict["mel"]
-        hift_cache_source = self.hift_cache_dict["source"]
-        hift_cache_speech = self.hift_cache_dict["speech"]
-
-        mel = torch.cat([hift_cache_mel, chunk_mel], dim=2)
-        speech, source = self.hift(mel, hift_cache_source)
-
-        # Cross-fade overlap region for smooth concatenation
-        if hift_cache_speech.shape[-1] > 0:
-            speech = fade_in_out(speech, hift_cache_speech, self.speech_window)
-
-        # Update vocoder cache for the next chunk
-        self.hift_cache_dict = {
-            "mel": mel[..., -self.mel_cache_len :].clone().detach(),
-            "source": source[:, :, -self.source_cache_len :].clone().detach(),
-            "speech": speech[:, -self.source_cache_len :].clone().detach(),
-        }
-
-        # For non-last chunks, trim the tail that will be re-synthesised
-        if not last_chunk:
-            speech = speech[:, : -self.source_cache_len]
-
-        return speech.squeeze(0)  # [samples]
-
-    def reset_stream(self) -> None:
-        """Clear all streaming state after an utterance is complete."""
-        self.stream_cache = None
-        self.hift_cache_dict = {}
 
     # ------------------------------------------------------------------
     # Per-request streaming (does NOT mutate self – uses external state)

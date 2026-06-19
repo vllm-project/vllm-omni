@@ -19,7 +19,7 @@ import inspect
 import json
 import os
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import PIL.Image
 import torch
@@ -36,6 +36,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import Distribu
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.utils import create_transformers_model
 from vllm_omni.diffusion.models.z_image.z_image_transformer import (
     ZImageTransformer2DModel,
@@ -160,7 +161,11 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
+class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     def __init__(
         self,
         *,
