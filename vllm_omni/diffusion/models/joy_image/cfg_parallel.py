@@ -48,6 +48,7 @@ class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                     "hidden_states": latent_model_input,
                     "timestep": timestep_expand,
                     "encoder_hidden_states": prompt_embeds,
+                    "encoder_hidden_states_mask": prompt_embeds_mask,
                     "return_dict": False,
                 }
                 negative_kwargs = None
@@ -56,6 +57,7 @@ class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                         "hidden_states": latent_model_input,
                         "timestep": timestep_expand,
                         "encoder_hidden_states": negative_prompt_embeds,
+                        "encoder_hidden_states_mask": negative_prompt_embeds_mask,
                         "return_dict": False,
                     }
 

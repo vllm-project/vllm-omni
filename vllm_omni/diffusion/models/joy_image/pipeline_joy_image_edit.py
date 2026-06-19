@@ -30,7 +30,10 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
+from vllm_omni.diffusion.model_loader.hub_prefetch import (
+    from_pretrained_with_prefetch,
+    prefetch_subfolders,
+)
 from vllm_omni.diffusion.models.interface import (
     SupportImageInput,
     SupportsComponentDiscovery,
@@ -360,16 +363,17 @@ class JoyImageEditPipeline(
         self.device = get_local_device()
         model = od_config.model
         local_files_only = os.path.exists(model)
+        joy_subfolders = [
+            "scheduler",
+            "text_encoder",
+            "vae",
+            "tokenizer",
+            "processor",
+            "transformer",
+        ]
         prefetch_subfolders(
             model,
-            [
-                "scheduler",
-                "text_encoder",
-                "vae",
-                "tokenizer",
-                "processor",
-                "transformer",
-            ],
+            joy_subfolders,
             local_files_only=local_files_only,
         )
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -377,9 +381,11 @@ class JoyImageEditPipeline(
             subfolder="scheduler",
             local_files_only=local_files_only,
         )
-        self.processor = Qwen3VLProcessor.from_pretrained(
+        self.processor = from_pretrained_with_prefetch(
+            Qwen3VLProcessor.from_pretrained,
             model,
             subfolder="processor",
+            prefetch_list=joy_subfolders,
             local_files_only=local_files_only,
         )
         self.tokenizer = getattr(self.processor, "tokenizer", None)
@@ -390,17 +396,21 @@ class JoyImageEditPipeline(
                 local_files_only=local_files_only,
             )
         defer_component_device_placement = _should_defer_component_device_placement(od_config)
-        self.text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+        self.text_encoder = from_pretrained_with_prefetch(
+            Qwen3VLForConditionalGeneration.from_pretrained,
             model,
             subfolder="text_encoder",
+            prefetch_list=joy_subfolders,
             torch_dtype=torch.bfloat16,
             local_files_only=local_files_only,
         )
         if not defer_component_device_placement:
             self.text_encoder = self.text_encoder.to(self.device)
-        self.vae = DistributedAutoencoderKLWan.from_pretrained(
+        self.vae = from_pretrained_with_prefetch(
+            DistributedAutoencoderKLWan.from_pretrained,
             model,
             subfolder="vae",
+            prefetch_list=joy_subfolders,
             torch_dtype=torch.bfloat16,
             local_files_only=local_files_only,
         )

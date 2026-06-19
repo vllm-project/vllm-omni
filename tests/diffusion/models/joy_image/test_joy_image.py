@@ -32,6 +32,8 @@ from vllm_omni.diffusion.models.joy_image.pipeline_joy_image_edit import (
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
 
 def _write_model_configs(tmp_path):
     (tmp_path / "vae").mkdir()
