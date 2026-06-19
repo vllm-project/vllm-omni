@@ -302,6 +302,8 @@ class DiffusionCacheConfig:
                     scm_steps_mask_policy, scm_steps_policy
         - MagCache: mag_threshold, mag_max_skip_steps, mag_retention_ratio,
                     mag_ratios, mag_calibrate
+        - step_cache: step_cache_dit_enabled, velocity_sim_thresholds,
+                          velocity_skip_countdowns, step_cache_dit_min_history
 
     Example:
         >>> # From dict (user-facing API) - partial config uses defaults for missing keys
@@ -374,6 +376,13 @@ class DiffusionCacheConfig:
     # Policy for force refresh: "once" refreshes only at the hint step,
     # "repeat" refreshes every force_refresh_step_hint steps.
     force_refresh_step_policy: str = "once"
+
+    # step_cache parameters [step_cache only] — DreamZero velocity schedule
+    step_cache_dit_enabled: bool = True
+    velocity_sim_thresholds: list[float] = field(default_factory=lambda: [0.95, 0.93])
+    velocity_skip_countdowns: list[int] = field(default_factory=lambda: [4, 2])
+    step_cache_dit_min_history: int = 2
+    step_cache_dit_max_history: int = 2
 
     # Additional parameters that may be passed but not explicitly defined
     _extra_params: dict[str, Any] = field(default_factory=dict, repr=False)
