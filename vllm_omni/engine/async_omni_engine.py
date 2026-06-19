@@ -520,7 +520,7 @@ class AsyncOmniEngine:
             return
 
         mm_data = prompt.get("multi_modal_data")
-        if not isinstance(mm_data, Mapping) or not mm_data:
+        if not isinstance(mm_data, dict) or not mm_data:
             return
 
         from vllm.multimodal.hasher import MultiModalHasher
@@ -841,6 +841,14 @@ class AsyncOmniEngine:
                 "mag_threshold": 0.24,
                 "mag_max_skip_steps": 5,
                 "mag_retention_ratio": 0.1,
+            }
+        if cache_backend in ("step_cache"):
+            return {
+                "step_cache_dit_enabled": True,
+                "velocity_sim_thresholds": [0.95, 0.93],
+                "velocity_skip_countdowns": [4, 2],
+                "step_cache_dit_min_history": 2,
+                "step_cache_dit_max_history": 2,
             }
         return None
 

@@ -512,7 +512,7 @@ class OmniServeCommand(CLISubcommand):
             "--cache-backend",
             type=str,
             default="none",
-            help="Cache backend for diffusion models, options: 'tea_cache', 'cache_dit', 'mag_cache'",
+            help="Cache backend for diffusion models, options: 'tea_cache', 'cache_dit', 'mag_cache', 'step_cache'",
         )
         omni_config_group.add_argument(
             "--cache-config",
