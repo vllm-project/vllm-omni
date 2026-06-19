@@ -15,17 +15,17 @@ from __future__ import annotations
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.bde.kv_cache.adapter import BDERequestAdapter
-from vllm_omni.bde.kv_cache.chunk_window import ChunkWindowSpec
-from vllm_omni.bde.kv_cache.config import BDEKVConfig
-from vllm_omni.bde.kv_cache.gather import (
+from vllm_omni.experimental.bde.kv_cache.adapter import BDERequestAdapter
+from vllm_omni.experimental.bde.kv_cache.chunk_window import ChunkWindowSpec
+from vllm_omni.experimental.bde.kv_cache.config import BDEKVConfig
+from vllm_omni.experimental.bde.kv_cache.gather import (
     allocate_kv_pool,
     build_window_slots,
     pool_gather_window,
     pool_write_chunk,
 )
-from vllm_omni.bde.kv_cache.pool import build_kv_manager, compute_num_blocks
-from vllm_omni.bde.kv_cache.slot_mapping import chunk_slot_mapping, resident_block_ids
+from vllm_omni.experimental.bde.kv_cache.pool import build_kv_manager, compute_num_blocks
+from vllm_omni.experimental.bde.kv_cache.slot_mapping import chunk_slot_mapping, resident_block_ids
 
 _log = init_logger(__name__)
 
@@ -121,6 +121,23 @@ class BDEKVCache:
             config.gpu_memory_fraction,
             self.spec.page_size_bytes * num_layers,
         )
+        # Floor: one forward needs the resident window plus the in-flight chunk for
+        # BOTH CFG branches (pos/neg are independent adapters allocating from the
+        # same pool), with a little eviction-transient headroom. The memory-fraction
+        # heuristic can under-size this once block_size grows — e.g. frame-granular
+        # paging at the true frame_seqlen makes each block larger and the pool
+        # fewer-blocks — so guarantee the minimum the rollout cannot run without,
+        # otherwise allocate_chunk hits an exhausted pool mid-forward.
+        min_blocks = 2 * (config.window_chunks + 1) + 2
+        if num_blocks < min_blocks:
+            _log.warning(
+                "BDE KV pool: memory-fraction sizing gave %d blocks; raising to the %d-block "
+                "floor (2 CFG branches x (window_chunks=%d + 1) + 2 headroom)",
+                num_blocks,
+                min_blocks,
+                config.window_chunks,
+            )
+            num_blocks = min_blocks
         layer_names = [f"bde.layer.{i}" for i in range(num_layers)]
         self.manager = build_kv_manager(self.spec, layer_names, num_blocks, max_model_len)
         self.num_blocks = num_blocks

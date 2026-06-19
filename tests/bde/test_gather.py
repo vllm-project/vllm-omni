@@ -3,7 +3,7 @@
 
 import torch
 
-from vllm_omni.bde.kv_cache import (
+from vllm_omni.experimental.bde.kv_cache import (
     BDEKVCache,
     BDEKVConfig,
     allocate_kv_pool,

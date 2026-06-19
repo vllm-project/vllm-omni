@@ -20,7 +20,7 @@ requires_gpus_2_3 = pytest.mark.skipif(
     reason="requires >= 2 GPUs",
 )
 
-RUNNER_OVERRIDE = "vllm_omni.bde.runner.BDEModelRunner"
+RUNNER_OVERRIDE = "vllm_omni.experimental.bde.runner.BDEModelRunner"
 BLOCK = 16
 N_HEADS = 4
 HEAD_DIM = 64
@@ -35,7 +35,7 @@ def _worker_entry(rank: int, od_config, q) -> None:
         runner_name = type(worker.model_runner).__name__
 
         # --- pool write + gather on the worker's GPU ------------------------
-        from vllm_omni.bde.kv_cache import BDEKVCache, BDEKVConfig
+        from vllm_omni.experimental.bde.kv_cache import BDEKVCache, BDEKVConfig
 
         cfg = BDEKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2)
         kv = BDEKVCache(

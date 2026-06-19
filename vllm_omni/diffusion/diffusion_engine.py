@@ -438,7 +438,7 @@ class DiffusionEngine:
         if backend == "bde":
             # Lazy import to avoid a circular dependency (bde.engine imports this
             # module), mirroring how DiffusionExecutor.get_class imports backends.
-            from vllm_omni.bde.engine import BDEEngine
+            from vllm_omni.experimental.bde.engine import BDEEngine
 
             return BDEEngine
         if isinstance(backend, str):

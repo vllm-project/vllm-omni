@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from vllm_omni.bde.kv_cache import BDEKVCache, BDEKVConfig
+from vllm_omni.experimental.bde.kv_cache import BDEKVCache, BDEKVConfig
 
 DIMS = dict(num_layers=2, num_kv_heads=4, head_size=64, dtype=torch.float16, block_size=16)
 
@@ -64,3 +64,30 @@ def test_num_computed_advances_per_chunk():
     kv.commit_chunk(a)
     assert a.num_computed_tokens == 16
     kv.end_request(a)
+
+
+def test_state_close_frees_both_branch_blocks():
+    """BDEKVState.close() returns both CFG branches' pool blocks to the pool.
+
+    This is the primitive the runner's LRU eviction relies on: when a session is
+    evicted, close() must free the blocks both adapters hold, or session churn
+    leaks pool ownership (review P1).
+    """
+    from vllm_omni.experimental.bde.kv_cache.gather import BDEKVState
+
+    kv = make_cache(chunk_size=16, window_chunks=2)
+    free_total = kv.manager.block_pool.get_num_free_blocks()
+
+    pos = kv.begin_request("bde__s")
+    neg = kv.begin_request("bde__s__neg")
+    state = BDEKVState(kv, pos, neg, num_layers=kv.num_layers)
+    for _ in range(3):
+        for adapter in (pos, neg):
+            kv.allocate_chunk(adapter)
+            kv.commit_chunk(adapter)
+    # Both branches hold resident blocks now.
+    assert kv.manager.block_pool.get_num_free_blocks() < free_total
+
+    state.close()
+    # All blocks returned — no leak across an evicted session.
+    assert kv.manager.block_pool.get_num_free_blocks() == free_total

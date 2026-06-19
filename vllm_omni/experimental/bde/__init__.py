@@ -7,6 +7,6 @@ cache management for autoregressive / chunked "world-model" diffusion models
 ``OmniDiffusionConfig.engine_backend = "bde"``.
 """
 
-from vllm_omni.bde.engine import BDEEngine
+from vllm_omni.experimental.bde.engine import BDEEngine
 
 __all__ = ["BDEEngine"]

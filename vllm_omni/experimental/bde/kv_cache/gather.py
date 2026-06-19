@@ -11,6 +11,8 @@ deliberate Phase-1 simplification the fused paged backend retires in Phase 2.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from vllm.logger import init_logger
 
@@ -148,6 +150,10 @@ class BDEKVState:
         # re-materializing the same tensors ~16x. Memoize the gathered window per
         # branch; invalidate on write-back (window grows) and on reset.
         self._gather_cache: dict[bool, list | None] = {False: None, True: None}
+        # Profiling escape hatch: BDE_KV_NO_MEMO=1 disables the per-forward gather
+        # memoization so every denoise step re-gathers the window (the pre-memo
+        # behavior), for A/B measurement of the memoization win. Default: enabled.
+        self._memo_enabled = os.environ.get("BDE_KV_NO_MEMO") != "1"
         # Cross-attn KV is populated once after text encoding (eager), then
         # read every denoising step.  Reset clears these flags so the next
         # forward repopulates from the new text encoding.
@@ -162,12 +168,13 @@ class BDEKVState:
             out = fallback()
             _log.info("BDE GET   [%s] source=model-local-empty layers=%d", branch, len(out))
             return out
-        cached = self._gather_cache[is_negative]
+        cached = self._gather_cache[is_negative] if self._memo_enabled else None
         if cached is not None:  # window unchanged this forward -> reuse (no re-gather)
             return cached
         adapter = self._adapter(is_negative)
         windows = self.kv_cache.gather_window_all_layers(adapter)
-        self._gather_cache[is_negative] = windows
+        if self._memo_enabled:
+            self._gather_cache[is_negative] = windows
         _log.info(
             "BDE GET   [%s] source=paged-gather layers=%d window0=%s resident_blocks=%d/%d",
             branch,
@@ -229,6 +236,18 @@ class BDEKVState:
     def commit_chunk(self) -> None:
         _log.info("BDE COMMIT (paged; resident window retained across forwards)")
 
+    def close(self) -> None:
+        """Final teardown — free both branches' resident pool blocks.
+
+        Unlike :meth:`reset`, this does **not** restart the adapters: the caller is
+        dropping this ``BDEKVState`` for good (session eviction / shutdown), so the
+        blocks return to the ``BlockPool`` and the dead adapters are discarded with
+        the state. Frees pool ownership that would otherwise leak when a session is
+        evicted from the runner's session map.
+        """
+        self.kv_cache.end_request(self.pos)
+        self.kv_cache.end_request(self.neg)
+
     def reset(self) -> None:
         """Drop this session's KV — mirrors the model-local ``state.reset()``.
 
@@ -240,8 +259,7 @@ class BDEKVState:
         is recycled.
         """
         pos_id, neg_id = self.pos.request_id, self.neg.request_id
-        self.kv_cache.end_request(self.pos)  # free resident blocks
-        self.kv_cache.end_request(self.neg)
+        self.close()  # free resident blocks for both branches
         self.pos = self.kv_cache.begin_request(pos_id)  # fresh, empty window
         self.neg = self.kv_cache.begin_request(neg_id)
         self._committed = {False: 0, True: 0}
@@ -249,37 +267,3 @@ class BDEKVState:
         self._gather_cache = {False: None, True: None}
         self._cross_populated = {False: False, True: False}
         _log.info("BDE RESET [%s/%s] session KV cleared (window boundary)", pos_id, neg_id)
-
-
-class BDEPipelineMixin:
-    """Mixin that replaces model-local KV state with pool-backed storage.
-
-    A DreamZero pipeline inheriting this mixin delegates KV access through
-    proxy methods (``_bde_kv_get`` / ``_bde_kv_create`` / ``_bde_kv_update``)
-    that check for ``self._bde_kv_state`` and route to :class:`BDEKVState`
-    when present, falling back to the ``DreamZeroState`` methods otherwise.
-    """
-
-    _bde_kv_state: BDEKVState | None = None
-
-    # -- proxy methods (call these instead of state.*) -----------------------
-
-    def _bde_kv_get(self, state, is_negative):
-        if self._bde_kv_state is not None:
-            return self._bde_kv_state.get_kv_caches(is_negative)
-        return state.get_kv_caches(is_negative)
-
-    def _bde_kv_create(self, state, batch_size, dtype, device, num_layers, num_heads, head_dim):
-        if self._bde_kv_state is not None:
-            return  # pool already allocated
-        state.create_kv_caches(batch_size, dtype, device, num_layers, num_heads, head_dim)
-
-    def _bde_kv_update(self, state, layer_idx, updated_kv, is_negative):
-        if self._bde_kv_state is not None:
-            self._bde_kv_state.update_kv_cache(layer_idx, updated_kv, is_negative)
-            return
-        state.update_kv_cache(layer_idx, updated_kv, is_negative=is_negative)
-
-    def _bde_kv_commit(self):
-        if self._bde_kv_state is not None:
-            self._bde_kv_state.commit_chunk()

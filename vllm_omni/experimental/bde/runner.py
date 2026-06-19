@@ -15,14 +15,16 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections import OrderedDict
 
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.bde.kv_cache.config import BDEKVConfig
-from vllm_omni.bde.kv_cache.gather import BDEKVState
-from vllm_omni.bde.kv_cache.manager import BDEKVCache
+from vllm_omni.experimental.bde.kv_cache.config import BDEKVConfig
+from vllm_omni.experimental.bde.kv_cache.gather import BDEKVState
+from vllm_omni.experimental.bde.kv_cache.manager import BDEKVCache
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import MAX_DREAMZERO_SESSIONS
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
@@ -64,7 +66,12 @@ class BDEModelRunner(DiffusionModelRunner):
         self.kv_cache: BDEKVCache | None = None
         # DreamZero KV is session-scoped (persists across a session's forwards),
         # so BDE KV state is keyed by session_id and reused, not created per request.
-        self._bde_states: dict[str, BDEKVState] = {}
+        # Bounded by the same LRU cap as DreamZeroPipeline._states: an evicted
+        # session's BDEKVState owns pool blocks (two CFG adapters), so without a
+        # bound, session-id churn in a long-running server would leak pool ownership
+        # until the KV pool is exhausted. Evicting frees those blocks (state.close()).
+        self._bde_states: OrderedDict[str, BDEKVState] = OrderedDict()
+        self._max_bde_states = MAX_DREAMZERO_SESSIONS
 
     def build_kv_cache(
         self,
@@ -133,7 +140,17 @@ class BDEModelRunner(DiffusionModelRunner):
         head_size = int(t.dim // t.num_heads)
         num_frame_per_block = int(t.num_frame_per_block)
         local_attn_size = int(t.local_attn_size)
-        frame_seqlen = self._infer_frame_seqlen()
+        # The loaded transformer is the source of truth for frame_seqlen (it derives
+        # max_attention_size from it). The deploy-config inference is only a
+        # cross-check — warn on drift rather than silently sizing chunks wrong.
+        frame_seqlen = int(getattr(t, "frame_seqlen", 0)) or self._infer_frame_seqlen()
+        inferred = self._infer_frame_seqlen()
+        if frame_seqlen != inferred:
+            logger.warning(
+                "BDE frame_seqlen mismatch: transformer=%d deploy-config=%d; using transformer",
+                frame_seqlen,
+                inferred,
+            )
         # The model's own attention window, in tokens (= the [-max_attention_size:]
         # slice it applies). Read it directly rather than recomputing.
         max_attention_size = int(t.blocks[0].self_attn.max_attention_size)
@@ -189,6 +206,15 @@ class BDEModelRunner(DiffusionModelRunner):
             neg = kv.begin_request(f"bde__{session_id}__neg")
             state = BDEKVState(kv, pos, neg, num_layers=kv.num_layers)
             self._bde_states[session_id] = state
+            # Evict the least-recently-used session(s) past the cap, freeing their
+            # pool blocks — mirrors DreamZeroPipeline._states so the BDE pool can't
+            # outlive the model-local state map it shadows.
+            while len(self._bde_states) > self._max_bde_states:
+                old_id, old_state = self._bde_states.popitem(last=False)
+                old_state.close()
+                logger.debug("BDE evicted session=%s (LRU); freed pool blocks", old_id)
+        # Track recency on every access (hit or miss) so the LRU order is correct.
+        self._bde_states.move_to_end(session_id)
         logger.debug(
             "BDE execute_model: req=%s session=%s chunk_size=%d window_chunks=%s num_blocks=%d",
             req.request_id,

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from vllm_omni.bde.kv_cache import BDEKVCache, BDEKVConfig
+from vllm_omni.experimental.bde.kv_cache import BDEKVCache, BDEKVConfig
 
 
 def kv_memory_plateau(

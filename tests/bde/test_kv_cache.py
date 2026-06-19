@@ -12,7 +12,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpecKind, get_kv_cache_spec_kind
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import RequestStatus
 
-from vllm_omni.bde.kv_cache import (
+from vllm_omni.experimental.bde.kv_cache import (
     BDEKVConfig,
     BDERequestAdapter,
     ChunkWindowManager,
@@ -20,7 +20,7 @@ from vllm_omni.bde.kv_cache import (
     build_kv_manager,
     compute_num_blocks,
 )
-from vllm_omni.bde.kv_cache.chunk_window import chunk_window_skipped_tokens
+from vllm_omni.experimental.bde.kv_cache.chunk_window import chunk_window_skipped_tokens
 
 BLOCK = 16
 

@@ -12,7 +12,7 @@ from vllm_omni.diffusion.sched import SchedulerInterface
 logger = init_logger(__name__)
 
 #: Import path of the runner the BDE engine routes its workers to.
-BDE_MODEL_RUNNER_CLS = "vllm_omni.bde.runner.BDEModelRunner"
+BDE_MODEL_RUNNER_CLS = "vllm_omni.experimental.bde.runner.BDEModelRunner"
 
 
 def apply_bde_runner_default(od_config: OmniDiffusionConfig) -> None:
@@ -43,8 +43,8 @@ class BDEEngine(DiffusionEngine):
 
     Architecture note: in the multiproc setup the KV cache lives in the worker /
     runner process (GPU side), co-located with the model and KV tensors — so the
-    actual KV *body* is :class:`~vllm_omni.bde.kv_cache.manager.BDEKVCache`, owned
-    by :class:`~vllm_omni.bde.runner.BDEModelRunner`. ``BDEEngine`` itself is the
+    actual KV *body* is :class:`~vllm_omni.experimental.bde.kv_cache.manager.BDEKVCache`, owned
+    by :class:`~vllm_omni.experimental.bde.runner.BDEModelRunner`. ``BDEEngine`` itself is the
     thin selection / injection seam; it wires the BDE executor → worker → runner
     so DreamZero's rollout runs against the runner-owned KV cache.
     """

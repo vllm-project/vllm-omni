@@ -77,9 +77,25 @@ def main() -> None:
     prefill = per_forward[0]
     steady = per_forward[2:] if len(per_forward) > 2 else per_forward[1:]  # drop prefill + 1 warmup
     mean_steady = sum(steady) / len(steady)
+
+    # Peak GPU memory over the whole rollout, queried from the worker process where
+    # the model + KV pools live. Monotonic high-water mark from process start.
+    peak_reserved_gib = None
+    peak_allocated_gib = None
+    try:
+        engine = getattr(omni.engine.stage_clients[0], "_engine", None)
+        if engine is not None:
+            stats = engine.executor.collective_rpc("gpu_mem_stats", unique_reply_rank=0, exec_all_ranks=True)
+            stats = stats[0] if isinstance(stats, (list, tuple)) else stats
+            peak_reserved_gib = stats["peak_reserved_gib"]
+            peak_allocated_gib = stats["peak_allocated_gib"]
+    except Exception as e:  # noqa: BLE001 — profiling extra must never fail the run
+        print(f"[perf:{args.tag}] WARN: could not read GPU mem stats: {e}")
+
     summary = {
         "tag": args.tag,
         "bde_kv_enable": os.environ.get("BDE_KV_ENABLE", "0"),
+        "bde_kv_no_memo": os.environ.get("BDE_KV_NO_MEMO", "0"),
         "num_forwards": n,
         "load_s": load_s,
         "prefill_s": prefill,
@@ -87,11 +103,14 @@ def main() -> None:
         "steady_min_s": min(steady),
         "steady_max_s": max(steady),
         "total_gen_s": sum(per_forward),
+        "peak_reserved_gib": peak_reserved_gib,
+        "peak_allocated_gib": peak_allocated_gib,
         "per_forward_s": per_forward,
     }
+    mem_str = f"  peak_reserved={peak_reserved_gib:.2f}GiB" if peak_reserved_gib is not None else ""
     print(
         f"[perf:{args.tag}] prefill={prefill * 1000:.1f}ms  "
-        f"steady_mean={mean_steady * 1000:.1f}ms (n={len(steady)})  total={sum(per_forward):.2f}s"
+        f"steady_mean={mean_steady * 1000:.1f}ms (n={len(steady)})  total={sum(per_forward):.2f}s{mem_str}"
     )
 
     # Decode once (after timing) so latents + the final video are both saved.

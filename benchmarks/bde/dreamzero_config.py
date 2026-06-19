@@ -8,7 +8,7 @@ BDE window must equal ``max_attention_size = local_attn_size * frame_seqlen``. S
 
 from __future__ import annotations
 
-from vllm_omni.bde.kv_cache import BDEKVConfig
+from vllm_omni.experimental.bde.kv_cache import BDEKVConfig
 
 
 def bde_config_for_dreamzero(
@@ -20,9 +20,16 @@ def bde_config_for_dreamzero(
 ) -> BDEKVConfig:
     """Build the parity-faithful ``BDEKVConfig`` for DreamZero.
 
-    ``chunk_size      = num_frame_per_block * frame_seqlen``
+    Frame-granular paging (matches ``BDEModelRunner._preallocate_kv_cache``): one
+    pool block = one frame, so the resident window equals ``max_attention_size``
+    exactly without rounding to whole causal blocks.
+
+    ``chunk_size      = frame_seqlen``
     ``window (tokens) = local_attn_size * frame_seqlen   (== max_attention_size)``
-    ``window_chunks   = local_attn_size // num_frame_per_block``
+    ``window_chunks   = local_attn_size``
+
+    ``num_frame_per_block`` no longer governs paging (it sets the reset cadence); it
+    is kept as an argument for call-site compatibility.
     """
     if num_frame_per_block <= 0 or frame_seqlen <= 0:
         raise ValueError("num_frame_per_block and frame_seqlen must be > 0")
@@ -31,14 +38,9 @@ def bde_config_for_dreamzero(
             f"local_attn_size must be > 0 for a bounded BDE window (got {local_attn_size}); "
             "DreamZero -1 (full attention) needs an explicit window size for Phase 1"
         )
-    if local_attn_size % num_frame_per_block != 0:
-        raise ValueError(
-            f"local_attn_size ({local_attn_size}) must be divisible by "
-            f"num_frame_per_block ({num_frame_per_block}) for exact window parity"
-        )
 
-    chunk_size = num_frame_per_block * frame_seqlen
-    window_chunks = local_attn_size // num_frame_per_block
+    chunk_size = frame_seqlen
+    window_chunks = local_attn_size
     config = BDEKVConfig(
         enable=True,
         chunk_size=chunk_size,

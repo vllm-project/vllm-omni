@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from vllm_omni.bde.kv_cache import (
+from vllm_omni.experimental.bde.kv_cache import (
     BDERequestAdapter,
     ChunkWindowSpec,
     build_kv_manager,

@@ -58,16 +58,25 @@ def test_check_gates():
 
 
 def test_config_derivation_matches_window():
+    # Frame-granular: one pool block = one frame, so chunk_size == frame_seqlen and
+    # window_chunks == local_attn_size (matches BDEModelRunner._preallocate_kv_cache,
+    # which overwrites chunk_size to frame_seqlen but preserves window_chunks).
     cfg = bde_config_for_dreamzero(num_frame_per_block=3, frame_seqlen=220, local_attn_size=21)
-    assert cfg.chunk_size == 660
-    assert cfg.window_chunks == 7
+    assert cfg.chunk_size == 220
+    assert cfg.window_chunks == 21
     assert cfg.sliding_window == 21 * 220  # == max_attention_size
     assert cfg.enable and not cfg.reset_at_boundary
 
 
-def test_config_rejects_nondivisible_window():
-    with pytest.raises(ValueError):
-        bde_config_for_dreamzero(num_frame_per_block=4, frame_seqlen=10, local_attn_size=21)
+def test_config_window_is_frame_granular():
+    # Regression: frame granularity makes the window exact for any
+    # num_frame_per_block (no divisibility constraint), and window_chunks tracks
+    # local_attn_size rather than local_attn_size // num_frame_per_block — the old
+    # causal-block math the runtime would silently shrink to a too-small window.
+    cfg = bde_config_for_dreamzero(num_frame_per_block=4, frame_seqlen=10, local_attn_size=21)
+    assert cfg.chunk_size == 10
+    assert cfg.window_chunks == 21
+    assert cfg.sliding_window == 21 * 10
 
 
 def test_config_rejects_full_attention():

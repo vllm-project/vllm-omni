@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
-from vllm_omni.bde.engine import (
+from vllm_omni.experimental.bde.engine import (
     BDE_MODEL_RUNNER_CLS,
     BDEEngine,
     apply_bde_runner_default,
@@ -51,7 +51,7 @@ def test_subclass_type_is_returned():
 
 
 def test_qualname_string_resolves():
-    cls = DiffusionEngine.resolve_engine_class(_cfg("vllm_omni.bde.engine.BDEEngine"))
+    cls = DiffusionEngine.resolve_engine_class(_cfg("vllm_omni.experimental.bde.engine.BDEEngine"))
     assert cls is BDEEngine
 
 
