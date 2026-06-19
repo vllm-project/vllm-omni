@@ -38,6 +38,7 @@ MINIMIND_OMNI_PIPELINE = PipelineConfig(
                 "ignore_eos": True,
                 "stop_token_ids": [17],
             },
+            custom_process_next_stage_input_func=f"{_PROC}.thinker2talker_full_payload",
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -46,6 +47,8 @@ MINIMIND_OMNI_PIPELINE = PipelineConfig(
             input_sources=(0,),
             engine_output_type="latent",
             custom_process_input_func=f"{_PROC}.thinker2talker",
+            sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
+            custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             sampling_constraints={"detokenize": False, "stop_token_ids": [2052]},
         ),
         StagePipelineConfig(
@@ -57,6 +60,7 @@ MINIMIND_OMNI_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             custom_process_input_func=f"{_PROC}.talker2code2wav",
+            sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
         ),
     ),

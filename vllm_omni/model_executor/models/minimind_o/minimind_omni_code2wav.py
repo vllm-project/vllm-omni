@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import torch
@@ -18,6 +18,22 @@ from vllm_omni.model_executor.models.minimind_o.resource_utils import resolve_mo
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
+
+
+def _codec_ids_from_payload_or_input(
+    input_ids: torch.Tensor,
+    runtime_info: Mapping[str, Any] | None,
+) -> torch.Tensor:
+    """Prefer connector-delivered codec IDs over scheduler placeholders."""
+    if isinstance(runtime_info, Mapping):
+        codes = runtime_info.get("codes", {})
+        if isinstance(codes, Mapping):
+            audio = codes.get("audio")
+            if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+                return audio.reshape(-1).to(device=input_ids.device, dtype=torch.long)
+            if isinstance(audio, (list, tuple)) and audio:
+                return torch.as_tensor(audio, device=input_ids.device, dtype=torch.long).reshape(-1)
+    return input_ids.reshape(-1).to(dtype=torch.long)
 
 
 class MiniMindOmniCode2Wav(nn.Module):
@@ -95,6 +111,7 @@ class MiniMindOmniCode2Wav(nn.Module):
         positions: torch.Tensor | None = None,
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
         mimi_model = self._ensure_mimi_loaded()
@@ -108,7 +125,15 @@ class MiniMindOmniCode2Wav(nn.Module):
             )
 
         ids = input_ids.reshape(-1).to(dtype=torch.long)
-        request_ids = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
+        placeholder_ids = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
+        runtime_infos = runtime_additional_information or []
+        request_ids = [
+            _codec_ids_from_payload_or_input(
+                req_ids,
+                runtime_infos[idx] if idx < len(runtime_infos) else None,
+            )
+            for idx, req_ids in enumerate(placeholder_ids)
+        ]
         audios: list[torch.Tensor] = []
         for req_ids in request_ids:
             if req_ids.numel() == 0 or req_ids.numel() % self.num_code_layers != 0:

@@ -117,6 +117,8 @@ class TestFullPayloadCoordinatorSelection(unittest.TestCase):
             ("CosyVoice3Model", "cosyvoice3_code2wav"),
             ("DyninOmniForConditionalGeneration", "token2image"),
             ("DyninOmniForConditionalGeneration", "token2audio"),
+            ("MiniMindOmniForConditionalGeneration", "talker"),
+            ("MiniMindOmniForConditionalGeneration", "code2wav"),
         }
     )
 
