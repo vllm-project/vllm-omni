@@ -9,7 +9,7 @@ import torch
 from transformers import AutoModel, AutoProcessor
 
 from vllm_omni.diffusion.models.gr00t.dataio.embodiment_tags import FINETUNE_ONLY_TAGS, POSTTRAIN_TAGS, EmbodimentTag
-from vllm_omni.diffusion.models.gr00t.dataio.types import MessageType, ModalityConfig, VLAStepData
+from vllm_omni.diffusion.models.gr00t.dataio.types import MessageType, VLAStepData
 from vllm_omni.diffusion.models.gr00t.modeling.gr00t_n1d7 import Gr00tN1d7
 from vllm_omni.diffusion.models.gr00t.modeling.processing_gr00t_n1d7 import Gr00tN1d7Processor
 
@@ -421,9 +421,6 @@ class Gr00tPolicy:
         if self.strict:
             self.check_action(action)
         return action, info
-
-    def get_modality_config(self) -> dict[str, ModalityConfig]:
-        return self.modality_configs
 
     def reset(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         """Reset the policy to its initial state.

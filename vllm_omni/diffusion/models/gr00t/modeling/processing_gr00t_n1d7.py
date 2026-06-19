@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torchvision.transforms.v2 as transforms
 from PIL import Image
-from transformers import AutoProcessor, ProcessorMixin, Qwen3VLProcessor
+from transformers import AutoProcessor, ProcessorMixin
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.utils import cached_file
 from vllm.logger import init_logger
@@ -88,7 +88,14 @@ EMBODIMENT_TAG_TO_PROJECTOR_INDEX = {
 QWEN3_VL_2B_PROCESSOR = "Qwen/Qwen3-VL-2B-Instruct"
 
 
-def build_processor(model_name: str, transformers_loading_kwargs: dict) -> Qwen3VLProcessor:
+def build_processor(model_name: str, transformers_loading_kwargs: dict) -> ProcessorMixin:
+    try:
+        from transformers import Qwen3VLProcessor
+    except ImportError as exc:
+        raise ImportError(
+            "GR00T-N1.7 requires transformers>=4.57.1 for Qwen3VLProcessor "
+            "(the repo's declared floor is 4.56.0). Please upgrade transformers."
+        ) from exc
     if model_name == "nvidia/Cosmos-Reason2-2B":
         # Cosmos-Reason2-2B lacks a Qwen3VLProcessor; fall back to upstream artifacts.
         logger.warning_once(
@@ -287,121 +294,6 @@ class Gr00tN1d7Processor(ProcessorMixin):
 
         # Use StateActionProcessor to unnormalize and convert to absolute
         return self.state_action_processor.unapply_action(out_dict, embodiment_tag.value, state=state)
-
-    def unapply(
-        self,
-        action: np.ndarray,
-        embodiment_tag: EmbodimentTag,
-        state: dict[str, np.ndarray] | None = None,
-        prev_action: dict[str, np.ndarray] | None = None,
-    ) -> dict[str, np.ndarray]:
-        """Undo action normalization and convert relative to absolute.
-
-        Args:
-            action: Normalized action array of shape (..., action_horizon, action_dim)
-            embodiment_tag: Embodiment tag
-            state: State observations with "state." prefixed keys (for relative actions)
-            prev_action: Unused (kept for API compatibility)
-
-        Returns:
-            Dict mapping "action.<key>" to unnormalized (absolute) action arrays.
-        """
-        out_dict = {}
-        start_idx = 0
-        joint_groups = self.modality_configs[embodiment_tag.value]["action"].modality_keys
-        action_horizon = len(self.modality_configs[embodiment_tag.value]["action"].delta_indices)
-        for key in joint_groups:
-            joint_dim = self.state_action_processor.norm_params[embodiment_tag.value]["action"][key]["dim"].item()
-            out_dict[key] = action[..., :action_horizon, start_idx : start_idx + joint_dim]
-            start_idx += joint_dim
-
-        # Strip "state." prefix for StateActionProcessor
-        stripped_state = None
-        if state is not None:
-            stripped_state = {k.replace("state.", ""): v for k, v in state.items()}
-
-        result = self.state_action_processor.unapply_action(out_dict, embodiment_tag.value, state=stripped_state)
-        return {f"action.{key}": value for key, value in result.items()}
-
-    def process_observation(self, observation: dict[str, Any], embodiment_tag: EmbodimentTag) -> BatchFeature:
-        """Process batched observation tensors for inference.
-
-        Args:
-            observation: Dict with keys like "video.<view>", "state.<key>", "<language_key>"
-                Video values expected as numpy arrays of shape (B, T, H, W, C).
-            embodiment_tag: Embodiment tag identifying the robot configuration.
-
-        Returns:
-            ``BatchFeature`` with tokenized VLM inputs, state, embodiment_id, and action_mask.
-        """
-        modality_config = self.modality_configs[embodiment_tag.value]
-        transformed_observation = {}
-
-        # Normalize states
-        state_keys = modality_config["state"].modality_keys
-        state_data = {key: observation[f"state.{key}"] for key in state_keys}
-        exclude_state = self.exclude_state or getattr(modality_config["state"], "exclude_state", False)
-        if exclude_state:
-            normalized_states = torch.cat(
-                [torch.from_numpy(np.zeros_like(state_data[key])) for key in state_keys], dim=-1
-            )
-        else:
-            norm_state_dict = self.state_action_processor.apply_state(
-                state=state_data, embodiment_tag=embodiment_tag.value
-            )
-            normalized_states = torch.cat([torch.from_numpy(norm_state_dict[key]) for key in state_keys], dim=-1)
-
-        assert normalized_states.shape[1] <= self.max_state_dim, (
-            f"State dimension {normalized_states.shape[1]} exceeds max_state_dim {self.max_state_dim}"
-        )
-        padding_shape = (
-            *normalized_states.shape[:-1],
-            self.max_state_dim - normalized_states.shape[-1],
-        )
-        normalized_states = torch.cat([normalized_states, torch.zeros(padding_shape)], dim=-1)
-        transformed_observation["state"] = normalized_states
-
-        image_keys = modality_config["video"].modality_keys
-        images_dict = {view: torch.from_numpy(observation[f"video.{view}"]) for view in image_keys}
-        images = torch.stack([images_dict[view] for view in image_keys], dim=2)  # (B, T, V, H, W, C)
-        assert images.ndim == 6
-        B, T, V, img_H, img_W, img_C = images.shape
-
-        images_perm = images.permute(0, 1, 2, 5, 3, 4).reshape(B, T * V, img_C, img_H, img_W)  # (B,T*V,C,H,W)
-        transformed_images = self.eval_image_transform(images_perm).numpy()
-
-        language_key = modality_config["language"].modality_keys[0]
-        language = [
-            re.sub(r"[^\w\s]", "", lang.lower()) if self.formalize_language else lang
-            for lang in observation[language_key]
-        ]
-
-        texts, all_images = [], []
-        for i in range(B):
-            vlm_inputs = self._apply_vlm_processing(transformed_images[i], language[i])
-            vc = vlm_inputs["vlm_content"]
-            texts.append(vc["text"])
-            all_images.extend(vc["images"])
-        tokenized = self.processor(text=texts, images=all_images, return_tensors="pt", padding=True)
-        for k, v in tokenized.items():
-            transformed_observation[k] = v
-
-        embodiment_id = torch.ones(B, dtype=torch.int32) * self.embodiment_id_mapping[embodiment_tag.value]
-        transformed_observation["embodiment_id"] = embodiment_id
-
-        action_config = modality_config["action"]
-        action_horizon = len(action_config.delta_indices)
-        assert action_horizon <= self.max_action_horizon, (
-            f"Action horizon {action_horizon} (from delta_indices) exceeds"
-            f" max_action_horizon {self.max_action_horizon}. Increase model config"
-            f" action_horizon to >= {action_horizon}."
-        )
-        action_mask = torch.zeros((B, self.max_action_horizon), dtype=torch.float32)
-        if action_horizon > 0:
-            action_mask[:, :action_horizon] = 1.0
-        transformed_observation["action_mask"] = action_mask
-
-        return BatchFeature(transformed_observation)
 
     def _apply_vlm_processing(self, images: np.ndarray, language: str) -> BatchFeature:
         pil_images = [Image.fromarray(np.transpose(v, (1, 2, 0))) for v in images]

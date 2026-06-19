@@ -31,8 +31,6 @@ class Gr00tN1d7Pipeline(nn.Module):
     inference, and actions are returned through `DiffusionOutput.output["actions"]`.
     """
 
-    EXTRA_BODY_PARAMS = frozenset({"robot_obs"})
-
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
         model_config = od_config.model_config
