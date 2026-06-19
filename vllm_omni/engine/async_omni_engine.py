@@ -683,14 +683,9 @@ class AsyncOmniEngine:
                 f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
         if final_stage_id < 0:
-            raise ValueError(
-                f"[{request_id}] final_stage_id must be >= 0, got {final_stage_id}."
-            )
+            raise ValueError(f"[{request_id}] final_stage_id must be >= 0, got {final_stage_id}.")
         if final_stage_id >= self.num_stages:
-            raise ValueError(
-                f"[{request_id}] final_stage_id must be < num_stages, got "
-                f"final_stage_id={final_stage_id} with num_stages={self.num_stages}."
-            )
+            raise ValueError(f"[{request_id}] final_stage_id={final_stage_id} exceeds num_stages={self.num_stages}.")
         if len(effective_sampling_params_list) <= final_stage_id:
             raise ValueError(
                 f"[{request_id}] sampling_params_list has "
