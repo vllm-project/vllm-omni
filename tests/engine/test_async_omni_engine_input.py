@@ -295,7 +295,7 @@ def test_build_add_request_message_rejects_final_stage_id_ge_num_stages():
     engine.num_stages = 1
     engine.default_sampling_params_list = []
     params = SamplingParams(max_tokens=8)
-    with pytest.raises(ValueError, match="final_stage_id=1 exceeds num_stages=1"):
+    with pytest.raises(ValueError, match="final_stage_id must be < num_stages=1"):
         engine._build_add_request_message(
             request_id="req-1",
             prompt={"prompt_token_ids": [1]},
