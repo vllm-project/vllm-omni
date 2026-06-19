@@ -711,6 +711,15 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             starts = q[:-1]
             spans = q[1:] - q[:-1]
             req_rows = torch.arange(int(q.numel()) - 1, dtype=torch.long, device=device)
+            if bool(getattr(self, "_use_external_decode_cudagraph", False)):
+                # Boolean-mask indexing (``req_rows[decode_mask]``) yields a
+                # data-dependent output shape, which forces a host sync and is
+                # illegal during CUDA graph capture. Under the external decode
+                # CUDA graph the batch is a uniform single-token decode (every
+                # span == 1), so ``decode_mask`` is all-True and the filtered
+                # result is identical to the unfiltered tensors. Return them
+                # directly to keep the captured shape static.
+                return req_rows, starts
             decode_mask = (spans == 1) & (starts >= 0) & (starts < int(num_tokens))
             return req_rows[decode_mask], starts[decode_mask]
 
