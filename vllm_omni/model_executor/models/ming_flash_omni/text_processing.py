@@ -15,19 +15,6 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Ported from
-# https://github.com/inclusionAI/Ming/blob/e58533db227031990c5a6864dcf5f08fb53ed0d2/front/toolkit.py
-_TOKENIZE_PATTERN = re.compile(r"(?:[a-zA-Z]\.)+|[a-zA-Z]+(?:['\-][a-zA-Z]+)*|\d+(?:\.\d+)?|[\u4e00-\u9fff]|\s+|\S")
-
-
-def tokenize_mixed_text(text: str) -> list[str]:
-    return re.findall(_TOKENIZE_PATTERN, text)
-
-
-def tokenize_mixed_text_iterator(text: str):
-    for match in _TOKENIZE_PATTERN.finditer(text):
-        yield match.group(0)
-
 
 # Ported from
 # https://github.com/inclusionAI/Ming/blob/e58533db227031990c5a6864dcf5f08fb53ed0d2/front/text_segment_cut.py
@@ -216,84 +203,6 @@ def cut_text_by_semantic_length(
                     result_fragments.append(sentence)
 
     return [f.replace(_DOT_PLACEHOLDER, ".") for f in result_fragments]
-
-
-# Streaming sentence boundary detection
-
-_RE_CJK = re.compile(r"[\u4e00-\u9fff]")
-_RE_DIGIT_LAST = re.compile(r"[0-9]")
-
-
-# Left for reference for now
-# Alternative to `cut_text_by_semantic_length`
-def detect_sentence_boundaries(
-    text: str,
-    max_length: int = 50,
-) -> list[str]:
-    """Accumulate tokens and flush at sentence boundaries.
-
-    Ported from the streaming sentence detection loop from the Ming repo
-    TTS branch, but operates on the full text since we have it available upfront.
-    """
-    sentences: list[str] = []
-    streaming_text: list[str] = []
-    count = 0
-
-    for ele in tokenize_mixed_text_iterator(text):
-        if len(ele) == 0:
-            continue
-
-        should_process = False
-        min_tokens = 12 if count == 0 else 8
-
-        if ele[-1] in "！？。，!?":
-            if len(streaming_text) >= min_tokens:
-                should_process = True
-            streaming_text.append(ele)
-
-        elif ele[-1] == ".":
-            if (
-                len(streaming_text) >= min_tokens
-                and streaming_text
-                and not _RE_DIGIT_LAST.search(streaming_text[-1][-1])
-            ):
-                should_process = True
-            streaming_text.append(ele)
-
-        elif ele[-1] == "\n":
-            if streaming_text:
-                joined = "".join(streaming_text)
-                if _RE_CJK.search(joined):
-                    if _RE_CJK.search(streaming_text[-1][-1]):
-                        ele = "，"
-                        streaming_text.append(ele)
-                else:
-                    if len(ele) > 1 and re.search(r"[a-zA-Z]", ele[-2]):
-                        ele = ele[:-1] + "."
-                    else:
-                        ele = ele[:-1]
-                    streaming_text.append(ele)
-
-            if len(streaming_text) >= min_tokens:
-                should_process = True
-        else:
-            streaming_text.append(ele)
-            continue
-
-        if should_process:
-            joined = "".join(streaming_text)
-            fragments = cut_text_by_semantic_length(joined, max_length)
-            sentences.extend(fragments)
-            streaming_text = []
-            count += 1
-
-    # Flush remaining
-    if streaming_text and re.search(r"[a-zA-Z\u4e00-\u9fff1-9]", "".join(streaming_text)):
-        joined = "".join(streaming_text)
-        fragments = cut_text_by_semantic_length(joined, max_length)
-        sentences.extend(fragments)
-
-    return sentences
 
 
 # number normalization for English. Ported from

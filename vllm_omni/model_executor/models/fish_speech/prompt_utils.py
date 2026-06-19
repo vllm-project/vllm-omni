@@ -132,13 +132,3 @@ def estimate_fish_voice_clone_prompt_len_from_normalized(
         [0] * semantic_len,
     )
     return len(prompt_ids)
-
-
-def estimate_fish_voice_clone_prompt_len(tokenizer: Any, text: str, ref_text: str, semantic_len: int) -> int:
-    normalized_text, normalized_ref_text = normalize_fish_voice_clone_texts(text, ref_text)
-    return estimate_fish_voice_clone_prompt_len_from_normalized(
-        tokenizer,
-        normalized_text,
-        normalized_ref_text,
-        semantic_len,
-    )

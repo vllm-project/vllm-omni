@@ -172,7 +172,6 @@ class MossTTSNanoForGeneration(nn.Module):
     has_preprocess = False
     has_postprocess = False
     enable_update_additional_information = True
-    inject_omni_request_id_into_runtime_info = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
