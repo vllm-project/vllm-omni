@@ -153,6 +153,12 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         # `make_omni_output`, which runs immediately before the sampler).
         self._batch_state: list[dict[str, Any]] | None = None
 
+        # Stacked weight caches built after load_weights(). Avoids a Python
+        # loop over n_vq heads/embeddings at every decode step.
+        # shapes: (n_vq, audio_vocab+1, hidden_size)
+        self._stacked_audio_head_w: torch.Tensor | None = None
+        self._stacked_audio_emb_w: torch.Tensor | None = None
+
     # ------------------------------------------------------------------
     # vLLM-Omni hooks
     # ------------------------------------------------------------------
@@ -394,9 +400,15 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                     chunk = ref_codes[ref_offset:end_off]
                     if chunk.numel() > 0 and chunk.shape[0] == span_len:
                         codes = chunk.to(device=device, dtype=torch.long).clamp_(0, self.audio_vocab_size)
-                        audio_embed = torch.zeros_like(embeds)
-                        for i, emb_layer in enumerate(self.audio_embeddings):
-                            audio_embed = audio_embed + emb_layer(codes[:, i])
+                        if self._stacked_audio_emb_w is not None:
+                            codes_nq = codes.t()  # (n_vq, L)
+                            audio_embed = self._stacked_audio_emb_w[
+                                torch.arange(self.n_vq, device=device)[:, None], codes_nq
+                            ].sum(0)
+                        else:
+                            audio_embed = torch.zeros_like(embeds)
+                            for i, emb_layer in enumerate(self.audio_embeddings):
+                                audio_embed = audio_embed + emb_layer(codes[:, i])
                         embeds = embeds + audio_embed
                         last_ref_row = codes[-1].detach()
 
@@ -436,10 +448,17 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         audio_codes_buf = (info_dict.get("audio_codes", {}) or {}).get("current")
         if isinstance(audio_codes_buf, torch.Tensor) and audio_codes_buf.numel() == self.n_vq:
             codes = audio_codes_buf.to(device=device, dtype=torch.long)
-            audio_embed = torch.zeros_like(text_embed)
-            for i, emb_layer in enumerate(self.audio_embeddings):
-                code_i = codes[i].clamp(0, self.audio_vocab_size).reshape(1)
-                audio_embed = audio_embed + emb_layer(code_i)
+            if self._stacked_audio_emb_w is not None:
+                # Single gather: stacked_emb[i, codes[i]] for each i → (n_vq, H) → sum → (1, H)
+                n_vq_idx = torch.arange(self.n_vq, device=device)
+                audio_embed = self._stacked_audio_emb_w[n_vq_idx, codes.clamp(0, self.audio_vocab_size)].sum(
+                    0, keepdim=True
+                )
+            else:
+                audio_embed = torch.zeros_like(text_embed)
+                for i, emb_layer in enumerate(self.audio_embeddings):
+                    code_i = codes[i].clamp(0, self.audio_vocab_size).reshape(1)
+                    audio_embed = audio_embed + emb_layer(code_i)
             combined = text_embed + audio_embed
         else:
             combined = text_embed
@@ -501,17 +520,38 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         if not bool(sampling_mask.any()):
             return codes
 
-        # Use deploy YAML defaults. The audio sampler isn't routed through
-        # vLLM's sampler so we apply the upstream's audio_top_k locally.
         audio_top_k = 25
         audio_temp = 1.7
 
+        if self._stacked_audio_head_w is not None:
+            # Single batched matmul: (n_vq, V+1, H) @ (H,) → (n_vq, V+1).
+            # Replaces n_vq serial nn.Linear calls.
+            all_logits = self._stacked_audio_head_w @ last_h.reshape(-1)  # (n_vq, V+1)
+            all_logits[:, -1] = float("-inf")  # invalid sentinel
+            all_logits[:, self.audio_pad_code] = float("-inf")
+
+            active_idx = sampling_mask.nonzero(as_tuple=True)[0]  # (n_active,)
+            active_logits = all_logits[active_idx]  # (n_active, V+1)
+            active_logits = active_logits / max(audio_temp, 1e-6)
+            if audio_top_k > 0 and audio_top_k < active_logits.shape[-1]:
+                top_vals, _ = torch.topk(active_logits, audio_top_k, dim=-1)
+                kth = top_vals[:, -1:].expand_as(active_logits)
+                active_logits = torch.where(
+                    active_logits < kth,
+                    torch.full_like(active_logits, float("-inf")),
+                    active_logits,
+                )
+            probs = torch.softmax(active_logits, dim=-1)
+            codes[active_idx] = torch.multinomial(probs, num_samples=1).squeeze(-1).long()
+            return codes
+
+        # Fallback: per-head loop (used before load_weights() completes).
         for i in range(n_vq):
             if not bool(sampling_mask[i]):
                 continue
             head = self.audio_heads[i]
             logits = head(last_h).reshape(-1)  # (V,)
-            logits[..., -1] = float("-inf")  # invalid sentinel
+            logits[..., -1] = float("-inf")
             logits[..., self.audio_pad_code] = float("-inf")
             sampled = self._sample_with_top_k(logits, audio_top_k, audio_temp)
             codes[i] = sampled.long()
@@ -678,6 +718,14 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         for n in backbone_loaded:
             loaded.add(f"model.{n}")
 
+        # Build stacked weight caches for vectorised decode ops.
+        self._stacked_audio_head_w = torch.stack(
+            [h.weight.detach() for h in self.audio_heads], dim=0
+        )  # (n_vq, audio_vocab+1, hidden_size)
+        self._stacked_audio_emb_w = torch.stack(
+            [e.weight.detach() for e in self.audio_embeddings], dim=0
+        )  # (n_vq, audio_vocab+1, hidden_size)
+
         return loaded
 
 
@@ -764,6 +812,10 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         # something callable; a minimal pass-through suffices.
         self.logits_processor = LogitsProcessor(self.text_vocab_size)
         self._batch_state: list[dict[str, Any]] | None = None
+
+        # Stacked weight cache built after load_weights().
+        # shape: (n_vq, audio_vocab_size, hidden_size)
+        self._stacked_audio_emb_w: torch.Tensor | None = None
 
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("audio_codes", "current"),
@@ -854,6 +906,11 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         embeds = self.embed_tokens[0](text_ids)
         if audio_codes is None:
             return embeds
+        if self._stacked_audio_emb_w is not None:
+            # Single gather: (n_vq, vocab, H)[arange[:,None], codes.T] → (n_vq, T, H) → sum → (T, H)
+            n_vq_idx = torch.arange(self.n_vq, device=audio_codes.device)
+            codes_t = audio_codes.t().clamp(0, self.audio_vocab_size - 1)  # (n_vq, T)
+            return embeds + self._stacked_audio_emb_w[n_vq_idx.unsqueeze(1), codes_t].sum(0)
         for i in range(self.n_vq):
             col = audio_codes[:, i].clamp_(0, self.audio_vocab_size - 1)
             embeds = embeds + self.embed_tokens[i + 1](col)
@@ -1114,6 +1171,12 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         backbone_loaded = self.model.load_weights(iter(backbone_weights))
         for n in backbone_loaded:
             loaded.add(f"model.{n}")
+
+        # Build stacked embedding cache for vectorised decode ops.
+        # embed_tokens[0] is the text embedding; [1..n_vq] are audio codebooks.
+        self._stacked_audio_emb_w = torch.stack(
+            [self.embed_tokens[i + 1].weight.detach() for i in range(self.n_vq)], dim=0
+        )  # (n_vq, audio_vocab_size, hidden_size)
 
         logger.info(
             "[MossTTSRealtime] loaded %d/%d params; skipped=%d (first 5: %s)",
