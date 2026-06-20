@@ -68,4 +68,19 @@ python benchmarks/dreamzero_async/compare_replays.py \
     --output-dir outputs/dreamzero_async/compare
 ```
 
+For repeated live benchmark pairs, use:
+
+```bash
+python benchmarks/dreamzero_async/live_benchmark.py \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --video-dir outputs/dreamzero/assets \
+    --num-chunks 2 \
+    --warmups 1 \
+    --repeats 3 \
+    --output-dir outputs/dreamzero_async/live_benchmark
+```
+
+`live_benchmark.py` defaults to `--order async-first`. That order intentionally runs the async endpoint before the sync OpenPI baseline, so BDE session cleanup regressions show up as a later sync failure. Use `--order sync-first` when measuring baseline first is more important than cleanup stress.
+
 Use these artifacts for demo smoke data. A final sync-vs-async benchmark should run both paths on the same checkpoint, deploy config, GPU setup, and replay length.

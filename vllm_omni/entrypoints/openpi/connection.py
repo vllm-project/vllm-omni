@@ -22,6 +22,7 @@ vLLM-native markers:
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import Any
 
 import msgspec
@@ -368,6 +369,24 @@ class RobotRealtimeConnection:
         self._current_session_id = None
         self._call_count = 0
 
+    async def _cleanup_session(self, session_id: str | None) -> None:
+        if session_id is None:
+            return
+
+        cleanup = getattr(self.serving, "cleanup_dreamzero_session", None)
+        if cleanup is None:
+            return
+
+        try:
+            result = cleanup(session_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception("Failed to clean up DreamZero OpenPI session %s", session_id)
+
+    async def _cleanup_current_session(self) -> None:
+        await self._cleanup_session(self._current_session_id)
+
     async def _send_error(self, message: str) -> None:
         await self.websocket.send_bytes(_pack({"type": "error", "message": message}))
 
@@ -423,6 +442,7 @@ class RobotRealtimeConnection:
                     endpoint = obs.pop("endpoint", "infer")
 
                     if endpoint == "reset":
+                        await self._cleanup_current_session()
                         self.reset()
                         self.serving.reset(obs)
                         await self.websocket.send_bytes(_pack({"status": "reset successful"}))
@@ -435,6 +455,7 @@ class RobotRealtimeConnection:
                                     self._current_session_id,
                                     session_id,
                                 )
+                                await self._cleanup_current_session()
                             self._current_session_id = session_id
                             self._call_count = 0
 
@@ -456,3 +477,5 @@ class RobotRealtimeConnection:
             pass
         except Exception:
             logger.exception("Connection error")
+        finally:
+            await self._cleanup_current_session()

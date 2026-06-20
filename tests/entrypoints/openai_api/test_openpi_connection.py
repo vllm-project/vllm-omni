@@ -47,6 +47,7 @@ def _serving_mock():
         }
     )
     serving.infer = AsyncMock(return_value=[0.0])
+    serving.cleanup_dreamzero_session = AsyncMock()
     return serving
 
 
@@ -289,6 +290,38 @@ def test_handle_connection_keeps_session_state_per_websocket(monkeypatch):
     assert calls[0].kwargs == {"session_id": "session-a", "reset": True}
     assert calls[1].kwargs == {"session_id": "session-a", "reset": False}
     assert calls[2].kwargs == {"session_id": "session-b", "reset": True}
+    assert [call.args[0] for call in serving.cleanup_dreamzero_session.await_args_list] == [
+        "session-a",
+        "session-b",
+    ]
+
+
+def test_handle_connection_cleans_up_previous_session_on_switch(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    requests = {
+        b"a1": {"prompt": "first", "session_id": "session-a"},
+        b"b1": {"prompt": "second", "session_id": "session-b"},
+    }
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+    websocket = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"a1"},
+            {"type": "websocket.receive", "bytes": b"b1"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    asyncio.run(openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection())
+
+    assert [call.kwargs["session_id"] for call in serving.infer.await_args_list] == [
+        "session-a",
+        "session-b",
+    ]
+    assert [call.args[0] for call in serving.cleanup_dreamzero_session.await_args_list] == [
+        "session-a",
+        "session-b",
+    ]
 
 
 def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):
@@ -312,6 +345,10 @@ def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):
     asyncio.run(openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection())
 
     assert [call.kwargs["reset"] for call in serving.infer.await_args_list] == [True, True]
+    assert [call.args[0] for call in serving.cleanup_dreamzero_session.await_args_list] == [
+        "session-a",
+        "session-a",
+    ]
     serving.reset.assert_called_once_with({})
     assert websocket.sent_bytes[2] == {"status": "reset successful"}
     assert websocket.sent_texts == []
