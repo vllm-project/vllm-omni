@@ -211,10 +211,14 @@ class DiffusionWorker:
         self.init_device()
         # Create model runner. An od_config override (e.g. the BDE engine selecting
         # BDEModelRunner) takes precedence; unset falls back to the platform default,
-        # so existing models are unaffected.
+        # so existing models are unaffected. The override must be an explicit import-
+        # path string — guard with isinstance so a non-string (e.g. a Mock od_config
+        # in tests) doesn't shadow the platform hook.
+        runner_override = getattr(self.od_config, "diffusion_model_runner_cls", None)
         model_runner_cls_path = (
-            getattr(self.od_config, "diffusion_model_runner_cls", None)
-            or current_omni_platform.get_diffusion_model_runner_cls()
+            runner_override
+            if isinstance(runner_override, str) and runner_override
+            else current_omni_platform.get_diffusion_model_runner_cls()
         )
         model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
         self.model_runner = model_runner_cls(
