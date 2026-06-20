@@ -651,6 +651,142 @@ class TestCFGParallelForwardPath:
         torch.testing.assert_close(video_out, (video_latents - 2 * expected_video_noise).reshape(1, 2, 1, 1, 1))
         torch.testing.assert_close(audio_out, (audio_latents - 2 * expected_audio_noise).reshape(1, 1, 1, 2))
 
+    def test_forward_single_rank_cfg_casts_latents_before_cat(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        pipe = object.__new__(ltx23.LTX23Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.device = torch.device("cpu")
+        pipe.tokenizer_max_length = 1
+        pipe.vae_spatial_compression_ratio = 32
+        pipe.vae_temporal_compression_ratio = 1
+        pipe.transformer_spatial_patch_size = 1
+        pipe.transformer_temporal_patch_size = 1
+        pipe.audio_sampling_rate = 1
+        pipe.audio_hop_length = 1
+        pipe.audio_vae_temporal_compression_ratio = 1
+        pipe.audio_vae_mel_compression_ratio = 1
+        pipe.od_config = SimpleNamespace(parallel_config=SimpleNamespace(sequence_parallel_size=1))
+        pipe.tokenizer = SimpleNamespace(padding_side="left")
+        pipe.vae = SimpleNamespace(
+            latents_mean=torch.zeros(2),
+            latents_std=torch.ones(2),
+            config=SimpleNamespace(scaling_factor=1.0),
+        )
+        pipe.audio_vae = SimpleNamespace(
+            latents_mean=torch.zeros(2),
+            latents_std=torch.ones(2),
+            config=SimpleNamespace(mel_bins=2, latent_channels=1),
+        )
+
+        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_world_size", lambda: 1)
+
+        def fake_retrieve_timesteps(scheduler, num_inference_steps, device, timesteps, sigmas=None, mu=None):
+            scheduler.sigmas = torch.tensor([0.25], device=device)
+            return torch.tensor([1.0], device=device), 1
+
+        monkeypatch.setattr(ltx23, "retrieve_timesteps", fake_retrieve_timesteps)
+
+        class FakeScheduler:
+            def __init__(self, name="video"):
+                self.name = name
+                self.config = {
+                    "max_image_seq_len": 4096,
+                    "base_image_seq_len": 1024,
+                    "base_shift": 0.95,
+                    "max_shift": 2.05,
+                }
+                self.sigmas = torch.tensor([0.25])
+
+            def __deepcopy__(self, memo):
+                return FakeScheduler("audio")
+
+            def step(self, noise_pred, t, latents, return_dict=False, generator=None):
+                assert noise_pred.shape == latents.shape
+                return (latents - noise_pred,)
+
+        class FakeConnectors:
+            def to(self, device):
+                return self
+
+            def __call__(self, prompt_embeds, prompt_attention_mask, padding_side):
+                assert padding_side == "left"
+                assert prompt_embeds.shape[0] == 2
+                return prompt_embeds, prompt_embeds, prompt_attention_mask
+
+        class FakeRope:
+            def prepare_video_coords(self, batch_size, num_frames, height, width, device, fps):
+                return torch.zeros(batch_size, num_frames * height * width, 3, device=device)
+
+            def prepare_audio_coords(self, batch_size, num_frames, device):
+                return torch.zeros(batch_size, num_frames, 1, device=device)
+
+        class FakeTransformer:
+            def __init__(self):
+                self.config = SimpleNamespace(in_channels=2)
+                self.rope = FakeRope()
+                self.audio_rope = FakeRope()
+                self.calls = []
+
+            def prepare_encoder_attention_metadata(self, attention_mask, *, query_lengths):
+                return attention_mask
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                assert kwargs["hidden_states"].dtype == torch.bfloat16
+                assert kwargs["audio_hidden_states"].dtype == torch.bfloat16
+                assert kwargs["hidden_states"].shape == (2, 1, 2)
+                assert kwargs["audio_hidden_states"].shape == (2, 1, 2)
+                assert kwargs["encoder_hidden_states"].dtype == torch.bfloat16
+                return torch.zeros_like(kwargs["hidden_states"]), torch.zeros_like(kwargs["audio_hidden_states"])
+
+        class DummyProgress:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def update(self):
+                pass
+
+        pipe.scheduler = FakeScheduler()
+        pipe.connectors = FakeConnectors()
+        pipe.transformer = FakeTransformer()
+        object.__setattr__(pipe, "progress_bar", lambda total: DummyProgress())
+
+        def fake_encode_prompt(**kwargs):
+            return (
+                torch.ones(1, 1, 1, dtype=torch.bfloat16),
+                torch.ones(1, 1, dtype=torch.bool),
+                torch.zeros(1, 1, 1, dtype=torch.bfloat16),
+                torch.ones(1, 1, dtype=torch.bool),
+            )
+
+        object.__setattr__(pipe, "encode_prompt", fake_encode_prompt)
+
+        req = OmniDiffusionRequest(
+            prompts=[{"prompt": "prompt", "negative_prompt": "negative"}],
+            sampling_params=OmniDiffusionSamplingParams(
+                height=32,
+                width=32,
+                num_frames=1,
+                frame_rate=1.0,
+                num_inference_steps=1,
+                guidance_scale=4.0,
+                latents=torch.tensor([[[1.0, -2.0]]], dtype=torch.float32),
+                audio_latents=torch.tensor([[[0.5, 3.0]]], dtype=torch.float32),
+                output_type="latent",
+            ),
+            request_id="ltx23-single-rank-cfg-dtype-test",
+        )
+
+        pipe.forward(req)
+
+        assert len(pipe.transformer.calls) == 1
+
 
 class TestRegistryIntegration:
     """Verify all LTX-2.3 pipeline variants are registered."""

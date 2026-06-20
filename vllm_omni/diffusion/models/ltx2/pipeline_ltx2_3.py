@@ -1156,12 +1156,11 @@ class LTX23Pipeline(
                         do_true_cfg=self.do_classifier_free_guidance,
                     )
                 else:
-                    latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                    latent_model_input = latent_model_input.to(connector_prompt_embeds.dtype)
-                    audio_latent_model_input = (
-                        torch.cat([audio_latents] * 2) if self.do_classifier_free_guidance else audio_latents
-                    )
-                    audio_latent_model_input = audio_latent_model_input.to(connector_prompt_embeds.dtype)
+                    latent_model_input = latents.to(connector_prompt_embeds.dtype)
+                    audio_latent_model_input = audio_latents.to(connector_prompt_embeds.dtype)
+                    if self.do_classifier_free_guidance:
+                        latent_model_input = torch.cat([latent_model_input] * 2)
+                        audio_latent_model_input = torch.cat([audio_latent_model_input] * 2)
                     ts = t.expand(latent_model_input.shape[0])
 
                     with self._transformer_cache_context("cond_uncond"):
