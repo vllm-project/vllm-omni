@@ -156,6 +156,11 @@ _DIFFUSION_MODELS = {
         "pipeline_internvla_a1",
         "InternVLAA1Pipeline",
     ),
+    "Gr00tN1d7Pipeline": (
+        "gr00t",
+        "pipeline_gr00t",
+        "Gr00tN1d7Pipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",

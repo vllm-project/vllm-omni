@@ -195,12 +195,15 @@ curl -X POST http://localhost:8091/v1/videos/sync \
 
 ## Storage
 
-Set `VLLM_OMNI_STORAGE_PATH` to control where asynchronous video outputs are
+Set `VLLM_OMNI_SERVER_STORAGE__PATH` to control where asynchronous video outputs are
 stored:
 
 ```bash
-export VLLM_OMNI_STORAGE_PATH=/var/tmp/vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
 ```
+
+> `VLLM_OMNI_STORAGE_PATH` is deprecated and will be removed in a future release;
+> use `VLLM_OMNI_SERVER_STORAGE__PATH` instead.
 
 ## Model-Specific Examples
 

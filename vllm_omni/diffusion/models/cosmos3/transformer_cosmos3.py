@@ -18,6 +18,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from cache_dit import ForwardPattern
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
@@ -30,6 +31,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
@@ -963,6 +965,16 @@ class Cosmos3VFMTransformer(nn.Module):
     ``forward_context.sp_active`` at runtime and routes to the framework
     ``Attention`` layer (with Ulysses all-to-all) or plain SDPA accordingly.
     """
+
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        # Cosmos3 GEN blocks return only hidden_states.  Per-layer UND K/V
+        # conditioning uses the transformer's cache-dit fallback path.
+        block_forward_patterns={
+            "gen_layers": ForwardPattern.Pattern_3,
+        },
+        has_separate_cfg=True,
+        check_forward_pattern=False,
+    )
 
     _repeated_blocks = ["Cosmos3GenDecoderLayer"]
 

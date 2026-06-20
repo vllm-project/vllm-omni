@@ -1053,6 +1053,10 @@ class OmniDiffusionConfig:
                         self.model_class_name = "WanS2VPipeline"
                     self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
+                elif model_type == "Gr00tN1d7" or "Gr00tN1d7" in architectures:
+                    self.model_class_name = "Gr00tN1d7Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 elif model_type == "vla":
                     from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
