@@ -150,7 +150,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
         elif self.model_stage == "talker":
             multimodal_config.skip_mm_profiling = True
-            self.talker_mtp_graph_safe = True
             self.has_preprocess = True
             self.has_postprocess = True
             self.set_custom_preprocess(self.talker_preprocess)
