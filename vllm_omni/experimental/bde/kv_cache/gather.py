@@ -234,6 +234,13 @@ class BDEKVState:
             pool_write_chunk(kpool, vpool, k, v, sm)
 
     def commit_chunk(self) -> None:
+        """No-op for DreamZero (logs only).
+
+        The per-chunk advance already happened in :meth:`update_kv_cache`, which
+        calls ``adapter.on_chunk_committed()`` at layer 0 while allocating each
+        frame-chunk. This method exists so the pipeline's ``_kv_commit`` bridge has
+        a symmetric call; the resident window is retained across forwards.
+        """
         _log.info("BDE COMMIT (paged; resident window retained across forwards)")
 
     def close(self) -> None:

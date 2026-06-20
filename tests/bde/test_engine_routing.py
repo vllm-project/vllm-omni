@@ -13,16 +13,18 @@ from types import SimpleNamespace
 import pytest
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
+from vllm_omni.diffusion.data import (
+    OmniDiffusionConfig,
+    _bde_routing_enabled,
+    default_engine_backend_for_model,
+    resolve_default_engine_backend,
+)
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.experimental.bde.engine import (
     BDE_MODEL_RUNNER_CLS,
     BDEEngine,
     apply_bde_runner_default,
 )
-from vllm_omni.diffusion.data import (
-    OmniDiffusionConfig,
-    default_engine_backend_for_model,
-)
-from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 
 
 def _cfg(backend):
@@ -99,6 +101,36 @@ def test_dreamzero_default_routes_to_bde_engine():
     # to BDEEngine through the same dispatcher used by make_engine.
     backend = default_engine_backend_for_model("DreamZeroPipeline")
     assert DiffusionEngine.resolve_engine_class(_cfg(backend)) is BDEEngine
+
+
+# --- BDE routing is gated on BDE_KV_ENABLE (PR #4534 blast-radius review) ----
+
+
+def test_routing_enabled_reads_env(monkeypatch):
+    monkeypatch.setenv("BDE_KV_ENABLE", "1")
+    assert _bde_routing_enabled() is True
+    monkeypatch.delenv("BDE_KV_ENABLE", raising=False)
+    assert _bde_routing_enabled() is False
+
+
+def test_default_backend_applied_only_when_enabled(monkeypatch):
+    # DreamZero + unset ("default") backend: auto-route applies only with BDE on.
+    monkeypatch.setenv("BDE_KV_ENABLE", "1")
+    assert resolve_default_engine_backend("DreamZeroPipeline", "default") == "bde"
+    monkeypatch.delenv("BDE_KV_ENABLE", raising=False)
+    assert resolve_default_engine_backend("DreamZeroPipeline", "default") is None
+
+
+def test_explicit_backend_not_overridden_even_when_enabled(monkeypatch):
+    # An explicit engine_backend bypasses the auto-route gate entirely.
+    monkeypatch.setenv("BDE_KV_ENABLE", "1")
+    assert resolve_default_engine_backend("DreamZeroPipeline", "bde") is None
+    assert resolve_default_engine_backend("DreamZeroPipeline", "vllm_omni.experimental.bde.engine.BDEEngine") is None
+
+
+def test_non_bde_model_never_routed(monkeypatch):
+    monkeypatch.setenv("BDE_KV_ENABLE", "1")
+    assert resolve_default_engine_backend("WanS2VPipeline", "default") is None
 
 
 # --- BDE worker/runner wiring -----------------------------------------------

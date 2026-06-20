@@ -245,7 +245,15 @@ class BDEKVCache:
         return resident_block_ids(self.block_table(adapter), self.null_block_id)
 
     def commit_chunk(self, adapter: BDERequestAdapter) -> None:
-        """Advance after the chunk's K/V is written. Once per chunk, not per step."""
+        """Advance the adapter by one chunk after its K/V is written.
+
+        This is the standalone per-chunk advance used by the unit lifecycle and the
+        ``tests/bde`` suite. In the DreamZero production path the advance happens
+        elsewhere: :meth:`BDEKVState.update_kv_cache` (gather.py) calls
+        ``adapter.on_chunk_committed()`` directly as it allocates each frame-chunk,
+        and the pipeline's ``_kv_commit`` -> :meth:`BDEKVState.commit_chunk` is only
+        a no-op log. Call once per chunk, not per denoise step.
+        """
         _log.debug("BDE commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
         adapter.on_chunk_committed()
         _log.debug("BDE commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)

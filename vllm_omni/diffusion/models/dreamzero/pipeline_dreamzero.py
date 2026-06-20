@@ -161,9 +161,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         for i, block in enumerate(self.transformer.blocks):
             # The cross-attn forward caches text-only k/v — the image tokens
             # (first 257, prepended inside _forward_blocks via img_emb) are
-            # always recomputed.  project_kv for I2V strips those image tokens,
-            # but we are feeding raw projected text (no image prepend), so
-            # compute k/v directly from the full projected text.
+            # always recomputed.  Here we feed raw projected text (no image
+            # prepend), so we compute k/v directly from the full projected text,
+            # mirroring the cross-attn forward's own k/v projection.
             ca = block.cross_attn
             n, d = ca.tp_num_heads, ca.head_dim
             k = ca.norm_k(ca.k(projected)).unflatten(2, (n, d))

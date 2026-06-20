@@ -495,10 +495,41 @@ def default_engine_backend_for_model(model_class_name: str | None) -> str | None
     on the Block Diffusion Engine with engine-level KV cache management; returns
     ``None`` to keep the base ``DiffusionEngine``. Extend
     ``_BDE_ENGINE_MODEL_CLASSES`` as more AR-DiT models migrate onto BDE.
+
+    NOTE: this is the *pure* "what would this model pick" lookup. Whether it is
+    actually applied is gated by :func:`_bde_routing_enabled` at the call sites, so
+    a deploy that hasn't opted into BDE stays on the base engine.
     """
     if model_class_name in _BDE_ENGINE_MODEL_CLASSES:
         return "bde"
     return None
+
+
+def _bde_routing_enabled() -> bool:
+    """Whether to auto-route a BDE-eligible model onto the BDE engine/runner.
+
+    Gated on the same switch as BDE KV (``BDE_KV_ENABLE``, read by
+    ``resolve_bde_kv_config``): a deploy that hasn't opted into BDE KV stays on the
+    base ``DiffusionEngine``/runner, keeping the (still-unvalidated for the
+    production CFG-parallel + CUDA-graph + compile topology) BDE runner off the
+    default path. An explicit ``engine_backend`` selection bypasses this gate
+    entirely (it only governs the ``"default"`` -> per-model auto-route). (PR #4534)
+    """
+    return os.environ.get("BDE_KV_ENABLE") == "1"
+
+
+def resolve_default_engine_backend(model_class_name: str | None, current_backend: str | None) -> str | None:
+    """Engine backend to apply for an auto-routed model, or ``None`` to leave as-is.
+
+    Applies the per-model default (:func:`default_engine_backend_for_model`) only
+    when ``current_backend`` is the unset ``"default"`` sentinel *and* BDE routing
+    is opted in (:func:`_bde_routing_enabled`). Returns ``None`` otherwise, so an
+    explicit backend choice and BDE-off deploys both stay untouched. Shared by the
+    two routing sites (``__post_init__`` auto-detect and ``from_kwargs``).
+    """
+    if current_backend != "default" or not _bde_routing_enabled():
+        return None
+    return default_engine_backend_for_model(model_class_name)
 
 
 @dataclass
@@ -558,6 +589,11 @@ class OmniDiffusionConfig:
     # The worker uses it instead of the platform default when set; the BDE engine
     # sets it to BDEModelRunner. Unset -> platform default (existing behavior).
     diffusion_model_runner_cls: str | None = None
+    # DEFERRED (#4425 / RFC #4021 structured config): when rebasing onto the
+    # structured VllmOmniConfig, mirror engine_backend + diffusion_model_runner_cls
+    # into its DiffusionConfig (engine/runtime group) and parity test. enrich_config()
+    # there only copies fields present on DiffusionConfig, so without the mirror
+    # DreamZero's BDE routing silently drops on the structured-config path. (PR #4534)
 
     # HuggingFace specific parameters
     trust_remote_code: bool = False
@@ -1082,11 +1118,12 @@ class OmniDiffusionConfig:
                         self.set_tf_model_config(TransformerConfig())
                         self.update_multimodal_support()
                         # DreamZero is an AR-diffusion world model: route it to the
-                        # BDE engine (engine-level KV cache management) unless the
-                        # caller explicitly selected an engine backend.
-                        bde_default = default_engine_backend_for_model(self.model_class_name)
-                        if bde_default is not None and self.engine_backend == "default":
-                            self.engine_backend = bde_default
+                        # BDE engine (engine-level KV cache management) when BDE is
+                        # opted in (BDE_KV_ENABLE) and the caller did not explicitly
+                        # select an engine backend; otherwise stay on base.
+                        backend = resolve_default_engine_backend(self.model_class_name, self.engine_backend)
+                        if backend is not None:
+                            self.engine_backend = backend
                     else:
                         raise
                 elif architectures and len(architectures) == 1:
@@ -1160,11 +1197,11 @@ class OmniDiffusionConfig:
         instance = cls(**filtered_kwargs)
         # Route per-model engines after model_class_name is finalized. This covers
         # the explicit-model_class_name path (e.g. deploy configs) that the
-        # __post_init__ auto-detect branch does not reach.
-        if instance.engine_backend == "default":
-            backend = default_engine_backend_for_model(instance.model_class_name)
-            if backend is not None:
-                instance.engine_backend = backend
+        # __post_init__ auto-detect branch does not reach. Gated on BDE_KV_ENABLE
+        # so non-BDE deploys stay on the base DiffusionEngine (PR #4534 review).
+        backend = resolve_default_engine_backend(instance.model_class_name, instance.engine_backend)
+        if backend is not None:
+            instance.engine_backend = backend
         return instance
 
 

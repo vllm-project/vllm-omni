@@ -290,18 +290,6 @@ class WanT2VCrossAttention(nn.Module):
         x = self.o(x)
         return x
 
-    def project_kv(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project encoder hidden states to cross-attn K/V (for eager caching).
-
-        Returns ``(k, v)`` where each has shape
-        ``(B, text_len, tp_num_heads, head_dim)`` — the same tensors the
-        ``forward`` method would compute on first call.
-        """
-        n, d = self.tp_num_heads, self.head_dim
-        k = self.norm_k(self.k(context)).unflatten(2, (n, d))
-        v = self.v(context).unflatten(2, (n, d))
-        return k, v
-
 
 class WanI2VCrossAttention(nn.Module):
     """Image-to-video cross-attention (splits first 257 image tokens).
@@ -371,18 +359,6 @@ class WanI2VCrossAttention(nn.Module):
         x = x + img_x
         x = self.o(x)
         return x
-
-    def project_kv(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project encoder hidden states to cross-attn K/V for the text part only.
-
-        Image tokens (first 257) are *not* cached — they are always recomputed.
-        Returns ``(k, v)`` for the text tokens.
-        """
-        context = context[:, 257:]  # strip image tokens; cache text only
-        n, d = self.tp_num_heads, self.head_dim
-        k = self.norm_k(self.k(context)).unflatten(2, (n, d))
-        v = self.v(context).unflatten(2, (n, d))
-        return k, v
 
 
 WAN_CROSSATTENTION_CLASSES = {
