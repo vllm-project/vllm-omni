@@ -112,9 +112,9 @@ _REF_JOINT = np.array(
 )  # rows = step 0, step 4, step 39
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_gr00t_n1d7_openpi_online(omni_server) -> None:
     result = openpi_client.run_policy_session(
@@ -125,9 +125,9 @@ def test_gr00t_n1d7_openpi_online(omni_server) -> None:
     openpi_client.validate_session_result(result)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_gr00t_n1d7_openpi_precision(omni_server) -> None:
     """Assert actions match Isaac-GR00T reference (GR00T_NOISE_SEED=42, zero inputs)."""
