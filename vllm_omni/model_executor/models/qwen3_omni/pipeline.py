@@ -64,3 +64,30 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+
+# Thinker-only variant: multimodal understanding with text output. This is
+# the only pipeline that can serve thinker-only checkpoints such as
+# Qwen/Qwen3-Omni-30B-A3B-Thinking, whose config.json carries no
+# talker_config (the talker/code2wav stages of the full pipeline crash on
+# such checkpoints). Select it via ``pipeline: qwen3_omni_moe_thinker_only``
+# in a deploy YAML or ``--deploy-config qwen3_omni_moe_thinker_only``.
+QWEN3_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(
+    model_type="qwen3_omni_moe_thinker_only",
+    model_arch="Qwen3OmniMoeForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            hf_config_name="thinker_config",
+            engine_output_type="text",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)
