@@ -283,3 +283,48 @@ At the time this file was written, the local workspace also had unrelated untrac
 - `vLLM-Omni Feature Design Doc Concise.md`
 
 Do not accidentally add these to the PR unless the user explicitly asks for them.
+
+## Performance Benchmarks (Parallelism Matrix)
+
+Measured on this branch to compare TP / Ulysses-SP / CFG-parallel for DreamZero.
+
+### Setup
+- Model: `GEAR-Dreams/DreamZero-DROID` (14B, Wan2.1-I2V based), resolution 180×320, 4-frame AR chunks.
+- Hardware: NVIDIA A100-SXM4-80GB. Software: vLLM 0.22.0 (+cu129) / torch 2.11+cu129, driver 555.
+- Mode: **eager** (`enforce_eager=True`, forced by the offline export path), **step_cache disabled**,
+  batch 1, `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA`.
+- Workload: 1 prefill + 12 AR chunks; metric = steady-state mean per-chunk latency over chunks[2:].
+- Configs: `vllm_omni/deploy/dreamzero_{sp2,sp4,sp2_cfg2}.yaml` (SP/SP+CFG; the TP and TP×SP/TP×CFG
+  runs used ad-hoc configs not shipped here); harness `examples/offline_inference/dreamzero/bench_dreamzero.py`.
+
+### Results
+
+| config   | GPUs | parallelism    | load (s) | steady mean (ms) | p90 (ms) | chunks/s | vs TP2 |
+|----------|------|----------------|----------|------------------|----------|----------|--------|
+| tp2      | 2    | TP2            | 73       | 8269             | 8777     | 0.121    | 1.00x  |
+| sp2      | 2    | SP2 (ulysses2) | 75       | 8217             | 8648     | 0.122    | 1.01x  |
+| tp4      | 4    | TP4            | 92       | 6347             | 6600     | 0.158    | 1.30x  |
+| sp4      | 4    | SP4 (ulysses4) | 144      | 5527             | 5724     | 0.181    | 1.50x  |
+| tp2_sp2  | 4    | TP2 x SP2      | 111      | 6122             | 6342     | 0.163    | 1.35x  |
+| tp2_cfg2 | 4    | TP2 x CFG2     | 102      | 4998             | 5191     | 0.200    | 1.66x  |
+| sp2_cfg2 | 4    | SP2 x CFG2     | 152      | 4981             | 5149     | 0.201    | 1.66x  |
+
+### Takeaways
+- **2-GPU: SP2 ≈ TP2** (8.22 vs 8.27 s/chunk) — Ulysses SP is a no-regression alternative to TP.
+- **4-GPU single axis: SP4 (1.50x) > TP4 (1.30x)** — SP scales more efficiently (2→4 efficiency: SP 74%, TP 65%).
+- **CFG-parallel is the most efficient axis** — TP2xCFG2 and SP2xCFG2 both 1.66x (fastest); SP composes with CFG as well as TP.
+- TP2xSP2 (1.35x) sits between TP4 and SP4 → pure SP4 beats the TP/SP hybrid here.
+- **Load time**: TP shards weights (TP4 92 s) vs SP/CFG replicate the full 14B per rank (SP2xCFG2 152 s).
+
+### Notes on absolute latency
+These are **conservative** numbers: eager + step_cache-off were chosen so the matrix isolates the
+parallelism axis; they are not production speed.
+- A100 raw bf16 GEMM measured 238–265 TFLOPS (~80% of peak); SM utilization during generation was
+  bursty but low on average (mean ~18%) — eager-mode launch overhead starves the GPU, it is not compute-bound.
+- Enabling **step_cache alone** (TP2 + `cache_backend: step_cache`) cut per-chunk latency
+  **8269 → 3004 ms (2.75x)**. Production (step_cache + CUDA-graph where supported) is expected ~2.5–3x
+  faster than the table above, with the same relative ordering between strategies.
+
+### Environment caveat
+GPU index 3 on the benchmark node is hardware-faulty (CUDA OOM on any allocation despite reporting free);
+4-GPU runs were measured on physical GPUs 0,1,2,4. The committed configs use the standard `devices: "0,1,2,3"`.
