@@ -84,6 +84,7 @@ class BDEModelRunner(DiffusionModelRunner):
         max_model_len: int,
         available_bytes: int,
         cross_attn_length: int = 0,
+        cross_attn_img_length: int = 0,
     ) -> None:
         """Construct the BDEKVCache (preallocating GPU pools on ``self.device``).
 
@@ -101,6 +102,7 @@ class BDEModelRunner(DiffusionModelRunner):
             max_model_len=max_model_len,
             available_bytes=available_bytes,
             cross_attn_length=cross_attn_length,
+            cross_attn_img_length=cross_attn_img_length,
             device=self.device,
         )
         logger.info(
@@ -159,6 +161,9 @@ class BDEModelRunner(DiffusionModelRunner):
         # prepended in _forward_blocks are stripped inside the cross-attn
         # forward but are not part of the cached k/v).
         cross_attn_length = int(getattr(t, "text_len", 0))
+        # I2V image-token cross-attn length: the model splits context[:, :257] as the
+        # image tokens (the img_emb(clip_feature) output), caching k_img/v_img. T2V: 0.
+        cross_attn_img_length = 257 if getattr(t, "model_type", "t2v") == "i2v" else 0
 
         # Frame-granular paging: 1 block = 1 frame = frame_seqlen tokens, so the
         # resident window matches max_attention_size exactly (it need not be a whole
@@ -187,6 +192,7 @@ class BDEModelRunner(DiffusionModelRunner):
             max_model_len=1 << 20,
             available_bytes=free_bytes,
             cross_attn_length=cross_attn_length,
+            cross_attn_img_length=cross_attn_img_length,
         )
 
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:

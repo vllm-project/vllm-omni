@@ -50,6 +50,7 @@ class BDEKVCache:
         max_model_len: int,
         available_bytes: int,
         cross_attn_length: int = 0,
+        cross_attn_img_length: int = 0,
         device: torch.device | None = None,
     ) -> None:
         if not config.enable:
@@ -77,8 +78,15 @@ class BDEKVCache:
         # DreamZero I2V).  Both pools draw from the same GPU free memory but
         # the cross-attn pool is sized directly rather than via the block pool
         # budget (no eviction/chunk lifecycle needed).
+        self.cross_attn_img_length = cross_attn_img_length
         self._cross_k: list[torch.Tensor] = []
         self._cross_v: list[torch.Tensor] = []
+        # I2V image-token cross-attn pool. Like the text k/v, the image-token
+        # k_img/v_img are session-invariant (the conditioning image doesn't change),
+        # so they are cached once and read every denoise step — see
+        # WanI2VCrossAttention (#4154 caches these model-side too). Empty for T2V.
+        self._cross_k_img: list[torch.Tensor] = []
+        self._cross_v_img: list[torch.Tensor] = []
         if device is not None and cross_attn_length > 0:
             cross_shape = (2, cross_attn_length, num_kv_heads, head_size)
             bytes_per_element = dtype.itemsize
@@ -102,6 +110,16 @@ class BDEKVCache:
                 head_size,
                 cross_bytes / (1024 * 1024),
             )
+            if cross_attn_img_length > 0:
+                img_shape = (2, cross_attn_img_length, num_kv_heads, head_size)
+                for _ in range(num_layers):
+                    self._cross_k_img.append(torch.empty(img_shape, dtype=dtype, device=device))
+                    self._cross_v_img.append(torch.empty(img_shape, dtype=dtype, device=device))
+                _log.info(
+                    "BDE cross-attn IMG pool: %d layers × %d img-tok (I2V)",
+                    num_layers,
+                    cross_attn_img_length,
+                )
 
         self.spec = ChunkWindowSpec(
             block_size=block_size,
@@ -161,28 +179,40 @@ class BDEKVCache:
         is_negative: bool,
         k: torch.Tensor,
         v: torch.Tensor,
+        k_img: torch.Tensor | None = None,
+        v_img: torch.Tensor | None = None,
     ) -> None:
         """Write one layer's cross-attn K/V into the pool.
 
         ``k`` / ``v``: ``(B, text_len, tp_num_heads, head_dim)``; only batch-0
         is copied (B=1 for inference). The ``is_negative`` flag selects the
-        correct CFG branch slot.
+        correct CFG branch slot. ``k_img`` / ``v_img`` (I2V image tokens,
+        ``(B, 257, ...)``) are written when the image pool is allocated.
         """
         branch = 1 if is_negative else 0
         self._cross_k[layer_idx][branch].copy_(k[0])
         self._cross_v[layer_idx][branch].copy_(v[0])
+        if k_img is not None and self._cross_k_img:
+            self._cross_k_img[layer_idx][branch].copy_(k_img[0])
+            self._cross_v_img[layer_idx][branch].copy_(v_img[0])
 
     def read_cross_kv(self, layer_idx: int, is_negative: bool) -> dict:
         """Return a pool-backed cross-attn cache dict for one layer.
 
         The dict matches the ``{"is_init": True, "k": Tensor, "v": Tensor}``
         convention the cross-attention module expects — it reads from the pool
-        slice rather than from the lazy-initialised model-local dict.
+        slice rather than from the lazy-initialised model-local dict. For I2V,
+        ``k_img`` / ``v_img`` are added so the image-token cache (added by #4154)
+        reads from the pool too.
         """
         branch = 1 if is_negative else 0
         k = self._cross_k[layer_idx][branch].unsqueeze(0)  # (1, L, heads, dim)
         v = self._cross_v[layer_idx][branch].unsqueeze(0)
-        return {"is_init": True, "k": k, "v": v}
+        cache = {"is_init": True, "k": k, "v": v}
+        if self._cross_k_img:
+            cache["k_img"] = self._cross_k_img[layer_idx][branch].unsqueeze(0)
+            cache["v_img"] = self._cross_v_img[layer_idx][branch].unsqueeze(0)
+        return cache
 
     # -- request lifecycle ---------------------------------------------------
 

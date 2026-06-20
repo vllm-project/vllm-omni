@@ -134,25 +134,52 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             s.commit_chunk()
 
     def _kv_get_cross(self, state, is_negative):
-        """Cross-attn cache: always model-local (even under BDE).
+        """Cross-attn cache: pool-backed when BDE active, model-local otherwise.
 
-        Upstream #4154 extended the I2V cross-attn cache to also store image-token
-        ``k_img``/``v_img``; BDE's cross-attn pool only stores text ``k``/``v``, so a
-        pool-backed dict makes the I2V forward ``KeyError`` on ``'k_img'``. BDE
-        manages *self*-attn KV via the paged pool; cross-attn uses the model's own
-        cache (now image-token-caching), which BDE's reset path already clears.
+        The BDE pool caches both text ``k``/``v`` and (for I2V) the image-token
+        ``k_img``/``v_img`` added by #4154, so the returned dict satisfies the I2V
+        forward without recomputation.
         """
+        s = self._bde_kv_state
+        if s is not None:
+            return s.get_cross_kv_caches(is_negative, lambda: state.get_crossattn_caches(is_negative))
         return state.get_crossattn_caches(is_negative)
 
-    def _kv_populate_cross(self, context: torch.Tensor, is_negative: bool) -> None:
-        """No-op: cross-attn is model-local (see :meth:`_kv_get_cross`).
+    def _kv_populate_cross(self, context: torch.Tensor, clip_feature, is_negative: bool) -> None:
+        """Eagerly project cross-attn K/V for all layers into the BDE pool.
 
-        Kept as a stable hook. The BDE cross-attn pool is unused after upstream
-        #4154 added ``k_img``/``v_img`` caching, so there is nothing to eagerly
-        populate; the model's own cross-attn cache handles (and now caches) the
-        image-token projections.
+        Caches the session-invariant cross-attn projections once (re-run after a
+        window-boundary reset, when ``_cross_populated`` clears): the text ``k``/``v``
+        from ``text_embedding(context)``, and for I2V the image-token ``k_img``/
+        ``v_img`` from ``img_emb(clip_feature)`` (the 257 image tokens the forward
+        splits off, cached model-side by #4154). Must run after the image is encoded
+        so ``clip_feature`` is available.
         """
-        return
+        s = self._bde_kv_state
+        if s is None or s._cross_populated.get(is_negative, False):
+            return
+        projected = self.transformer.text_embedding(context)
+        img_ctx = None
+        if clip_feature is not None and getattr(self.transformer, "model_type", "t2v") == "i2v":
+            img_ctx = self.transformer.img_emb(clip_feature)
+        for i, block in enumerate(self.transformer.blocks):
+            ca = block.cross_attn
+            n, d = ca.tp_num_heads, ca.head_dim
+            k = ca.norm_k(ca.k(projected)).unflatten(2, (n, d))
+            v = ca.v(projected).unflatten(2, (n, d))
+            k_img = v_img = None
+            if img_ctx is not None:
+                k_img = ca.norm_k_img(ca.k_img(img_ctx)).unflatten(2, (n, d))
+                v_img = ca.v_img(img_ctx).unflatten(2, (n, d))
+            s.kv_cache.write_cross_kv(i, is_negative, k, v, k_img, v_img)
+        s._cross_populated[is_negative] = True
+        _log.info(
+            "BDE CROSS POPULATE [%s]: %d layers, text=%s img=%s",
+            "neg" if is_negative else "pos",
+            len(self.transformer.blocks),
+            tuple(context.shape),
+            None if img_ctx is None else tuple(img_ctx.shape),
+        )
 
     def _kv_reset(self, state, *, clear_video_latents: bool = True):
         """Reset model-local KV and, under BDE, the pooled session window too.
@@ -1094,14 +1121,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 neg_inputs["attention_mask"].to(device),
             )
 
-        # -- Eager cross-attn population (BDE only) ----------------------------
-        # Project encoder hidden states to K/V once and store in the BDE pool
-        # so every denoising step reads without recomputing.  Re-populated after
-        # each window-boundary reset (_cross_populated clears → guard re-triggers).
-        self._kv_populate_cross(prompt_embeds, is_negative=False)
-        if negative_prompt_embeds is not None:
-            self._kv_populate_cross(negative_prompt_embeds, is_negative=True)
-
         # Extract first/last frame for CLIP + VAE encoding
         if num_frames_raw == 4 or num_frames_raw == 9:
             image = videos[:, :, -1:].transpose(1, 2)
@@ -1117,6 +1136,14 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
             state.clip_feas = clip_feas.to(dtype=image.dtype)
             state.ys = ys.to(dtype=image.dtype)
+
+            # Eager cross-attn population (BDE only): cache text + image-token K/V
+            # into the pool now that the image is encoded (clip_feas available).
+            # Runs on the first forward of a session and after each window-boundary
+            # reset (current_start_frame returns to 0); _cross_populated guards re-entry.
+            self._kv_populate_cross(prompt_embeds, state.clip_feas, is_negative=False)
+            if negative_prompt_embeds is not None:
+                self._kv_populate_cross(negative_prompt_embeds, state.clip_feas, is_negative=True)
 
         if state.current_start_frame != 0:
             # Subsequent calls: encode current observation via VAE
