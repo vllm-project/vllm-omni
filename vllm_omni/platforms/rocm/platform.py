@@ -4,12 +4,12 @@
 import torch
 from vllm import envs
 from vllm.config import VllmConfig
-from vllm.config.kernel import IrOpPriorityConfig
 from vllm.logger import init_logger
 from vllm.platforms.rocm import RocmPlatform
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+from vllm_omni.platforms.kernel_compat import IrOpPriorityConfig
 from vllm_omni.platforms.rocm.patch import apply_patches
 
 logger = init_logger(__name__)

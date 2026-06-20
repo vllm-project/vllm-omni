@@ -190,6 +190,10 @@ class OmniModelConfig(ModelConfig):
         # to handle the case that each model stage has their own text config,
         # we need to draw the text config from the corresponding model stage.
         if self.hf_config_name is None:
+            if getattr(self.hf_config, "model_type", None) == "multi_modality":
+                language_config = getattr(self.hf_config, "language_config", None)
+                if language_config is not None:
+                    return language_config
             return get_hf_text_config(self.hf_config)
         try:
             # Try to get the stage-specific config (e.g., thinker_config, talker_config)

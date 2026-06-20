@@ -3,12 +3,12 @@
 
 import torch
 from vllm.config import VllmConfig
-from vllm.config.kernel import IrOpPriorityConfig
 from vllm.logger import init_logger
 from vllm.platforms.xpu import XPUPlatform
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+from vllm_omni.platforms.kernel_compat import IrOpPriorityConfig
 
 logger = init_logger(__name__)
 

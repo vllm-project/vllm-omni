@@ -3,7 +3,8 @@
 """Shared utilities for omni schedulers."""
 
 import numpy as np
-from vllm.v1.outputs import RoutedExpertsLists
+
+from vllm_omni.core.sched.routed_experts import RoutedExpertsLists
 
 
 def omni_routed_experts_for_request(routed_experts: RoutedExpertsLists, request) -> np.ndarray | None:

@@ -141,6 +141,16 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
+    "JanusPipeline": (
+        "deepseek_janus",
+        "pipeline_janus",
+        "JanusPipeline",
+    ),
+    "JanusVQDecodePipeline": (
+        "deepseek_janus",
+        "pipeline_janus_vq",
+        "JanusVQDecodePipeline",
+    ),
     "LancePipeline": (
         "lance",
         "pipeline_lance",
@@ -332,6 +342,8 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
+    "JanusPipeline",
+    "JanusVQDecodePipeline",
     "AudioXPipeline",
 }
 
@@ -518,6 +530,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
+    "JanusPipeline": "get_janus_post_process_func",
     "LancePipeline": "get_lance_post_process_func",
     "MingImagePipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",

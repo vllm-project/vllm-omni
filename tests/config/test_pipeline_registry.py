@@ -66,3 +66,9 @@ def test_register_resolver_requires_model_type(custom_resolver, clean_pipeline_r
     """Ensure that registering a custom resolver to OMNI_PIPELINES requires an explicit model_type."""
     with pytest.raises(ValueError):
         register_pipeline(custom_resolver)
+
+
+def test_deepseek_janus_pipelines_registered():
+    """Ensure DeepSeek Janus deploy topologies are registered."""
+    assert "deepseek_janus_single_stage" in OMNI_PIPELINES
+    assert "deepseek_janus_two_stage" in OMNI_PIPELINES

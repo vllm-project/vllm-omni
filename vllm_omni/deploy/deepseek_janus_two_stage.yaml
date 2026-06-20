@@ -1,0 +1,37 @@
+# DeepSeek Janus two-stage: AR image-token generation → VQ decode.
+#
+# Stage 0 (AR engine): ``JanusForImageGeneration`` via vLLM's GPU model runner.
+#   Gets ALL vLLM LLM optimisations automatically:
+#   - PagedAttention (block-based KV cache with paged memory management)
+#   - CUDA Graph via CUDAGraphWrapper (automatic capture/replay of decode steps)
+#   - Two-phase prefill/decode execution (via attention metadata)
+#   - Chunked prefill (split long prompts for memory efficiency)
+#   - Prefix caching (automatic KV cache reuse for shared prefixes)
+#   - FP8 KV cache quantization (reduced memory footprint)
+#   - FlashInfer/FA3 attention backends (auto-selected best kernel)
+#   - Tensor parallelism (multi-GPU model distribution)
+#   - Continuous batching (dynamic request scheduling)
+#
+# Stage 1 (diffusion engine): ``JanusVQDecodePipeline``
+#   VQ decoder only — converts image token grid → RGB image.
+#   Runs in <1ms, no AR steps.
+#
+# Example:
+#   vllm serve deepseek-ai/Janus-Pro-7B --omni \
+#       --deploy-config vllm_omni/deploy/deepseek_janus_two_stage.yaml
+
+pipeline: deepseek_janus_two_stage
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    devices: "0"
+    default_sampling_params:
+      temperature: 1.0
+      max_tokens: 576
+  - stage_id: 1
+    max_num_seqs: 4
+    devices: "0"
+    default_sampling_params:
+      seed: 52

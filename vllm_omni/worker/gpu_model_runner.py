@@ -37,7 +37,8 @@ from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.v1.outputs import RoutedExpertsLists
+
+    from vllm_omni.core.sched.routed_experts import RoutedExpertsLists
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
     xgr_torch_compile = LazyLoader(
@@ -127,7 +128,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         Returns RoutedExpertsLists (batch-level, with slot_mapping) so that
         downstream schedulers can use slot_mapping to map back to requests.
         """
-        from vllm.v1.outputs import RoutedExpertsLists
+        from vllm_omni.core.sched.routed_experts import RoutedExpertsLists
 
         if not self.routed_experts_initialized:
             return None
