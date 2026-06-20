@@ -672,7 +672,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if model_stage in _OMNIVOICE_TTS_MODEL_STAGES:
             return "omnivoice"
         if model_stage in _COVO_AUDIO_MODEL_STAGES:
-            model_arch = getattr(self._tts_stage.engine_args, "model_arch", None)
             if model_arch and "CovoAudio" in model_arch:
                 return "covo_audio"
         if model_stage in _VOXCPM2_TTS_MODEL_STAGES:

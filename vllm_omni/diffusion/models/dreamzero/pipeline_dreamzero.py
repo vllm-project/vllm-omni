@@ -23,6 +23,10 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.cache.stepcache import (
+    get_stepcache_state,
+    is_stepcache_active,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
     DistributedAutoencoderKLWan,
@@ -54,10 +58,6 @@ from vllm_omni.platforms import current_omni_platform
 logger = logging.getLogger(__name__)
 _log = logger
 MAX_DREAMZERO_SESSIONS = 64
-
-
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 
 
 class VideoActionScheduler:
@@ -134,57 +134,36 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             s.commit_chunk()
 
     def _kv_get_cross(self, state, is_negative):
-        """Cross-attn cache: pool-backed when BDE active, model-local otherwise."""
-        s = self._bde_kv_state
-        if s is not None:
-            return s.get_cross_kv_caches(is_negative, lambda: state.get_crossattn_caches(is_negative))
+        """Cross-attn cache: always model-local (even under BDE).
+
+        Upstream #4154 extended the I2V cross-attn cache to also store image-token
+        ``k_img``/``v_img``; BDE's cross-attn pool only stores text ``k``/``v``, so a
+        pool-backed dict makes the I2V forward ``KeyError`` on ``'k_img'``. BDE
+        manages *self*-attn KV via the paged pool; cross-attn uses the model's own
+        cache (now image-token-caching), which BDE's reset path already clears.
+        """
         return state.get_crossattn_caches(is_negative)
 
     def _kv_populate_cross(self, context: torch.Tensor, is_negative: bool) -> None:
-        """Eagerly project cross-attn K/V for all layers into the BDE pool.
+        """No-op: cross-attn is model-local (see :meth:`_kv_get_cross`).
 
-        Called once per branch after text encoding (before the first denoising
-        step), and again after each window-boundary reset.  The attention
-        forward never writes to the cross-attn pool — it only reads.
-
-        The raw encoder output is projected through ``text_embedding`` first
-        so it matches the shape the cross-attn linear layers expect (the same
-        projection ``_forward_blocks`` applies internally).
+        Kept as a stable hook. The BDE cross-attn pool is unused after upstream
+        #4154 added ``k_img``/``v_img`` caching, so there is nothing to eagerly
+        populate; the model's own cross-attn cache handles (and now caches) the
+        image-token projections.
         """
-        s = self._bde_kv_state
-        if s is None:
-            return
-        # Only populate once per branch per session — reset clears this flag.
-        if s._cross_populated.get(is_negative, False):
-            return
-        projected = self.transformer.text_embedding(context)
-        for i, block in enumerate(self.transformer.blocks):
-            # The cross-attn forward caches text-only k/v — the image tokens
-            # (first 257, prepended inside _forward_blocks via img_emb) are
-            # always recomputed.  Here we feed raw projected text (no image
-            # prepend), so we compute k/v directly from the full projected text,
-            # mirroring the cross-attn forward's own k/v projection.
-            ca = block.cross_attn
-            n, d = ca.tp_num_heads, ca.head_dim
-            k = ca.norm_k(ca.k(projected)).unflatten(2, (n, d))
-            v = ca.v(projected).unflatten(2, (n, d))
-            s.kv_cache.write_cross_kv(i, is_negative, k, v)
-        s._cross_populated[is_negative] = True
-        _log.info(
-            "BDE CROSS POPULATE [%s]: %d layers, context=%s",
-            "neg" if is_negative else "pos",
-            len(self.transformer.blocks),
-            tuple(context.shape),
-        )
+        return
 
-    def _kv_reset(self, state):
+    def _kv_reset(self, state, *, clear_video_latents: bool = True):
         """Reset model-local KV and, under BDE, the pooled session window too.
 
         DreamZero resets its sliding window at the attention-window boundary; the
         BDE pool must drop the same window so the next forward starts fresh and
-        stays parity-exact with the model-local path.
+        stays parity-exact with the model-local path. ``clear_video_latents=False``
+        mirrors ``state.reset_inference_state()`` (window-boundary "inference" reset),
+        which keeps the accumulated video latents for export.
         """
-        state.reset()
+        state.reset(clear_video_latents=clear_video_latents)
         s = self._bde_kv_state
         if s is not None:
             s.reset()
@@ -297,6 +276,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self._max_session_states = MAX_DREAMZERO_SESSIONS
         self.state = self._get_or_create_state("default")
 
+        # DiT step cache is configured by StepCacheBackend
+        # (cache_backend="step_cache") via pipeline._stepcache_config.
+
         # Keep runtime inference settings separate from the training-time config.
         self.num_inference_steps: int = model_config.get(
             "num_inference_steps",
@@ -398,6 +380,27 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def predict_noise(self, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         """Call CausalWanModel, return (video_pred, action_pred)."""
+        video_pred, action_pred = self._predict_noise_eager(kwargs)
+
+        if is_stepcache_active(self):
+            video_pred = video_pred.clone()
+            if action_pred is not None:
+                action_pred = action_pred.clone()
+
+        if action_pred is None:
+            batch_size = kwargs["hidden_states"].shape[0]
+            action_pred = torch.empty(
+                batch_size,
+                0,
+                self.transformer.action_dim,
+                device=video_pred.device,
+                dtype=video_pred.dtype,
+            )
+        return (video_pred, action_pred)
+
+    def _predict_noise_eager(self, kwargs: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Eager DiT forward; also handles KV-cache write-back on prefill."""
+        self._cudagraph_mark_step_begin()
         video_pred, action_pred, updated_kv_caches = self.transformer(
             x=kwargs["hidden_states"],
             timestep=kwargs["timestep_video"],
@@ -428,19 +431,118 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 self._kv_update(state, i, kv, is_neg, kwargs.get("seq_len"))
             self._kv_commit()
 
-        video_pred = video_pred.clone()
-        if action_pred is not None:
-            action_pred = action_pred.clone()
-        else:
-            batch_size = kwargs["hidden_states"].shape[0]
-            action_pred = torch.empty(
-                batch_size,
-                0,
-                self.transformer.action_dim,
-                device=video_pred.device,
-                dtype=video_pred.dtype,
-            )  # CFG-parallel-safe dummy action pred
-        return (video_pred, action_pred)
+        return video_pred, action_pred
+
+    # -----------------------------------------------------------------------
+    # torch.compile setup (paper D.2 extended: encoders + VAE + DiT blocks)
+    # -----------------------------------------------------------------------
+
+    def setup_compile(self) -> None:
+        """Compile DreamZero encoders, VAE, and per-block DiT for inference.
+
+        Paper D.2 uses ``mode=reduce-overhead``, ``fullgraph=True``, ``dynamic=False``
+        on text/image/VAE and DiT. VAE decode uses a tensor feat_cache patch and
+        compiles ``decoder.forward`` (not ``_decode``, which has a Python frame loop).
+        DiT blocks use per-block ``fullgraph=True``.
+        """
+        if not torch.cuda.is_available():
+            logger.info("DreamZero setup_compile skipped: CUDA not available.")
+            return
+
+        from vllm_omni.diffusion.models.dreamzero.wan_vae_feat_cache_patch import (
+            apply_wan_vae_feat_cache_tensor_patch,
+        )
+
+        apply_wan_vae_feat_cache_tensor_patch()
+
+        compile_ro = {"mode": "reduce-overhead", "fullgraph": True, "dynamic": False}
+        # DiT blocks: default avoids CUDAGraph overwrite on modulation tensors; encoders use reduce-overhead.
+        dit_compile = {"mode": "default", "fullgraph": True, "dynamic": False}
+
+        logger.info(
+            "DreamZero: torch.compile text/image/VAE encode + per-block DiT (encoders reduce-overhead, DiT default)."
+        )
+
+        try:
+            self.text_encoder.forward = torch.compile(self.text_encoder.forward, **compile_ro)
+        except Exception as exc:
+            logger.warning("DreamZero: text_encoder compile failed (%s); skipping.", exc)
+
+        try:
+            self.image_encoder.model.visual.forward = torch.compile(
+                self.image_encoder.model.visual.forward,
+                **compile_ro,
+            )
+        except Exception as exc:
+            logger.warning("DreamZero: image_encoder compile failed (%s); skipping.", exc)
+
+        try:
+            self.vae.encode = torch.compile(self.vae.encode, **compile_ro)
+        except Exception as exc:
+            logger.warning("DreamZero: vae.encode compile failed (%s); skipping.", exc)
+
+        compiled_blocks = 0
+        for block in self.transformer.blocks:
+            try:
+                block.forward = torch.compile(block.forward, **dit_compile)
+                compiled_blocks += 1
+            except Exception as exc:
+                logger.warning(
+                    "DreamZero: transformer block %d compile failed (%s); leaving remaining eager.",
+                    compiled_blocks,
+                    exc,
+                )
+                break
+        if compiled_blocks:
+            logger.info(
+                "DreamZero: compiled %d/%d transformer blocks.",
+                compiled_blocks,
+                len(self.transformer.blocks),
+            )
+
+        self.warmup_compile()
+
+    def warmup_compile(self) -> None:
+        """Warm up compiled text/image/VAE paths before timed inference."""
+        if not torch.cuda.is_available():
+            return
+
+        device = next(self.text_encoder.parameters()).device
+        with torch.inference_mode():
+            try:
+                text_tokens = torch.zeros(1, 16, dtype=torch.long, device=device)
+                attention_mask = torch.ones_like(text_tokens)
+                self._encode_text(text_tokens, attention_mask)
+            except Exception as exc:
+                logger.warning("DreamZero compile warmup (text_encoder) skipped: %s", exc)
+
+            try:
+                image = torch.zeros(1, 1, 3, 180, 320, dtype=torch.bfloat16, device=device)
+                self._encode_image(image, self.num_frames, 180, 320)
+            except Exception as exc:
+                logger.warning("DreamZero compile warmup (image_encoder) skipped: %s", exc)
+
+            try:
+                latent_h, latent_w = 180 // 8, 320 // 8
+                dummy_latent = torch.zeros(
+                    1,
+                    16,
+                    self.num_frame_per_block,
+                    latent_h * 2,
+                    latent_w * 2,
+                    dtype=self.vae.dtype,
+                    device=device,
+                )
+                mean = self.vae_latents_mean.to(device=device, dtype=self.vae.dtype)
+                inv_std = self.vae_latents_inv_std.to(device=device, dtype=self.vae.dtype)
+                dummy_latent_denorm = dummy_latent / inv_std + mean
+                self._cudagraph_mark_step_begin()
+                self.vae.decode(dummy_latent_denorm, return_dict=False)
+            except Exception as exc:
+                logger.warning("DreamZero compile warmup (vae decode) skipped: %s", exc)
+
+        torch.accelerator.synchronize(device)
+        logger.info("DreamZero compile warmup finished (text / image / vae decode).")
 
     def combine_cfg_noise(
         self,
@@ -489,12 +591,20 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             videos = videos.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
         return videos.to(dtype=torch.bfloat16)
 
+    @staticmethod
+    def _cudagraph_mark_step_begin() -> None:
+        try:
+            torch.compiler.cudagraph_mark_step_begin()
+        except Exception:
+            pass
+
     # -----------------------------------------------------------------------
     # Text encoding
     # -----------------------------------------------------------------------
 
     def _encode_text(self, text_tokens: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Encode text prompt via UMT5."""
+        self._cudagraph_mark_step_begin()
         seq_lens = attention_mask.gt(0).sum(dim=1).long()
         prompt_emb = self.text_encoder(
             text_tokens,
@@ -523,6 +633,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         batch_size = image.shape[0]
 
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=device.type):
+            self._cudagraph_mark_step_begin()
             clip_context = self.image_encoder.encode_image(image)
 
             msk = torch.ones(batch_size, num_frames, height // 8, width // 8, device=device)
@@ -570,7 +681,22 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         inv_std = self.vae_latents_inv_std.to(device=vae_device, dtype=vae_dtype)
         latents = latents / inv_std + mean
         with torch.no_grad():
+            self._cudagraph_mark_step_begin()
             return self.vae.decode(latents, return_dict=False)[0]
+
+    def decode_accumulated_video_latents(self, session_id: str | None = None) -> torch.Tensor:
+        """Decode all AR-chunk latents accumulated for ``session_id``."""
+        state = self._get_or_create_state(session_id)
+        latents = state.get_concatenated_video_latents()
+        if latents is None:
+            session_key = str(session_id or "default")
+            raise RuntimeError(f"No accumulated video latents for session {session_key!r}.")
+        return self.decode_video_latents(latents)
+
+    def clear_accumulated_video_latents(self, session_id: str | None = None) -> None:
+        """Clear accumulated video latents for ``session_id`` without resetting KV state."""
+        state = self._get_or_create_state(session_id)
+        state.clear_video_latents()
 
     # -----------------------------------------------------------------------
     # KV cache prefill
@@ -737,6 +863,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         noisy_input = video_latents
         noisy_input_action = action_latents
+        # ---- step_cache (StepCacheBackend / dreamzero.git) ----
+        _cached_flow_pred: torch.Tensor | None = None
+        _cached_flow_pred_action: torch.Tensor | None = None
+        _prev_predictions: list[tuple[torch.Tensor]] = []
+        _step_cache = get_stepcache_state(self) if is_stepcache_active(self) else None
+
         for index in range(len(timesteps_video)):
             video_timestep = timesteps_video[index]
             action_timestep = timesteps_action[index]
@@ -765,46 +897,58 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             else:
                 y = state.ys[:, :, -self.num_frame_per_block :]
 
-            positive_kwargs = dict(
-                hidden_states=noisy_input.transpose(1, 2),
-                timestep_video=timestep,
-                encoder_hidden_states=prompt_embeds,
-                kv_cache=self._kv_get(state, False),
-                crossattn_cache=self._kv_get_cross(state, False),
-                y=y,
-                clip_feature=state.clip_feas,
-                action=noisy_input_action,
-                timestep_action=timestep_action,
-                is_negative=False,
-                **common_kwargs,
-            )
-
-            # Negative (uncond) kwargs
-            if do_true_cfg and negative_prompt_embeds is not None:
-                negative_kwargs = dict(
+            run_dit = _step_cache is None or _step_cache.should_run_step(_prev_predictions)
+            if run_dit:
+                positive_kwargs = dict(
                     hidden_states=noisy_input.transpose(1, 2),
                     timestep_video=timestep,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    kv_cache=self._kv_get(state, True),
-                    crossattn_cache=self._kv_get_cross(state, True),
+                    encoder_hidden_states=prompt_embeds,
+                    kv_cache=self._kv_get(state, False),
+                    crossattn_cache=self._kv_get_cross(state, False),
                     y=y,
                     clip_feature=state.clip_feas,
                     action=noisy_input_action,
                     timestep_action=timestep_action,
-                    is_negative=True,
+                    is_negative=False,
                     **common_kwargs,
                 )
-            else:
-                negative_kwargs = None
 
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                do_true_cfg=do_true_cfg,
-                true_cfg_scale=self.cfg_scale,
-                cfg_normalize=False,
-            )
-            flow_pred, flow_pred_action = noise_pred
+                if do_true_cfg and negative_prompt_embeds is not None:
+                    negative_kwargs = dict(
+                        hidden_states=noisy_input.transpose(1, 2),
+                        timestep_video=timestep,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        kv_cache=self._kv_get(state, True),
+                        crossattn_cache=self._kv_get_cross(state, True),
+                        y=y,
+                        clip_feature=state.clip_feas,
+                        action=noisy_input_action,
+                        timestep_action=timestep_action,
+                        is_negative=True,
+                        **common_kwargs,
+                    )
+                else:
+                    negative_kwargs = None
+
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    do_true_cfg=do_true_cfg,
+                    true_cfg_scale=self.cfg_scale,
+                    cfg_normalize=False,
+                )
+                flow_pred, flow_pred_action = noise_pred
+                _cached_flow_pred = flow_pred
+                _cached_flow_pred_action = flow_pred_action
+
+                _prev_predictions.append((flow_pred,))
+                if _step_cache is not None:
+                    _step_cache.trim_history(_prev_predictions)
+            else:
+                # Reuse previous prediction (DiT step-skipping cache).
+                assert _cached_flow_pred is not None, "DiT cache: no cached prediction available for step skip."
+                flow_pred = _cached_flow_pred
+                flow_pred_action = _cached_flow_pred_action
 
             latents = (noisy_input, noisy_input_action)
             t = (video_timestep, action_timestep)
@@ -913,9 +1057,17 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # on the next inference request after websocket reset/session switch.
         if extra_args.get("reset", False):
             self._kv_reset(state)
-        # Auto-reset based on model state (before accumulation)
-        if state.should_reset(text_tokens, 0, self.transformer.local_attn_size):
-            self._kv_reset(state)
+        else:
+            # Auto-reset based on model state (before accumulation). Both a "session"
+            # reset and an "inference" (window-boundary) reset clear the model-local
+            # KV window, so route both through _kv_reset to drop the BDE pool window
+            # too and stay parity-exact; "inference" keeps the accumulated video
+            # latents (reset_inference_state == reset(clear_video_latents=False)).
+            reset_reason = state.reset_reason(text_tokens, 0, self.transformer.local_attn_size)
+            if reset_reason == "session":
+                self._kv_reset(state)
+            elif reset_reason == "inference":
+                self._kv_reset(state, clear_video_latents=False)
         state.language = text_tokens
 
         # Frame accumulation: stitched single frame -> multi-frame video
@@ -1069,7 +1221,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             video_out = torch.cat([image, video_out], dim=1)
         state.current_start_frame += self.num_frame_per_block
 
-        # q99 denorm: [-1,1] -> real values
+        state.append_video_latents(video_out)
+
+        # q99 denorm: [-1,1] → real values
         action_out = self._denormalize_action(action_out.float(), embodiment_name)
 
         # Relative -> absolute: only for relative_action_keys (joint_position only)
@@ -1214,10 +1368,27 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     .replace("img_emb.proj.3.", "img_emb.fc2.")
                     .replace("img_emb.proj.4.", "img_emb.norm2.")
                 )
+
+                # Self-attn q/k/v are fused into a single QKVParallelLinear; route
+                # each separate checkpoint weight/bias to the packed `qkv` param
+                # with its shard id. cross_attn keeps separate q/k/v (q from x,
+                # k/v from context — not fusible), so it is left untouched here.
+                qkv_shard_id: str | None = None
+                for shard_id in ("q", "k", "v"):
+                    needle = f".self_attn.{shard_id}."
+                    if needle in new_name:
+                        new_name = new_name.replace(needle, ".self_attn.qkv.")
+                        qkv_shard_id = shard_id
+                        break
+
                 if new_name in params:
                     param = params[new_name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, tensor)
+                    if qkv_shard_id is not None:
+                        # QKVParallelLinear.weight_loader needs the shard id.
+                        param.weight_loader(param, tensor, qkv_shard_id)
+                    else:
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, tensor)
                     loaded.add(new_name)
                 elif new_name in buffers:
                     buffers[new_name].data.copy_(tensor)

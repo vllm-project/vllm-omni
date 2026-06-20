@@ -41,8 +41,13 @@ def main() -> None:
     ap.add_argument("--timing", type=Path, default=None)
     args = ap.parse_args()
 
-    _, base = E._build_observations(args.video_dir, prompt=args.prompt, session_id=args.session_id)
-    observations = [base[0]] + [base[1]] * args.num_chunks
+    _, observations = E._build_observations(
+        args.video_dir,
+        prompt=args.prompt,
+        session_id=args.session_id,
+        num_chunks=args.num_chunks,
+        repeat_chunk_observations=True,
+    )
     n = len(observations)
     print(
         f"[perf:{args.tag}] {n} forwards (1 prefill + {args.num_chunks} chunk) "
