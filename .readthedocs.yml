@@ -8,6 +8,10 @@ build:
   tools:
     python: "3.12"
   jobs:
+    pre_install:
+      # Avoid pulling CUDA wheels when RTD installs the project for docs
+      # generation. The docs build only needs torch for imports.
+      - python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
     post_checkout:
       - git fetch --unshallow || true
     pre_install:
