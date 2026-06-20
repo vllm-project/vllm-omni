@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from cache_dit import ForwardPattern
 from transformers.cache_utils import DynamicCache
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -30,6 +31,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig, SensenovaCachedAdapter
 
 
 @dataclass
@@ -606,6 +608,14 @@ class SenseNovaU1DecoderLayer(nn.Module):
 
 
 class SenseNovaU1Model(nn.Module):
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "layers": ForwardPattern.Pattern_3,
+        },
+        has_separate_cfg=True,
+        cached_adapter_cls=SensenovaCachedAdapter,
+    )
+
     def __init__(self, config, quant_config=None, prefix: str = ""):
         super().__init__()
         self.config = config

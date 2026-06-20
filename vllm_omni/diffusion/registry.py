@@ -156,6 +156,11 @@ _DIFFUSION_MODELS = {
         "pipeline_internvla_a1",
         "InternVLAA1Pipeline",
     ),
+    "Gr00tN1d7Pipeline": (
+        "gr00t",
+        "pipeline_gr00t",
+        "Gr00tN1d7Pipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
@@ -285,6 +290,11 @@ _DIFFUSION_MODELS = {
         "dreamzero",
         "pipeline_dreamzero",
         "DreamZeroPipeline",
+    ),
+    "StableDiffusionXLPipeline": (
+        "sdxl",
+        "pipeline_sdxl",
+        "StableDiffusionXLPipeline",
     ),
 }
 
@@ -510,6 +520,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
+    "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
 }
 
 _DIFFUSION_ACTION_POST_PROCESS_FUNCS = {

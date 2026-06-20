@@ -556,6 +556,10 @@ def benchmark_params(request, diffusion_server):
 # ---------------------------------------------------------------------------
 
 
+_STAGE_METRICS_ENDPOINTS = {"/v1/chat/completions"}
+_DIFFUSION_PIPELINE_PROFILER_ARG = "enable-diffusion-pipeline-profiler"
+
+
 def run_benchmark(
     host: str,
     port: int,
@@ -607,6 +611,11 @@ def run_benchmark(
         "--output-file",
         str(tmp_result_file),
     ]
+
+    serve_args_dict = (server_cfg or {}).get("serve_args_dict")
+    profiler_enabled = isinstance(serve_args_dict, dict) and bool(serve_args_dict.get(_DIFFUSION_PIPELINE_PROFILER_ARG))
+    if endpoint in _STAGE_METRICS_ENDPOINTS and profiler_enabled:
+        cmd.append("--return-stage-metrics")
 
     for key, value in params.items():
         if key in exclude_keys or value is None:

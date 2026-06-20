@@ -25,10 +25,24 @@ _OMNI_RUNNER_PARAM = (
     },
 )
 
+_OMNI_RUNNER_PARAM_OFFLOAD = (
+    MODEL,
+    None,
+    {
+        "init_timeout": 1200,
+        "tensor_parallel_size": 2,
+        "enable_cpu_offload": True,
+    },
+)
+
 pytestmark = [
     pytest.mark.full_model,
     pytest.mark.diffusion,
-    pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
+    pytest.mark.parametrize(
+        "omni_runner",
+        [_OMNI_RUNNER_PARAM, _OMNI_RUNNER_PARAM_OFFLOAD],
+        indirect=True,
+    ),
 ]
 
 _SKIP_ISSUE_3236 = pytest.mark.skip(

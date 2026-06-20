@@ -12,10 +12,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _MODEL = "test-model"
 
 _PIPELINE_METRICS = [
-    "vllm:omni_num_requests_running",
-    "vllm:omni_num_requests_waiting",
-    "vllm:omni_requests_success",
-    "vllm:omni_e2e_request_latency_s",
+    "vllm_omni:num_requests_running",
+    "vllm_omni:num_requests_waiting",
+    "vllm_omni:requests_success",
+    "vllm_omni:e2e_request_latency_s",
 ]
 
 
@@ -58,32 +58,32 @@ class TestMetricObservation:
         # Per-reason buckets sourced from the merged completion Counter.
         stop = _sample_value(
             scrape_output,
-            f'vllm:omni_requests_success_total{{finished_reason="stop",model_name="{_MODEL}"}}',
+            f'vllm_omni:requests_success_total{{finished_reason="stop",model_name="{_MODEL}"}}',
         )
         assert stop == 2.0
 
         length = _sample_value(
             scrape_output,
-            f'vllm:omni_requests_success_total{{finished_reason="length",model_name="{_MODEL}"}}',
+            f'vllm_omni:requests_success_total{{finished_reason="length",model_name="{_MODEL}"}}',
         )
         assert length == 1.0
 
         abort = _sample_value(
             scrape_output,
-            f'vllm:omni_requests_success_total{{finished_reason="abort",model_name="{_MODEL}"}}',
+            f'vllm_omni:requests_success_total{{finished_reason="abort",model_name="{_MODEL}"}}',
         )
         assert abort == 1.0
 
     def test_gauge_values(self, scrape_output: str) -> None:
         running = _sample_value(
             scrape_output,
-            f'vllm:omni_num_requests_running{{model_name="{_MODEL}"}}',
+            f'vllm_omni:num_requests_running{{model_name="{_MODEL}"}}',
         )
         assert running == 5.0
 
         waiting = _sample_value(
             scrape_output,
-            f'vllm:omni_num_requests_waiting{{model_name="{_MODEL}"}}',
+            f'vllm_omni:num_requests_waiting{{model_name="{_MODEL}"}}',
         )
         assert waiting == 2.0
 
@@ -93,7 +93,7 @@ class TestMetricObservation:
         # observing the latency histogram, so the count stays at 3.
         e2e_count = _sample_value(
             scrape_output,
-            f'vllm:omni_e2e_request_latency_s_count{{model_name="{_MODEL}"}}',
+            f'vllm_omni:e2e_request_latency_s_count{{model_name="{_MODEL}"}}',
         )
         assert e2e_count == 3.0
 
@@ -110,8 +110,8 @@ class TestLabelCorrectness:
     def test_no_legacy_seconds_or_ms_families(self, scrape_output: str) -> None:
         # Renamed: *_time_ms → *_s; *_time_seconds dropped.
         for legacy in (
-            "vllm:omni_request_queue_time_seconds",
-            "vllm:omni_e2e_request_latency_seconds",
+            "vllm_omni:request_queue_time_seconds",
+            "vllm_omni:e2e_request_latency_seconds",
         ):
             assert legacy not in scrape_output, f"legacy family {legacy} still registered"
 
@@ -170,8 +170,8 @@ class TestRequestLifecycleGauges:
         assert obj.engine._running_counter.value == 0
         assert len(obj.request_states) == 0
         out = generate_latest(registry).decode()
-        assert _sample_value(out, 'vllm:omni_num_requests_running{model_name="lifecycle-test"}') == 0.0
-        assert _sample_value(out, 'vllm:omni_num_requests_waiting{model_name="lifecycle-test"}') == 0.0
+        assert _sample_value(out, 'vllm_omni:num_requests_running{model_name="lifecycle-test"}') == 0.0
+        assert _sample_value(out, 'vllm_omni:num_requests_waiting{model_name="lifecycle-test"}') == 0.0
 
     def test_gauges_reflect_remaining_requests_after_one_completes(self, registry: CollectorRegistry) -> None:
         from types import SimpleNamespace
@@ -196,5 +196,5 @@ class TestRequestLifecycleGauges:
         obj._log_summary_and_cleanup("req-1")
 
         out = generate_latest(registry).decode()
-        assert _sample_value(out, 'vllm:omni_num_requests_running{model_name="lifecycle-test-2"}') == 1.0
-        assert _sample_value(out, 'vllm:omni_num_requests_waiting{model_name="lifecycle-test-2"}') == 0.0
+        assert _sample_value(out, 'vllm_omni:num_requests_running{model_name="lifecycle-test-2"}') == 1.0
+        assert _sample_value(out, 'vllm_omni:num_requests_waiting{model_name="lifecycle-test-2"}') == 0.0

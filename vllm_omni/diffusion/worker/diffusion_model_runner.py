@@ -168,8 +168,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
             if current_omni_platform.supports_torch_inductor():
-                self._compile_transformer("transformer")
-                self._compile_transformer("transformer_2")
+                if hasattr(self.pipeline, "setup_compile"):
+                    try:
+                        self.pipeline.setup_compile()
+                    except Exception as exc:
+                        logger.warning(
+                            "Model runner: setup_compile() failed (%s); running without compile.",
+                            exc,
+                        )
+                else:
+                    self._compile_transformer("transformer")
+                    self._compile_transformer("transformer_2")
             else:
                 logger.warning(
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
@@ -306,8 +315,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 # num_inference_steps at all (i.e., just resets state and clears
                 # stale residuals).
                 num_inference_steps = req.sampling_params.num_inference_steps
-                if self.od_config.cache_backend == "tea_cache" and num_inference_steps is None:
-                    num_inference_steps = 0
+                if num_inference_steps is None and self.od_config.cache_backend in (
+                    "tea_cache",
+                    "step_cache",
+                ):
+                    # TeaCache refresh ignores the value; step_cache refresh is a
+                    # no-op (per-chunk state resets in the denoise loop). DreamZero often
+                    # leaves sampling_params.num_inference_steps unset and uses the
+                    # pipeline default instead.
+                    num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
 
                 if num_inference_steps is not None:
                     self.cache_backend.refresh(self.pipeline, num_inference_steps)

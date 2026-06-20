@@ -24,7 +24,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -336,10 +336,15 @@ class HunyuanImage3Pipeline(
     HunyuanImage3PreTrainedModel,
     GenerationMixin,
     SupportImageInput,
+    SupportsComponentDiscovery,
     DiffusionPipelineProfilerMixin,
 ):
     supports_step_execution: ClassVar[bool] = True
     support_image_input = True
+    _dit_modules: ClassVar[list[str]] = ["model"]
+    _encoder_modules: ClassVar[list[str]] = ["vision_model"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "model.": "",

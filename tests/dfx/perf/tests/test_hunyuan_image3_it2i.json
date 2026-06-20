@@ -41,7 +41,11 @@
                                 "tensor_parallel_size": 2,
                                 "hf_overrides": {
                                     "rope_parameters": {
-                                        "mrope_section": [0, 32, 32],
+                                        "mrope_section": [
+                                            0,
+                                            32,
+                                            32
+                                        ],
                                         "rope_type": "default"
                                     }
                                 },
@@ -58,7 +62,9 @@
                                     "max_tokens": 8192,
                                     "detokenize": true,
                                     "skip_special_tokens": false,
-                                    "stop_token_ids": [128025]
+                                    "stop_token_ids": [
+                                        128025
+                                    ]
                                 }
                             },
                             {
@@ -106,7 +112,9 @@
                     "content": [
                         {
                             "prompt": "新年宠物海报，Q版圆润的可爱标题“新年快乐汪”，副标题“HAPPY NEW YEAR”。 鱼眼镜头，背景是房间门口，近景，上传的主体歪头笑，围着红色围巾，戴着红色毛线帽，高清，绒毛细节，面部特写。 宝丽莱相纸，超现实主义，写实主义，胶片摄影，打印颗粒感肌理。肌理，超写实，复古感。",
-                            "image_urls": ["https://raw.githubusercontent.com/Tencent-Hunyuan/HunyuanImage-3.0/main/assets/demo_instruct_imgs/input_0_0.png"],
+                            "image_urls": [
+                                "https://raw.githubusercontent.com/Tencent-Hunyuan/HunyuanImage-3.0/main/assets/demo_instruct_imgs/input_0_0.png"
+                            ],
                             "num_inference_steps": 8,
                             "seed": 42,
                             "guidance_scale": 1.0
@@ -119,10 +127,9 @@
                 "num-prompts": 96,
                 "skip-performance-assertion": true,
                 "baseline": {
-                    "throughput_qps": 0.1,
-                    "latency_p99": 44.46,
-                    "latency_mean": 35.57,
-                    "latency_std_dev": 0.5,
+                    "throughput_qps": 0.1874,
+                    "latency_p99": 101.852,
+                    "latency_mean": 79.0385,
                     "peak_memory_mb_max": 70000,
                     "peak_memory_mb_mean": 70000
                 }
