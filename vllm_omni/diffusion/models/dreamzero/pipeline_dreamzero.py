@@ -1009,6 +1009,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
         """Full inference step. Called by DiffusionEngine.step()."""
         extra_args = req.sampling_params.extra_args or {}
+        dreamzero_async = extra_args.get("dreamzero_async") or {}
         robot_obs = extra_args.get("robot_obs")
         if robot_obs is None:
             first_prompt = req.prompts[0] if req.prompts else ""
@@ -1145,7 +1146,14 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             if negative_prompt_embeds is not None:
                 self._kv_populate_cross(negative_prompt_embeds, state.clip_feas, is_negative=True)
 
-        if state.current_start_frame != 0:
+        latent_video = dreamzero_async.get("latent_video")
+        if state.current_start_frame != 0 and latent_video is not None:
+            if not torch.is_tensor(latent_video):
+                latent_video = torch.as_tensor(latent_video)
+            if latent_video.dim() != 5:
+                raise ValueError(f"latent_video must have shape (B, C, T, H, W), got {tuple(latent_video.shape)}")
+            image = latent_video.to(device=device, dtype=videos.dtype)
+        elif state.current_start_frame != 0:
             # Subsequent calls: encode current observation via VAE
             if (num_frames_raw - 1) // 4 == self.num_frame_per_block:
                 pass
@@ -1270,12 +1278,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         actions_np = transform.transform_action_output(actions_np)
 
         return DiffusionOutput(
-            output={
-                "actions": actions_np,
-                # Source `video_pred` is normalized VAE latent output, not RGB.
-                # Use `decode_video_latents()` for DreamZero-equivalent debug
-                # video decoding.
-                "video": video_out.transpose(1, 2).cpu(),
+            output={"actions": actions_np},
+            custom_output={
+                # Normalized VAE latent output used by DreamZero async lookahead.
+                "dreamzero_async_video": video_out.transpose(1, 2).cpu(),
             },
         )
 

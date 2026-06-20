@@ -30,6 +30,10 @@ from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 from vllm.logger import init_logger
 
+from vllm_omni.entrypoints.openpi import dreamzero_async_protocol as _dz_async_protocol
+from vllm_omni.entrypoints.openpi.dreamzero_async_runtime import (
+    DreamZeroAsyncSessionHarness,
+)
 from vllm_omni.entrypoints.openpi.serving import (
     ServingRealtimeRobotOpenPI,
 )
@@ -144,6 +148,205 @@ def _pack(obj: Any) -> bytes:
 
 def _unpack(data: bytes) -> Any:
     return _unpack_numpy(msgspec.msgpack.decode(data))
+
+
+class DreamZeroAsyncRealtimeConnection:
+    """WebSocket connection for DreamZero async robot control.
+
+    The connection owns protocol handshake/reset/error behavior and delegates
+    background observation/forward scheduling to ``DreamZeroAsyncSessionHarness``.
+    """
+
+    def __init__(
+        self,
+        websocket: WebSocket,
+        serving: ServingRealtimeRobotOpenPI,
+        idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
+        scheduler: DreamZeroAsyncSessionHarness | None = None,
+    ) -> None:
+        self.websocket = websocket
+        self.serving = serving
+        self._idle_timeout = idle_timeout
+        self._scheduler = scheduler
+        self._session_id: str | None = None
+        self._session_epoch = 0
+        self._prompt = ""
+
+    async def _send_payload(self, payload: dict[str, Any]) -> None:
+        await self.websocket.send_bytes(_dz_async_protocol.pack_message(payload))
+
+    async def _send_error(
+        self,
+        code: str,
+        message: str,
+        *,
+        session_id: str | None = None,
+        session_epoch: int | None = None,
+    ) -> None:
+        await self._send_payload(
+            _dz_async_protocol.make_error(
+                code=code,
+                message=message,
+                session_id=session_id if session_id is not None else self._session_id,
+                session_epoch=session_epoch if session_epoch is not None else self._current_epoch_or_none(),
+            )
+        )
+
+    def _current_epoch_or_none(self) -> int | None:
+        return self._session_epoch if self._session_epoch > 0 else None
+
+    def _metadata(self) -> dict[str, Any]:
+        return _dz_async_protocol.make_metadata(self.serving.policy_server_config.to_dict())
+
+    def _unpack_request(self, data: bytes) -> dict[str, Any]:
+        return _dz_async_protocol.validate_client_message(_dz_async_protocol.unpack_message(data))
+
+    async def handle_connection(self) -> None:
+        await self.websocket.accept()
+        writer_task: asyncio.Task[None] | None = None
+
+        try:
+            await self._send_payload(self._metadata())
+            if self._scheduler is not None:
+                writer_task = asyncio.create_task(self._writer_loop())
+                writer_task.add_done_callback(self._log_writer_task_done)
+
+            while True:
+                try:
+                    msg = await asyncio.wait_for(
+                        self.websocket.receive(),
+                        timeout=self._idle_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.info("DreamZero async connection idle timeout after %.1f seconds", self._idle_timeout)
+                    try:
+                        await self.websocket.close()
+                    except Exception:
+                        logger.debug("Failed to close idle DreamZero async websocket", exc_info=True)
+                    return
+
+                if msg.get("type") == "websocket.disconnect":
+                    break
+
+                if "bytes" not in msg or not msg["bytes"]:
+                    continue
+
+                try:
+                    request = self._unpack_request(msg["bytes"])
+                except _dz_async_protocol.ProtocolValidationError as exc:
+                    await self._send_error(exc.code, exc.message)
+                    continue
+                except Exception:
+                    logger.exception("Invalid DreamZero async request payload")
+                    try:
+                        await self._send_error("invalid_payload", "Invalid DreamZero async request payload")
+                    except Exception:
+                        break
+                    continue
+
+                try:
+                    await self._handle_request(request)
+                except Exception:
+                    logger.exception("Error handling DreamZero async request")
+                    try:
+                        await self._send_error("internal_error", "Internal DreamZero async error")
+                    except Exception:
+                        break
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            logger.exception("DreamZero async connection error")
+        finally:
+            if writer_task is not None:
+                writer_task.cancel()
+                await asyncio.gather(writer_task, return_exceptions=True)
+            if self._scheduler is not None:
+                await self._scheduler.close()
+
+    async def _writer_loop(self) -> None:
+        if self._scheduler is None:
+            return
+        while True:
+            payload = await self._scheduler.get_outbound()
+            logger.debug("Sending DreamZero async outbound message type=%s", payload.get("type"))
+            await self._send_payload(payload)
+
+    def _log_writer_task_done(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.exception(
+                "DreamZero async outbound writer failed",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    async def _handle_request(self, request: dict[str, Any]) -> None:
+        msg_type = request["type"]
+        if msg_type == _dz_async_protocol.SESSION_START:
+            await self._handle_session_start(request)
+            return
+        if msg_type == _dz_async_protocol.SESSION_RESET:
+            await self._handle_session_reset(request)
+            return
+        if msg_type == _dz_async_protocol.OBSERVATION_REAL:
+            await self._handle_observation_real(request)
+            return
+        await self._send_error("unknown_message_type", f"Unknown DreamZero async message type: {msg_type}")
+
+    async def _handle_session_start(self, request: dict[str, Any]) -> None:
+        if self._session_id is not None:
+            await self._send_error("session_already_started", "DreamZero async session is already started")
+            return
+        self._session_id = request["session_id"]
+        self._session_epoch = 1
+        self._prompt = request["prompt"]
+        if self._scheduler is not None:
+            await self._scheduler.start_session(
+                session_id=self._session_id,
+                session_epoch=self._session_epoch,
+                prompt=self._prompt,
+            )
+        await self._send_payload(_dz_async_protocol.make_session_started(self._session_id, self._session_epoch))
+
+    async def _handle_session_reset(self, request: dict[str, Any]) -> None:
+        if not self._matches_active_session(request):
+            await self._send_error(
+                "stale_session",
+                "session_reset does not match the active DreamZero async session",
+                session_id=request["session_id"],
+                session_epoch=request["session_epoch"],
+            )
+            return
+        self._session_epoch += 1
+        if self._scheduler is not None:
+            await self._scheduler.reset(session_epoch=self._session_epoch)
+        await self._send_payload(
+            _dz_async_protocol.make_session_reset_ack(
+                self._session_id or request["session_id"],
+                self._session_epoch,
+            )
+        )
+
+    async def _handle_observation_real(self, request: dict[str, Any]) -> None:
+        if not self._matches_active_session(request):
+            await self._send_error(
+                "stale_session",
+                "observation_real does not match the active DreamZero async session",
+                session_id=request["session_id"],
+                session_epoch=request["session_epoch"],
+            )
+            return
+        if self._scheduler is not None:
+            await self._scheduler.submit_observation(request)
+            return
+        await self._send_error(
+            "scheduler_unavailable",
+            "DreamZero async scheduler is not enabled in this implementation slice",
+        )
+
+    def _matches_active_session(self, request: dict[str, Any]) -> bool:
+        return self._session_id == request["session_id"] and self._session_epoch == request["session_epoch"]
 
 
 class RobotRealtimeConnection:

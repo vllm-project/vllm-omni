@@ -8,6 +8,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,7 @@ DEFAULT_PATH = "/v1/realtime/robot/openpi"
 DEFAULT_PROMPT = "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
 ACTION_HORIZON = 24
 DEFAULT_ACTION_DIM = 8
+CONTROL_HZ = 15.0
 RELATIVE_OFFSETS = [-23, -16, -8, 0]
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ASSET_REPO_ID = "YangshenDeng/vllm-omni-dreamzero-assets"
@@ -56,6 +58,18 @@ def _as_action_array(response: Any) -> np.ndarray:
         message = response.get("message", response)
         raise RuntimeError(f"Inference failed: {message}")
     return np.asarray(response, dtype=np.float32)
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -254,14 +268,89 @@ def run_policy_session(
     client = WebsocketClientPolicy(host=uri)
     try:
         metadata = dict(client.get_server_metadata())
-        actions = [_as_action_array(client.infer(obs)) for obs in observations]
+        actions = []
+        events: list[dict[str, Any]] = []
+        for index, obs in enumerate(observations, start=1):
+            started_s = time.monotonic()
+            events.append({"event": "observation_sent", "t_s": started_s, "data": {"observation_index": index}})
+            action = _as_action_array(client.infer(obs))
+            finished_s = time.monotonic()
+            events.append(
+                {
+                    "event": "action_chunk_received",
+                    "t_s": finished_s,
+                    "data": {
+                        "chunk_index": index,
+                        "latency_s": finished_s - started_s,
+                        "shape": list(action.shape),
+                    },
+                }
+            )
+            actions.append(action)
         return {
             "metadata": metadata,
             "actions": actions,
+            "events": events,
             "session_id": session_id,
         }
     finally:
         _close_policy_client(client)
+
+
+def summarize_policy_session(result: dict[str, Any], *, action_horizon: int, control_hz: float) -> dict[str, Any]:
+    events = result["events"]
+    t0_s = events[0]["t_s"] if events else 0.0
+    t_end_s = events[-1]["t_s"] if events else t0_s
+    inference_time_s = sum(
+        float(event["data"].get("latency_s", 0.0)) for event in events if event["event"] == "action_chunk_received"
+    )
+    chunk_execution_time_s = len(result["actions"]) * action_horizon / control_hz
+    total_closed_loop_time_s = inference_time_s + chunk_execution_time_s
+    return {
+        "mode": "sync_openpi",
+        "session_id": result["session_id"],
+        "request_elapsed_s": round(t_end_s - t0_s, 6),
+        "total_closed_loop_time_s": round(total_closed_loop_time_s, 6),
+        "idle_time_s": round(inference_time_s, 6),
+        "effective_control_idle_ratio": (
+            round(inference_time_s / total_closed_loop_time_s, 6) if total_closed_loop_time_s > 0 else 0.0
+        ),
+        "action_chunk_count": len(result["actions"]),
+        "executed_rows": len(result["actions"]) * action_horizon,
+        "underruns": 0,
+        "metadata": _jsonable(result["metadata"]),
+    }
+
+
+def write_policy_artifacts(output_dir: Path, result: dict[str, Any], *, action_horizon: int, control_hz: float) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    events = result["events"]
+    t0_s = events[0]["t_s"] if events else 0.0
+    event_lines = []
+    for event in events:
+        event_lines.append(
+            json.dumps(
+                {
+                    "event": event["event"],
+                    "t_s": round(event["t_s"] - t0_s, 6),
+                    "data": _jsonable(event["data"]),
+                },
+                sort_keys=True,
+            )
+        )
+    (output_dir / "client_events.jsonl").write_text("\n".join(event_lines) + "\n", encoding="utf-8")
+    summary = summarize_policy_session(result, action_horizon=action_horizon, control_hz=control_hz)
+    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    lines = [
+        "| Metric | Value |",
+        "| --- | ---: |",
+        f"| Total closed-loop time (s) | {summary['total_closed_loop_time_s']:.3f} |",
+        f"| Idle time (s) | {summary['idle_time_s']:.3f} |",
+        f"| Idle ratio | {summary['effective_control_idle_ratio']:.3f} |",
+        f"| Action chunks received | {summary['action_chunk_count']} |",
+        f"| Executed rows | {summary['executed_rows']} |",
+    ]
+    (output_dir / "result_table.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def format_action_summary(index: int, action: np.ndarray) -> str:
@@ -282,6 +371,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--num-chunks", type=int, default=2)
+    parser.add_argument("--control-hz", type=float, default=CONTROL_HZ)
+    parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -304,6 +395,13 @@ def main() -> int:
     for index, action in enumerate(result["actions"]):
         print(format_action_summary(index, action))
     print("Session ID:", result["session_id"])
+    if args.output_dir is not None:
+        write_policy_artifacts(
+            args.output_dir,
+            result,
+            action_horizon=ACTION_HORIZON,
+            control_hz=args.control_hz,
+        )
     return 0
 
 

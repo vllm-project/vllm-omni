@@ -9,6 +9,13 @@ AR-diffusion models. See ``BDE_doc/dreamzero_kv_phase1_plan.md``.
 from vllm_omni.experimental.bde.kv_cache.adapter import BDERequestAdapter
 from vllm_omni.experimental.bde.kv_cache.chunk_window import ChunkWindowManager, ChunkWindowSpec
 from vllm_omni.experimental.bde.kv_cache.config import BDEKVConfig
+from vllm_omni.experimental.bde.kv_cache.entries import (
+    BDECacheEntryKey,
+    BDECacheEntryLease,
+    BDECacheEntryStore,
+    bde_cache_entry_key,
+    bde_cache_entry_key_dict,
+)
 from vllm_omni.experimental.bde.kv_cache.gather import (
     allocate_kv_pool,
     pool_gather_window,
@@ -25,10 +32,15 @@ from vllm_omni.experimental.bde.kv_cache.slot_mapping import (
 __all__ = [
     "BDEKVCache",
     "BDEKVConfig",
+    "BDECacheEntryKey",
+    "BDECacheEntryLease",
+    "BDECacheEntryStore",
     "BDERequestAdapter",
     "ChunkWindowManager",
     "ChunkWindowSpec",
     "allocate_kv_pool",
+    "bde_cache_entry_key",
+    "bde_cache_entry_key_dict",
     "build_kv_manager",
     "chunk_slot_mapping",
     "compute_num_blocks",

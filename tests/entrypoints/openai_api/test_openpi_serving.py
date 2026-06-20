@@ -12,6 +12,7 @@ from starlette.testclient import TestClient
 
 from vllm_omni.entrypoints.openpi import connection as openpi_connection
 from vllm_omni.entrypoints.openpi import serving as openpi_serving
+from vllm_omni.experimental.bde.kv_cache import BDECacheEntryKey
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -216,6 +217,30 @@ def test_build_request_uses_unique_engine_request_id_per_inference():
     assert request_a.request_id == "robot-session-a-0"
     assert request_b.request_id == "robot-session-a-1"
     assert request_a.request_id != request_b.request_id
+
+
+def test_build_dreamzero_async_forward_request_adds_bde_metadata():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+    o1 = BDECacheEntryKey("session-a", 1, 1, 0)
+    o2_sim = BDECacheEntryKey("session-a", 1, 2, 1)
+
+    request = serving.build_dreamzero_async_forward_request(
+        {"prompt": "pick up the object"},
+        session_id="session-a",
+        reset=False,
+        prefix_keys=(o1,),
+        input_key=o2_sim,
+        drop_owner_key=o2_sim,
+    )
+
+    metadata = request.sampling_params.extra_args["dreamzero_async"]
+    assert metadata == {
+        "prefix_keys": [
+            {"session_id": "session-a", "session_epoch": 1, "observation_index": 1, "sim_depth": 0},
+        ],
+        "input_key": {"session_id": "session-a", "session_epoch": 1, "observation_index": 2, "sim_depth": 1},
+        "drop_owner_key": {"session_id": "session-a", "session_epoch": 1, "observation_index": 2, "sim_depth": 1},
+    }
 
 
 def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():

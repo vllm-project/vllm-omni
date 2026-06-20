@@ -11,6 +11,8 @@ deliberate Phase-1 simplification the fused paged backend retires in Phase 2.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import os
 
 import torch
@@ -133,10 +135,13 @@ class BDEKVState:
     """
 
     def __init__(self, kv_cache, pos_adapter, neg_adapter, num_layers: int) -> None:
+        from vllm_omni.experimental.bde.kv_cache.entries import BDECacheEntryStore
+
         self.kv_cache = kv_cache
         self.pos = pos_adapter
         self.neg = neg_adapter
         self.num_layers = num_layers
+        self.entries = BDECacheEntryStore(kv_cache)
         # --- Approach 2: true chunk-paged write / gather -----------------------
         # Each get gathers the resident window from the paged pool blocks; each
         # update writes only the genuinely-new tokens (seq_len growth) into newly
@@ -158,12 +163,24 @@ class BDEKVState:
         # read every denoising step.  Reset clears these flags so the next
         # forward repopulates from the new text encoding.
         self._cross_populated: dict[bool, bool] = {False: False, True: False}
+        self._active_prefix_lease = None
+        self._active_write_key = None
 
     def _adapter(self, is_negative: bool):
         return self.neg if is_negative else self.pos
 
     def get_kv_caches(self, is_negative: bool, fallback) -> list:
         branch = "neg" if is_negative else "pos"
+        if self._active_prefix_lease is not None:
+            if self._active_write_key is not None and self.entries.has_entry(self._active_write_key):
+                return self.entries.get_leased_prefix_with_owned_suffix_kv_caches(
+                    self._active_prefix_lease,
+                    (self._active_write_key,),
+                    is_negative=is_negative,
+                )
+            return self._active_prefix_lease.get_kv_caches(is_negative=is_negative)
+        if self._active_write_key is not None and self.entries.has_entry(self._active_write_key):
+            return self.entries.get_prefix_kv_caches((self._active_write_key,), is_negative=is_negative)
         if self._committed[is_negative] == 0:  # nothing committed yet (prefill start)
             out = fallback()
             _log.info("BDE GET   [%s] source=model-local-empty layers=%d", branch, len(out))
@@ -192,6 +209,16 @@ class BDEKVState:
         return fallback()
 
     def update_kv_cache(self, layer_idx: int, updated_kv: torch.Tensor, is_negative: bool, seq_len) -> None:
+        if self._active_write_key is not None:
+            self.entries.update_entry_kv(
+                self._active_write_key,
+                layer_idx=layer_idx,
+                updated_kv=updated_kv,
+                is_negative=is_negative,
+                seq_len=int(seq_len),
+            )
+            return
+
         branch = "neg" if is_negative else "pos"
         adapter = self._adapter(is_negative)
         cs = self.kv_cache.spec.chunk_size
@@ -252,8 +279,39 @@ class BDEKVState:
         the state. Frees pool ownership that would otherwise leak when a session is
         evicted from the runner's session map.
         """
+        self.entries.close()
         self.kv_cache.end_request(self.pos)
         self.kv_cache.end_request(self.neg)
+
+    def lease_prefix(self, prefix_keys):
+        """Lease W8 cache entries for an in-flight prefix forward."""
+        return self.entries.lease_entries(prefix_keys)
+
+    @contextmanager
+    def use_prefix(self, prefix_keys) -> Iterator[None]:
+        """Route KV reads through a leased W8 prefix for one forward."""
+        lease = self.lease_prefix(prefix_keys)
+        previous = self._active_prefix_lease
+        self._active_prefix_lease = lease
+        try:
+            yield
+        finally:
+            self._active_prefix_lease = previous
+            lease.close()
+
+    @contextmanager
+    def write_entry(self, key) -> Iterator[None]:
+        """Route KV writes into a named W8 cache entry for one forward."""
+        previous = self._active_write_key
+        self._active_write_key = key
+        try:
+            yield
+        finally:
+            self._active_write_key = previous
+
+    def drop_cache_entry_owner(self, key) -> None:
+        """Release W8 entry ownership while preserving active forward leases."""
+        self.entries.release_owner(key)
 
     def reset(self) -> None:
         """Drop this session's KV — mirrors the model-local ``state.reset()``.
@@ -269,6 +327,9 @@ class BDEKVState:
         self.close()  # free resident blocks for both branches
         self.pos = self.kv_cache.begin_request(pos_id)  # fresh, empty window
         self.neg = self.kv_cache.begin_request(neg_id)
+        from vllm_omni.experimental.bde.kv_cache.entries import BDECacheEntryStore
+
+        self.entries = BDECacheEntryStore(self.kv_cache)
         self._committed = {False: 0, True: 0}
         self._pending = {False: [], True: []}
         self._gather_cache = {False: None, True: None}

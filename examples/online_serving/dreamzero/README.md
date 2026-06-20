@@ -88,10 +88,29 @@ hf download YangshenDeng/vllm-omni-dreamzero-assets --repo-type dataset --local-
 python examples/online_serving/dreamzero/openpi_client.py \
     --host 127.0.0.1 \
     --port 8000 \
-    --video-dir outputs/dreamzero/assets
+    --video-dir outputs/dreamzero/assets \
+    --output-dir outputs/dreamzero_async/sync_openpi
 ```
 
 This client uses downloaded example videos and talks to the OpenPI websocket server.
+
+`--output-dir` writes sync baseline artifacts: `client_events.jsonl`, `summary.json`, and `result_table.md`.
+
+### Run the async replay client
+
+```bash
+python examples/online_serving/dreamzero/async_client.py \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --video-dir outputs/dreamzero/assets \
+    --num-chunks 2 \
+    --output-json outputs/dreamzero_async/replay/client_events.json \
+    --output-dir outputs/dreamzero_async/replay
+```
+
+This client talks to `/v1/realtime/robot/dreamzero-async`, blocks for the first action chunk, then receives later chunks in the background while it sends real boundary observations.
+
+`--output-dir` writes benchmark-style replay artifacts: `client_events.jsonl`, `summary.json`, and `result_table.md`.
 
 ### Run DROID sim eval
 

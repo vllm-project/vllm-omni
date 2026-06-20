@@ -209,6 +209,8 @@ cache/
 diffusion_cache/
 kv_cache/
 !vllm_omni/bde/kv_cache/
+!vllm_omni/experimental/bde/kv_cache/
+!vllm_omni/experimental/bde/kv_cache/*.py
 
 # Logs
 logs/

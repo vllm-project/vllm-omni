@@ -35,6 +35,13 @@ RDMA environment setup and transfer tests for `MooncakeTransferEngineConnector`,
 - **Transfer modes**: `copy`, `zerocopy`, `gpu` (GPUDirect)
 - **Supports**: single-node pytest suites and manual multi-node/cross-node transfer testing
 
+### [DreamZero Async](dreamzero_async/README.md) — Robot Control
+
+Benchmarks for DreamZero W8 asynchronous control.
+
+- **Layout**: `dreamzero_async/mock_benchmark.py` for CPU metric validation; sync OpenPI and async replay clients emit live-server benchmark artifacts
+- **Key metrics**: effective control-loop idle time, idle-time reduction versus naive sync, underrun rows, executed rows
+
 ### [Accuracy](accuracy/README.md) — Image Generation and Editing Quality
 
 Accuracy benchmarks for image generation/editing models, adapting external suites to vLLM-Omni serving and local judge-evaluation flows.

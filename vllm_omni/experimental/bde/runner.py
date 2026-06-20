@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import os
 from collections import OrderedDict
+from contextlib import ExitStack
 
 import torch
 from vllm.logger import init_logger
@@ -25,6 +26,7 @@ from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import MAX_DREAMZER
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.experimental.bde.kv_cache.config import BDEKVConfig
+from vllm_omni.experimental.bde.kv_cache.entries import bde_cache_entry_key
 from vllm_omni.experimental.bde.kv_cache.gather import BDEKVState
 from vllm_omni.experimental.bde.kv_cache.manager import BDEKVCache
 
@@ -231,6 +233,30 @@ class BDEModelRunner(DiffusionModelRunner):
         )
         self.pipeline._bde_kv_state = state
         try:
-            return super().execute_model(req)
+            with self._dreamzero_async_bde_context(state, extra_args):
+                return super().execute_model(req)
         finally:
             self.pipeline._bde_kv_state = None
+
+    def _dreamzero_async_bde_context(self, state: BDEKVState, extra_args: dict):
+        metadata = extra_args.get("dreamzero_async") or {}
+        stack = ExitStack()
+        drop_owner_payload = metadata.get("drop_owner_key")
+        if drop_owner_payload is not None:
+            state.drop_cache_entry_owner(bde_cache_entry_key(drop_owner_payload))
+        prefix_keys = tuple(bde_cache_entry_key(key) for key in metadata.get("prefix_keys") or ())
+        if prefix_keys:
+            stack.enter_context(state.use_prefix(prefix_keys))
+        input_key_payload = metadata.get("input_key")
+        if input_key_payload is not None:
+            stack.enter_context(state.write_entry(bde_cache_entry_key(input_key_payload)))
+        return stack
+
+    def drop_bde_session(self, session_id: str) -> bool:
+        """Free BDE KV state owned by one DreamZero serving session."""
+        state = self._bde_states.pop(str(session_id), None)
+        if state is None:
+            return False
+        state.close()
+        logger.info("BDE dropped session=%s; freed pool blocks", session_id)
+        return True

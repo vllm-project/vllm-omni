@@ -395,6 +395,13 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def drop_bde_session(self, session_id: str) -> bool:
+        """Drop one BDE session if the active model runner supports it."""
+        drop_session = getattr(self.model_runner, "drop_bde_session", None)
+        if drop_session is None:
+            return False
+        return bool(drop_session(session_id))
+
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"

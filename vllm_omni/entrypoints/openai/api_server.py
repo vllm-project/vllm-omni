@@ -1552,6 +1552,30 @@ async def realtime_robot_openpi(websocket: WebSocket):
     await connection.handle_connection()
 
 
+@router.websocket("/v1/realtime/robot/dreamzero-async")
+async def realtime_robot_dreamzero_async(websocket: WebSocket):
+    """WebSocket endpoint for DreamZero async robot control."""
+    from vllm_omni.entrypoints.openpi.connection import (
+        DreamZeroAsyncRealtimeConnection,
+    )
+    from vllm_omni.entrypoints.openpi.dreamzero_async_runtime import (
+        DreamZeroAsyncSessionHarness,
+        ServingDreamZeroAsyncRunner,
+    )
+
+    serving = getattr(websocket.app.state, "openai_serving_realtime_robot", None)
+    if serving is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "Robot policy not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    scheduler = DreamZeroAsyncSessionHarness(
+        runner=ServingDreamZeroAsyncRunner(serving),
+    )
+    connection = DreamZeroAsyncRealtimeConnection(websocket, serving, scheduler=scheduler)
+    await connection.handle_connection()
+
+
 # Health and Model endpoints for diffusion mode
 
 

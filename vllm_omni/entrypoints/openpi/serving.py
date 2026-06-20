@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -21,6 +21,9 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 ActionOutput = np.ndarray | dict[str, np.ndarray]
+
+if TYPE_CHECKING:
+    from vllm_omni.experimental.bde.kv_cache import BDECacheEntryKey
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -119,6 +122,20 @@ class ServingRealtimeRobotOpenPI:
     def reset(self, obs: dict) -> None:
         """Compatibility hook; per-connection state lives in RobotRealtimeConnection."""
 
+    async def cleanup_dreamzero_session(self, session_id: str) -> None:
+        """Best-effort cleanup for DreamZero/BDE session-scoped state."""
+        collective_rpc = getattr(self.engine_client, "collective_rpc", None)
+        if not callable(collective_rpc):
+            return
+        try:
+            await collective_rpc(
+                "drop_bde_session",
+                timeout=10.0,
+                kwargs={"session_id": session_id},
+            )
+        except Exception:
+            logger.exception("Failed to cleanup DreamZero session %s", session_id)
+
     async def infer(self, obs: dict, *, session_id: str, reset: bool) -> ActionOutput:
         """raw obs → engine → actions."""
         # Build request, run inference through AsyncOmni
@@ -163,6 +180,31 @@ class ServingRealtimeRobotOpenPI:
             sampling_params=sampling_params,
             request_id=self._next_request_id(session_id),
         )
+
+    def build_dreamzero_async_forward_request(
+        self,
+        obs: dict,
+        *,
+        session_id: str,
+        reset: bool,
+        prefix_keys: tuple["BDECacheEntryKey", ...],
+        input_key: "BDECacheEntryKey",
+        drop_owner_key: "BDECacheEntryKey | None" = None,
+        latent_video: Any | None = None,
+    ) -> Any:
+        from vllm_omni.experimental.bde.kv_cache import bde_cache_entry_key_dict
+
+        request = self._build_request(obs, session_id=session_id, reset=reset)
+        metadata = {
+            "prefix_keys": [bde_cache_entry_key_dict(key) for key in prefix_keys],
+            "input_key": bde_cache_entry_key_dict(input_key),
+        }
+        if drop_owner_key is not None:
+            metadata["drop_owner_key"] = bde_cache_entry_key_dict(drop_owner_key)
+        if latent_video is not None:
+            metadata["latent_video"] = latent_video
+        request.sampling_params.extra_args["dreamzero_async"] = metadata
+        return request
 
     def _extract_actions(self, result: Any) -> ActionOutput:
         """Extract actions from engine result."""
