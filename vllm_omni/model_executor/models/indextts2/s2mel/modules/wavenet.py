@@ -55,7 +55,6 @@ class WN(torch.nn.Module):
 
     def forward(self, x, x_mask, g=None, **kwargs):
         output = torch.zeros_like(x)
-        n_channels_tensor = torch.IntTensor([self.hidden_channels])
 
         if g is not None:
             g = self.cond_layer(g)
@@ -68,7 +67,7 @@ class WN(torch.nn.Module):
             else:
                 g_l = torch.zeros_like(x_in)
 
-            acts = commons.fused_add_tanh_sigmoid_multiply(x_in, g_l, n_channels_tensor)
+            acts = commons.fused_add_tanh_sigmoid_multiply(x_in, g_l, self.hidden_channels)
             acts = self.drop(acts)
 
             res_skip_acts = self.res_skip_layers[i](acts)

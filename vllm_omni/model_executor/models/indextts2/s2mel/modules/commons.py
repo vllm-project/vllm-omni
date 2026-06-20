@@ -12,7 +12,7 @@ class AttrDict(dict):
 
 
 def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
-    n_channels_int = n_channels[0]
+    n_channels_int = n_channels if isinstance(n_channels, int) else n_channels[0]
     in_act = input_a + input_b
     t_act_part, s_act_part = torch.split(in_act, n_channels_int, dim=1)
     t_act = torch.tanh(t_act_part)

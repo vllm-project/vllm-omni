@@ -224,8 +224,7 @@ class DiT(torch.nn.Module):
             x_mask_expanded = x_mask[:, None, :].expand(-1, -1, x_in.size(1), -1) if not self.is_causal else None
 
         input_pos = self.input_pos[: x_in.size(1)]  # (T,) range（0，1863）
-        # 通过 per-shape CUDA graph runner 路由（若已启用）；TeaCache hook 路径
-        # 在 extractor 内有同样的路由，此处覆盖无 TeaCache 的直连路径。
+        # Route through per-shape CUDA graph runner if enabled.
         graph_runner = getattr(self, "_cuda_graph_runner", None)
         if graph_runner is not None:
             x_res = graph_runner(x_in, t1.unsqueeze(1), input_pos, x_mask_expanded)

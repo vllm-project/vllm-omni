@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import math
 import re
-import time
 from collections.abc import Iterable
 from typing import Any
 
@@ -19,6 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
@@ -61,6 +61,14 @@ def _find_most_similar_cosine(query: torch.Tensor, matrix: torch.Tensor) -> int:
     return int(torch.argmax(sims).item())
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class IndexTTS2TalkerForConditionalGeneration(nn.Module):
     """vLLM-native GPT-2 AR talker for IndexTTS2.
 
@@ -104,6 +112,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             ("hidden_states", "latent"),
             ("meta", "mel_start_offset"),
             ("meta", "latent_acc"),
+            ("meta", "mel_code_count"),
         }
 
         # --- GPT-2 transformer (vLLM-native with PagedAttention) ---
@@ -247,7 +256,6 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         """
         if get_pp_group().is_first_rank:
             if inputs_embeds is None:
-                # Fallback: decode without preprocess (should not happen normally)
                 logger.warning("[FORWARD] inputs_embeds=None — fallback decode path")
                 mel_start_offset = self._extract_mel_offsets(positions, kwargs)
                 mel_pos = positions - mel_start_offset
@@ -264,8 +272,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        hidden_states = self.final_norm(self.ln_f(hidden_states))
-        return hidden_states
+        return self.final_norm(self.ln_f(hidden_states))
 
     def compute_logits(
         self,
@@ -276,8 +283,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             hidden_states = hidden_states.text_hidden_states
         if hidden_states is None or self.mel_head is None:
             return None
-        logits = self.logits_processor(self.mel_head, hidden_states)
-        return logits
+        return self.logits_processor(self.mel_head, hidden_states)
 
     # ------------------------------------------------------------------
     # Omni multimodal output plumbing
@@ -320,19 +326,18 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 continue
             codes = info.get("codes", {})
             mc = codes.get("mel")
-            mel_len = 0
-            if isinstance(mc, torch.Tensor) and mc.numel() > 0:
+            info_meta = info.get("meta", {})
+            # mel_len now comes from the int counter in meta, not from
+            # code_seq.shape[0] (codes.mel is a single-token delta).
+            mel_len = int(info_meta.get("mel_code_count", 0))
+            if isinstance(mc, torch.Tensor) and mc.numel() > 0 and mel_len > 0:
                 code_seq = mc.reshape(-1)
-                mel_len = int(code_seq.shape[0])
                 mel_codes_list.append(code_seq[-1:].reshape(1, 1).contiguous())
             else:
                 mel_codes_list.append(_zero_codes)
 
-            meta = info.get("meta", {})
-            lat_acc = meta.get("latent_acc")
+            lat_acc = info_meta.get("latent_acc")
             if isinstance(lat_acc, torch.Tensor) and lat_acc.numel() > 0 and mel_len > 0:
-                # Code i pairs with lat_acc row i (the hidden that predicted
-                # it). Emit the row aligned to the current last mel code.
                 lat_seq = lat_acc.reshape(-1, lat_acc.shape[-1]) if lat_acc.ndim != 2 else lat_acc
                 idx = min(max(mel_len - 1, 0), int(lat_seq.shape[0]) - 1)
                 latent_list.append(lat_seq[idx : idx + 1].contiguous())
@@ -347,35 +352,19 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
             req_meta: dict[str, Any] = {}
             if mel_len == 1:
-                s_ref = meta.get("S_ref")
-                ref_mel = meta.get("ref_mel")
-                style = meta.get("style")
+                s_ref = info_meta.get("S_ref")
+                ref_mel = info_meta.get("ref_mel")
+                style = info_meta.get("style")
                 if isinstance(s_ref, torch.Tensor):
                     req_meta["S_ref"] = s_ref
                 if isinstance(ref_mel, torch.Tensor):
                     req_meta["ref_mel"] = ref_mel
                 if isinstance(style, torch.Tensor):
                     req_meta["style"] = style
-                if req_meta:
-                    logger.debug(
-                        "[OMNI_OUTPUT] EMIT meta (first step) for batch item: S_ref=%s ref_mel=%s style=%s",
-                        s_ref.shape if isinstance(s_ref, torch.Tensor) else None,
-                        ref_mel.shape if isinstance(ref_mel, torch.Tensor) else None,
-                        style.shape if isinstance(style, torch.Tensor) else None,
-                    )
             meta_list.append(req_meta)
 
         if not any(t.numel() > 0 for t in mel_codes_list):
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
-
-        logger.debug(
-            "[OMNI_OUTPUT] mel_codes_list=%d items (%d non-empty), latent_list=%d items, meta=%d/%d",
-            len(mel_codes_list),
-            sum(1 for t in mel_codes_list if t.numel() > 0),
-            len(latent_list),
-            sum(1 for m in meta_list if m),
-            len(meta_list),
-        )
 
         mm: OmniPayload = {
             "codes": {"mel": mel_codes_list},
@@ -420,32 +409,28 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         info_dict: dict[str, Any],
         meta: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Lightweight decode step: embed token + accumulate codes."""
-        device = input_ids.device
+        """Lightweight decode step: embed token + track code count."""
+        # Track code count via int counter instead of accumulating a full tensor
+        # (the connector reconstructs the full sequence from per-step deltas).
+        prev_count = meta.get("mel_code_count", 0)
+        if not isinstance(prev_count, int):
+            prev_count = int(prev_count)
+        decode_step = prev_count + 1
 
-        # Accumulate the sampled token from previous step
-        existing_codes = info_dict.get("codes", {}).get("mel")
-        if isinstance(existing_codes, torch.Tensor) and existing_codes.numel() > 0:
-            existing_codes = existing_codes.to(device)
-            new_codes = torch.cat([existing_codes, input_ids.detach()])
-        else:
-            new_codes = input_ids.detach().clone()
+        # Only keep the current token; no O(T) history accumulation.
+        new_codes = input_ids.detach()
 
-        # mel_pos = number of accumulated codes (start_mel was pos 0 in prefill)
-        mel_pos = torch.tensor([new_codes.shape[0]], device=device, dtype=torch.long)
+        mel_pos = input_ids.new_full((1,), decode_step)
         embeds = self.mel_embedding(input_ids) + self.mel_pos_embedding.emb(mel_pos)
 
-        decode_step = int(new_codes.shape[0])
-        if decode_step <= 5 or decode_step % 200 == 0:
-            logger.debug(
-                "[DECODE_PP] step=%d mel_pos=%d codes_len=%d token=%s",
-                decode_step,
-                int(mel_pos.item()),
-                new_codes.shape[0],
-                input_ids.tolist(),
-            )
-
-        return input_ids, embeds, {"codes": {"mel": new_codes}}
+        return (
+            input_ids,
+            embeds,
+            {
+                "codes": {"mel": new_codes},
+                "meta": {"mel_code_count": decode_step},
+            },
+        )
 
     def _preprocess_prefill(
         self,
@@ -455,9 +440,6 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         span_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Full conditioning pipeline — runs once during prefill."""
-        t_start = time.perf_counter()
-        logger.info("[PREFILL_PP] start, span_len=%d, device=%s", span_len, input_ids.device)
-
         additional_information = info_dict.get("additional_information")
         if isinstance(additional_information, dict):
             merged: dict[str, Any] = {k: v for k, v in info_dict.items() if k != "additional_information"}
@@ -511,7 +493,6 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             style = _cached["style"].to(device)
             ref_mel = _cached["ref_mel"].to(device)
             spk_cond_emb = _cached["spk_cond_emb"].to(device)
-            logger.debug("[PREFILL_PP] speaker cache HIT for %s", _voice_name)
         else:
             wav_16k, wav_22k = load_reference_audio(voice_path, device, mode="speaker")
             w2v_model, w2v_proc = load_wav2vec2(self.model_path, device)
@@ -519,20 +500,15 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             spk_cond_emb = wav2vec_extract(wav_16k, w2v_model, w2v_proc, device, self._w2v_stat)
 
             semantic_codec = load_semantic_codec(self.model_path, self.config.semantic_codec, device)
-            logger.debug("[PREFILL_PP] spk_cond_emb=%s", spk_cond_emb.shape)
             with torch.no_grad():
                 _, s_ref = semantic_codec.quantize(spk_cond_emb)  # [B, T, 1024] quantized embeddings
-            logger.debug("[PREFILL_PP] S_ref=%s after quantize", s_ref.shape)
 
             campplus = load_campplus(self.model_path, device)
             fbank = compute_fbank(wav_16k, device)
-            logger.debug("[PREFILL_PP] fbank=%s", fbank.shape)
             with torch.no_grad():
                 style = campplus(fbank)  # [1, 192]
-            logger.debug("[PREFILL_PP] style=%s", style.shape)
 
             ref_mel = self._compute_mel_22k(wav_22k, device)  # [1, 80, T_ref]
-            logger.debug("[PREFILL_PP] ref_mel=%s", ref_mel.shape)
 
             if _speaker_cache_key is not None:
                 self._speaker_cache.put(
@@ -601,16 +577,11 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
         input_ids_out = torch.full_like(input_ids, self.start_mel_token)
 
-        logger.debug(
-            "[PREFILL_PP] info_update shapes — S_ref=%s, ref_mel=%s, style=%s",
-            s_ref.shape,
-            ref_mel.shape,
-            style.shape,
-        )
         info_update: dict[str, Any] = {
             "meta": {
                 "mel_start_offset": mel_start_offset,
                 "prefill_mel_index": prefill_mel_index,
+                "mel_code_count": 0,
                 "S_ref": s_ref.cpu().contiguous(),
                 "ref_mel": ref_mel.cpu().contiguous(),
                 "style": style.cpu().contiguous(),
@@ -620,14 +591,6 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             "hidden_states": {"latent": torch.zeros(0, self.model_dim, dtype=inputs_embeds.dtype, device=device)},
         }
 
-        t_elapsed = time.perf_counter() - t_start
-        logger.info(
-            "[PREFILL_PP] done in %.2fs — mel_start_offset=%d, inputs_embeds=%s, text_tokens=%d",
-            t_elapsed,
-            mel_start_offset,
-            inputs_embeds.shape,
-            int(text_emb.shape[1]),
-        )
         return input_ids_out, inputs_embeds, info_update
 
     def postprocess(
@@ -636,12 +599,11 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         multimodal_outputs: Any = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Accumulate per-step hidden states into meta.latent_acc for Stage 1.
+        """Store current decode-step hidden state for Stage 1.
 
-        Prefill contributes the start_mel hidden state. Decode steps contribute
-        hidden states after each generated code is consumed. Output pairing then
-        uses the previous hidden state for each code, matching official
-        teacher-forced GPT latent extraction.
+        Only the current row is kept; the connector's full-payload accumulator
+        reconstructs the complete latent sequence from per-step deltas emitted
+        by make_omni_output.
         """
         if hidden_states.shape[0] != 1:
             meta = kwargs.get("meta", {})
@@ -649,15 +611,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             prefill_mel_index = min(max(prefill_mel_index, 0), hidden_states.shape[0] - 1)
             return {"meta": {"latent_acc": hidden_states[prefill_mel_index : prefill_mel_index + 1].detach()}}
 
-        hs = hidden_states.detach()
-        # Accumulate the full latent history (payload-at-finish emits it once
-        # at request end). Row i is the hidden that predicted code i.
-        meta = kwargs.get("meta") or {}
-        prev = meta.get("latent_acc")
-        if isinstance(prev, torch.Tensor) and prev.numel() > 0:
-            hs = torch.cat([prev, hs], dim=0)
-
-        return {"meta": {"latent_acc": hs}}
+        return {"meta": {"latent_acc": hidden_states.detach()}}
 
     def _compute_mel_22k(self, wav_22k: torch.Tensor, device: torch.device) -> torch.Tensor:
         """Compute 80-band mel spectrogram at 22.05kHz for Stage 1."""

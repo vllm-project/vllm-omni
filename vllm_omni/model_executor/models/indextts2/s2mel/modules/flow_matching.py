@@ -94,19 +94,23 @@ class BASECFM(torch.nn.Module, ABC):
         pre_mask = self._precompute_mask(x, x_lens)
 
         if inference_cfg_rate > 0:
-            cfg_prompt_x = torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0)
-            cfg_style = torch.cat([style, torch.zeros_like(style)], dim=0)
-            cfg_mu = torch.cat([mu, torch.zeros_like(mu)], dim=0)
-            cfg_x = torch.empty_like(x).repeat(2, 1, 1)
-            cfg_t = torch.zeros(2, device=x.device, dtype=x.dtype)
+            batch = x.shape[0]
+            cfg_prompt_x = prompt_x.new_zeros((2 * batch, *prompt_x.shape[1:]))
+            cfg_prompt_x[:batch].copy_(prompt_x)
+            cfg_style = style.new_zeros((2 * batch, *style.shape[1:]))
+            cfg_style[:batch].copy_(style)
+            cfg_mu = mu.new_zeros((2 * batch, *mu.shape[1:]))
+            cfg_mu[:batch].copy_(mu)
+            cfg_x = x.new_empty((2 * batch, *x.shape[1:]))
+            cfg_t = x.new_empty((2 * batch,))
+            cfg_pre_mask = self._repeat_pre_mask_for_cfg(pre_mask)
 
         for step in range(1, len(t_span)):
             dt = t_span[step] - t_span[step - 1]
             if inference_cfg_rate > 0:
-                cfg_x[: x.shape[0]] = x
-                cfg_x[x.shape[0] :] = x
-                cfg_t[0] = t
-                cfg_t[1] = t
+                cfg_x[:batch].copy_(x)
+                cfg_x[batch:].copy_(x)
+                cfg_t.fill_(t)
 
                 stacked_dphi_dt = _run_estimator(
                     cfg_x,
@@ -115,7 +119,7 @@ class BASECFM(torch.nn.Module, ABC):
                     cfg_t,
                     cfg_style,
                     cfg_mu,
-                    pre_mask=pre_mask,
+                    pre_mask=cfg_pre_mask,
                 )
 
                 dphi_dt, cfg_dphi_dt = stacked_dphi_dt.chunk(2, dim=0)
@@ -128,6 +132,25 @@ class BASECFM(torch.nn.Module, ABC):
             x[:, :, :prompt_len] = 0
 
         return x
+
+    @staticmethod
+    def _repeat_pre_mask_for_cfg(pre_mask):
+        """Duplicate precomputed masks when CFG doubles the batch.
+
+        The original IndexTTS2 inference path used B=1, where a two-element
+        timestep tensor happened to match CFG. Stage-1 batching makes the
+        estimator input batch 2B, so all batch-indexed masks must be repeated
+        consistently with ``torch.cat([cond, uncond], dim=0)``.
+        """
+        if not isinstance(pre_mask, tuple):
+            return pre_mask
+        repeated = []
+        for mask in pre_mask:
+            if isinstance(mask, torch.Tensor):
+                repeated.append(torch.cat([mask, mask], dim=0))
+            else:
+                repeated.append(mask)
+        return tuple(repeated)
 
     def _precompute_mask(self, x: torch.Tensor, x_lens: torch.Tensor):
         """Precompute padding mask for DiT — reused across all ODE steps."""

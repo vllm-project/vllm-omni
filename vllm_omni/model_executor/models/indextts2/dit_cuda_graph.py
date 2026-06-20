@@ -3,20 +3,18 @@
 Profiling showed the DiT estimator forward is CPU launch-bound (the GPU
 is idle ~85% of CFM wall time). Within one request the CFM runs 12 Euler
 steps with *identical* tensor shapes (T_in never changes), so the graph
-captured on the first TeaCache full-compute step is replayed by every
-subsequent full step. Across requests T_in varies, so graphs are cached
-per shape with a small LRU; a cache miss costs roughly one extra eager
-step (warm run + capture).
+captured on the first step is replayed by every subsequent step. Across
+requests T_in varies, so graphs are cached per shape with a small LRU;
+a cache miss costs roughly one extra eager step (warm run + capture).
 
-Capture safety relies on two invariants of the IndexTTS2 S2Mel path:
+Capture safety relies on the IndexTTS2 S2Mel decoder only enabling this
+runner for full-mask shapes:
 
-- ``x_lens == T`` always (the decoder feeds full-length sequences), so
+- ``x_lens == T`` for every sample (the decoder feeds full-length sequences), so
   the attention padding mask is all-True and dense flash attention is
   mathematically identical. The decoder sets ``_assume_full_mask`` on
   the gpt_fast ``Attention`` modules so the backend skips its
   ``torch.any(~mask)`` D2H sync, which would abort stream capture.
-- TeaCache's cache decision (``.item()`` D2H) lives in the hook, outside
-  this capture boundary; cached steps never reach the transformer.
 
 Modeled on ``CUDAGraphGLMTTSDiTWrapper``
 (vllm_omni/model_executor/models/glm_tts/glm_tts_dit_wrapper.py).
@@ -52,6 +50,7 @@ class CUDAGraphDiTRunner:
         self.max_graphs = int(max_graphs)
         self.enabled = bool(enabled)
         self._cache: OrderedDict[tuple, _GraphEntry] = OrderedDict()
+        self.last_call_info: dict[str, object] = {}
 
     def __call__(
         self,
@@ -61,13 +60,36 @@ class CUDAGraphDiTRunner:
         mask: torch.Tensor | None,
     ) -> torch.Tensor:
         if not self.enabled or x_in.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
+            self.last_call_info = {
+                "mode": "eager",
+                "reason": "ineligible",
+                "shape": tuple(x_in.shape),
+                "cache_size": len(self._cache),
+            }
             return self.transformer(x_in, c, input_pos, mask)
 
-        key = (tuple(x_in.shape), tuple(c.shape), x_in.dtype)
+        mask_key = None if mask is None else (tuple(mask.shape), mask.dtype)
+        device_key = (x_in.device.type, x_in.device.index)
+        key = (
+            device_key,
+            tuple(x_in.shape),
+            x_in.dtype,
+            tuple(c.shape),
+            c.dtype,
+            tuple(input_pos.shape),
+            input_pos.dtype,
+            mask_key,
+        )
         entry = self._cache.get(key)
         if entry is None:
             entry = self._capture(x_in, c, input_pos, mask)
             if entry is None:
+                self.last_call_info = {
+                    "mode": "eager",
+                    "reason": "capture_failed",
+                    "shape": tuple(x_in.shape),
+                    "cache_size": len(self._cache),
+                }
                 return self.transformer(x_in, c, input_pos, mask)
             self._cache[key] = entry
             while len(self._cache) > self.max_graphs:
@@ -76,12 +98,27 @@ class CUDAGraphDiTRunner:
             # Kernels are only recorded (not executed) during capture, so
             # replay once to produce the first real output.
             entry.graph.replay()
+            self.last_call_info = {
+                "mode": "graph",
+                "reason": "capture",
+                "shape": tuple(x_in.shape),
+                "cache_size": len(self._cache),
+            }
             return entry.static_out.clone()
 
         self._cache.move_to_end(key)
         entry.static_x.copy_(x_in)
         entry.static_c.copy_(c)
+        entry.static_pos.copy_(input_pos)
+        if entry.static_mask is not None and mask is not None:
+            entry.static_mask.copy_(mask)
         entry.graph.replay()
+        self.last_call_info = {
+            "mode": "graph",
+            "reason": "hit",
+            "shape": tuple(x_in.shape),
+            "cache_size": len(self._cache),
+        }
         return entry.static_out.clone()
 
     def _capture(

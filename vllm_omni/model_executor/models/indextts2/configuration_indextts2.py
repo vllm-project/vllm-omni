@@ -139,9 +139,7 @@ class IndexTTS2Config(PretrainedConfig):
         "qwen_emo_path": "qwen0.6bemo4-merge/",
         "vocoder": {"type": "bigvgan", "name": "nvidia/bigvgan_v2_22khz_80band_256x"},
         "version": 2.0,
-        # S2Mel DiT cache acceleration — overridable via deploy YAML hf_overrides.
-        "s2mel_cache_backend": None,
-        "s2mel_tea_cache_thresh": 0.2,
+        # Default-off performance tracing for IndexTTS2 overhead analysis.
     }
 
     def __init__(self, **kwargs):

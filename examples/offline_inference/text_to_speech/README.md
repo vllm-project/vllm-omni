@@ -464,7 +464,6 @@ python examples/offline_inference/text_to_speech/indextts2/end2end.py \
 - Stage 0 (AR Talker): GPT-2 generates mel codes from text + reference audio.
 - Stage 1 (S2Mel + BigVGAN): CFM DiT converts mel codes to waveform at 22.05 kHz.
 - Deploy config: `vllm_omni/deploy/indextts2.yaml`. Stage 1 runs with `enforce_eager: true` (DiT has dynamic shapes).
-- TeaCache acceleration available via `s2mel_cache_backend: "tea_cache"` in deploy config (~1.5x speedup).
 
 ---
 

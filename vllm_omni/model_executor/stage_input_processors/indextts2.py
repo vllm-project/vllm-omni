@@ -12,8 +12,12 @@ logger = init_logger(__name__)
 STOP_MEL_TOKEN = 8193
 
 
-def _shape(tensor: Any) -> tuple[int, ...] | None:
-    return tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else None
+def _cpu_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a contiguous CPU tensor suitable for connector serialization."""
+    out = tensor.detach()
+    if out.device.type != "cpu":
+        out = out.cpu()
+    return out if out.is_contiguous() else out.contiguous()
 
 
 def _strip_stop_token(
@@ -30,6 +34,11 @@ def _strip_stop_token(
     if latent.ndim == 2:
         latent = latent.unsqueeze(0)
 
+    if codes.device.type != "cpu":
+        codes = codes.detach().cpu()
+    if latent.device.type != "cpu":
+        latent = latent.detach().cpu()
+
     device = codes.device
     code_lens = []
     codes_out = []
@@ -39,20 +48,15 @@ def _strip_stop_token(
         code = codes[i]
         lat = latent[i]
 
-        # Find stop token
         stop_mask = (code == stop_mel_token).nonzero(as_tuple=False)
         if stop_mask.numel() > 0:
             valid_len = int(stop_mask[0].item())
         else:
             valid_len = int(code.shape[0])
-        code = code[:valid_len]
-        lat = lat[:valid_len]
+        code_lens.append(valid_len)
+        codes_out.append(code[:valid_len])
+        latent_out.append(lat[:valid_len])
 
-        code_lens.append(int(code.shape[0]))
-        codes_out.append(code)
-        latent_out.append(lat)
-
-    # Pad to max length
     max_len = max(code_lens) if code_lens else 0
     if max_len == 0:
         return (
@@ -61,14 +65,13 @@ def _strip_stop_token(
             torch.zeros(codes.shape[0], dtype=torch.long, device=device),
         )
 
-    padded_codes = torch.full((len(codes_out), max_len), stop_mel_token, dtype=torch.long, device=device)
-    lat_dtype = latent_out[0].dtype
+    padded_codes = torch.zeros((len(codes_out), max_len), dtype=torch.long, device=device)
     padded_latent = torch.zeros(
         len(latent_out),
         max_len,
         latent_out[0].shape[-1],
         device=device,
-        dtype=lat_dtype,
+        dtype=latent_out[0].dtype,
     )
     for i, (c, lat) in enumerate(zip(codes_out, latent_out)):
         padded_codes[i, : c.shape[0]] = c
@@ -78,39 +81,22 @@ def _strip_stop_token(
 
 
 def _normalize_mel_sequence(mel_codes: torch.Tensor) -> torch.Tensor:
-    """Normalize accumulated full-payload mel rows to one 1-D sequence."""
     mel_codes = mel_codes.to(torch.long)
-    if mel_codes.ndim == 0:
-        return mel_codes.reshape(1)
-    if mel_codes.ndim == 1:
-        return mel_codes.contiguous()
-    if mel_codes.ndim == 2:
-        if mel_codes.shape[1] == 1:
-            return mel_codes[:, 0].contiguous()
-        if mel_codes.shape[0] == 1:
-            return mel_codes[0].contiguous()
+    if mel_codes.ndim <= 1:
+        return mel_codes.reshape(-1).contiguous() if mel_codes.ndim == 0 else mel_codes.contiguous()
+    if mel_codes.ndim == 2 and (mel_codes.shape[0] == 1 or mel_codes.shape[1] == 1):
+        return mel_codes.reshape(-1).contiguous()
     return mel_codes.reshape(-1).contiguous()
 
 
 def _normalize_latent_sequence(latent: torch.Tensor) -> torch.Tensor:
-    """Normalize accumulated full-payload latent rows to [T, D]."""
-    if latent.ndim == 1:
+    if latent.ndim <= 1:
         return latent.reshape(1, -1).contiguous()
     if latent.ndim == 2:
         return latent.contiguous()
     if latent.ndim == 3 and latent.shape[0] == 1:
         return latent[0].contiguous()
-    if latent.ndim >= 3:
-        return latent.reshape(-1, latent.shape[-1]).contiguous()
-    return latent.contiguous()
-
-
-def _cpu_float_clone(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.float().cpu().clone()
-
-
-def _cpu_clone(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.cpu().clone()
+    return latent.reshape(-1, latent.shape[-1]).contiguous()
 
 
 def _build_s2mel_additional_information(
@@ -123,37 +109,18 @@ def _build_s2mel_additional_information(
     """Build the Stage-1 S2Mel tensor contract shared by legacy and connector paths."""
     mel_codes_clean, latent_clean, code_lens = _strip_stop_token(mel_codes, latent)
 
-    logger.debug(
-        "[%s] after stop trim — mel_codes=%s→%s, latent=%s→%s, max_code_len=%d",
-        context,
-        _shape(mel_codes),
-        _shape(mel_codes_clean),
-        _shape(latent),
-        _shape(latent_clean),
-        int(code_lens.max().item()) if code_lens.numel() else 0,
-    )
-
     additional_information = {
-        "latent": _cpu_float_clone(latent_clean),
-        "mel_codes": _cpu_clone(mel_codes_clean),
-        "code_lens": _cpu_clone(code_lens),
+        "latent": _cpu_view(latent_clean),
+        "mel_codes": _cpu_view(mel_codes_clean),
+        "code_lens": _cpu_view(code_lens),
     }
 
-    s_ref = meta.get("S_ref")
-    ref_mel = meta.get("ref_mel")
-    style = meta.get("style")
-    if isinstance(s_ref, torch.Tensor):
-        additional_information["S_ref"] = _cpu_float_clone(s_ref)
-    else:
-        logger.warning("[%s] S_ref MISSING — Stage 1 will skip ref conditioning", context)
-    if isinstance(ref_mel, torch.Tensor):
-        additional_information["ref_mel"] = _cpu_float_clone(ref_mel)
-    else:
-        logger.warning("[%s] ref_mel MISSING — Stage 1 will skip ref conditioning", context)
-    if isinstance(style, torch.Tensor):
-        additional_information["style"] = _cpu_float_clone(style)
-    else:
-        logger.warning("[%s] style MISSING — Stage 1 will use zeros", context)
+    for key in ("S_ref", "ref_mel", "style"):
+        val = meta.get(key)
+        if isinstance(val, torch.Tensor):
+            additional_information[key] = _cpu_view(val)
+        else:
+            logger.warning("[%s] %s MISSING — Stage 1 will use fallback", context, key)
 
     return additional_information
 
@@ -178,9 +145,6 @@ def talker2s2mel(
     _requires_multimodal_data: bool = False,
 ) -> list[Any]:
     """Legacy orchestrator path: collect all Stage 0 output, format Stage 1 input."""
-    # Clamp intra-op threads: this runs in the orchestrator/APIServer process
-    # where torch defaults to all cores; the tiny CPU tensor ops below pay
-    # ~85ms of OMP fork/join overhead per request otherwise (measured 4090 host).
     _old_nt = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
@@ -221,19 +185,10 @@ def _talker2s2mel_impl(source_outputs: list[Any]) -> list[Any]:
         if not isinstance(meta, dict):
             meta = {}
 
-        logger.debug(
-            "[talker2s2mel] shapes — mel_codes=%s, latent=%s, S_ref=%s, ref_mel=%s, style=%s",
-            _shape(mel_codes),
-            _shape(latent),
-            _shape(meta.get("S_ref")),
-            _shape(meta.get("ref_mel")),
-            _shape(meta.get("style")),
-        )
-
         additional_information = _build_s2mel_additional_information(mel_codes, latent, meta, context="talker2s2mel")
         s2mel_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=[0],  # dummy token for vLLM scheduler
+                prompt_token_ids=[0],
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
                 additional_information=additional_information,
@@ -277,52 +232,30 @@ def talker2s2mel_full_payload(
     del transfer_manager
     rid = _request_id(request)
     if not isinstance(pooling_output, dict):
-        logger.warning(
-            "indextts2.talker2s2mel_full_payload: pooling_output not a dict (type=%s) for req=%s; "
-            "consumer wait gate may hang.",
-            type(pooling_output).__name__,
-            rid,
-        )
+        logger.warning("talker2s2mel_full_payload: pooling_output not a dict for req=%s", rid)
         return None
 
     mel_codes = _get_payload_value(pooling_output, "codes.mel", "codes", "mel")
     if not isinstance(mel_codes, torch.Tensor) or mel_codes.numel() == 0:
-        logger.warning(
-            "indextts2.talker2s2mel_full_payload: missing/empty codes.mel (keys=%s) for req=%s; "
-            "consumer wait gate may hang.",
-            list(pooling_output.keys()),
-            rid,
-        )
+        logger.warning("talker2s2mel_full_payload: missing codes.mel for req=%s", rid)
         return None
 
     latent = _get_payload_value(pooling_output, "hidden_states.latent", "hidden_states", "latent")
     if not isinstance(latent, torch.Tensor) or latent.numel() == 0:
-        logger.warning(
-            "indextts2.talker2s2mel_full_payload: missing/empty hidden_states.latent (keys=%s) for req=%s; "
-            "consumer wait gate may hang.",
-            list(pooling_output.keys()),
-            rid,
-        )
+        logger.warning("talker2s2mel_full_payload: missing hidden_states.latent for req=%s", rid)
         return None
 
     mel_seq = _normalize_mel_sequence(mel_codes)
     latent_seq = _normalize_latent_sequence(latent)
-    if mel_seq.numel() == 0 or latent_seq.numel() == 0 or latent_seq.shape[0] == 0:
-        logger.warning("indextts2.talker2s2mel_full_payload: empty normalized mel/latent for req=%s", rid)
+    if mel_seq.numel() == 0 or latent_seq.numel() == 0:
+        logger.warning("talker2s2mel_full_payload: empty normalized mel/latent for req=%s", rid)
         return None
 
     common_len = min(int(mel_seq.shape[0]), int(latent_seq.shape[0]))
     if common_len <= 0:
-        logger.warning("indextts2.talker2s2mel_full_payload: no common mel/latent length for req=%s", rid)
+        logger.warning("talker2s2mel_full_payload: no common mel/latent length for req=%s", rid)
         return None
-    if int(mel_seq.shape[0]) != int(latent_seq.shape[0]):
-        logger.warning(
-            "indextts2.talker2s2mel_full_payload: mel/latent length mismatch for req=%s; cropping %d/%d to %d",
-            rid,
-            int(mel_seq.shape[0]),
-            int(latent_seq.shape[0]),
-            common_len,
-        )
+
     mel_seq = mel_seq[:common_len]
     latent_seq = latent_seq[:common_len]
 
@@ -331,11 +264,4 @@ def talker2s2mel_full_payload(
         "ref_mel": _get_payload_value(pooling_output, "meta.ref_mel", "meta", "ref_mel"),
         "style": _get_payload_value(pooling_output, "meta.style", "meta", "style"),
     }
-    additional_information = _build_s2mel_additional_information(
-        mel_seq,
-        latent_seq,
-        meta,
-        context="talker2s2mel_full_payload",
-    )
-    additional_information["meta"] = {"finished": torch.tensor(True, dtype=torch.bool)}
-    return additional_information
+    return _build_s2mel_additional_information(mel_seq, latent_seq, meta, context="full_payload")

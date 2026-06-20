@@ -94,7 +94,7 @@ def test_strip_stop_token_batch_with_padding():
     assert c.shape == (2, 3)
     assert lat.shape == (2, 3, LATENT_DIM)
     assert lens.tolist() == [2, 3]
-    assert c[0, 2].item() == STOP_MEL_TOKEN  # padded
+    assert c[0, 2].item() == 0  # padded with a valid semantic code
 
 
 def test_strip_stop_token_all_stop():
