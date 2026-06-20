@@ -692,16 +692,27 @@ class TestRegistryIntegration:
             assert name in _DIFFUSION_POST_PROCESS_FUNCS, f"{name} not in _DIFFUSION_POST_PROCESS_FUNCS"
             assert _DIFFUSION_POST_PROCESS_FUNCS[name] == "get_ltx2_post_process_func"
 
-    def test_cache_dit_enablers_registered(self):
-        """Pipeline variants must be registered in CUSTOM_DIT_ENABLERS."""
+    def test_cache_dit_for_ltx2_does_not_have_custom_enablers_registered(self):
+        """Pipeline variants are *not* registered in CUSTOM_DIT_ENABLERS."""
         from vllm_omni.diffusion.cache.cache_dit_backend import CUSTOM_DIT_ENABLERS
 
+        # NOTE: We used to have custom enablers for this model, but refactored to handle
+        # it more generically. Now we only need to ensure it has git cache adapter config.
         expected = [
             "LTX23Pipeline",
             "LTX23ImageToVideoPipeline",
         ]
         for name in expected:
-            assert name in CUSTOM_DIT_ENABLERS, f"{name} not in CUSTOM_DIT_ENABLERS"
+            assert name not in CUSTOM_DIT_ENABLERS, f"{name} not in CUSTOM_DIT_ENABLERS"
+
+    def test_ltx2_transformer_has_dit_cache_config(self):
+        """Ensure LTX2 has a Cache DiT adapter config and that it uses separate CFG."""
+        from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+        from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
+
+        adapter_config = getattr(LTX2VideoTransformer3DModel, "_cache_dit_adapter_config")
+        assert isinstance(adapter_config, CacheDiTAdapterConfig)
+        assert adapter_config.has_separate_cfg
 
 
 class TestVocoderSampleRateDetection:
