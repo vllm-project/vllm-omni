@@ -373,7 +373,9 @@ steps:
           - vllm_omni/model_executor/models/indextts2/
           - vllm_omni/model_executor/stage_input_processors/indextts2.py
           - vllm_omni/deploy/indextts2.yaml
+          - vllm_omni/deploy/indextts2_low_latency.yaml
           - vllm_omni/entrypoints/openai/serving_speech.py
+          - vllm_omni/entrypoints/openai/tts_adapters/indextts2.py
           - vllm_omni/config/pipeline_registry.py
           - vllm_omni/model_executor/models/registry.py
         timeout_in_minutes: 20
