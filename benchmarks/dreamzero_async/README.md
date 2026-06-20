@@ -83,4 +83,51 @@ python benchmarks/dreamzero_async/live_benchmark.py \
 
 `live_benchmark.py` defaults to `--order async-first`. That order intentionally runs the async endpoint before the sync OpenPI baseline, so BDE session cleanup regressions show up as a later sync failure. Use `--order sync-first` when measuring baseline first is more important than cleanup stress.
 
-Use these artifacts for demo smoke data. A final sync-vs-async benchmark should run both paths on the same checkpoint, deploy config, GPU setup, and replay length.
+Use these artifacts for demo smoke data. A sync-vs-async speedup claim must run both paths on the same checkpoint, deploy config, GPU setup, and replay length, with async realtime control timing enabled.
+
+`summary.json` records the async validity evidence:
+
+- `deadline_miss_count`: number of chunk boundaries where the needed action chunk was not ready. In real-behavior replay, the client waits and this becomes measured idle time.
+- `non_sim_conditioned_post_bootstrap_chunks`: executed chunks after `A1` that did not depend on the matching simulated observation.
+- `server_error_count` and `underruns`.
+
+If the configured `chunk_timeout_s` expires before the required action arrives, the async client raises immediately and the benchmark command fails.
+
+`--require-valid-speedup` treats dropped work, server errors, wrong provenance, or execution-coverage mismatch as a failed benchmark proof, even if raw elapsed time is lower. Deadline misses remain visible in the artifact and table because they explain async idle time, but the eventual executed post-bootstrap action should still be the sim-conditioned action.
+
+## PR-Style Suite Benchmark
+
+`suite_benchmark.py` runs one or more named server variants, waits for `/health`, runs repeated sync-vs-async replay pairs for each variant, and writes a PR-style comparison table. This is the preferred benchmark driver when comparing W8 against server/runtime modes in the style of the DreamZero W1 performance PR.
+
+Start from the example config:
+
+```bash
+cp benchmarks/dreamzero_async/suite_config.example.json /tmp/dreamzero_async_suite.json
+```
+
+Edit the variant commands and benchmark length in the copied config, then validate the plan:
+
+```bash
+.venv/bin/python benchmarks/dreamzero_async/suite_benchmark.py \
+    --config /tmp/dreamzero_async_suite.json \
+    --output-dir outputs/dreamzero_async/suite \
+    --dry-run
+```
+
+Run the suite:
+
+```bash
+.venv/bin/python benchmarks/dreamzero_async/suite_benchmark.py \
+    --config /tmp/dreamzero_async_suite.json \
+    --output-dir outputs/dreamzero_async/suite
+```
+
+Artifacts:
+
+- `plan.json`: resolved suite config plus environment metadata
+- `summary.json`: machine-readable variant comparison
+- `result_table.md`: PR-ready comparison table
+- `<variant>/benchmark/`: per-run sync/async artifacts from `live_benchmark.py`
+- `<variant>/logs/server.log`: server log for that variant
+
+The example config defaults to 15 chunks, 1 warmup, and 3 measured repeats to match the scale of PR-style DreamZero performance reporting. It sets `realtime=true` and `chunk_timeout_s=10` so the async client behaves like a real controller: execute available chunks, send the next observation at the boundary, then wait idle if the next action has not arrived yet. It also sets `repeat_last_observation=true` so the small public DROID sample assets can drive a longer perf/soak run. Turn that off when using a real 15-chunk replay video set.

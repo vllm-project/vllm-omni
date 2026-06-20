@@ -231,6 +231,7 @@ def test_build_dreamzero_async_forward_request_adds_bde_metadata():
         prefix_keys=(o1,),
         input_key=o2_sim,
         drop_owner_key=o2_sim,
+        drop_owner_keys=(o1,),
     )
 
     metadata = request.sampling_params.extra_args["dreamzero_async"]
@@ -240,6 +241,9 @@ def test_build_dreamzero_async_forward_request_adds_bde_metadata():
         ],
         "input_key": {"session_id": "session-a", "session_epoch": 1, "observation_index": 2, "sim_depth": 1},
         "drop_owner_key": {"session_id": "session-a", "session_epoch": 1, "observation_index": 2, "sim_depth": 1},
+        "drop_owner_keys": [
+            {"session_id": "session-a", "session_epoch": 1, "observation_index": 1, "sim_depth": 0},
+        ],
     }
 
 

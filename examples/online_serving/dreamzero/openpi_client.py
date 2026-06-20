@@ -187,6 +187,7 @@ def build_demo_observations(
     prompt: str,
     session_id: str,
     num_chunks: int = 2,
+    repeat_last_observation: bool = False,
 ) -> list[dict[str, Any]]:
     if num_chunks < 1:
         raise ValueError("num_chunks must be at least 1")
@@ -200,7 +201,12 @@ def build_demo_observations(
             session_id=session_id,
         )
     ]
-    for indices in build_frame_schedule(total_frames, num_chunks - 1):
+    chunk_schedule = build_frame_schedule(total_frames, num_chunks - 1)
+    if repeat_last_observation and chunk_schedule and len(chunk_schedule) < num_chunks - 1:
+        while len(chunk_schedule) < num_chunks - 1:
+            chunk_schedule.append(chunk_schedule[-1])
+
+    for indices in chunk_schedule:
         observations.append(
             make_obs_from_video(
                 camera_frames,
@@ -253,6 +259,7 @@ def run_policy_session(
     prompt: str = DEFAULT_PROMPT,
     session_id: str | None = None,
     num_chunks: int = 2,
+    repeat_last_observation: bool = False,
 ) -> dict[str, Any]:
     session_id = session_id or str(uuid.uuid4())
     camera_frames = load_camera_frames(video_dir)
@@ -261,6 +268,7 @@ def run_policy_session(
         prompt=prompt,
         session_id=session_id,
         num_chunks=num_chunks,
+        repeat_last_observation=repeat_last_observation,
     )
 
     uri = _openpi_uri(host, port, path)
@@ -371,6 +379,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--num-chunks", type=int, default=2)
+    parser.add_argument(
+        "--repeat-last-observation",
+        action="store_true",
+        help="Repeat the last available AR observation when videos are shorter than --num-chunks.",
+    )
     parser.add_argument("--control-hz", type=float, default=CONTROL_HZ)
     parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
@@ -388,6 +401,7 @@ def main() -> int:
         prompt=args.prompt,
         session_id=args.session_id,
         num_chunks=args.num_chunks,
+        repeat_last_observation=args.repeat_last_observation,
     )
     validate_session_result(result, expected_action_count=args.num_chunks)
 

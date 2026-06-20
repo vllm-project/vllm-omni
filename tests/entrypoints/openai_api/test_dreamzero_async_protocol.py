@@ -11,11 +11,12 @@ from vllm_omni.entrypoints.openpi.connection import DreamZeroAsyncRealtimeConnec
 from vllm_omni.entrypoints.openpi.dreamzero_async_runtime import (
     CacheEntryKey,
     DeterministicFakeDreamZeroRunner,
-    DreamZeroAsyncSessionHarness,
+    DreamZeroAsyncScheduler,
+    DreamZeroAsyncSession,
     ForwardResult,
     ForwardTask,
+    RealObservationEntry,
     ServingDreamZeroAsyncRunner,
-    SessionRuntime,
 )
 from vllm_omni.entrypoints.openpi.serving import PolicyServerConfig
 
@@ -234,7 +235,7 @@ def test_connection_rejects_malformed_payload_without_traceback():
 
 def test_fake_scheduler_bootstrap_and_real_rebased_step_sequence():
     async def run_sequence():
-        harness = DreamZeroAsyncSessionHarness(
+        harness = DreamZeroAsyncSession(
             runner=DeterministicFakeDreamZeroRunner(action_horizon=2, action_dim=8)
         )
         await harness.start_session(session_id="session-a", session_epoch=1, prompt="pick")
@@ -267,7 +268,7 @@ def test_fake_scheduler_bootstrap_and_real_rebased_step_sequence():
 
 def test_fake_scheduler_submit_observation_does_not_wait_for_forward_completion():
     async def run_sequence():
-        harness = DreamZeroAsyncSessionHarness(
+        harness = DreamZeroAsyncSession(
             runner=DeterministicFakeDreamZeroRunner(
                 action_horizon=2,
                 action_dim=8,
@@ -293,9 +294,82 @@ def test_fake_scheduler_submit_observation_does_not_wait_for_forward_completion(
     assert [message["chunk_index"] for message in finished] == [1, 2]
 
 
+def test_fake_scheduler_uses_late_sim_observation_for_missing_action():
+    async def run_sequence():
+        harness = DreamZeroAsyncSession(
+            runner=DeterministicFakeDreamZeroRunner(
+                action_horizon=2,
+                action_dim=8,
+                forward_delay_s=0.01,
+            )
+        )
+        await harness.start_session(session_id="session-a", session_epoch=1, prompt="pick")
+
+        await harness.handle_observation(
+            {
+                "observation_index": 1,
+                "robot_obs": {"observation/joint_position": np.zeros(7, dtype=np.float32)},
+            }
+        )
+        await harness.submit_observation(
+            {
+                "observation_index": 2,
+                "robot_obs": {"observation/joint_position": np.ones(7, dtype=np.float32)},
+            }
+        )
+        await harness.submit_observation(
+            {
+                "observation_index": 3,
+                "robot_obs": {"observation/joint_position": np.full(7, 2.0, dtype=np.float32)},
+            }
+        )
+        await harness.wait_for_idle()
+        return harness.drain_ready_outbound()
+
+    messages = asyncio.run(run_sequence())
+    action_chunks = [message for message in messages if message["type"] == "action_chunk"]
+
+    chunk3 = next(message for message in action_chunks if message["chunk_index"] == 3)
+    assert chunk3["provenance"]["real_observations"] == [1, 2]
+    assert chunk3["provenance"]["sim_observations"] == [3]
+
+
+def test_fake_scheduler_caps_real_prefix_for_sim_conditioned_action():
+    async def run_sequence():
+        harness = DreamZeroAsyncSession(
+            runner=DeterministicFakeDreamZeroRunner(action_horizon=2, action_dim=8)
+        )
+        await harness.start_session(session_id="session-a", session_epoch=1, prompt="pick")
+
+        messages = []
+        for observation_index in range(1, 6):
+            messages.extend(
+                await harness.handle_observation(
+                    {
+                        "observation_index": observation_index,
+                        "robot_obs": {
+                            "observation/joint_position": np.full(
+                                7,
+                                float(observation_index),
+                                dtype=np.float32,
+                            )
+                        },
+                    }
+                )
+            )
+        return messages
+
+    messages = asyncio.run(run_sequence())
+    action_chunks = [message for message in messages if message["type"] == "action_chunk"]
+
+    chunk5 = next(message for message in action_chunks if message["chunk_index"] == 5)
+    assert chunk5["provenance"]["real_observations"] == [2, 3, 4]
+    assert chunk5["provenance"]["sim_observations"] == [5]
+
+
 def test_fake_scheduler_reports_forward_failure_without_hanging():
     async def run_sequence():
-        harness = DreamZeroAsyncSessionHarness(runner=FailingForwardRunner())
+        harness = DreamZeroAsyncSession(runner=FailingForwardRunner())
         await harness.start_session(session_id="session-a", session_epoch=1, prompt="pick")
 
         await harness.submit_observation(
@@ -319,7 +393,7 @@ def test_fake_scheduler_reports_forward_failure_without_hanging():
 def test_fake_scheduler_close_cleans_up_runner_session():
     async def run_sequence():
         runner = CleanupTrackingRunner()
-        harness = DreamZeroAsyncSessionHarness(runner=runner)
+        harness = DreamZeroAsyncSession(runner=runner)
         await harness.start_session(session_id="session-a", session_epoch=1, prompt="pick")
         await harness.close()
         return runner.closed_sessions
@@ -330,10 +404,10 @@ def test_fake_scheduler_close_cleans_up_runner_session():
 def test_fake_scheduler_reset_cleans_up_old_runner_session():
     async def run_sequence():
         runner = CleanupTrackingRunner()
-        harness = DreamZeroAsyncSessionHarness(runner=runner)
+        harness = DreamZeroAsyncSession(runner=runner)
         await harness.start_session(session_id="session-a", session_epoch=1, prompt="pick")
         await harness.reset(session_epoch=2)
-        return runner.closed_sessions, harness.runtime
+        return runner.closed_sessions, harness.scheduler
 
     closed_sessions, runtime = asyncio.run(run_sequence())
 
@@ -344,7 +418,7 @@ def test_fake_scheduler_reset_cleans_up_old_runner_session():
 
 
 def test_runtime_deduplicates_duplicate_observation_commits():
-    runtime = SessionRuntime(session_id="session-a", session_epoch=1, prompt="pick")
+    runtime = DreamZeroAsyncScheduler(session_id="session-a", session_epoch=1, prompt="pick")
     first = runtime.on_observation_received(observation_index=1, robot_obs={})
     duplicate_while_committing = runtime.on_observation_received(observation_index=1, robot_obs={})
 
@@ -358,14 +432,19 @@ def test_runtime_deduplicates_duplicate_observation_commits():
 
 
 def test_runtime_discards_stale_epoch_forward_completion():
-    runtime = SessionRuntime(session_id="session-a", session_epoch=1, prompt="pick")
+    runtime = DreamZeroAsyncScheduler(session_id="session-a", session_epoch=1, prompt="pick")
     key = CacheEntryKey(
         session_id="session-a",
         session_epoch=1,
         observation_index=1,
         sim_depth=0,
     )
-    runtime.committed_real_keys[1] = key
+    runtime.real_observations[1] = RealObservationEntry(
+        robot_obs={},
+        key=key,
+        commit_in_flight=False,
+        kv_committed=True,
+    )
     task = ForwardTask(prefix_keys=(key,), send_action=True, commit_sim_kv=True)
     runtime.try_submit_forward(task)
 
@@ -400,6 +479,54 @@ def test_forward_task_engine_metadata_uses_plain_cache_key_dicts():
     }
 
 
+def test_forward_task_engine_metadata_batches_owner_drops():
+    o1 = CacheEntryKey("session-a", 1, 1, 0)
+    o2 = CacheEntryKey("session-a", 1, 2, 0)
+    o2_sim = CacheEntryKey("session-a", 1, 2, 1)
+    task = ForwardTask(
+        prefix_keys=(o2,),
+        send_action=False,
+        commit_sim_kv=True,
+        drop_owner_key=o2_sim,
+        drop_owner_keys=(o1,),
+    )
+
+    assert task.engine_metadata()["drop_owner_keys"] == [
+        {"session_id": "session-a", "session_epoch": 1, "observation_index": 2, "sim_depth": 1},
+        {"session_id": "session-a", "session_epoch": 1, "observation_index": 1, "sim_depth": 0},
+    ]
+
+
+def test_runtime_can_queue_action_and_real_materialization_forwards():
+    runtime = DreamZeroAsyncScheduler(session_id="session-a", session_epoch=1, prompt="pick")
+    o1 = runtime.on_observation_received(observation_index=1, robot_obs={}).observation_commits[0]
+    update = runtime.on_observation_committed(o1)
+    assert len(update.forwards) == 1
+
+    o2_update = runtime.on_observation_received(observation_index=2, robot_obs={})
+    assert len(o2_update.observation_commits) == 1
+    assert o2_update.forwards == ()
+    assert runtime.on_observation_committed(o2_update.observation_commits[0]).forwards == ()
+
+    forward_done = runtime.on_forward_done(
+        update.forwards[0],
+        ForwardResult(
+            chunk_index=1,
+            actions=np.zeros((2, 8), dtype=np.float32),
+            produced_sim_observation=2,
+            produced_video=np.zeros((1, 16, 2, 1, 1), dtype=np.float32),
+        ),
+    )
+
+    assert len(forward_done.forwards) == 2
+    assert forward_done.forwards[0].prefix_keys[-1].observation_index == 2
+    assert forward_done.forwards[0].prefix_keys[-1].sim_depth == 1
+    assert forward_done.forwards[0].send_action is True
+    assert forward_done.forwards[1].prefix_keys[-1].observation_index == 2
+    assert forward_done.forwards[1].prefix_keys[-1].sim_depth == 0
+    assert forward_done.forwards[1].send_action is False
+
+
 def test_connection_with_fake_scheduler_publishes_bootstrap_actions():
     websocket = WaitForActionChunksWebSocket(
         [
@@ -424,7 +551,7 @@ def test_connection_with_fake_scheduler_publishes_bootstrap_actions():
         ],
         action_chunk_count=2,
     )
-    scheduler = DreamZeroAsyncSessionHarness(
+    scheduler = DreamZeroAsyncSession(
         runner=DeterministicFakeDreamZeroRunner(action_horizon=2, action_dim=8)
     )
 

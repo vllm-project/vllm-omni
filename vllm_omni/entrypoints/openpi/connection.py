@@ -33,7 +33,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openpi import dreamzero_async_protocol as _dz_async_protocol
 from vllm_omni.entrypoints.openpi.dreamzero_async_runtime import (
-    DreamZeroAsyncSessionHarness,
+    DreamZeroAsyncSession,
 )
 from vllm_omni.entrypoints.openpi.serving import (
     ServingRealtimeRobotOpenPI,
@@ -155,7 +155,7 @@ class DreamZeroAsyncRealtimeConnection:
     """WebSocket connection for DreamZero async robot control.
 
     The connection owns protocol handshake/reset/error behavior and delegates
-    background observation/forward scheduling to ``DreamZeroAsyncSessionHarness``.
+    background observation/forward scheduling to ``DreamZeroAsyncSession``.
     """
 
     def __init__(
@@ -163,7 +163,7 @@ class DreamZeroAsyncRealtimeConnection:
         websocket: WebSocket,
         serving: ServingRealtimeRobotOpenPI,
         idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
-        scheduler: DreamZeroAsyncSessionHarness | None = None,
+        scheduler: DreamZeroAsyncSession | None = None,
     ) -> None:
         self.websocket = websocket
         self.serving = serving

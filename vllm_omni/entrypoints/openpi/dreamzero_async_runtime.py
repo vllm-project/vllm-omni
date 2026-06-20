@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -27,11 +27,6 @@ class ObservationCommitTask:
 
 
 @dataclass(frozen=True)
-class DropSimOwnerTask:
-    key: CacheEntryKey
-
-
-@dataclass(frozen=True)
 class ForwardTask:
     prefix_keys: tuple[CacheEntryKey, ...]
     send_action: bool
@@ -39,6 +34,7 @@ class ForwardTask:
     robot_obs: dict[str, Any] | None = None
     latent_video: Any | None = None
     drop_owner_key: CacheEntryKey | None = None
+    drop_owner_keys: tuple[CacheEntryKey, ...] = ()
 
     @property
     def session_epoch(self) -> int:
@@ -55,8 +51,11 @@ class ForwardTask:
             "prefix_keys": [bde_cache_entry_key_dict(key) for key in prefix_keys],
             "input_key": bde_cache_entry_key_dict(input_key),
         }
+        drop_owner_keys = self.drop_owner_keys
         if self.drop_owner_key is not None:
-            metadata["drop_owner_key"] = bde_cache_entry_key_dict(self.drop_owner_key)
+            drop_owner_keys = (self.drop_owner_key,) + drop_owner_keys
+        if drop_owner_keys:
+            metadata["drop_owner_keys"] = [bde_cache_entry_key_dict(key) for key in drop_owner_keys]
         return metadata
 
 
@@ -73,28 +72,45 @@ class ForwardResult:
 @dataclass(frozen=True)
 class RuntimeUpdate:
     observation_commits: tuple[ObservationCommitTask, ...] = ()
-    drop_sim_owner_tasks: tuple[DropSimOwnerTask, ...] = ()
     forwards: tuple[ForwardTask, ...] = ()
     outbound_messages: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass
+class RealObservationEntry:
+    robot_obs: dict[str, Any]
+    key: CacheEntryKey
+    commit_in_flight: bool = True
+    kv_committed: bool = False
+    kv_materialized: bool = False
+
+
+@dataclass(frozen=True)
+class SimulatedObservationEntry:
+    key: CacheEntryKey
+    robot_obs: dict[str, Any]
+    latent_video: Any
 
 
 TaskKey = tuple[int, tuple[CacheEntryKey, ...], bool, bool]
 
 
-class SessionRuntime:
+class DreamZeroAsyncScheduler:
+    # DROID's current DreamZero checkpoint uses local_attn_size=9 latent frames
+    # and num_frame_per_block=2, so four observation entries cover the active
+    # BDE window while leaving room for the current in-flight write entry.
+    _MAX_PREFIX_ENTRIES = 4
+    _MAX_REAL_PREFIX_ENTRIES_WITH_SIM = _MAX_PREFIX_ENTRIES - 1
+    _MAX_QUEUED_FORWARDS = 2
+
     def __init__(self, *, session_id: str, session_epoch: int, prompt: str) -> None:
         self.session_id = session_id
         self.session_epoch = session_epoch
         self.prompt = prompt
-        self.arrived_real_indices: set[int] = set()
-        self.real_obs_by_index: dict[int, dict[str, Any]] = {}
-        self.committed_real_keys: dict[int, CacheEntryKey] = {}
-        self.committing_real_indices: set[int] = set()
-        self.admitted_sim_by_index: dict[int, CacheEntryKey] = {}
-        self.sim_obs_by_index: dict[int, dict[str, Any]] = {}
-        self.sim_video_by_index: dict[int, Any] = {}
-        self.dropped_sim_owner_keys: set[CacheEntryKey] = set()
-        self.pending_drop_owner_by_index: dict[int, CacheEntryKey] = {}
+        self.real_observations: dict[int, RealObservationEntry] = {}
+        self.sim_observations: dict[int, SimulatedObservationEntry] = {}
+        self.completed_sim_indices: set[int] = set()
+        self.owner_release_candidates: set[CacheEntryKey] = set()
         self.running_tasks: set[TaskKey] = set()
         self.completed_tasks: set[TaskKey] = set()
         self.published_chunks: set[int] = set()
@@ -105,17 +121,15 @@ class SessionRuntime:
         observation_index: int,
         robot_obs: dict[str, Any],
     ) -> RuntimeUpdate:
-        self.arrived_real_indices.add(observation_index)
-        self.real_obs_by_index[observation_index] = robot_obs
-        drop_tasks: list[DropSimOwnerTask] = []
-        sim_key = self.admitted_sim_by_index.get(observation_index)
-        if sim_key is not None and sim_key not in self.dropped_sim_owner_keys:
-            self.dropped_sim_owner_keys.add(sim_key)
-            self.pending_drop_owner_by_index[observation_index] = sim_key
-            drop_tasks.append(DropSimOwnerTask(sim_key))
+        sim_entry = self.sim_observations.get(observation_index)
+        if sim_entry is not None:
+            self.owner_release_candidates.add(sim_entry.key)
+            if not self._key_used_by_running_task(sim_entry.key):
+                self.sim_observations.pop(observation_index, None)
 
-        if observation_index in self.committed_real_keys or observation_index in self.committing_real_indices:
-            return RuntimeUpdate(drop_sim_owner_tasks=tuple(drop_tasks))
+        existing = self.real_observations.get(observation_index)
+        if existing is not None and (existing.commit_in_flight or existing.kv_committed):
+            return RuntimeUpdate(forwards=self._try_submit_next_forward())
 
         key = CacheEntryKey(
             session_id=self.session_id,
@@ -123,41 +137,27 @@ class SessionRuntime:
             observation_index=observation_index,
             sim_depth=0,
         )
-        self.committing_real_indices.add(observation_index)
+        self.real_observations[observation_index] = RealObservationEntry(
+            robot_obs=robot_obs,
+            key=key,
+            commit_in_flight=True,
+        )
         return RuntimeUpdate(
             observation_commits=(ObservationCommitTask(key=key, robot_obs=robot_obs),),
-            drop_sim_owner_tasks=tuple(drop_tasks),
+            forwards=self._try_submit_next_forward(),
         )
 
     def on_observation_committed(self, task: ObservationCommitTask) -> RuntimeUpdate:
         if self._is_stale_key(task.key):
             return RuntimeUpdate()
         index = task.key.observation_index
-        self.committing_real_indices.discard(index)
-        self.committed_real_keys[index] = task.key
-        drop_owner_key = self.pending_drop_owner_by_index.pop(index, None)
-
-        if index == 1:
-            forward = ForwardTask(
-                prefix_keys=(task.key,),
-                send_action=True,
-                commit_sim_kv=True,
-                robot_obs=task.robot_obs,
-                drop_owner_key=drop_owner_key,
-            )
-            return RuntimeUpdate(forwards=self.try_submit_forward(forward))
-
-        real_prefix = self._real_prefix_through(index)
-        if real_prefix is None:
+        entry = self.real_observations.get(index)
+        if entry is None or entry.key != task.key:
             return RuntimeUpdate()
-        forward = ForwardTask(
-            prefix_keys=real_prefix,
-            send_action=False,
-            commit_sim_kv=True,
-            robot_obs=task.robot_obs,
-            drop_owner_key=drop_owner_key,
-        )
-        return RuntimeUpdate(forwards=self.try_submit_forward(forward))
+        entry.commit_in_flight = False
+        entry.kv_committed = True
+
+        return RuntimeUpdate(forwards=self._try_submit_next_forward())
 
     def on_forward_done(self, task: ForwardTask, result: ForwardResult) -> RuntimeUpdate:
         if task.session_epoch != self.session_epoch:
@@ -177,8 +177,24 @@ class SessionRuntime:
             )
             messages.append(self._action_chunk_message(task, result))
 
+        input_key = task.prefix_keys[-1]
+        if input_key.sim_depth == 0:
+            entry = self.real_observations.get(input_key.observation_index)
+            if entry is not None and entry.key == input_key:
+                entry.kv_materialized = True
+
+        for key in task.prefix_keys:
+            if key.sim_depth > 0 and self._real_arrived(key.observation_index):
+                self.owner_release_candidates.add(key)
+                if not self._key_used_by_running_task(key):
+                    self.sim_observations.pop(key.observation_index, None)
+
         if not task.commit_sim_kv:
-            return RuntimeUpdate(outbound_messages=tuple(messages))
+            return RuntimeUpdate(
+                forwards=self._try_submit_next_forward(),
+                outbound_messages=tuple(messages),
+            )
+        self.completed_sim_indices.add(result.produced_sim_observation)
 
         sim_key = CacheEntryKey(
             session_id=self.session_id,
@@ -186,15 +202,6 @@ class SessionRuntime:
             observation_index=result.produced_sim_observation,
             sim_depth=1,
         )
-        if sim_key.observation_index in self.arrived_real_indices:
-            if sim_key not in self.dropped_sim_owner_keys:
-                self.dropped_sim_owner_keys.add(sim_key)
-                return RuntimeUpdate(
-                    drop_sim_owner_tasks=(DropSimOwnerTask(sim_key),),
-                    outbound_messages=tuple(messages),
-                )
-            return RuntimeUpdate(outbound_messages=tuple(messages))
-
         if result.produced_video is None:
             logger.info(
                 "DreamZero async forward chunk=%d did not produce simulated video; no lookahead scheduled",
@@ -202,37 +209,36 @@ class SessionRuntime:
             )
             return RuntimeUpdate(outbound_messages=tuple(messages))
 
-        self.admitted_sim_by_index[sim_key.observation_index] = sim_key
-        self.sim_video_by_index[sim_key.observation_index] = result.produced_video
-        self.sim_obs_by_index[sim_key.observation_index] = self._make_sim_robot_obs(task, result)
-        real_prefix = self._real_prefix_through(result.chunk_index)
-        if real_prefix is None:
-            return RuntimeUpdate(outbound_messages=tuple(messages))
-        forward = ForwardTask(
-            prefix_keys=real_prefix + (sim_key,),
-            send_action=True,
-            commit_sim_kv=False,
-            robot_obs=self.sim_obs_by_index[sim_key.observation_index],
+        self.sim_observations[sim_key.observation_index] = SimulatedObservationEntry(
+            key=sim_key,
+            robot_obs=self._make_sim_robot_obs(task, result),
             latent_video=result.produced_video,
         )
+        if self._real_arrived(sim_key.observation_index):
+            self.owner_release_candidates.add(sim_key)
         return RuntimeUpdate(
-            forwards=self.try_submit_forward(forward),
+            forwards=self._try_submit_next_forward(),
             outbound_messages=tuple(messages),
         )
 
     def on_observation_commit_failed(self, task: ObservationCommitTask, message: str) -> RuntimeUpdate:
         if self._is_stale_key(task.key):
             return RuntimeUpdate()
-        self.committing_real_indices.discard(task.key.observation_index)
+        entry = self.real_observations.get(task.key.observation_index)
+        if entry is not None and entry.key == task.key:
+            entry.commit_in_flight = False
         return RuntimeUpdate(outbound_messages=(self._error_message("observation_commit_failed", message),))
 
     def on_forward_failed(self, task: ForwardTask, message: str) -> RuntimeUpdate:
         if task.session_epoch != self.session_epoch:
             return RuntimeUpdate()
         self.running_tasks.discard(self._task_key(task))
+        self.completed_tasks.add(self._task_key(task))
         return RuntimeUpdate(outbound_messages=(self._error_message("forward_failed", message),))
 
     def try_submit_forward(self, task: ForwardTask) -> tuple[ForwardTask, ...]:
+        if len(self.running_tasks) >= self._MAX_QUEUED_FORWARDS:
+            return ()
         if not self._prefix_available(task.prefix_keys):
             return ()
         task_key = self._task_key(task)
@@ -244,6 +250,7 @@ class SessionRuntime:
                 task.commit_sim_kv,
             )
             return ()
+        task = replace(task, drop_owner_keys=self._take_releasable_owner_keys(task.prefix_keys))
         self.running_tasks.add(task_key)
         logger.info(
             "DreamZero async schedule forward prefix=%s send_action=%s commit_sim_kv=%s",
@@ -253,24 +260,209 @@ class SessionRuntime:
         )
         return (task,)
 
-    def _real_prefix_through(self, observation_index: int) -> tuple[CacheEntryKey, ...] | None:
+    def _try_submit_next_forward(self) -> tuple[ForwardTask, ...]:
+        if len(self.running_tasks) >= self._MAX_QUEUED_FORWARDS:
+            return ()
+
+        candidates: list[ForwardTask] = []
+        if self._real_committed(1) and not self._real_materialized(1):
+            real_prefix = self._real_forward_prefix_through(1)
+            if real_prefix is None:
+                return ()
+            candidates.append(
+                ForwardTask(
+                    prefix_keys=real_prefix,
+                    send_action=True,
+                    commit_sim_kv=True,
+                    robot_obs=self._real_robot_obs(1),
+                )
+            )
+
+        for sim_index in sorted(self.sim_observations):
+            if sim_index in self.published_chunks:
+                continue
+            real_prefix = self._materialized_real_prefix_through(
+                sim_index - 1,
+                max_entries=self._MAX_REAL_PREFIX_ENTRIES_WITH_SIM,
+            )
+            if real_prefix is None:
+                continue
+            sim_entry = self.sim_observations[sim_index]
+            candidates.append(
+                ForwardTask(
+                    prefix_keys=real_prefix + (sim_entry.key,),
+                    send_action=True,
+                    commit_sim_kv=False,
+                    robot_obs=sim_entry.robot_obs,
+                    latent_video=sim_entry.latent_video,
+                )
+            )
+
+        for index in self._committed_real_indices():
+            if not self._real_materialized(index):
+                real_prefix = self._real_forward_prefix_through(index)
+                if real_prefix is None:
+                    continue
+                if any(candidate.prefix_keys == real_prefix and candidate.commit_sim_kv for candidate in candidates):
+                    continue
+                candidates.append(
+                    ForwardTask(
+                        prefix_keys=real_prefix,
+                        send_action=False,
+                        commit_sim_kv=True,
+                        robot_obs=self._real_robot_obs(index),
+                    )
+                )
+                break
+
+        for index in self._materialized_real_indices():
+            produced_index = index + 1
+            if (
+                self._real_arrived(produced_index)
+                or produced_index in self.sim_observations
+                or produced_index in self.completed_sim_indices
+            ):
+                continue
+            real_prefix = self._materialized_real_prefix_through(index)
+            if real_prefix is None:
+                continue
+            if any(candidate.prefix_keys == real_prefix and candidate.commit_sim_kv for candidate in candidates):
+                continue
+            candidates.append(
+                ForwardTask(
+                    prefix_keys=real_prefix,
+                    send_action=False,
+                    commit_sim_kv=True,
+                    robot_obs=self._real_robot_obs(index),
+                )
+            )
+
+        materialized_indices = self._materialized_real_indices()
+        if materialized_indices:
+            latest_index = max(materialized_indices)
+            real_prefix = self._materialized_real_prefix_through(latest_index)
+            if (
+                real_prefix is not None
+                and latest_index + 1 not in self.completed_sim_indices
+                and not any(candidate.prefix_keys == real_prefix and candidate.commit_sim_kv for candidate in candidates)
+            ):
+                candidates.append(
+                    ForwardTask(
+                        prefix_keys=real_prefix,
+                        send_action=False,
+                        commit_sim_kv=True,
+                        robot_obs=self._real_robot_obs(latest_index),
+                    )
+                )
+
+        submitted_tasks: list[ForwardTask] = []
+        for candidate in candidates:
+            submitted = self.try_submit_forward(candidate)
+            if submitted:
+                submitted_tasks.extend(submitted)
+            if len(self.running_tasks) >= self._MAX_QUEUED_FORWARDS:
+                break
+        return tuple(submitted_tasks)
+
+    def _real_forward_prefix_through(self, observation_index: int) -> tuple[CacheEntryKey, ...] | None:
         keys = []
-        for index in range(1, observation_index + 1):
-            key = self.committed_real_keys.get(index)
+        for index in range(1, observation_index):
+            if not self._real_materialized(index):
+                return None
+            key = self._real_key(index)
             if key is None:
                 return None
             keys.append(key)
-        return tuple(keys)
+        key = self._real_key(observation_index)
+        if key is None:
+            return None
+        keys.append(key)
+        return tuple(keys[-self._MAX_PREFIX_ENTRIES :])
+
+    def _materialized_real_prefix_through(
+        self,
+        observation_index: int,
+        *,
+        max_entries: int | None = None,
+    ) -> tuple[CacheEntryKey, ...] | None:
+        keys = []
+        for index in range(1, observation_index + 1):
+            if not self._real_materialized(index):
+                return None
+            key = self._real_key(index)
+            if key is None:
+                return None
+            keys.append(key)
+        limit = self._MAX_PREFIX_ENTRIES if max_entries is None else max_entries
+        return tuple(keys[-limit:])
 
     def _prefix_available(self, prefix_keys: tuple[CacheEntryKey, ...]) -> bool:
-        for key in prefix_keys:
+        input_position = len(prefix_keys) - 1
+        for position, key in enumerate(prefix_keys):
             if self._is_stale_key(key):
                 return False
-            if key.sim_depth == 0 and self.committed_real_keys.get(key.observation_index) != key:
-                return False
-            if key.sim_depth == 1 and self.admitted_sim_by_index.get(key.observation_index) != key:
-                return False
+            if key.sim_depth == 0:
+                if self._real_key(key.observation_index) != key:
+                    return False
+                if position != input_position and not self._real_materialized(key.observation_index):
+                    return False
+            if key.sim_depth == 1:
+                sim_entry = self.sim_observations.get(key.observation_index)
+                if sim_entry is None or sim_entry.key != key:
+                    return False
         return True
+
+    def _real_arrived(self, observation_index: int) -> bool:
+        return observation_index in self.real_observations
+
+    def _real_committed(self, observation_index: int) -> bool:
+        entry = self.real_observations.get(observation_index)
+        return entry is not None and entry.kv_committed
+
+    def _real_materialized(self, observation_index: int) -> bool:
+        entry = self.real_observations.get(observation_index)
+        return entry is not None and entry.kv_materialized
+
+    def _real_key(self, observation_index: int) -> CacheEntryKey | None:
+        entry = self.real_observations.get(observation_index)
+        if entry is None or not entry.kv_committed:
+            return None
+        return entry.key
+
+    def _real_robot_obs(self, observation_index: int) -> dict[str, Any] | None:
+        entry = self.real_observations.get(observation_index)
+        if entry is None:
+            return None
+        return entry.robot_obs
+
+    def _committed_real_indices(self) -> list[int]:
+        return sorted(index for index, entry in self.real_observations.items() if entry.kv_committed)
+
+    def _materialized_real_indices(self) -> list[int]:
+        return sorted(index for index, entry in self.real_observations.items() if entry.kv_materialized)
+
+    def _take_releasable_owner_keys(self, next_prefix_keys: tuple[CacheEntryKey, ...]) -> tuple[CacheEntryKey, ...]:
+        excluded = set(next_prefix_keys)
+        for task_key in self.running_tasks:
+            excluded.update(task_key[1])
+
+        committed_indices = self._committed_real_indices()
+        latest_committed_index = committed_indices[-1] if committed_indices else 0
+        for index, entry in self.real_observations.items():
+            if not entry.kv_committed:
+                continue
+            key = entry.key
+            if key in excluded:
+                continue
+            if index < latest_committed_index:
+                self.owner_release_candidates.add(key)
+
+        releasable = tuple(sorted(key for key in self.owner_release_candidates if key not in excluded))
+        self.owner_release_candidates.difference_update(releasable)
+        return releasable
+
+    def _key_used_by_running_task(self, key: CacheEntryKey) -> bool:
+        return any(key in task_key[1] for task_key in self.running_tasks)
 
     def _is_stale_key(self, key: CacheEntryKey) -> bool:
         return key.session_id != self.session_id or key.session_epoch != self.session_epoch
@@ -304,7 +496,7 @@ class SessionRuntime:
         }
 
     def _make_sim_robot_obs(self, task: ForwardTask, result: ForwardResult) -> dict[str, Any]:
-        base = self.real_obs_by_index.get(result.chunk_index)
+        base = self._real_robot_obs(result.chunk_index)
         if base is None:
             base = task.robot_obs or {}
         sim_obs = dict(base)
@@ -339,10 +531,6 @@ class DeterministicFakeDreamZeroRunner:
         self.forward_delay_s = forward_delay_s
 
     async def commit_observation(self, task: ObservationCommitTask) -> ObservationCommitTask:
-        await asyncio.sleep(0)
-        return task
-
-    async def drop_sim_owner(self, task: DropSimOwnerTask) -> DropSimOwnerTask:
         await asyncio.sleep(0)
         return task
 
@@ -387,10 +575,6 @@ class ServingDreamZeroAsyncRunner:
         await asyncio.sleep(0)
         return task
 
-    async def drop_sim_owner(self, task: DropSimOwnerTask) -> DropSimOwnerTask:
-        await asyncio.sleep(0)
-        return task
-
     async def run_forward(self, task: ForwardTask) -> ForwardResult:
         if task.robot_obs is None:
             raise RuntimeError("DreamZero async forward requires robot_obs")
@@ -404,6 +588,7 @@ class ServingDreamZeroAsyncRunner:
             prefix_keys=task.prefix_keys[:-1],
             input_key=input_key,
             drop_owner_key=task.drop_owner_key,
+            drop_owner_keys=task.drop_owner_keys,
             latent_video=task.latent_video,
         )
 
@@ -445,54 +630,53 @@ class ServingDreamZeroAsyncRunner:
             },
         )
 
-
-class DreamZeroAsyncSessionHarness:
+class DreamZeroAsyncSession:
     def __init__(
         self,
         *,
         runner: DeterministicFakeDreamZeroRunner | None = None,
     ) -> None:
         self.runner = runner or DeterministicFakeDreamZeroRunner()
-        self.runtime: SessionRuntime | None = None
+        self.scheduler: DreamZeroAsyncScheduler | None = None
         self._outbound: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._tasks: set[asyncio.Task[None]] = set()
 
     async def start_session(self, *, session_id: str, session_epoch: int, prompt: str) -> None:
         await self._cancel_tasks()
         self._drain_outbound()
-        self.runtime = SessionRuntime(
+        self.scheduler = DreamZeroAsyncScheduler(
             session_id=session_id,
             session_epoch=session_epoch,
             prompt=prompt,
         )
 
     async def reset(self, *, session_epoch: int) -> None:
-        if self.runtime is None:
+        if self.scheduler is None:
             return
-        old_session_id = self.runtime.session_id
-        old_prompt = self.runtime.prompt
+        old_session_id = self.scheduler.session_id
+        old_prompt = self.scheduler.prompt
         await self._cancel_tasks()
         await self._close_runner_session(old_session_id)
         self._drain_outbound()
-        self.runtime = SessionRuntime(
+        self.scheduler = DreamZeroAsyncScheduler(
             session_id=old_session_id,
             session_epoch=session_epoch,
             prompt=old_prompt,
         )
 
     async def close(self) -> None:
-        session_id = self.runtime.session_id if self.runtime is not None else None
+        session_id = self.scheduler.session_id if self.scheduler is not None else None
         await self._cancel_tasks()
         if session_id is not None:
             await self._close_runner_session(session_id)
-        self.runtime = None
+        self.scheduler = None
         self._drain_outbound()
 
     async def submit_observation(self, request: dict[str, Any]) -> None:
-        if self.runtime is None:
+        if self.scheduler is None:
             return
 
-        update = self.runtime.on_observation_received(
+        update = self.scheduler.on_observation_received(
             observation_index=request["observation_index"],
             robot_obs=request["robot_obs"],
         )
@@ -519,36 +703,27 @@ class DreamZeroAsyncSessionHarness:
     def _schedule_update(self, update: RuntimeUpdate) -> None:
         for message in update.outbound_messages:
             self._outbound.put_nowait(message)
-        for drop_task in update.drop_sim_owner_tasks:
-            self._track(asyncio.create_task(self._run_drop_sim_owner(drop_task)))
         for commit_task in update.observation_commits:
             self._track(asyncio.create_task(self._run_observation_commit(commit_task)))
         for forward_task in update.forwards:
             self._track(asyncio.create_task(self._run_forward(forward_task)))
-
-    async def _run_drop_sim_owner(self, task: DropSimOwnerTask) -> None:
-        try:
-            await self.runner.drop_sim_owner(task)
-        except Exception:
-            logger.exception("DreamZero async failed to release simulated cache owner")
-            await self._publish_task_error("drop_sim_owner_failed", "DreamZero async failed to release simulated cache owner")
 
     async def _run_observation_commit(self, task: ObservationCommitTask) -> None:
         try:
             committed = await self.runner.commit_observation(task)
         except Exception:
             logger.exception("DreamZero async failed to commit real observation")
-            if self.runtime is not None:
+            if self.scheduler is not None:
                 self._schedule_update(
-                    self.runtime.on_observation_commit_failed(
+                    self.scheduler.on_observation_commit_failed(
                         task,
                         "DreamZero async failed to commit real observation",
                     )
                 )
             return
-        if self.runtime is None:
+        if self.scheduler is None:
             return
-        self._schedule_update(self.runtime.on_observation_committed(committed))
+        self._schedule_update(self.scheduler.on_observation_committed(committed))
 
     async def _run_forward(self, task: ForwardTask) -> None:
         try:
@@ -556,32 +731,32 @@ class DreamZeroAsyncSessionHarness:
         except Exception:
             logger.exception(
                 "DreamZero async forward failed prefix=%s send_action=%s commit_sim_kv=%s",
-                SessionRuntime._prefix_label(task.prefix_keys),
+                DreamZeroAsyncScheduler._prefix_label(task.prefix_keys),
                 task.send_action,
                 task.commit_sim_kv,
             )
-            if self.runtime is not None:
+            if self.scheduler is not None:
                 self._schedule_update(
-                    self.runtime.on_forward_failed(
+                    self.scheduler.on_forward_failed(
                         task,
                         "DreamZero async forward failed",
                     )
                 )
             return
-        if self.runtime is None:
+        if self.scheduler is None:
             return
-        self._schedule_update(self.runtime.on_forward_done(task, result))
+        self._schedule_update(self.scheduler.on_forward_done(task, result))
 
     async def _publish_task_error(self, code: str, message: str) -> None:
-        if self.runtime is None:
+        if self.scheduler is None:
             return
         self._outbound.put_nowait(
             {
                 "type": "error",
                 "code": code,
                 "message": message,
-                "session_id": self.runtime.session_id,
-                "session_epoch": self.runtime.session_epoch,
+                "session_id": self.scheduler.session_id,
+                "session_epoch": self.scheduler.session_epoch,
             }
         )
 

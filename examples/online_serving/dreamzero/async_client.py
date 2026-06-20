@@ -109,6 +109,35 @@ def summarize_replay(result: dict[str, Any]) -> dict[str, Any]:
     q_spec_reject_count = sum(1 for event in events if event.event == "q_spec_rejected")
     server_error_count = sum(1 for event in events if event.event == "server_error")
     action_chunk_count = sum(1 for event in events if event.event == "action_chunk_received")
+    received_chunk_indices = sorted(
+        {
+            int(event.data["chunk_index"])
+            for event in events
+            if event.event == "action_chunk_received" and "chunk_index" in event.data
+        }
+    )
+    executed_chunk_events = [event for event in events if event.event == "chunk_execution_started"]
+    executed_chunk_indices = [int(event.data["chunk_index"]) for event in executed_chunk_events]
+    post_bootstrap_executed = [index for index in executed_chunk_indices if index > 1]
+    sim_conditioned_post_bootstrap = [
+        int(event.data["chunk_index"])
+        for event in executed_chunk_events
+        if int(event.data["chunk_index"]) > 1
+        and int(event.data["chunk_index"]) in event.data.get("sim_observations", [])
+    ]
+    non_sim_conditioned_post_bootstrap = [
+        index for index in post_bootstrap_executed if index not in set(sim_conditioned_post_bootstrap)
+    ]
+    missing_chunk_indices = [
+        int(event.data["chunk_index"])
+        for event in events
+        if event.event == "chunk_underrun" and "chunk_index" in event.data
+    ]
+    deadline_miss_indices = [
+        int(event.data["chunk_index"])
+        for event in events
+        if event.event == "chunk_deadline_miss" and "chunk_index" in event.data
+    ]
     return {
         "session_id": result["session_id"],
         "total_elapsed_s": round(t_end_s - t0_s, 6),
@@ -116,9 +145,18 @@ def summarize_replay(result: dict[str, Any]) -> dict[str, Any]:
         "executed_rows": result["executed_rows"],
         "underruns": result["underruns"],
         "action_chunk_count": action_chunk_count,
+        "received_chunk_indices": received_chunk_indices,
+        "executed_chunk_indices": executed_chunk_indices,
+        "missing_chunk_indices": missing_chunk_indices,
+        "deadline_miss_indices": deadline_miss_indices,
+        "deadline_miss_count": len(deadline_miss_indices),
+        "post_bootstrap_executed_chunks": post_bootstrap_executed,
+        "sim_conditioned_post_bootstrap_chunks": sim_conditioned_post_bootstrap,
+        "non_sim_conditioned_post_bootstrap_chunks": non_sim_conditioned_post_bootstrap,
         "q_spec_reject_count": q_spec_reject_count,
         "server_error_count": server_error_count,
         "metadata": _jsonable(result["metadata"]),
+        "config": _jsonable(result.get("config", {})),
     }
 
 
@@ -148,6 +186,8 @@ def write_result_table(path: Path, summary: dict[str, Any]) -> None:
         f"| Action chunks received | {summary['action_chunk_count']} |",
         f"| Executed rows | {summary['executed_rows']} |",
         f"| Underrun rows | {summary['underruns']} |",
+        f"| Deadline misses | {summary['deadline_miss_count']} |",
+        f"| Non-sim post-bootstrap chunks | {len(summary['non_sim_conditioned_post_bootstrap_chunks'])} |",
         f"| q_spec rejects | {summary['q_spec_reject_count']} |",
         f"| Server errors | {summary['server_error_count']} |",
     ]
@@ -216,6 +256,7 @@ def build_replay_observations(
     prompt: str,
     session_id: str,
     num_chunks: int,
+    repeat_last_observation: bool = False,
 ) -> list[dict[str, Any]]:
     total_frames = min(frames.shape[0] for frames in camera_frames.values())
     observations = [
@@ -226,7 +267,12 @@ def build_replay_observations(
             session_id=session_id,
         )
     ]
-    for indices in build_frame_schedule(total_frames, num_chunks - 1):
+    chunk_schedule = build_frame_schedule(total_frames, num_chunks - 1)
+    if repeat_last_observation and chunk_schedule and len(chunk_schedule) < num_chunks - 1:
+        while len(chunk_schedule) < num_chunks - 1:
+            chunk_schedule.append(chunk_schedule[-1])
+
+    for indices in chunk_schedule:
         observations.append(
             make_obs_from_video(
                 camera_frames,
@@ -328,6 +374,9 @@ class DreamZeroAsyncReplayClient:
                     return None
             return self.chunks[chunk_index]
 
+    def has_chunk(self, chunk_index: int) -> bool:
+        return chunk_index in self.chunks
+
     def chunk_is_executable(self, chunk: ActionChunk, robot_obs: dict[str, Any]) -> bool:
         q_spec = chunk.provenance.get("q_spec")
         if self.q_spec_tolerance is None or not q_spec:
@@ -396,6 +445,7 @@ async def run_replay(args: argparse.Namespace) -> dict[str, Any]:
         prompt=args.prompt,
         session_id=session_id,
         num_chunks=args.num_chunks,
+        repeat_last_observation=args.repeat_last_observation,
     )
     if not observations:
         raise RuntimeError("No replay observations were built.")
@@ -420,11 +470,24 @@ async def run_replay(args: argparse.Namespace) -> dict[str, Any]:
         tick_s = 1.0 / args.control_hz
         for chunk_index in range(1, args.num_chunks + 1):
             boundary_obs = observations[min(chunk_index - 1, len(observations) - 1)]
+            client._record("chunk_boundary", chunk_index=chunk_index)
+            if not client.has_chunk(chunk_index):
+                client._record("chunk_deadline_miss", chunk_index=chunk_index)
             chunk = await client.wait_for_chunk(chunk_index, timeout_s=args.chunk_timeout_s)
-            if chunk is None or not client.chunk_is_executable(chunk, boundary_obs):
+            if chunk is None:
+                raise TimeoutError(f"Timed out waiting for action chunk A{chunk_index}.")
+            if not client.chunk_is_executable(chunk, boundary_obs):
                 underruns += action_horizon
                 client._record("chunk_underrun", chunk_index=chunk_index)
+                if args.realtime:
+                    await asyncio.sleep(action_horizon * tick_s)
             else:
+                client._record(
+                    "chunk_execution_started",
+                    chunk_index=chunk_index,
+                    real_observations=chunk.provenance.get("real_observations", []),
+                    sim_observations=chunk.provenance.get("sim_observations", []),
+                )
                 for row_index in range(min(action_horizon, chunk.actions.shape[0])):
                     executed_rows += 1
                     client._record(
@@ -434,6 +497,7 @@ async def run_replay(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     if args.realtime:
                         await asyncio.sleep(tick_s)
+                client._record("chunk_execution_finished", chunk_index=chunk_index)
 
             next_observation_index = chunk_index + 1
             if next_observation_index <= len(observations):
@@ -448,6 +512,13 @@ async def run_replay(args: argparse.Namespace) -> dict[str, Any]:
             "executed_rows": executed_rows,
             "underruns": underruns,
             "raw_events": client.events,
+            "config": {
+                "num_chunks": args.num_chunks,
+                "control_hz": args.control_hz,
+                "realtime": args.realtime,
+                "chunk_timeout_s": args.chunk_timeout_s,
+                "repeat_last_observation": args.repeat_last_observation,
+            },
             "events": [
                 _event_dict(event)
                 for event in client.events
@@ -464,6 +535,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--num-chunks", type=int, default=2)
+    parser.add_argument(
+        "--repeat-last-observation",
+        action="store_true",
+        help="Repeat the last available AR observation when videos are shorter than --num-chunks.",
+    )
     parser.add_argument("--control-hz", type=float, default=CONTROL_HZ)
     parser.add_argument("--bootstrap-timeout-s", type=float, default=60.0)
     parser.add_argument("--chunk-timeout-s", type=float, default=0.0)

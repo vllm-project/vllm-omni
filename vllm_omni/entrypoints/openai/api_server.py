@@ -1559,7 +1559,7 @@ async def realtime_robot_dreamzero_async(websocket: WebSocket):
         DreamZeroAsyncRealtimeConnection,
     )
     from vllm_omni.entrypoints.openpi.dreamzero_async_runtime import (
-        DreamZeroAsyncSessionHarness,
+        DreamZeroAsyncSession,
         ServingDreamZeroAsyncRunner,
     )
 
@@ -1569,7 +1569,7 @@ async def realtime_robot_dreamzero_async(websocket: WebSocket):
         await websocket.send_json({"type": "error", "error": "Robot policy not available", "code": "unsupported"})
         await websocket.close()
         return
-    scheduler = DreamZeroAsyncSessionHarness(
+    scheduler = DreamZeroAsyncSession(
         runner=ServingDreamZeroAsyncRunner(serving),
     )
     connection = DreamZeroAsyncRealtimeConnection(websocket, serving, scheduler=scheduler)

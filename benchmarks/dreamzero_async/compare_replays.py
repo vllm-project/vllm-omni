@@ -18,6 +18,30 @@ def _round(value: float) -> float:
     return round(float(value), 6)
 
 
+def _validity(sync: dict[str, Any], async_summary: dict[str, Any]) -> dict[str, Any]:
+    reasons = []
+    config = async_summary.get("config", {})
+    if config and not bool(config.get("realtime", False)):
+        reasons.append("async replay did not use realtime control timing")
+    if int(async_summary["server_error_count"]) != 0:
+        reasons.append("async server reported errors")
+    if int(async_summary["underruns"]) != 0:
+        reasons.append("async client reported underruns")
+    if int(async_summary["executed_rows"]) != int(sync["executed_rows"]):
+        reasons.append("async executed row count differs from sync")
+    if int(async_summary["action_chunk_count"]) != int(sync["action_chunk_count"]):
+        reasons.append("async action chunk count differs from sync")
+    if float(async_summary["total_elapsed_s"]) >= float(sync["total_closed_loop_time_s"]):
+        reasons.append("async closed-loop time is not faster than sync")
+    non_sim_conditioned = async_summary.get("non_sim_conditioned_post_bootstrap_chunks")
+    if non_sim_conditioned:
+        reasons.append(f"post-bootstrap chunks were not sim-conditioned: {non_sim_conditioned}")
+    return {
+        "speedup_claim_valid": not reasons,
+        "reason": "valid" if not reasons else "; ".join(reasons),
+    }
+
+
 def summarize(sync: dict[str, Any], async_summary: dict[str, Any], *, control_hz: float) -> dict[str, Any]:
     sync_time = float(sync["total_closed_loop_time_s"])
     async_time = float(async_summary["total_elapsed_s"])
@@ -41,6 +65,13 @@ def summarize(sync: dict[str, Any], async_summary: dict[str, Any], *, control_hz
             "idle_proxy_s": _round(async_idle_proxy_s),
             "bootstrap_latency_s": async_summary["bootstrap_latency_s"],
             "underruns": async_summary["underruns"],
+            "deadline_miss_count": async_summary.get("deadline_miss_count", 0),
+            "sim_conditioned_post_bootstrap_chunks": async_summary.get(
+                "sim_conditioned_post_bootstrap_chunks", []
+            ),
+            "non_sim_conditioned_post_bootstrap_chunks": async_summary.get(
+                "non_sim_conditioned_post_bootstrap_chunks", []
+            ),
             "server_error_count": async_summary["server_error_count"],
         },
         "gain": {
@@ -48,6 +79,7 @@ def summarize(sync: dict[str, Any], async_summary: dict[str, Any], *, control_hz
             "time_reduction_ratio": _round((sync_time - async_time) / sync_time) if sync_time > 0 else 0.0,
             "speedup": _round(sync_time / async_time) if async_time > 0 else 0.0,
         },
+        "validity": _validity(sync, async_summary),
     }
 
 
@@ -67,8 +99,19 @@ def write_result_table(path: Path, summary: dict[str, Any]) -> None:
             f"{async_item['action_chunk_count']} | {async_item['executed_rows']} | {async_item['underruns']} |"
         ),
         "",
-        f"Time saved: {gain['time_saved_s']:.3f}s ({gain['time_reduction_ratio']:.1%}); speedup: {gain['speedup']:.3f}x.",
+        (
+            "Async post-bootstrap sim-conditioned chunks: "
+            f"{async_item['sim_conditioned_post_bootstrap_chunks']}; "
+            "non-sim-conditioned: "
+            f"{async_item['non_sim_conditioned_post_bootstrap_chunks']}."
+        ),
+        f"Time saved: {gain['time_saved_s']:.3f}s ({gain['time_reduction_ratio']:.1%}); raw speedup: {gain['speedup']:.3f}x.",
     ]
+    validity = summary["validity"]
+    if validity["speedup_claim_valid"]:
+        lines.append("Speedup claim status: valid.")
+    else:
+        lines.append(f"Speedup claim status: invalid as speedup proof ({validity['reason']}).")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

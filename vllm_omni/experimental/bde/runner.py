@@ -241,9 +241,13 @@ class BDEModelRunner(DiffusionModelRunner):
     def _dreamzero_async_bde_context(self, state: BDEKVState, extra_args: dict):
         metadata = extra_args.get("dreamzero_async") or {}
         stack = ExitStack()
+        drop_owner_payloads = []
         drop_owner_payload = metadata.get("drop_owner_key")
         if drop_owner_payload is not None:
-            state.drop_cache_entry_owner(bde_cache_entry_key(drop_owner_payload))
+            drop_owner_payloads.append(drop_owner_payload)
+        drop_owner_payloads.extend(metadata.get("drop_owner_keys") or ())
+        for payload in drop_owner_payloads:
+            state.drop_cache_entry_owner(bde_cache_entry_key(payload))
         prefix_keys = tuple(bde_cache_entry_key(key) for key in metadata.get("prefix_keys") or ())
         if prefix_keys:
             stack.enter_context(state.use_prefix(prefix_keys))

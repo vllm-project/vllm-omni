@@ -190,6 +190,7 @@ class ServingRealtimeRobotOpenPI:
         prefix_keys: tuple["BDECacheEntryKey", ...],
         input_key: "BDECacheEntryKey",
         drop_owner_key: "BDECacheEntryKey | None" = None,
+        drop_owner_keys: tuple["BDECacheEntryKey", ...] = (),
         latent_video: Any | None = None,
     ) -> Any:
         from vllm_omni.experimental.bde.kv_cache import bde_cache_entry_key_dict
@@ -201,6 +202,8 @@ class ServingRealtimeRobotOpenPI:
         }
         if drop_owner_key is not None:
             metadata["drop_owner_key"] = bde_cache_entry_key_dict(drop_owner_key)
+        if drop_owner_keys:
+            metadata["drop_owner_keys"] = [bde_cache_entry_key_dict(key) for key in drop_owner_keys]
         if latent_video is not None:
             metadata["latent_video"] = latent_video
         request.sampling_params.extra_args["dreamzero_async"] = metadata

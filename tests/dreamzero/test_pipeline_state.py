@@ -6,7 +6,10 @@ from collections import OrderedDict
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
+from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import (
+    DreamZeroPipeline,
+    _maybe_set_dynamo_recompile_limit,
+)
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -57,3 +60,17 @@ def test_dreamzero_state_cache_access_requires_initialization() -> None:
 
     with pytest.raises(RuntimeError, match="create_kv_caches first"):
         state.update_kv_cache(0, torch.empty(0))
+
+
+def test_dreamzero_recompile_limit_env_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    import torch._dynamo.config as dynamo_config
+
+    original_limit = dynamo_config.recompile_limit
+    try:
+        monkeypatch.setenv("VLLM_OMNI_DREAMZERO_RECOMPILE_LIMIT", "64")
+
+        _maybe_set_dynamo_recompile_limit()
+
+        assert dynamo_config.recompile_limit == 64
+    finally:
+        dynamo_config.recompile_limit = original_limit

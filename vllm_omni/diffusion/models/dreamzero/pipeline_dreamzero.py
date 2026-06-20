@@ -60,6 +60,19 @@ _log = logger
 MAX_DREAMZERO_SESSIONS = 64
 
 
+def _maybe_set_dynamo_recompile_limit() -> None:
+    recompile_limit = os.environ.get("VLLM_OMNI_DREAMZERO_RECOMPILE_LIMIT")
+    if not recompile_limit:
+        return
+    try:
+        import torch._dynamo.config as dynamo_config
+
+        dynamo_config.recompile_limit = int(recompile_limit)
+        logger.info("DreamZero: set torch._dynamo.config.recompile_limit=%s.", recompile_limit)
+    except Exception as exc:
+        logger.warning("DreamZero: failed to set Dynamo recompile limit %r: %s", recompile_limit, exc)
+
+
 class VideoActionScheduler:
     """Wraps video + action schedulers into single .step() interface."""
 
@@ -475,6 +488,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if not torch.cuda.is_available():
             logger.info("DreamZero setup_compile skipped: CUDA not available.")
             return
+
+        _maybe_set_dynamo_recompile_limit()
 
         from vllm_omni.diffusion.models.dreamzero.wan_vae_feat_cache_patch import (
             apply_wan_vae_feat_cache_tensor_patch,
@@ -1005,6 +1020,20 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         transform = get_transform(embodiment)
         return transform, transform.transform_input(robot_obs)
 
+    def _dreamzero_async_start_frame(self, dreamzero_async: dict) -> int | None:
+        """Return the local start frame implied by a DreamZero async BDE prefix."""
+        if not dreamzero_async.get("input_key"):
+            return None
+
+        current_start_frame = 0
+        for key in dreamzero_async.get("prefix_keys") or ():
+            observation_index = int(key.get("observation_index", 0))
+            if observation_index == 1 and current_start_frame == 0:
+                current_start_frame += 1 + self.num_frame_per_block
+            else:
+                current_start_frame += self.num_frame_per_block
+        return current_start_frame
+
     @torch.no_grad()
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
         """Full inference step. Called by DiffusionEngine.step()."""
@@ -1083,6 +1112,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         # Explicit reset from OpenPI serving is carried by `extra_args["reset"]`
         # on the next inference request after websocket reset/session switch.
+        has_dreamzero_async_prefix = (
+            bool(dreamzero_async.get("prefix_keys")) or dreamzero_async.get("input_key") is not None
+        )
+        if has_dreamzero_async_prefix:
+            async_start_frame = self._dreamzero_async_start_frame(dreamzero_async)
+            if async_start_frame is not None:
+                state.current_start_frame = async_start_frame
         if extra_args.get("reset", False):
             self._kv_reset(state)
         else:
@@ -1094,7 +1130,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             reset_reason = state.reset_reason(text_tokens, 0, self.transformer.local_attn_size)
             if reset_reason == "session":
                 self._kv_reset(state)
-            elif reset_reason == "inference":
+            elif reset_reason == "inference" and not has_dreamzero_async_prefix:
                 self._kv_reset(state, clear_video_latents=False)
         state.language = text_tokens
 
