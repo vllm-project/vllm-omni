@@ -37,6 +37,37 @@ def _try_extract_layer_index(prefix: str) -> int | None:
         return None
 
 
+def append_attention_kv_cache(
+    *,
+    kv_cache: torch.Tensor,
+    fresh_key: torch.Tensor,
+    fresh_value: torch.Tensor,
+    max_cache_len: int,
+) -> torch.Tensor:
+    if kv_cache.ndim != 5:
+        raise ValueError(f"kv_cache must be [2, B, S, H, D], got {tuple(kv_cache.shape)}.")
+    if fresh_key.shape != fresh_value.shape:
+        raise ValueError(
+            "fresh_key and fresh_value must have the same shape, "
+            f"got {tuple(fresh_key.shape)} and {tuple(fresh_value.shape)}."
+        )
+    if kv_cache.shape[0] != 2:
+        raise ValueError(f"kv_cache first dim must be 2 for K/V, got {kv_cache.shape[0]}.")
+    if kv_cache.shape[1] != fresh_key.shape[0]:
+        raise ValueError("batch size mismatch between kv_cache and fresh KV.")
+    if kv_cache.shape[3:] != fresh_key.shape[2:]:
+        raise ValueError(
+            "kv_cache and fresh KV must share [H, D], "
+            f"got cache {tuple(kv_cache.shape[3:])} and fresh {tuple(fresh_key.shape[2:])}."
+        )
+
+    new_k = torch.cat([kv_cache[0], fresh_key], dim=1)
+    new_v = torch.cat([kv_cache[1], fresh_value], dim=1)
+    new_k = new_k[:, -max_cache_len:]
+    new_v = new_v[:, -max_cache_len:]
+    return torch.stack([new_k, new_v], dim=0)
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -252,6 +283,103 @@ class Attention(nn.Module):
         out = strategy.post_attention(out, ctx)
 
         return out
+
+    def forward_with_kv_cache(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor | None,
+        *,
+        max_cache_len: int,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        strategy = self._get_active_parallel_strategy()
+        if self.use_ring:
+            raise NotImplementedError(
+                "Ring sequence parallel KV cache layout is not implemented. "
+                "Use Ulysses-only cached attention with ring_degree=1."
+            )
+
+        query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
+        attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+
+        live_joint_key = None
+        live_joint_value = None
+        joint_len = int(getattr(ctx, "joint_len", 0) or 0)
+        joint_strategy = getattr(ctx, "joint_strategy", None)
+        if joint_strategy is None and attn_metadata is not None:
+            joint_strategy = attn_metadata.joint_strategy
+        joint_strategy = joint_strategy or "front"
+
+        if joint_len > 0:
+            if joint_strategy == "front":
+                live_joint_key = key[:, :joint_len]
+                live_joint_value = value[:, :joint_len]
+                key = key[:, joint_len:]
+                value = value[:, joint_len:]
+            elif joint_strategy == "rear":
+                live_joint_key = key[:, -joint_len:]
+                live_joint_value = value[:, -joint_len:]
+                key = key[:, :-joint_len]
+                value = value[:, :-joint_len]
+            else:
+                raise ValueError(f"joint_strategy: {joint_strategy} not supported.")
+        elif attn_metadata is not None:
+            joint_query = attn_metadata.joint_query
+            live_joint_key = attn_metadata.joint_key
+            live_joint_value = attn_metadata.joint_value
+            if (joint_query is None) != (live_joint_key is None) or (joint_query is None) != (live_joint_value is None):
+                raise ValueError("joint_query, joint_key, and joint_value should be None or not None simultaneously.")
+            if joint_query is not None:
+                if joint_strategy == "front":
+                    query = torch.cat([joint_query, query], dim=1)
+                elif joint_strategy == "rear":
+                    query = torch.cat([query, joint_query], dim=1)
+                else:
+                    raise ValueError(f"joint_strategy: {joint_strategy} not supported.")
+                attn_metadata = replace(
+                    attn_metadata,
+                    joint_query=None,
+                    joint_key=None,
+                    joint_value=None,
+                )
+
+        if kv_cache is None:
+            kv_cache = torch.empty(
+                2,
+                key.shape[0],
+                0,
+                key.shape[2],
+                key.shape[3],
+                dtype=key.dtype,
+                device=key.device,
+            )
+        updated_cache = append_attention_kv_cache(
+            kv_cache=kv_cache,
+            fresh_key=key,
+            fresh_value=value,
+            max_cache_len=max_cache_len,
+        )
+        attn_key = updated_cache[0]
+        attn_value = updated_cache[1]
+        if live_joint_key is not None and live_joint_value is not None:
+            if joint_strategy == "front":
+                attn_key = torch.cat([live_joint_key, attn_key], dim=1)
+                attn_value = torch.cat([live_joint_value, attn_value], dim=1)
+            elif joint_strategy == "rear":
+                attn_key = torch.cat([attn_key, live_joint_key], dim=1)
+                attn_value = torch.cat([attn_value, live_joint_value], dim=1)
+            else:
+                raise ValueError(f"joint_strategy: {joint_strategy} not supported.")
+
+        if self.use_ring and strategy is not self._no_parallel_strategy:
+            out = self._run_ring_attention(query, attn_key, attn_value, attn_metadata)
+        else:
+            out = self._run_local_attention(query, attn_key, attn_value, attn_metadata)
+
+        out = strategy.post_attention(out, ctx)
+        return out, updated_cache
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if query.dtype == torch.float32:

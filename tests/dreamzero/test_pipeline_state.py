@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import OrderedDict
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.dreamzero import pipeline_dreamzero
 from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
 
@@ -57,3 +59,38 @@ def test_dreamzero_state_cache_access_requires_initialization() -> None:
 
     with pytest.raises(RuntimeError, match="create_kv_caches first"):
         state.update_kv_cache(0, torch.empty(0))
+
+
+def test_prefill_kv_cache_allocates_runtime_ulysses_local_heads(monkeypatch) -> None:
+    pipeline = _empty_pipeline()
+    state = DreamZeroState()
+    state.clip_feas = None
+    state.ys = None
+    pipeline.cfg_scale = 1.0
+    pipeline.transformer = SimpleNamespace(
+        dim=5120,
+        num_heads=40,
+        num_layers=1,
+        kv_cache_num_heads=lambda ulysses_degree=1: 40 // ulysses_degree,
+    )
+    seen: dict[str, tuple[int, ...]] = {}
+
+    def record_predict_noise_maybe_with_cfg(**kwargs):
+        kv_cache = kwargs["positive_kwargs"]["kv_cache"][0]
+        seen["kv_cache_shape"] = tuple(kv_cache.shape)
+
+    monkeypatch.setattr(pipeline, "predict_noise_maybe_with_cfg", record_predict_noise_maybe_with_cfg)
+    monkeypatch.setattr(pipeline_dreamzero, "get_current_diffusion_config_or_none", lambda: None)
+    monkeypatch.setattr(pipeline_dreamzero, "get_ulysses_parallel_world_size", lambda: 2, raising=False)
+
+    pipeline._prefill_kv_cache(
+        image_latents=torch.zeros(1, 1, 16, 2, 2),
+        prompt_embeds=torch.zeros(1, 1, 8),
+        negative_prompt_embeds=None,
+        frame_seqlen=1,
+        seq_len=1,
+        do_true_cfg=False,
+        state=state,
+    )
+
+    assert seen["kv_cache_shape"] == (2, 1, 0, 20, 128)

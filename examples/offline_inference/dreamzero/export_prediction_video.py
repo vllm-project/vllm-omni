@@ -5,8 +5,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import uuid
 from pathlib import Path
+
+# Match DreamZero serving defaults and avoid cuDNN backend auto-selection in offline export.
+os.environ.setdefault("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
 
 import cv2
 import numpy as np
