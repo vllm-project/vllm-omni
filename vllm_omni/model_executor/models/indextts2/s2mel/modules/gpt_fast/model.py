@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
+from vllm_omni.diffusion.layers.norm import RMSNorm
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -32,7 +33,7 @@ class AdaptiveLayerNorm(nn.Module):
         self.project_layer = nn.Linear(d_model, 2 * d_model)
         self.norm = norm
         self.d_model = d_model
-        self.eps = self.norm.eps
+        self.eps = getattr(self.norm, "eps", getattr(self.norm, "variance_epsilon", 1e-5))
 
     def forward(self, input: Tensor, embedding: Tensor = None) -> Tensor:
         if embedding is None:
@@ -276,20 +277,6 @@ class FeedForward(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
-
-    def forward(self, x: Tensor) -> Tensor:
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
 
 
 def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000, dtype: torch.dtype = torch.bfloat16) -> Tensor:

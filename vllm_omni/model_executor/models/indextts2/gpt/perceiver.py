@@ -8,7 +8,7 @@
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from torch import einsum, nn
+from torch import nn
 
 
 def exists(val):
@@ -25,20 +25,19 @@ class Attend(nn.Module):
     def __init__(self, dropout=0.0):
         super().__init__()
         self.dropout = dropout
-        self.attn_dropout = nn.Dropout(dropout)
 
     def forward(self, q, k, v, mask=None):
-        scale = q.shape[-1] ** -0.5
-        sim = einsum("b h i d, b h j d -> b h i j", q, k) * scale
-
+        attn_mask = None
         if exists(mask):
-            mask = rearrange(mask, "b j -> b 1 1 j")
-            sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
+            attn_mask = rearrange(mask, "b j -> b 1 1 j")
 
-        attn = sim.softmax(dim=-1)
-        attn = self.attn_dropout(attn)
-
-        return einsum("b h i j, b h j d -> b h i d", attn, v)
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
 
 
 class RMSNorm(nn.Module):
