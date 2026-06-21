@@ -1,0 +1,45 @@
+# MiniCPM-o 2.6 default deploy: 2-GPU layout.
+#
+# Stage 0 (thinker): GPU 0 — multimodal understanding, ~70% mem.
+# Stage 1 (talker) : GPU 1 — ConditionalChatTTS + DVAE + Vocos, ~80% mem.
+#
+# Other GPU layouts: minicpmo_2_6_8x4090.yaml.
+async_chunk: false
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.7
+    enforce_eager: true
+    tensor_parallel_size: 1
+    max_num_batched_tokens: 16384
+    devices: "0"
+    limit_mm_per_prompt:
+      video: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.8
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    devices: "1"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false
+
+platforms: {}
