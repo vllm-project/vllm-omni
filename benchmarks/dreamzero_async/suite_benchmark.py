@@ -261,7 +261,8 @@ def summarize_benchmark_suite(
                 "sync_mean_s": _round(sync_mean),
                 "async_mean_s": _round(async_mean),
                 "time_saved_mean_s": summary["time_saved_mean_s"],
-                "async_vs_sync_speedup": summary["speedup_mean"],
+                "closed_loop_speedup": summary.get("closed_loop_speedup_mean", summary["speedup_mean"]),
+                "exposed_wait_speedup": summary.get("exposed_wait_speedup_mean"),
                 "async_vs_baseline_async": _round(baseline_async / async_mean) if baseline_async and async_mean else None,
                 "sync_vs_baseline_sync": _round(baseline_sync / sync_mean) if baseline_sync and sync_mean else None,
                 "underruns": summary["async_underrun_total"],
@@ -282,16 +283,18 @@ def summarize_benchmark_suite(
 
 def write_comparison_table(path: Path, suite: dict[str, Any]) -> None:
     lines = [
-        "| Variant | Sync mean (s) | Async mean (s) | Raw async vs sync | Claim valid | Async vs baseline async | Underruns | Errors |",
-        "| --- | ---: | ---: | ---: | :---: | ---: | ---: | ---: |",
+        "| Variant | Sync mean (s) | Async mean (s) | Closed-loop speedup | Exposed wait speedup | Claim valid | Async vs baseline async | Underruns | Errors |",
+        "| --- | ---: | ---: | ---: | ---: | :---: | ---: | ---: | ---: |",
     ]
     for row in suite["comparison"]:
         async_vs_baseline = row["async_vs_baseline_async"]
         async_vs_baseline_text = "n/a" if async_vs_baseline is None else f"{async_vs_baseline:.3f}x"
+        wait_speedup = row["exposed_wait_speedup"]
+        wait_speedup_text = "n/a" if wait_speedup is None else f"{wait_speedup:.3f}x"
         claim_text = "yes" if row["speedup_claim_valid"] else "no"
         lines.append(
             f"| {row['name']} | {row['sync_mean_s']:.3f} | {row['async_mean_s']:.3f} | "
-            f"{row['async_vs_sync_speedup']:.3f}x | {claim_text} | {async_vs_baseline_text} | "
+            f"{row['closed_loop_speedup']:.3f}x | {wait_speedup_text} | {claim_text} | {async_vs_baseline_text} | "
             f"{row['underruns']} | {row['server_errors']} |"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

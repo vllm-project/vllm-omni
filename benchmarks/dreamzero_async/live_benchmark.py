@@ -30,6 +30,12 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -133,6 +139,8 @@ def _run_pair(args: argparse.Namespace, *, run_dir: Path, run_index: int, warmup
         _load_json(sync_dir / "summary.json"),
         _load_json(async_dir / "summary.json"),
         control_hz=args.control_hz,
+        sync_events=_load_jsonl(sync_dir / "client_events.jsonl"),
+        async_events=_load_jsonl(async_dir / "client_events.jsonl"),
     )
     pair_summary["run"] = {
         "index": run_index,
@@ -158,9 +166,23 @@ def _stdev(values: list[float]) -> float:
 def summarize_suite(pairs: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
     measured = [item for item in pairs if not item["run"]["warmup"]]
     speedups = [float(item["gain"]["speedup"]) for item in measured]
+    wait_speedups = [float(item["gain"]["exposed_wait_speedup"]) for item in measured]
     saved = [float(item["gain"]["time_saved_s"]) for item in measured]
+    exposed_wait_saved = [float(item["gain"]["exposed_wait_saved_s"]) for item in measured]
     sync_times = [float(item["sync_openpi"]["closed_loop_time_s"]) for item in measured]
     async_times = [float(item["dreamzero_async"]["closed_loop_time_s"]) for item in measured]
+    sync_waits = [float(item["sync_openpi"]["idle_time_s"]) for item in measured]
+    async_waits = [float(item["dreamzero_async"]["idle_proxy_s"]) for item in measured]
+    sync_avg_forwards = [
+        float(item["sync_openpi"]["avg_request_latency_s"])
+        for item in measured
+        if item["sync_openpi"].get("avg_request_latency_s") is not None
+    ]
+    async_avg_forward_gaps = [
+        float(item["dreamzero_async"]["avg_action_receive_gap_s"])
+        for item in measured
+        if item["dreamzero_async"].get("avg_action_receive_gap_s") is not None
+    ]
     async_underruns = [int(item["dreamzero_async"]["underruns"]) for item in measured]
     async_deadline_misses = [int(item["dreamzero_async"].get("deadline_miss_count", 0)) for item in measured]
     async_non_sim_conditioned = [
@@ -195,7 +217,14 @@ def summarize_suite(pairs: list[dict[str, Any]], args: argparse.Namespace) -> di
             "async_time_stdev_s": _stdev(async_times),
             "time_saved_mean_s": _mean(saved),
             "time_saved_stdev_s": _stdev(saved),
+            "sync_exposed_wait_mean_s": _mean(sync_waits),
+            "async_exposed_wait_mean_s": _mean(async_waits),
+            "exposed_wait_saved_mean_s": _mean(exposed_wait_saved),
+            "exposed_wait_speedup_mean": _mean(wait_speedups),
+            "sync_avg_request_latency_mean_s": _mean(sync_avg_forwards),
+            "async_avg_action_receive_gap_mean_s": _mean(async_avg_forward_gaps),
             "speedup_mean": _mean(speedups),
+            "closed_loop_speedup_mean": _mean(speedups),
             "speedup_stdev": _stdev(speedups),
             "async_underrun_total": sum(async_underruns),
             "async_deadline_miss_total": sum(async_deadline_misses),
@@ -219,7 +248,13 @@ def write_suite_table(path: Path, suite: dict[str, Any]) -> None:
         f"| Sync mean time (s) | {summary['sync_time_mean_s']:.3f} |",
         f"| Async mean time (s) | {summary['async_time_mean_s']:.3f} |",
         f"| Mean time saved (s) | {summary['time_saved_mean_s']:.3f} |",
-        f"| Raw mean speedup | {summary['speedup_mean']:.3f}x |",
+        f"| Closed-loop speedup | {summary['closed_loop_speedup_mean']:.3f}x |",
+        f"| Sync exposed wait mean (s) | {summary['sync_exposed_wait_mean_s']:.3f} |",
+        f"| Async exposed wait mean (s) | {summary['async_exposed_wait_mean_s']:.3f} |",
+        f"| Exposed wait saved mean (s) | {summary['exposed_wait_saved_mean_s']:.3f} |",
+        f"| Exposed wait speedup | {summary['exposed_wait_speedup_mean']:.3f}x |",
+        f"| Sync avg request latency (s) | {summary['sync_avg_request_latency_mean_s']:.3f} |",
+        f"| Async avg action receive gap (s) | {summary['async_avg_action_receive_gap_mean_s']:.3f} |",
         f"| Speedup claim valid | {summary['speedup_claim_valid']} |",
         f"| Valid speedup repeats | {summary['valid_speedup_repeats']} |",
         f"| Invalid speedup repeats | {summary['invalid_speedup_repeats']} |",

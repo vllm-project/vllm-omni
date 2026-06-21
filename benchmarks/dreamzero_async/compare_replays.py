@@ -42,27 +42,63 @@ def _validity(sync: dict[str, Any], async_summary: dict[str, Any]) -> dict[str, 
     }
 
 
-def summarize(sync: dict[str, Any], async_summary: dict[str, Any], *, control_hz: float) -> dict[str, Any]:
+def _mean(values: list[float]) -> float | None:
+    return _round(sum(values) / len(values)) if values else None
+
+
+def _sync_request_latencies(events: list[dict[str, Any]] | None) -> list[float]:
+    return [
+        float(event["data"]["latency_s"])
+        for event in events or []
+        if event.get("event") == "action_chunk_received" and "latency_s" in event.get("data", {})
+    ]
+
+
+def _async_receive_gaps(events: list[dict[str, Any]] | None) -> list[float]:
+    receive_times = [
+        float(event["t_s"])
+        for event in events or []
+        if event.get("event") == "action_chunk_received" and "t_s" in event
+    ]
+    return [receive_times[index] - receive_times[index - 1] for index in range(1, len(receive_times))]
+
+
+def summarize(
+    sync: dict[str, Any],
+    async_summary: dict[str, Any],
+    *,
+    control_hz: float,
+    sync_events: list[dict[str, Any]] | None = None,
+    async_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     sync_time = float(sync["total_closed_loop_time_s"])
     async_time = float(async_summary["total_elapsed_s"])
     async_execution_s = float(async_summary["executed_rows"]) / control_hz
+    sync_idle_s = float(sync["idle_time_s"])
     async_idle_proxy_s = max(0.0, async_time - async_execution_s)
+    wait_speedup = sync_idle_s / async_idle_proxy_s if async_idle_proxy_s > 0 else 0.0
+    closed_loop_speedup = sync_time / async_time if async_time > 0 else 0.0
+    sync_latencies = _sync_request_latencies(sync_events)
+    async_gaps = _async_receive_gaps(async_events)
     return {
         "config": {
             "control_hz": control_hz,
+            "action_execution_s": _round(async_execution_s),
         },
         "sync_openpi": {
             "action_chunk_count": sync["action_chunk_count"],
             "executed_rows": sync["executed_rows"],
             "closed_loop_time_s": sync_time,
-            "idle_time_s": sync["idle_time_s"],
+            "idle_time_s": sync_idle_s,
             "idle_ratio": sync["effective_control_idle_ratio"],
+            "avg_request_latency_s": _mean(sync_latencies),
         },
         "dreamzero_async": {
             "action_chunk_count": async_summary["action_chunk_count"],
             "executed_rows": async_summary["executed_rows"],
             "closed_loop_time_s": async_time,
             "idle_proxy_s": _round(async_idle_proxy_s),
+            "avg_action_receive_gap_s": _mean(async_gaps),
             "bootstrap_latency_s": async_summary["bootstrap_latency_s"],
             "underruns": async_summary["underruns"],
             "deadline_miss_count": async_summary.get("deadline_miss_count", 0),
@@ -77,7 +113,11 @@ def summarize(sync: dict[str, Any], async_summary: dict[str, Any], *, control_hz
         "gain": {
             "time_saved_s": _round(sync_time - async_time),
             "time_reduction_ratio": _round((sync_time - async_time) / sync_time) if sync_time > 0 else 0.0,
-            "speedup": _round(sync_time / async_time) if async_time > 0 else 0.0,
+            "closed_loop_speedup": _round(closed_loop_speedup),
+            "exposed_wait_saved_s": _round(sync_idle_s - async_idle_proxy_s),
+            "exposed_wait_speedup": _round(wait_speedup),
+            # Backward-compatible alias for older result readers.
+            "speedup": _round(closed_loop_speedup),
         },
         "validity": _validity(sync, async_summary),
     }
@@ -87,15 +127,20 @@ def write_result_table(path: Path, summary: dict[str, Any]) -> None:
     sync = summary["sync_openpi"]
     async_item = summary["dreamzero_async"]
     gain = summary["gain"]
+    config = summary["config"]
+    sync_avg = sync.get("avg_request_latency_s")
+    async_gap = async_item.get("avg_action_receive_gap_s")
     lines = [
-        "| Mode | Time (s) | Idle/proxy idle (s) | Action chunks | Executed rows | Underruns |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        "| Mode | Closed-loop time (s) | Exposed wait (s) | Avg forward/gap (s) | Action execution (s) | Chunks | Rows | Underruns |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         (
             f"| sync_openpi | {sync['closed_loop_time_s']:.3f} | {sync['idle_time_s']:.3f} | "
+            f"{'n/a' if sync_avg is None else f'{sync_avg:.3f}'} | {config['action_execution_s']:.3f} | "
             f"{sync['action_chunk_count']} | {sync['executed_rows']} | 0 |"
         ),
         (
             f"| dreamzero_async | {async_item['closed_loop_time_s']:.3f} | {async_item['idle_proxy_s']:.3f} | "
+            f"{'n/a' if async_gap is None else f'{async_gap:.3f}'} | {config['action_execution_s']:.3f} | "
             f"{async_item['action_chunk_count']} | {async_item['executed_rows']} | {async_item['underruns']} |"
         ),
         "",
@@ -105,7 +150,14 @@ def write_result_table(path: Path, summary: dict[str, Any]) -> None:
             "non-sim-conditioned: "
             f"{async_item['non_sim_conditioned_post_bootstrap_chunks']}."
         ),
-        f"Time saved: {gain['time_saved_s']:.3f}s ({gain['time_reduction_ratio']:.1%}); raw speedup: {gain['speedup']:.3f}x.",
+        (
+            f"Closed-loop time saved: {gain['time_saved_s']:.3f}s "
+            f"({gain['time_reduction_ratio']:.1%}); closed-loop speedup: {gain['closed_loop_speedup']:.3f}x."
+        ),
+        (
+            f"Exposed wait saved: {gain['exposed_wait_saved_s']:.3f}s; "
+            f"exposed wait speedup: {gain['exposed_wait_speedup']:.3f}x."
+        ),
     ]
     validity = summary["validity"]
     if validity["speedup_claim_valid"]:

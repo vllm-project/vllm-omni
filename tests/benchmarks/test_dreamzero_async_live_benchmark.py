@@ -85,11 +85,32 @@ def _args(tmp_path: Path) -> argparse.Namespace:
 
 
 def test_summarize_pair_computes_speedup_and_idle_proxy():
-    summary = summarize_pair(_sync_summary(12.0), _async_summary(9.0), control_hz=15.0)
+    sync_events = [
+        {"event": "action_chunk_received", "data": {"latency_s": 4.0}},
+        {"event": "action_chunk_received", "data": {"latency_s": 4.8}},
+    ]
+    async_events = [
+        {"event": "action_chunk_received", "t_s": 1.0, "data": {}},
+        {"event": "action_chunk_received", "t_s": 3.5, "data": {}},
+        {"event": "action_chunk_received", "t_s": 6.5, "data": {}},
+    ]
+
+    summary = summarize_pair(
+        _sync_summary(12.0),
+        _async_summary(9.0),
+        control_hz=15.0,
+        sync_events=sync_events,
+        async_events=async_events,
+    )
 
     assert summary["gain"]["time_saved_s"] == pytest.approx(3.0)
     assert summary["gain"]["speedup"] == pytest.approx(1.333333)
+    assert summary["gain"]["closed_loop_speedup"] == pytest.approx(1.333333)
+    assert summary["gain"]["exposed_wait_saved_s"] == pytest.approx(3.0)
+    assert summary["gain"]["exposed_wait_speedup"] == pytest.approx(1.517241)
     assert summary["dreamzero_async"]["idle_proxy_s"] == pytest.approx(5.8)
+    assert summary["sync_openpi"]["avg_request_latency_s"] == pytest.approx(4.4)
+    assert summary["dreamzero_async"]["avg_action_receive_gap_s"] == pytest.approx(2.75)
     assert summary["validity"]["speedup_claim_valid"] is True
 
 
@@ -153,6 +174,10 @@ def test_summarize_suite_skips_warmups_and_accumulates_failures(tmp_path: Path):
     assert suite["summary"]["sync_time_mean_s"] == pytest.approx(11.0)
     assert suite["summary"]["async_time_mean_s"] == pytest.approx(8.5)
     assert suite["summary"]["time_saved_mean_s"] == pytest.approx(2.5)
+    assert suite["summary"]["closed_loop_speedup_mean"] == pytest.approx(1.291667)
+    assert suite["summary"]["sync_exposed_wait_mean_s"] == pytest.approx(7.8)
+    assert suite["summary"]["async_exposed_wait_mean_s"] == pytest.approx(5.3)
+    assert suite["summary"]["exposed_wait_saved_mean_s"] == pytest.approx(2.5)
     assert suite["summary"]["async_underrun_total"] == 1
     assert suite["summary"]["async_deadline_miss_total"] == 0
     assert suite["summary"]["async_non_sim_conditioned_post_bootstrap_total"] == 0
@@ -172,7 +197,8 @@ def test_write_suite_table_and_json_payload_are_stable(tmp_path: Path):
     (tmp_path / "summary.json").write_text(json.dumps(suite, indent=2, sort_keys=True), encoding="utf-8")
 
     table = table_path.read_text(encoding="utf-8")
-    assert "| Raw mean speedup | 1.333x |" in table
+    assert "| Closed-loop speedup | 1.333x |" in table
+    assert "| Exposed wait speedup | 1.517x |" in table
     assert "| Speedup claim valid | True |" in table
     assert json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))["summary"]["measured_repeats"] == 1
 
@@ -198,6 +224,8 @@ def test_summarize_benchmark_suite_builds_pr_style_comparison(tmp_path: Path):
                 "async_time_mean_s": 10.0,
                 "time_saved_mean_s": 4.0,
                 "speedup_mean": 1.4,
+                "closed_loop_speedup_mean": 1.4,
+                "exposed_wait_speedup_mean": 1.8,
                 "async_underrun_total": 0,
                 "async_deadline_miss_total": 0,
                 "async_non_sim_conditioned_post_bootstrap_total": 0,
@@ -216,6 +244,8 @@ def test_summarize_benchmark_suite_builds_pr_style_comparison(tmp_path: Path):
                 "async_time_mean_s": 5.0,
                 "time_saved_mean_s": 2.0,
                 "speedup_mean": 1.4,
+                "closed_loop_speedup_mean": 1.4,
+                "exposed_wait_speedup_mean": 1.6,
                 "async_underrun_total": 1,
                 "async_deadline_miss_total": 0,
                 "async_non_sim_conditioned_post_bootstrap_total": 0,
@@ -234,7 +264,7 @@ def test_summarize_benchmark_suite_builds_pr_style_comparison(tmp_path: Path):
 
     assert suite["baseline"] == "baseline"
     assert suite["comparison"][1]["async_vs_baseline_async"] == pytest.approx(2.0)
-    assert "| faster | 7.000 | 5.000 | 1.400x | no | 2.000x | 1 | 0 |" in table_path.read_text(
+    assert "| faster | 7.000 | 5.000 | 1.400x | 1.600x | no | 2.000x | 1 | 0 |" in table_path.read_text(
         encoding="utf-8"
     )
 
