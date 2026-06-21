@@ -3234,9 +3234,9 @@ async def start_profile(raw_request: Request, request: ProfileRequest | None = N
         stages = request.stages if request else None
         logger.info("Starting profiler for stages: %s", stages if stages else "all")
         engine_client = raw_request.app.state.engine_client
-        result = await engine_client.start_profile(stages=stages)
+        await engine_client.start_profile(stages=stages)
         logger.info("Profiler started.")
-        return JSONResponse(content=result)
+        return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:
         logger.exception("Failed to start profiler: %s", e)
         raise HTTPException(
@@ -3260,9 +3260,9 @@ async def stop_profile(raw_request: Request, request: ProfileRequest | None = No
         stages = request.stages if request else None
         logger.info("Stopping profiler for stages: %s", stages if stages else "all")
         engine_client = raw_request.app.state.engine_client
-        result = await engine_client.stop_profile(stages=stages)
+        await engine_client.stop_profile(stages=stages)
         logger.info("Profiler stopped.")
-        return JSONResponse(content=result)
+        return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:
         logger.exception("Failed to stop profiler: %s", e)
         raise HTTPException(
