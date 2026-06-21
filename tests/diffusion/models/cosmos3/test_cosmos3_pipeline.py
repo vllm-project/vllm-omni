@@ -288,11 +288,19 @@ def stub_real_pipeline_init(monkeypatch: pytest.MonkeyPatch):
             return self
 
     class _StubDiffusersScheduler:
-        config = SimpleNamespace(flow_shift=1.0)
+        from_config_calls: list[dict[str, Any]] = []
+
+        def __init__(self, *, flow_shift: float = 1.0) -> None:
+            self.config = SimpleNamespace(flow_shift=flow_shift)
 
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
             return cls()
+
+        @classmethod
+        def from_config(cls, config, **kwargs):
+            cls.from_config_calls.append({"config": config, "kwargs": dict(kwargs)})
+            return cls(flow_shift=kwargs.get("flow_shift", getattr(config, "flow_shift", 1.0)))
 
     class _StubVideoProcessor:
         def __init__(self, *args, **kwargs) -> None:
@@ -303,6 +311,7 @@ def stub_real_pipeline_init(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(pipeline_cosmos3, "UniPCMultistepScheduler", _StubDiffusersScheduler)
     monkeypatch.setattr(pipeline_cosmos3, "VideoProcessor", _StubVideoProcessor)
     monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: torch.device("cpu"))
+    return _StubDiffusersScheduler
 
 
 def _make_od_config(*, sound_gen: bool) -> SimpleNamespace:
@@ -342,6 +351,21 @@ def test_pipeline_init_skips_tokenizer_when_sound_disabled(stub_real_pipeline_in
     assert pipeline.transformer.sound_gen is False
     assert not hasattr(pipeline.transformer, "audio_proj_in")
     assert not hasattr(pipeline.transformer, "audio_proj_out")
+
+
+def test_pipeline_init_rebuilds_scheduler_with_cosmos3_defaults(stub_real_pipeline_init) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    od_config = _make_od_config(sound_gen=False)
+    od_config.flow_shift = 2.5
+
+    pipeline = Cosmos3OmniDiffusersPipeline(od_config=od_config)
+
+    assert stub_real_pipeline_init.from_config_calls
+    call = stub_real_pipeline_init.from_config_calls[-1]
+    assert getattr(call["config"], "flow_shift") == 1.0
+    assert call["kwargs"] == {"flow_shift": 2.5, "use_karras_sigmas": False}
+    assert pipeline._engine_init_flow_shift == 2.5
 
 
 def test_pipeline_init_passes_tokenizer_attrs_into_transformer(
@@ -1107,7 +1131,18 @@ class TestForwardRouting:
     def _install_forward_stubs(self, pipeline):
         captured: dict[str, object] = {"diffuse_calls": [], "prepare_calls": []}
 
-        def fake_format(prompt, negative_prompt, num_frames, frame_rate, height, width, *args, **kwargs):
+        def fake_format(
+            prompt,
+            negative_prompt,
+            num_frames,
+            frame_rate,
+            height,
+            width,
+            max_sequence_length,
+            sp,
+            use_system_prompt=False,
+            is_t2i=False,
+        ):
             captured["format"] = {
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
@@ -1115,7 +1150,8 @@ class TestForwardRouting:
                 "frame_rate": frame_rate,
                 "height": height,
                 "width": width,
-                "is_t2i": kwargs["is_t2i"],
+                "use_system_prompt": use_system_prompt,
+                "is_t2i": is_t2i,
             }
             return _ids(2), _mask(), _ids(1), _mask()
 
@@ -1145,12 +1181,26 @@ class TestForwardRouting:
             (
                 {"prompt": "A painted robot", "modalities": ["image"]},
                 make_sampling_params(num_outputs_per_prompt=2),
-                {"key": "image", "is_t2i": True, "flow": [3.0], "steps": [50, 50], "frames": 1},
+                {
+                    "key": "image",
+                    "is_t2i": True,
+                    "use_system_prompt": True,
+                    "flow": [3.0],
+                    "steps": [50, 50],
+                    "frames": 1,
+                },
             ),
             (
                 "A warehouse robot",
                 make_sampling_params(),
-                {"key": "video", "is_t2i": False, "flow": [1.0], "steps": [35], "frames": 189},
+                {
+                    "key": "video",
+                    "is_t2i": False,
+                    "use_system_prompt": True,
+                    "flow": [1.0],
+                    "steps": [35],
+                    "frames": 189,
+                },
             ),
         ],
     )
@@ -1168,6 +1218,7 @@ class TestForwardRouting:
 
         assert expected["key"] in output.output
         assert captured["format"]["is_t2i"] is expected["is_t2i"]
+        assert captured["format"]["use_system_prompt"] is expected["use_system_prompt"]
         assert captured["format"]["num_frames"] == expected["frames"]
         assert captured["flow_shifts"] == expected["flow"]
         assert [call[0] for call in pipeline.scheduler.set_timesteps_calls] == expected["steps"]
@@ -1196,6 +1247,7 @@ class TestForwardRouting:
             )
         )
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["noisy_frame_mask"] is velocity_mask
+        assert captured["format"]["use_system_prompt"] is True
 
         video_tensor = torch.zeros(1, 3, 5, 16, 16)
         v2v_condition = torch.full((1, 2, 2, 1, 1), 4.0)
@@ -1222,6 +1274,7 @@ class TestForwardRouting:
         )
         assert captured["flow_shifts"][-1] == 10.0
         assert captured["format"]["negative_prompt"] == ""
+        assert captured["format"]["use_system_prompt"] is True
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["noisy_frame_mask"] is v2v_mask
         assert captured["diffuse_calls"][-1]["condition_latents"] is v2v_condition
 
@@ -1237,6 +1290,7 @@ class TestForwardRouting:
             )
         )
         assert captured["diffuse_calls"][-1]["sound_latents"] is sound_latents
+        assert captured["format"]["use_system_prompt"] is True
         assert output.output["audio_sample_rate"] == 10
 
         pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, action_gen=True, action_dim=4)
@@ -1262,6 +1316,7 @@ class TestForwardRouting:
             )
         )
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
+        assert captured["format"]["use_system_prompt"] is False
         assert output.custom_output["action"].shape == (1, 2, 2)
         assert "action_only_output" not in output.custom_output
 
@@ -1337,6 +1392,7 @@ class TestForwardRouting:
             "frame_rate": 15.0,
             "height": 16,
             "width": 16,
+            "use_system_prompt": False,
             "is_t2i": False,
         }
         assert "flow_shifts" not in captured

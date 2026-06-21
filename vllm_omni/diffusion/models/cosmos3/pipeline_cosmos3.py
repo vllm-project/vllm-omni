@@ -129,8 +129,9 @@ COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolutio
 COSMOS3_INVERSE_DURATION_TEMPLATE = "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS."
 COSMOS3_INVERSE_RESOLUTION_TEMPLATE = "This video is not of {height}x{width} resolution."
 COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE = "This image is not of {height}x{width} resolution."
-COSMOS3_SYSTEM_PROMPT = "You are a helpful assistant who will generate videos from a given prompt."
-COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate images from a given prompt."
+# NOTE: Intentional typo in "give" instead of "given" to match training setup.
+COSMOS3_SYSTEM_PROMPT = "You are a helpful assistant who will generate videos from a give prompt."
+COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate images from a give prompt."
 
 COSMOS3_T2V_DEFAULT_HEIGHT = 720
 COSMOS3_T2V_DEFAULT_WIDTH = 1280
@@ -732,8 +733,16 @@ class Cosmos3OmniDiffusersPipeline(
             subfolder="scheduler",
             local_files_only=local_files_only,
         )
-        if od_config.flow_shift is not None:
-            self.scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config, flow_shift=od_config.flow_shift)
+        init_flow_shift = (
+            od_config.flow_shift
+            if od_config.flow_shift is not None
+            else getattr(self.scheduler.config, "flow_shift", 1.0)
+        )
+        self.scheduler = UniPCMultistepScheduler.from_config(
+            self.scheduler.config,
+            flow_shift=init_flow_shift,
+            use_karras_sigmas=False,
+        )
         self._cpu_scheduler_state()
 
         # --- Video processor for post-decode ---
@@ -1410,7 +1419,9 @@ class Cosmos3OmniDiffusersPipeline(
         target = float(target_shift)
         if target == float(self._current_flow_shift):
             return
-        self.scheduler = UniPCMultistepScheduler.from_config(self._base_scheduler_config, flow_shift=target)
+        self.scheduler = UniPCMultistepScheduler.from_config(
+            self._base_scheduler_config, flow_shift=target, use_karras_sigmas=False
+        )
         self._cpu_scheduler_state()
         self._current_flow_shift = target
 
@@ -2909,7 +2920,7 @@ class Cosmos3OmniDiffusersPipeline(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
             or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", False))
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", not action_enabled))
 
         if action_enabled and action_video_tensor is None:
             extra_action_video = self._get_sp_param(sp, "action_video", None)
