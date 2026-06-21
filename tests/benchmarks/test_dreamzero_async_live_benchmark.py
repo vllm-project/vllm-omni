@@ -41,21 +41,26 @@ def _async_summary(
     time_s: float,
     *,
     chunks: int = 2,
+    executed_chunks: int | None = None,
     underruns: int = 0,
     errors: int = 0,
     realtime: bool | None = None,
     non_sim_chunks: list[int] | None = None,
     deadline_misses: int = 0,
+    missing_chunks: list[int] | None = None,
 ) -> dict:
     config = {} if realtime is None else {"realtime": realtime}
+    executed_chunks = chunks if executed_chunks is None else executed_chunks
     return {
         "action_chunk_count": chunks,
-        "executed_rows": chunks * 24,
+        "executed_chunk_indices": list(range(1, executed_chunks + 1)),
+        "executed_rows": executed_chunks * 24,
+        "missing_chunk_indices": missing_chunks or [],
         "total_elapsed_s": time_s,
         "bootstrap_latency_s": 4.5,
         "underruns": underruns,
         "deadline_miss_count": deadline_misses,
-        "sim_conditioned_post_bootstrap_chunks": [] if non_sim_chunks else list(range(2, chunks + 1)),
+        "sim_conditioned_post_bootstrap_chunks": [] if non_sim_chunks else list(range(2, executed_chunks + 1)),
         "non_sim_conditioned_post_bootstrap_chunks": non_sim_chunks or [],
         "server_error_count": errors,
         "config": config,
@@ -146,6 +151,30 @@ def test_summarize_pair_allows_waited_deadline_misses_with_full_coverage():
 
     assert summary["validity"]["speedup_claim_valid"] is True
     assert summary["dreamzero_async"]["deadline_miss_count"] == 1
+
+
+def test_summarize_pair_allows_extra_unused_lookahead_chunk():
+    summary = summarize_pair(
+        _sync_summary(12.0, chunks=2),
+        _async_summary(9.0, chunks=3, executed_chunks=2, realtime=True),
+        control_hz=15.0,
+    )
+
+    assert summary["dreamzero_async"]["action_chunk_count"] == 3
+    assert summary["dreamzero_async"]["executed_rows"] == 48
+    assert summary["validity"]["speedup_claim_valid"] is True
+
+
+def test_summarize_pair_rejects_missing_required_chunks():
+    summary = summarize_pair(
+        _sync_summary(12.0, chunks=2),
+        _async_summary(9.0, chunks=1, executed_chunks=1, realtime=True, missing_chunks=[2]),
+        control_hz=15.0,
+    )
+
+    assert summary["validity"]["speedup_claim_valid"] is False
+    assert "async executed row count differs from sync" in summary["validity"]["reason"]
+    assert "async missed required chunks: [2]" in summary["validity"]["reason"]
 
 
 def test_summarize_pair_rejects_non_sim_conditioned_post_bootstrap_chunks():

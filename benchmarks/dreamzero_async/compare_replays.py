@@ -29,8 +29,12 @@ def _validity(sync: dict[str, Any], async_summary: dict[str, Any]) -> dict[str, 
         reasons.append("async client reported underruns")
     if int(async_summary["executed_rows"]) != int(sync["executed_rows"]):
         reasons.append("async executed row count differs from sync")
-    if int(async_summary["action_chunk_count"]) != int(sync["action_chunk_count"]):
-        reasons.append("async action chunk count differs from sync")
+    missing_chunks = async_summary.get("missing_chunk_indices") or []
+    if missing_chunks:
+        reasons.append(f"async missed required chunks: {missing_chunks}")
+    executed_chunks = async_summary.get("executed_chunk_indices") or []
+    if executed_chunks and len(executed_chunks) != int(sync["action_chunk_count"]):
+        reasons.append("async executed chunk count differs from sync")
     if float(async_summary["total_elapsed_s"]) >= float(sync["total_closed_loop_time_s"]):
         reasons.append("async closed-loop time is not faster than sync")
     non_sim_conditioned = async_summary.get("non_sim_conditioned_post_bootstrap_chunks")
@@ -131,7 +135,7 @@ def write_result_table(path: Path, summary: dict[str, Any]) -> None:
     sync_avg = sync.get("avg_request_latency_s")
     async_gap = async_item.get("avg_action_receive_gap_s")
     lines = [
-        "| Mode | Closed-loop time (s) | Exposed wait (s) | Avg forward/gap (s) | Action execution (s) | Chunks | Rows | Underruns |",
+        "| Mode | Closed-loop time (s) | Exposed wait (s) | Avg forward/gap (s) | Action execution (s) | Received chunks | Rows | Underruns |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         (
             f"| sync_openpi | {sync['closed_loop_time_s']:.3f} | {sync['idle_time_s']:.3f} | "

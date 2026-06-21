@@ -207,6 +207,28 @@ def test_bde_kv_state_use_prefix_routes_reads_temporarily():
     assert torch.allclose(state.get_kv_caches(False, lambda: ["EMPTY"])[0], window(1, 9.0))
 
 
+def test_bde_kv_state_use_prefix_falls_back_when_branch_has_no_resident_blocks():
+    kv = make_cache()
+    state = BDEKVState(
+        kv,
+        kv.begin_request("linear-pos"),
+        kv.begin_request("linear-neg"),
+        num_layers=kv.num_layers,
+    )
+    key = entry_key(1)
+    state.entries.update_entry_kv(
+        key,
+        layer_idx=0,
+        updated_kv=window(1, 1.0),
+        is_negative=False,
+        seq_len=BLOCK,
+    )
+
+    with state.use_prefix((key,)):
+        assert torch.allclose(state.get_kv_caches(False, lambda: ["EMPTY"])[0], window(1, 1.0))
+        assert state.get_kv_caches(True, lambda: ["NEG_EMPTY"]) == ["NEG_EMPTY"]
+
+
 def test_bde_kv_state_write_entry_routes_writes_temporarily():
     kv = make_cache()
     state = BDEKVState(
@@ -242,6 +264,22 @@ def test_bde_kv_state_reads_current_entry_without_prefix_after_write():
         assert state.get_kv_caches(False, lambda: ["EMPTY"]) == ["EMPTY"]
         state.update_kv_cache(0, window(1, 1.0), False, seq_len=BLOCK)
         assert torch.allclose(state.get_kv_caches(False, lambda: ["EMPTY"])[0], window(1, 1.0))
+
+
+def test_bde_kv_state_write_entry_created_in_other_branch_uses_fallback_until_resident():
+    kv = make_cache()
+    state = BDEKVState(
+        kv,
+        kv.begin_request("linear-pos"),
+        kv.begin_request("linear-neg"),
+        num_layers=kv.num_layers,
+    )
+    o1_real = entry_key(1)
+
+    with state.write_entry(o1_real):
+        state.update_kv_cache(0, window(1, 1.0), False, seq_len=BLOCK)
+
+        assert state.get_kv_caches(True, lambda: ["NEG_EMPTY"]) == ["NEG_EMPTY"]
 
 
 def test_bde_kv_state_reads_prefix_plus_current_entry_after_write():

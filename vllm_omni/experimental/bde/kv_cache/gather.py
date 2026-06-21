@@ -172,14 +172,41 @@ class BDEKVState:
     def get_kv_caches(self, is_negative: bool, fallback) -> list:
         branch = "neg" if is_negative else "pos"
         if self._active_prefix_lease is not None:
-            if self._active_write_key is not None and self.entries.has_entry(self._active_write_key):
+            prefix_has_blocks = self.entries.prefix_has_resident_blocks(
+                self._active_prefix_lease.keys,
+                is_negative=is_negative,
+                allow_owner_released=True,
+            )
+            active_write_has_blocks = (
+                self._active_write_key is not None
+                and self.entries.has_entry(self._active_write_key)
+                and self.entries.has_resident_blocks(
+                    self._active_write_key,
+                    is_negative=is_negative,
+                )
+            )
+            if (
+                self._active_write_key is not None
+                and active_write_has_blocks
+            ):
                 return self.entries.get_leased_prefix_with_owned_suffix_kv_caches(
                     self._active_prefix_lease,
                     (self._active_write_key,),
                     is_negative=is_negative,
                 )
-            return self._active_prefix_lease.get_kv_caches(is_negative=is_negative)
-        if self._active_write_key is not None and self.entries.has_entry(self._active_write_key):
+            if prefix_has_blocks:
+                return self._active_prefix_lease.get_kv_caches(is_negative=is_negative)
+            out = fallback()
+            _log.info("BDE GET   [%s] source=model-local-empty-prefix layers=%d", branch, len(out))
+            return out
+        if (
+            self._active_write_key is not None
+            and self.entries.has_entry(self._active_write_key)
+            and self.entries.has_resident_blocks(
+                self._active_write_key,
+                is_negative=is_negative,
+            )
+        ):
             return self.entries.get_prefix_kv_caches((self._active_write_key,), is_negative=is_negative)
         if self._committed[is_negative] == 0:  # nothing committed yet (prefill start)
             out = fallback()

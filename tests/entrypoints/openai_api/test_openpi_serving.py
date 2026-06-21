@@ -69,6 +69,22 @@ class RecordingEngine:
         return _generate()
 
 
+class CleanupRecordingEngine(RecordingEngine):
+    def __init__(self):
+        super().__init__()
+        self.collective_rpc_calls = []
+
+    async def collective_rpc(self, method, *, timeout=None, kwargs=None):
+        self.collective_rpc_calls.append(
+            {
+                "method": method,
+                "timeout": timeout,
+                "kwargs": kwargs or {},
+            }
+        )
+        return [True]
+
+
 class ConcurrentRecordingEngine(RecordingEngine):
     def __init__(self, *, expected_calls: int):
         super().__init__()
@@ -245,6 +261,21 @@ def test_build_dreamzero_async_forward_request_adds_bde_metadata():
             {"session_id": "session-a", "session_epoch": 1, "observation_index": 1, "sim_depth": 0},
         ],
     }
+
+
+def test_cleanup_dreamzero_session_drops_bde_session_by_collective_rpc():
+    engine = CleanupRecordingEngine()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    asyncio.run(serving.cleanup_dreamzero_session("session-a"))
+
+    assert engine.collective_rpc_calls == [
+        {
+            "method": "drop_bde_session",
+            "timeout": 10.0,
+            "kwargs": {"session_id": "session-a"},
+        }
+    ]
 
 
 def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():

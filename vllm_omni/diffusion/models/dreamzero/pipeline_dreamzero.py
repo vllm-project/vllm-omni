@@ -61,6 +61,13 @@ MAX_DREAMZERO_SESSIONS = 64
 
 
 def _maybe_set_dynamo_recompile_limit() -> None:
+    """Raise Dynamo's limit for optimized DreamZero serving when requested.
+
+    W8 async serving uses BDE prefix views whose effective prefix shape changes
+    across rollout steps. With per-block fullgraph compilation, the default
+    Dynamo recompile limit can be too low and can fail long async rollouts even
+    though the optimized path is otherwise valid.
+    """
     recompile_limit = os.environ.get("VLLM_OMNI_DREAMZERO_RECOMPILE_LIMIT")
     if not recompile_limit:
         return
@@ -235,6 +242,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         local_files_only = os.path.exists(model_path)
         self.od_config = od_config
         ensure_transforms_loaded()
+        # Keep this before compile setup. The optimized W1/W8 DreamZero path can
+        # need a higher Dynamo recompile limit for async BDE prefix variation.
+        _maybe_set_dynamo_recompile_limit()
         self.default_robot_embodiment = model_config.get(
             "default_robot_embodiment",
             DEFAULT_EMBODIMENT,
@@ -488,8 +498,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if not torch.cuda.is_available():
             logger.info("DreamZero setup_compile skipped: CUDA not available.")
             return
-
-        _maybe_set_dynamo_recompile_limit()
 
         from vllm_omni.diffusion.models.dreamzero.wan_vae_feat_cache_patch import (
             apply_wan_vae_feat_cache_tensor_patch,
@@ -1182,30 +1190,33 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             if negative_prompt_embeds is not None:
                 self._kv_populate_cross(negative_prompt_embeds, state.clip_feas, is_negative=True)
 
-        latent_video = dreamzero_async.get("latent_video")
-        if state.current_start_frame != 0 and latent_video is not None:
-            if not torch.is_tensor(latent_video):
-                latent_video = torch.as_tensor(latent_video)
-            if latent_video.dim() != 5:
-                raise ValueError(f"latent_video must have shape (B, C, T, H, W), got {tuple(latent_video.shape)}")
-            image = latent_video.to(device=device, dtype=videos.dtype)
-        elif state.current_start_frame != 0:
-            # Subsequent calls: encode current observation via VAE
-            if (num_frames_raw - 1) // 4 == self.num_frame_per_block:
-                pass
-            elif num_frames_raw // 4 != self.num_frame_per_block:
-                repeat_factor = self.num_frame_per_block // (num_frames_raw // 4)
-                videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
-                first_frame = videos[:, :, 0:1]
-                videos = torch.cat([first_frame, videos], dim=2)
+        if state.current_start_frame != 0:
+            latent_video = dreamzero_async.get("latent_video")
+            if latent_video is not None:
+                if not torch.is_tensor(latent_video):
+                    latent_video = torch.as_tensor(latent_video)
+                if latent_video.dim() != 5:
+                    raise ValueError(
+                        f"latent_video must have shape (B, C, T, H, W), got {tuple(latent_video.shape)}"
+                    )
+                image = latent_video.to(device=device, dtype=videos.dtype)
             else:
-                first_frame = videos[:, :, 0:1]
-                videos = torch.cat([first_frame, videos], dim=2)
+                # Subsequent calls: encode current observation via VAE
+                if (num_frames_raw - 1) // 4 == self.num_frame_per_block:
+                    pass
+                elif num_frames_raw // 4 != self.num_frame_per_block:
+                    repeat_factor = self.num_frame_per_block // (num_frames_raw // 4)
+                    videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
+                    first_frame = videos[:, :, 0:1]
+                    videos = torch.cat([first_frame, videos], dim=2)
+                else:
+                    first_frame = videos[:, :, 0:1]
+                    videos = torch.cat([first_frame, videos], dim=2)
 
-            latent_dtype = videos.dtype
-            with torch.no_grad():
-                image = self._encode_vae_latents(videos)
-            image = image.to(dtype=latent_dtype)
+                latent_dtype = videos.dtype
+                with torch.no_grad():
+                    image = self._encode_vae_latents(videos)
+                image = image.to(dtype=latent_dtype)
 
         batch_size = image.shape[0]
         generator = torch.Generator(device=device).manual_seed(self.seed)

@@ -118,6 +118,14 @@ def main() -> None:
         f"steady_mean={mean_steady * 1000:.1f}ms (n={len(steady)})  total={sum(per_forward):.2f}s{mem_str}"
     )
 
+    if args.timing is not None:
+        args.timing.parent.mkdir(parents=True, exist_ok=True)
+        args.timing.write_text(json.dumps(summary, indent=2))
+        print(f"[perf:{args.tag}] SAVED_TIMING={args.timing}")
+
+    if args.latents is None and args.video is None:
+        return
+
     # Decode once (after timing) so latents + the final video are both saved.
     latents = torch.cat([E._extract_latents(o) for o in outputs], dim=2)
     if args.latents is not None:
@@ -129,10 +137,6 @@ def main() -> None:
         args.video.parent.mkdir(parents=True, exist_ok=True)
         E._write_mp4(args.video, frames, fps=args.fps)
         print(f"[perf:{args.tag}] SAVED_MP4={args.video} frames={frames.shape[0]}")
-    if args.timing is not None:
-        args.timing.parent.mkdir(parents=True, exist_ok=True)
-        args.timing.write_text(json.dumps(summary, indent=2))
-        print(f"[perf:{args.tag}] SAVED_TIMING={args.timing}")
 
 
 if __name__ == "__main__":

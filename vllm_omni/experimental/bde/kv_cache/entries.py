@@ -124,6 +124,34 @@ class BDECacheEntryStore:
     def has_entry(self, key: BDECacheEntryKey) -> bool:
         return key in self._entries and not self._entries[key].owner_released
 
+    def has_resident_blocks(
+        self,
+        key: BDECacheEntryKey,
+        *,
+        is_negative: bool,
+        allow_owner_released: bool = False,
+    ) -> bool:
+        return self.prefix_has_resident_blocks(
+            (key,),
+            is_negative=is_negative,
+            allow_owner_released=allow_owner_released,
+        )
+
+    def prefix_has_resident_blocks(
+        self,
+        keys: Iterable[BDECacheEntryKey],
+        *,
+        is_negative: bool,
+        allow_owner_released: bool = False,
+    ) -> bool:
+        return bool(
+            self._prefix_block_ids(
+                keys,
+                is_negative=is_negative,
+                allow_owner_released=allow_owner_released,
+            )
+        )
+
     def lease_entries(self, keys: Iterable[BDECacheEntryKey]) -> BDECacheEntryLease:
         key_tuple = tuple(keys)
         if not key_tuple:

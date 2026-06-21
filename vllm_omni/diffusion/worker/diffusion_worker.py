@@ -396,7 +396,11 @@ class DiffusionWorker:
         return output
 
     def drop_bde_session(self, session_id: str) -> bool:
-        """Drop one BDE session if the active model runner supports it."""
+        """Drop one BDE session if the active model runner supports it.
+
+        Called by OpenPI serving through engine ``collective_rpc`` when a
+        websocket session closes or switches sessions.
+        """
         drop_session = getattr(self.model_runner, "drop_bde_session", None)
         if drop_session is None:
             return False
