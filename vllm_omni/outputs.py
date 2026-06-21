@@ -54,6 +54,12 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
+    # IDs of requests whose forward was skipped this step (text starving).
+    # Scheduler rolls back num_computed_tokens for these requests.
+    streaming_starving_req_ids: set[str] | None = None
+    # IDs of requests whose streaming text input is fully drained (finished +
+    # EOS consumed + tail empty). Scheduler force-finishes these requests.
+    streaming_drained_req_ids: set[str] | None = None
 
 
 @dataclass

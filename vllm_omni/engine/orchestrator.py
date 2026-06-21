@@ -42,6 +42,7 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
     StageMetricsMessage,
     StageSubmissionMessage,
+    StreamingTextExtendMessage,
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.serialization import serialize_additional_information
@@ -393,6 +394,8 @@ class Orchestrator:
                 await self._handle_add_request(msg)
             elif msg_type == "streaming_update":
                 await self._handle_streaming_update(msg)
+            elif msg_type == "streaming_text_extend":
+                await self._handle_streaming_text_extend(msg)
             elif msg_type == "add_companion_request":
                 await self._handle_add_companion(msg)
             elif msg_type == "abort":
@@ -1415,6 +1418,50 @@ class Orchestrator:
             request_id=req_id,
             tx_ms=_tx_ms,
         )
+
+    async def _handle_streaming_text_extend(self, msg: StreamingTextExtendMessage) -> None:
+        request_id = msg.request_id
+        new_text = msg.new_text
+        finished = msg.finished
+
+        # The client extends by the base API request id (e.g. "speech-<uuid>"),
+        # but the orchestrator tracks requests (and the worker keys its model
+        # buffer) under a per-request global/stage id that appends a suffix
+        # ("speech-<uuid>-<hex>"). Resolve the tracked id so the update lands on
+        # the right request instead of being silently dropped.
+        if request_id not in self.request_states:
+            prefix = request_id + "-"
+            resolved = next((k for k in self.request_states if k.startswith(prefix)), None)
+            if resolved is None:
+                return
+            request_id = resolved
+
+        state_update: dict[str, Any] = {}
+        if new_text:
+            state_update["streaming_text_new_text"] = new_text
+        if finished:
+            state_update["streaming_text_finished"] = True
+        if not state_update:
+            return
+
+        try:
+            pool = self.stage_pools[0]
+            replica_id = pool.get_bound_replica_id(request_id)
+            if replica_id is None:
+                return
+            await pool.collective_rpc(
+                replica_id,
+                "update_model_state",
+                args=(request_id, state_update),
+            )
+            logger.info(
+                "[Orchestrator] streaming_text_extend OK req=%s text_len=%d finished=%s",
+                request_id,
+                len(new_text) if new_text else 0,
+                finished,
+            )
+        except Exception as exc:
+            logger.warning("[Orchestrator] streaming_text_extend failed for req=%s: %s", request_id, exc)
 
     async def _prewarm_async_chunk_stages(
         self,

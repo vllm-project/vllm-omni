@@ -1122,6 +1122,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 scheduler_output.total_num_scheduled_tokens,
             )
 
+        _skip_ids_bk = getattr(self, "_streaming_starving_req_ids", set()) | getattr(
+            self,
+            "_streaming_drained_req_ids",
+            set(),
+        )
+        if _skip_ids_bk and valid_sampled_token_ids is not None:
+            for rid in _skip_ids_bk:
+                idx = req_id_to_index_output_copy.get(rid)
+                if idx is not None and idx < len(valid_sampled_token_ids):
+                    valid_sampled_token_ids[idx] = []
+
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
@@ -1197,6 +1208,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # OmniModelRunnerOutput.pooler_output (which is set to None below).
         # The actual multimodal wire transport uses multimodal_outputs instead.
         pooler_output: list[dict[str, object]] | None = None
+        _skip_ids = getattr(self, "_streaming_starving_req_ids", set()) | getattr(
+            self,
+            "_streaming_drained_req_ids",
+            set(),
+        )
+        if _skip_ids:
+            downstream_req_id_set -= _skip_ids
+            downstream_req_ids = [rid for rid in downstream_req_ids if rid in downstream_req_id_set]
+            needs_pooler_payload = len(downstream_req_ids) > 0
+
         if needs_pooler_payload:
             mm_cpu = None
             if self.omni_prefix_cache is not None:
@@ -1326,6 +1347,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             output.kv_extracted_req_ids = kv_extracted_req_ids
             output.omni_connector_output = self.get_omni_connector_output()
             output.routed_experts = routed_experts_lists
+            starving = getattr(self, "_streaming_starving_req_ids", None)
+            if starving:
+                output.streaming_starving_req_ids = starving
+            drained = getattr(self, "_streaming_drained_req_ids", None)
+            if drained:
+                output.streaming_drained_req_ids = drained
 
         if not self.use_async_scheduling:
             return output

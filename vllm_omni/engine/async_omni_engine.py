@@ -43,6 +43,7 @@ from vllm_omni.engine.messages import (
     ErrorMessage,
     ShutdownRequestMessage,
     StageSubmissionMessage,
+    StreamingTextExtendMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.serialization import (
@@ -1320,6 +1321,17 @@ class AsyncOmniEngine:
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
+        )
+
+    def extend_streaming_text(self, request_id: str, *, new_text: str, finished: bool) -> None:
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+        self.request_queue.sync_q.put_nowait(
+            StreamingTextExtendMessage(
+                request_id=request_id,
+                new_text=new_text,
+                finished=finished,
+            )
         )
 
     def add_streaming_update(

@@ -1387,8 +1387,15 @@ class OmniGPUModelRunner(GPUModelRunner):
                 postprocess_uses_hidden_states = getattr(self.model, "postprocess_uses_hidden_states", True)
                 postprocess_uses_multimodal_outputs = getattr(self.model, "postprocess_uses_multimodal_outputs", True)
                 postprocess_uses_req_infos = getattr(self.model, "postprocess_uses_req_infos", True)
+                _skip_ids = getattr(self, "_streaming_starving_req_ids", set()) | getattr(
+                    self,
+                    "_streaming_drained_req_ids",
+                    set(),
+                )
                 for req_index, req_id in enumerate(self.input_batch.req_ids):
                     if req_ids_filter is not None and req_id not in req_ids_filter:
+                        continue
+                    if req_id in _skip_ids:
                         continue
                     req_infos = self.model_intermediate_buffer.get(req_id, {}) if postprocess_uses_req_infos else {}
                     if postprocess_uses_hidden_states:
@@ -1518,6 +1525,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ):
         """Align with v0.14.0 preprocess and omni's additional information handling."""
+        self._streaming_starving_req_ids: set[str] = set()
+        self._streaming_drained_req_ids: set[str] = set()
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
@@ -1722,6 +1731,18 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
                 )
+
+                # Streaming text starving: model returned None embeds to signal
+                # it needs more input.  Merge the update (sets streaming_wait_for_input)
+                # and skip this request's forward pass.
+                if req_embeds is None:
+                    self._merge_additional_information_update(req_id, update_dict)
+                    if update_dict.get("streaming_text_drained"):
+                        self._streaming_drained_req_ids.add(req_id)
+                    else:
+                        self._streaming_starving_req_ids.add(req_id)
+                    continue
+
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
                         (input_ids.shape[0], req_embeds.shape[-1]),
@@ -1753,6 +1774,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             # run talker mtp decode
             if self.has_talker_mtp:
                 self._talker_mtp_forward(decode_req_ids, inputs_embeds, decode_start_offsets)
+
+        skipped_ids = self._streaming_starving_req_ids | self._streaming_drained_req_ids
+        if skipped_ids and inputs_embeds is not None:
+            for req_index, req_id in enumerate(self.input_batch.req_ids):
+                if req_id in skipped_ids:
+                    s = int(self.query_start_loc.cpu[req_index])
+                    e = s + int(num_scheduled_tokens_np[req_index])
+                    inputs_embeds[s:e].zero_()
 
         return (
             input_ids,

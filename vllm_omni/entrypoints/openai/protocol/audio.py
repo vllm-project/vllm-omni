@@ -145,6 +145,18 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
     )
+    streaming_text_input: bool = Field(
+        default=False,
+        description="Internal flag: set by token_level streaming handler to enable "
+        "incremental text embedding append in the Talker model.",
+    )
+    streaming_drain_max_steps: int = Field(
+        default=100,
+        ge=0,
+        description="Max decode steps after text input is fully drained before "
+        "runtime force-finishes the request. 0 means force-finish immediately "
+        "when text + EOS are consumed (no grace period for natural codec EOS).",
+    )
 
     @field_validator("stream_format")
     @classmethod
@@ -463,9 +475,35 @@ class StreamingSpeechSessionConfig(BaseModel):
             "'clause' also splits on CJK commas ， and semicolons ；."
         ),
     )
+    streaming_mode: Literal["sentence", "token_level"] = Field(
+        default="sentence",
+        description=(
+            "Text input streaming mode: 'sentence' (default) waits for sentence boundaries "
+            "before submitting to TTS; 'token_level' feeds text incrementally to a single "
+            "TTS request via engine-level streaming updates."
+        ),
+    )
+    streaming_drain_max_steps: int = Field(
+        default=100,
+        ge=0,
+        description=(
+            "Max decode steps after text + EOS are fully consumed before "
+            "runtime force-finishes the request. Only used in token_level mode."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
+        if self.streaming_mode == "token_level":
+            if self.response_format != "pcm":
+                raise ValueError(
+                    "token_level streaming requires response_format='pcm'. "
+                    f"Got response_format='{self.response_format}'."
+                )
+            self.stream_audio = True
+            if self.speed is not None and self.speed != 1.0:
+                raise ValueError("Speed adjustment is not supported in token_level mode.")
+            self.speed = 1.0
         if self.stream_audio:
             if self.response_format != "pcm":
                 raise ValueError(

@@ -44,6 +44,13 @@ class AbortRequestMessage(EngineQueueMessage, kw_only=True):
     request_ids: list[str]
 
 
+class StreamingTextExtendMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["streaming_text_extend"] = "streaming_text_extend"
+    request_id: str
+    new_text: str
+    finished: bool
+
+
 class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["collective_rpc"] = "collective_rpc"
     rpc_id: str

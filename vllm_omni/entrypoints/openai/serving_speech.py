@@ -2865,6 +2865,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         elif params["task_type"][0] == "VoiceDesign":
             params["non_streaming_mode"] = [True]
 
+        if request.streaming_text_input:
+            params["streaming_text_input"] = [True]
+            params["streaming_drain_max_steps"] = [request.streaming_drain_max_steps]
+
         return params
 
     # ---- Voxtral TTS helpers ----

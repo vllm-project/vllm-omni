@@ -337,6 +337,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 except Exception:
                     init_logger(__name__).exception("Failed to pre-process KV extraction for %s", req_id)
 
+        # Roll back num_computed_tokens for requests that were skipped during
+        # forward (streaming text starving). schedule() already incremented
+        # num_computed_tokens before execute_model, but the model runner
+        # skipped these requests, so no token was actually computed.
+        starving_ids = getattr(model_runner_output, "streaming_starving_req_ids", None) or set()
+        for sid in starving_ids:
+            req = self.requests.get(sid)
+            if req is not None and sid in num_scheduled_tokens:
+                req.num_computed_tokens -= num_scheduled_tokens[sid]
+
+        # Force-finish requests whose streaming text input is fully drained.
+        # Same rollback as starving (forward was skipped), then mark FINISHED.
+        drained_ids = getattr(model_runner_output, "streaming_drained_req_ids", None) or set()
+        for did in drained_ids:
+            req = self.requests.get(did)
+            if req is not None:
+                if did in num_scheduled_tokens:
+                    req.num_computed_tokens -= num_scheduled_tokens[did]
+                if not req.is_finished():
+                    req.status = RequestStatus.FINISHED_STOPPED
+
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -346,6 +367,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # Skip requests that were recovered from KV load failure
+                continue
+            if req_id in starving_ids:
+                continue
+            if req_id in drained_ids:
+                request = self.requests.get(req_id)
+                if request is not None and request.is_finished():
+                    finish_reason = request.get_finished_reason()
+                    finished = self._handle_stopped_request(request)
+                    if finished:
+                        self._free_request(request)
+                    stopped_running_reqs.add(request)
+                    outputs[request.client_index].append(
+                        EngineCoreOutput(
+                            request_id=req_id,
+                            new_token_ids=[],
+                            finish_reason=finish_reason,
+                            events=request.take_events(),
+                            trace_headers=request.trace_headers,
+                            num_cached_tokens=request.num_cached_tokens,
+                        )
+                    )
                 continue
             request = self.requests.get(req_id)
             if request is None or request.is_finished():

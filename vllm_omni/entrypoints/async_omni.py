@@ -771,6 +771,9 @@ class AsyncOmni(EngineClient, OmniBase):
             return all(bool(item) for item in result)
         return bool(result)
 
+    def extend_streaming_text(self, request_id: str, *, new_text: str, finished: bool) -> None:
+        self.engine.extend_streaming_text(request_id, new_text=new_text, finished=finished)
+
     async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort request(s) via the Orchestrator."""
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)

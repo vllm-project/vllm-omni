@@ -106,6 +106,47 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
+    def update_model_state(self, req_id: str, state: dict) -> None:
+        """Update a running request's model_intermediate_buffer directly.
+
+        Called via collective_rpc from the orchestrator to inject streaming
+        text updates into the Talker model without going through the scheduler.
+
+        Special handling for streaming_text_new_text: append to existing
+        unconsumed text instead of overwriting, so rapid consecutive chunks
+        don't lose data.
+        """
+        new_text = state.get("streaming_text_new_text")
+        if isinstance(new_text, str) and new_text:
+            existing = self.model_runner.model_intermediate_buffer.get(req_id, {})
+            old_text = existing.get("streaming_text_new_text")
+            if isinstance(old_text, str) and old_text:
+                state = dict(state)
+                state["streaming_text_new_text"] = old_text + new_text
+                logger.info(
+                    "[Worker] update_model_state req=%s APPEND text old=%d new=%d total=%d",
+                    req_id,
+                    len(old_text),
+                    len(new_text),
+                    len(state["streaming_text_new_text"]),
+                )
+            else:
+                logger.info(
+                    "[Worker] update_model_state req=%s SET text len=%d",
+                    req_id,
+                    len(new_text),
+                )
+        else:
+            keys = list(state.keys())
+            logger.info("[Worker] update_model_state req=%s keys=%s", req_id, keys)
+        self.model_runner._update_intermediate_buffer(req_id, state)
+
+        if new_text or state.get("streaming_text_finished"):
+            buf = self.model_runner.model_intermediate_buffer.get(req_id)
+            if buf is not None:
+                buf["streaming_wait_for_input"] = False
+            logger.info("[Worker] cleared streaming_wait_for_input for req=%s", req_id)
+
     def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK:
         """
         Explicitly handle sleep commands.

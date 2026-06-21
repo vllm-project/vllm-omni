@@ -12,6 +12,7 @@
 #     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
 #     set true to disable that path in eager mode.
 async_chunk: true
+streaming_text_enabled: true
 
 connectors:
   connector_of_shared_memory:

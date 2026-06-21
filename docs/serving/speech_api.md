@@ -247,7 +247,80 @@ All REST API parameters are supported, plus:
 |-----------|------|---------|-------------|
 | `stream_audio` | bool | false | Stream one or more PCM chunks per sentence over WebSocket |
 | `split_granularity` | string | "sentence" | Text splitting granularity |
+| `streaming_mode` | string | "sentence" | `"sentence"` waits for sentence boundaries before submitting to TTS; `"token_level"` feeds text incrementally into a single TTS request (see below) |
+| `streaming_drain_max_steps` | int | 100 | token_level only: max decode steps after text + EOS are fully consumed before the runtime force-finishes the request |
 
+## Token-Level Streaming Text Input (WebSocket)
+
+The default `streaming_mode="sentence"` buffers text until a sentence boundary, then
+runs one TTS request per sentence. `streaming_mode="token_level"` instead starts a
+**single** TTS request from an initial text buffer and extends that same request with
+later text chunks via engine-level streaming updates — so audio for the beginning of an
+utterance can start before the rest of the text has arrived (e.g. while an upstream LLM is
+still producing tokens), without rebuilding the request.
+
+### Enabling the feature
+
+Token-level streaming is **off by default** and must be enabled per model at deploy time
+by setting `streaming_text_enabled: true` at the top level of the deploy YAML
+(`vllm_omni/deploy/qwen3_tts.yaml` ships with it on). It is currently supported by
+Qwen3-TTS. If a client requests `streaming_mode="token_level"` against a server that did
+not enable it, the session is rejected with an `error` frame.
+
+```yaml
+# vllm_omni/deploy/qwen3_tts.yaml
+streaming_text_enabled: true   # enable token-level streaming text input
+```
+
+### Constraints
+
+- `response_format` must be `"pcm"` (the handler forces `stream_audio=true`).
+- `speed` must be `1.0` (or omitted).
+
+### Message flow
+
+1. Client sends `session.config` with `streaming_mode: "token_level"` and `response_format: "pcm"`.
+2. Client sends one or more `input.text` chunks. The server buffers an initial ~60
+   characters, submits one TTS request, and emits `audio.start`.
+3. Audio streams back as binary PCM frames while the client keeps sending `input.text`
+   chunks; each chunk is appended to the **same** request.
+4. Client sends `input.done`; the server appends an end-of-text marker and lets the
+   request drain, then emits `audio.done` and `session.done`.
+
+### Example client
+
+```python
+import asyncio, json, websockets
+
+async def main():
+    async with websockets.connect("ws://localhost:8091/v1/audio/speech/stream") as ws:
+        await ws.send(json.dumps({
+            "type": "session.config",
+            "voice": "vivian",
+            "streaming_mode": "token_level",
+            "response_format": "pcm",
+        }))
+        # Feed text incrementally (e.g. tokens streamed from an upstream LLM).
+        for chunk in ["Hello there, ", "this is token level ", "streaming. "]:
+            await ws.send(json.dumps({"type": "input.text", "text": chunk}))
+        await ws.send(json.dumps({"type": "input.done"}))
+
+        audio = bytearray()
+        while True:
+            msg = await ws.recv()
+            if isinstance(msg, bytes):
+                audio.extend(msg)            # PCM s16le, 24 kHz mono
+            else:
+                evt = json.loads(msg)
+                if evt["type"] == "session.done":
+                    break
+        print("received", len(audio), "PCM bytes")
+
+asyncio.run(main())
+```
+
+A runnable version with incremental-feed timing is at
+`examples/online_serving/text_to_speech/qwen3_tts/token_level_streaming_client.py`.
 
 ```bash
 DELETE /v1/audio/voices/{name}

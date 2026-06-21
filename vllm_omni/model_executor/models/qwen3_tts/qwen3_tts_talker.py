@@ -684,6 +684,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     info_update.setdefault("codes", {})["ref"] = ref_code.detach().to("cpu").contiguous()
                 if ref_code_len is not None:
                     info_update["meta"]["ref_code_len"] = int(ref_code_len)
+                st_input_flag = info_dict.get("streaming_text_input")
+                if isinstance(st_input_flag, list):
+                    st_input_flag = st_input_flag[0] if st_input_flag else False
+                if st_input_flag:
+                    info_update["meta"]["streaming_text_input"] = True
+                    drain_max_raw = info_dict.get("streaming_drain_max_steps")
+                    if isinstance(drain_max_raw, list):
+                        drain_max_raw = drain_max_raw[0] if drain_max_raw else None
+                    if drain_max_raw is not None:
+                        info_update["meta"]["streaming_drain_max_steps"] = int(drain_max_raw)
                 # First prefill: source the slice offset from `_omni_num_computed_tokens`
                 # so cache-recovery (prefill replay at a later offset) lands on the right
                 # slice of the stored embeddings. Subsequent chunks below advance from
@@ -724,8 +734,71 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # (request-independent buffer) — no per-request fetch needed.
 
         tail = hs.get("trailing_text")
+        is_streaming_text = bool(meta.get("streaming_text_input"))
+        eos_injected_this_step = False
+        if is_streaming_text:
+            new_raw_text = info_dict.get("streaming_text_new_text")
+            if isinstance(new_raw_text, str) and new_raw_text:
+                tok = self._get_tokenizer()
+                raw_ids = tok(new_raw_text, return_tensors="pt", padding=False, add_special_tokens=False)["input_ids"]
+                raw_ids = raw_ids.to(device=input_ids.device)
+                raw_embeds = self.text_projection(self.text_embedding(raw_ids)).squeeze(0)
+                if isinstance(tail, torch.Tensor) and tail.ndim == 2 and tail.shape[0] > 0:
+                    tail = torch.cat([tail, raw_embeds.to(device=tail.device, dtype=tail.dtype)], dim=0)
+                else:
+                    tail = raw_embeds.to(device=input_ids.device, dtype=dtype)
+            if bool(info_dict.get("streaming_text_finished")) and not bool(meta.get("streaming_eos_appended")):
+                eos_ids = torch.tensor([[self.config.tts_eos_token_id]], device=input_ids.device, dtype=torch.long)
+                eos_embed = self.text_projection(self.text_embedding(eos_ids)).squeeze(0).to(dtype=dtype)
+                if isinstance(tail, torch.Tensor) and tail.ndim == 2 and tail.shape[0] > 0:
+                    tail = torch.cat([tail, eos_embed.to(device=tail.device, dtype=tail.dtype)], dim=0)
+                else:
+                    tail = eos_embed
+                eos_injected_this_step = True
+
         text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
         trailing_text_update = None
+        if is_streaming_text and (not isinstance(tail, torch.Tensor) or tail.ndim != 2 or tail.shape[0] == 0):
+            if not bool(info_dict.get("streaming_text_finished")):
+                return (
+                    input_ids,
+                    None,
+                    {
+                        "hidden_states": {
+                            "trailing_text": torch.empty(
+                                (0, tts_pad_embed.shape[-1]),
+                                device=input_ids.device,
+                                dtype=dtype,
+                            )
+                        },
+                        "meta": {
+                            "streaming_wait_for_input": True,
+                        },
+                        "streaming_text_new_text": None,
+                        "streaming_text_new_ids": None,
+                    },
+                )
+            if bool(meta.get("streaming_eos_appended")):
+                drain_step = int(meta.get("streaming_drain_step", 0) or 0)
+                max_drain = int(meta.get("streaming_drain_max_steps", 100) or 100)
+                if drain_step >= max_drain:
+                    return (
+                        input_ids,
+                        None,
+                        {
+                            "hidden_states": {
+                                "trailing_text": torch.empty(
+                                    (0, tts_pad_embed.shape[-1]),
+                                    device=input_ids.device,
+                                    dtype=dtype,
+                                )
+                            },
+                            "meta": {"streaming_drain_step": drain_step},
+                            "streaming_text_drained": True,
+                            "streaming_text_new_text": None,
+                            "streaming_text_new_ids": None,
+                        },
+                    )
         if isinstance(tail, torch.Tensor) and tail.ndim == 2:
             tail_len = int(tail.shape[0])
             if text_offset < tail_len:
@@ -778,6 +851,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         }
         if trailing_text_update is not None:
             info_update["hidden_states"] = {"trailing_text": trailing_text_update.detach()}
+        if is_streaming_text:
+            info_update["streaming_text_new_text"] = None
+            info_update["streaming_text_new_ids"] = None
+            info_update["meta"]["streaming_text_input"] = True
+            if eos_injected_this_step:
+                info_update["meta"]["streaming_eos_appended"] = True
+            st_fin = bool(info_dict.get("streaming_text_finished"))
+            st_eos = bool(meta.get("streaming_eos_appended")) or eos_injected_this_step
+            tail_empty = trailing_text_update is not None and trailing_text_update.numel() == 0
+            if st_fin and st_eos and tail_empty:
+                info_update["meta"]["streaming_drain_step"] = int(meta.get("streaming_drain_step", 0) or 0) + 1
         return input_ids, inputs_embeds_out, info_update
 
     def preprocess_decode_batch(
