@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.distributed as dist
+from cache_dit import ForwardPattern
 from torch import nn
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
@@ -36,6 +37,7 @@ from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
+from vllm_omni.diffusion.cache.cache_dit_backend import BagelCachedAdapter, CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
@@ -772,6 +774,13 @@ class Qwen2MoTDecoderLayer(nn.Module):
 
 
 class Qwen2MoTModel(Qwen2PreTrainedModel):
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "layers": ForwardPattern.Pattern_0,
+        },
+        cached_adapter_cls=BagelCachedAdapter,
+    )
+
     _layerwise_offload_blocks_attrs = ["layers"]
 
     @staticmethod

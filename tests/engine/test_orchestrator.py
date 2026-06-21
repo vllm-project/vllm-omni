@@ -24,7 +24,12 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
-from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.orchestrator import (
+    Orchestrator,
+    OrchestratorRequestState,
+    _build_terminal_empty_output,
+    _infer_stage_audio_sample_rate,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -133,6 +138,20 @@ class FakeStageClient:
 
     def push_diffusion_output(self, output) -> None:
         self._diffusion_outputs.put_nowait(output)
+
+
+def test_terminal_empty_audio_output_uses_stage_sample_rate() -> None:
+    final_stage = FakeStageClient(final_output=True, final_output_type="audio")
+    final_stage.sample_rate = 44100
+    final_pool = SimpleNamespace(stage_client=final_stage, _stage_vllm_config=None)
+
+    terminal_output = _build_terminal_empty_output(
+        "req-1",
+        final_output_type="audio",
+        audio_sample_rate=_infer_stage_audio_sample_rate(final_pool),
+    )
+
+    assert terminal_output.outputs[0].multimodal_output["sr"] == 44100
 
 
 class FakeCollectiveRpcStageClient(FakeStageClient):

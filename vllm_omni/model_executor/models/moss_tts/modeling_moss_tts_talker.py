@@ -31,8 +31,6 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
-_AUDIO_PAD_ID = 0  # padding id used before delay slot fires
-
 
 def _maybe_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
@@ -1058,7 +1056,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     history_per_codebook=hist_per_cb,
                 ).squeeze(0)  # (n_vq,)
                 if int(state.get("step", 0)) < 5 or int(state.get("step", 0)) % 50 == 0:
-                    logger.info(
+                    logger.debug(
                         "[MossTTSRealtime make_omni] step=%d ch0=%d cursor=%d/%d",
                         int(state.get("step", 0)),
                         int(new_codes[0].item()),

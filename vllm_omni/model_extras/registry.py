@@ -19,6 +19,10 @@ from vllm_omni.model_extras.bagel import (
 from vllm_omni.model_extras.bagel import (
     build_text_to_image_prompt as build_bagel_text_to_image_prompt,
 )
+from vllm_omni.model_extras.helios import (
+    HELIOS_EXTRA_BODY_PARAMS,
+    HELIOS_EXTRA_OUTPUT_PARAMS,
+)
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
@@ -75,6 +79,14 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "SenseNovaU1Pipeline": {
         "extra_body_params": SENSENOVA_U1_EXTRA_BODY_PARAMS,
         "extra_output_params": SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
+    },
+    "HeliosPipeline": {
+        "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
+        "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
+    },
+    "HeliosPyramidPipeline": {
+        "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
+        "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
     },
 }
 
