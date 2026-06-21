@@ -16,7 +16,7 @@ import hashlib
 import logging
 import math
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from types import MethodType
 from typing import Any
 
@@ -84,6 +84,14 @@ class _VoxCPM2RuntimeConfig:
     enable_batched_vae_decode: bool = True
     enable_batched_fsq_fusion: bool = False
     batched_fsq_fusion_max_batch: int = 32
+    enable_batched_prefill_tail: bool = False
+    enable_unified_decode_graph: bool = False
+    unified_decode_graph_max_batch_size: int = 1
+    unified_decode_graph_pre_capture_sizes: str = ""
+    enable_runner_assisted_unified_decode_graph: bool = False
+    allow_unified_decode_graph_batch_attention: bool = False
+    enable_decode_tail_graph: bool = False
+    decode_tail_graph_pre_capture_sizes: str = ""
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> _VoxCPM2RuntimeConfig:
@@ -133,6 +141,21 @@ class _VoxCPM2RuntimeConfig:
                 "audio_emit_every > 1, and VAE CUDA Graph; disabling batched VAE decode."
             )
             cfg = dataclasses.replace(cfg, enable_batched_vae_decode=False)
+        if cfg.enable_unified_decode_graph:
+            if cfg.enable_cfm_cuda_graph:
+                logger.info("VoxCPM2 unified decode graph supersedes independent CFM CUDA Graph; disabling it.")
+                cfg = dataclasses.replace(cfg, enable_cfm_cuda_graph=False, enable_cfm_prealloc_output=False)
+            if not cfg.enable_batched_cfm:
+                logger.info("VoxCPM2 unified decode graph requires batched CFM; enabling it.")
+                cfg = dataclasses.replace(cfg, enable_batched_cfm=True)
+            if cfg.unified_decode_graph_max_batch_size > 1 and not cfg.allow_unified_decode_graph_batch_attention:
+                logger.warning(
+                    "VoxCPM2 unified decode graph with batch>1 is not audio-quality safe; "
+                    "capping unified_decode_graph_max_batch_size to 1. Use tail graph for "
+                    "batch decode or set allow_unified_decode_graph_batch_attention=true "
+                    "only for controlled experiments."
+                )
+                cfg = dataclasses.replace(cfg, unified_decode_graph_max_batch_size=1)
         return cfg
 
     @staticmethod
@@ -342,6 +365,48 @@ class _CapturedCFMGraph:
     noise: torch.Tensor
     output: torch.Tensor
     buffers: _CFMBufferManager
+
+
+@dataclasses.dataclass
+class _CapturedUnifiedDecodeGraph:
+    graph: torch.cuda.CUDAGraph
+    batch_size: int
+    # Static input buffers (copied before replay)
+    input_embeds: torch.Tensor
+    positions: torch.Tensor
+    prev_feat_embed: torch.Tensor
+    prefix_feat_cond: torch.Tensor
+    # Static output buffers (read after replay)
+    next_feat_embed: torch.Tensor
+    cfm_output: torch.Tensor
+    lm_hidden: torch.Tensor
+    # Internal buffers for CFM solver
+    cfm_buffers: _CFMBufferManager
+    cfm_noise: torch.Tensor
+
+
+@dataclasses.dataclass
+class _CapturedDecodeTailGraph:
+    graph: torch.cuda.CUDAGraph
+    batch_size: int
+    lm_hidden: torch.Tensor
+    residual_hidden: torch.Tensor
+    prefix_feat_cond: torch.Tensor
+    next_feat_embed: torch.Tensor
+    stop_logits: torch.Tensor
+    cfm_output: torch.Tensor
+    cfm_buffers: _CFMBufferManager
+    cfm_noise: torch.Tensor
+
+
+@dataclasses.dataclass
+class _UnifiedDecodeGraphStats:
+    captures: int = 0
+    replays: int = 0
+    fallbacks: dict[str, int] = dataclasses.field(default_factory=dict)
+
+    def record_fallback(self, reason: str) -> None:
+        self.fallbacks[reason] = self.fallbacks.get(reason, 0) + 1
 
 
 @dataclasses.dataclass
@@ -928,6 +993,23 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._max_cached_graphs = self._max_batch_size
         self._cuda_graph_warmup_steps = 0
         self._cuda_graph_warmup_threshold = 3
+        self._unified_graphs: dict[int, _CapturedUnifiedDecodeGraph] = {}
+        self._enable_unified_decode_graph = use_cuda_graph and self._runtime_config.enable_unified_decode_graph
+        self._unified_decode_graph_max_batch_size = self._runtime_config.unified_decode_graph_max_batch_size
+        self._unified_graph_bucket_sizes: frozenset[int] = self._build_unified_graph_bucket_sizes(
+            min(self._max_batch_size, self._unified_decode_graph_max_batch_size)
+        )
+        self._unified_graph_pre_capture_sizes = self._parse_unified_graph_pre_capture_sizes(
+            self._runtime_config.unified_decode_graph_pre_capture_sizes
+        )
+        self._unified_graph_stats = _UnifiedDecodeGraphStats()
+        self._runner_assisted_unified_decode_graph_active = False
+        self._runner_assisted_unified_decode_graph_batch_size = 0
+        self._decode_tail_graphs: dict[int, _CapturedDecodeTailGraph] = {}
+        self._enable_decode_tail_graph = use_cuda_graph and self._runtime_config.enable_decode_tail_graph
+        self._decode_tail_graph_pre_capture_sizes = self._parse_decode_tail_graph_pre_capture_sizes(
+            self._runtime_config.decode_tail_graph_pre_capture_sizes
+        )
 
         self._multichar_zh_split: dict[int, list[int]] | None = None
 
@@ -1107,6 +1189,28 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             max_batch_size=self._max_batch_size,
         )
 
+    @staticmethod
+    def _compile_without_inductor_cudagraphs(
+        module: nn.Module | Callable,
+        *,
+        mode: str | None,
+        fullgraph: bool,
+    ) -> Callable:
+        import torch._inductor.config as inductor_config
+
+        old_cudagraphs = inductor_config.triton.cudagraphs
+        old_cudagraph_trees = inductor_config.triton.cudagraph_trees
+        inductor_config.triton.cudagraphs = False
+        inductor_config.triton.cudagraph_trees = False
+        try:
+            kwargs: dict[str, Any] = {"fullgraph": fullgraph}
+            if mode is not None:
+                kwargs["mode"] = mode
+            return torch.compile(module, **kwargs)
+        finally:
+            inductor_config.triton.cudagraphs = old_cudagraphs
+            inductor_config.triton.cudagraph_trees = old_cudagraph_trees
+
     def _setup_torch_compile(self) -> None:
         if not self._enable_torch_compile:
             return
@@ -1134,30 +1238,56 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             if _install_locdit_zero_dt_cache(estimator):
                 targets.append("LocDiT zero-dt embedding cache")
 
+        external_cfm_capture = (
+            self._enable_cfm_cuda_graph or self._enable_unified_decode_graph or self._enable_decode_tail_graph
+        )
         if cfg.enable_loc_dit_layer_nvtx:
             patched = _install_locdit_layer_nvtx(estimator)
             if patched:
                 targets.append(f"LocDiT layer NVTX ({patched} layers, compile skipped)")
             estimator._compiled = True
-        elif self._enable_cfm_cuda_graph:
+        elif self._enable_unified_decode_graph:
+            try:
+                compiled_ro = torch.compile(estimator, mode="reduce-overhead", fullgraph=False)
+                compiled_ro._compiled = True
+                compiled_nocg = torch.compile(
+                    estimator,
+                    fullgraph=False,
+                    options={
+                        "triton.cudagraphs": False,
+                        "triton.cudagraph_trees": False,
+                    },
+                )
+                capture_mode = "no-cg"
+                compiled_nocg._compiled = True
+                tts.feat_decoder.estimator = compiled_ro
+                self._estimator_for_unified_capture = compiled_nocg
+                targets.append(f"LocDiT (dual: reduce-overhead fallback + {capture_mode} unified capture)")
+            except Exception as e:
+                logger.warning("torch.compile LocDiT dual-mode failed: %s", e)
+                try:
+                    tts.feat_decoder.estimator = torch.compile(
+                        estimator,
+                        fullgraph=False,
+                        options={
+                            "triton.cudagraphs": False,
+                            "triton.cudagraph_trees": False,
+                        },
+                    )
+                    tts.feat_decoder.estimator._compiled = True
+                    self._estimator_for_unified_capture = tts.feat_decoder.estimator
+                    targets.append("LocDiT (no-cg only, dual fallback)")
+                except Exception as inner_e:
+                    logger.warning("torch.compile LocDiT failed completely: %s", inner_e)
+        elif external_cfm_capture:
             try:
                 if cfg.enable_loc_dit_reduce_overhead_no_cg:
-                    import torch._inductor.config as inductor_config
-
-                    old_cudagraphs = inductor_config.triton.cudagraphs
-                    old_cudagraph_trees = inductor_config.triton.cudagraph_trees
-                    inductor_config.triton.cudagraphs = False
-                    inductor_config.triton.cudagraph_trees = False
-                    try:
-                        tts.feat_decoder.estimator = torch.compile(
-                            estimator,
-                            mode="reduce-overhead",
-                            fullgraph=False,
-                        )
-                    finally:
-                        inductor_config.triton.cudagraphs = old_cudagraphs
-                        inductor_config.triton.cudagraph_trees = old_cudagraph_trees
-                    targets.append("LocDiT (reduce-overhead no-inductor-cudagraph + CUDA Graph)")
+                    tts.feat_decoder.estimator = self._compile_without_inductor_cudagraphs(
+                        estimator,
+                        mode="reduce-overhead",
+                        fullgraph=False,
+                    )
+                    targets.append("LocDiT (reduce-overhead no-inductor-cudagraph + external CUDA Graph)")
                 else:
                     tts.feat_decoder.estimator = torch.compile(
                         estimator,
@@ -1167,25 +1297,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                             "triton.cudagraph_trees": False,
                         },
                     )
-                    graph_mode = "fullgraph" if cfg.enable_loc_dit_fullgraph_no_cg else "partitioned"
-                    targets.append(f"LocDiT ({graph_mode} compile no-inductor-cudagraph + CUDA Graph)")
+                    targets.append("LocDiT (no-inductor-cudagraph + external CUDA Graph)")
                 tts.feat_decoder.estimator._compiled = True
             except Exception as e:
-                logger.warning("torch.compile LocDiT reduce-overhead for CUDA Graph failed: %s", e)
-                try:
-                    tts.feat_decoder.estimator = torch.compile(
-                        estimator,
-                        fullgraph=cfg.enable_loc_dit_fullgraph_no_cg,
-                        options={
-                            "triton.cudagraphs": False,
-                            "triton.cudagraph_trees": False,
-                        },
-                    )
-                    tts.feat_decoder.estimator._compiled = True
-                    graph_mode = "fullgraph" if cfg.enable_loc_dit_fullgraph_no_cg else "partitioned"
-                    targets.append(f"LocDiT ({graph_mode} compile no-inductor-cudagraph + CUDA Graph)")
-                except Exception as inner_e:
-                    logger.warning("torch.compile LocDiT for CUDA Graph failed: %s", inner_e)
+                logger.warning("torch.compile LocDiT for external CUDA Graph failed: %s", e)
         else:
             try:
                 tts.feat_decoder.estimator = torch.compile(
@@ -1200,9 +1315,37 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         try:
             if not hasattr(tts.feat_encoder, "_compiled"):
-                tts.feat_encoder = torch.compile(tts.feat_encoder, mode="reduce-overhead", fullgraph=False)
-                tts.feat_encoder._compiled = True
-                targets.append("feat_encoder")
+                if self._enable_unified_decode_graph:
+                    feat_encoder = tts.feat_encoder
+                    compiled_ro = torch.compile(feat_encoder, mode="reduce-overhead", fullgraph=False)
+                    compiled_ro._compiled = True
+                    compiled_nocg = torch.compile(
+                        feat_encoder,
+                        fullgraph=False,
+                        options={
+                            "triton.cudagraphs": False,
+                            "triton.cudagraph_trees": False,
+                        },
+                    )
+                    compiled_nocg._compiled = True
+                    tts.feat_encoder = compiled_ro
+                    self._feat_encoder_for_unified_capture = compiled_nocg
+                    targets.append("feat_encoder (dual: reduce-overhead fallback + no-cg unified capture)")
+                elif external_cfm_capture:
+                    tts.feat_encoder = torch.compile(
+                        tts.feat_encoder,
+                        fullgraph=False,
+                        options={
+                            "triton.cudagraphs": False,
+                            "triton.cudagraph_trees": False,
+                        },
+                    )
+                    tts.feat_encoder._compiled = True
+                    targets.append("feat_encoder (no-inductor-cudagraph)")
+                else:
+                    tts.feat_encoder = torch.compile(tts.feat_encoder, mode="reduce-overhead", fullgraph=False)
+                    tts.feat_encoder._compiled = True
+                    targets.append("feat_encoder")
         except Exception as e:
             logger.warning("torch.compile feat_encoder failed: %s", e)
 
@@ -1351,6 +1494,78 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 or (batch_size > 0 and (batch_size & (batch_size - 1)) == 0)
             )
         return True
+
+    @staticmethod
+    def _build_unified_graph_bucket_sizes(max_size: int) -> frozenset[int]:
+        if max_size <= 0:
+            return frozenset()
+        sizes = {1}
+        size = 2
+        while size <= min(max_size, 16):
+            sizes.add(size)
+            size <<= 1
+        bucket = 24
+        while bucket <= max_size:
+            sizes.add(bucket)
+            bucket += 8
+        sizes.add(max_size)
+        return frozenset(size for size in sizes if 0 < size <= max_size)
+
+    def _select_unified_graph_bucket_size(self, batch_size: int) -> int | None:
+        if (
+            batch_size <= 0
+            or batch_size > self._unified_decode_graph_max_batch_size
+            or batch_size > self._max_cached_graphs
+        ):
+            return None
+        return min((size for size in self._unified_graph_bucket_sizes if size >= batch_size), default=None)
+
+    def _parse_graph_pre_capture_sizes(
+        self,
+        raw: str,
+        *,
+        max_size: int,
+        respect_capture_policy: bool = True,
+    ) -> tuple[int, ...]:
+        value = raw.strip().lower()
+        if not value or value in {"0", "false", "none", "off"}:
+            return ()
+        if value in {"power2", "powers_of_two"}:
+            candidates = [1 << i for i in range(max_size.bit_length())]
+        elif value == "policy":
+            candidates = list(range(1, max_size + 1))
+        else:
+            candidates = []
+            for part in raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    candidates.append(int(part))
+                except ValueError:
+                    logger.warning("Ignoring invalid graph pre-capture size: %s", part)
+
+        sizes = {
+            size
+            for size in candidates
+            if 0 < size <= max_size
+            and size in self._unified_graph_bucket_sizes
+            and (not respect_capture_policy or self._should_use_decode_graph(size))
+        }
+        return tuple(sorted(sizes, reverse=True))
+
+    def _parse_unified_graph_pre_capture_sizes(self, raw: str) -> tuple[int, ...]:
+        return self._parse_graph_pre_capture_sizes(
+            raw,
+            max_size=min(self._max_batch_size, self._unified_decode_graph_max_batch_size),
+        )
+
+    def _parse_decode_tail_graph_pre_capture_sizes(self, raw: str) -> tuple[int, ...]:
+        return self._parse_graph_pre_capture_sizes(
+            raw,
+            max_size=self._max_batch_size,
+            respect_capture_policy=False,
+        )
 
     def _capture_vae_graph(self, feat: torch.Tensor) -> _CapturedVAEGraph:
         batch_size = feat.shape[0]
@@ -1536,7 +1751,468 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state.cfm_output_gpu.copy_(graph.output)
         return state.cfm_output_gpu.transpose(1, 2)
 
+    # -------------------- unified decode graph --------------------
+
+    def _capture_unified_decode_graph(self, batch_size: int) -> _CapturedUnifiedDecodeGraph:
+        H = self.config.hidden_size
+        D = self._feat_dim
+        P = self._patch_size
+        dev = torch.device(self._device)
+        dtype = self._side_dtype
+
+        self._setup_cfm_buffers()
+        if self._enable_torch_compile:
+            self._setup_torch_compile()
+        self.model.precompute_fused_qkv()
+        self.residual_model.precompute_fused_qkv()
+
+        tts = self.tts
+        dit_hidden = tts.lm_to_dit_proj.out_features + tts.res_to_dit_proj.out_features
+        cfm_buffers = _CFMBufferManager(
+            device=dev,
+            dtype=dtype,
+            feat_dim=D,
+            patch_size=P,
+            dit_hidden_size=dit_hidden,
+            max_batch_size=batch_size,
+        )
+
+        g = _CapturedUnifiedDecodeGraph(
+            graph=torch.cuda.CUDAGraph(),
+            batch_size=batch_size,
+            input_embeds=torch.zeros(batch_size, H, device=dev, dtype=dtype),
+            positions=torch.zeros(batch_size, device=dev, dtype=torch.long),
+            prev_feat_embed=torch.zeros(batch_size, H, device=dev, dtype=dtype),
+            prefix_feat_cond=torch.zeros(batch_size, P, D, device=dev, dtype=dtype),
+            next_feat_embed=torch.zeros(batch_size, H, device=dev, dtype=dtype),
+            cfm_output=torch.zeros(batch_size, D, P, device=dev, dtype=dtype),
+            lm_hidden=torch.zeros(batch_size, H, device=dev, dtype=dtype),
+            cfm_buffers=cfm_buffers,
+            cfm_noise=torch.zeros(batch_size, D, P, device=dev, dtype=dtype),
+        )
+
+        dit_proj = self._dit_proj_fn
+
+        def unified_fwd():
+            scaffold_h = self.model(input_ids=None, positions=g.positions, inputs_embeds=g.input_embeds)
+            if isinstance(scaffold_h, tuple):
+                scaffold_h = scaffold_h[0]
+            lm_h = tts.fsq_layer(scaffold_h)
+            res_input = tts.fusion_concat_proj(torch.cat([lm_h, g.prev_feat_embed], dim=-1))
+            res_h = self.residual_model(positions=g.positions, inputs_embeds=res_input)
+            dit_h = dit_proj(lm_h, res_h)
+            cond = g.prefix_feat_cond.transpose(1, 2).contiguous()
+            g.cfm_noise.normal_()
+            cfm_out = _optimized_solve_euler_with_noise(
+                tts.feat_decoder,
+                dit_h,
+                P,
+                cond,
+                g.cfm_noise,
+                self._inference_timesteps,
+                self._cfg_value,
+                cfm_buffers,
+                cfg_cutoff_ratio=self._cfg_cutoff_ratio,
+            )
+            feat_enc = tts.feat_encoder(cfm_out.transpose(1, 2).unsqueeze(1)).squeeze(1)
+            next_embed = tts.enc_to_lm_proj(feat_enc)
+            return next_embed, cfm_out, lm_h
+
+        ctx = get_forward_context()
+        capture_context = override_forward_context(self._nullify_volatile_metadata(ctx))
+
+        original_estimator = tts.feat_decoder.estimator
+        capture_estimator = getattr(self, "_estimator_for_unified_capture", original_estimator)
+        tts.feat_decoder.estimator = capture_estimator
+
+        original_feat_encoder = tts.feat_encoder
+        capture_feat_encoder = getattr(self, "_feat_encoder_for_unified_capture", original_feat_encoder)
+        tts.feat_encoder = capture_feat_encoder
+
+        try:
+            with capture_context:
+                with torch.no_grad():
+                    for _ in range(3):
+                        unified_fwd()
+
+                    with torch.cuda.graph(g.graph, pool=current_platform.get_global_graph_pool()):
+                        g.next_feat_embed, g.cfm_output, g.lm_hidden = unified_fwd()
+        finally:
+            tts.feat_decoder.estimator = original_estimator
+            tts.feat_encoder = original_feat_encoder
+        self._unified_graph_stats.captures += 1
+        logger.info(
+            "CUDA Graph captured for unified decode (batch_size=%d, captures=%d)",
+            batch_size,
+            self._unified_graph_stats.captures,
+        )
+        return g
+
+    def _unified_decode_graph_skip_reason(
+        self,
+        *,
+        can_use_graph: bool,
+        is_all_decode: bool,
+        num_reqs: int,
+    ) -> str | None:
+        if not self._enable_unified_decode_graph:
+            return "disabled"
+        if not can_use_graph:
+            return "graph_not_ready"
+        if not is_all_decode:
+            return "not_all_decode"
+        if num_reqs > self._unified_decode_graph_max_batch_size:
+            return "batch_exceeds_unified_max"
+        if num_reqs > self._max_cached_graphs:
+            return "batch_too_large"
+        graph_size = self._select_unified_graph_bucket_size(num_reqs)
+        if graph_size is None:
+            return "capture_policy"
+        if (
+            num_reqs > 1
+            and not self._runner_assisted_unified_decode_graph_active
+            and not self._runtime_config.allow_unified_decode_graph_batch_attention
+        ):
+            return "runner_full_metadata_missing"
+        for req_id, _, _, _ in self._pending_requests:
+            state = self._active_states[req_id]
+            if not state.prefill_completed:
+                return "prefill_incomplete"
+            if state.prev_feat_embed is None or state.curr_prefix_feat_cond is None:
+                return "state_not_ready"
+        return None
+
+    @staticmethod
+    def _padded_batch_size(n: int) -> int:
+        if n <= 1:
+            return 1
+        if n <= 2:
+            return 2
+        if n <= 4:
+            return 4
+        if n <= 8:
+            return 8
+        return ((n + 7) // 8) * 8
+
+    def _capture_decode_tail_graph(self, batch_size: int) -> _CapturedDecodeTailGraph:
+        H = self.config.hidden_size
+        D = self._feat_dim
+        P = self._patch_size
+        dev = torch.device(self._device)
+        dtype = self._side_dtype
+
+        self._setup_cfm_buffers()
+        if self._enable_torch_compile:
+            self._setup_torch_compile()
+
+        tts = self.tts
+        dit_hidden = tts.lm_to_dit_proj.out_features + tts.res_to_dit_proj.out_features
+        cfm_buffers = _CFMBufferManager(
+            device=dev,
+            dtype=dtype,
+            feat_dim=D,
+            patch_size=P,
+            dit_hidden_size=dit_hidden,
+            max_batch_size=batch_size,
+        )
+
+        g = _CapturedDecodeTailGraph(
+            graph=torch.cuda.CUDAGraph(),
+            batch_size=batch_size,
+            lm_hidden=torch.zeros(batch_size, H, device=dev, dtype=dtype),
+            residual_hidden=torch.zeros(batch_size, H, device=dev, dtype=dtype),
+            prefix_feat_cond=torch.zeros(batch_size, P, D, device=dev, dtype=dtype),
+            next_feat_embed=torch.zeros(batch_size, H, device=dev, dtype=dtype),
+            stop_logits=torch.zeros(batch_size, tts.stop_head.out_features, device=dev, dtype=dtype),
+            cfm_output=torch.zeros(batch_size, D, P, device=dev, dtype=dtype),
+            cfm_buffers=cfm_buffers,
+            cfm_noise=torch.zeros(batch_size, D, P, device=dev, dtype=dtype),
+        )
+
+        dit_proj = self._dit_proj_fn
+        stop_fn = self._stop_fn
+
+        def tail_fwd():
+            dit_h = dit_proj(g.lm_hidden, g.residual_hidden)
+            cond = g.prefix_feat_cond.transpose(1, 2).contiguous()
+            g.cfm_noise.normal_()
+            cfm_out = _optimized_solve_euler_with_noise(
+                tts.feat_decoder,
+                dit_h,
+                P,
+                cond,
+                g.cfm_noise,
+                self._inference_timesteps,
+                self._cfg_value,
+                cfm_buffers,
+                cfg_cutoff_ratio=self._cfg_cutoff_ratio,
+            )
+            feat_enc = tts.feat_encoder(cfm_out.transpose(1, 2).unsqueeze(1)).squeeze(1)
+            next_embed = tts.enc_to_lm_proj(feat_enc)
+            stop_out = stop_fn(g.lm_hidden)
+            return next_embed, stop_out, cfm_out
+
+        original_estimator = tts.feat_decoder.estimator
+        if not hasattr(self, "_estimator_for_unified_capture"):
+            estimator_for_compile = (
+                tts.feat_decoder.estimator._orig_mod
+                if hasattr(tts.feat_decoder.estimator, "_orig_mod")
+                else original_estimator
+            )
+            self._estimator_for_unified_capture = torch.compile(
+                estimator_for_compile,
+                fullgraph=False,
+                options={"triton.cudagraphs": False, "triton.cudagraph_trees": False},
+            )
+            self._estimator_for_unified_capture._compiled = True
+        capture_estimator = self._estimator_for_unified_capture
+        tts.feat_decoder.estimator = capture_estimator
+
+        original_feat_encoder = tts.feat_encoder
+        if not hasattr(self, "_feat_encoder_for_unified_capture"):
+            self._feat_encoder_for_unified_capture = torch.compile(
+                tts.feat_encoder._orig_mod if hasattr(tts.feat_encoder, "_orig_mod") else original_feat_encoder,
+                fullgraph=False,
+                options={"triton.cudagraphs": False, "triton.cudagraph_trees": False},
+            )
+            self._feat_encoder_for_unified_capture._compiled = True
+        capture_feat_encoder = self._feat_encoder_for_unified_capture
+        tts.feat_encoder = capture_feat_encoder
+
+        try:
+            with torch.no_grad():
+                for _ in range(3):
+                    tail_fwd()
+
+                with torch.cuda.graph(g.graph, pool=current_platform.get_global_graph_pool()):
+                    g.next_feat_embed, g.stop_logits, g.cfm_output = tail_fwd()
+        finally:
+            tts.feat_decoder.estimator = original_estimator
+            tts.feat_encoder = original_feat_encoder
+
+        logger.info("CUDA Graph captured for decode tail (batch_size=%d)", batch_size)
+        return g
+
+    def _pre_capture_decode_tail_graphs(self) -> None:
+        for size in self._decode_tail_graph_pre_capture_sizes:
+            if size in self._decode_tail_graphs:
+                continue
+            self._decode_tail_graphs[size] = self._capture_decode_tail_graph(size)
+
+    def _select_decode_tail_graph_size(self, batch_size: int) -> int | None:
+        if batch_size <= 0 or batch_size > self._max_cached_graphs:
+            return None
+        if batch_size in self._decode_tail_graphs:
+            return batch_size
+
+        candidates = set(self._decode_tail_graphs) | set(self._decode_tail_graph_pre_capture_sizes)
+        bucket = min((size for size in candidates if size >= batch_size), default=None)
+        if bucket is not None:
+            return bucket
+
+        if self._should_use_decode_graph(batch_size):
+            return batch_size
+        return None
+
+    def _forward_decode_tail_graph(self, req_metas: list[tuple], batch_out: torch.Tensor) -> None:
+        batch_size = len(req_metas)
+        graph_size = self._select_decode_tail_graph_size(batch_size)
+        if graph_size is None:
+            return self._forward_decode_tail_graph_fallback(req_metas, batch_out)
+
+        graph = self._decode_tail_graphs.get(graph_size)
+        if graph is None:
+            if len(self._decode_tail_graphs) <= 1 and self._decode_tail_graph_pre_capture_sizes:
+                self._pre_capture_decode_tail_graphs()
+                graph = self._decode_tail_graphs.get(graph_size)
+            if graph is None:
+                graph = self._capture_decode_tail_graph(graph_size)
+                self._decode_tail_graphs[graph_size] = graph
+            if graph is None:
+                return self._forward_decode_tail_graph_fallback(req_metas, batch_out)
+
+        states = [state for state, _, _ in req_metas]
+        torch.cat(
+            [meta["new_lm_hidden"].to(self._side_dtype) for _, _, meta in req_metas],
+            dim=0,
+            out=graph.lm_hidden[:batch_size],
+        )
+        graph.residual_hidden[:batch_size].copy_(batch_out[:batch_size])
+        prefix_feat_conds: list[torch.Tensor] = []
+        for state in states:
+            pfc = state.curr_prefix_feat_cond.to(self._side_dtype)
+            prefix_feat_conds.append(pfc.unsqueeze(0) if pfc.ndim == 2 else pfc)
+        torch.cat(prefix_feat_conds, dim=0, out=graph.prefix_feat_cond[:batch_size])
+
+        graph.graph.replay()
+
+        all_stop_logits = graph.stop_logits[:batch_size].clone()
+        next_embeds = graph.next_feat_embed[:batch_size].clone()
+        for i, state in enumerate(states):
+            cfm_out_i = graph.cfm_output[i : i + 1].transpose(1, 2)
+            self._commit_decode_state(state, all_stop_logits[i : i + 1], next_embeds[i : i + 1], cfm_out_i)
+
+        self._precompute_stop_flags_for_audio_collect(states)
+        ready_audio_by_req = self._drain_ready_audio_copies_for_states(states)
+        audio_by_req = self._collect_audio_batch(states, initial_delayed_chunks_by_req=ready_audio_by_req)
+        for state in states:
+            self._results_queue.append((state.request_id, state.precomputed_stop_logits))
+            self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
+
+    def _forward_decode_tail_graph_fallback(self, req_metas: list[tuple], batch_out: torch.Tensor) -> None:
+        self._finish_decode_batch(req_metas, batch_out)
+        self._precompute_stop_flags_for_audio_collect([state for state, _, _ in req_metas])
+        ready_audio_by_req = self._drain_ready_audio_copies_for_states([state for state, _, _ in req_metas])
+        audio_by_req = self._collect_audio_batch(
+            [state for state, _, _ in req_metas],
+            initial_delayed_chunks_by_req=ready_audio_by_req,
+        )
+        for state, _, _ in req_metas:
+            self._results_queue.append((state.request_id, state.precomputed_stop_logits))
+            self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
+
+    def _pre_capture_unified_graphs(self, trigger_size: int) -> None:
+        for size in self._unified_graph_pre_capture_sizes:
+            if size in self._unified_graphs:
+                continue
+            if size == trigger_size:
+                continue
+            if size > 1 and self._runtime_config.enable_runner_assisted_unified_decode_graph:
+                continue
+            self._unified_graphs[size] = self._capture_unified_decode_graph(size)
+
+    def _forward_unified_decode(
+        self,
+        inputs_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        graph_size = self._select_unified_graph_bucket_size(num_reqs)
+        if graph_size is None:
+            raise RuntimeError(f"No unified decode graph bucket for batch size {num_reqs}")
+        g = self._unified_graphs.get(graph_size)
+        if g is None:
+            g = self._capture_unified_decode_graph(graph_size)
+            self._unified_graphs[graph_size] = g
+            can_pre_capture = not (num_reqs > 1 and self._runner_assisted_unified_decode_graph_active)
+            if can_pre_capture and len(self._unified_graphs) == 1 and self._unified_graph_pre_capture_sizes:
+                self._pre_capture_unified_graphs(num_reqs)
+
+        self._unified_graph_stats.replays += 1
+        states: list[_RequestState] = []
+        commit_mask: list[bool] = []
+        for req_id, _is_prefill, _embeds, _n in self._pending_requests:
+            state = self._active_states[req_id]
+            states.append(state)
+            already_stopping = state.is_stopping
+            commit_mask.append(not already_stopping)
+            if not already_stopping:
+                state.decode_step_count += 1
+                if state.decode_step_count >= self._max_decode_steps:
+                    state.is_stopping = True
+
+        self._perf.start("unified.copy_inputs")
+        for i, state in enumerate(states):
+            pfe = state.prev_feat_embed
+            g.prev_feat_embed[i].copy_(pfe.squeeze(0) if pfe.ndim > 1 else pfe)
+            pfc = state.curr_prefix_feat_cond
+            if pfc.ndim == 2:
+                g.prefix_feat_cond[i].copy_(pfc)
+            else:
+                g.prefix_feat_cond[i].copy_(pfc.squeeze(0))
+
+        g.input_embeds[:num_reqs].copy_(inputs_embeds[:num_reqs])
+        g.positions[:num_reqs].copy_(positions[:num_reqs])
+        if graph_size > num_reqs:
+            g.input_embeds[num_reqs:graph_size].zero_()
+            g.positions[num_reqs:graph_size].zero_()
+            g.prev_feat_embed[num_reqs:graph_size].zero_()
+            g.prefix_feat_cond[num_reqs:graph_size].zero_()
+        self._perf.stop("unified.copy_inputs")
+
+        self._perf.start("unified.replay")
+        g.graph.replay()
+        self._perf.stop("unified.replay")
+
+        self._perf.start("unified.commit")
+        with torch.no_grad():
+            all_stop_logits = self._stop_fn(g.lm_hidden[:num_reqs])
+        for i, state in enumerate(states):
+            stop_logits_i = all_stop_logits[i : i + 1]
+            if not commit_mask[i]:
+                state.precomputed_stop_logits = stop_logits_i
+                continue
+            next_embed_i = g.next_feat_embed[i : i + 1].clone()
+            cfm_out_i = g.cfm_output[i : i + 1].transpose(1, 2)
+            self._commit_decode_state(state, stop_logits_i, next_embed_i, cfm_out_i)
+        self._perf.stop("unified.commit")
+
+        self._perf.start("unified.audio")
+        self._precompute_stop_flags_for_audio_collect(states)
+        ready_audio = self._drain_ready_audio_copies_for_states(states)
+        audio_by_req = self._collect_audio_batch(states, initial_delayed_chunks_by_req=ready_audio)
+        for state in states:
+            self._results_queue.append((state.request_id, state.precomputed_stop_logits))
+            self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
+
+        self._pending_requests.clear()
+        self._flush_deferred_cleanup()
+        self._perf.stop("unified.audio")
+        return g.next_feat_embed[:num_reqs]
+
     # -------------------- vllm hooks --------------------
+
+    def get_runner_assisted_full_attention_metadata_request(
+        self,
+        *,
+        req_ids: list[str],
+        num_reqs: int,
+        num_scheduled_tokens: list[int],
+        num_computed_tokens: list[int],
+        max_num_scheduled_tokens: int,
+    ) -> tuple[int, bool] | None:
+        if not self._runtime_config.enable_runner_assisted_unified_decode_graph:
+            return None
+        if not self._enable_unified_decode_graph or not self._enable_cuda_graph:
+            return None
+        if num_reqs <= 1 or num_reqs > self._unified_decode_graph_max_batch_size:
+            return None
+        if num_reqs > self._max_cached_graphs or self._select_unified_graph_bucket_size(num_reqs) is None:
+            return None
+        if max_num_scheduled_tokens != 1 or len(num_scheduled_tokens) != num_reqs:
+            return None
+        if any(int(n) != 1 for n in num_scheduled_tokens):
+            return None
+        if len(req_ids) != num_reqs or len(num_computed_tokens) != num_reqs:
+            return None
+        if any(int(n) <= 0 for n in num_computed_tokens):
+            return None
+        tts_compiled = getattr(self.tts.feat_decoder.estimator, "_compiled", False) if self._tts is not None else False
+        if not tts_compiled or self._cuda_graph_warmup_steps < self._cuda_graph_warmup_threshold:
+            return None
+        for req_id in req_ids:
+            state = self._active_states.get(req_id)
+            if (
+                state is None
+                or not state.prefill_completed
+                or state.prev_feat_embed is None
+                or state.curr_prefix_feat_cond is None
+            ):
+                return None
+        bucket_size = self._select_unified_graph_bucket_size(num_reqs)
+        if bucket_size is None:
+            return None
+        return bucket_size, bucket_size not in self._unified_graphs
+
+    def set_runner_assisted_full_attention_metadata_context(
+        self,
+        *,
+        enabled: bool,
+        num_reqs: int = 0,
+    ) -> None:
+        enabled = bool(enabled and self._runtime_config.enable_runner_assisted_unified_decode_graph)
+        self._runner_assisted_unified_decode_graph_active = enabled
+        self._runner_assisted_unified_decode_graph_batch_size = int(num_reqs) if enabled else 0
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1565,6 +2241,27 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         can_use_graph = (
             self._enable_cuda_graph and graph_ready and intermediate_tensors is None and inputs_embeds is not None
         )
+
+        unified_skip_reason = self._unified_decode_graph_skip_reason(
+            can_use_graph=can_use_graph,
+            is_all_decode=is_all_decode,
+            num_reqs=num_reqs,
+        )
+        if unified_skip_reason is None:
+            self._perf.start("unified_decode")
+            result = self._forward_unified_decode(inputs_embeds, positions, num_reqs)
+            self._perf.stop("unified_decode")
+            self._perf.stop("forward_total")
+            return result
+        if self._enable_unified_decode_graph and num_reqs > 0:
+            self._unified_graph_stats.record_fallback(unified_skip_reason)
+            if self._enable_profiling and sum(self._unified_graph_stats.fallbacks.values()) % 50 == 0:
+                logger.info(
+                    "VoxCPM2 unified graph stats: captures=%d replays=%d fallbacks=%s",
+                    self._unified_graph_stats.captures,
+                    self._unified_graph_stats.replays,
+                    self._unified_graph_stats.fallbacks,
+                )
 
         if can_use_graph and is_all_decode and num_reqs <= self._max_cached_graphs:
             use_scaffold_graph = self._should_use_decode_graph(num_reqs)
@@ -1686,29 +2383,39 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 and all(x.shape[0] == 1 for x in residual_inputs)
             )
             if can_batch_decode_tail:
-                self._finish_decode_batch(req_metas, batch_out)
-                self._precompute_stop_flags_for_audio_collect([state for state, _, _ in req_metas])
-                ready_audio_by_req = self._drain_ready_audio_copies_for_states([state for state, _, _ in req_metas])
-                audio_by_req = self._collect_audio_batch(
-                    [state for state, _, _ in req_metas],
-                    initial_delayed_chunks_by_req=ready_audio_by_req,
-                )
-                for state, _, _ in req_metas:
-                    self._results_queue.append((state.request_id, state.precomputed_stop_logits))
-                    self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
+                if self._enable_decode_tail_graph and graph_ready and batch_out.shape[0] <= self._max_cached_graphs:
+                    self._forward_decode_tail_graph(req_metas, batch_out)
+                else:
+                    self._finish_decode_batch(req_metas, batch_out)
+                    self._precompute_stop_flags_for_audio_collect([state for state, _, _ in req_metas])
+                    ready_audio_by_req = self._drain_ready_audio_copies_for_states([state for state, _, _ in req_metas])
+                    audio_by_req = self._collect_audio_batch(
+                        [state for state, _, _ in req_metas],
+                        initial_delayed_chunks_by_req=ready_audio_by_req,
+                    )
+                    for state, _, _ in req_metas:
+                        self._results_queue.append((state.request_id, state.precomputed_stop_logits))
+                        self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
             else:
                 offset = 0
                 decoded_states: list[_RequestState] = []
+                prefill_batch: list[tuple[_RequestState, dict, torch.Tensor]] = []
                 for idx, (state, is_prefill, meta) in enumerate(req_metas):
                     n = residual_inputs[idx].shape[0]
                     res_out = batch_out[offset : offset + n]
                     offset += n
 
                     if is_prefill:
-                        self._finish_prefill(state, meta, res_out, dev)
+                        prefill_batch.append((state, meta, res_out))
                     else:
                         self._finish_decode(state, meta, res_out, dev)
                         decoded_states.append(state)
+
+                if prefill_batch and self._runtime_config.enable_batched_prefill_tail:
+                    self._finish_prefill_batch(prefill_batch)
+                else:
+                    for state, meta, res_out in prefill_batch:
+                        self._finish_prefill(state, meta, res_out, dev)
 
                 collect_states = [state for state, _, _ in req_metas]
                 self._precompute_stop_flags_for_audio_collect(collect_states)
@@ -1907,14 +2614,90 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         out.normal_(generator=gen)
         state.cfm_noise_step += 1
 
+    def _finish_prefill_batch(self, batch: list[tuple[_RequestState, dict, torch.Tensor]]) -> None:
+        if len(batch) == 1:
+            state, meta, res_out = batch[0]
+            self._finish_prefill(state, meta, res_out, None)
+            return
+
+        self._perf.start("prefill_tail_batch")
+        tts = self.tts
+        self._setup_cfm_buffers()
+        if self._enable_torch_compile:
+            self._setup_torch_compile()
+
+        dit_hs: list[torch.Tensor] = []
+        conds: list[torch.Tensor] = []
+        stop_logits_list: list[torch.Tensor] = []
+
+        for state, meta, res_out in batch:
+            lm_hidden = meta["lm_hidden"]
+            prefix_feat_cond = meta["prefix_feat_cond"]
+            residual_hidden = res_out[-1:, :]
+            stop_logits = tts.stop_head(tts.stop_actn(tts.stop_proj(lm_hidden))).detach()
+            dit_h = torch.cat([tts.lm_to_dit_proj(lm_hidden), tts.res_to_dit_proj(residual_hidden)], dim=-1)
+            cond = prefix_feat_cond.transpose(1, 2).contiguous()
+            dit_hs.append(dit_h)
+            conds.append(cond)
+            stop_logits_list.append(stop_logits)
+
+        batched_dit_h = torch.cat(dit_hs, dim=0)
+        batched_cond = torch.cat(conds, dim=0)
+        b = batched_dit_h.shape[0]
+
+        if self._deterministic_cfm_noise and self._cfm_buffers is not None:
+            noise = self._cfm_buffers.noise[:b]
+            for i, (state, _, _) in enumerate(batch):
+                self._fill_deterministic_cfm_noise(state, noise[i : i + 1])
+        else:
+            noise = torch.randn(
+                b,
+                self._feat_dim,
+                self._patch_size,
+                device=batched_dit_h.device,
+                dtype=batched_dit_h.dtype,
+            )
+        pred_feats = _optimized_solve_euler_with_noise(
+            tts.feat_decoder,
+            batched_dit_h,
+            self._patch_size,
+            batched_cond,
+            noise,
+            self._inference_timesteps,
+            self._cfg_value,
+            self._cfm_buffers,
+            cfg_cutoff_ratio=self._cfg_cutoff_ratio,
+        ).transpose(1, 2)
+
+        with torch.no_grad():
+            curr_embeds = tts.enc_to_lm_proj(tts.feat_encoder(pred_feats.unsqueeze(1))).squeeze(1)
+
+        for i, (state, meta, res_out) in enumerate(batch):
+            pred_feat_i = pred_feats[i : i + 1]
+            curr_embed_i = curr_embeds[i : i + 1]
+            self._commit_decode_state(state, stop_logits_list[i], curr_embed_i, pred_feat_i)
+            state.decode_step_count = 0
+            state.request_start_time = time.perf_counter()
+            state.prefill_completed = True
+
+        self._perf.stop("prefill_tail_batch")
+        if self._enable_profiling:
+            logger.info("PREFILL_BATCH[%d requests] tail breakdown:\n%s", len(batch), self._perf.breakdown())
+            self._perf.reset()
+
     def _finish_prefill(self, state: _RequestState, meta: dict, res_out: torch.Tensor, dev: Any):
+        self._perf.start("prefill_tail")
         tts = self.tts
         lm_hidden = meta["lm_hidden"]
         prefix_feat_cond = meta["prefix_feat_cond"]
         residual_hidden = res_out[-1:, :]
 
+        self._perf.start("prefill.stop_fn")
         stop_logits = tts.stop_head(tts.stop_actn(tts.stop_proj(lm_hidden))).detach()
+        self._perf.stop("prefill.stop_fn")
+        self._perf.start("prefill.dit_proj")
         dit_h = torch.cat([tts.lm_to_dit_proj(lm_hidden), tts.res_to_dit_proj(residual_hidden)], dim=-1)
+        self._perf.stop("prefill.dit_proj")
 
         self._setup_cfm_buffers()
         if self._enable_torch_compile:
@@ -1922,17 +2705,22 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         pred_feat = self._run_cfm_for_state(state, dit_h, prefix_feat_cond.transpose(1, 2).contiguous())
 
+        self._perf.start("prefill.feat_encoder")
         with torch.no_grad():
             curr_embed = tts.enc_to_lm_proj(tts.feat_encoder(pred_feat.unsqueeze(1))).squeeze(1)
+        self._perf.stop("prefill.feat_encoder")
 
         self._commit_decode_state(state, stop_logits, curr_embed, pred_feat)
         state.decode_step_count = 0
         state.request_start_time = time.perf_counter()
         state.prefill_completed = True
+        self._perf.stop("prefill_tail")
 
         if logger.isEnabledFor(logging.DEBUG):
             # Only compute the norm (which forces a GPU->CPU sync) if we will log it.
             logger.debug("PREFILL[%s]: patch norm=%.4f", state.request_id, pred_feat.norm().item())
+        if self._enable_profiling:
+            logger.info("PREFILL[%s] tail breakdown:\n%s", state.request_id, self._perf.breakdown())
         self._perf.reset()
 
     def _finish_decode(self, state: _RequestState, meta: dict, res_out: torch.Tensor, dev: Any):
@@ -2620,11 +3408,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state = self._active_states.get(req_id)
             if state and state.decode_step_count > 0:
                 logger.info(
-                    "REQUEST DONE[%s]: %d steps, %.2fs\n%s",
+                    "REQUEST DONE[%s]: %d steps, %.2fs\n%s\nUnified graph: captures=%d replays=%d fallbacks=%s",
                     req_id,
                     state.decode_step_count,
                     time.perf_counter() - state.request_start_time,
                     self._perf.breakdown(),
+                    self._unified_graph_stats.captures,
+                    self._unified_graph_stats.replays,
+                    self._unified_graph_stats.fallbacks,
                 )
         return {}
 
