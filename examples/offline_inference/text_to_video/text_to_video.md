@@ -9,6 +9,7 @@ A unified script for text-to-video generation. Supports multiple models with mod
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
+| `BestWishYsh/Helios-Base` / `Helios-Mid` / `Helios-Distilled` | 384x640 | 99 | 50 | 5.0 / 5.0 / 1.0 | — |
 
 ## Local CLI Usage
 
@@ -100,6 +101,49 @@ python text_to_video.py \
   --output quick_test.mp4
 ```
 
+### Helios (T2V)
+
+Helios ships three variants. Model-specific knobs (declared in
+`vllm_omni/model_extras/helios.py`) are passed via the generic `--extra-body`
+JSON flag rather than bespoke per-model flags.
+
+**Helios-Base** (Stage 1 only):
+
+```bash
+python text_to_video.py \
+  --model BestWishYsh/Helios-Base \
+  --prompt "A dynamic time-lapse of scenery rushing past the window of a speeding train." \
+  --guidance-scale 5.0 \
+  --output helios_t2v_base.mp4
+```
+
+**Helios-Mid** (Stage 2 pyramid + CFG-Zero*):
+
+```bash
+python text_to_video.py \
+  --model BestWishYsh/Helios-Mid \
+  --prompt "A dynamic time-lapse of scenery rushing past the window of a speeding train." \
+  --guidance-scale 5.0 \
+  --extra-body '{"is_enable_stage2": true, "pyramid_num_inference_steps_list": [20, 20, 20], "use_cfg_zero_star": true, "use_zero_init": true, "zero_steps": 1}' \
+  --output helios_t2v_mid.mp4
+```
+
+**Helios-Distilled** (Stage 2 pyramid + DMD, few-step):
+
+```bash
+python text_to_video.py \
+  --model BestWishYsh/Helios-Distilled \
+  --prompt "A dynamic time-lapse of scenery rushing past the window of a speeding train." \
+  --num-frames 240 \
+  --guidance-scale 1.0 \
+  --extra-body '{"is_enable_stage2": true, "pyramid_num_inference_steps_list": [2, 2, 2], "is_amplify_first_chunk": true}' \
+  --output helios_t2v_distilled.mp4
+```
+
+> Helios image-to-video (I2V) and video-to-video (V2V) require image/video
+> conditioning tensors that cannot be passed through the JSON `--extra-body`
+> flag; they are out of scope for this text-to-video example.
+
 ## Key Arguments
 
 ### Common
@@ -112,6 +156,7 @@ python text_to_video.py \
 - `--num-inference-steps`: sampling steps. Default depends on model.
 - `--fps`: frames per second for the saved MP4.
 - `--output`: path to save the generated video.
+- `--extra-body`: JSON dict of model-specific knobs (declared in `vllm_omni/model_extras/`), merged into sampling `extra_args`. See the Helios recipes above.
 - `--vae-use-slicing`: enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: enable VAE tiling for memory optimization.
 - `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
