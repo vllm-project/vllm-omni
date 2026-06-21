@@ -9,6 +9,7 @@ import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.ipc import (
     _SHM_TENSOR_THRESHOLD,
+    DIFFUSION_RPC_RESULT_ENVELOPE,
     _pack_value_if_large,
     _unpack_if_shm_handle,
     pack_diffusion_output_shm,
@@ -79,6 +80,31 @@ def test_diffusion_output_list_tensors_round_trip_through_shm() -> None:
     assert isinstance(output.output, list)
     torch.testing.assert_close(output.output[0], frames[0])
     torch.testing.assert_close(output.output[1], frames[1])
+
+
+def test_rpc_result_envelope_diffusion_output_round_trips_through_shm() -> None:
+    tensor = torch.arange(300_000, dtype=torch.float32)
+    envelope = {
+        "type": DIFFUSION_RPC_RESULT_ENVELOPE,
+        "result": DiffusionOutput(output=tensor),
+        "rank_statuses": [{"rank": 0, "ok": True}],
+    }
+
+    packed = pack_diffusion_output_shm(envelope)
+
+    assert packed is envelope
+    result = packed["result"]
+    assert isinstance(result, DiffusionOutput)
+    assert result.output["__tensor_shm__"] is True
+    assert packed["rank_statuses"] == [{"rank": 0, "ok": True}]
+
+    unpacked = unpack_diffusion_output_shm(packed)
+
+    assert unpacked is envelope
+    result = unpacked["result"]
+    assert isinstance(result, DiffusionOutput)
+    torch.testing.assert_close(result.output, tensor)
+    assert unpacked["rank_statuses"] == [{"rank": 0, "ok": True}]
 
 
 def test_pack_value_keeps_tensor_at_threshold_inline() -> None:

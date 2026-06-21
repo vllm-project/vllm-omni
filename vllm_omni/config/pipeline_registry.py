@@ -44,6 +44,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.qwen3_omni.pipeline",
         "QWEN3_OMNI_PIPELINE",
     ),
+    "aura_omni": (
+        "vllm_omni.model_executor.models.aura_omni.pipeline",
+        "AURA_OMNI_PIPELINE",
+    ),
     "qwen3_tts": (
         "vllm_omni.model_executor.models.qwen3_tts.pipeline",
         "QWEN3_TTS_PIPELINE",
@@ -76,6 +80,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "glm_image": (
         "vllm_omni.model_executor.models.glm_image.pipeline",
         "GLM_IMAGE_PIPELINE",
+    ),
+    "Gr00tN1d7": (
+        "vllm_omni.model_executor.models.gr00t.pipeline",
+        "GR00T_N1D7_PIPELINE",
     ),
     "hunyuan_image_3_moe": (
         "vllm_omni.model_executor.models.hunyuan_image3.pipeline",

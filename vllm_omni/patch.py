@@ -1,7 +1,9 @@
 import logging
+import os
 import sys
 from functools import cached_property
 
+import torch
 from aenum import extend_enum
 from vllm.config import ModelConfig as _OriginalModelConfig
 from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
@@ -20,6 +22,8 @@ from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEn
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
+
+_PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
 
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
@@ -70,6 +74,185 @@ assert _installed is _patched_cp, (
     "is_mm_prefix_lm patch failed to install — bidirectional attention "
     "for HunyuanImage3 will not work. Check vLLM ModelConfig changes."
 )
+
+# =============================================================================
+# Patch ModelOptNvFp4LinearMethod.process_weights_after_loading to clamp NaN
+# bytes in per-block FP8 weight_scale tensors at load time.
+# =============================================================================
+# WHY: ModelOpt 0.44's float32 -> torch.float8_e4m3fn cast of per-block weight
+# scales occasionally emits NaN bytes (E4M3 encoding 0x7F / 0xFF) when the
+# pre-cast scale rounds above the FP8 E4M3 max of 448 after the global-scale
+# division. Any single NaN byte in weight_scale propagates through the
+# FlashInfer FP4 GEMM and the served model collapses to `!!!!`. NVFP4 W4A4
+# Qwen3-Omni checkpoints published by the community — exported with stock
+# ModelOpt 0.44 — currently fail this way the moment they're served.
+#
+# WHY here (vllm-omni, not upstream): the root cause sits in ModelOpt; the
+# analogous fix in vLLM's own PWAL is also pending. Both are planned as
+# follow-up PRs. Until those land in vllm-omni's pinned vLLM, this load-time
+# clamp keeps the user-visible failure from looking like a vllm-omni
+# inference bug. Newly calibrated, clean checkpoints pay no runtime cost
+# (the clamp is a no-op when no NaN bytes are present).
+#
+# SCOPE: ModelOptNvFp4LinearMethod (W4A4 NVFP4 Linear) only. NvFp4FusedMoE /
+# NvFp4W4A16 / CompressedTensors / Quark NVFP4 paths are not covered.
+#
+# SELF-EXTINGUISH: `_already_patched_upstream` heuristically detects when
+# vLLM's own PWAL contains an in-place `masked_fill_` against `weight_scale`
+# / `isnan` — the structure the upstream fix is expected to take when it is
+# filed (planned as a follow-up PR after this one merges). Once vllm-omni's
+# vllm pin moves to a release with that upstream fix, the override is
+# skipped at import and this block can be deleted. NOTE: the heuristic only
+# matches "vLLM PWAL clamps NaN in-place with `masked_fill_`"; if the
+# upstream fix lands as `nan_to_num_` or as a clamp before the FP32→FP8
+# cast, the check won't fire and this override stays active. The override
+# is idempotent so the overlap is a warning log, not a correctness issue —
+# but the heuristic should be revisited when the upstream PR is filed.
+#
+# ORDERING: the clamp must run BEFORE the original PWAL. The non-Blackwell
+# Marlin fallback (sm_<100) casts weight_scale FP8 -> bf16/fp16 and permutes
+# inside its kernel PWAL; an after-PWAL clamp would either trip the
+# byte-view shape assertion (FP8 1B/elem -> bf16 2B/elem) or operate on
+# already-transformed bytes where NaN has propagated through permute. On
+# Blackwell (Cutlass/TRTLLM/cuDNN) the kernel PWAL only swizzles/shuffles
+# FP8 bytes, so clamp-before is equivalent to clamp-after there.
+
+
+def _clamp_nvfp4_weight_scale_nans(layer) -> int:
+    """Scan ``layer.weight_scale`` for NaN bytes and clamp them to the FP8
+    E4M3 max byte (0x7E) in place. Returns the number of bytes clamped.
+
+    Scoped to NVFP4 ``float8_e4m3fn`` weight_scale only — a future MXFP4
+    weight-scale clamp would need its own helper (MXFP4 uses
+    ``float8_e8m0fnu`` for scales, and the byte encoding of NaN differs).
+
+    Exposed at module scope so tests can exercise the clamp directly
+    without monkey-patching + reloading the parent ``vllm_omni.patch``
+    module.
+    """
+    # Defensive: a stray subclass without weight_scale would crash inside
+    # the override; just bail out.
+    weight_scale = getattr(layer, "weight_scale", None)
+    if weight_scale is None:
+        return 0
+    # Re-entry safety: this clamp expects raw on-disk FP8 weight_scale (1
+    # byte/elem). If we are ever invoked after the original PWAL ran (e.g.
+    # a caller re-issues process_weights_after_loading on the same layer),
+    # weight_scale may have been cast to bf16/fp16 by the Marlin path, in
+    # which case the uint8 byte view below would have a different shape
+    # than the NaN mask. Bail out cleanly rather than trip the assert.
+    if weight_scale.dtype != torch.float8_e4m3fn:
+        return 0
+    # `.view(torch.uint8)` below requires a contiguous tensor and raises on a
+    # non-contiguous one. A checkpoint whose per-block scale tensor isn't
+    # contiguous would otherwise crash here. Materialize a contiguous copy and
+    # write it back to the Parameter so the in-place byte clamp lands on the
+    # tensor the kernel will actually read (a bare `.contiguous()` copy would
+    # be discarded and the original left un-clamped).
+    weight_scale_data = weight_scale.data
+    if not weight_scale_data.is_contiguous():
+        weight_scale_data = weight_scale_data.contiguous()
+        weight_scale.data = weight_scale_data
+    nan_mask = torch.isnan(weight_scale_data)
+    if not nan_mask.any():
+        return 0
+    # PyTorch does not implement masked_fill_ for float8_e4m3fn, so view
+    # the storage as uint8 and write the FP8 max byte (0x7E) directly.
+    # float8_e4m3fn is 1 byte per element so the byte view is shape-
+    # for-shape with the original tensor; pin that here so a future
+    # packed scale format would fail loudly rather than silently corrupt
+    # unrelated bytes.
+    byte_view = weight_scale_data.view(torch.uint8)
+    if byte_view.shape != nan_mask.shape:
+        raise RuntimeError(
+            f"NVFP4 weight_scale uint8 view shape {byte_view.shape} != NaN mask shape "
+            f"{nan_mask.shape}; per-block scale layout changed — recheck the clamp."
+        )
+    fp8_max_byte = (
+        torch.tensor(torch.finfo(torch.float8_e4m3fn).max, dtype=torch.float8_e4m3fn).view(torch.uint8).item()
+    )
+    byte_view.masked_fill_(nan_mask, fp8_max_byte)
+    n = int(nan_mask.sum().item())
+    _PATCH_LOGGER.warning("Clamped %d NaN entries in NVFP4 per-block weight_scale.", n)
+    return n
+
+
+# Module-level defaults so downstream code (and tests) can import these names
+# without guarding for the import-failure / escape-hatch branches below.
+# `_already_patched_upstream` = upstream PWAL contains its own NaN clamp.
+# `_clamp_installed`         = our wrapper was installed on the upstream class.
+# These are independent: the env-var escape hatch and the import-failure path
+# both leave the wrapper uninstalled WITHOUT upstream being patched, so the
+# right check for "we own NaN-clamp behavior" is `_clamp_installed`.
+_already_patched_upstream = False
+_clamp_installed = False
+
+try:
+    # Escape hatch — set VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP=1 to skip installing
+    # the patch (e.g. to confirm a `!!!!` failure is the NaN-byte case).
+    # The escape-hatch deliberately raises ImportError so the not-installed
+    # warning below logs through the same path a real ImportError would.
+    # Use the repo-wide bool-env idiom so values like `0`, `false`, `no`,
+    # `off` correctly mean "do not skip" rather than tripping naive
+    # truthiness on the non-empty string.
+    if os.environ.get("VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP", "").lower() in ("1", "true", "yes", "on"):
+        raise ImportError("VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP is set; skipping NaN-clamp install")
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4LinearMethod as _OriginalModelOptNvFp4LinearMethod,
+    )
+except ImportError as _nan_clamp_import_err:
+    _PATCH_LOGGER.warning(
+        "NVFP4 weight_scale NaN-clamp patch could NOT install: %s. NVFP4 W4A4 "
+        "checkpoints with NaN bytes in per-block weight_scale will serve `!!!!`.",
+        _nan_clamp_import_err,
+    )
+else:
+    _current_nvfp4_pwal = _OriginalModelOptNvFp4LinearMethod.process_weights_after_loading
+    # Reload idempotency: on a module reload (importlib.reload in a test, or a
+    # second import path) the class attribute already holds OUR wrapper, so
+    # capturing it as the "original" and re-wrapping would nest the clamp and
+    # run it twice per load. Recover the genuine upstream method from the
+    # sentinel we stamp below; the heuristic + a fresh single-level wrapper are
+    # then computed against the real upstream, not against our own wrapper.
+    _original_nvfp4_pwal = getattr(_current_nvfp4_pwal, "_vllm_omni_wrapped_pwal", _current_nvfp4_pwal)
+    _upstream_pwal_names = set(_original_nvfp4_pwal.__code__.co_names or ())
+    # Require ALL three names — `weight_scale` alone is too loose because the
+    # current upstream PWAL already references `weight_scale_2` (close prefix
+    # collisions aside, future PWALs may legitimately reference `weight_scale`
+    # without a NaN clamp). `masked_fill_` + `isnan` + `weight_scale` together
+    # are the structural signature of an in-place NaN clamp on weight_scale.
+    # KNOWN BLIND SPOTS (false-negatives, safe direction — we install a
+    # redundant but idempotent clamp): upstream using
+    # `getattr(layer, "weight_scale")` (string lands in co_consts, not
+    # co_names), or factoring the clamp into a helper called from PWAL
+    # (none of the three names appear in the top-level co_names). Revisit
+    # this heuristic when the upstream PR is actually filed.
+    _already_patched_upstream = all(n in _upstream_pwal_names for n in ("masked_fill_", "isnan", "weight_scale"))
+
+    def _patched_nvfp4_pwal(self, layer, *args, **kwargs):
+        # Clamp BEFORE the original PWAL — see ORDERING note above.
+        _clamp_nvfp4_weight_scale_nans(layer)
+        _original_nvfp4_pwal(self, layer, *args, **kwargs)
+
+    # Sentinel so a later reload of this module recovers the genuine upstream
+    # method above instead of wrapping this wrapper (see reload-idempotency note).
+    _patched_nvfp4_pwal._vllm_omni_wrapped_pwal = _original_nvfp4_pwal
+
+    if not _already_patched_upstream:
+        _OriginalModelOptNvFp4LinearMethod.process_weights_after_loading = _patched_nvfp4_pwal
+        # Fail loudly if install dropped silently (e.g. another plugin
+        # patched the same class) rather than degrade to `!!!!` at decode.
+        # Use raise, not assert: asserts are compiled out under `python -O` /
+        # PYTHONOPTIMIZE, which would silently disable this guard in exactly
+        # the optimized runs where a conflicting plugin must still be caught.
+        if _OriginalModelOptNvFp4LinearMethod.process_weights_after_loading is not _patched_nvfp4_pwal:
+            raise RuntimeError("NVFP4 weight_scale NaN-clamp install failed — check for conflicting plugins.")
+        _clamp_installed = True
+
+    _PATCH_LOGGER.info(
+        "NVFP4 W4A4 weight_scale NaN-clamp: %s.",
+        "skipped (upstream already patched)" if _already_patched_upstream else "installed",
+    )
 
 # =============================================================================
 # Patch GlmImageTextConfig to expose mrope_section in rope_parameters
@@ -129,43 +312,6 @@ for module_name, module in list(sys.modules.items()):
         module.StreamingUpdate = OmniStreamingUpdate
     if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
         module.EngineCoreRequest = OmniEngineCoreRequest
-
-# =============================================================================
-# Patch unregister_vllm_metrics to skip vllm:omni_* collectors
-# =============================================================================
-# WHY: Upstream unregister_vllm_metrics() uses `"vllm" in collector._name` to
-# strip collectors before each new PrometheusStatLogger registers, which is
-# how it avoids "Duplicated timeseries" when the same process spawns multiple
-# engines / orchestrators.  But its substring match also wipes our vllm:omni_*
-# families, so we must replace it with a scoped version that keeps ours.
-#
-# REMOVAL: Remove this patch once upstream vLLM adds
-# _STAT_LOGGER_METRIC_NAMES to vllm.v1.metrics.prometheus and scopes
-# unregister_vllm_metrics() to that set.  Track:
-# https://github.com/vllm-project/vllm/pull/42331
-import vllm.v1.metrics.prometheus as _vllm_prometheus  # noqa: E402
-
-_logger = logging.getLogger(__name__)
-
-
-def _scoped_unregister_vllm_metrics():
-    """Drop upstream vllm:* collectors but preserve vllm:omni_* (ours)."""
-    from prometheus_client import REGISTRY
-
-    for collector in list(REGISTRY._collector_to_names):
-        name = getattr(collector, "_name", "")
-        if "vllm" not in name:
-            continue
-        if name.startswith("vllm:omni_") or name.startswith("vllm_omni"):
-            continue
-        REGISTRY.unregister(collector)
-
-
-_vllm_prometheus.unregister_vllm_metrics = _scoped_unregister_vllm_metrics
-_logger.warning(
-    "Monkey-patched unregister_vllm_metrics() to scope drops to non-omni vllm:* collectors. "
-    "Remove this patch once vLLM adds _STAT_LOGGER_METRIC_NAMES."
-)
 
 
 # Patch: add qwen3_omni_moe to vllm's chat template fallback registry.

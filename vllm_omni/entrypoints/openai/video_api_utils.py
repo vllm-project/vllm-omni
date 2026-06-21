@@ -28,6 +28,29 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 )
 
 
+class VideoFrames(list[Image.Image]):
+    """Decoded video frames plus source metadata."""
+
+    def __init__(self, frames: list[Image.Image] | None = None, *, fps: float | None = None) -> None:
+        super().__init__(frames or [])
+        self.fps = fps
+        self.frame_rate = fps
+
+
+def positive_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if hasattr(value, "item") and not isinstance(value, (bytes, str)):
+        value = value.item()
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if result <= 0:
+        return None
+    return result
+
+
 def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
     try:
         return Image.open(BytesIO(image_bytes)).convert("RGB")
@@ -41,7 +64,7 @@ def _decode_video_bytes(
     source: str,
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
-) -> list[Image.Image]:
+) -> VideoFrames:
     try:
         import av
     except ImportError as exc:  # pragma: no cover - av is a serving dependency via media_utils
@@ -56,8 +79,16 @@ def _decode_video_bytes(
     tail_frames: deque[Image.Image] | None = (
         deque(maxlen=max_frames) if keep == "last" and max_frames is not None else None
     )
+    fps: float | None = None
     try:
         with av.open(BytesIO(video_bytes)) as container:
+            video_stream = container.streams.video[0] if container.streams.video else None
+            if video_stream is not None:
+                fps = (
+                    positive_float(getattr(video_stream, "average_rate", None))
+                    or positive_float(getattr(video_stream, "base_rate", None))
+                    or positive_float(getattr(video_stream, "guessed_rate", None))
+                )
             for frame in container.decode(video=0):
                 image = frame.to_image().convert("RGB")
                 if tail_frames is not None:
@@ -73,7 +104,7 @@ def _decode_video_bytes(
         frames = list(tail_frames)
     if not frames:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid video.")
-    return frames
+    return VideoFrames(frames, fps=fps)
 
 
 def _decode_media_bytes(
@@ -82,7 +113,7 @@ def _decode_media_bytes(
     source: str,
     max_video_frames: int | None = None,
     video_keep: Literal["first", "last"] = "first",
-) -> Image.Image | list[Image.Image]:
+) -> Image.Image | VideoFrames:
     try:
         return _decode_image_bytes(media_bytes, source=source)
     except InvalidInputReferenceError:
@@ -138,7 +169,7 @@ def _decode_base64_video(
     source: str,
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
-) -> list[Image.Image]:
+) -> VideoFrames:
     if video_reference:
         if video_reference.startswith("data:video"):
             _, b64_data = video_reference.split(",", 1)
@@ -158,7 +189,7 @@ async def decode_video_url(
     *,
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
-) -> list[Image.Image]:
+) -> VideoFrames:
     if video_url.startswith("data:video"):
         return _decode_base64_video(
             video_url,
@@ -186,6 +217,53 @@ async def decode_video_url(
     raise InvalidInputReferenceError("Invalid video_reference.video_url: must be an http(s) URL or data URL.")
 
 
+async def decode_audio_url(audio_url: str) -> str:
+    """Decode an audio URL or data-URL to a temporary file path."""
+    import tempfile
+
+    audio_bytes: bytes | None = None
+
+    if audio_url.startswith("data:audio"):
+        _, b64_data = audio_url.split(",", 1)
+        try:
+            audio_bytes = base64.b64decode(b64_data)
+        except (binascii.Error, ValueError) as exc:
+            raise InvalidInputReferenceError(
+                "Invalid audio_reference.audio_url: audio data is not valid base64."
+            ) from exc
+    elif audio_url.startswith(("http://", "https://")):
+        async with httpx.AsyncClient(timeout=60) as client:
+            try:
+                response = await client.get(audio_url)
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise InvalidInputReferenceError(
+                    "Invalid audio_reference.audio_url: failed to download audio."
+                ) from exc
+        audio_bytes = response.content
+    else:
+        raise InvalidInputReferenceError("Invalid audio_reference.audio_url: must be an http(s) URL or data URL.")
+
+    if not audio_bytes:
+        raise InvalidInputReferenceError("Invalid audio_reference: audio data is empty.")
+
+    suffix = ".wav"
+    if audio_url.startswith("data:audio/"):
+        mime = audio_url.split(";")[0].removeprefix("data:")
+        ext = mime.split("/")[-1]
+        if ext in ("mpeg", "mp3"):
+            suffix = ".mp3"
+        elif ext == "wav":
+            suffix = ".wav"
+        elif ext.isalnum() and len(ext) <= 8:
+            suffix = f".{ext}"
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(audio_bytes)
+    tmp.close()
+    return tmp.name
+
+
 async def decode_input_reference(
     image_reference: ImageReference | None,
     video_reference: VideoReference | None,
@@ -193,7 +271,7 @@ async def decode_input_reference(
     *,
     max_video_frames: int | None = None,
     video_keep: Literal["first", "last"] = "first",
-) -> Image.Image | list[Image.Image] | None:
+) -> Image.Image | VideoFrames | None:
     """Decode media input from multipart bytes, data URLs, or typed references."""
 
     provided = sum(item is not None for item in (input_reference_bytes, image_reference, video_reference))

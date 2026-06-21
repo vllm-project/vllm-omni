@@ -20,7 +20,8 @@ from __future__ import annotations
 import math
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import fields
 from typing import Any, ClassVar
 
 import numpy as np
@@ -49,6 +50,7 @@ from vllm_omni.diffusion.models.interface import (
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.entrypoints.openai.video_api_utils import positive_float
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from .action import (
@@ -64,17 +66,59 @@ from .action import (
     pad_action_to_dim,
     resolve_domain_id,
 )
+from .transfer import (
+    Cosmos3TransferConfig,
+    has_transfer_hints,
+    load_or_compute_control_frames,
+    media_hw,
+    media_to_uint8_cthw,
+    normalized_video_to_uint8_cthw,
+    pad_temporal_frames,
+    resize_center_crop_uint8_cthw,
+    resolve_transfer_config,
+    transfer_max_frames_from_extra_args,
+    uint8_cthw_to_normalized_5d,
+)
 from .transformer_cosmos3 import Cosmos3VFMTransformer, resolve_sound_gen
+from .utils import (
+    COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION,
+    COSMOS3_VAE_TEMPORAL_COMPRESSION,
+    ROBOLAB_CONCAT_VIEW_DESCRIPTION,
+    ROBOLAB_DEFAULT_ACTION_CHUNK_SIZE,
+    ROBOLAB_DEFAULT_ACTION_SPACE,
+    ROBOLAB_DEFAULT_CONDITIONING_FPS,
+    ROBOLAB_DEFAULT_DOMAIN_NAME,
+    ROBOLAB_DEFAULT_FLOW_SHIFT,
+    ROBOLAB_DEFAULT_GUIDANCE_SCALE,
+    ROBOLAB_DEFAULT_IMAGE_HEIGHT,
+    ROBOLAB_DEFAULT_IMAGE_WIDTH,
+    ROBOLAB_DEFAULT_NUM_INFERENCE_STEPS,
+    ROBOLAB_DEFAULT_RAW_ACTION_DIM,
+    ROBOLAB_DEFAULT_RESOLUTION,
+    ROBOLAB_MIDTRAIN_RAW_ACTION_DIM,
+    RoboLabActionPostprocessInputs,
+    RoboLabPolicyInputs,
+    build_abs_pose_from_components,
+    build_robolab_unipc_scheduler,
+    condition_pixel_frame_count,
+    convert_midtrain_rotation,
+    ensure_2d_float_array,
+    ensure_gripper_array,
+    extract_robolab_image,
+    extract_robolab_prompt_image,
+    lazy_action_transform_pipeline,
+    make_robolab_action_postprocess_inputs,
+    next_robolab_seed,
+    normalize_condition_frame_indexes_vision,
+    normalize_condition_video_keep,
+    normalize_robolab_action_space,
+    pose_abs_to_rel,
+    postprocess_robolab_action,
+    resize_rgb_uint8,
+)
 
 logger = init_logger(__name__)
 
-COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION = (0, 1)
-COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP = "first"
-# Mirrors the WAN VAE's temporal compression. Authoritative value is
-# ``self.vae.config.scale_factor_temporal`` at runtime; this constant exists so
-# off-line / API code that runs before the pipeline is constructed can compute
-# pixel-frame budgets without instantiating the VAE.
-COSMOS3_VAE_TEMPORAL_COMPRESSION = 4
 COSMOS3_DEFAULT_CONDITION_PIXEL_FRAMES = (
     max(COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION) * COSMOS3_VAE_TEMPORAL_COMPRESSION + 1
 )
@@ -85,8 +129,9 @@ COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolutio
 COSMOS3_INVERSE_DURATION_TEMPLATE = "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS."
 COSMOS3_INVERSE_RESOLUTION_TEMPLATE = "This video is not of {height}x{width} resolution."
 COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE = "This image is not of {height}x{width} resolution."
-COSMOS3_SYSTEM_PROMPT = "You are a helpful assistant who will generate videos from a given prompt."
-COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate images from a given prompt."
+# NOTE: Intentional typo in "give" instead of "given" to match training setup.
+COSMOS3_SYSTEM_PROMPT = "You are a helpful assistant who will generate videos from a give prompt."
+COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate images from a give prompt."
 
 COSMOS3_T2V_DEFAULT_HEIGHT = 720
 COSMOS3_T2V_DEFAULT_WIDTH = 1280
@@ -105,43 +150,6 @@ COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL: tuple[float, float] = (400.0, 1000.0)
 # are tokenized to their natural length (no padding); this only bounds the
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
 COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
-
-
-def _normalize_condition_frame_indexes_vision(value: Any) -> tuple[int, ...]:
-    """Normalize Cosmos3 vision-conditioning latent frame indexes."""
-    if value is None:
-        return COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION
-    if isinstance(value, str):
-        value = [item.strip() for item in value.split(",") if item.strip()]
-    elif isinstance(value, int):
-        value = [value]
-
-    if not isinstance(value, Iterable):
-        raise TypeError(
-            "Cosmos3 condition_frame_indexes_vision must be an int, comma-separated string, "
-            f"or iterable of ints; got {type(value)!r}."
-        )
-
-    indexes = tuple(sorted({int(index) for index in value}))
-    if not indexes:
-        raise ValueError("Cosmos3 condition_frame_indexes_vision must contain at least one index.")
-    if any(index < 0 for index in indexes):
-        raise ValueError(f"Cosmos3 condition_frame_indexes_vision must be non-negative, got {indexes}.")
-    return indexes
-
-
-def _condition_pixel_frame_count(
-    condition_frame_indexes_vision: Iterable[int],
-    temporal_compression: int = COSMOS3_VAE_TEMPORAL_COMPRESSION,
-) -> int:
-    return max(condition_frame_indexes_vision) * int(temporal_compression) + 1
-
-
-def _normalize_condition_video_keep(value: Any) -> str:
-    keep = str(value or COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP).strip().lower()
-    if keep not in {"first", "last"}:
-        raise ValueError("Cosmos3 condition_video_keep must be either 'first' or 'last'.")
-    return keep
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +180,14 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
 
     def _request_action_mode(request: OmniDiffusionRequest) -> str | None:
         return normalize_action_mode(_extra_args(request).get("action_mode"))
+
+    def _set_transfer_size_from_image(request: OmniDiffusionRequest, image: PIL.Image.Image) -> tuple[int, int]:
+        extra = _extra_args(request)
+        resolution = extra.get("resolution", extra.get("image_size", 720))
+        target_w, target_h = find_closest_target_size(image.height, image.width, resolution)
+        request.sampling_params.height = target_h
+        request.sampling_params.width = target_w
+        return int(target_h), int(target_w)
 
     def _set_action_size_from_image(request: OmniDiffusionRequest, image: PIL.Image.Image) -> tuple[int, int]:
         sp = request.sampling_params
@@ -255,7 +271,43 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
         image = image.crop((left, top, left + target_w, top + target_h))
         return video_processor.preprocess(image, height=target_h, width=target_w)
 
+    def _video_payload_value(video: Any, key: str) -> Any:
+        if isinstance(video, Mapping):
+            return video.get(key)
+        return getattr(video, key, None)
+
+    def _video_payload_fps(video: Any) -> float | None:
+        for key in ("fps", "frame_rate", "source_fps", "input_fps", "avg_fps", "average_fps"):
+            fps = positive_float(_video_payload_value(video, key))
+            if fps is not None:
+                return fps
+        for key in ("metadata", "info"):
+            metadata = _video_payload_value(video, key)
+            if metadata is None or metadata is video:
+                continue
+            fps = _video_payload_fps(metadata)
+            if fps is not None:
+                return fps
+        if isinstance(video, Mapping):
+            for key in ("frames", "data", "video"):
+                nested = video.get(key)
+                if nested is None or nested is video:
+                    continue
+                fps = _video_payload_fps(nested)
+                if fps is not None:
+                    return fps
+        return None
+
+    def _unwrap_video_payload(video: Any) -> Any:
+        if isinstance(video, Mapping):
+            for key in ("frames", "data", "video"):
+                nested = video.get(key)
+                if nested is not None:
+                    return nested
+        return video
+
     def _video_payload_to_frames(video: Any) -> list[Any]:
+        video = _unwrap_video_payload(video)
         if isinstance(video, list):
             return video
         if isinstance(video, torch.Tensor):
@@ -322,7 +374,9 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                 prompt["additional_information"] = {}
 
             raw_video_frames: list[Any] | None = None
+            transfer_input_fps: float | None = None
             if raw_video is not None:
+                transfer_input_fps = _video_payload_fps(raw_video)
                 raw_video_frames = _video_payload_to_frames(raw_video)
                 if not raw_video_frames:
                     raise TypeError("Cosmos3 video input must be a non-empty list of PIL images or image paths.")
@@ -332,9 +386,13 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                 image = _pil_to_rgb(raw_video_frames[0])
             else:
                 image = _pil_to_rgb(raw_image)
+            extra = _extra_args(request)
+            transfer_requested = action_mode is None and has_transfer_hints(extra)
 
             # Auto-calculate H/W from aspect ratio (720p max area)
-            if request.sampling_params.height is None or request.sampling_params.width is None:
+            if transfer_requested:
+                _set_transfer_size_from_image(request, image)
+            elif request.sampling_params.height is None or request.sampling_params.width is None:
                 if action_mode is not None:
                     _set_action_size_from_image(request, image)
                 else:
@@ -364,27 +422,40 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                 )
             else:
                 assert raw_video_frames is not None
-                extra = _extra_args(request)
-                condition_frame_indexes_vision = _normalize_condition_frame_indexes_vision(
-                    extra.get(
-                        "condition_frame_indexes_vision",
-                        prompt.get("condition_frame_indexes_vision"),
+                if transfer_requested:
+                    if transfer_input_fps is not None:
+                        prompt["additional_information"]["transfer_input_fps"] = transfer_input_fps
+                    transfer_frames = media_to_uint8_cthw(
+                        raw_video_frames,
+                        height=int(target_h),
+                        width=int(target_w),
+                        max_frames=transfer_max_frames_from_extra_args(extra),
                     )
-                )
-                keep = _normalize_condition_video_keep(
-                    extra.get("condition_video_keep", prompt.get("condition_video_keep"))
-                )
-                max_frames = _condition_pixel_frame_count(condition_frame_indexes_vision)
-                prompt["additional_information"]["preprocessed_video"] = _preprocess_condition_video(
-                    raw_video_frames,
-                    int(target_h),
-                    int(target_w),
-                    max_frames,
-                    keep,
-                )
-                prompt["additional_information"]["condition_frame_indexes_vision"] = list(
-                    condition_frame_indexes_vision
-                )
+                    prompt["additional_information"]["preprocessed_transfer_video"] = uint8_cthw_to_normalized_5d(
+                        transfer_frames,
+                        dtype=torch.float32,
+                    )
+                else:
+                    condition_frame_indexes_vision = normalize_condition_frame_indexes_vision(
+                        extra.get(
+                            "condition_frame_indexes_vision",
+                            prompt.get("condition_frame_indexes_vision"),
+                        )
+                    )
+                    keep = normalize_condition_video_keep(
+                        extra.get("condition_video_keep", prompt.get("condition_video_keep"))
+                    )
+                    max_frames = condition_pixel_frame_count(condition_frame_indexes_vision)
+                    prompt["additional_information"]["preprocessed_video"] = _preprocess_condition_video(
+                        raw_video_frames,
+                        int(target_h),
+                        int(target_w),
+                        max_frames,
+                        keep,
+                    )
+                    prompt["additional_information"]["condition_frame_indexes_vision"] = list(
+                        condition_frame_indexes_vision
+                    )
             if action_mode is not None and raw_video_frames is not None:
                 prompt["additional_information"]["preprocessed_video"] = _preprocess_action_video(
                     raw_video_frames,
@@ -491,6 +562,36 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
+def get_cosmos3_action_post_process_func(od_config: OmniDiffusionConfig):
+    del od_config
+
+    def action_post_process_func(action: Any, custom_output: dict[str, Any] | None = None, sampling_params=None):
+        del sampling_params
+        inputs = custom_output.get("robolab_action_postprocess") if isinstance(custom_output, dict) else None
+        if isinstance(inputs, RoboLabActionPostprocessInputs):
+            processed_action = postprocess_robolab_action(action, inputs)
+            custom_output.pop("robolab_action_postprocess", None)
+            return processed_action
+        return action
+
+    return action_post_process_func
+
+
+def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
+    del od_config
+
+    def ir_op_priority_func(ir_op_priority, vllm_config=None):
+        del vllm_config
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        priority_kwargs = {field.name: list(getattr(ir_op_priority, field.name)) for field in fields(ir_op_priority)}
+        priority_kwargs["rms_norm"] = ["native"]
+        priority_kwargs["fused_add_rms_norm"] = ["native"]
+        return IrOpPriorityConfig(**priority_kwargs)
+
+    return ir_op_priority_func
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -535,6 +636,12 @@ class Cosmos3OmniDiffusersPipeline(
         extra_args: dict[str, Any] | None = None,
     ) -> ReferenceVideoDecodeSpec:
         extra_args = extra_args if isinstance(extra_args, dict) else {}
+        if has_transfer_hints(extra_args):
+            max_frames = transfer_max_frames_from_extra_args(extra_args)
+            if num_frames is not None:
+                max_frames = min(max_frames, int(num_frames))
+            return ReferenceVideoDecodeSpec(max_frames=max_frames, keep="first")
+
         action_mode = normalize_action_mode(extra_args.get("action_mode"))
         if action_mode is not None:
             if num_frames is not None:
@@ -549,11 +656,11 @@ class Cosmos3OmniDiffusersPipeline(
                     return ReferenceVideoDecodeSpec(max_frames=max_frames, keep="first")
             return ReferenceVideoDecodeSpec(max_frames=None, keep="first")
 
-        condition_indexes = _normalize_condition_frame_indexes_vision(extra_args.get("condition_frame_indexes_vision"))
-        max_frames = _condition_pixel_frame_count(condition_indexes)
+        condition_indexes = normalize_condition_frame_indexes_vision(extra_args.get("condition_frame_indexes_vision"))
+        max_frames = condition_pixel_frame_count(condition_indexes)
         if num_frames is not None:
             max_frames = min(max_frames, int(num_frames))
-        keep = _normalize_condition_video_keep(extra_args.get("condition_video_keep"))
+        keep = normalize_condition_video_keep(extra_args.get("condition_video_keep"))
         return ReferenceVideoDecodeSpec(max_frames=max_frames, keep=keep)
 
     def __init__(
@@ -626,8 +733,16 @@ class Cosmos3OmniDiffusersPipeline(
             subfolder="scheduler",
             local_files_only=local_files_only,
         )
-        if od_config.flow_shift is not None:
-            self.scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config, flow_shift=od_config.flow_shift)
+        init_flow_shift = (
+            od_config.flow_shift
+            if od_config.flow_shift is not None
+            else getattr(self.scheduler.config, "flow_shift", 1.0)
+        )
+        self.scheduler = UniPCMultistepScheduler.from_config(
+            self.scheduler.config,
+            flow_shift=init_flow_shift,
+            use_karras_sigmas=False,
+        )
         self._cpu_scheduler_state()
 
         # --- Video processor for post-decode ---
@@ -654,6 +769,8 @@ class Cosmos3OmniDiffusersPipeline(
 
         self._guidance_scale = None
         self._num_timesteps = None
+        self._cosmos3_branch_caches: dict[str, tuple[Any, Any]] | None = None
+        self._robolab_transform = None
 
         # Set True by ``enable_cache_for_cosmos3`` when cache-dit is enabled on
         # this pipeline. Tells the sequential-CFG loop to keep paired
@@ -826,7 +943,63 @@ class Cosmos3OmniDiffusersPipeline(
         The transformer returns the raw prediction: video-only as a tensor,
         or a tuple in video, action, sound order for multimodal generation.
         """
-        return self.transformer(**kwargs)
+        cache_key = kwargs.pop("_cosmos3_cache_key", None)
+        if cache_key is None:
+            return self.transformer(**kwargs)
+
+        branch_caches = self._cosmos3_branch_caches
+        if branch_caches is None:
+            return self.transformer(**kwargs)
+
+        cache_key = str(cache_key)
+        self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(cache_key, (None, None))
+        prediction = self.transformer(**kwargs)
+        branch_caches[cache_key] = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
+        return prediction
+
+    def combine_multi_branch_cfg_noise(
+        self,
+        predictions: list[torch.Tensor | tuple[torch.Tensor, ...]],
+        true_cfg_scale: float | dict[str, float],
+        cfg_normalize: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if not isinstance(true_cfg_scale, dict) or true_cfg_scale.get("mode") != "cosmos3_transfer":
+            return super().combine_multi_branch_cfg_noise(predictions, true_cfg_scale, cfg_normalize)
+        mode = str(true_cfg_scale.get("branch_mode", "control_and_text"))
+        guidance_scale = float(true_cfg_scale.get("guidance_scale", 1.0))
+        control_guidance = float(true_cfg_scale.get("control_guidance", 1.0))
+
+        if mode == "control_only":
+            if len(predictions) != 2:
+                raise ValueError(f"Cosmos3 transfer control-only CFG expects 2 branches, got {len(predictions)}.")
+            cond_full, cond_no_control = predictions
+            if isinstance(cond_full, tuple) or isinstance(cond_no_control, tuple):
+                raise ValueError("Cosmos3 transfer control-only CFG expects video-only tensor predictions.")
+            cfg_reference = cond_full
+            combined = cond_no_control + control_guidance * (cond_full - cond_no_control)
+        elif mode == "text_only":
+            if len(predictions) != 2:
+                raise ValueError(f"Cosmos3 transfer text-only CFG expects 2 branches, got {len(predictions)}.")
+            cond_full, uncond_full = predictions
+            if isinstance(cond_full, tuple) or isinstance(uncond_full, tuple):
+                raise ValueError("Cosmos3 transfer text-only CFG expects video-only tensor predictions.")
+            cfg_reference = cond_full
+            combined = uncond_full + guidance_scale * (cond_full - uncond_full)
+        elif mode == "control_and_text":
+            if len(predictions) != 3:
+                raise ValueError(f"Cosmos3 transfer control+text CFG expects 3 branches, got {len(predictions)}.")
+            cond_full, cond_no_control, uncond_full = predictions
+            if isinstance(cond_full, tuple) or isinstance(cond_no_control, tuple) or isinstance(uncond_full, tuple):
+                raise ValueError("Cosmos3 transfer control+text CFG expects video-only tensor predictions.")
+            cfg_reference = cond_full
+            control_cond = cond_no_control + control_guidance * (cond_full - cond_no_control)
+            combined = uncond_full + guidance_scale * (control_cond - uncond_full)
+        else:
+            raise ValueError(f"Unknown Cosmos3 transfer CFG branch_mode={mode!r}.")
+
+        if cfg_normalize:
+            combined = self.cfg_normalize_function(cfg_reference, combined)
+        return combined
 
     @staticmethod
     def _cfg_parallel_active() -> bool:
@@ -874,6 +1047,306 @@ class Cosmos3OmniDiffusersPipeline(
         if val is not None:
             return val
         return default
+
+    def _get_robolab_transform(self):
+        if self._robolab_transform is None:
+            action_dim = int(getattr(self.transformer, "action_dim", 64))
+            self._robolab_transform = lazy_action_transform_pipeline(action_dim)
+        return self._robolab_transform
+
+    def _build_robolab_policy_inputs(
+        self,
+        sp: OmniDiffusionSamplingParams,
+        prompt_data: Any | None = None,
+        request_id: str | None = None,
+    ) -> RoboLabPolicyInputs | None:
+        extra = sp.extra_args if isinstance(sp.extra_args, dict) else {}
+        obs = extra.get("robot_obs")
+        if obs is None:
+            obs = extra.get("observation")
+        if obs is None:
+            return None
+        if not isinstance(obs, dict):
+            raise TypeError(f"Cosmos3 RoboLab observation must be a dict, got {type(obs)!r}.")
+
+        prompt = obs.get("prompt")
+        if not isinstance(prompt, str):
+            raise ValueError("RoboLab observation must contain string key 'prompt'.")
+
+        def extra_param(key: str, default: Any) -> Any:
+            value = extra.get(key)
+            return default if value is None else value
+
+        def extra_param_alias(primary_key: str, alias_key: str, default: Any) -> Any:
+            value = extra.get(primary_key)
+            if value is not None:
+                return value
+            value = extra.get(alias_key)
+            return default if value is None else value
+
+        action_space = normalize_robolab_action_space(extra_param("action_space", ROBOLAB_DEFAULT_ACTION_SPACE))
+        action_chunk_size = int(extra_param("action_chunk_size", ROBOLAB_DEFAULT_ACTION_CHUNK_SIZE))
+        raw_action_dim_default = (
+            ROBOLAB_DEFAULT_RAW_ACTION_DIM if action_space == "joint_pos" else ROBOLAB_MIDTRAIN_RAW_ACTION_DIM
+        )
+        raw_action_dim = int(extra_param("raw_action_dim", raw_action_dim_default))
+        image_h = int(extra_param("image_height", ROBOLAB_DEFAULT_IMAGE_HEIGHT))
+        image_w = int(extra_param("image_width", ROBOLAB_DEFAULT_IMAGE_WIDTH))
+        history_length = int(extra_param("history_length", 1))
+        use_state = self._truthy(extra_param("use_state", True))
+        resolution = str(extra_param("resolution", ROBOLAB_DEFAULT_RESOLUTION))
+        fps = float(extra_param("conditioning_fps", ROBOLAB_DEFAULT_CONDITIONING_FPS))
+        domain_name = str(extra_param("domain_name", ROBOLAB_DEFAULT_DOMAIN_NAME))
+        domain_id = resolve_domain_id(domain_name=domain_name, require_explicit=True)
+
+        if use_state and history_length < 1:
+            raise ValueError("RoboLab history_length must be >= 1 when use_state is true.")
+        if action_chunk_size <= 0:
+            raise ValueError(f"RoboLab action_chunk_size must be positive, got {action_chunk_size}.")
+        if raw_action_dim <= 0:
+            raise ValueError(f"RoboLab raw_action_dim must be positive, got {raw_action_dim}.")
+
+        try:
+            image = extract_robolab_image(obs)
+        except ValueError as exc:
+            image = extract_robolab_prompt_image(prompt_data)
+            if image is None:
+                raise exc
+        if image.shape[:2] != (image_h, image_w):
+            image = resize_rgb_uint8(image, (image_h, image_w))
+
+        t_frames = action_chunk_size + 1
+        video = torch.zeros((3, t_frames, image_h, image_w), dtype=torch.uint8)
+        video[:, 0] = torch.from_numpy(image.copy()).permute(2, 0, 1)
+
+        use_state_rows = 1 if use_state else 0
+        action = torch.zeros((action_chunk_size + use_state_rows, raw_action_dim), dtype=torch.float32)
+        history_action = None
+        num_history_rows = history_length - use_state_rows
+        gripper_position = 1.0 - ensure_gripper_array(obs["observation/gripper_position"])
+
+        if action_space == "joint_pos":
+            joint_position = ensure_2d_float_array(obs["observation/joint_position"], "observation/joint_position", 7)
+            if use_state:
+                action[0] = torch.from_numpy(np.concatenate((joint_position[-1], gripper_position[-1])))
+            if num_history_rows > 0:
+                if len(joint_position) < num_history_rows + 1:
+                    raise ValueError("Not enough joint_position rows for requested history_length.")
+                history_np = np.concatenate(
+                    (joint_position[-num_history_rows - 1 : -1], gripper_position[-num_history_rows - 1 : -1]),
+                    axis=-1,
+                )
+                history_action = torch.from_numpy(history_np).float()
+        else:
+            eef_pos = ensure_2d_float_array(obs["observation/eef_pos"], "observation/eef_pos", 3)
+            eef_quat = ensure_2d_float_array(obs["observation/eef_quat"], "observation/eef_quat", 4)
+            if use_state:
+                rot6d = convert_midtrain_rotation(eef_quat[-1], "quat_xyzw", "rot6d")
+                action[0] = torch.from_numpy(np.concatenate((eef_pos[-1], rot6d, gripper_position[-1])))
+            if num_history_rows > 0:
+                if len(eef_pos) < num_history_rows + 1 or len(eef_quat) < num_history_rows + 1:
+                    raise ValueError("Not enough eef_pos/eef_quat rows for requested history_length.")
+                poses_abs = build_abs_pose_from_components(eef_pos, eef_quat, "quat_xyzw")
+                poses_rel = pose_abs_to_rel(poses_abs, rotation_format="rot6d", pose_convention="backward_framewise")
+                history_np = np.concatenate(
+                    [poses_rel[-num_history_rows:], gripper_position[-num_history_rows:]],
+                    axis=-1,
+                )
+                history_action = torch.from_numpy(history_np).float()
+
+        sample: dict[str, Any] = {
+            "ai_caption": prompt,
+            "video": video,
+            "action": action,
+            # Cosmos Framework consumes this as an integer conditioning bucket.
+            "conditioning_fps": torch.tensor(fps, dtype=torch.long),
+            "mode": ACTION_MODE_POLICY,
+            "domain_id": torch.tensor(domain_id, dtype=torch.long),
+            "viewpoint": "concat_view",
+            "additional_view_description": ROBOLAB_CONCAT_VIEW_DESCRIPTION,
+        }
+        if history_action is not None:
+            sample["history_action"] = history_action
+
+        sample = self._get_robolab_transform()(sample, resolution)
+        sequence_plan = sample["sequence_plan"]
+        video_tensor = sample["video"].float() / 127.5 - 1.0
+        raw_action_dim_tensor = sample.get("raw_action_dim")
+        if isinstance(raw_action_dim_tensor, torch.Tensor):
+            transformed_raw_action_dim = int(raw_action_dim_tensor.item())
+        else:
+            transformed_raw_action_dim = raw_action_dim
+
+        return RoboLabPolicyInputs(
+            prompt=sample["ai_caption"],
+            video_tensor=video_tensor.unsqueeze(0),
+            action_tensor=sample["action"].float(),
+            action_condition_indexes=list(getattr(sequence_plan, "condition_frame_indexes_action", []) or []),
+            action_start_frame_offset=int(getattr(sequence_plan, "action_start_frame_offset", 1)),
+            raw_action_dim=transformed_raw_action_dim,
+            domain_id=domain_id,
+            fps=fps,
+            height=int(video_tensor.shape[-2]),
+            width=int(video_tensor.shape[-1]),
+            image_size=sample.get("image_size"),
+            num_frames=int(video_tensor.shape[1]),
+            num_inference_steps=int(
+                extra_param_alias("num_inference_steps", "num_steps", ROBOLAB_DEFAULT_NUM_INFERENCE_STEPS)
+            ),
+            guidance_scale=float(extra_param_alias("guidance_scale", "guidance", ROBOLAB_DEFAULT_GUIDANCE_SCALE)),
+            flow_shift=float(extra_param_alias("flow_shift", "shift", ROBOLAB_DEFAULT_FLOW_SHIFT)),
+            seed=next_robolab_seed(extra, obs, request_id),
+            history_length=history_length,
+            action_space=action_space,
+            observation=obs,
+        )
+
+    @staticmethod
+    def _build_action_condition_mask_from_indexes(
+        indexes: list[int],
+        action_length: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        mask = torch.zeros(1, action_length, 1, device=device, dtype=dtype)
+        for idx in indexes:
+            if idx < 0 or idx >= action_length:
+                raise ValueError(f"Action condition index {idx} is out of range for action length {action_length}.")
+            mask[:, idx, :] = 1.0
+        return mask
+
+    def _forward_robolab_policy(
+        self,
+        sp: OmniDiffusionSamplingParams,
+        inputs: RoboLabPolicyInputs,
+        pipeline_start: float,
+    ) -> DiffusionOutput:
+        if not getattr(self.transformer, "action_gen", False):
+            raise ValueError(
+                "Cosmos3 RoboLab policy serving was requested, but the transformer "
+                "was initialized without action modules. Check that the checkpoint "
+                "config enables action_gen and includes action weights."
+            )
+
+        action_mode = ACTION_MODE_POLICY
+        height = inputs.height
+        width = inputs.width
+        num_frames = inputs.num_frames
+        action_chunk_size = int(inputs.action_tensor.shape[0])
+        num_inference_steps = inputs.num_inference_steps
+        guidance_scale = float(inputs.guidance_scale)
+        flow_shift_target = float(inputs.flow_shift)
+        domain_id = int(inputs.domain_id)
+        frame_rate = self._get_sp_param(sp, "resolved_frame_rate") or self._get_sp_param(sp, "frame_rate") or inputs.fps
+        max_sequence_length = (
+            self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
+            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+        )
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", False))
+
+        self._guidance_scale = guidance_scale
+        self._num_timesteps = num_inference_steps
+
+        generator = sp.generator
+        if generator is None:
+            generator = torch.Generator(device=self.device).manual_seed(int(inputs.seed))
+
+        cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
+            inputs.prompt,
+            "",
+            num_frames,
+            frame_rate,
+            height,
+            width,
+            max_sequence_length,
+            sp,
+            use_system_prompt,
+            is_t2i=False,
+        )
+
+        action_video_tensor = inputs.video_tensor
+        if action_video_tensor.ndim == 4:
+            action_video_tensor = action_video_tensor.unsqueeze(0)
+        if action_video_tensor.ndim != 5:
+            raise ValueError(
+                "Cosmos3 RoboLab action video tensor must have shape [1, 3, T, H, W] "
+                f"or [3, T, H, W], got {tuple(action_video_tensor.shape)}."
+            )
+        if action_video_tensor.shape[2] < num_frames:
+            pad = action_video_tensor[:, :, -1:].repeat(1, 1, num_frames - action_video_tensor.shape[2], 1, 1)
+            action_video_tensor = torch.cat([action_video_tensor, pad], dim=2)
+        elif action_video_tensor.shape[2] > num_frames:
+            action_video_tensor = action_video_tensor[:, :, :num_frames]
+
+        action_latents, action_velocity_mask, action_condition_latents, raw_action_dim = self._prepare_action_latents(
+            mode=action_mode,
+            action_chunk_size=action_chunk_size,
+            raw_action_dim=int(inputs.raw_action_dim),
+            generator=generator,
+            sp=sp,
+            clean_action=inputs.action_tensor,
+            condition_indexes=inputs.action_condition_indexes,
+        )
+        action_offset = int(inputs.action_start_frame_offset)
+
+        latents, velocity_mask, condition_latents = self._prepare_latents_action_video(
+            action_video_tensor,
+            action_mode,
+            height,
+            width,
+            num_frames,
+            generator,
+            image_size=inputs.image_size,
+        )
+        image_latent = condition_latents[:, :, 0:1]
+
+        video_shape = (latents.shape[2], latents.shape[3], latents.shape[4])
+        shared_kwargs = dict(
+            video_shape=video_shape,
+            fps=frame_rate,
+            noisy_frame_mask=velocity_mask,
+            action_domain_ids=torch.tensor([domain_id], dtype=torch.long, device=self.device),
+            action_noisy_mask=action_velocity_mask,
+            action_start_frame_offset=action_offset,
+            action_fps=float(self._get_sp_param(sp, "action_fps", frame_rate) or frame_rate),
+        )
+
+        scheduler = build_robolab_unipc_scheduler(num_inference_steps, flow_shift_target, self.device)
+        _, action_latents = self.diffuse(
+            latents=latents,
+            timesteps=scheduler.timesteps,
+            cond_ids=cond_ids,
+            cond_mask=cond_mask,
+            uncond_ids=uncond_ids,
+            uncond_mask=uncond_mask,
+            guidance_scale=guidance_scale,
+            shared_kwargs=shared_kwargs,
+            action_latents=action_latents,
+            action_velocity_mask=action_velocity_mask,
+            action_condition_latents=action_condition_latents,
+            sound_latents=None,
+            velocity_mask=velocity_mask,
+            image_latent=image_latent,
+            condition_latents=condition_latents,
+            guidance_interval=None,
+            raw_action_dim=raw_action_dim,
+            scheduler=scheduler,
+        )
+
+        if _is_rank_zero():
+            logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
+
+        action = action_latents[:, :, :raw_action_dim].detach().cpu()
+        custom_action_output: dict[str, Any] = {
+            "action": action,
+            "raw_action_dim": raw_action_dim,
+            "action_mode": action_mode,
+            "domain_id": domain_id,
+            "action_only_output": True,
+            "robolab_action_postprocess": make_robolab_action_postprocess_inputs(inputs),
+        }
+        return DiffusionOutput(output={}, custom_output=custom_action_output)
 
     @staticmethod
     def _truthy(value) -> bool:
@@ -946,7 +1419,9 @@ class Cosmos3OmniDiffusersPipeline(
         target = float(target_shift)
         if target == float(self._current_flow_shift):
             return
-        self.scheduler = UniPCMultistepScheduler.from_config(self._base_scheduler_config, flow_shift=target)
+        self.scheduler = UniPCMultistepScheduler.from_config(
+            self._base_scheduler_config, flow_shift=target, use_karras_sigmas=False
+        )
         self._cpu_scheduler_state()
         self._current_flow_shift = target
 
@@ -1313,7 +1788,28 @@ class Cosmos3OmniDiffusersPipeline(
 
         return latent.to(self.dtype)
 
-    def _encode_video_tensor(self, video_tensor: torch.Tensor) -> torch.Tensor:
+    def _latent_hw_from_image_size(self, image_size: Any | None) -> tuple[int, int] | None:
+        if image_size is None:
+            return None
+        if isinstance(image_size, torch.Tensor):
+            frame_size = image_size.detach().cpu().flatten()
+        else:
+            frame_size = torch.as_tensor(image_size).flatten()
+        if frame_size.numel() < 4:
+            return None
+        orig_h = int(frame_size[2].item())
+        orig_w = int(frame_size[3].item())
+        spatial_factor = int(self.vae_scale_factor_spatial)
+        return max(orig_h // spatial_factor, 1), max(orig_w // spatial_factor, 1)
+
+    def _crop_latent_to_image_size(self, latent: torch.Tensor, image_size: Any | None) -> torch.Tensor:
+        latent_hw = self._latent_hw_from_image_size(image_size)
+        if latent_hw is None:
+            return latent
+        h_latent, w_latent = latent_hw
+        return latent[:, :, :, :h_latent, :w_latent].contiguous()
+
+    def _encode_video_tensor(self, video_tensor: torch.Tensor, image_size: Any | None = None) -> torch.Tensor:
         """VAE-encode a preprocessed pixel video [1, 3, T, H, W]."""
         if video_tensor.ndim == 4:
             video_tensor = video_tensor.unsqueeze(0)
@@ -1335,6 +1831,7 @@ class Cosmos3OmniDiffusersPipeline(
             scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
             latent = latent * scaling_factor
 
+        latent = self._crop_latent_to_image_size(latent, image_size)
         return latent.to(self.dtype)
 
     def _prepare_latents_i2v(
@@ -1395,7 +1892,7 @@ class Cosmos3OmniDiffusersPipeline(
         T_lat = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         H_lat = video_tensor.shape[-2] // self.vae_scale_factor_spatial
         W_lat = video_tensor.shape[-1] // self.vae_scale_factor_spatial
-        indexes = _normalize_condition_frame_indexes_vision(condition_frame_indexes_vision)
+        indexes = normalize_condition_frame_indexes_vision(condition_frame_indexes_vision)
         out_of_range = [index for index in indexes if index >= T_lat]
         if out_of_range:
             raise ValueError(
@@ -1409,7 +1906,7 @@ class Cosmos3OmniDiffusersPipeline(
             device=self.device,
             dtype=self.dtype,
         )
-        condition_pixel_frames = _condition_pixel_frame_count(indexes, self.vae_scale_factor_temporal)
+        condition_pixel_frames = condition_pixel_frame_count(indexes, self.vae_scale_factor_temporal)
         condition_video = video_tensor[:, :, :condition_pixel_frames]
         if condition_video.shape[2] < condition_pixel_frames:
             pad = condition_video[:, :, -1:].repeat(1, 1, condition_pixel_frames - condition_video.shape[2], 1, 1)
@@ -1445,13 +1942,18 @@ class Cosmos3OmniDiffusersPipeline(
         width: int,
         num_frames: int,
         generator: torch.Generator,
+        image_size: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Prepare video latents for action modes with mode-specific conditioning."""
         del height, width
         C = self.transformer.latent_channel_size
         T_lat = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-        H_lat = video_tensor.shape[-2] // self.vae_scale_factor_spatial
-        W_lat = video_tensor.shape[-1] // self.vae_scale_factor_spatial
+        latent_hw = self._latent_hw_from_image_size(image_size)
+        if latent_hw is None:
+            H_lat = video_tensor.shape[-2] // self.vae_scale_factor_spatial
+            W_lat = video_tensor.shape[-1] // self.vae_scale_factor_spatial
+        else:
+            H_lat, W_lat = latent_hw
 
         noise = randn_tensor(
             (1, C, T_lat, H_lat, W_lat),
@@ -1459,7 +1961,7 @@ class Cosmos3OmniDiffusersPipeline(
             device=self.device,
             dtype=self.dtype,
         )
-        cond_latent = self._encode_video_tensor(video_tensor)
+        cond_latent = self._encode_video_tensor(video_tensor, image_size=image_size)
         if cond_latent.shape[2:] != noise.shape[2:]:
             raise ValueError(
                 "Cosmos3 action video latent shape mismatch: "
@@ -1484,9 +1986,25 @@ class Cosmos3OmniDiffusersPipeline(
         raw_action_dim: int | None,
         generator: torch.Generator,
         sp,
+        clean_action: torch.Tensor | None = None,
+        condition_indexes: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         action_dim = int(getattr(self.transformer, "action_dim", 64))
-        if mode == ACTION_MODE_FORWARD_DYNAMICS:
+        if clean_action is not None:
+            action = clean_action.detach().to(dtype=torch.float32)
+            if action.ndim == 3 and action.shape[0] == 1:
+                action = action.squeeze(0)
+            if action.ndim != 2:
+                raise ValueError(f"Cosmos3 clean action must have shape [T, D], got {tuple(action.shape)}.")
+            if action.shape[0] < action_chunk_size:
+                pad = action[-1:].repeat(action_chunk_size - action.shape[0], 1)
+                action = torch.cat([action, pad], dim=0)
+            elif action.shape[0] > action_chunk_size:
+                action = action[:action_chunk_size]
+            if raw_action_dim is None:
+                raw_action_dim = int(action.shape[-1])
+            clean_action = pad_action_to_dim(action, action_dim)
+        elif mode == ACTION_MODE_FORWARD_DYNAMICS:
             action = load_action_tensor(self._get_sp_param(sp, "action", None))
             if action.shape[0] < action_chunk_size:
                 pad = action[-1:].repeat(action_chunk_size - action.shape[0], 1)
@@ -1508,12 +2026,20 @@ class Cosmos3OmniDiffusersPipeline(
             raise ValueError(f"Cosmos3 raw_action_dim must be in [1, {action_dim}], got {raw_action_dim}.")
 
         clean_action = clean_action.to(device=self.device, dtype=self.dtype).unsqueeze(0)
-        condition_mask = build_action_condition_mask(
-            mode,
-            action_chunk_size,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        if condition_indexes is None:
+            condition_mask = build_action_condition_mask(
+                mode,
+                action_chunk_size,
+                device=self.device,
+                dtype=self.dtype,
+            )
+        else:
+            condition_mask = self._build_action_condition_mask_from_indexes(
+                condition_indexes,
+                action_chunk_size,
+                device=self.device,
+                dtype=self.dtype,
+            )
         noise = randn_tensor(
             (1, action_chunk_size, action_dim),
             generator=generator,
@@ -1548,6 +2074,7 @@ class Cosmos3OmniDiffusersPipeline(
         condition_latents: torch.Tensor | None = None,
         guidance_interval: tuple[float, float] | None = None,
         raw_action_dim: int | None = None,
+        scheduler: Any | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Denoising loop with 3-mode CFG support (parallel, sequential, none).
 
@@ -1578,6 +2105,7 @@ class Cosmos3OmniDiffusersPipeline(
         """
         do_cfg = guidance_scale > 1.0
         cfg_parallel = self._cfg_parallel_active() and do_cfg
+        step_scheduler = scheduler if scheduler is not None else self.scheduler
         self.transformer.reset_cache()
 
         def _cfg_active_at(t: torch.Tensor) -> bool:
@@ -1655,11 +2183,11 @@ class Cosmos3OmniDiffusersPipeline(
                 if raw_action_dim is not None and 0 < raw_action_dim < action_pred.shape[-1]:
                     action_pred[..., raw_action_dim:] = 0
             if action_latents is None and sound_latents is None:
-                latents = self.scheduler.step(video_pred, t, latents, return_dict=False)[0]
+                latents = step_scheduler.step(video_pred, t, latents, return_dict=False)[0]
             else:
                 packed_noise, shapes, numels = _pack_joint(video_pred, action_pred, sound_pred)
                 packed_latents, _, _ = _pack_joint(latents, action_latents, sound_latents)
-                packed_next = self.scheduler.step(packed_noise, t, packed_latents, return_dict=False)[0]
+                packed_next = step_scheduler.step(packed_noise, t, packed_latents, return_dict=False)[0]
                 unpacked = _unpack_joint(packed_next, shapes, numels)
                 latents = unpacked[0]
                 idx = 1
@@ -1799,6 +2327,444 @@ class Cosmos3OmniDiffusersPipeline(
             outputs.append(sound_latents)
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
+    @staticmethod
+    def _get_transfer_num_chunks(
+        total_frames: int,
+        frames_per_chunk: int,
+        conditional_frames: int,
+    ) -> tuple[int, int]:
+        if frames_per_chunk <= 0:
+            raise ValueError("Cosmos3 transfer frames_per_chunk must be positive.")
+        if total_frames <= frames_per_chunk:
+            return 1, frames_per_chunk
+        stride = frames_per_chunk - conditional_frames
+        if stride <= 0:
+            raise ValueError("Cosmos3 transfer num_conditional_frames must be smaller than num_video_frames_per_chunk.")
+        remaining = total_frames - frames_per_chunk
+        extra_chunks = remaining // stride + (1 if remaining % stride else 0)
+        return 1 + extra_chunks, stride
+
+    def _prepare_transfer_latents(
+        self,
+        target_video: torch.Tensor,
+        current_conditional_frames: int,
+        generator: torch.Generator,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        condition_latents = self._encode_video_tensor(target_video)
+        noise = randn_tensor(
+            condition_latents.shape,
+            generator=generator,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        condition_mask = torch.zeros(
+            1,
+            1,
+            condition_latents.shape[2],
+            1,
+            1,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        if current_conditional_frames > 0:
+            latent_frames = (current_conditional_frames - 1) // self.vae_scale_factor_temporal + 1
+            condition_mask[:, :, :latent_frames] = 1.0
+        latents = condition_mask * condition_latents + (1.0 - condition_mask) * noise
+        velocity_mask = 1.0 - condition_mask
+        return latents, velocity_mask, condition_mask * condition_latents
+
+    def _transfer_bucket_size(
+        self,
+        sp: OmniDiffusionSamplingParams,
+        source_hw: tuple[int, int] | None,
+    ) -> tuple[int, int]:
+        resolution = self._get_sp_param(sp, "resolution", self._get_sp_param(sp, "image_size", 720))
+        source_h, source_w = source_hw or (COSMOS3_T2V_DEFAULT_HEIGHT, COSMOS3_T2V_DEFAULT_WIDTH)
+        target_w, target_h = find_closest_target_size(int(source_h), int(source_w), resolution)
+        return int(target_h), int(target_w)
+
+    @staticmethod
+    def _first_transfer_control_hw(transfer_config: Cosmos3TransferConfig) -> tuple[int, int] | None:
+        for hint in transfer_config.ordered_hints:
+            if hint.control is not None:
+                detected = media_hw(hint.control)
+                if detected is not None:
+                    return detected
+            if hint.control_path is not None:
+                detected = media_hw(hint.control_path)
+                if detected is not None:
+                    return detected
+        return None
+
+    def diffuse_transfer(
+        self,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        cond_ids: torch.Tensor,
+        cond_mask: torch.Tensor,
+        uncond_ids: torch.Tensor,
+        uncond_mask: torch.Tensor,
+        guidance_scale: float,
+        control_guidance: float,
+        control_guidance_interval: tuple[float, float] | None,
+        control_latents: list[torch.Tensor],
+        shared_kwargs: dict[str, Any],
+        *,
+        velocity_mask: torch.Tensor,
+        condition_latents: torch.Tensor,
+        guidance_interval: tuple[float, float] | None = None,
+    ) -> torch.Tensor:
+        def _active_at(t: torch.Tensor, interval: tuple[float, float] | None) -> bool:
+            if interval is None:
+                return True
+            t_scalar = float(t.item()) if torch.is_tensor(t) else float(t)
+            lo, hi = interval
+            return lo <= t_scalar <= hi
+
+        self.transformer.reset_cache()
+        self._cosmos3_branch_caches = {}
+        try:
+            for t in self.progress_bar(timesteps):
+                timestep = t.unsqueeze(0)
+                step_guidance = guidance_scale if _active_at(t, guidance_interval) else 1.0
+                step_control = control_guidance if _active_at(t, control_guidance_interval) else 1.0
+                needs_text_cfg = step_guidance > 1.0
+                needs_control_cfg = step_control != 1.0
+
+                cond_full_kwargs = dict(
+                    hidden_states=latents,
+                    timestep=timestep,
+                    text_ids=cond_ids,
+                    text_mask=cond_mask,
+                    control_latents=control_latents,
+                    _cosmos3_cache_key="transfer_cond_full",
+                    **shared_kwargs,
+                )
+                if needs_control_cfg and needs_text_cfg:
+                    branches_kwargs = [
+                        cond_full_kwargs,
+                        dict(
+                            hidden_states=latents,
+                            timestep=timestep,
+                            text_ids=cond_ids,
+                            text_mask=cond_mask,
+                            control_latents=None,
+                            _cosmos3_cache_key="transfer_cond_no_control",
+                            **shared_kwargs,
+                        ),
+                        dict(
+                            hidden_states=latents,
+                            timestep=timestep,
+                            text_ids=uncond_ids,
+                            text_mask=uncond_mask,
+                            control_latents=control_latents,
+                            _cosmos3_cache_key="transfer_uncond_full",
+                            **shared_kwargs,
+                        ),
+                    ]
+                    noise_pred = self.predict_noise_with_multi_branch_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale={
+                            "mode": "cosmos3_transfer",
+                            "branch_mode": "control_and_text",
+                            "guidance_scale": step_guidance,
+                            "control_guidance": step_control,
+                        },
+                        branches_kwargs=branches_kwargs,
+                        cfg_normalize=False,
+                    )
+                elif needs_control_cfg:
+                    branches_kwargs = [
+                        cond_full_kwargs,
+                        dict(
+                            hidden_states=latents,
+                            timestep=timestep,
+                            text_ids=cond_ids,
+                            text_mask=cond_mask,
+                            control_latents=None,
+                            _cosmos3_cache_key="transfer_cond_no_control",
+                            **shared_kwargs,
+                        ),
+                    ]
+                    noise_pred = self.predict_noise_with_multi_branch_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale={
+                            "mode": "cosmos3_transfer",
+                            "branch_mode": "control_only",
+                            "control_guidance": step_control,
+                        },
+                        branches_kwargs=branches_kwargs,
+                        cfg_normalize=False,
+                    )
+                elif needs_text_cfg:
+                    branches_kwargs = [
+                        cond_full_kwargs,
+                        dict(
+                            hidden_states=latents,
+                            timestep=timestep,
+                            text_ids=uncond_ids,
+                            text_mask=uncond_mask,
+                            control_latents=control_latents,
+                            _cosmos3_cache_key="transfer_uncond_full",
+                            **shared_kwargs,
+                        ),
+                    ]
+                    noise_pred = self.predict_noise_with_multi_branch_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale={
+                            "mode": "cosmos3_transfer",
+                            "branch_mode": "text_only",
+                            "guidance_scale": step_guidance,
+                        },
+                        branches_kwargs=branches_kwargs,
+                        cfg_normalize=False,
+                    )
+                else:
+                    noise_pred = self.predict_noise(**cond_full_kwargs)
+                if isinstance(noise_pred, tuple):
+                    raise ValueError("Cosmos3 transfer diffusion expects video-only tensor predictions.")
+                noise_pred = noise_pred * velocity_mask
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+        finally:
+            self._cosmos3_branch_caches = None
+            self.transformer.reset_cache()
+        return latents
+
+    def _forward_transfer(
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str,
+        sp: OmniDiffusionSamplingParams,
+        transfer_config: Cosmos3TransferConfig,
+        transfer_video_tensor: torch.Tensor | None,
+        transfer_input_fps: float | None,
+    ) -> DiffusionOutput:
+        input_frames = None
+        if transfer_video_tensor is not None:
+            input_frames = normalized_video_to_uint8_cthw(transfer_video_tensor)
+            source_hw = (int(input_frames.shape[-2]), int(input_frames.shape[-1]))
+        else:
+            source_hw = self._first_transfer_control_hw(transfer_config)
+        height, width = self._transfer_bucket_size(sp, source_hw)
+
+        if input_frames is not None:
+            if tuple(input_frames.shape[-2:]) != (height, width):
+                input_frames = resize_center_crop_uint8_cthw(input_frames, height, width)
+            input_frames = input_frames[:, : transfer_config.max_frames]
+
+        per_hint_frames: dict[str, torch.Tensor] = {}
+        for hint in transfer_config.ordered_hints:
+            frames = load_or_compute_control_frames(
+                hint,
+                height=height,
+                width=width,
+                max_frames=transfer_config.max_frames,
+                input_frames=input_frames,
+            )
+            if frames.shape[1] < 1:
+                raise ValueError(f"Cosmos3 transfer hint '{hint.key}' produced no frames.")
+            per_hint_frames[hint.key] = frames
+        if not per_hint_frames:
+            raise ValueError("Cosmos3 transfer requires at least one control hint.")
+
+        total_frames = next(iter(per_hint_frames.values())).shape[1]
+        if transfer_config.num_frames is not None:
+            total_frames = min(total_frames, int(transfer_config.num_frames))
+        total_frames = max(1, total_frames)
+        per_hint_frames = {key: pad_temporal_frames(frames, total_frames) for key, frames in per_hint_frames.items()}
+        if input_frames is not None:
+            input_frames = pad_temporal_frames(input_frames, total_frames)
+
+        temporal_compression = self.vae_scale_factor_temporal
+        chunk_frames = 1 if total_frames == 1 else transfer_config.num_video_frames_per_chunk
+        chunk_frames = math.ceil((chunk_frames - 1) / temporal_compression) * temporal_compression + 1
+        num_chunks, stride = self._get_transfer_num_chunks(
+            total_frames,
+            chunk_frames,
+            transfer_config.num_conditional_frames,
+        )
+        padded_frames = max(total_frames, chunk_frames)
+        per_hint_frames = {key: pad_temporal_frames(frames, padded_frames) for key, frames in per_hint_frames.items()}
+        if input_frames is not None:
+            input_frames = pad_temporal_frames(input_frames, padded_frames)
+
+        configured_frame_rate = positive_float(transfer_config.fps)
+        input_frame_rate = positive_float(transfer_input_fps)
+        sampling_frame_rate = (
+            positive_float(self._get_sp_param(sp, "resolved_frame_rate"))
+            or positive_float(self._get_sp_param(sp, "frame_rate"))
+            or positive_float(self._get_sp_param(sp, "fps"))
+        )
+        is_wsm_only = len(transfer_config.hints) == 1 and "wsm" in transfer_config.hints
+        if is_wsm_only:
+            frame_rate = configured_frame_rate or input_frame_rate or sampling_frame_rate or 24.0
+        else:
+            frame_rate = input_frame_rate or configured_frame_rate or sampling_frame_rate or 24.0
+        num_inference_steps = sp.num_inference_steps or COSMOS3_T2V_DEFAULT_NUM_INFERENCE_STEPS
+        guidance_scale = (
+            float(transfer_config.guidance_scale)
+            if transfer_config.guidance_scale is not None
+            else float(sp.guidance_scale or COSMOS3_T2V_DEFAULT_GUIDANCE_SCALE)
+        )
+        flow_shift_target = float(
+            transfer_config.flow_shift
+            if transfer_config.flow_shift is not None
+            else self._get_sp_param(sp, "flow_shift", COSMOS3_V2V_DEFAULT_FLOW_SHIFT)
+        )
+        max_sequence_length = (
+            self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
+            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+        )
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", False))
+
+        self._guidance_scale = guidance_scale
+        self._num_timesteps = num_inference_steps
+        self._set_flow_shift(flow_shift_target)
+
+        generator = sp.generator
+        if generator is None:
+            seed = sp.seed if sp.seed is not None else 42
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
+            prompt,
+            negative_prompt,
+            chunk_frames,
+            frame_rate,
+            height,
+            width,
+            max_sequence_length,
+            sp,
+            use_system_prompt,
+            is_t2i=False,
+        )
+
+        output_chunks: list[torch.Tensor] = []
+        control_chunks_per_hint: dict[str, list[torch.Tensor]] = {key: [] for key in per_hint_frames}
+        previous_output: torch.Tensor | None = None
+
+        for chunk_id in range(num_chunks):
+            start_frame = chunk_id * stride
+            end_frame = min(start_frame + chunk_frames, total_frames)
+            control_norms = {
+                key: uint8_cthw_to_normalized_5d(
+                    pad_temporal_frames(frames[:, start_frame:end_frame], chunk_frames),
+                    dtype=self.dtype,
+                )
+                for key, frames in per_hint_frames.items()
+            }
+            target_norm = torch.zeros_like(next(iter(control_norms.values())))
+            current_conditional_frames = 0
+
+            if chunk_id == 0 and transfer_config.num_first_chunk_conditional_frames > 0:
+                if input_frames is None:
+                    raise ValueError("Cosmos3 transfer num_first_chunk_conditional_frames > 0 requires a video input.")
+                current_conditional_frames = min(
+                    transfer_config.num_first_chunk_conditional_frames,
+                    input_frames.shape[1],
+                    chunk_frames,
+                )
+                if current_conditional_frames > 0:
+                    input_cond = uint8_cthw_to_normalized_5d(
+                        input_frames[:, :current_conditional_frames],
+                        dtype=self.dtype,
+                    )
+                    target_norm[:, :, :current_conditional_frames] = input_cond
+                    if current_conditional_frames < chunk_frames:
+                        fill = target_norm[:, :, current_conditional_frames - 1 : current_conditional_frames]
+                        target_norm[:, :, current_conditional_frames:] = fill.expand(
+                            -1,
+                            -1,
+                            chunk_frames - current_conditional_frames,
+                            -1,
+                            -1,
+                        )
+            elif chunk_id > 0 and previous_output is not None:
+                current_conditional_frames = min(
+                    transfer_config.num_conditional_frames,
+                    previous_output.shape[2],
+                    chunk_frames,
+                )
+                if current_conditional_frames > 0:
+                    target_norm[:, :, :current_conditional_frames] = previous_output[
+                        :, :, -current_conditional_frames:
+                    ].to(target_norm)
+                    if current_conditional_frames < chunk_frames:
+                        fill = target_norm[:, :, current_conditional_frames - 1 : current_conditional_frames]
+                        target_norm[:, :, current_conditional_frames:] = fill.expand(
+                            -1,
+                            -1,
+                            chunk_frames - current_conditional_frames,
+                            -1,
+                            -1,
+                        )
+
+            control_latents = [self._encode_video_tensor(video) for video in control_norms.values()]
+            latents, velocity_mask, condition_latents = self._prepare_transfer_latents(
+                target_norm,
+                current_conditional_frames,
+                generator,
+            )
+            video_shape = (latents.shape[2], latents.shape[3], latents.shape[4])
+            shared_kwargs = dict(
+                video_shape=video_shape,
+                fps=frame_rate,
+                noisy_frame_mask=velocity_mask,
+                transfer_share_vision_temporal_positions=transfer_config.share_vision_temporal_positions,
+            )
+
+            self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+            latents = self.diffuse_transfer(
+                latents=latents,
+                timesteps=self.scheduler.timesteps,
+                cond_ids=cond_ids,
+                cond_mask=cond_mask,
+                uncond_ids=uncond_ids,
+                uncond_mask=uncond_mask,
+                guidance_scale=guidance_scale,
+                control_guidance=transfer_config.control_guidance,
+                control_guidance_interval=transfer_config.control_guidance_interval,
+                control_latents=control_latents,
+                shared_kwargs=shared_kwargs,
+                velocity_mask=velocity_mask,
+                condition_latents=condition_latents,
+            )
+            output_video = self._decode_latents(latents).clamp(-1, 1)
+            previous_output = output_video
+
+            if chunk_id == 0:
+                output_chunks.append(output_video)
+                for key, control in control_norms.items():
+                    control_chunks_per_hint[key].append(control)
+            else:
+                output_chunks.append(output_video[:, :, current_conditional_frames:])
+                for key, control in control_norms.items():
+                    control_chunks_per_hint[key].append(control[:, :, current_conditional_frames:])
+
+        full_output = torch.cat(output_chunks, dim=2)[:, :, :total_frames]
+        full_controls = {
+            key: torch.cat(chunks, dim=2)[:, :, :total_frames] for key, chunks in control_chunks_per_hint.items()
+        }
+
+        if transfer_config.show_control_condition:
+            all_controls = torch.cat([full_controls[key] for key in per_hint_frames], dim=-1)
+            all_controls = all_controls.to(full_output)
+            full_output = torch.cat([all_controls, full_output], dim=-1)
+        if transfer_config.show_input and input_frames is not None:
+            normalized_input = uint8_cthw_to_normalized_5d(input_frames[:, :total_frames], dtype=torch.float32)
+            full_output = torch.cat([normalized_input.to(full_output), full_output], dim=-1)
+
+        return DiffusionOutput(
+            output={"video": full_output},
+            custom_output={
+                "transfer_controls": full_controls,
+                "transfer_hints": list(per_hint_frames),
+                "fps": frame_rate,
+            },
+        )
+
     # -- Forward (main generation entry point) -------------------------------
 
     def forward(
@@ -1811,25 +2777,41 @@ class Cosmos3OmniDiffusersPipeline(
         if len(req.prompts) > 1:
             raise ValueError("Cosmos3OmniDiffusersPipeline currently supports a single prompt per request.")
 
+        sp = req.sampling_params
         prompt_data = req.prompts[0]
+        robolab_inputs = self._build_robolab_policy_inputs(sp, prompt_data, getattr(req, "request_id", None))
+        if robolab_inputs is not None:
+            return self._forward_robolab_policy(sp, robolab_inputs, pipeline_start)
+
         if isinstance(prompt_data, str):
             prompt = prompt_data
             negative_prompt = None
             image_tensor = None
             video_tensor = None
+            transfer_video_tensor = None
+            transfer_input_fps = None
         else:
             prompt = prompt_data.get("prompt", "")
             negative_prompt = prompt_data.get("negative_prompt")
             additional_info = prompt_data.get("additional_information", {}) or {}
             image_tensor = additional_info.get("preprocessed_image")
             video_tensor = additional_info.get("preprocessed_video")
+            transfer_video_tensor = additional_info.get("preprocessed_transfer_video")
+            transfer_input_fps = positive_float(additional_info.get("transfer_input_fps"))
 
-        sp = req.sampling_params
         is_t2i = self._is_t2i_request(req)
         sound_enabled = self._is_sound_request(prompt_data, sp)
         action_mode = self._get_action_mode(prompt_data, sp)
         action_enabled = action_mode is not None
+        transfer_config = resolve_transfer_config(sp, prompt_data)
         action_video_tensor = video_tensor if action_enabled else None
+        if transfer_config is not None:
+            if is_t2i:
+                raise ValueError("Cosmos3 transfer inference is supported only for video outputs.")
+            if action_enabled:
+                raise ValueError("Cosmos3 transfer inference cannot be combined with action generation.")
+            if sound_enabled:
+                raise ValueError("Cosmos3 transfer inference cannot be combined with sound generation.")
         if action_enabled and is_t2i:
             raise ValueError("Cosmos3 action generation is supported only for video outputs.")
         if action_enabled and sound_enabled:
@@ -1853,6 +2835,19 @@ class Cosmos3OmniDiffusersPipeline(
             )
         if negative_prompt is None:
             negative_prompt = ""
+        if transfer_config is not None:
+            if image_tensor is not None:
+                raise ValueError("Cosmos3 transfer inference accepts video inputs or control_path values, not images.")
+            if transfer_video_tensor is None and video_tensor is not None:
+                transfer_video_tensor = video_tensor
+            return self._forward_transfer(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                sp=sp,
+                transfer_config=transfer_config,
+                transfer_video_tensor=transfer_video_tensor,
+                transfer_input_fps=transfer_input_fps,
+            )
         if image_tensor is not None and video_tensor is not None and not action_enabled:
             raise ValueError("Cosmos3 non-action generation accepts either image or video input, not both.")
         if video_tensor is not None and is_t2i:
@@ -1925,7 +2920,7 @@ class Cosmos3OmniDiffusersPipeline(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
             or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", False))
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", not action_enabled))
 
         if action_enabled and action_video_tensor is None:
             extra_action_video = self._get_sp_param(sp, "action_video", None)
@@ -1948,8 +2943,7 @@ class Cosmos3OmniDiffusersPipeline(
         self._num_timesteps = num_inference_steps
 
         # Always resolve to a concrete target shift for this request, then
-        # update the scheduler.  This is what guarantees mode-to-mode
-        # transitions restore the right schedule (no T2I to T2V leak).
+        # update the shared Diffusers scheduler.
         self._set_flow_shift(flow_shift_target)
 
         generator = sp.generator
@@ -2010,12 +3004,16 @@ class Cosmos3OmniDiffusersPipeline(
 
             raw_action_dim_param = self._get_sp_param(sp, "raw_action_dim", None)
             raw_action_dim = int(raw_action_dim_param) if raw_action_dim_param is not None else None
+            clean_action = None
+            action_condition_indexes = None
             action_prepared = self._prepare_action_latents(
                 mode=action_mode,
                 action_chunk_size=action_chunk_size,
                 raw_action_dim=raw_action_dim,
                 generator=generator,
                 sp=sp,
+                clean_action=clean_action,
+                condition_indexes=action_condition_indexes,
             )
             action_latents, action_velocity_mask, action_condition_latents, raw_action_dim = action_prepared
             action_offset = action_start_frame_offset(action_mode, action_chunk_size, num_frames)
@@ -2031,7 +3029,7 @@ class Cosmos3OmniDiffusersPipeline(
             )
             image_latent = condition_latents[:, :, 0:1]
         elif is_v2v:
-            condition_frame_indexes_vision = _normalize_condition_frame_indexes_vision(
+            condition_frame_indexes_vision = normalize_condition_frame_indexes_vision(
                 self._get_sp_param(
                     sp,
                     "condition_frame_indexes_vision",
@@ -2088,9 +3086,10 @@ class Cosmos3OmniDiffusersPipeline(
 
         def _run_diffusion(start_latents):
             self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+            scheduler = self.scheduler
             return self.diffuse(
                 latents=start_latents,
-                timesteps=self.scheduler.timesteps,
+                timesteps=scheduler.timesteps,
                 cond_ids=cond_ids,
                 cond_mask=cond_mask,
                 uncond_ids=uncond_ids,
@@ -2106,6 +3105,7 @@ class Cosmos3OmniDiffusersPipeline(
                 condition_latents=condition_latents,
                 guidance_interval=guidance_interval,
                 raw_action_dim=raw_action_dim,
+                scheduler=scheduler,
             )
 
         if is_t2i and batch_size > 1:
@@ -2139,28 +3139,31 @@ class Cosmos3OmniDiffusersPipeline(
         video = self._decode_latents(latents)
         if _is_rank_zero():
             logger.info("Video decoded in %.2fs", time.time() - decode_start)
-            logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
+            if not sound_enabled:
+                logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
 
         if sound_enabled:
             if sound_latents is None or target_audio_samples is None or sound_sample_rate is None:
                 raise ValueError("Cosmos3 sound generation finished without sound latents.")
             if _is_rank_zero():
                 logger.info("Decoding sound...")
+            sound_decode_start = time.time()
             audio = self._decode_sound_latents(sound_latents, target_audio_samples)
+            if _is_rank_zero():
+                logger.info("Sound tokenizer decoded in %.2fs", time.time() - sound_decode_start)
+                logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
             return DiffusionOutput(output={"video": video, "audio": audio, "audio_sample_rate": sound_sample_rate})
 
         if action_enabled:
             if action_latents is None or raw_action_dim is None or domain_id is None:
                 raise ValueError("Cosmos3 action generation finished without action latents.")
             action = action_latents[:, :, :raw_action_dim].detach().cpu()
-            return DiffusionOutput(
-                output={"video": video},
-                custom_output={
-                    "action": action,
-                    "raw_action_dim": raw_action_dim,
-                    "action_mode": action_mode,
-                    "domain_id": domain_id,
-                },
-            )
+            custom_action_output: dict[str, Any] = {
+                "action": action,
+                "raw_action_dim": raw_action_dim,
+                "action_mode": action_mode,
+                "domain_id": domain_id,
+            }
+            return DiffusionOutput(output={"video": video}, custom_output=custom_action_output)
 
         return DiffusionOutput(output={"image": video} if is_t2i else {"video": video})
