@@ -186,8 +186,10 @@ class AudioVaePromptAdapter(nn.Module):
         self.proj_features_128 = nn.Linear(latent_seq_len, 128)
         self.proj_out = nn.Linear(in_ch, cond_dim) if in_ch != cond_dim else nn.Identity()
 
-    def forward(self, audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        z = self.pretransform.encode(audio, return_dict=True).latent_dist.sample()
+    def forward(
+        self, audio: torch.Tensor, generator: torch.Generator | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        z = self.pretransform.encode(audio, return_dict=True).latent_dist.sample(generator=generator)
         latents = z / float(self.pretransform.audiox_scaling_factor)
         latents = rearrange(self.proj_features_128(latents), "b c s -> b s c")
         latents = self.proj_out(latents)
@@ -783,11 +785,13 @@ class AudioXPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMix
         hidden = torch.where(is_zero.view(batch_size, 1, 1), empty, hidden)
         return [hidden, torch.ones(batch_size, 1, device=device)]
 
-    def _encode_conditioning_tensors(self, batch_metadata: list[dict[str, Any]]) -> dict[str, Any]:
+    def _encode_conditioning_tensors(
+        self, batch_metadata: list[dict[str, Any]], generator: torch.Generator | None = None
+    ) -> dict[str, Any]:
         device = self.device
         audio = torch.cat([item["audio_prompt"] for item in batch_metadata], dim=0).to(device)
         return {
-            "audio_prompt": list(self.audio_vae_adapter(audio)),
+            "audio_prompt": list(self.audio_vae_adapter(audio, generator=generator)),
             "text_prompt": self._encode_text([item["text_prompt"] for item in batch_metadata], device),
             "video_prompt": self._encode_video([item["video_prompt"] for item in batch_metadata], device),
         }
@@ -901,10 +905,12 @@ class AudioXPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMix
                 task_norm=task_norm,
             )
 
-        conditioning_tensors = self._encode_conditioning_tensors(conditioning_batch)
+        conditioning_tensors = self._encode_conditioning_tensors(conditioning_batch, generator=generator)
         negative_conditioning_tensors: dict[str, Any] | None = None
         if negative_conditioning_batch is not None:
-            negative_conditioning_tensors = self._encode_conditioning_tensors(negative_conditioning_batch)
+            negative_conditioning_tensors = self._encode_conditioning_tensors(
+                negative_conditioning_batch, generator=generator
+            )
 
         audio = self.diffuse(
             steps=num_inference_steps,

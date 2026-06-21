@@ -69,3 +69,44 @@ def test_audiox_model(omni_runner: OmniRunner) -> None:
     assert audio.shape[2] > 0
     expected_samples = int(seconds_total * sample_rate)
     assert abs(audio.shape[2] - expected_samples) <= 2 * 1024
+
+
+@hardware_test(res={"cuda": "L4", "xpu": "B60"})
+def test_audiox_determinism(omni_runner: OmniRunner) -> None:
+    # Same seed must produce identical audio. Guards against the global-RNG leak
+    # where ``audio_vae_adapter`` drew noise from the unseeded global RNG instead
+    # of the user's seeded generator (non-deterministic same-seed runs).
+    prompt = {"prompt": "A dog barking in a quiet park."}
+
+    def _generate():
+        outputs = omni_runner.omni.generate(
+            prompts=prompt,
+            sampling_params_list=OmniDiffusionSamplingParams(
+                num_inference_steps=4,
+                guidance_scale=6.0,
+                # A generator is stateful/consumed, so each run needs a fresh one
+                # seeded identically for a valid same-seed comparison.
+                generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
+                num_outputs_per_prompt=1,
+                extra_args={
+                    "audiox_task": "t2a",
+                    "seconds_start": 0.0,
+                    "seconds_total": 2.0,
+                },
+            ),
+        )
+        audio = outputs[0].request_output.multimodal_output.get("audio")
+        assert isinstance(audio, np.ndarray)
+        return audio
+
+    audio_a = _generate()
+    audio_b = _generate()
+
+    assert audio_a.shape == audio_b.shape, (
+        f"shape mismatch between runs: {audio_a.shape} vs {audio_b.shape}"
+    )
+    abs_diff = np.abs(audio_a - audio_b)
+    assert np.allclose(audio_a, audio_b, atol=1e-3), (
+        "same-seed AudioX runs diverged: "
+        f"max abs diff {abs_diff.max():.6f}, mean abs diff {abs_diff.mean():.6f}"
+    )
