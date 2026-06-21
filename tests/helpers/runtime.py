@@ -1774,7 +1774,7 @@ class OpenAIClientHandler:
         # Standard OpenAI param: use omit when not provided to keep default behavior.
         response_format = request_config.get("response_format", omit)
 
-        # TTS custom fields, forwarded via extra_body.
+        # Qwen3-TTS custom fields, forwarded via extra_body.
         extra_body: dict[str, Any] = {}
         # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
         for key in (
@@ -1786,7 +1786,6 @@ class OpenAIClientHandler:
             "seed",
             "instructions",
             "speed",
-            "extra_params",
         ):
             if key in request_config:
                 extra_body[key] = request_config[key]

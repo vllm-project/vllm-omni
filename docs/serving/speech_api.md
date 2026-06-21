@@ -7,8 +7,6 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
 
-- **IndexTTS-2** (`IndexTeam/IndexTTS-2`) -- 2-stage AR + S2Mel CFM DiT + BigVGAN. Voice cloning via `ref_audio` or an uploaded audio `voice`; no built-in preset voice. Emotion control via `extra_params`. Output: 22.05 kHz.
-
 See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, and MOSS-TTS-Nano.
 
 !!! tip "Deployment recipes"
@@ -110,7 +108,7 @@ Content-Type: application/json
 |-----------|------|---------|-------------|
 | `input` | string | **required** | The text to synthesize into speech |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
-| `voice` | string | model-dependent | Speaker/voice name. Some models provide presets; voice-cloning-only models may require `ref_audio` or an uploaded voice. |
+| `voice` | string | "vivian" | Speaker name (e.g., vivian, ryan, aiden) |
 | `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, aac, opus |
 | `speed` | float | 1.0 | Playback speed (0.25-4.0) |
 
@@ -124,7 +122,7 @@ Content-Type: application/json
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
-| `stream` | bool | false | Return raw PCM through the streaming response path when `response_format="pcm"`; true incremental chunking depends on the model and deploy config. |
+| `stream` | bool | false | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
 
 **Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 
@@ -645,12 +643,6 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | Model | Description |
 |-------|-------------|
 | `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
-
-### IndexTTS-2
-
-| Model | Description |
-|-------|-------------|
-| `IndexTeam/IndexTTS-2` | 2-stage voice cloning TTS (22.05 kHz). Use `ref_audio` per request or pass `voice` only when it names an uploaded audio voice; there is no built-in preset voice. Emotion conditioning via `extra_params`: `emo_audio`, `emo_text`, `emo_vector` (8-dim), `emo_alpha`, `use_emo_text`, `use_random`; precedence is `use_emo_text` > `emo_vector` > `emo_audio` > same emotion as the speaker reference. `stream=true` is accepted for PCM response compatibility, but the model is non-async-chunk and emits audio after full generation. |
 
 ### MOSS-TTS-Nano
 
