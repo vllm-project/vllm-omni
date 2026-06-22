@@ -197,6 +197,16 @@ class VoxtralTTSForConditionalGeneration(
             return self.model.sampler
         return Sampler()
 
+    @staticmethod
+    def _is_prefill_step(info_dict: Mapping[str, object], input_ids: torch.Tensor) -> bool:
+        is_prefill_raw = info_dict.get("_omni_is_prefill")
+        if isinstance(is_prefill_raw, bool):
+            return is_prefill_raw
+        try:
+            return int(info_dict["_omni_num_computed_tokens"]) < int(info_dict["_omni_prompt_len"])
+        except (KeyError, TypeError, ValueError):
+            return input_ids.shape[0] > 1
+
     def tts_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict | None):
         self.post_process_idx = 0
         audio_tokens = info_dict.pop("audio", None)
@@ -206,8 +216,9 @@ class VoxtralTTSForConditionalGeneration(
             if input_ids[0] == self._audio_token_id:
                 input_embeds = multimodal_embeddings[0]
             return input_ids, input_embeds, info_dict
-        voice = info_dict.pop("voice", None)
-        if voice is not None:
+        voice = info_dict.get("voice")
+        if voice is not None and self._is_prefill_step(info_dict, input_ids):
+            voice = info_dict.pop("voice")
             if isinstance(voice, list):
                 voice = voice[0]
             multimodal_embeddings = self.voice_to_embedding[voice].to(input_ids.device).clone().detach()
