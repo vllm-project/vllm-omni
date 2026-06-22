@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 logger = init_logger(__name__)
+_MISSING_RPC_RESULT = object()
 
 
 def create_diffusion_client(
@@ -506,8 +507,8 @@ class StageDiffusionClient(StageClientBase):
         try:
             while True:
                 self._drain_responses()
-                result = self._rpc_results.pop(rpc_id, None)
-                if result is not None:
+                result = self._rpc_results.pop(rpc_id, _MISSING_RPC_RESULT)
+                if result is not _MISSING_RPC_RESULT:
                     return result
                 proc = self._proc_manager.proc
                 if self._engine_dead or not proc.is_alive():

@@ -88,6 +88,47 @@ def test_unpack_accepts_msgpack_numpy_marker_dicts():
     np.testing.assert_allclose(decoded[b"actions"], np.asarray([[1.0, 0.0]], dtype=np.float32))
 
 
+def test_unpack_accepts_openpi_client_ndarray_markers():
+    image = np.arange(6, dtype=np.uint8).reshape(2, 3)
+    payload = {
+        "observation/exterior_image_0_left": {
+            b"__ndarray__": True,
+            b"dtype": image.dtype.str,
+            b"shape": image.shape,
+            b"data": image.tobytes(),
+        }
+    }
+
+    decoded = openpi_connection._unpack_numpy(payload)
+
+    np.testing.assert_array_equal(decoded["observation/exterior_image_0_left"], image)
+    assert decoded["observation/exterior_image_0_left"].dtype == np.uint8
+
+
+def test_unpack_openpi_client_packed_observation():
+    openpi_msgpack = pytest.importorskip("openpi_client.msgpack_numpy")
+    image = np.zeros((180, 320, 3), dtype=np.uint8)
+    obs = {
+        "observation/exterior_image_0_left": image,
+        "observation/joint_position": np.zeros(7, dtype=np.float32),
+    }
+
+    decoded = openpi_connection._unpack(openpi_msgpack.packb(obs))
+
+    np.testing.assert_array_equal(decoded["observation/exterior_image_0_left"], image)
+    np.testing.assert_allclose(decoded["observation/joint_position"], obs["observation/joint_position"])
+
+
+def test_pack_uses_openpi_client_ndarray_markers():
+    openpi_msgpack = pytest.importorskip("openpi_client.msgpack_numpy")
+    actions = np.asarray([[1.0, 2.0]], dtype=np.float32)
+
+    packed = openpi_connection._pack(actions)
+    decoded = openpi_msgpack.unpackb(packed)
+
+    np.testing.assert_allclose(decoded, actions)
+
+
 def test_unpack_leaves_user_dict_without_numpy_kind_marker_unchanged():
     payload = {
         "metadata": {

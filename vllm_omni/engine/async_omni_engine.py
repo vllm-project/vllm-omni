@@ -220,6 +220,8 @@ class AsyncOmniEngine:
         self.model = model
         self.tokenizer = tokenizer
         self.diffusion_batch_size = diffusion_batch_size
+        # Cached by get_diffusion_od_config().
+        self._diffusion_od_config_view: Any = None
         startup_timeout = int(init_timeout)
         # Forwarded into Orchestrator so its _forward_to_next_stage path can
         # emit per-edge transfer_tx_s / transfer_size_bytes histograms.
@@ -322,6 +324,20 @@ class AsyncOmniEngine:
         )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
+
+    def get_diffusion_od_config(self) -> Any:
+        """Expose the diffusion ``model_class_name`` to client-side model-extras.
+
+        The worker holds the full config; here we just resolve the pipeline class
+        name from the model config (cached). ``model_class_name`` may be ``None``.
+        """
+        if self._diffusion_od_config_view is None:
+            from types import SimpleNamespace
+
+            from vllm_omni.diffusion.data import resolve_model_class_name
+
+            self._diffusion_od_config_view = SimpleNamespace(model_class_name=resolve_model_class_name(self.model))
+        return self._diffusion_od_config_view
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors via StageRuntime and assign to self."""
@@ -504,7 +520,7 @@ class AsyncOmniEngine:
             return
 
         mm_data = prompt.get("multi_modal_data")
-        if not isinstance(mm_data, Mapping) or not mm_data:
+        if not isinstance(mm_data, dict) or not mm_data:
             return
 
         from vllm.multimodal.hasher import MultiModalHasher
@@ -825,6 +841,14 @@ class AsyncOmniEngine:
                 "mag_threshold": 0.24,
                 "mag_max_skip_steps": 5,
                 "mag_retention_ratio": 0.1,
+            }
+        if cache_backend in ("step_cache"):
+            return {
+                "step_cache_dit_enabled": True,
+                "velocity_sim_thresholds": [0.95, 0.93],
+                "velocity_skip_countdowns": [4, 2],
+                "step_cache_dit_min_history": 2,
+                "step_cache_dit_max_history": 2,
             }
         return None
 

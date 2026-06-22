@@ -591,6 +591,24 @@ def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_p
     assert engine_args["tokenizer"] == "/external/tokenizer"
 
 
+def test_build_engine_args_stage_model_overrides_parent_model():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model": "/stage/model"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(
+        stage_cfg,
+        "/parent/model",
+    )
+
+    assert engine_args["model"] == "/stage/model"
+
+
 def test_build_engine_args_keeps_stage_owned_tokenizer_subdir(tmp_path):
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 

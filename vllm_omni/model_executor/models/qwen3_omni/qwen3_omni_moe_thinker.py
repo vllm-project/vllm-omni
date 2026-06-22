@@ -577,7 +577,20 @@ class Qwen3MoeLLMForCausalLM(Qwen3MoeForCausalLM):
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen3MoeLLMModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, quant_config=quant_config)
+        # Pass the prefix so ModelOpt's prefix-based exclude-list can match this
+        # head. vLLM 0.23.0 made ParallelLMHead quantizable by NVFP4 (0.22's
+        # ModelOpt.get_quant_method only matched LinearBase, so the head was
+        # never a quant candidate and the prefix was irrelevant). On 0.23.0 the
+        # head is kept BF16 only via the exclude-list (the W4A4 ckpt ignores
+        # "*.lm_head"); with prefix="" that match fails, the head is wrongly
+        # NVFP4-quantized (FP4-packed -> width 1024), and the BF16 [vocab, 2048]
+        # weight fails to load. Mirrors vLLM's stock Qwen3MoeForCausalLM.
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(config.vocab_size)

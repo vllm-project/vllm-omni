@@ -105,3 +105,45 @@ voice-cloning e2e test ([`Voice cloning (capability gated upstream)`](../../exam
 ) or adding a `ref_audio` request parameter will fail
 because the public checkpoint does not provide the encoder weights needed to
 convert reference audio into conditioning features. The expected failure is: `RuntimeError: encode_waveforms requires encoder weights which are not available in the open-source checkpoint.`
+
+### 1x NVIDIA RTX A6000 48GB
+
+#### Environment
+
+- OS: Ubuntu 22.04
+- Python: 3.12
+- Driver / runtime: NVIDIA driver 580.126.09, CUDA 13.0
+- GPU: NVIDIA RTX A6000, 48 GB
+- vLLM version: 0.22.0
+- vLLM-Omni version or commit: 0.22.0rc2.dev8+g41a795b5d
+- Required package: `pip install mistral-common`
+
+#### Command
+
+```bash
+vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
+```
+
+#### Verification
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mistralai/Voxtral-4B-TTS-2603",
+    "input": "Artificial intelligence is transforming the way we interact with technology.",
+    "voice": "neutral_female",
+    "response_format": "wav"
+  }' -o voxtral_test.wav
+```
+
+Supported voice presets: `ar_male`, `casual_female`, `casual_male`, `cheerful_female`,
+`de_female`, `de_male`, `es_female`, `es_male`, `fr_female`, `fr_male`, `hi_female`,
+`hi_male`, `it_female`, `it_male`, `neutral_female`, `neutral_male`, `nl_female`,
+`nl_male`, `pt_female`, `pt_male`.
+
+#### Notes
+
+- Memory usage: Peak VRAM ~40.5 GiB during inference.
+- Generation time: ~8 seconds for ~200 words of English text.
+- Audio quality is high; mono 24 kHz output.

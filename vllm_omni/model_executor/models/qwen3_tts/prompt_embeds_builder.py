@@ -1320,9 +1320,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
             spk_tensor = torch.tensor([spk_id], device=input_ids.device, dtype=torch.long)
             spk_embed = codec_embed(spk_tensor)
-            if spk_embed.ndim == 1:
-                spk_embed = spk_embed.view(1, 1, -1)
-            elif spk_embed.ndim == 2:
+            if spk_embed.ndim in (1, 2):
                 spk_embed = spk_embed.view(1, 1, -1)
             speaker_embed = spk_embed
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
@@ -1523,9 +1521,7 @@ class Qwen3TTSPromptEmbedsBuilder:
 
                 ref_code_len: int | None = None
                 if isinstance(ref_code, list):
-                    if ref_code and isinstance(ref_code[0], list):
-                        ref_code_len = len(ref_code)
-                    elif ref_code:
+                    if ref_code:
                         ref_code_len = len(ref_code)
                 elif hasattr(ref_code, "shape"):
                     try:

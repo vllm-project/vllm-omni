@@ -244,9 +244,6 @@ class VoxtralTTSForConditionalGeneration(
         # Delegate to generation model for multimodal processing
         return self.model.embed_multimodal(**kwargs)
 
-    def last_index_of(self, list, value):
-        return len(list) - 1 - list[::-1].index(value)
-
     def forward(
         self,
         input_ids: torch.Tensor,

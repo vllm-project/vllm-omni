@@ -907,7 +907,6 @@ class OmniStreamingVideoHandler:
             sample_rate=24000,
             response_format="wav",
             speed=1.0,
-            stream_format="audio",
             base64_encode=True,
         )
         mixin = AudioMixin()
