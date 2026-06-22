@@ -102,11 +102,8 @@ def test_audiox_determinism(omni_runner: OmniRunner) -> None:
     audio_a = _generate()
     audio_b = _generate()
 
-    assert audio_a.shape == audio_b.shape, (
-        f"shape mismatch between runs: {audio_a.shape} vs {audio_b.shape}"
-    )
+    assert audio_a.shape == audio_b.shape, f"shape mismatch between runs: {audio_a.shape} vs {audio_b.shape}"
     abs_diff = np.abs(audio_a - audio_b)
     assert np.allclose(audio_a, audio_b, atol=1e-3), (
-        "same-seed AudioX runs diverged: "
-        f"max abs diff {abs_diff.max():.6f}, mean abs diff {abs_diff.mean():.6f}"
+        f"same-seed AudioX runs diverged: max abs diff {abs_diff.max():.6f}, mean abs diff {abs_diff.mean():.6f}"
     )
