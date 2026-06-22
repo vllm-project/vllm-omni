@@ -343,6 +343,11 @@ _OMNI_MODELS = {
         "minicpmo_4_5_omni_tts",
         "MiniCPMO45OmniTTSForConditionalGeneration",
     ),
+    "AuraQwen3VLForConditionalGeneration": (
+        "aura_omni",
+        "qwen3_vl",
+        "AuraQwen3VLForConditionalGeneration",
+    ),
 }
 
 

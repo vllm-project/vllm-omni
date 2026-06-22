@@ -35,6 +35,15 @@ _MODEL_PRESETS = {
         "fps": 24,
         "output": "hunyuan_video_15_output.mp4",
     },
+    "helios": {
+        "height": 384,
+        "width": 640,
+        "num_frames": 99,
+        "num_inference_steps": 50,
+        "guidance_scale": 5.0,
+        "fps": 16,
+        "output": "helios_output.mp4",
+    },
 }
 
 
@@ -42,6 +51,8 @@ def _detect_preset(model: str) -> dict:
     model_lower = model.lower()
     if "hunyuan" in model_lower:
         return _MODEL_PRESETS["hunyuan"]
+    if "helios" in model_lower:
+        return _MODEL_PRESETS["helios"]
     return _MODEL_PRESETS["wan"]
 
 
@@ -55,10 +66,26 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
     return config
 
 
+def parse_extra_body(value: str) -> dict[str, Any]:
+    """Parse a JSON object of model-specific extra_body params.
+
+    Pipeline-declared knobs (see vllm_omni/model_extras/) are merged into
+    OmniDiffusionSamplingParams.extra_args, so a single generic example can
+    drive model-specific behaviour without bespoke per-model flags.
+    """
+    try:
+        body = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--extra-body must be valid JSON: {e}") from e
+    if not isinstance(body, dict):
+        raise argparse.ArgumentTypeError("--extra-body must be a JSON object")
+    return body
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a video from a text prompt. "
-        "Supports Wan2.2, HunyuanVideo-1.5, and other text-to-video models."
+        "Supports Wan2.2, HunyuanVideo-1.5, Helios, and other text-to-video models."
     )
     parser.add_argument(
         "--model",
@@ -74,6 +101,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
+    parser.add_argument(
+        "--extra-body",
+        type=parse_extra_body,
+        default=None,
+        help="JSON dict of model-specific extra_body params (declared in vllm_omni/model_extras/), "
+        "merged into sampling extra_args. Example (Helios-Distilled): "
+        '\'{"is_enable_stage2": true, "pyramid_num_inference_steps_list": [2, 2, 2], "is_amplify_first_chunk": true}\'.',
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
     parser.add_argument(
@@ -357,6 +392,9 @@ def main():
     )
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
+    if args.extra_body:
+        # Model-specific knobs (declared in vllm_omni/model_extras/) routed via extra_args.
+        sampling_kwargs["extra_args"] = dict(args.extra_body)
 
     generation_start = time.perf_counter()
     frames = omni.generate(

@@ -698,6 +698,7 @@ def build_engine_args_dict(
     stage_id = stage_config.stage_id
 
     engine_args_dict = _to_dict(engine_args)
+    model = engine_args_dict.pop("model", None) or model
     stage_defines_tokenizer = (
         engine_args_dict.get("tokenizer") is not None or engine_args_dict.get("tokenizer_subdir") is not None
     )
