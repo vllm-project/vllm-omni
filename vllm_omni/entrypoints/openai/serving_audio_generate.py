@@ -152,7 +152,6 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 sample_rate=int(sample_rate),
                 response_format=request.response_format or "wav",
                 speed=request.speed or 1.0,
-                stream_format=request.stream_format,
                 base64_encode=False,
             )
 
