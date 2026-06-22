@@ -169,4 +169,8 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.dynin_omni.pipeline",
         "DYNIN_OMNI_PIPELINE",
     ),
+    "minimind-o": (
+        "vllm_omni.model_executor.models.minimind_o.pipeline",
+        "MINIMIND_OMNI_PIPELINE",
+    ),
 }

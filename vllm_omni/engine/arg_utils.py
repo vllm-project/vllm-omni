@@ -36,6 +36,7 @@ def _register_omni_hf_configs() -> None:
         from transformers import AutoConfig
 
         from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingDenseConfig
+        from vllm_omni.model_executor.models.minimind_o.minimind_omni_config import MiniMindOmniConfig
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
@@ -62,6 +63,7 @@ def _register_omni_hf_configs() -> None:
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
+        ("minimind-o", MiniMindOmniConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)

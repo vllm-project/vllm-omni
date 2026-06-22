@@ -56,6 +56,10 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
         # custom_process_next_stage_input_func: *_full_payload in deploy yaml.
         ("DyninOmniForConditionalGeneration", "token2image"),
         ("DyninOmniForConditionalGeneration", "token2audio"),
+        # MiniMind-O: thinker (Stage 0) -> talker (Stage 1) -> code2wav
+        # (Stage 2), both edges use synchronous full-payload transfer.
+        ("MiniMindOmniForConditionalGeneration", "talker"),
+        ("MiniMindOmniForConditionalGeneration", "code2wav"),
     }
 )
 

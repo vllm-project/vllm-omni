@@ -303,6 +303,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "Qwen3TTSCode2Wav",
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
+            "MiniMindOmniForConditionalGeneration",
         }
         if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(
@@ -375,8 +376,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return sampling_metadata
         output_token_ids = self._build_model_sampler_output_token_ids()
         if output_token_ids == sampling_metadata.output_token_ids:
-            return sampling_metadata
-        return replace(sampling_metadata, output_token_ids=output_token_ids)
+            metadata_for_model_sampler = sampling_metadata
+        else:
+            metadata_for_model_sampler = replace(sampling_metadata, output_token_ids=output_token_ids)
+        setattr(metadata_for_model_sampler, "request_ids", list(getattr(self.input_batch, "req_ids", [])))
+        return metadata_for_model_sampler
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
@@ -546,6 +550,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     emb = self.talker_mtp_inputs_embeds.gpu[:n]
                     hid = self.last_talker_hidden.gpu[:n]
                     ts = self.text_step.gpu[:n]
+                    active_mask_kwargs = self._talker_mtp_active_mask_kwargs(n)
 
                     for _ in range(num_warmups):
                         with set_forward_context(
@@ -554,7 +559,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                             cudagraph_runtime_mode=CUDAGraphMode.NONE,
                             batch_descriptor=batch_desc,
                         ):
-                            self.talker_mtp(ids, emb, hid, ts)
+                            self.talker_mtp(ids, emb, hid, ts, **active_mask_kwargs)
 
                     with set_forward_context(
                         None,
@@ -562,7 +567,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         cudagraph_runtime_mode=CUDAGraphMode.FULL,
                         batch_descriptor=batch_desc,
                     ):
-                        self.talker_mtp(ids, emb, hid, ts)
+                        self.talker_mtp(ids, emb, hid, ts, **active_mask_kwargs)
                     torch.accelerator.synchronize()
 
             logger.info("Captured talker_mtp graphs for %d sizes", len(capture_sizes))
