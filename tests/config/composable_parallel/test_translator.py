@@ -128,7 +128,7 @@ def test_dp_hash_routing_rejected():
 
 def test_dp_invalid_routing_policy_rejected():
     spec = StrategySpec("dp", MeshAxisSpec("dp", 2), RouteByStage("bogus"), Union())
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(AxisTranslationError):
         translate_strategy_stack([spec])
 
 

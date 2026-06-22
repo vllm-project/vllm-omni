@@ -238,8 +238,12 @@ def _validate_dp(spec: StrategySpec, owner: L1Owner) -> None:
             f"got {type(spec.routing).__name__}"
         )
     if spec.routing.routing_policy not in _STAGE_POLICY_TO_OMNI_LB:
-        _not_implemented(
-            f"dp axis {spec.name!r} has unsupported routing_policy "
+        # Recognized-but-unimplemented routing (key-stable/hash) is already
+        # handled above via _is_affinity_dp_routing -> _not_implemented. Anything
+        # left here is an unknown/invalid policy value (e.g. a typo from YAML),
+        # i.e. invalid input -> AxisTranslationError, not NotImplementedError.
+        _fail(
+            f"dp axis {spec.name!r} has invalid routing_policy "
             f"{spec.routing.routing_policy!r}; expected one of "
             f"{sorted(_STAGE_POLICY_TO_OMNI_LB)}."
         )
