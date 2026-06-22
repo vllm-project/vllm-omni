@@ -167,8 +167,7 @@ def _assert_post_fault_image_fast_fail(host: str, port: int, *, model: str, scen
         elapsed = time.monotonic() - start
         assert elapsed < 15, f"[{scenario} fast_fail] /v1/images/generations did not fail fast: {elapsed:.2f}s"
         assert status >= 500, (
-            f"[{scenario} fast_fail] expected server-side error after fault, "
-            f"got status={status}, body={body[:200]!r}"
+            f"[{scenario} fast_fail] expected server-side error after fault, got status={status}, body={body[:200]!r}"
         )
     except Exception:  # noqa: BLE001
         elapsed = time.monotonic() - start
