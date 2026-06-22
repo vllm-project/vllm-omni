@@ -19,7 +19,7 @@ from tests.helpers.runtime import OmniResponse
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.model_executor.models.glm_tts.glm_tts import build_glm_tts_prefill_metadata
 
-pytestmark = [pytest.mark.full_model, pytest.mark.tts]
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 MODEL = os.environ.get("GLM_TTS_MODEL_PATH", "zai-org/GLM-TTS")
 REF_TEXT = "他当时还跟线下其他的站姐吵架，然后，打架进局子了。"

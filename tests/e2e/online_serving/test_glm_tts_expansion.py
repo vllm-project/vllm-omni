@@ -18,7 +18,7 @@ from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.full_model, pytest.mark.tts]
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 MODEL = os.environ.get("GLM_TTS_MODEL_PATH", "zai-org/GLM-TTS")
 REF_TEXT = "他当时还跟线下其他的站姐吵架，然后，打架进局子了。"

@@ -17,7 +17,7 @@ import pytest
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 TEXT_TO_IMAGE_PROMPT = (
     "A cinematic illustration of a cat typing on a silver laptop, soft window light, highly detailed."

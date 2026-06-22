@@ -21,7 +21,7 @@ MODEL = "stepfun-ai/Step-Audio-2-mini"
 STAGE_CONFIG = str(Path(__file__).parent / "stage_configs" / "step_audio2_ci.yaml")
 TEST_PARAMS = [(MODEL, STAGE_CONFIG)]
 
-pytestmark = [pytest.mark.full_model, pytest.mark.tts]
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 DEFAULT_SYSTEM_PROMPT = "你是一个语音对话助手，能够理解音频输入并生成语音回复。"
 SAMPLE_RATE = 16000

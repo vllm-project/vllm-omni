@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-E2E expansion tests for Step-Audio2 online serving (nightly CI).
+E2E expansion tests for Step-Audio2 online serving (weekly CI).
 
 Tests speech-to-speech translation via /v1/chat/completions.
 Request shape follows examples/online_serving/step_audio2/openai_chat_completion_client.py.
@@ -39,7 +39,7 @@ TEST_PARAMS = [
 
 pytestmark = [
     pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True),
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.tts,
 ]
 

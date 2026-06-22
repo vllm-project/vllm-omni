@@ -3,7 +3,7 @@
 """
 E2E tests for Voxtral TTS online serving.
 
-Smoke tests (core_model + advanced_model) and expansion scenarios (full_model)
+Smoke tests (core_model + advanced_model) and expansion scenarios (slow)
 for the /v1/audio/speech endpoint.
 """
 
@@ -25,7 +25,7 @@ _MIN_AUDIO_BYTES_BASIC = 10000
 
 pytestmark = [
     pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True),
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.tts,
 ]
 

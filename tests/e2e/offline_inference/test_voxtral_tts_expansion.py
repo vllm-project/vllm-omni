@@ -33,7 +33,7 @@ MIN_AUDIO_SAMPLES = 1000
 VOICE = "casual_female"
 TEST_TEXT = "Hello, how are you?"
 
-pytestmark = [pytest.mark.full_model, pytest.mark.tts]
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 _OMNI_RUNNER_PARAM = (
     MODEL,
