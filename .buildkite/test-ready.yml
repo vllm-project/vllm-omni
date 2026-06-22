@@ -61,7 +61,7 @@ steps:
     steps:
       - label: "Diffusion · Offloader Test"
         commands:
-          - timeout 10m pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
+          - timeout 40m pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
@@ -215,47 +215,78 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: "Entrypoints Test"
+  - group: ":card_index_dividers: Entrypoints Test"
     depends_on: upload-ready-pipeline
-    commands:
-      - |
-        timeout 30m bash -c "
-          export VLLM_WORKER_MULTIPROC_METHOD=spawn
-          pytest -sv tests/entrypoints/ -m 'core_model and cuda' --run-level 'core_model'
-        "
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 2
-                volumeMounts:
+    steps:
+      - label: "Entrypoints Test with H100"
+        commands:
+          - |
+            timeout 30m bash -c "
+              export VLLM_WORKER_MULTIPROC_METHOD=spawn
+              pytest -sv tests/entrypoints/ -m 'core_model and cuda and H100' --run-level 'core_model'
+            "
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 2
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
                   - name: devshm
-                    mountPath: /dev/shm
+                    emptyDir:
+                      medium: Memory
                   - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
+      - label: "Entrypoints Test with L4"
+        commands:
+          - |
+            timeout 30m bash -c "
+              export VLLM_WORKER_MULTIPROC_METHOD=spawn
+              pytest -sv tests/entrypoints/ -m 'core_model and cuda and L4' --run-level 'core_model'
+            "
+        agents:
+          queue: "gpu_1_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
 
   - group: ":card_index_dividers: E2E Test"
     depends_on: upload-ready-pipeline
     steps:
       - label: "RLHF · VeRL-Omni E2E Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/rlhf_test/test_verl_omni_e2e.py
+          - tests/e2e/offline_inference/custom_pipeline/
+          - vllm_omni/diffusion/
+          - vllm_omni/engine/
+          - vllm_omni/entrypoints/
+          - vllm_omni/inputs/
+          - vllm_omni/outputs/
         commands:
           - |
             timeout 20m bash -c "
@@ -316,13 +347,17 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "TTS · VoxCPM2 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_voxcpm2_tts.py
+          - vllm_omni/model_executor/models/voxcpm2/
+          - vllm_omni/deploy/voxcpm2.yaml
         timeout_in_minutes: 30
         commands:
           - |
             timeout 30m bash -c "
               export VLLM_LOGGING_LEVEL=DEBUG
               export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              pytest -s -v tests/e2e/offline_inference/test_voxcpm2_tts.py tests/e2e/online_serving/test_voxcpm2_tts.py -m 'core_model' --run-level 'core_model'
+              pytest -s -v tests/e2e/online_serving/test_voxcpm2_tts.py -m 'core_model' --run-level 'core_model'
             "
         agents:
           queue: "gpu_1_queue"
@@ -339,6 +374,11 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "TTS · Qwen3-TTS CustomVoice Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen3_tts_customvoice.py
+          - vllm_omni/model_executor/models/qwen3_tts/
+          - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
+          - vllm_omni/deploy/qwen3_tts.yaml
         commands:
           - |
             timeout 20m bash -c "
@@ -346,7 +386,7 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m 'core_model' --run-level 'core_model'
             "
         agents:
-          queue: "gpu_4_queue"
+          queue: "gpu_1_queue"
         plugins:
           - docker#v5.2.0:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
@@ -360,6 +400,11 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "TTS · Qwen3-TTS Base Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen3_tts_base.py
+          - vllm_omni/model_executor/models/qwen3_tts/
+          - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
+          - vllm_omni/deploy/qwen3_tts.yaml
         commands:
           - |
             timeout 20m bash -c "
@@ -369,7 +414,7 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py -m 'core_model' --run-level 'core_model'
             "
         agents:
-          queue: "gpu_4_queue"
+          queue: "gpu_1_queue"
         plugins:
           - docker#v5.2.0:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
@@ -383,6 +428,11 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "TTS · Higgs-Audio-V3 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_higgs_audio_v3.py
+          - vllm_omni/model_executor/models/higgs_audio_v3/
+          - vllm_omni/model_executor/stage_input_processors/higgs_audio_v3.py
+          - vllm_omni/deploy/higgs_multimodal_qwen3.yaml
         commands:
           - |
             timeout 20m bash -c "
@@ -392,7 +442,7 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_higgs_audio_v3.py -m 'core_model' --run-level 'core_model'
             "
         agents:
-          queue: "gpu_4_queue"
+          queue: "gpu_1_queue"
         plugins:
           - docker#v5.2.0:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT

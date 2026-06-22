@@ -87,29 +87,17 @@ from vllm.config.multimodal import (
     ImageDummyOptions,
     VideoDummyOptions,
 )
+from vllm.inputs import ModalityData, MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMRoPE, SupportsMultiModal, SupportsPP
+from vllm.model_executor.models.utils import (
+    _merge_multimodal_embeddings as merge_multimodal_embeddings,
+)
 from vllm.model_executor.models.utils import (
     flatten_bn,
     init_vllm_registered_model,
     maybe_prefix,
 )
-
-try:
-    from vllm.model_executor.models.utils import merge_multimodal_embeddings
-except ImportError:
-    from vllm.model_executor.models.utils import (
-        _merge_multimodal_embeddings as merge_multimodal_embeddings,
-    )
-try:
-    from vllm.utils import flatten_2d_lists
-except ImportError:
-
-    def flatten_2d_lists(nested):
-        """vLLM >=0.18 removed vllm.utils.flatten_2d_lists; keep MiniCPM-o vision path working."""
-        return [x for row in nested for x in row]
-
-
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     ImageItem,
@@ -117,17 +105,6 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItems,
     NestedTensors,
 )
-
-# vllm >=0.21 moved ModalityData / MultiModalDataDict from
-# vllm.multimodal.inputs to vllm.inputs (still re-exported from
-# vllm.multimodal.parse). Fall back to the old location for older vllm.
-try:
-    from vllm.inputs import ModalityData, MultiModalDataDict
-except ImportError:
-    from vllm.multimodal.inputs import (  # type: ignore[no-redef]
-        ModalityData,
-        MultiModalDataDict,
-    )
 from vllm.multimodal.parse import (
     AudioItem,
     AudioProcessorItems,
@@ -141,37 +118,19 @@ from vllm.multimodal.parse import (
     VideoProcessorItems,
 )
 from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
 )
-
-try:
-    from vllm.multimodal.processing import BaseDummyInputsBuilder
-except ImportError:
-    from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 
 
 def encode_tokens(tokenizer, prompt: str) -> list[int]:
-    """Tokenize ``prompt`` without adding special tokens.
-
-    Prefer vllm's ``vllm.transformers_utils.tokenizer.encode_tokens`` when
-    available; falls back to the equivalent ``tokenizer.encode`` call so we
-    keep working across vllm versions that do not ship that helper.
-
-    The import is performed lazily inside the function so the docs builder
-    (griffe / mkdocs strict mode) does not try to statically resolve the
-    upstream alias, which can fail across vllm releases that rename or move
-    the helper.
-    """
-    try:
-        from vllm.transformers_utils.tokenizer import encode_tokens as _impl
-    except ImportError:
-        return tokenizer.encode(prompt, add_special_tokens=False)
-    return _impl(tokenizer, prompt)
+    """Tokenize ``prompt`` without adding special tokens."""
+    return tokenizer.encode(prompt, add_special_tokens=False)
 
 
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
@@ -2855,7 +2814,7 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         if self.ctx.tokenizer is not None:
             return self.ctx.tokenizer
         if not hasattr(self, "_lazy_tokenizer") or self._lazy_tokenizer is None:
-            from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
+            from vllm.tokenizers import cached_tokenizer_from_config
 
             self._lazy_tokenizer = cached_tokenizer_from_config(self.ctx.model_config)
         return self._lazy_tokenizer

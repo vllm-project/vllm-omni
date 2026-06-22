@@ -395,6 +395,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         injected_kv = req.sampling_params.past_key_values
         if injected_kv is not None:
             logger.info("Using injected KV Cache (direct)")
+            injected_kv = NaiveCache.from_object(injected_kv)
             gen_context["past_key_values"] = injected_kv
             seq_len = injected_kv.key_cache[0].shape[0]
             gen_context["kv_lens"] = [seq_len]
@@ -431,6 +432,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 )
 
             if cfg_text_kv is not None:
+                cfg_text_kv = NaiveCache.from_object(cfg_text_kv)
                 cfg_text_seq_len = cfg_text_kv.key_cache[0].shape[0]
                 cfg_text_context["past_key_values"] = cfg_text_kv
                 cfg_text_context["kv_lens"] = [cfg_text_seq_len]
@@ -458,6 +460,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 else:
                     cfg_img_context["ropes"] = [cfg_img_seq_len]
             else:
+                cfg_img_kv = NaiveCache.from_object(cfg_img_kv)
                 cfg_img_seq_len = cfg_img_kv.key_cache[0].shape[0]
                 cfg_img_context["past_key_values"] = cfg_img_kv
                 cfg_img_context["kv_lens"] = [cfg_img_seq_len]
@@ -553,6 +556,8 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                     for k, v in gen_input_img.items():
                         if torch.is_tensor(v):
                             gen_input_img[k] = v.to(self.device)
+                    for k in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
+                        gen_input_img.pop(k, None)
                     with torch.autocast(
                         device_type=self.device.type,
                         enabled=self.device.type != "cpu",
@@ -604,7 +609,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
 
             # cfg_text_context: update with negative prompt (no text condition).
             # When empty, keep cfg_text_context as-is (kv_lens=0) to match
-            # original BAGEL; _merge_naive_caches handles None KV entries.
+            # original BAGEL.
             neg_prompt = extra_args.get("negative_prompt", "")
             if neg_prompt:
                 neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
@@ -869,18 +874,34 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         tp_aware_params = {name for name, p in self.named_parameters() if hasattr(p, "weight_loader")}
 
         # Expand allowed/tp_aware_params with stacked param source names.
-        # QKVParallelLinear merges q_proj+k_proj+v_proj into qkv_proj; the
-        # checkpoint stores the original separate names.  We must recognise
-        # those names so _filtered_weights does not drop them.
+        # The model fuses several checkpoint projections into merged layers:
+        #   QKV: q/k/v_proj → qkv_proj, q/k/v_proj_moe_gen → qkv_proj.gen_exp
+        # and remaps non-stacked weights like:
+        #   {norm}_moe_gen.weight → {norm}.gen_weight  (MoTRMSNorm layers)
+        # We expand allowed names so _filtered_weights does not drop them.
         _stacked_expansions = [
+            # text QKV
             (".qkv_proj", ".q_proj"),
             (".qkv_proj", ".k_proj"),
             (".qkv_proj", ".v_proj"),
-            (".qkv_proj_moe_gen", ".q_proj_moe_gen"),
-            (".qkv_proj_moe_gen", ".k_proj_moe_gen"),
-            (".qkv_proj_moe_gen", ".v_proj_moe_gen"),
-            (".gate_up_proj", ".gate_proj"),
-            (".gate_up_proj", ".up_proj"),
+            # gen QKV
+            (".qkv_proj.gen_exp", ".q_proj_moe_gen"),
+            (".qkv_proj.gen_exp", ".k_proj_moe_gen"),
+            (".qkv_proj.gen_exp", ".v_proj_moe_gen"),
+            # gen o_proj (non-stacked, but still remapped)
+            (".o_proj.gen_exp", ".o_proj_moe_gen"),
+            # text FFN gate+up
+            (".mlp.gate_up_proj", ".mlp.gate_proj"),
+            (".mlp.gate_up_proj", ".mlp.up_proj"),
+            # gen FFN gate+up
+            (".mlp_moe_gen.gate_up_proj", ".mlp_moe_gen.gate_proj"),
+            (".mlp_moe_gen.gate_up_proj", ".mlp_moe_gen.up_proj"),
+            # MoTRMSNorm gen_weight ← checkpoint _moe_gen.weight
+            (".input_layernorm.gen_", ".input_layernorm_moe_gen."),
+            (".post_attention_layernorm.gen_", ".post_attention_layernorm_moe_gen."),
+            (".q_norm.gen_", ".q_norm_moe_gen."),
+            (".k_norm.gen_", ".k_norm_moe_gen."),
+            (".norm.gen_", ".norm_moe_gen."),
         ]
         stacked_source_names: set[str] = set()
         for name in list(allowed):

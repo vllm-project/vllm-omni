@@ -39,6 +39,20 @@ def _get_diffusion_feature_cases(model: str):
                     "2",
                     "--model-class-name",
                     "NextStep11Pipeline",
+                    "--enable-cpu-offload",
+                ],
+            ),
+            id="nextstep_tp2_cpu_offload",
+            marks=FOUR_CARD_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--tensor-parallel-size",
+                    "2",
+                    "--model-class-name",
+                    "NextStep11Pipeline",
                 ],
             ),
             id="nextstep_tp4_pipeline",

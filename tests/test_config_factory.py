@@ -1384,6 +1384,34 @@ class TestCLIOverrideFlow:
             assert s.runtime_overrides["enforce_eager"] is True
 
 
+class TestAuraOmniDeploy:
+    def test_aura_omni_deploy_forces_pipeline_override(self):
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni.yaml"
+        deploy = load_deploy_config(deploy_path)
+
+        assert deploy.pipeline == "aura_omni"
+
+    def test_aura_omni_deploy_resolves_four_native_stages(self):
+        stages = StageConfigFactory._create_from_registry(
+            "qwen3_tts",
+            cli_overrides={},
+            deploy_config_path=str(Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni.yaml"),
+        )
+
+        assert [stage.model_stage for stage in stages] == [
+            "asr",
+            "aura",
+            "qwen3_tts",
+            "code2wav",
+        ]
+        assert [stage.final_output for stage in stages] == [False, True, False, True]
+        assert [stage.final_output_type for stage in stages] == [None, "text", None, "audio"]
+        assert stages[0].yaml_engine_args["model_arch"] == "Qwen3ASRForConditionalGeneration"
+        assert stages[1].yaml_engine_args["model_arch"] == "AuraQwen3VLForConditionalGeneration"
+        assert stages[2].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"
+        assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
+
+
 class TestSentinelDefaultPrecedence:
     """Caller-typed (non-None) values win over YAML; None values fall through
     to YAML / dataclass defaults (#3035)."""
