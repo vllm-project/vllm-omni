@@ -44,7 +44,13 @@ def _batched_chunked_decode(
     left_context_size: int = 25,
     max_batch_size: int = 0,
 ) -> torch.Tensor:
-    """Decode a padded batch by grouping same-round chunks across requests."""
+    """Decode a padded batch by grouping same-round chunks across requests.
+
+    Assumes ``decode_fn`` returns exactly ``chunk_len * total_upsample`` samples per
+    chunk (causal-conv trim constant C = 0, e.g. Qwen3-TTS) and raises otherwise. It
+    is not used by short-output decoders such as Qwen3-Omni Code2Wav (C = 555), which
+    go through the per-request ``chunked_decode`` / ``chunked_decode_streaming`` paths.
+    """
     if codes.dim() < 3:
         raise ValueError(f"Expected codes with shape [B, Q, F], got {tuple(codes.shape)}")
     if chunk_size <= 0:
@@ -511,8 +517,7 @@ class CUDAGraphDecoderWrapper:
                 static_input.zero_()
                 static_input[:, :, :actual_size] = codes
             self._compiled_graphs[compile_key].replay()
-            actual_out_len = actual_size * self.decoder.total_upsample
-            output = self._compiled_static_outputs[compile_key][..., :actual_out_len]
+            output = self._trim_replay_output(self._compiled_static_outputs[compile_key], actual_size, compiled_size)
             if clone_graph_output:
                 return output.clone()
             return output
@@ -542,11 +547,25 @@ class CUDAGraphDecoderWrapper:
             static_input[:, :, :actual_size] = codes
         self.graphs[graph_key].replay()
 
-        actual_out_len = actual_size * self.decoder.total_upsample
-        output = self.static_outputs[graph_key][..., :actual_out_len]
+        output = self._trim_replay_output(self.static_outputs[graph_key], actual_size, padded_size)
         if clone_graph_output:
             return output.clone()
         return output
+
+    def _trim_replay_output(self, static_output: torch.Tensor, actual_size: int, padded_size: int) -> torch.Tensor:
+        """Trim a graph/compiled replay output to the eager-equivalent length.
+
+        The captured ``static_output`` already reflects the decoder's TRUE output
+        length for ``padded_size`` frames, which for causal decoders (e.g.
+        Qwen3-Omni Code2Wav) is shorter than ``padded_size * total_upsample`` by a
+        fixed amount. Each zero-padded frame beyond ``actual_size`` contributes
+        ``total_upsample`` trailing samples that are stale buffer content, so trim
+        relative to the captured length instead of the nominal length. This is a
+        no-op for decoders whose output equals the nominal length (e.g. Qwen3-TTS).
+        """
+        drop = (padded_size - actual_size) * self.decoder.total_upsample
+        actual_out_len = max(0, static_output.shape[-1] - drop)
+        return static_output[..., :actual_out_len]
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         return self._decode(codes, clone_graph_output=True)
