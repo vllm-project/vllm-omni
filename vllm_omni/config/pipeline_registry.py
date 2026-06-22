@@ -44,6 +44,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.qwen3_omni.pipeline",
         "QWEN3_OMNI_PIPELINE",
     ),
+    "aura_omni": (
+        "vllm_omni.model_executor.models.aura_omni.pipeline",
+        "AURA_OMNI_PIPELINE",
+    ),
     "qwen3_tts": (
         "vllm_omni.model_executor.models.qwen3_tts.pipeline",
         "QWEN3_TTS_PIPELINE",
@@ -77,6 +81,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.glm_image.pipeline",
         "GLM_IMAGE_PIPELINE",
     ),
+    "Gr00tN1d7": (
+        "vllm_omni.model_executor.models.gr00t.pipeline",
+        "GR00T_N1D7_PIPELINE",
+    ),
     "hunyuan_image_3_moe": (
         "vllm_omni.model_executor.models.hunyuan_image3.pipeline",
         "HUNYUAN_IMAGE3_PIPELINE",
@@ -100,6 +108,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "mimo_audio": (
         "vllm_omni.model_executor.models.mimo_audio.pipeline",
         "MIMO_AUDIO_PIPELINE",
+    ),
+    "ming_tts": (
+        "vllm_omni.model_executor.models.ming_tts.pipeline",
+        "MING_TTS_PIPELINE",
     ),
     "voxtral_tts": (
         "vllm_omni.model_executor.models.voxtral_tts.pipeline",
@@ -148,6 +160,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "higgs_audio_v2": (
         "vllm_omni.model_executor.models.higgs_audio_v2.pipeline",
         "HIGGS_AUDIO_V2_PIPELINE",
+    ),
+    "higgs_multimodal_qwen3": (
+        "vllm_omni.model_executor.models.higgs_audio_v3.pipeline",
+        "HIGGS_AUDIO_V3_PIPELINE",
     ),
     "dynin_omni": (
         "vllm_omni.model_executor.models.dynin_omni.pipeline",

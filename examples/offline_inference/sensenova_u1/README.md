@@ -145,7 +145,7 @@ python end2end.py \
 ## Reducing GPU Memory Usage
 
 For hardware with limited VRAM, enable **module-wise CPU offload** with
-`--enable-cpu-offload`. The pipeline implements `SupportsModuleOffload`, so the
+`--enable-cpu-offload`. The pipeline implements `SupportsComponentDiscovery`, so the
 vision encoder (`vision_model`) and the Qwen3 LLM (`language_model`) are
 swapped between CPU and GPU on demand:
 

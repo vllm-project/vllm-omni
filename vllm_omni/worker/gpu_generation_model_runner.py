@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gc
 import logging
+from collections.abc import Mapping
 from dataclasses import replace
 
 import numpy as np
@@ -36,7 +37,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
+from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -404,7 +405,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
-            multimodal_outputs,
+            multimodal_outputs_raw,
             slot_mappings,  # OMNI: unpack slot_mappings for upstream v1 API compatibility
         ) = self.execute_model_state
         self.execute_model_state = None
@@ -414,27 +415,29 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self.speculative_config is not None:
             self.finalize_kv_connector()
 
-        pooler_output: list[object] = []
-        if isinstance(multimodal_outputs, torch.Tensor):
-            assert multimodal_outputs.shape[0] == 1, (
+        # Build per-request multimodal_outputs list (dedicated channel).
+        # pooler_output is no longer used for multimodal data.
+        multimodal_outputs: list[dict[str, object]] = []
+        if isinstance(multimodal_outputs_raw, torch.Tensor):
+            assert multimodal_outputs_raw.shape[0] == 1, (
                 "model should return a single tensor, to return multiple tensors, use a dict"
             )
-            assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
+            assert multimodal_outputs_raw.shape[0] == self.input_batch.num_reqs
             for i in range(self.input_batch.num_reqs):
-                pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
-        elif isinstance(multimodal_outputs, list):
-            assert len(multimodal_outputs) == 1, (
+                multimodal_outputs.append({"model_outputs": multimodal_outputs_raw[i].detach().to("cpu").contiguous()})
+        elif isinstance(multimodal_outputs_raw, list):
+            assert len(multimodal_outputs_raw) == 1, (
                 "model should return a single list, to return multiple lists, use a dict"
             )
-            for out in multimodal_outputs:
-                pooler_output.append(
+            for out in multimodal_outputs_raw:
+                multimodal_outputs.append(
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
-        elif isinstance(multimodal_outputs, dict):
+        elif isinstance(multimodal_outputs_raw, Mapping):
             num_reqs = self.input_batch.num_reqs
             for i in range(num_reqs):
                 mm_payload = {}
-                for key, out in multimodal_outputs.items():
+                for key, out in multimodal_outputs_raw.items():
                     if isinstance(out, list):
                         if len(out) != num_reqs:
                             raise ValueError(
@@ -446,7 +449,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                         mm_payload[key] = out.detach().to("cpu").contiguous()
                     else:
                         logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
-                pooler_output.append(mm_payload)
+                multimodal_outputs.append(_ensure_tensor_values(mm_payload))
         else:
             raise RuntimeError("Unsupported diffusion output type")
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
@@ -458,8 +461,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self._should_accumulate_full_payload_output():
             for i, rid in enumerate(req_ids_output_copy):
                 req_state = self.requests.get(rid)
-                if req_state is not None and pooler_output[i]:
-                    self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
+                if req_state is not None and multimodal_outputs[i]:
+                    self.accumulate_full_payload_output(rid, multimodal_outputs[i], req_state)
 
         output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
@@ -467,7 +470,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},
-            pooler_output=pooler_output,
+            pooler_output=None,
+            multimodal_outputs=multimodal_outputs,
             kv_connector_output=kv_connector_output,
             num_nans_in_logits={},
             cudagraph_stats=cudagraph_stats,
@@ -714,6 +718,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
                 cum_num_tokens = self._get_cumsum_and_arange(num_scheduled_tokens, self.query_pos.np)
                 self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+                self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1].fill(cum_num_tokens[-1])
                 self.query_start_loc.copy_to_gpu()
 
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)

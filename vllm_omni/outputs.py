@@ -36,6 +36,7 @@ class OmniConnectorOutput:
     has_pending_kv_work: bool = False
 
 
+@dataclass
 class OmniModelRunnerOutput(ModelRunnerOutput):
     """Model runner output for omni models.
 
@@ -43,11 +44,12 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     that may be produced by non-autoregressive stages.
 
     Attributes:
-        multimodal_outputs: Optional dictionary mapping modality names to
-            output tensors (e.g., {"image": tensor, "audio": tensor})
+        multimodal_outputs: Optional per-request list of multimodal output
+            dicts, indexed by req_index. Each element is a dict mapping
+            output keys to tensors/values (e.g., [{"audio": tensor}, ...]).
     """
 
-    multimodal_outputs: dict[str, torch.Tensor] | None = None
+    multimodal_outputs: list[dict[str, object]] | None = None
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
@@ -102,12 +104,17 @@ class OmniRequestOutput:
 
     # error handling
     error: str | None = None
+    error_status_code: int | None = None
+    error_type: str | None = None
 
     @classmethod
     def from_error(
         cls,
         request_id: str,
         error_message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str | None = None,
     ) -> "OmniRequestOutput":
         """Create a terminal error output.
 
@@ -122,6 +129,8 @@ class OmniRequestOutput:
             request_id=request_id,
             finished=True,
             error=error_message,
+            error_status_code=status_code,
+            error_type=error_type,
         )
 
     @classmethod
@@ -206,11 +215,13 @@ class OmniRequestOutput:
         )
 
     @property
-    def multimodal_output(self) -> dict[str, Any]:
+    def multimodal_output(self) -> Any:
         """Return multimodal output from the underlying request output or local field.
 
         For pipeline outputs, this checks completion outputs first, then request_output.
         For diffusion outputs, this returns the local _multimodal_output field.
+
+        Returns either a MultimodalPayload (Phase 3+) or a plain dict (legacy).
         """
         if self.request_output is None:
             return self._multimodal_output

@@ -1,0 +1,55 @@
+# Ming-omni-tts deploy: stage-0 LLM+flow -> stage-1 audio VAE.
+# Verified legacy settings migrated from ming_tts.yaml and ming_tts_async_chunk.yaml.
+# Default mode is async-chunk streaming on a single GPU.
+# pipeline: required — HF config reports model_type="dense" with no architectures,
+# so auto-detection falls through. This key routes the deploy-config probe in
+# StageConfigFactory.create_from_model to the correct registry entry.
+pipeline: ming_tts
+async_chunk: true
+trust_remote_code: false
+dtype: bfloat16
+enable_prefix_caching: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      latent_chunk_size: 25
+      latent_left_context: 0
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.45
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 512
+      detokenize: true
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.25
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      detokenize: false
