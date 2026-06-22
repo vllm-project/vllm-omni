@@ -13,9 +13,9 @@ time-bearing metrics use the ``_s`` suffix (values in seconds), counters use
 
 from typing import Any
 
-# vllm:omni_ avoids upstream's unregister_vllm_metrics() stripping, which
-# removes every collector whose ``_name`` does not start with ``vllm``.
-METRIC_PREFIX = "vllm:omni_"
+# vllm_omni: namespace for omni-specific Prometheus families, distinct from
+# the upstream vllm:* families.
+METRIC_PREFIX = "vllm_omni:"
 
 
 # ============================================================================
@@ -113,6 +113,10 @@ E2E_REQUEST_LATENCY_S = METRIC_PREFIX + "e2e_request_latency_s"
 # Aborts include client disconnect / cancellation paths. Counter auto-suffixes
 # ``_total`` at exposition time.
 REQUESTS_SUCCESS = METRIC_PREFIX + "requests_success"
+
+# Token counters — aggregated across all pipeline stages per request.
+PROMPT_TOKENS = METRIC_PREFIX + "prompt_tokens"
+GENERATION_TOKENS = METRIC_PREFIX + "generation_tokens"
 
 
 # ============================================================================

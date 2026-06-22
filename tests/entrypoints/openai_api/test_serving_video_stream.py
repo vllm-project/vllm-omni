@@ -14,11 +14,12 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from vllm_omni.entrypoints.openai import serving_video_stream, video_stream_envs
+from vllm_omni.entrypoints.openai import video_stream_base, video_stream_envs
 from vllm_omni.entrypoints.openai.serving_video_stream import (
-    OmniStreamingVideoHandler,
+    QwenOmniStreamingVideoHandler,
     StreamingVideoSessionConfig,
 )
+from vllm_omni.entrypoints.openai.video_stream_base import OmniStreamingVideoHandler
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -149,7 +150,7 @@ async def test_audio_in_video_sets_mm_processor_kwargs():
 
             return _gen()
 
-    class CapturingHandler(OmniStreamingVideoHandler):
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
         async def _preprocess_to_engine_prompt(self, request):
             captured_requests.append(request)
             return {"prompt": "x"}
@@ -186,7 +187,7 @@ async def test_audio_in_video_disabled_omits_mm_processor_kwargs():
 
             return _gen()
 
-    class CapturingHandler(OmniStreamingVideoHandler):
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
         async def _preprocess_to_engine_prompt(self, request):
             captured_requests.append(request)
             return {"prompt": "x"}
@@ -223,7 +224,7 @@ async def test_query_inline_audio_data_sets_mm_processor_kwargs():
 
             return _gen()
 
-    class CapturingHandler(OmniStreamingVideoHandler):
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
         async def _preprocess_to_engine_prompt(self, request):
             captured_requests.append(request)
             return {"prompt": "x"}
@@ -309,7 +310,7 @@ async def test_async_chunk_mode_is_read_by_engine_path_at_runtime(monkeypatch):
 
             return _gen()
 
-    class CapturingHandler(OmniStreamingVideoHandler):
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
         async def _preprocess_to_engine_prompt(self, request):
             return {"prompt": "x"}
 
@@ -374,7 +375,7 @@ async def test_new_query_cancels_in_flight_query():
     query_cancelled = asyncio.Event()
     calls = 0
 
-    class BlockingHandler(OmniStreamingVideoHandler):
+    class BlockingHandler(QwenOmniStreamingVideoHandler):
         async def _process_query(self, *args, **kwargs):
             nonlocal calls
             calls += 1
@@ -412,7 +413,7 @@ async def test_video_done_waits_for_in_flight_query():
     allow_finish = asyncio.Event()
     query_finished = asyncio.Event()
 
-    class BlockingHandler(OmniStreamingVideoHandler):
+    class BlockingHandler(QwenOmniStreamingVideoHandler):
         async def _process_query(self, *args, **kwargs):
             query_started.set()
             await allow_finish.wait()
@@ -452,11 +453,11 @@ async def test_frame_prewarm_does_not_block_following_query(monkeypatch):
         release_decode.wait(timeout=2.0)
         return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
 
-    class BlockingHandler(OmniStreamingVideoHandler):
+    class BlockingHandler(QwenOmniStreamingVideoHandler):
         async def _process_query(self, *args, **kwargs):
             query_started.set()
 
-    monkeypatch.setattr(serving_video_stream, "_decode_frame_bytes", blocked_decode)
+    monkeypatch.setattr(video_stream_base, "_decode_frame_bytes", blocked_decode)
 
     ws = TimedWebSocket()
     handler = BlockingHandler(chat_service=object(), idle_timeout=5.0)
@@ -486,7 +487,7 @@ async def test_client_cannot_send_internal_frame_decode_failed_message():
     captured_frames: list[list[str]] = []
     frame = _b64(_make_jpeg())
 
-    class CapturingHandler(OmniStreamingVideoHandler):
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
         async def _process_query(
             self,
             websocket,
@@ -550,7 +551,7 @@ async def test_frame_filter_error_sends_invalid_image(monkeypatch):
     def fail_should_retain(self, frame_jpeg):
         raise ValueError("decode failed")
 
-    monkeypatch.setattr(serving_video_stream.FrameSimilarityFilter, "should_retain", fail_should_retain)
+    monkeypatch.setattr(video_stream_base.FrameSimilarityFilter, "should_retain", fail_should_retain)
 
     ws = TimedWebSocket()
     handler = OmniStreamingVideoHandler(chat_service=object(), idle_timeout=5.0)
@@ -579,7 +580,7 @@ async def test_audio_buffer_overflow_clears_buffer_before_query(monkeypatch):
 
             return _gen()
 
-    class CapturingHandler(OmniStreamingVideoHandler):
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
         async def _process_query_engine(
             self,
             websocket,
@@ -594,7 +595,7 @@ async def test_audio_buffer_overflow_clears_buffer_before_query(monkeypatch):
         ):
             captured_audio_lengths.append(len(audio_buffer))
 
-    monkeypatch.setattr(serving_video_stream, "_MAX_AUDIO_BUFFER_BYTES", 4)
+    monkeypatch.setattr(video_stream_base, "_MAX_AUDIO_BUFFER_BYTES", 4)
 
     ws = TimedWebSocket()
     handler = CapturingHandler(chat_service=object(), engine_client=EmptyEngine(), idle_timeout=5.0)
@@ -618,7 +619,7 @@ async def test_audio_buffer_overflow_clears_buffer_before_query(monkeypatch):
 
 
 def test_build_messages_keeps_recent_history_text_only():
-    handler = OmniStreamingVideoHandler(chat_service=object())
+    handler = QwenOmniStreamingVideoHandler(chat_service=object())
     old_frame = _b64(_make_jpeg(1, 2, 3))
     current_frame = _b64(_make_jpeg(4, 5, 6))
     history = [

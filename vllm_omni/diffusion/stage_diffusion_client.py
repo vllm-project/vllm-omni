@@ -1,8 +1,7 @@
 """Stage Diffusion Client for vLLM-Omni multi-stage runtime.
 
-Spawns StageDiffusionProc in a subprocess and communicates via ZMQ
-(PUSH/PULL) to expose the same interface the Orchestrator expects
-from any stage client.
+Owns the frontend-side ZMQ sockets for StageDiffusionProc and exposes the
+interface the Orchestrator expects from a stage client.
 """
 
 from __future__ import annotations
@@ -23,15 +22,14 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.stage_diffusion_proc import (
     StageDiffusionProc,
-    complete_diffusion_handshake,
-    spawn_diffusion_proc,
+    StageDiffusionProcManager,
 )
 from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackDecoder,
     OmniMsgpackEncoder,
 )
 from vllm_omni.engine.stage_client import StageClientBase
-from vllm_omni.engine.stage_init_utils import StageMetadata, terminate_alive_proc
+from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -39,6 +37,7 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 logger = init_logger(__name__)
+_MISSING_RPC_RESULT = object()
 
 
 def create_diffusion_client(
@@ -54,8 +53,17 @@ def create_diffusion_client(
         from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 
         return InlineStageDiffusionClient(model, od_config, metadata, batch_size=batch_size)
-    return StageDiffusionClient(
-        model, od_config, metadata, stage_init_timeout=stage_init_timeout, batch_size=batch_size
+    proc_manager = StageDiffusionProcManager(
+        model=model,
+        od_config=od_config,
+        stage_init_timeout=stage_init_timeout,
+    )
+    return StageDiffusionClient.from_addresses(
+        metadata,
+        request_address=proc_manager.addresses.inputs[0],
+        response_address=proc_manager.addresses.outputs[0],
+        proc_manager=proc_manager,
+        batch_size=batch_size,
     )
 
 
@@ -74,16 +82,20 @@ class StageDiffusionClient(StageClientBase):
 
     def __init__(
         self,
-        model: str,
-        od_config: OmniDiffusionConfig,
         metadata: StageMetadata,
-        stage_init_timeout: int,
+        request_address: str,
+        response_address: str,
+        *,
+        proc_manager: StageDiffusionProcManager | None = None,
         batch_size: int = 1,
     ) -> None:
-        # Spawn StageDiffusionProc subprocess and wait for READY.
-        proc, handshake_address, request_address, response_address = spawn_diffusion_proc(model, od_config)
-        complete_diffusion_handshake(proc, handshake_address, stage_init_timeout)
-        self._initialize_client(metadata, request_address, response_address, proc=proc, batch_size=batch_size)
+        self._initialize_client(
+            metadata,
+            request_address,
+            response_address,
+            proc_manager=proc_manager,
+            batch_size=batch_size,
+        )
 
     @classmethod
     def from_addresses(
@@ -92,19 +104,17 @@ class StageDiffusionClient(StageClientBase):
         request_address: str,
         response_address: str,
         *,
-        proc: Any = None,
+        proc_manager: StageDiffusionProcManager | None = None,
         batch_size: int = 1,
     ) -> StageDiffusionClient:
         """Create a client for an already-running diffusion subprocess."""
-        client = cls.__new__(cls)
-        client._initialize_client(
+        return cls(
             metadata,
             request_address,
             response_address,
-            proc=proc,
+            proc_manager=proc_manager,
             batch_size=batch_size,
         )
-        return client
 
     def _initialize_client(
         self,
@@ -112,37 +122,12 @@ class StageDiffusionClient(StageClientBase):
         request_address: str,
         response_address: str,
         *,
-        proc: Any,
+        proc_manager: StageDiffusionProcManager | None = None,
         batch_size: int,
     ) -> None:
-        self.stage_id = metadata.stage_id
-        self.replica_id = metadata.replica_id
-        self.final_output = metadata.final_output
-        self.final_output_type = metadata.final_output_type
-        self.model_stage = getattr(metadata, "model_stage", None)
-        self.default_sampling_params = metadata.default_sampling_params
-        self.requires_multimodal_data = getattr(metadata, "requires_multimodal_data", False)
-        self.custom_process_input_func = getattr(metadata, "custom_process_input_func", None)
-        self.engine_input_source = getattr(metadata, "engine_input_source", [])
-        self._proc = proc
-        self._owns_process = proc is not None
-        # Expose the ZMQ addresses on the instance so callers (e.g.
-        # ``StagePool._client_input_addr``) can identify the diffusion
-        # replica by its bound address.
-        self.request_address = request_address
-        self.response_address = response_address
-
-        self._zmq_ctx = zmq.Context()
-        self._request_socket = self._zmq_ctx.socket(zmq.PUSH)
-        self._request_socket.connect(request_address)
-        self._response_socket = self._zmq_ctx.socket(zmq.PULL)
-        self._response_socket.connect(response_address)
-
-        self._response_poller = zmq.asyncio.Poller()
-        self._response_poller.register(self._response_socket, zmq.POLLIN)
-
-        self._encoder = OmniMsgpackEncoder()
-        self._decoder = OmniMsgpackDecoder()
+        self._set_stage_metadata(metadata)
+        self._proc_manager = proc_manager
+        self._connect_transport(request_address, response_address)
 
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
         self._rpc_results: dict[str, Any] = {}
@@ -151,18 +136,47 @@ class StageDiffusionClient(StageClientBase):
         self._shutting_down = False
         self._engine_dead: bool = False
 
-        # Background thread to detect silent process death (SIGKILL, segfault)
-        # where the subprocess cannot send the ZMQ death sentinel.
-        # Mirrors MPClient.start_engine_core_monitor() in vLLM.
-        self._start_proc_monitor()
+        if self._proc_manager is not None:
+            self._start_proc_monitor()
 
         logger.info(
             "[StageDiffusionClient] stage-%s [rep-%s] initialized (owns_process=%s, batch_size=%d)",
             self.stage_id,
             self.replica_id,
-            self._owns_process,
+            self._proc_manager is not None,
             batch_size,
         )
+
+    def _set_stage_metadata(self, metadata: StageMetadata) -> None:
+        self.stage_id = metadata.stage_id
+        self.replica_id = metadata.replica_id
+        self.final_output = metadata.final_output
+        self.final_output_type = metadata.final_output_type
+        self.model_stage = metadata.model_stage
+        self.default_sampling_params = metadata.default_sampling_params
+        self.prompt_expand_func = metadata.prompt_expand_func
+        self.requires_multimodal_data = getattr(metadata, "requires_multimodal_data", False)
+        self.custom_process_input_func = getattr(metadata, "custom_process_input_func", None)
+        self.engine_input_source = getattr(metadata, "engine_input_source", [])
+
+    def _connect_transport(self, request_address: str, response_address: str) -> None:
+        # Expose the ZMQ addresses on the instance so callers (e.g.
+        # ``StagePool._client_input_addr``) can identify the diffusion
+        # replica by its bound address.
+        self.request_address = request_address
+        self.response_address = response_address
+
+        self._zmq_ctx = zmq.Context()
+        self._request_socket = self._zmq_ctx.socket(zmq.PUSH)
+        self._request_socket.bind(request_address)
+        self._response_socket = self._zmq_ctx.socket(zmq.PULL)
+        self._response_socket.bind(response_address)
+
+        self._response_poller = zmq.asyncio.Poller()
+        self._response_poller.register(self._response_socket, zmq.POLLIN)
+
+        self._encoder = OmniMsgpackEncoder()
+        self._decoder = OmniMsgpackDecoder()
 
     # ------------------------------------------------------------------
     # Process monitor (mirrors vLLM's MPClient.start_engine_core_monitor)
@@ -175,7 +189,10 @@ class StageDiffusionClient(StageClientBase):
         (e.g. SIGKILL, segfault), this thread sets ``_engine_dead`` so
         subsequent calls raise ``EngineDeadError``.
         """
-        proc = self._proc
+        # Background thread to detect silent process death (SIGKILL, segfault)
+        # where the subprocess cannot send the ZMQ death sentinel.
+        # Mirrors MPClient.start_engine_core_monitor() in vLLM.
+        proc = self._proc_manager.proc
         self_ref = weakref.ref(self)
 
         def _monitor() -> None:
@@ -413,9 +430,12 @@ class StageDiffusionClient(StageClientBase):
                 if self._shutting_down:
                     return None
                 raise EngineDeadError()
-            if not self._shutting_down and self._owns_process and self._proc is not None and not self._proc.is_alive():
+            if self._proc_manager is None:
+                return None
+            proc = self._proc_manager.proc
+            if not self._shutting_down and not proc.is_alive():
                 self._engine_dead = True
-                exitcode = self._proc.exitcode
+                exitcode = proc.exitcode
                 # One final drain – the last ZMQ frame may have arrived
                 # between the first drain and the is_alive() check.
                 self._drain_responses()
@@ -487,14 +507,15 @@ class StageDiffusionClient(StageClientBase):
         try:
             while True:
                 self._drain_responses()
-                result = self._rpc_results.pop(rpc_id, None)
-                if result is not None:
+                result = self._rpc_results.pop(rpc_id, _MISSING_RPC_RESULT)
+                if result is not _MISSING_RPC_RESULT:
                     return result
-                if self._engine_dead or (self._owns_process and self._proc is not None and not self._proc.is_alive()):
+                proc = self._proc_manager.proc
+                if self._engine_dead or not proc.is_alive():
                     self._engine_dead = True
                     raise EngineDeadError(
                         f"StageDiffusionProc died while waiting for "
-                        f"collective_rpc '{method}' (exit code {self._proc.exitcode})"
+                        f"collective_rpc '{method}' (exit code {proc.exitcode})"
                     )
                 if deadline is not None and time.monotonic() > deadline:
                     raise TimeoutError(f"collective_rpc_async '{method}' timed out after {timeout}s")
@@ -518,10 +539,13 @@ class StageDiffusionClient(StageClientBase):
         """
         if self._engine_dead:
             raise EngineDeadError(f"Stage-{self.stage_id} diffusion subprocess is dead")
-        if self._proc is not None and not self._proc.is_alive():
+        if self._proc_manager is None:
+            return
+        proc = self._proc_manager.proc
+        if not proc.is_alive():
             self._engine_dead = True
             raise EngineDeadError(
-                f"Stage-{self.stage_id} diffusion subprocess is not alive (exit code: {self._proc.exitcode})."
+                f"Stage-{self.stage_id} diffusion subprocess is not alive (exit code: {proc.exitcode})."
             )
 
     def shutdown(self) -> None:
@@ -531,9 +555,8 @@ class StageDiffusionClient(StageClientBase):
         except Exception:
             pass
 
-        if self._owns_process and self._proc is not None and self._proc.is_alive():
-            self._proc.join(timeout=10)
-            terminate_alive_proc(self._proc)
+        if self._proc_manager is not None and self._proc_manager.proc.is_alive():
+            self._proc_manager.shutdown(timeout=10)
 
         self._request_socket.close(linger=0)
         self._response_socket.close(linger=0)

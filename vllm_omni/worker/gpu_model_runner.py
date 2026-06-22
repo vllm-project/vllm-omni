@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
@@ -46,6 +47,30 @@ else:
     )
 
 logger = init_logger(__name__)
+
+
+def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return only M-RoPE kwargs accepted by the model implementation."""
+    method = getattr(model, "get_mrope_input_positions")
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return kwargs
+
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return kwargs
+
+    accepted = {
+        name
+        for name, param in signature.parameters.items()
+        if name not in {"self", "input_tokens"}
+        and param.kind
+        in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    }
+    return {key: value for key, value in kwargs.items() if key in accepted}
 
 
 class OmniGPUModelRunner(GPUModelRunner):
@@ -338,7 +363,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 kwargs["target_w"] = target_w
             req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
-                **kwargs,
+                **_filter_mrope_kwargs_for_model(self.model, kwargs),
             )
         else:
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
@@ -1312,6 +1337,20 @@ class OmniGPUModelRunner(GPUModelRunner):
             import traceback
 
             traceback.print_exc()
+
+        # Per-request (start, end) hidden-row spans so make_omni_output can map
+        # flat hidden rows to the right request in mixed prefill+decode steps,
+        # instead of assuming an equal rows-per-request split (which samples the
+        # wrong rows whenever per-request token counts differ).
+        nstp = self._omni_num_scheduled_tokens_np
+        if nstp is not None and len(nstp) == len(self.input_batch.req_ids):
+            try:
+                model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(nstp)
+            except Exception as e:
+                # Visible on purpose: the fallback is the equal rows-per-request
+                # split, which can re-introduce the cross-request corruption this
+                # plumbing fixes — a silent failure here must not pass unnoticed.
+                logger.warning("[OMNI] Failed to compute request_token_spans: %s", e)
 
         if self._omni_query_start_loc_model_kwarg:
             try:

@@ -625,11 +625,11 @@ class TestStageDiffusionClientErrorPropagation:
         client._tasks = {}
         client._shutting_down = False
         client._engine_dead = engine_dead
-        client._owns_process = True
-        client._proc = MagicMock(
+        proc = MagicMock(
             is_alive=MagicMock(return_value=proc_alive),
             exitcode=1,
         )
+        client._proc_manager = SimpleNamespace(proc=proc)
         client._request_socket = MagicMock()
         client._response_socket = MagicMock()
         client._encoder = MagicMock()
@@ -672,7 +672,7 @@ class TestStageDiffusionClientErrorPropagation:
         assert client.get_diffusion_output_nowait() is None
 
     def test_check_health_raises_when_proc_dead(self):
-        """``check_health`` detects a dead subprocess via ``_proc.is_alive()``
+        """``check_health`` detects a dead subprocess via the manager's proc
         and raises ``EngineDeadError``, setting ``_engine_dead`` as a
         side effect."""
         client = self._make_client(proc_alive=False)
@@ -699,7 +699,7 @@ class TestStageDiffusionClientErrorPropagation:
         ``get_diffusion_output_nowait`` returns ``None`` and sets
         ``_shutting_down`` instead of raising."""
         client = self._make_client(proc_alive=False)
-        client._proc.exitcode = 137  # SIGKILL (128 + 9)
+        client._proc_manager.proc.exitcode = 137  # SIGKILL (128 + 9)
         client._response_socket.recv.side_effect = zmq.Again
 
         result = client.get_diffusion_output_nowait()
@@ -727,9 +727,41 @@ class TestStageDiffusionClientErrorPropagation:
                 metadata,
                 "tcp://req",
                 "tcp://resp",
-                proc=None,
                 batch_size=1,
             )
+
+    @pytest.mark.asyncio
+    async def test_collective_rpc_async_returns_none_result(self, monkeypatch):
+        client = self._make_client()
+        client._owns_process = False
+        client._proc = None
+        client._encoder.encode.return_value = b"encoded-rpc"
+
+        async def _unexpected_poll(*_, **__):
+            raise AssertionError("collective_rpc_async should not keep polling after a None rpc_result arrives")
+
+        client._response_poller = SimpleNamespace(poll=_unexpected_poll)
+
+        rpc_id = "rpc-none"
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.stage_diffusion_client.uuid.uuid4",
+            lambda: SimpleNamespace(hex=rpc_id),
+        )
+
+        def _drain() -> None:
+            client._rpc_results[rpc_id] = None
+
+        client._drain_responses = _drain
+
+        result = await client.collective_rpc_async(
+            method="profile",
+            timeout=0.01,
+            args=(False, None),
+        )
+
+        assert result is None
+        client._request_socket.send.assert_called_once_with(b"encoded-rpc")
+        assert rpc_id not in client._pending_rpcs
 
 
 # ───────── monitor thread & death sentinel integration tests ─────────
@@ -836,7 +868,7 @@ class TestStageDiffusionClientProcMonitor:
         client._engine_dead = False
 
         proc = _make_short_lived_process()
-        client._proc = proc
+        client._proc_manager = SimpleNamespace(proc=proc)
 
         client._start_proc_monitor()
         proc.join(5)

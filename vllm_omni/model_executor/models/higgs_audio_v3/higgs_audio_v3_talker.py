@@ -531,7 +531,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: Any = None) -> torch.Tensor:
         self._last_logits_hidden = hidden_states
-        return self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
+        return self.logits_processor(self.lm_head, hidden_states)
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         safe_ids = torch.where(input_ids < 0, torch.zeros_like(input_ids), input_ids)

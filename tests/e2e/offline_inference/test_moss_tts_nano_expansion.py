@@ -32,7 +32,6 @@ _OMNI_RUNNER_PARAM = (
 )
 
 pytestmark = [
-    pytest.mark.skip(reason="issue#4361"),
     pytest.mark.full_model,
     pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),

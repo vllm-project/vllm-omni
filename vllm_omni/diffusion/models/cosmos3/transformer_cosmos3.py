@@ -18,6 +18,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from cache_dit import ForwardPattern
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
@@ -30,6 +31,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
@@ -964,6 +966,16 @@ class Cosmos3VFMTransformer(nn.Module):
     ``Attention`` layer (with Ulysses all-to-all) or plain SDPA accordingly.
     """
 
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        # Cosmos3 GEN blocks return only hidden_states.  Per-layer UND K/V
+        # conditioning uses the transformer's cache-dit fallback path.
+        block_forward_patterns={
+            "gen_layers": ForwardPattern.Pattern_3,
+        },
+        has_separate_cfg=True,
+        check_forward_pattern=False,
+    )
+
     _repeated_blocks = ["Cosmos3GenDecoderLayer"]
 
     _layerwise_offload_blocks_attrs = ["gen_layers"]
@@ -1222,8 +1234,12 @@ class Cosmos3VFMTransformer(nn.Module):
         action_start_frame_offset: int = 1,
         action_fps: float | None = None,
         t_sound: int | None = None,
+        num_vision_items: int = 1,
+        share_vision_temporal_positions: bool = False,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
         """Compute mRoPE cos/sin for UND text and GEN media pathways."""
+        if num_vision_items <= 0:
+            raise ValueError(f"Cosmos3 num_vision_items must be positive, got {num_vision_items}.")
         B = text_mask.shape[0]
         S_text = text_mask.shape[1]
         text_lengths = text_mask.sum(dim=1).long()
@@ -1237,17 +1253,33 @@ class Cosmos3VFMTransformer(nn.Module):
             real_len = int(text_lengths[b].item())
             t_pos, t_offset = compute_mrope_position_ids_text(real_len, temporal_offset=0)
             media_temporal_offset = t_offset + self.temporal_modality_margin
-            v_pos, _ = compute_mrope_position_ids_vision(
-                t,
-                hp,
-                wp,
-                temporal_offset=media_temporal_offset,
-                fps=effective_fps,
-                base_fps=self.base_fps,
-                temporal_compression_factor=self.temporal_compression_factor,
-                enable_fps_modulation=self.enable_fps_modulation,
-            )
-            gen_positions = [v_pos]
+            gen_positions = []
+            if num_vision_items == 1 or share_vision_temporal_positions:
+                v_pos, _ = compute_mrope_position_ids_vision(
+                    t,
+                    hp,
+                    wp,
+                    temporal_offset=media_temporal_offset,
+                    fps=effective_fps,
+                    base_fps=self.base_fps,
+                    temporal_compression_factor=self.temporal_compression_factor,
+                    enable_fps_modulation=self.enable_fps_modulation,
+                )
+                gen_positions.extend([v_pos] * num_vision_items)
+            else:
+                vision_offset: int | float = media_temporal_offset
+                for _ in range(num_vision_items):
+                    v_pos, vision_offset = compute_mrope_position_ids_vision(
+                        t,
+                        hp,
+                        wp,
+                        temporal_offset=vision_offset,
+                        fps=effective_fps,
+                        base_fps=self.base_fps,
+                        temporal_compression_factor=self.temporal_compression_factor,
+                        enable_fps_modulation=self.enable_fps_modulation,
+                    )
+                    gen_positions.append(v_pos)
             if action_frames > 0:
                 a_pos, _ = compute_mrope_position_ids_action(
                     action_frames,
@@ -1304,16 +1336,21 @@ class Cosmos3VFMTransformer(nn.Module):
         *,
         s_gen: int,
         s_video: int,
+        s_control: int,
         s_action: int,
         s_sound: int,
         has_action: bool,
         has_sound: bool,
+        has_control: bool,
         ulysses_size: int,
     ) -> None:
         if ulysses_size <= 1 or s_gen % ulysses_size == 0:
             return
 
-        detail_parts = [f"video tokens {s_video}"]
+        detail_parts = []
+        if has_control:
+            detail_parts.append(f"control tokens {s_control}")
+        detail_parts.append(f"video tokens {s_video}")
         if has_action:
             detail_parts.append(f"action tokens {s_action}")
         if has_sound:
@@ -1323,7 +1360,7 @@ class Cosmos3VFMTransformer(nn.Module):
             "Adjust the spatial resolution, frame count, action chunk size, "
             "sound duration, or sound latent FPS so the combined media sequence is a "
             "multiple of ulysses_degree."
-            if has_action or has_sound
+            if has_control or has_action or has_sound
             else (
                 "Adjust the spatial resolution so that "
                 "t * ceil(h/patch) * ceil(w/patch) is a multiple "
@@ -1352,6 +1389,8 @@ class Cosmos3VFMTransformer(nn.Module):
         action_fps: float | None = None,
         sound_latents: torch.Tensor | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
+        control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        transfer_share_vision_temporal_positions: bool = True,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
@@ -1371,11 +1410,15 @@ class Cosmos3VFMTransformer(nn.Module):
                 timestep embedding, predict velocity) and 0=conditioned (clean
                 context, skip timestep embedding).  None means all frames noisy
                 (T2V mode).
+            control_latents: Optional transfer-control latents. Controls are
+                clean vision context and are packed before the noisy target.
 
         Returns:
             [B, C, t, h, w] velocity prediction, or
             tuple outputs in video, action, sound order when extra modalities are provided.
         """
+        if kwargs:
+            raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
         text_lengths = text_mask.sum(dim=1)
@@ -1388,6 +1431,15 @@ class Cosmos3VFMTransformer(nn.Module):
             )
         has_action = action_latents is not None
         has_sound = sound_latents is not None
+        if control_latents is None:
+            control_latent_list: list[torch.Tensor] = []
+        elif isinstance(control_latents, torch.Tensor):
+            control_latent_list = [control_latents]
+        else:
+            control_latent_list = list(control_latents)
+        has_control = len(control_latent_list) > 0
+        if has_control and (has_action or has_sound):
+            raise ValueError("Cosmos3 transfer control latents cannot be combined with action or sound latents.")
         if has_action and not self.action_gen:
             raise ValueError(
                 "Cosmos3 action generation was requested, but this transformer "
@@ -1407,6 +1459,19 @@ class Cosmos3VFMTransformer(nn.Module):
         # Patchify latents and project to hidden space
         hidden_video = self.proj_in(self.patchify(hidden_states, t, h, w))
         s_video = hidden_video.shape[1]
+        s_control = 0
+        hidden_controls: list[torch.Tensor] = []
+        for idx, control in enumerate(control_latent_list):
+            if control.shape != hidden_states.shape:
+                raise ValueError(
+                    "Cosmos3 transfer control latent shape must match target latent shape: "
+                    f"control[{idx}]={tuple(control.shape)}, target={tuple(hidden_states.shape)}."
+                )
+            hidden_control = self.proj_in(
+                self.patchify(control.to(device=hidden_states.device, dtype=hidden_states.dtype), t, h, w)
+            )
+            hidden_controls.append(hidden_control)
+            s_control += hidden_control.shape[1]
         s_action = 0
         hidden_action = None
         s_sound = 0
@@ -1467,7 +1532,7 @@ class Cosmos3VFMTransformer(nn.Module):
 
         if hidden_sound is not None:
             hidden_sound = hidden_sound + time_embed.unsqueeze(1)
-        hidden_parts = [hidden_video]
+        hidden_parts = [*hidden_controls, hidden_video]
         if hidden_action is not None:
             hidden_parts.append(hidden_action)
         if hidden_sound is not None:
@@ -1488,6 +1553,8 @@ class Cosmos3VFMTransformer(nn.Module):
                 action_start_frame_offset=action_start_frame_offset,
                 action_fps=action_fps,
                 t_sound=s_sound,
+                num_vision_items=len(control_latent_list) + 1,
+                share_vision_temporal_positions=transfer_share_vision_temporal_positions,
             )
             cached_kv_full = self.language_model(text_ids, freqs_und)
             self.cached_freqs_gen = freqs_gen
@@ -1504,10 +1571,12 @@ class Cosmos3VFMTransformer(nn.Module):
         self._validate_gen_sequence_parallel(
             s_gen=hidden_gen.shape[1],
             s_video=s_video,
+            s_control=s_control,
             s_action=s_action,
             s_sound=s_sound,
             has_action=has_action,
             has_sound=has_sound,
+            has_control=has_control,
             ulysses_size=ulysses_size,
         )
         freqs_cos, freqs_sin = self.cached_freqs_gen
@@ -1541,19 +1610,27 @@ class Cosmos3VFMTransformer(nn.Module):
 
         # Final norm and project back to latent space
         hidden_gen = self.norm_moe_gen(hidden_gen)
-        if not has_action and not has_sound:
+        if not has_action and not has_sound and not has_control:
             return self.unpatchify(self.proj_out(hidden_gen), t, h, w)
 
-        split_sizes = [s_video]
+        split_sizes = []
+        if has_control:
+            split_sizes.append(s_control)
+        split_sizes.append(s_video)
         if has_action:
             split_sizes.append(s_action)
         if has_sound:
             split_sizes.append(s_sound)
         split_hidden = hidden_gen.split(split_sizes, dim=1)
-        hidden_video = split_hidden[0]
+        split_idx = 0
+        if has_control:
+            split_idx += 1
+        hidden_video = split_hidden[split_idx]
+        split_idx += 1
         video_pred = self.unpatchify(self.proj_out(hidden_video), t, h, w)
+        if has_control:
+            return video_pred
         outputs: list[torch.Tensor] = [video_pred]
-        split_idx = 1
         if has_action:
             hidden_action = split_hidden[split_idx]
             split_idx += 1
