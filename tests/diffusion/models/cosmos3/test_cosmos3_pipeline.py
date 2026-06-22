@@ -783,6 +783,38 @@ def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline)
     torch.testing.assert_close(action, clean)
 
 
+def test_i2v_conditioning_moves_single_frame_before_video_expand(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    calls: list[tuple[str, tuple[int, ...]]] = []
+
+    def record_to_vae_device(tensor: torch.Tensor, *, pin_cpu: bool = False) -> torch.Tensor:
+        assert pin_cpu is True
+        calls.append(("to_vae_device", tuple(tensor.shape)))
+        return tensor
+
+    class RecordingVAE(StubCosmos3VAE):
+        def encode(self, video: torch.Tensor):
+            calls.append(("encode", tuple(video.shape)))
+            assert video.is_contiguous()
+            return super().encode(video)
+
+    pipeline._to_vae_device = record_to_vae_device
+    pipeline.vae = RecordingVAE(z_dim=2)
+
+    latent = pipeline._encode_conditioning_video(
+        torch.zeros(1, 3, 16, 24),
+        num_frames=5,
+        height=16,
+        width=24,
+    )
+
+    assert calls == [
+        ("to_vae_device", (1, 3, 16, 24)),
+        ("encode", (1, 3, 5, 16, 24)),
+    ]
+    assert latent.shape == (1, 2, 2, 2, 3)
+
+
 def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)

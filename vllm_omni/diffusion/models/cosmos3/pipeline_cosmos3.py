@@ -1644,18 +1644,36 @@ class Cosmos3OmniDiffusersPipeline(
 
     # -- VAE decode ----------------------------------------------------------
 
+    def _get_latents_mean_std(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        cached = getattr(self, "_latents_mean_std", None)
+        if cached is not None:
+            latents_mean, latents_std = cached
+            if latents_mean.device == device and latents_mean.dtype == dtype:
+                return latents_mean, latents_std
+
+        latents_mean = torch.as_tensor(self.vae.config.latents_mean, device=device, dtype=dtype).view(1, -1, 1, 1, 1)
+        latents_std = torch.as_tensor(self.vae.config.latents_std, device=device, dtype=dtype).view(1, -1, 1, 1, 1)
+        self._latents_mean_std = (latents_mean, latents_std)
+        return latents_mean, latents_std
+
+    def _to_vae_device(self, tensor: torch.Tensor, *, pin_cpu: bool = False) -> torch.Tensor:
+        if tensor.device == self.device and tensor.dtype == self.vae.dtype:
+            return tensor
+
+        non_blocking = False
+        if tensor.device.type == "cpu" and self.device.type == "cuda":
+            if pin_cpu and not tensor.is_pinned():
+                tensor = tensor.pin_memory()
+            non_blocking = tensor.is_pinned()
+
+        return tensor.to(device=self.device, dtype=self.vae.dtype, non_blocking=non_blocking)
+
     def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         latents = latents.to(self.vae.dtype)
 
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            if not hasattr(self, "_latents_mean"):
-                self._latents_mean = (
-                    torch.tensor(self.vae.config.latents_mean).view(1, -1, 1, 1, 1).to(self.device, self.vae.dtype)
-                )
-                self._latents_std = (
-                    torch.tensor(self.vae.config.latents_std).view(1, -1, 1, 1, 1).to(self.device, self.vae.dtype)
-                )
-            latents = (latents * self._latents_std) + self._latents_mean
+            latents_mean, latents_std = self._get_latents_mean_std(latents.device, latents.dtype)
+            latents = (latents * latents_std) + latents_mean
         else:
             scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
             latents = latents / scaling_factor
@@ -1769,18 +1787,17 @@ class Cosmos3OmniDiffusersPipeline(
         The caller keeps only the conditioned latent frame(s) and replaces
         the rest with noise.
         """
-        # image_tensor: [1, 3, H, W] -> [1, 3, num_frames, H, W]
+        # Move the single conditioning frame first, then materialize the
+        # repeated video on GPU.  Materializing [1, 3, T, H, W] on CPU creates
+        # a large pageable H2D copy on I2V requests.
+        image_tensor = self._to_vae_device(image_tensor, pin_cpu=True)
         video = image_tensor.unsqueeze(2).expand(-1, -1, num_frames, -1, -1).contiguous()
-        video = video.to(device=self.device, dtype=self.vae.dtype)
 
         latent = self.vae.encode(video).latent_dist.mode()
 
         # Normalize (inverse of _decode_latents denormalization)
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latent.device, latent.dtype)
-            )
-            latents_std = torch.tensor(self.vae.config.latents_std).view(1, -1, 1, 1, 1).to(latent.device, latent.dtype)
+            latents_mean, latents_std = self._get_latents_mean_std(latent.device, latent.dtype)
             latent = (latent - latents_mean) / latents_std
         else:
             scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
@@ -1818,14 +1835,11 @@ class Cosmos3OmniDiffusersPipeline(
         if video_tensor.shape[0] != 1 or video_tensor.shape[1] != 3:
             raise ValueError(f"Cosmos3 video tensor must have shape [1, 3, T, H, W], got {tuple(video_tensor.shape)}.")
 
-        video = video_tensor.to(device=self.device, dtype=self.vae.dtype)
+        video = self._to_vae_device(video_tensor)
         latent = self.vae.encode(video).latent_dist.mode()
 
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latent.device, latent.dtype)
-            )
-            latents_std = torch.tensor(self.vae.config.latents_std).view(1, -1, 1, 1, 1).to(latent.device, latent.dtype)
+            latents_mean, latents_std = self._get_latents_mean_std(latent.device, latent.dtype)
             latent = (latent - latents_mean) / latents_std
         else:
             scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
