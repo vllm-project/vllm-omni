@@ -43,7 +43,6 @@ RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
         "server_params": {
             "model": "openbmb/VoxCPM2",
             "stage_config_name": "voxcpm2.yaml",
-            "server_args": ["--trust-remote-code", "--disable-log-stats", "--stage-init-timeout", "600"],
         },
     },
 ]

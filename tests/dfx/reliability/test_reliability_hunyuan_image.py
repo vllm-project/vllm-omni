@@ -43,14 +43,6 @@ RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
         "server_params": {
             "model": "tencent/HunyuanImage-3.0-Instruct",
             "stage_config_name": "hunyuan_image3_dit.yaml",
-            "server_args": [
-                "--trust-remote-code",
-                "--disable-log-stats",
-                "--stage-init-timeout",
-                "300",
-                "--init-timeout",
-                "900",
-            ],
         },
     },
 ]
