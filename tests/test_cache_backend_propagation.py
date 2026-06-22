@@ -7,6 +7,7 @@ is silently dropped under a deploy YAML: per-stage engine args default
 ``cache_backend`` to "none", and the top-level value was never injected into the
 diffusion stage, so the diffusion cache (TeaCache / cache-dit) never activated.
 """
+
 from types import SimpleNamespace
 
 import pytest
