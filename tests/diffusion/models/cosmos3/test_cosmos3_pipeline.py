@@ -54,8 +54,10 @@ class StubCosmos3VAE:
             latents_mean=[0.0] * z_dim,
             latents_std=[1.0] * z_dim,
         )
+        self.encode_input_shapes: list[tuple[int, ...]] = []
 
     def encode(self, video: torch.Tensor):
+        self.encode_input_shapes.append(tuple(video.shape))
         latent_frames = (video.shape[2] - 1) // self.config.scale_factor_temporal + 1
         latent_height = video.shape[-2] // self.config.scale_factor_spatial
         latent_width = video.shape[-1] // self.config.scale_factor_spatial
@@ -733,7 +735,7 @@ def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline)
     latents = pipeline._prepare_latents(16, 24, 5, torch.Generator(device="cpu").manual_seed(0))
     assert latents.shape == (1, 2, 2, 2, 3)
 
-    pipeline._encode_conditioning_video = lambda *args, **kwargs: torch.full((1, 2, 2, 2, 3), 5.0)
+    pipeline._encode_conditioning_image_latent = lambda *args, **kwargs: torch.full((1, 2, 1, 2, 3), 5.0)
     i2v_latents, velocity_mask, image_latent = pipeline._prepare_latents_i2v(
         torch.zeros(1, 3, 16, 24), 16, 24, 5, torch.Generator(device="cpu").manual_seed(0)
     )
@@ -783,7 +785,7 @@ def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline)
     torch.testing.assert_close(action, clean)
 
 
-def test_i2v_conditioning_moves_single_frame_before_video_expand(make_cosmos3_pipeline) -> None:
+def test_prepare_latents_i2v_encodes_only_conditioning_frame(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     calls: list[tuple[str, tuple[int, ...]]] = []
 
@@ -795,24 +797,30 @@ def test_i2v_conditioning_moves_single_frame_before_video_expand(make_cosmos3_pi
     class RecordingVAE(StubCosmos3VAE):
         def encode(self, video: torch.Tensor):
             calls.append(("encode", tuple(video.shape)))
-            assert video.is_contiguous()
             return super().encode(video)
 
     pipeline._to_vae_device = record_to_vae_device
     pipeline.vae = RecordingVAE(z_dim=2)
+    generator = torch.Generator(device="cpu").manual_seed(0)
 
-    latent = pipeline._encode_conditioning_video(
+    latents, velocity_mask, image_latent = pipeline._prepare_latents_i2v(
         torch.zeros(1, 3, 16, 24),
-        num_frames=5,
-        height=16,
-        width=24,
+        16,
+        24,
+        9,
+        generator,
     )
 
     assert calls == [
         ("to_vae_device", (1, 3, 16, 24)),
-        ("encode", (1, 3, 5, 16, 24)),
+        ("encode", (1, 3, 1, 16, 24)),
     ]
-    assert latent.shape == (1, 2, 2, 2, 3)
+    assert pipeline.vae.encode_input_shapes[-1] == (1, 3, 1, 16, 24)
+    assert latents.shape == (1, 2, 3, 2, 3)
+    assert image_latent.shape == (1, 2, 1, 2, 3)
+    torch.testing.assert_close(latents[:, :, 0:1], image_latent)
+    assert not torch.allclose(latents[:, :, 1:], image_latent.expand(-1, -1, 2, -1, -1))
+    assert velocity_mask.tolist() == [[[[[0.0]], [[1.0]], [[1.0]]]]]
 
 
 def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> None:
@@ -846,6 +854,9 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
         image_latent=torch.full((1, 2, 1, 1, 1), 7.0),
     )
     torch.testing.assert_close(i2v[:, :, 0:1], torch.full((1, 2, 1, 1, 1), 7.0))
+    i2v_noise = pipeline.scheduler.step_calls[-1][0]
+    torch.testing.assert_close(i2v_noise[:, :, 0:1], torch.zeros(1, 2, 1, 1, 1))
+    torch.testing.assert_close(i2v_noise[:, :, 1:2], torch.full((1, 2, 1, 1, 1), 2.0))
 
     pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, action_gen=True, action_dim=4)
     video_result, action_result = pipeline.diffuse(
