@@ -102,6 +102,8 @@ def check_audio_determinism(audio1, audio2, atol=1e-2):
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("model_name", list(MODELS.keys()))
 def test_cpu_offload_diffusion_model(model_name: str):
+    if model_name == "OmniGen2/OmniGen2":
+        pytest.skip("issue #4537")
     if model_name in _GATED_MODELS:
         _skip_if_gated_repo_inaccessible(model_name)
     try:

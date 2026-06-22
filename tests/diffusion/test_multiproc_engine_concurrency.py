@@ -730,6 +730,39 @@ class TestStageDiffusionClientErrorPropagation:
                 batch_size=1,
             )
 
+    @pytest.mark.asyncio
+    async def test_collective_rpc_async_returns_none_result(self, monkeypatch):
+        client = self._make_client()
+        client._owns_process = False
+        client._proc = None
+        client._encoder.encode.return_value = b"encoded-rpc"
+
+        async def _unexpected_poll(*_, **__):
+            raise AssertionError("collective_rpc_async should not keep polling after a None rpc_result arrives")
+
+        client._response_poller = SimpleNamespace(poll=_unexpected_poll)
+
+        rpc_id = "rpc-none"
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.stage_diffusion_client.uuid.uuid4",
+            lambda: SimpleNamespace(hex=rpc_id),
+        )
+
+        def _drain() -> None:
+            client._rpc_results[rpc_id] = None
+
+        client._drain_responses = _drain
+
+        result = await client.collective_rpc_async(
+            method="profile",
+            timeout=0.01,
+            args=(False, None),
+        )
+
+        assert result is None
+        client._request_socket.send.assert_called_once_with(b"encoded-rpc")
+        assert rpc_id not in client._pending_rpcs
+
 
 # ───────── monitor thread & death sentinel integration tests ─────────
 

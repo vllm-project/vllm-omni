@@ -1031,6 +1031,14 @@ def _save_generated_outputs(
         if not out.success or not out.response_body:
             continue
 
+        if isinstance(out.response_body, bytes):
+            fname = f"req_{idx:04d}.mp4"
+            fpath = os.path.join(save_dir, fname)
+            with open(fpath, "wb") as f:
+                f.write(out.response_body)
+            saved += 1
+            continue
+
         media_urls: list[str] = []
 
         # Chat-completions style: choices[*].message.content[*].image_url.url

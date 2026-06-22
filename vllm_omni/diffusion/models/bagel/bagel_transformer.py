@@ -7,12 +7,13 @@
 # Original file was released under Apache-2.0, with the full license text
 # available at https://github.com/huggingface/transformers/blob/main/LICENSE.
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 import torch.distributed as dist
+from cache_dit import ForwardPattern
 from torch import nn
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
@@ -36,6 +37,7 @@ from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
+from vllm_omni.diffusion.cache.cache_dit_backend import BagelCachedAdapter, CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
@@ -49,6 +51,7 @@ from vllm_omni.diffusion.layers.mot.mot_layernorm import MoTRMSNorm
 from vllm_omni.diffusion.layers.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
 from vllm_omni.diffusion.layers.mot.mot_row_parallel_linear import MoTRowParallelLinear
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.utils.kv_utils import left_pad_stack
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 logger = init_logger(__name__)
@@ -324,6 +327,10 @@ class NaiveCache:
     def __init__(self, num_layers):
         self.key_cache = {k: None for k in range(num_layers)}
         self.value_cache = {k: None for k in range(num_layers)}
+        # Track kv_lens; we need this because we pack the forward passes
+        # for CFG into a single forward call and the kv length may be different,
+        # e.g., due to 0 kvs for text_cfg path and nonzero for others
+        self.key_values_lens: list[int] | None = None
 
     @property
     def num_layers(self):
@@ -335,6 +342,76 @@ class NaiveCache:
             return self.key_cache[0].shape[0]
         else:
             return 0
+
+    @classmethod
+    def from_object(cls, obj) -> "NaiveCache":
+        """Convert a duck-typed cache (e.g., SimpleNamespace from KV transfer)
+        to NaiveCache; in the future, we should find a better way to handle this,
+        e.g., a model agnostic abstraction for key cache transfer instead of having
+        this cache live in bagel.
+
+        NOTE: If a NaiveCache is provided, the object is just returned. Otherwise,
+        we enumerate over the key/value cache values and map layer indices to the
+        corresponding tensors.
+        """
+        if isinstance(obj, cls):
+            return obj
+        cache = cls(len(obj.key_cache))
+        for i, (k, v) in enumerate(zip(obj.key_cache, obj.value_cache, strict=True)):
+            cache.key_cache[i] = k
+            cache.value_cache[i] = v
+        return cache
+
+    @staticmethod
+    def merge(caches: Sequence["NaiveCache"]) -> "NaiveCache":
+        """Merge per-branch NaiveCaches into one for batched attention;
+        this lets us do the forward passes for CFG in one batched pass,
+        although it's worth noting that this is currently only used
+        for single request. We need this so that gen mode knows the
+        respective kv lengths, and can split things back out as needed.
+        """
+        num_layers = caches[0].num_layers
+        merged = NaiveCache(num_layers)
+        lens = [c.seq_lens for c in caches]
+        merged.key_values_lens = lens
+
+        nonempty = [c for c in caches if c.key_cache[0] is not None]
+        if not nonempty:
+            return merged
+
+        for layer in range(num_layers):
+            merged.key_cache[layer] = torch.cat([c.key_cache[layer] for c in nonempty], dim=0)
+            merged.value_cache[layer] = torch.cat([c.value_cache[layer] for c in nonempty], dim=0)
+
+        return merged
+
+    @staticmethod
+    def split_with_zeros(
+        tensor: torch.Tensor,
+        lengths: Sequence[int],
+    ) -> list[torch.Tensor | None]:
+        """Split tensor by lengths, which may include 0 entries, e.g., for splitting cfg
+        branches out, since text_cfg may have 0 kv length.
+
+        0 lengths will be replaced with None in the returned list.
+        """
+        # Ensure that the lengths are all nonzero and sum to the first dim of our tensor
+        if not all(isinstance(ln, int) and ln >= 0 for ln in lengths):
+            raise ValueError("split lengths must be greater than or equal to zero")
+
+        expected = sum(ln for ln in lengths if ln > 0)
+        if tensor.shape[0] != expected:
+            raise ValueError(f"tensor dim 0 ({tensor.shape[0]}) != sum of nonzero lengths ({expected})")
+
+        result: list[torch.Tensor | None] = []
+        offset = 0
+        for ln in lengths:
+            if ln > 0:
+                result.append(tensor[offset : offset + ln])
+                offset += ln
+            else:
+                result.append(None)
+        return result
 
 
 @dataclass
@@ -425,6 +502,7 @@ class PackedAttentionMoT(nn.Module):
     def _forward_gen(
         self,
         packed_query_sequence: torch.Tensor,
+        query_lens: torch.Tensor,
         packed_query_position_embeddings: torch.Tensor,
         past_key_values: NaiveCache | None,
         packed_vae_token_indexes: torch.Tensor,
@@ -452,6 +530,7 @@ class PackedAttentionMoT(nn.Module):
         text_indices = packed_text_indexes
         vae_indices = packed_vae_token_indexes
 
+        cache_k = cache_v = None
         packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
 
         # MoT QKV projection routes text/vae tokens to the matching weights.
@@ -482,6 +561,10 @@ class PackedAttentionMoT(nn.Module):
         vae_k = k[vae_indices]
         vae_v = v[vae_indices]
 
+        num_branches = len(query_lens)
+        text_per_branch = text_q.shape[0] // num_branches
+        vae_per_branch = vae_q.shape[0] // num_branches
+
         # Build joint K/V: [kv_cache, text_markers] (replicated across SP ranks)
         if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
             cache_k = past_key_values.key_cache[self.layer_idx]
@@ -508,15 +591,46 @@ class PackedAttentionMoT(nn.Module):
                 ),
             )
         else:
-            q = torch.cat([text_q, vae_q], dim=0).unsqueeze(0)
-            k = torch.cat([ctx_k, vae_k], dim=0).unsqueeze(0)
-            v = torch.cat([ctx_v, vae_v], dim=0).unsqueeze(0)
-            attn_out = self.attn_noncausal(q, k, v)
+            text_q_parts = text_q.split([text_per_branch] * num_branches)
+            vae_q_parts = vae_q.split([vae_per_branch] * num_branches)
+            text_k_parts = text_k.split([text_per_branch] * num_branches)
+            vae_k_parts = vae_k.split([vae_per_branch] * num_branches)
+            text_v_parts = text_v.split([text_per_branch] * num_branches)
+            vae_v_parts = vae_v.split([vae_per_branch] * num_branches)
 
-        text_len = text_q.shape[0]
-        attn_out = attn_out.squeeze(0)
-        text_attn = attn_out[:text_len].reshape(text_len, self.q_size)
-        vae_attn = attn_out[text_len:].reshape(-1, self.q_size)
+            # Query lengths should not be variable since we
+            # just split above, so we just concat + stack to 4D
+            q_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_q_parts, vae_q_parts)])
+
+            if cache_k is not None and cache_v is not None:
+                kv_lens = getattr(past_key_values, "key_values_lens", None)
+                if kv_lens is None:
+                    per_branch = cache_k.shape[0] // num_branches
+                    kv_lens = [per_branch] * num_branches
+
+                ck_per_branch = NaiveCache.split_with_zeros(cache_k, kv_lens)
+                cv_per_branch = NaiveCache.split_with_zeros(cache_v, kv_lens)
+                k_branches = [
+                    torch.cat([t for t in (ck_per_branch[i], text_k_parts[i], vae_k_parts[i]) if t is not None])
+                    for i in range(num_branches)
+                ]
+                v_branches = [
+                    torch.cat([t for t in (cv_per_branch[i], text_v_parts[i], vae_v_parts[i]) if t is not None])
+                    for i in range(num_branches)
+                ]
+                k_4d, mask = left_pad_stack(k_branches)
+                v_4d, _ = left_pad_stack(v_branches)
+                metadata = DiffusionAttentionMetadata(attn_mask=mask) if mask is not None else None
+            else:
+                k_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_k_parts, vae_k_parts)])
+                v_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_v_parts, vae_v_parts)])
+                metadata = None
+            attn_out = self.attn_noncausal(q_4d, k_4d, v_4d, metadata)
+
+        attn_out = attn_out.reshape(num_branches, -1, self.q_size)
+        text_attn = attn_out[:, :text_per_branch].reshape(-1, self.q_size)
+        vae_attn = attn_out[:, text_per_branch:].reshape(-1, self.q_size)
+        text_len = text_attn.shape[0]
 
         # MoT output projection over local [text, vae] order.
         local_packed = torch.cat([text_attn, vae_attn], dim=0)
@@ -660,6 +774,7 @@ class PackedAttentionMoT(nn.Module):
                 raise ValueError("Generation model for Bagel requires non-causal attention")
             return self._forward_gen(
                 packed_query_sequence=packed_query_sequence,
+                query_lens=query_lens,
                 packed_query_position_embeddings=packed_query_position_embeddings,
                 past_key_values=past_key_values,
                 packed_vae_token_indexes=packed_vae_token_indexes,
@@ -772,6 +887,13 @@ class Qwen2MoTDecoderLayer(nn.Module):
 
 
 class Qwen2MoTModel(Qwen2PreTrainedModel):
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "layers": ForwardPattern.Pattern_0,
+        },
+        cached_adapter_cls=BagelCachedAdapter,
+    )
+
     _layerwise_offload_blocks_attrs = ["layers"]
 
     @staticmethod
@@ -1128,6 +1250,13 @@ def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_pat
 class Bagel(nn.Module):
     config_class = BagelConfig
     base_model_prefix = "bagel"
+
+    # Flow-matching denoise schedule convention. Official BAGEL samples
+    # ``num_timesteps`` points over [1, 0] and drops the terminal t=0, yielding
+    # ``num_timesteps - 1`` Euler steps. Lance samples one extra point
+    # (``num_timesteps + 1``) for ``num_timesteps`` steps; ``LanceBagel`` flips
+    # this on. See https://github.com/vllm-project/vllm-omni/issues/4470.
+    _denoise_schedule_extra_step: bool = False
 
     def __init__(
         self,
@@ -1690,11 +1819,11 @@ class Bagel(nn.Module):
             frame_condition_token_indexes = frame_condition_token_indexes.to(x_t.device).long()
             pinned_x_t = x_t[frame_condition_token_indexes].clone()
 
-        # Use num_timesteps + 1 sample points so we get `num_timesteps` denoise
-        # steps after dropping the terminal t=0 (which has no dt).  Upstream
-        # Lance / BAGEL both use this convention; without the +1 we silently
-        # run one fewer denoise iteration than the user asked for.
-        timesteps = torch.linspace(1, 0, num_timesteps + 1, device=x_t.device)
+        # Build the flow-matching schedule. BAGEL drops the terminal t=0 for
+        # ``num_timesteps - 1`` Euler steps; Lance keeps it for ``num_timesteps``.
+        # ``_denoise_schedule_extra_step`` (overridden by ``LanceBagel``) selects which.
+        num_sample_points = num_timesteps + 1 if self._denoise_schedule_extra_step else num_timesteps
+        timesteps = torch.linspace(1, 0, num_sample_points, device=x_t.device)
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
@@ -1851,15 +1980,15 @@ class Bagel(nn.Module):
         # Each CFG branch runs its own LLM forward; we just need the
         # per-branch packed_position_ids and past_key_values for
         # ``Bagel.forward`` to dispatch through.
-        cfg_branches: dict | None = None
+        cfg_branch_pids: list[torch.Tensor] | None = None
+        cfg_branch_caches: list[NaiveCache] | None = None
 
         if use_cfg_text:
-            branches_pid = [packed_position_ids, cfg_text_packed_position_ids]
-            branches_cache = [past_key_values, cfg_text_past_key_values]
+            cfg_branch_pids = [packed_position_ids, cfg_text_packed_position_ids]
+            cfg_branch_caches = [past_key_values, cfg_text_past_key_values]
             if use_cfg_img:
-                branches_pid.append(cfg_img_packed_position_ids)
-                branches_cache.append(cfg_img_past_key_values)
-            cfg_branches = {"pids": branches_pid, "caches": branches_cache}
+                cfg_branch_pids.append(cfg_img_packed_position_ids)
+                cfg_branch_caches.append(cfg_img_past_key_values)
 
         if return_trajectory_latents and len(timesteps) > 0:
             trajectory_latents.append(x_t.clone())
@@ -1892,7 +2021,8 @@ class Bagel(nn.Module):
                 cfg_renorm_type=cfg_renorm_type,
                 cfg_text_scale=cfg_text_scale_,
                 cfg_img_scale=cfg_img_scale_,
-                cfg_branches=cfg_branches,
+                cfg_branch_pids=cfg_branch_pids,
+                cfg_branch_caches=cfg_branch_caches,
             )
 
             if scheduler is not None:
@@ -2236,7 +2366,8 @@ class Bagel(nn.Module):
         cfg_renorm_type: str = "global",
         cfg_text_scale: float = 1.0,
         cfg_img_scale: float = 1.0,
-        cfg_branches: dict | None = None,
+        cfg_branch_pids: list[torch.Tensor] | None = None,
+        cfg_branch_caches: list[NaiveCache] | None = None,
     ):
         # Build query sequence (identical for all CFG branches)
         packed_text_embedding = self.language_model.forward(
@@ -2264,31 +2395,37 @@ class Bagel(nn.Module):
         cfg_text_v_t = None
         cfg_img_v_t = None
 
-        if use_cfg and cfg_branches is not None:
-            # Sequential per-branch CFG forwards (matches upstream lance.py).
-            # The previous batched path concatenated cond + cfg into one LLM
-            # forward, but the block-diagonal attention mask was lost when
-            # PR #3728 dropped flash_attn_varlen, so branches leaked into
-            # each other.  Running each branch through its own forward is
-            # numerically identical to upstream.
-            def _run_branch(branch_pkv, branch_pids):
-                out = self.language_model.forward(
-                    packed_query_sequence=packed_sequence,
-                    query_lens=packed_seqlens,
-                    packed_query_position_ids=branch_pids,
-                    past_key_values=branch_pkv,
-                    update_past_key_values=False,
-                    is_causal=False,
-                    **extra_inputs,
-                )
-                return self.llm2vae(out.packed_query_sequence)[packed_vae_token_indexes]
+        if use_cfg and cfg_branch_pids is not None and cfg_branch_caches is not None:
+            num_branches = len(cfg_branch_pids)
+            seq_len = int(packed_seqlens.sum())
 
-            branches_pids = cfg_branches["pids"]
-            branches_caches = cfg_branches["caches"]
-            v_t = _run_branch(branches_caches[0], branches_pids[0])
-            cfg_text_v_t = _run_branch(branches_caches[1], branches_pids[1])
-            if cfg_img_scale > 1.0 and len(branches_caches) > 2:
-                cfg_img_v_t = _run_branch(branches_caches[2], branches_pids[2])
+            batched_sequence = packed_sequence.repeat(num_branches, 1)
+            batched_vae_indexes = torch.cat([packed_vae_token_indexes + i * seq_len for i in range(num_branches)])
+            batched_position_ids = torch.cat(cfg_branch_pids)
+            batched_seqlens = packed_seqlens.repeat(num_branches)
+            merged_cache = NaiveCache.merge(cfg_branch_caches)
+
+            if self.use_moe:
+                batched_text_indices = torch.cat([packed_text_indexes + i * seq_len for i in range(num_branches)])
+                extra_inputs["packed_vae_token_indexes"] = batched_vae_indexes
+                extra_inputs["packed_text_indexes"] = batched_text_indices
+
+            output = self.language_model.forward(
+                packed_query_sequence=batched_sequence,
+                query_lens=batched_seqlens,
+                packed_query_position_ids=batched_position_ids,
+                past_key_values=merged_cache,
+                update_past_key_values=False,
+                is_causal=False,
+                **extra_inputs,
+            )
+
+            all_vae_v_t = self.llm2vae(output.packed_query_sequence)[batched_vae_indexes]
+            vae_per_branch = packed_vae_token_indexes.shape[0]
+            branch_v_ts = all_vae_v_t.split(vae_per_branch)
+            v_t = branch_v_ts[0]
+            cfg_text_v_t = branch_v_ts[1]
+            cfg_img_v_t = branch_v_ts[2] if len(branch_v_ts) > 2 else None
         else:
             # Single forward (no CFG or outside cfg_interval).
             output = self.language_model.forward(
