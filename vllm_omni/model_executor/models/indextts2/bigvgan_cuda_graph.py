@@ -33,10 +33,11 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-# Mel-frame buckets at 22050 Hz / hop 256 (~86 fps).  The 640/1280
-# buckets cover the measured SeedTTS mean length with less padding, and
-# larger buckets avoid falling back to eager BigVGAN for long-form text.
-DEFAULT_CAPTURE_SIZES = [128, 256, 384, 512, 640, 768, 1024, 1280, 1536, 2048, 3072, 4096]
+# Mel-frame buckets at 22050 Hz / hop 256 (~86 fps).
+# Keep buckets modest so that CUDA-graph private pools do not exhaust
+# GPU memory when stage0 and stage1 share the same device (~22 GiB).
+# Inputs longer than the largest bucket fall back to eager BigVGAN.
+DEFAULT_CAPTURE_SIZES = [128, 256, 384, 512, 640]
 
 
 class CUDAGraphBigVGANWrapper:
@@ -151,7 +152,7 @@ class CUDAGraphBigVGANWrapper:
                 self._capture_compiled(size, device, dtype)
                 self._compiled_shapes.add(size)
                 logger.info(
-                    "  torch.compile + CUDA Graph ready for mel frames=%d in %.1f ms",
+                    "  torch.compile + CUDA Graph ready for mel frames=%d",
                     size,
                 )
             except Exception:
@@ -162,7 +163,7 @@ class CUDAGraphBigVGANWrapper:
                     exc_info=True,
                 )
         logger.info(
-            "torch.compile + CUDA Graph warmup complete: %d/%d shapes ready in %.1f ms",
+            "torch.compile + CUDA Graph warmup complete: %d/%d shapes ready",
             len(self._compiled_shapes),
             len(self.compile_shapes),
         )
