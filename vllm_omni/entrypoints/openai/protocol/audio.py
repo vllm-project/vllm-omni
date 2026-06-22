@@ -145,6 +145,15 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
     )
+    word_timestamps: bool = Field(
+        default=False,
+        description=(
+            "When true, the server runs a shared forced aligner alongside the streamed "
+            "audio and emits per-chunk word timestamps. Requires the server to be "
+            "launched with --forced-aligner pointing at an aligner model. No effect "
+            "when streaming is off."
+        ),
+    )
 
     @field_validator("stream_format")
     @classmethod
@@ -461,6 +470,15 @@ class StreamingSpeechSessionConfig(BaseModel):
         description=(
             "Text splitting granularity: 'sentence' splits on .!?。！？, "
             "'clause' also splits on CJK commas ， and semicolons ；."
+        ),
+    )
+    word_timestamps: bool = Field(
+        default=False,
+        description=(
+            "When true, audio chunks are wrapped in JSON 'audio.chunk' frames carrying "
+            "base64-encoded PCM plus aligned word timestamps. Requires the server to be "
+            "launched with --forced-aligner. When false, audio is sent as raw binary "
+            "frames (existing behavior)."
         ),
     )
 

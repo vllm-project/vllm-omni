@@ -369,6 +369,20 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
 ```
 Streaming requires `async_chunk: true` in the stage config.
 
+### Word Timestamps
+Generate a WAV offline and a JSON sidecar with word-level timestamps from
+`Qwen/Qwen3-ForcedAligner-0.6B`:
+```bash
+python examples/offline_inference/text_to_speech/qwen3_tts/word_timestamps.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --forced-aligner Qwen/Qwen3-ForcedAligner-0.6B \
+    --text "Hello world." \
+    --output-dir /tmp/qwen3_tts_timestamps
+```
+The script writes `qwen3_tts_word_timestamps.wav` and
+`qwen3_tts_word_timestamps.json`. On machines without a local CUDA toolkit,
+set `VLLM_USE_FLASHINFER_SAMPLER=0` to avoid FlashInfer sampler JIT.
+
 ### Batched decoding
 The Code2Wav stage supports batched decoding through the SpeechTokenizer. Pass multiple prompts via `--txt-prompts` and set `--batch-size` accordingly. To raise `max_num_seqs` on either stage, point `--stage-configs-path` at a stage configs YAML with the desired values (see `vllm_omni/model_executor/stage_configs/` for templates):
 ```bash
