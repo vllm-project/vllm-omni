@@ -24,6 +24,7 @@ list of supported architectures across all modalities, see
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
+| StepAudioEditX | `stepfun-ai/Step-Audio-EditX` | 2 (AR + DiT) | ✓ | ✓ | clone / emotion / style / paralinguistic | 24 kHz |
 
 ## Common Quick Start
 
@@ -476,3 +477,83 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 - `--num-prompts N` replicates the prompt for performance measurement.
 - `--concurrency M` requires `--streaming` and must evenly divide `--num-prompts`.
 - Run `--help` for the full argument surface.
+
+
+## StepAudioEditX
+Zero-shot TTS cloning for Mandarin, English, Sichuanese, and Cantonese, also support three edit modes: emotion, speaking style, and paralinguistic.
+
+Emotion editing: angry, happy, sad, excited, fearful, surprised, disgusted, etc.
+
+Speaking style editing: act_coy, older, child, whisper, serious, generous, exaggerated, etc.
+
+Paralinguistic editing supports tags such as breathing, laughter, surprise-oh, confirmation-en, uhm,
+surprise-ah, surprise-wa, sigh, question-ei, and dissatisfaction-hnn.
+
+### Prerequisites
+The isolated Step-Audio-Tokenizer checkpoint is required for reference audio encoding.
+
+```bash
+hf download stepfun-ai/Step-Audio-EditX
+hf download stepfun-ai/Step-Audio-Tokenizer
+```
+
+### Quick Start
+`--ref-audio` and `--ref-text` are required.
+`--text` is required for `clone` and `paralinguistic`; other edit modes use `--ref-text`.
+Replace the Hugging Face repo IDs with local checkpoint paths when running offline.
+
+### Voice Clone
+Read the target text using the reference voice.
+
+```bash
+python3 examples/offline_inference/text_to_speech/step_audio_editx/end2end.py \
+    --model stepfun-ai/Step-Audio-EditX \
+    --audio-tokenizer stepfun-ai/Step-Audio-Tokenizer \
+    --ref-audio "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav" \
+    --ref-text "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you." \
+    --text "Please review the document before we begin." \
+    --output result/audio_clone.wav
+```
+
+### Emotion Editing
+Read the reference transcript with the requested emotion.
+
+```bash
+python3 examples/offline_inference/text_to_speech/step_audio_editx/end2end.py \
+    --model stepfun-ai/Step-Audio-EditX \
+    --audio-tokenizer stepfun-ai/Step-Audio-Tokenizer \
+    --ref-audio /path/to/ref_audio.wav \
+    --ref-text "This is the reference transcript." \
+    --edit-type emotion \
+    --edit-info angry \
+    --output result/audio_emotion_angry.wav
+```
+
+### Style Editing
+Read the reference transcript with the requested speaking style.
+
+```bash
+python3 examples/offline_inference/text_to_speech/step_audio_editx/end2end.py \
+    --model stepfun-ai/Step-Audio-EditX \
+    --audio-tokenizer stepfun-ai/Step-Audio-Tokenizer \
+    --ref-audio /path/to/ref_audio.wav \
+    --ref-text "This is the reference transcript." \
+    --edit-type style \
+    --edit-info sweet \
+    --output result/audio_style_sweet.wav
+```
+
+### Paralinguistic Editing
+Read the target text with the requested paralinguistic tag.
+
+```bash
+python3 examples/offline_inference/text_to_speech/step_audio_editx/end2end.py \
+    --model stepfun-ai/Step-Audio-EditX \
+    --audio-tokenizer stepfun-ai/Step-Audio-Tokenizer \
+    --ref-audio /path/to/ref_audio.wav \
+    --ref-text "This is the reference transcript." \
+    --text "[laughter] What are you talking about?" \
+    --edit-type paralinguistic \
+    --edit-info laughter \
+    --output result/audio_paralinguistic_laughter.wav
+```

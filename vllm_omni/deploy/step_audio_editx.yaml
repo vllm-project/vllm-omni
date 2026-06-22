@@ -1,0 +1,43 @@
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    enforce_eager: false
+    stage_type: llm
+    enable_chunked_prefill: false
+    enable_prefix_caching:  false
+    max_model_len: 8192
+    runtime:
+      devices: "0"
+    engine_args:
+      worker_type: ar
+      model_stage: step_audio_editx_ar
+      max_num_seqs: 8
+      model_arch: StepAudioAR
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      engine_output_type: latent
+    default_sampling_params:
+      temperature: 0.7
+      max_tokens: 2048
+    gpu_memory_utilization: 0.4
+
+
+  - stage_id: 1
+    stage_type: llm
+    enforce_eager: true
+    runtime:
+      devices: "0"
+    engine_args:
+      worker_type: generation
+      model_stage: step_audio_editx_code2wav
+      model_arch: StepAudioCode2wav
+      max_num_seqs: 8
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      engine_output_type: audio
+      dtype: float16
+    enable_prefix_caching:  false
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: audio
+    gpu_memory_utilization: 0.4

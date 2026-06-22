@@ -85,6 +85,7 @@ _HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
 _HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _STEP_AUDIO2_TTS_MODEL_STAGES = {"step_audio2_thinker"}
+_STEP_AUDIO_EDITX_MODEL_STAGES = {"step_audio_editx_ar"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -100,6 +101,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _MOSS_TTS_FULL_MODEL_STAGES
     | _GLM_TTS_MODEL_STAGES
     | _STEP_AUDIO2_TTS_MODEL_STAGES
+    | _STEP_AUDIO_EDITX_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "fish_tts",
@@ -693,6 +695,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "glm_tts"
         if model_stage in _STEP_AUDIO2_TTS_MODEL_STAGES:
             return "step_audio2"
+        if model_stage in _STEP_AUDIO_EDITX_MODEL_STAGES:
+            return "step_audio_editx"
         return None
 
     def _get_custom_voice_dir(self) -> str | None:
@@ -1415,6 +1419,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_moss_tts_request(request)
         if self._tts_model_type == "glm_tts":
             return self._validate_glm_tts_request(request)
+        if self._tts_model_type == "step_audio_editx":
+            return self._validate_step_audio_editx_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _validate_voxcpm2_request(self, request: OpenAICreateSpeechRequest) -> str | None:
@@ -2318,6 +2324,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
+    def _validate_step_audio_editx_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        if request.ref_audio is None:
+            return "step_audio_editx requests require 'ref_audio'"
+        if request.ref_text is None:
+            return "step_audio_editx requests require 'ref_text'"
+        extra_params = dict(request.extra_params or {})
+        edit_type = extra_params.get("edit_type", "clone")
+        if edit_type in {"clone", "paralinguistic"} and (not request.input or not request.input.strip()):
+            return f"step_audio_editx {edit_type} requests require non-empty input text"
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+        return None
+
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
         """Resolve ref_audio to (wav_samples, sample_rate).
 
@@ -2979,6 +3001,37 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         return {"prompt": raw_prompt}
 
+    # ---- StepAudioEditX helpers ----
+
+    def _build_step_audio_editx_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> dict[str, Any]:
+        from vllm_omni.inputs.data import token_inputs_omni
+        from vllm_omni.model_executor.models.step_audio_editx.step_audio_tokenizer import (
+            estimate_step_audio_editx_prompt_len,
+        )
+
+        extra_params = dict(request.extra_params or {})
+        edit_type = extra_params.pop("edit_type", "clone")
+        edit_info = extra_params.pop("edit_info", None)
+
+        additional_information = {
+            "text": [request.input or ""],
+            "ref_text": [request.ref_text],
+            "ref_audio": [request.ref_audio],
+            "edit_type": edit_type,
+            "edit_info": edit_info,
+        }
+        prompt_len = estimate_step_audio_editx_prompt_len(
+            additional_information,
+            self.engine_client.model_config.model,
+        )
+        return token_inputs_omni(
+            prompt_token_ids=[0] * prompt_len,
+            additional_information=additional_information,
+        )
+
     # ---- Fish Speech helpers ----
 
     def _build_fish_speech_prompt(
@@ -3405,7 +3458,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = {}
             prompt = {"prompt": request.input}
 
-        if self._tts_model_type == "step_audio2":
+        if self._tts_model_type == "step_audio_editx":
+            model_type = "step_audio_editx"
+        elif self._tts_model_type == "step_audio2":
             model_type = "step_audio2"
         elif self._is_fish_speech:
             model_type = "fish_speech"

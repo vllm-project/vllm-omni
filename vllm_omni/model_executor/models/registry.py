@@ -348,6 +348,8 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
+    "StepAudioAR": ("step_audio_editx", "step_audio_ar", "StepAudioAR"),
+    "StepAudioCode2wav": ("step_audio_editx", "step_audio_decoder", "StepAudioCode2wav"),
 }
 
 

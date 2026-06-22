@@ -64,6 +64,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             "Qwen3TTSCode2Wav",
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
+            "StepAudioAR",
+            "StepAudioCode2wav",
         }
         if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(

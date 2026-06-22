@@ -23,6 +23,7 @@ For the full list of supported architectures across all modalities, see
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
+| StepAudioEditX | `stepfun-ai/Step-Audio-EditX` | ✓ | ✓ | clone / emotion / style / paralinguistic | — |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
 
@@ -626,3 +627,92 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
 - Voice presets are listed on the HF model card (`mistralai/Voxtral-4B-TTS-2603`).
 - Voice cloning is gated upstream and may require a recent `mistral_common`.
 - A standalone CLI client is not yet shipped; the gradio demo is the canonical reference for now.
+
+
+---
+
+## StepAudioEditX
+
+StepAudioEditX is a two-stage TTS and audio editing model (`AR + DiT`) with voice cloning,
+emotion editing, style editing, and paralinguistic control.
+
+### Prerequisites
+The isolated Step-Audio-Tokenizer checkpoint is required for reference audio encoding.
+
+```bash
+hf download stepfun-ai/Step-Audio-EditX
+hf download stepfun-ai/Step-Audio-Tokenizer
+```
+
+### Launch
+Replace the Hugging Face repo IDs with local checkpoint paths when running offline.
+
+```bash
+export STEP_AUDIO_TOKENIZER_PATH=stepfun-ai/Step-Audio-Tokenizer
+
+vllm-omni serve stepfun-ai/Step-Audio-EditX \
+    --deploy-config vllm_omni/deploy/step_audio_editx.yaml \
+    --host 0.0.0.0 \
+    --port 8091 \
+    --trust-remote-code \
+    --omni
+```
+
+### Voice Clone
+Read the target text using the reference voice.
+
+```bash
+python examples/online_serving/text_to_speech/step_audio_editx/speech_client.py \
+    --model stepfun-ai/Step-Audio-EditX \
+    --ref-audio /path/to/ref_audio.wav \
+    --ref-text "This is the reference transcript." \
+    --text "Please review the document before we begin." \
+    --output result/audio_clone.wav
+```
+
+### Emotion Editing
+Read the reference transcript with the requested emotion.
+
+```bash
+python examples/online_serving/text_to_speech/step_audio_editx/speech_client.py \
+    --model stepfun-ai/Step-Audio-EditX \
+    --ref-audio /path/to/ref_audio.wav \
+    --ref-text "This is the reference transcript." \
+    --edit-type emotion \
+    --edit-info angry \
+    --output result/audio_emotion_angry.wav
+```
+
+### Style Editing
+Read the reference transcript with the requested speaking style.
+
+```bash
+python examples/online_serving/text_to_speech/step_audio_editx/speech_client.py \
+    --model stepfun-ai/Step-Audio-EditX \
+    --ref-audio /path/to/ref_audio.wav \
+    --ref-text "This is the reference transcript." \
+    --edit-type style \
+    --edit-info whisper \
+    --output result/audio_style_whisper.wav
+```
+
+### Paralinguistic Editing
+Read the target text with the requested paralinguistic tag.
+
+```bash
+python examples/online_serving/text_to_speech/step_audio_editx/speech_client.py \
+    --model stepfun-ai/Step-Audio-EditX \
+    --ref-audio /path/to/ref_audio.wav \
+    --ref-text "This is the reference transcript." \
+    --text "[laughter] What are you talking about?" \
+    --edit-type paralinguistic \
+    --edit-info laughter \
+    --output result/audio_paralinguistic_laughter.wav
+```
+
+### Notes
+- `--ref-audio` and `--ref-text` are required.
+- `--text` is required for `clone` and `paralinguistic`; other edit modes use `--ref-text`.
+- Default output is 24 kHz mono WAV. Use `--response-format pcm` for raw PCM output.
+- Streaming requests are supported through the Speech API with `stream=true`; for low-latency
+  chunked decoding, use a StepAudioEditX deploy config with `async_chunk: true`.

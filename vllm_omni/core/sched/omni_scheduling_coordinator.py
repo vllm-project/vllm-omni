@@ -56,6 +56,9 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
         # custom_process_next_stage_input_func: *_full_payload in deploy yaml.
         ("DyninOmniForConditionalGeneration", "token2image"),
         ("DyninOmniForConditionalGeneration", "token2audio"),
+        # step_audio: step_audio_editx (Stage 0) -> step_audio_editx_code2wav (Stage 1).
+        # Producer wires via custom_process_next_stage_input_func: *_full_payload in deploy yaml.
+        ("StepAudioCode2wav", "step_audio_editx_code2wav"),
     }
 )
 
