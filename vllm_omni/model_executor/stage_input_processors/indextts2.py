@@ -13,11 +13,15 @@ STOP_MEL_TOKEN = 8193
 
 
 def _cpu_view(tensor: torch.Tensor) -> torch.Tensor:
-    """Return a contiguous CPU tensor suitable for connector serialization."""
+    """Return a contiguous CPU tensor suitable for connector serialization.
+
+    Always returns an owning copy so downstream consumers cannot mutate the
+    source tensors that may still be referenced by the producer stage.
+    """
     out = tensor.detach()
     if out.device.type != "cpu":
-        out = out.cpu()
-    return out if out.is_contiguous() else out.contiguous()
+        return out.cpu().contiguous()
+    return out.clone().contiguous()
 
 
 def _strip_stop_token(
