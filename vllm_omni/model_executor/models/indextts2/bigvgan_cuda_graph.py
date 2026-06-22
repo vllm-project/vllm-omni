@@ -37,7 +37,7 @@ logger = init_logger(__name__)
 # Keep buckets modest so that CUDA-graph private pools do not exhaust
 # GPU memory when stage0 and stage1 share the same device (~22 GiB).
 # Inputs longer than the largest bucket fall back to eager BigVGAN.
-DEFAULT_CAPTURE_SIZES = [128, 256, 384, 512, 640]
+DEFAULT_CAPTURE_SIZES = [128, 256, 384, 512]
 
 
 class CUDAGraphBigVGANWrapper:
