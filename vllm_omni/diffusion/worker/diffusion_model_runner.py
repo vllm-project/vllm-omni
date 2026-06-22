@@ -101,8 +101,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def load_model(
         self,
         memory_pool_context_fn: callable | None = None,
-        load_format: str | None = None,
-        custom_pipeline_name: str | type | None = None,
+        load_format: str = "default",
+        custom_pipeline_name: str | None = None,
     ) -> None:
         """
         Load the diffusion model, apply compilation and offloading.
@@ -138,7 +138,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         with get_memory_context():
             with DeviceMemoryProfiler() as m:
                 self.pipeline = model_loader.load_model(
-                    od_config=self.od_config,
                     load_device=load_device,
                     load_format=load_format,
                     custom_pipeline_name=custom_pipeline_name,
@@ -169,8 +168,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
             if current_omni_platform.supports_torch_inductor():
-                self._compile_transformer("transformer")
-                self._compile_transformer("transformer_2")
+                if hasattr(self.pipeline, "setup_compile"):
+                    try:
+                        self.pipeline.setup_compile()
+                    except Exception as exc:
+                        logger.warning(
+                            "Model runner: setup_compile() failed (%s); running without compile.",
+                            exc,
+                        )
+                else:
+                    self._compile_transformer("transformer")
+                    self._compile_transformer("transformer_2")
             else:
                 logger.warning(
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
@@ -307,8 +315,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 # num_inference_steps at all (i.e., just resets state and clears
                 # stale residuals).
                 num_inference_steps = req.sampling_params.num_inference_steps
-                if self.od_config.cache_backend == "tea_cache" and num_inference_steps is None:
-                    num_inference_steps = 0
+                if num_inference_steps is None and self.od_config.cache_backend in (
+                    "tea_cache",
+                    "step_cache",
+                ):
+                    # TeaCache refresh ignores the value; step_cache refresh is a
+                    # no-op (per-chunk state resets in the denoise loop). DreamZero often
+                    # leaves sampling_params.num_inference_steps unset and uses the
+                    # pipeline default instead.
+                    num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
 
                 if num_inference_steps is not None:
                     self.cache_backend.refresh(self.pipeline, num_inference_steps)
@@ -374,6 +389,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     request_id=request_id,
                     sampling=copy.deepcopy(req.sampling_params),
                     prompts=req.prompts,
+                )
+                state_req = copy.copy(req)
+                state_req.sampling_params = new_state.sampling
+                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                    state_req,
+                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                    target_device=getattr(self.pipeline, "device", None),
                 )
                 self.state_cache[request_id] = new_state
                 resolved.append(new_state)
@@ -453,8 +475,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if not self.supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
         # Stepwise mode only supports the basic state-driven denoise path for now.
-        # Request-mode extras such as cache backends, KV transfer, editing inputs,
-        # and similar features are not supported here yet.
+        # Request-mode extras such as cache backends, editing inputs, and
+        # similar features are not supported here yet.
         if self.od_config.cache_backend not in (None, "none"):
             raise ValueError("Step mode does not support cache_backend yet.")
 

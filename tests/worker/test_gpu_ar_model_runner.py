@@ -44,6 +44,14 @@ def test_resolve_pooler_payload_req_ids_downstream_stage_uses_filtered_requests(
     assert payload_req_ids == ["r2"]
 
 
+def test_sparse_mm_req_ids_requires_sparse_audio_marker():
+    assert GPUARModelRunner._sparse_mm_req_ids({"meta": {"req_id": ["r1"]}}) is None
+    assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"]}) is None
+
+    assert GPUARModelRunner._sparse_mm_req_ids({"meta": {"req_id": ["r1"], "sparse_audio": ["1"]}}) == ["r1"]
+    assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"], "meta.sparse_audio": ["1"]}) == ["r1"]
+
+
 @pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])
 def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monkeypatch, query_start_loc_attr):
     runner = object.__new__(GPUARModelRunner)
@@ -84,6 +92,9 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     runner.supports_mm_inputs = False
     runner.use_async_scheduling = False
     runner._omni_num_scheduled_tokens_np = None
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type="audio"),
+    )
 
     monkeypatch.setattr(
         GPUARModelRunner, "_sample", lambda self, logits, spec_decode_metadata: SimpleNamespace(sampled_token_ids=[])
@@ -117,8 +128,8 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
 
     output = GPUARModelRunner.sample_tokens(runner, grammar_output=None)
 
-    assert torch.equal(output.pooler_output[0]["hidden"], torch.tensor([[1.0, 10.0]]))
+    assert torch.equal(output.multimodal_outputs[0]["hidden"], torch.tensor([[1.0, 10.0]]))
     assert torch.equal(
-        output.pooler_output[1]["hidden"],
+        output.multimodal_outputs[1]["hidden"],
         torch.tensor([[2.0, 20.0], [3.0, 30.0]]),
     )

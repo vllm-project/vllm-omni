@@ -762,6 +762,10 @@ class OmniResponse:
     prompt_tokens: int | None = None
     cached_tokens: int | None = None
     logprobs: list | None = None
+    #: HTTP status + error text for the error-handling path (e.g. validator
+    #: rejections); populated when the OpenAI client raises an APIError.
+    status_code: int | None = None
+    error_message: str | None = None
 
 
 @dataclass
@@ -888,6 +892,12 @@ class OpenAIClientHandler:
                         audio_data.append(content)
                     elif modality == "text" and content:
                         text_content += content
+                # Usage is yielded after the last token
+                if chunk.usage:
+                    result.prompt_tokens = chunk.usage.prompt_tokens
+                    if details := getattr(chunk.usage, "prompt_tokens_details", None):
+                        result.cached_tokens = details.cached_tokens
+
             audio_content = None
             if audio_data:
                 merged_seg = _merge_base64_audio_to_segment(audio_data)
@@ -1467,6 +1477,8 @@ class OpenAIClientHandler:
 
         - ``send_frames``: optional ``str`` or sequence of ``str`` raw WebSocket text frames (omit when the server
           speaks first, e.g. ``/v1/realtime`` rejection path).
+        - ``ws_skip_types``: optional event ``type`` strings to ignore while waiting for the first matching frame
+          (e.g. ``["session.created"]`` on ``/v1/realtime``).
         - ``timeout``: seconds to wait for the first inbound text frame (default ``120``).
         - ``ws_max_size``: passed through as ``max_size`` to :func:`websockets.connect` when the key is present.
         """
@@ -1480,6 +1492,7 @@ class OpenAIClientHandler:
 
         timeout = float(cfg.get("timeout", 120.0))
         uri = self._build_ws_url(path)
+        skip_types = set(cfg.get("ws_skip_types") or [])
 
         connect_kw: dict[str, Any] = {}
         if "ws_max_size" in cfg:
@@ -1491,16 +1504,19 @@ class OpenAIClientHandler:
             async with websockets.connect(uri, **connect_kw) as ws:
                 for frame in frames:
                     await ws.send(frame)
-                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                if not isinstance(raw, str):
-                    raise AssertionError(f"Expected JSON text frame from {uri}, got {type(raw).__name__}")
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise AssertionError(f"Expected JSON text frame from {uri}, body={raw[:500]!r}") from exc
-                if not isinstance(data, dict):
-                    raise AssertionError(f"Expected JSON object from {uri}, got {type(data).__name__}")
-                return WebSocketJsonResponse(json_body=data)
+                while True:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                    if not isinstance(raw, str):
+                        raise AssertionError(f"Expected JSON text frame from {uri}, got {type(raw).__name__}")
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        raise AssertionError(f"Expected JSON text frame from {uri}, body={raw[:500]!r}") from exc
+                    if not isinstance(data, dict):
+                        raise AssertionError(f"Expected JSON object from {uri}, got {type(data).__name__}")
+                    if skip_types and data.get("type") in skip_types:
+                        continue
+                    return WebSocketJsonResponse(json_body=data)
 
         resp = asyncio.run(_recv_first_json_object())
         _run_ws_expectations_from_request_config(cfg, resp)
@@ -1582,6 +1598,8 @@ class OpenAIClientHandler:
             create_kwargs["logprobs"] = request_config["logprobs"]
         if "top_logprobs" in request_config:
             create_kwargs["top_logprobs"] = request_config["top_logprobs"]
+        if "stream_options" in request_config:
+            create_kwargs["stream_options"] = request_config["stream_options"]
         if extra_body:
             create_kwargs["extra_body"] = extra_body
 
@@ -1759,7 +1777,16 @@ class OpenAIClientHandler:
         # Qwen3-TTS custom fields, forwarded via extra_body.
         extra_body: dict[str, Any] = {}
         # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
-        for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens", "seed"):
+        for key in (
+            "task_type",
+            "ref_text",
+            "ref_audio",
+            "language",
+            "max_new_tokens",
+            "seed",
+            "instructions",
+            "speed",
+        ):
             if key in request_config:
                 extra_body[key] = request_config[key]
 

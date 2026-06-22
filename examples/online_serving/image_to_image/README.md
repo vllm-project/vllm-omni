@@ -1,6 +1,8 @@
 # Image-To-Image
 
-This example demonstrates how to deploy Qwen-Image-Edit model for online image editing service using vLLM-Omni.
+This example demonstrates how to deploy image-to-image models for online image editing service using vLLM-Omni.
+
+Supported models include Qwen-Image-Edit, BAGEL, and other image-to-image pipelines.
 
 For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPlusPipeline) and send multiple images in the user message content.
 
@@ -19,6 +21,12 @@ vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
 
 ```bash
 vllm serve Qwen/Qwen-Image-Edit-2509 --omni --port 8092
+```
+
+### BAGEL
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091
 ```
 
 ### Start with Parameters
@@ -117,6 +125,16 @@ python openai_chat_client.py --input input.png --prompt "Convert to oil painting
 
 # Multi-image editing (Qwen-Image-Edit-2509 server required)
 python openai_chat_client.py --input input1.png input2.png --prompt "Combine these images into a single scene" --output output.png
+```
+
+Pass model-specific parameters through `--extra-body` (e.g. for BAGEL):
+
+```bash
+python openai_chat_client.py \
+  --input input.png \
+  --prompt "Make the scene look like a watercolor painting" \
+  --server http://localhost:8091 \
+  --extra-body '{"cfg_text_scale": 4.0, "cfg_img_scale": 1.5}'
 ```
 
 ### Method 4: Using Gradio Demo
@@ -317,6 +335,9 @@ count, use `size` and `n` rather than `height`, `width`, or
 | `strength`               | float | 0.6     | **Z-Image only** - Denoising start timestep for I2I. Range: [0.0, 1.0]. Lower preserves more of original image. |
 | `layers`                 | int   | 4       | Number of layers (Qwen-Image-Layered) |
 | `resolution`             | int   | 640     | Resolution, 640 or 1024 (Qwen-Image-Layered) |
+
+Models like BAGEL accept additional parameters via `extra_body` (e.g.
+`cfg_text_scale`, `cfg_img_scale`). See the [BAGEL recipe](../../../recipes/Bagel/BAGEL-7B-MoT.md) for the full list.
 
 ## Response Format
 

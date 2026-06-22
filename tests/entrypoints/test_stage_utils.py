@@ -4,7 +4,7 @@ import sys
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.entrypoints.stage_utils import _map_device_list, set_stage_devices
+from vllm_omni.entrypoints.stage_utils import _map_device_list, resolve_stage_physical_devices, set_stage_devices
 
 
 def _make_dummy_torch(call_log):
@@ -137,22 +137,6 @@ def test_set_stage_devices_npu_platform(mocker: MockerFixture, monkeypatch: pyte
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_map_device_list_idempotency():
-    """Device IDs already in the visible set are returned as-is (idempotency)."""
-    result = _map_device_list(0, ["0", "1"], ["0", "1", "2", "3"])
-    assert result == ["0", "1"]
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_map_device_list_idempotency_single():
-    """Single device ID in visible set passes through."""
-    result = _map_device_list(1, ["1"], ["0", "1"])
-    assert result == ["1"]
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_map_device_list_index_mapping():
     """Device IDs < num_visible not in set are treated as indices."""
     result = _map_device_list(0, ["0", "1"], ["6", "7", "8", "9"])
@@ -209,6 +193,25 @@ def test_map_device_list_partial_mapping():
     """When only a subset can map, returns the mapped subset (no error)."""
     result = _map_device_list(0, ["0", "1", "2"], ["5", "6"])
     assert result == ["5", "6"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_multi_replica_offset_cvd():
+    """Logical indices from split_devices_for_replicas must map through an offset
+    CUDA_VISIBLE_DEVICES, not be treated as physical IDs.
+    """
+    visible = ["2", "3", "4", "5"]
+    assert _map_device_list(1, ["1"], visible) == ["3"]
+    assert _map_device_list(1, ["2"], visible) == ["4"]
+    assert _map_device_list(1, ["2", "3"], visible) == ["4", "5"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_resolve_stage_physical_devices_uses_visible_baseline(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    assert resolve_stage_physical_devices(1, "1", visible_baseline="3,4,5") == "4"
 
 
 @pytest.mark.core_model

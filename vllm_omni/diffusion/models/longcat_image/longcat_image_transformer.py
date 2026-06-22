@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps, apply_rotary_emb, get_1d_rotary_pos_embed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
@@ -18,6 +19,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -580,6 +582,14 @@ class LongCatImageTransformer2DModel(nn.Module):
 
     Supports Sequence Parallelism (Ulysses and Ring) when configured via OmniDiffusionConfig.
     """
+
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_1,
+            "single_transformer_blocks": ForwardPattern.Pattern_1,
+        },
+        has_separate_cfg=True,
+    )
 
     _repeated_blocks = ["LongCatImageTransformerBlock", "LongCatImageSingleTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
