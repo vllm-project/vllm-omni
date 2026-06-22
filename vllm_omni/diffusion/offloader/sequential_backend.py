@@ -204,12 +204,6 @@ class ModelLevelOffloadBackend(OffloadBackend):
             return
 
         modules = ModuleDiscovery.discover(pipeline)
-        if not modules.dits:
-            logger.warning("No DiT/transformer modules found, skipping model-level offloading")
-            return
-        if not modules.encoders:
-            logger.warning("No encoder modules found, skipping model-level offloading")
-            return
 
         # Move encoders to GPU
         for enc in modules.encoders:
@@ -228,6 +222,17 @@ class ModelLevelOffloadBackend(OffloadBackend):
                 res.to(self.device)
             except Exception as exc:
                 logger.warning("Failed to move resident module '%s' to GPU: %s", name, exc)
+
+        if not modules.dits:
+            logger.warning("No DiT/transformer modules found, skipping model-level offloading")
+            return
+
+        if not modules.encoders:
+            # Nothing to swap against — move DiTs to GPU and skip hooks.
+            for dit in modules.dits:
+                dit.to(self.device)
+            logger.warning("No encoder modules found, skipping model-level offloading")
+            return
 
         # Apply sequential offloading hooks
         apply_sequential_offload(

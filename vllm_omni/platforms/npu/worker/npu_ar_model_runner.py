@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from copy import copy, deepcopy
 from typing import Any, NamedTuple
 
@@ -45,6 +46,39 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+
+
+def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
+    """Convert a flattened payload to strictly ``dict[str, torch.Tensor]``.
+
+    Non-tensor scalars (int, float, bool) are wrapped with ``torch.tensor()``.
+    Values that cannot be safely converted are dropped with a warning.
+    This enforces the tensor-only invariant required by the
+    ``OmniEngineCoreOutput.multimodal_output`` wire field and msgspec
+    serialization. Mirrors ``gpu_ar_model_runner._ensure_tensor_values``.
+    """
+    result: dict[str, torch.Tensor] = {}
+    for key, val in payload.items():
+        if isinstance(val, torch.Tensor):
+            result[key] = val
+        elif isinstance(val, (int, float, bool)):
+            result[key] = torch.tensor(val)
+        elif isinstance(val, (list, tuple)):
+            try:
+                result[key] = torch.tensor(val)
+            except (ValueError, TypeError, RuntimeError):
+                logger.warning(
+                    "Dropping non-tensorizable multimodal output key '%s' (type=%s) from wire payload.",
+                    key,
+                    type(val).__name__,
+                )
+        else:
+            logger.warning(
+                "Dropping non-tensor multimodal output key '%s' (type=%s) from wire payload.",
+                key,
+                type(val).__name__,
+            )
+    return result
 
 
 class ExecuteModelState(NamedTuple):
@@ -163,7 +197,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
         num_tokens_padded: int,
     ):
         if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
-            if multimodal_outputs is not None and not isinstance(multimodal_outputs, dict):
+            if multimodal_outputs is not None and not isinstance(multimodal_outputs, Mapping):
                 logger.warning_once(
                     "prefix caching expects mm outputs to be a dict, but got %s",
                     type(multimodal_outputs),
@@ -214,6 +248,18 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 raise RuntimeError("Request IDs in the batch are missing from the merged states!")
             return combined_hidden_states[rid]
         return hidden_states_cpu[start:end]
+
+
+    def _build_multimodal_outputs(
+        self,
+        per_req_payloads: list[dict[str, object]] | None,
+    ) -> list[dict[str, torch.Tensor]] | None:
+        if self.vllm_config.model_config.engine_output_type == "text":
+            return None
+        if per_req_payloads is None:
+            return None
+        return [_ensure_tensor_values(payload) if payload else {} for payload in per_req_payloads]
+
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
@@ -639,7 +685,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             if multimodal_outputs is not None:
                 keys_or_type = (
                     list(multimodal_outputs.keys())
-                    if isinstance(multimodal_outputs, dict)
+                    if isinstance(multimodal_outputs, Mapping)
                     else type(multimodal_outputs)
                 )
                 logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
@@ -1086,13 +1132,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))
 
+        multimodal_outputs = self._build_multimodal_outputs(pooler_output)
         model_runner_output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=valid_sampled_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
-            pooler_output=(pooler_output if engine_output_type != "text" and needs_pooler_payload else None),
+            pooler_output=None,
+            multimodal_outputs=multimodal_outputs,
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,

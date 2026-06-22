@@ -3,7 +3,6 @@
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailingmm.py
 from __future__ import annotations
 
-import warnings
 from collections.abc import Iterable
 from typing import Any
 
@@ -346,10 +345,10 @@ class MingLLMModel(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params = AutoWeightsLoader(self).load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        _warn_missing_prefix("flowloss", params_dict, loaded_params, prefix="flowloss.", fatal=True)
-        _warn_missing_prefix("linear_proj_audio", params_dict, loaded_params, prefix="linear_proj_audio.", fatal=True)
-        _warn_missing_prefix("stop_head", params_dict, loaded_params, prefix="stop_head.", fatal=True)
-        _warn_missing_prefix("spk_head", params_dict, loaded_params, prefix="spk_head.", fatal=True)
+        _warn_missing_prefix("flowloss", params_dict, loaded_params, prefix="flowloss.")
+        _warn_missing_prefix("linear_proj_audio", params_dict, loaded_params, prefix="linear_proj_audio.")
+        _warn_missing_prefix("stop_head", params_dict, loaded_params, prefix="stop_head.")
+        _warn_missing_prefix("spk_head", params_dict, loaded_params, prefix="spk_head.")
         return loaded_params
 
 
@@ -383,7 +382,6 @@ def _warn_missing_prefix(
     params_dict: dict[str, nn.Parameter],
     loaded_params: set[str],
     prefix: str,
-    fatal: bool = False,
 ) -> None:
     missing = {key for key in params_dict if key.startswith(prefix)} - loaded_params
     if not missing:
@@ -392,9 +390,7 @@ def _warn_missing_prefix(
         f"MingLLMModel: {len(missing)} {module_name} params not loaded "
         f"(prefix={prefix}). First few: {sorted(missing)[:5]}"
     )
-    if fatal:
-        raise RuntimeError(msg)
-    warnings.warn(msg, stacklevel=3)
+    raise RuntimeError(msg)
 
 
 __all__ = [

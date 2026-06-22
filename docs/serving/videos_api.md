@@ -160,7 +160,12 @@ JSON references currently support `image_url`/`video_url`; `file_id` references
 are not implemented yet. Models may expose additional V2V controls through
 `extra_params`. For example, Cosmos3 supports
 `condition_frame_indexes_vision` and `condition_video_keep` to select which
-decoded reference frames are used as clean conditioning.
+decoded reference frames are used as clean conditioning. Cosmos3 transfer mode
+also accepts `edge`, `blur`, `depth`, `seg`, or `wsm` control hints plus
+transfer options such as `control_path`, `control_guidance`,
+`control_guidance_interval`, `num_video_frames_per_chunk`,
+`num_conditional_frames`, `show_control_condition`, and `show_input`; see the
+Cosmos3 recipe for complete examples.
 
 ### Speech-to-Video
 
@@ -195,12 +200,15 @@ curl -X POST http://localhost:8091/v1/videos/sync \
 
 ## Storage
 
-Set `VLLM_OMNI_STORAGE_PATH` to control where asynchronous video outputs are
+Set `VLLM_OMNI_SERVER_STORAGE__PATH` to control where asynchronous video outputs are
 stored:
 
 ```bash
-export VLLM_OMNI_STORAGE_PATH=/var/tmp/vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
 ```
+
+> `VLLM_OMNI_STORAGE_PATH` is deprecated and will be removed in a future release;
+> use `VLLM_OMNI_SERVER_STORAGE__PATH` instead.
 
 ## Model-Specific Examples
 

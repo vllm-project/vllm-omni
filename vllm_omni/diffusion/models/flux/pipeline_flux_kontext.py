@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable, Iterable
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -30,7 +30,7 @@ from vllm_omni.diffusion.models.flux import (
     FluxKontextTransformer2DModel,
 )
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -70,9 +70,18 @@ def get_flux_kontext_post_process_func(od_config: OmniDiffusionConfig) -> Callab
 
 
 class FluxKontextPipeline(
-    nn.Module, FluxPipelineMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    FluxPipelineMixin,
+    SupportImageInput,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
     """FLUX.1-Kontext pipeline for image editing with text guidance."""
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     support_image_input = True
 

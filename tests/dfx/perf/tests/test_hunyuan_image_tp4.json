@@ -23,10 +23,11 @@
                 "max-concurrency": 1,
                 "skip-performance-assertion": true,
                 "baseline": {
-                    "throughput_qps": 0.21,
-                    "latency_p99": 4.9235,
-                    "peak_memory_mb_max": 57576,
-                    "peak_memory_mb_mean": 57576
+                    "throughput_qps": 0.213,
+                    "latency_mean": 4.6953,
+                    "latency_p99": 4.8601,
+                    "peak_memory_mb_max": 56912.0,
+                    "peak_memory_mb_mean": 56912.0
                 }
             }
         ]

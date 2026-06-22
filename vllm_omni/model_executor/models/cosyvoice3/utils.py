@@ -13,8 +13,6 @@ from vllm_omni.utils.audio import mel_filter_bank
 
 logger = logging.getLogger(__name__)
 
-IGNORE_ID = -1
-
 
 def dynamic_range_compression_torch(x, c=1, clip_val=1e-5):
     return torch.log(torch.clamp(x, min=clip_val) * c)
@@ -180,26 +178,6 @@ def log_mel_spectrogram(
     log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
     log_spec = (log_spec + 4.0) / 4.0
     return log_spec
-
-
-def extract_speech_token(prompt_wav, speech_tokenizer_session, device):
-    speech = load_wav(prompt_wav, 16000)
-    assert speech.shape[1] / 16000 <= 30, "do not support extract speech token for audio longer than 30s"
-    feat = log_mel_spectrogram(speech, n_mels=128)
-    speech_token = (
-        speech_tokenizer_session.run(
-            None,
-            {
-                speech_tokenizer_session.get_inputs()[0].name: feat.detach().cpu().numpy(),
-                speech_tokenizer_session.get_inputs()[1].name: np.array([feat.shape[2]], dtype=np.int32),
-            },
-        )[0]
-        .flatten()
-        .tolist()
-    )
-    speech_token = torch.tensor([speech_token], dtype=torch.int32).to(device)
-    speech_token_len = torch.tensor([speech_token.shape[1]], dtype=torch.int32).to(device)
-    return speech_token, speech_token_len
 
 
 def extract_spk_embedding(prompt_wav, campplus_session, device):

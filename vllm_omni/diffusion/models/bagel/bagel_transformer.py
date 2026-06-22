@@ -7,12 +7,13 @@
 # Original file was released under Apache-2.0, with the full license text
 # available at https://github.com/huggingface/transformers/blob/main/LICENSE.
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 import torch.distributed as dist
+from cache_dit import ForwardPattern
 from torch import nn
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
@@ -20,11 +21,11 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 from transformers.utils import ModelOutput
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization.base_config import (
@@ -36,6 +37,7 @@ from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
+from vllm_omni.diffusion.cache.cache_dit_backend import BagelCachedAdapter, CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
@@ -45,8 +47,14 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sp_group,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.mot.mot_layernorm import MoTRMSNorm
+from vllm_omni.diffusion.layers.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
+from vllm_omni.diffusion.layers.mot.mot_row_parallel_linear import MoTRowParallelLinear
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.utils.kv_utils import left_pad_stack
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
+
+logger = init_logger(__name__)
 
 
 def patchify(imgs, p):
@@ -203,6 +211,13 @@ class BagelRotaryEmbedding(nn.Module):
 
 
 class BagelMLP(nn.Module):
+    """FFN with Mixture-of-Tokens routing via MoT parallel linear layers.
+
+    gate_proj + up_proj are fused into a single MoTMergedColumnParallelLinear.
+    down_proj uses MoTRowParallelLinear.  Both layers hold text weights on self
+    and vae weights on self.gen_exp, routing by text_indices / vae_indices.
+    """
+
     def __init__(
         self,
         hidden_size: int,
@@ -212,29 +227,35 @@ class BagelMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+
+        self.intermediate_size = intermediate_size
+
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size, intermediate_size],
+            input_size=hidden_size,
+            output_sizes=[intermediate_size, intermediate_size],
             bias=False,
+            gather_output=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            input_is_parallel=True,
+            input_size=intermediate_size,
+            output_size=hidden_size,
             bias=False,
+            input_is_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported.")
-        self.act_fn = nn.SiLU()
+        self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = self.act_fn(gate) * up
+        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -306,6 +327,10 @@ class NaiveCache:
     def __init__(self, num_layers):
         self.key_cache = {k: None for k in range(num_layers)}
         self.value_cache = {k: None for k in range(num_layers)}
+        # Track kv_lens; we need this because we pack the forward passes
+        # for CFG into a single forward call and the kv length may be different,
+        # e.g., due to 0 kvs for text_cfg path and nonzero for others
+        self.key_values_lens: list[int] | None = None
 
     @property
     def num_layers(self):
@@ -318,6 +343,76 @@ class NaiveCache:
         else:
             return 0
 
+    @classmethod
+    def from_object(cls, obj) -> "NaiveCache":
+        """Convert a duck-typed cache (e.g., SimpleNamespace from KV transfer)
+        to NaiveCache; in the future, we should find a better way to handle this,
+        e.g., a model agnostic abstraction for key cache transfer instead of having
+        this cache live in bagel.
+
+        NOTE: If a NaiveCache is provided, the object is just returned. Otherwise,
+        we enumerate over the key/value cache values and map layer indices to the
+        corresponding tensors.
+        """
+        if isinstance(obj, cls):
+            return obj
+        cache = cls(len(obj.key_cache))
+        for i, (k, v) in enumerate(zip(obj.key_cache, obj.value_cache, strict=True)):
+            cache.key_cache[i] = k
+            cache.value_cache[i] = v
+        return cache
+
+    @staticmethod
+    def merge(caches: Sequence["NaiveCache"]) -> "NaiveCache":
+        """Merge per-branch NaiveCaches into one for batched attention;
+        this lets us do the forward passes for CFG in one batched pass,
+        although it's worth noting that this is currently only used
+        for single request. We need this so that gen mode knows the
+        respective kv lengths, and can split things back out as needed.
+        """
+        num_layers = caches[0].num_layers
+        merged = NaiveCache(num_layers)
+        lens = [c.seq_lens for c in caches]
+        merged.key_values_lens = lens
+
+        nonempty = [c for c in caches if c.key_cache[0] is not None]
+        if not nonempty:
+            return merged
+
+        for layer in range(num_layers):
+            merged.key_cache[layer] = torch.cat([c.key_cache[layer] for c in nonempty], dim=0)
+            merged.value_cache[layer] = torch.cat([c.value_cache[layer] for c in nonempty], dim=0)
+
+        return merged
+
+    @staticmethod
+    def split_with_zeros(
+        tensor: torch.Tensor,
+        lengths: Sequence[int],
+    ) -> list[torch.Tensor | None]:
+        """Split tensor by lengths, which may include 0 entries, e.g., for splitting cfg
+        branches out, since text_cfg may have 0 kv length.
+
+        0 lengths will be replaced with None in the returned list.
+        """
+        # Ensure that the lengths are all nonzero and sum to the first dim of our tensor
+        if not all(isinstance(ln, int) and ln >= 0 for ln in lengths):
+            raise ValueError("split lengths must be greater than or equal to zero")
+
+        expected = sum(ln for ln in lengths if ln > 0)
+        if tensor.shape[0] != expected:
+            raise ValueError(f"tensor dim 0 ({tensor.shape[0]}) != sum of nonzero lengths ({expected})")
+
+        result: list[torch.Tensor | None] = []
+        offset = 0
+        for ln in lengths:
+            if ln > 0:
+                result.append(tensor[offset : offset + ln])
+                offset += ln
+            else:
+                result.append(None)
+        return result
+
 
 @dataclass
 class BaseNavitOutputWithPast(ModelOutput):
@@ -328,12 +423,9 @@ class BaseNavitOutputWithPast(ModelOutput):
 class PackedAttentionMoT(nn.Module):
     """Packed attention with Mixture-of-Tokens routing for understanding/generation.
 
-    Uses vLLM's QKVParallelLinear and RowParallelLinear for tensor parallelism
-    support, following the same pattern as vLLM's Qwen2Attention.
-
-    The q/k/v projections are stacked into a single QKVParallelLinear:
-      - qkv_proj      : stacks q_proj + k_proj + v_proj  (understanding + gen text)
-      - qkv_proj_moe_gen : stacks q_proj_moe_gen + k_proj_moe_gen + v_proj_moe_gen (gen vae)
+    Uses MoTQKVParallelLinear and MoTRowParallelLinear for tensor parallelism.
+    Text and vae weights are held within the same MoT layer (text on self,
+    vae on self.gen_exp).  Token routing is driven by text_indices / vae_indices.
     """
 
     def __init__(
@@ -363,47 +455,26 @@ class PackedAttentionMoT(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
-        # Understanding mode projections (stacked q/k/v)
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = MoTQKVParallelLinear(
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=True,
+            vae_bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
+        self.o_proj = MoTRowParallelLinear(
+            input_size=self.total_num_heads * self.head_dim,
+            output_size=self.hidden_size,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
 
-        # Generation mode MoE projections (stacked q/k/v)
-        self.qkv_proj_moe_gen = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj_moe_gen",
-        )
-        self.o_proj_moe_gen = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj_moe_gen",
-        )
-
-        # QK normalization
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.q_norm_moe_gen = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm_moe_gen = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = MoTRMSNorm(self.head_dim, head_norm=True, eps=config.rms_norm_eps)
+        self.k_norm = MoTRMSNorm(self.head_dim, head_norm=True, eps=config.rms_norm_eps)
 
         self.rotary_op = RotaryEmbedding(is_neox_style=True)
 
@@ -431,6 +502,7 @@ class PackedAttentionMoT(nn.Module):
     def _forward_gen(
         self,
         packed_query_sequence: torch.Tensor,
+        query_lens: torch.Tensor,
         packed_query_position_embeddings: torch.Tensor,
         past_key_values: NaiveCache | None,
         packed_vae_token_indexes: torch.Tensor,
@@ -455,51 +527,43 @@ class PackedAttentionMoT(nn.Module):
         Currently we shouldn't need it in the model, and it would be ideal to handle
         packing/batching etc in a more model agnostic way.
         """
+        text_indices = packed_text_indexes
+        vae_indices = packed_vae_token_indexes
+
+        cache_k = cache_v = None
         packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
-        packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-        packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
 
-        # Project text tokens through base qkv
-        text_qkv, _ = self.qkv_proj(packed_text_query_sequence)
-        text_q, text_k, text_v = text_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        # Project vae tokens through moe_gen qkv
-        vae_qkv, _ = self.qkv_proj_moe_gen(packed_vae_query_sequence)
-        vae_q, vae_k, vae_v = vae_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # MoT QKV projection routes text/vae tokens to the matching weights.
+        qkv, _ = self.qkv_proj(packed_query_sequence, text_indices, vae_indices)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Reshape to (tokens, heads, head_dim)
-        text_q = text_q.view(-1, self.num_heads, self.head_dim)
-        text_k = text_k.view(-1, self.num_kv_heads, self.head_dim)
-        text_v = text_v.view(-1, self.num_kv_heads, self.head_dim)
-        vae_q = vae_q.view(-1, self.num_heads, self.head_dim)
-        vae_k = vae_k.view(-1, self.num_kv_heads, self.head_dim)
-        vae_v = vae_v.view(-1, self.num_kv_heads, self.head_dim)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-        # Apply QK norms
-        text_q = self.q_norm(text_q.to(torch.float32))
-        text_k = self.k_norm(text_k.to(torch.float32))
-        vae_q = self.q_norm_moe_gen(vae_q.to(torch.float32))
-        vae_k = self.k_norm_moe_gen(vae_k.to(torch.float32))
+        # MoT QK norms route text/vae tokens to weight/gen_weight internally.
+        q = self.q_norm(q.to(torch.float32), text_indices, vae_indices)
+        k = self.k_norm(k.to(torch.float32), text_indices, vae_indices)
 
-        # Apply RoPE - need to build per-token cos/sin for text and vae separately
-        # packed_query_position_embeddings are ordered as the packed sequence
-        cos_full, sin_full = [x[..., : self.head_dim // 2] for x in packed_query_position_embeddings]
-        text_cos = cos_full[packed_text_indexes]
-        text_sin = sin_full[packed_text_indexes]
-        vae_cos = cos_full[packed_vae_token_indexes]
-        vae_sin = sin_full[packed_vae_token_indexes]
+        cos, sin = [x[..., : self.head_dim // 2] for x in packed_query_position_embeddings]
+        q = self.rotary_op(q.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
+        k = self.rotary_op(k.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
 
-        text_q = self.rotary_op(text_q.to(text_cos.dtype).unsqueeze(0), text_cos, text_sin).squeeze(0)
-        text_k = self.rotary_op(text_k.to(text_cos.dtype).unsqueeze(0), text_cos, text_sin).squeeze(0)
-        vae_q = self.rotary_op(vae_q.to(vae_cos.dtype).unsqueeze(0), vae_cos, vae_sin).squeeze(0)
-        vae_k = self.rotary_op(vae_k.to(vae_cos.dtype).unsqueeze(0), vae_cos, vae_sin).squeeze(0)
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
 
-        text_q = text_q.to(torch.bfloat16)
-        text_k = text_k.to(torch.bfloat16)
-        text_v = text_v.to(torch.bfloat16)
-        vae_q = vae_q.to(torch.bfloat16)
-        vae_k = vae_k.to(torch.bfloat16)
-        vae_v = vae_v.to(torch.bfloat16)
+        text_q = q[text_indices]
+        text_k = k[text_indices]
+        text_v = v[text_indices]
+        vae_q = q[vae_indices]
+        vae_k = k[vae_indices]
+        vae_v = v[vae_indices]
+
+        num_branches = len(query_lens)
+        text_per_branch = text_q.shape[0] // num_branches
+        vae_per_branch = vae_q.shape[0] // num_branches
 
         # Build joint K/V: [kv_cache, text_markers] (replicated across SP ranks)
         if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
@@ -527,19 +591,54 @@ class PackedAttentionMoT(nn.Module):
                 ),
             )
         else:
-            q = torch.cat([text_q, vae_q], dim=0).unsqueeze(0)
-            k = torch.cat([ctx_k, vae_k], dim=0).unsqueeze(0)
-            v = torch.cat([ctx_v, vae_v], dim=0).unsqueeze(0)
-            attn_out = self.attn_noncausal(q, k, v)
+            text_q_parts = text_q.split([text_per_branch] * num_branches)
+            vae_q_parts = vae_q.split([vae_per_branch] * num_branches)
+            text_k_parts = text_k.split([text_per_branch] * num_branches)
+            vae_k_parts = vae_k.split([vae_per_branch] * num_branches)
+            text_v_parts = text_v.split([text_per_branch] * num_branches)
+            vae_v_parts = vae_v.split([vae_per_branch] * num_branches)
 
-        text_len = text_q.shape[0]
-        attn_out = attn_out.squeeze(0)
-        text_attn = attn_out[:text_len].reshape(text_len, self.q_size)
-        vae_attn = attn_out[text_len:].reshape(-1, self.q_size)
+            # Query lengths should not be variable since we
+            # just split above, so we just concat + stack to 4D
+            q_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_q_parts, vae_q_parts)])
 
-        # Apply output projections
-        text_out, _ = self.o_proj(text_attn)
-        vae_out, _ = self.o_proj_moe_gen(vae_attn)
+            if cache_k is not None and cache_v is not None:
+                kv_lens = getattr(past_key_values, "key_values_lens", None)
+                if kv_lens is None:
+                    per_branch = cache_k.shape[0] // num_branches
+                    kv_lens = [per_branch] * num_branches
+
+                ck_per_branch = NaiveCache.split_with_zeros(cache_k, kv_lens)
+                cv_per_branch = NaiveCache.split_with_zeros(cache_v, kv_lens)
+                k_branches = [
+                    torch.cat([t for t in (ck_per_branch[i], text_k_parts[i], vae_k_parts[i]) if t is not None])
+                    for i in range(num_branches)
+                ]
+                v_branches = [
+                    torch.cat([t for t in (cv_per_branch[i], text_v_parts[i], vae_v_parts[i]) if t is not None])
+                    for i in range(num_branches)
+                ]
+                k_4d, mask = left_pad_stack(k_branches)
+                v_4d, _ = left_pad_stack(v_branches)
+                metadata = DiffusionAttentionMetadata(attn_mask=mask) if mask is not None else None
+            else:
+                k_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_k_parts, vae_k_parts)])
+                v_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_v_parts, vae_v_parts)])
+                metadata = None
+            attn_out = self.attn_noncausal(q_4d, k_4d, v_4d, metadata)
+
+        attn_out = attn_out.reshape(num_branches, -1, self.q_size)
+        text_attn = attn_out[:, :text_per_branch].reshape(-1, self.q_size)
+        vae_attn = attn_out[:, text_per_branch:].reshape(-1, self.q_size)
+        text_len = text_attn.shape[0]
+
+        # MoT output projection over local [text, vae] order.
+        local_packed = torch.cat([text_attn, vae_attn], dim=0)
+        local_text_idx = torch.arange(text_len, device=local_packed.device)
+        local_vae_idx = torch.arange(text_len, text_len + vae_attn.shape[0], device=local_packed.device)
+        local_out, _ = self.o_proj(local_packed, local_text_idx, local_vae_idx)
+        text_out = local_out[:text_len]
+        vae_out = local_out[text_len:]
 
         # Merge back into packed format
         total_len = packed_query_sequence.shape[0]
@@ -675,6 +774,7 @@ class PackedAttentionMoT(nn.Module):
                 raise ValueError("Generation model for Bagel requires non-causal attention")
             return self._forward_gen(
                 packed_query_sequence=packed_query_sequence,
+                query_lens=query_lens,
                 packed_query_position_embeddings=packed_query_position_embeddings,
                 past_key_values=past_key_values,
                 packed_vae_token_indexes=packed_vae_token_indexes,
@@ -702,11 +802,14 @@ class Qwen2MoTDecoderLayer(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
         self.self_attn = attn_module(
             config, layer_idx, parallel_config=parallel_config, quant_config=quant_config, prefix=f"{prefix}.self_attn"
         )
+
+        self.input_layernorm = MoTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.mlp = BagelMLP(
             config.hidden_size,
@@ -722,10 +825,8 @@ class Qwen2MoTDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp_moe_gen",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.post_attention_layernorm = MoTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -743,18 +844,12 @@ class Qwen2MoTDecoderLayer(nn.Module):
     ) -> BaseNavitOutputWithPast:
         if packed_query_sequence is None:
             packed_query_sequence = hidden_states
+
+        text_indices = packed_text_indexes if mode == "gen" else None
+        vae_indices = packed_vae_token_indexes if mode == "gen" else None
+
         residual = packed_query_sequence
-        if mode == "und":
-            packed_query_sequence = self.input_layernorm(packed_query_sequence)
-        elif mode == "gen":
-            packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
-            packed_query_sequence_[packed_text_indexes] = self.input_layernorm(
-                packed_query_sequence[packed_text_indexes]
-            )
-            packed_query_sequence_[packed_vae_token_indexes] = self.input_layernorm_moe_gen(
-                packed_query_sequence[packed_vae_token_indexes]
-            )
-            packed_query_sequence = packed_query_sequence_
+        packed_query_sequence = self.input_layernorm(packed_query_sequence, text_indices, vae_indices)
 
         # Self Attention
         packed_query_sequence, past_key_values = self.self_attn(
@@ -776,13 +871,11 @@ class Qwen2MoTDecoderLayer(nn.Module):
             packed_query_sequence = self.post_attention_layernorm(packed_query_sequence)
             packed_query_sequence = self.mlp(packed_query_sequence)
         elif mode == "gen":
-            packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-            packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
-            packed_text_query_sequence = self.post_attention_layernorm(packed_text_query_sequence).to(torch.bfloat16)
-            packed_vae_query_sequence = self.post_attention_layernorm_moe_gen(packed_vae_query_sequence).to(
+            packed_normed = self.post_attention_layernorm(packed_query_sequence, text_indices, vae_indices).to(
                 torch.bfloat16
             )
-
+            packed_text_query_sequence = packed_normed[packed_text_indexes]
+            packed_vae_query_sequence = packed_normed[packed_vae_token_indexes]
             packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
             packed_query_sequence_[packed_text_indexes] = self.mlp(packed_text_query_sequence)
             packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence)
@@ -794,6 +887,13 @@ class Qwen2MoTDecoderLayer(nn.Module):
 
 
 class Qwen2MoTModel(Qwen2PreTrainedModel):
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "layers": ForwardPattern.Pattern_0,
+        },
+        cached_adapter_cls=BagelCachedAdapter,
+    )
+
     _layerwise_offload_blocks_attrs = ["layers"]
 
     @staticmethod
@@ -829,9 +929,7 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
             ]
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if self.use_moe:
-            self.norm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = MoTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = BagelRotaryEmbedding(config=config)
 
         # Initialize weights and apply final processing
@@ -895,18 +993,9 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
                 **extra_inputs,
             )
 
-        if self.use_moe:
-            if mode == "und":
-                packed_query_sequence = self.norm(packed_query_sequence)
-            elif mode == "gen":
-                packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
-                packed_query_sequence_[packed_text_indexes] = self.norm(packed_query_sequence[packed_text_indexes])
-                packed_query_sequence_[packed_vae_token_indexes] = self.norm_moe_gen(
-                    packed_query_sequence[packed_vae_token_indexes]
-                )
-                packed_query_sequence = packed_query_sequence_
-        else:
-            packed_query_sequence = self.norm(packed_query_sequence)
+        text_indices = packed_text_indexes if self.use_moe and mode == "gen" else None
+        vae_indices = packed_vae_token_indexes if self.use_moe and mode == "gen" else None
+        packed_query_sequence = self.norm(packed_query_sequence, text_indices, vae_indices)
 
         return BaseNavitOutputWithPast(
             packed_query_sequence=packed_query_sequence,
@@ -983,57 +1072,87 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
         return outputs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights for vLLM parallel layers.
+        """Load weights for MoT parallel layers.
 
-        Handles stacked parameter remapping for QKVParallelLinear:
-          - q_proj, k_proj, v_proj -> qkv_proj (shard ids: q, k, v)
-          - q_proj_moe_gen, k_proj_moe_gen, v_proj_moe_gen -> qkv_proj_moe_gen
-        Other parallel layers (gate_proj, up_proj, down_proj, embed_tokens, etc.)
-        keep HF checkpoint names and use weight_loader for TP sharding.
+        Stacked parameter remapping (checkpoint name → model parameter):
+          - q/k/v_proj       → qkv_proj          (text, shard q/k/v)
+          - q/k/v_proj_moe_gen → qkv_proj.gen_exp (gen,  shard q/k/v)
+
+        Direct remapping (no shard dimension):
+          - o_proj_moe_gen   → o_proj.gen_exp
+          - {norm}_moe_gen.weight → {norm}.gen_weight  (all MoTRMSNorm layers)
+
+        Text norm weights (input_layernorm.weight, q_norm.weight, etc.) and
+        other names (embed_tokens, lm_head) pass through unchanged.
         """
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            # More specific _moe_gen patterns FIRST to avoid substring
-            # ambiguity (`.q_proj` is a substring of `.q_proj_moe_gen`).
-            (".qkv_proj_moe_gen", ".q_proj_moe_gen", "q"),
-            (".qkv_proj_moe_gen", ".k_proj_moe_gen", "k"),
-            (".qkv_proj_moe_gen", ".v_proj_moe_gen", "v"),
+            # (param_name, weight_name, shard_id)
+            # _moe_gen patterns MUST come first — `.q_proj` is a substring
+            # of `.q_proj_moe_gen`, so the more specific pattern must match first.
+            (".qkv_proj.gen_exp", ".q_proj_moe_gen", "q"),
+            (".qkv_proj.gen_exp", ".k_proj_moe_gen", "k"),
+            (".qkv_proj.gen_exp", ".v_proj_moe_gen", "v"),
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            # MLP gate/up projections — fused into MergedColumnParallelLinear.
-            # HF checkpoints store separate gate_proj / up_proj weights;
-            # these entries remap them to the fused gate_up_proj parameter.
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
+            (".mlp_moe_gen.gate_up_proj", ".mlp_moe_gen.gate_proj", 0),
+            (".mlp_moe_gen.gate_up_proj", ".mlp_moe_gen.up_proj", 1),
+            (".mlp.gate_up_proj", ".mlp.gate_proj", 0),
+            (".mlp.gate_up_proj", ".mlp.up_proj", 1),
         ]
-        self.stacked_params_mapping = stacked_params_mapping
+
+        direct_remap = [
+            (".o_proj_moe_gen.", ".o_proj.gen_exp."),
+            # Norm _moe_gen.weight → {norm_name}.gen_weight
+            (".input_layernorm_moe_gen.", ".input_layernorm.gen_"),
+            (".post_attention_layernorm_moe_gen.", ".post_attention_layernorm.gen_"),
+            (".q_norm_moe_gen.", ".q_norm.gen_"),
+            (".k_norm_moe_gen.", ".k_norm.gen_"),
+            (".norm_moe_gen.", ".norm.gen_"),
+        ]
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
+        def handle_weight(name, loaded_weight, shard_id=None):
+            param = params_dict.get(name)
+            if param is None:
+                logger.warning_once("Skipping weight %r: no matching parameter found in model.", name)
+                return
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if shard_id is not None:
+                weight_loader(param, loaded_weight, shard_id)
+            else:
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
         for name, loaded_weight in weights:
-            loaded = False
+            # match direct remap
+            handled = False
+            for old_substr, new_substr in direct_remap:
+                if old_substr in name:
+                    name = name.replace(old_substr, new_substr)
+                    handle_weight(name, loaded_weight)
+                    handled = True
+                    break
+
+            if handled:
+                continue
+
+            # match stacked params mapping
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                stacked_name = name.replace(weight_name, param_name)
-                param = params_dict.get(stacked_name)
-                if param is None:
-                    break
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                name = stacked_name
-                loaded = True
+                name = name.replace(weight_name, param_name)
+                handle_weight(name, loaded_weight, shard_id)
+                handled = True
                 break
 
-            if not loaded:
-                param = params_dict.get(name)
-                if param is None:
-                    continue
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+            if handled:
+                continue
 
-            loaded_params.add(name)
+            # no-name-match cases are handled here
+            handle_weight(name, loaded_weight)
 
         return loaded_params
 
@@ -1131,6 +1250,13 @@ def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_pat
 class Bagel(nn.Module):
     config_class = BagelConfig
     base_model_prefix = "bagel"
+
+    # Flow-matching denoise schedule convention. Official BAGEL samples
+    # ``num_timesteps`` points over [1, 0] and drops the terminal t=0, yielding
+    # ``num_timesteps - 1`` Euler steps. Lance samples one extra point
+    # (``num_timesteps + 1``) for ``num_timesteps`` steps; ``LanceBagel`` flips
+    # this on. See https://github.com/vllm-project/vllm-omni/issues/4470.
+    _denoise_schedule_extra_step: bool = False
 
     def __init__(
         self,
@@ -1693,11 +1819,11 @@ class Bagel(nn.Module):
             frame_condition_token_indexes = frame_condition_token_indexes.to(x_t.device).long()
             pinned_x_t = x_t[frame_condition_token_indexes].clone()
 
-        # Use num_timesteps + 1 sample points so we get `num_timesteps` denoise
-        # steps after dropping the terminal t=0 (which has no dt).  Upstream
-        # Lance / BAGEL both use this convention; without the +1 we silently
-        # run one fewer denoise iteration than the user asked for.
-        timesteps = torch.linspace(1, 0, num_timesteps + 1, device=x_t.device)
+        # Build the flow-matching schedule. BAGEL drops the terminal t=0 for
+        # ``num_timesteps - 1`` Euler steps; Lance keeps it for ``num_timesteps``.
+        # ``_denoise_schedule_extra_step`` (overridden by ``LanceBagel``) selects which.
+        num_sample_points = num_timesteps + 1 if self._denoise_schedule_extra_step else num_timesteps
+        timesteps = torch.linspace(1, 0, num_sample_points, device=x_t.device)
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
@@ -1854,15 +1980,15 @@ class Bagel(nn.Module):
         # Each CFG branch runs its own LLM forward; we just need the
         # per-branch packed_position_ids and past_key_values for
         # ``Bagel.forward`` to dispatch through.
-        cfg_branches: dict | None = None
+        cfg_branch_pids: list[torch.Tensor] | None = None
+        cfg_branch_caches: list[NaiveCache] | None = None
 
         if use_cfg_text:
-            branches_pid = [packed_position_ids, cfg_text_packed_position_ids]
-            branches_cache = [past_key_values, cfg_text_past_key_values]
+            cfg_branch_pids = [packed_position_ids, cfg_text_packed_position_ids]
+            cfg_branch_caches = [past_key_values, cfg_text_past_key_values]
             if use_cfg_img:
-                branches_pid.append(cfg_img_packed_position_ids)
-                branches_cache.append(cfg_img_past_key_values)
-            cfg_branches = {"pids": branches_pid, "caches": branches_cache}
+                cfg_branch_pids.append(cfg_img_packed_position_ids)
+                cfg_branch_caches.append(cfg_img_past_key_values)
 
         if return_trajectory_latents and len(timesteps) > 0:
             trajectory_latents.append(x_t.clone())
@@ -1895,7 +2021,8 @@ class Bagel(nn.Module):
                 cfg_renorm_type=cfg_renorm_type,
                 cfg_text_scale=cfg_text_scale_,
                 cfg_img_scale=cfg_img_scale_,
-                cfg_branches=cfg_branches,
+                cfg_branch_pids=cfg_branch_pids,
+                cfg_branch_caches=cfg_branch_caches,
             )
 
             if scheduler is not None:
@@ -2239,7 +2366,8 @@ class Bagel(nn.Module):
         cfg_renorm_type: str = "global",
         cfg_text_scale: float = 1.0,
         cfg_img_scale: float = 1.0,
-        cfg_branches: dict | None = None,
+        cfg_branch_pids: list[torch.Tensor] | None = None,
+        cfg_branch_caches: list[NaiveCache] | None = None,
     ):
         # Build query sequence (identical for all CFG branches)
         packed_text_embedding = self.language_model.forward(
@@ -2267,31 +2395,37 @@ class Bagel(nn.Module):
         cfg_text_v_t = None
         cfg_img_v_t = None
 
-        if use_cfg and cfg_branches is not None:
-            # Sequential per-branch CFG forwards (matches upstream lance.py).
-            # The previous batched path concatenated cond + cfg into one LLM
-            # forward, but the block-diagonal attention mask was lost when
-            # PR #3728 dropped flash_attn_varlen, so branches leaked into
-            # each other.  Running each branch through its own forward is
-            # numerically identical to upstream.
-            def _run_branch(branch_pkv, branch_pids):
-                out = self.language_model.forward(
-                    packed_query_sequence=packed_sequence,
-                    query_lens=packed_seqlens,
-                    packed_query_position_ids=branch_pids,
-                    past_key_values=branch_pkv,
-                    update_past_key_values=False,
-                    is_causal=False,
-                    **extra_inputs,
-                )
-                return self.llm2vae(out.packed_query_sequence)[packed_vae_token_indexes]
+        if use_cfg and cfg_branch_pids is not None and cfg_branch_caches is not None:
+            num_branches = len(cfg_branch_pids)
+            seq_len = int(packed_seqlens.sum())
 
-            branches_pids = cfg_branches["pids"]
-            branches_caches = cfg_branches["caches"]
-            v_t = _run_branch(branches_caches[0], branches_pids[0])
-            cfg_text_v_t = _run_branch(branches_caches[1], branches_pids[1])
-            if cfg_img_scale > 1.0 and len(branches_caches) > 2:
-                cfg_img_v_t = _run_branch(branches_caches[2], branches_pids[2])
+            batched_sequence = packed_sequence.repeat(num_branches, 1)
+            batched_vae_indexes = torch.cat([packed_vae_token_indexes + i * seq_len for i in range(num_branches)])
+            batched_position_ids = torch.cat(cfg_branch_pids)
+            batched_seqlens = packed_seqlens.repeat(num_branches)
+            merged_cache = NaiveCache.merge(cfg_branch_caches)
+
+            if self.use_moe:
+                batched_text_indices = torch.cat([packed_text_indexes + i * seq_len for i in range(num_branches)])
+                extra_inputs["packed_vae_token_indexes"] = batched_vae_indexes
+                extra_inputs["packed_text_indexes"] = batched_text_indices
+
+            output = self.language_model.forward(
+                packed_query_sequence=batched_sequence,
+                query_lens=batched_seqlens,
+                packed_query_position_ids=batched_position_ids,
+                past_key_values=merged_cache,
+                update_past_key_values=False,
+                is_causal=False,
+                **extra_inputs,
+            )
+
+            all_vae_v_t = self.llm2vae(output.packed_query_sequence)[batched_vae_indexes]
+            vae_per_branch = packed_vae_token_indexes.shape[0]
+            branch_v_ts = all_vae_v_t.split(vae_per_branch)
+            v_t = branch_v_ts[0]
+            cfg_text_v_t = branch_v_ts[1]
+            cfg_img_v_t = branch_v_ts[2] if len(branch_v_ts) > 2 else None
         else:
             # Single forward (no CFG or outside cfg_interval).
             output = self.language_model.forward(

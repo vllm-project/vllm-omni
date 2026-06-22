@@ -92,7 +92,7 @@ def talker2codec(
 
 def talker2codec_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any] | None,
+    multimodal_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -107,6 +107,7 @@ def talker2codec_async_chunk(
     signal "not enough data yet — wait for more frames".
     """
     req_id: str = str(getattr(request, "request_id", id(request)))
+    pooling_output = multimodal_output
 
     # Initialise per-request accumulation state
     if not hasattr(transfer_manager, "_moss_tts_state"):

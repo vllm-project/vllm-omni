@@ -68,6 +68,7 @@ Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn 
 - [Installation](https://vllm-omni.readthedocs.io/en/latest/getting_started/installation/)
 - [Quickstart](https://vllm-omni.readthedocs.io/en/latest/getting_started/quickstart/)
 - [List of Supported Models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
+- [Deployment Recipes](https://recipes.vllm.ai) for vLLM-Omni model serving
 
 ## Contributing
 

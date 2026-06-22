@@ -122,9 +122,6 @@ def test_speech_missing_required_fields(omni_server: OmniServer, openai_client: 
             {"response_format": "mpeg"}, ("response_format", "literal_error", "wav"), id="response_format_invalid"
         ),
         pytest.param({"stream_format": 1}, ("stream_format", "literal_error", "audio"), id="stream_format_wrong_type"),
-        pytest.param(
-            {"stream_format": "sse"}, ("stream_format", "value_error", "audio"), id="stream_format_sse_blocked"
-        ),
         pytest.param({"stream": "wrong_type"}, ("stream", "bool_parsing", "validation error"), id="stream_wrong_type"),
         pytest.param(
             {

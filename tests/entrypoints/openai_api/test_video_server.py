@@ -31,6 +31,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
+from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -422,6 +423,7 @@ def test_decode_video_bytes_can_keep_last_frames():
     )
 
     assert len(frames) == 2
+    assert frames.fps == pytest.approx(8.0)
     red_means = [np.asarray(frame)[:, :, 0].mean() for frame in frames]
     assert red_means[0] > 100
     assert red_means[1] > red_means[0]
@@ -519,9 +521,47 @@ def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):
     engine = test_client.app.state.openai_serving_video._engine_client
     captured = engine.captured_sampling_params_list[0]
     assert captured.num_frames == 72
-    assert captured.fps == 24
-    assert captured.frame_rate == 24.0
+    # fps omitted -> sampling params carry None (the "not provided" signal); the 24
+    # default is applied only at output encoding.
+    assert captured.fps is None
+    assert captured.frame_rate is None
     assert fps_values == [24]
+
+
+def test_model_reported_fps_wins_when_request_fps_omitted(test_client, mocker: MockerFixture):
+    fps_values = []
+
+    def _fake_encode(video, fps, audio=None, audio_sample_rate=None, **kwargs):
+        del video, audio, audio_sample_rate, kwargs
+        fps_values.append(fps)
+        return b"fake-video"
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        side_effect=_fake_encode,
+    )
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        engine.captured_prompt = prompt
+        engine.captured_sampling_params_list = sampling_params_list
+        result = MockVideoResult([object()])
+        result.multimodal_output["fps"] = 8
+        yield result
+
+    engine.generate = _generate
+
+    response = test_client.post("/v1/videos", data={"prompt": "source fps"})
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    captured = engine.captured_sampling_params_list[0]
+    # fps omitted -> None on the sampling params; the model-reported fps (8) wins for output.
+    assert captured.fps is None
+    assert captured.frame_rate is None
+    assert fps_values == [8]
 
 
 def test_size_param_sets_width_height(test_client, mocker: MockerFixture):
@@ -1019,6 +1059,50 @@ def test_invalid_lora_returns_400(test_client):
     assert "lora object" in failed["error"]["message"].lower()
 
 
+def test_failed_generation_awaits_storage_cleanup(test_client, isolated_video_backends, mocker: MockerFixture):
+    """Regression (merge seam): when async generation raises, the failure handler
+    must ``await _cleanup_video(video_id)`` (single-arg, async) and still record
+    FAILED. Upstream carried a sync ``_cleanup_video(video_id, output_path)`` whose
+    stale call in the generic handler sat outside the conflict markers; against the
+    PR's async storage manager that raised NameError before the FAILED update,
+    wedging the job in IN_PROGRESS and orphaning the artifact."""
+    _store, _tasks, storage = isolated_video_backends
+    delete_spy = mocker.spy(storage, "delete")
+    mocker.patch.object(
+        OmniOpenAIServingVideo,
+        "generate_video_bytes",
+        side_effect=RuntimeError("GPU exploded"),
+    )
+
+    response = test_client.post("/v1/videos", data={"prompt": "will fail"})
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+
+    failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
+    assert failed["error"]["code"] == 500
+    assert "GPU exploded" in failed["error"]["message"]
+    delete_spy.assert_called_once_with(video_id)
+
+
+def test_async_guardrail_error_returns_400_on_retrieve(test_client, mocker: MockerFixture):
+    mocker.patch.object(
+        OmniOpenAIServingVideo,
+        "generate_video_bytes",
+        side_effect=GuardrailViolationError("Input was blocked by Cosmos3 guardrails."),
+    )
+    response = test_client.post("/v1/videos", data={"prompt": "blocked prompt"})
+    assert response.status_code == 200
+
+    video_id = response.json()["id"]
+    failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
+    assert failed["error"]["code"] == 400
+    assert failed["error"]["message"] == "Input was blocked by Cosmos3 guardrails."
+
+    retrieve = test_client.get(f"/v1/videos/{video_id}")
+    assert retrieve.status_code == 400
+    assert retrieve.json()["error"]["code"] == 400
+
+
 def test_unsupported_image_reference_file_id_returns_400(test_client):
     response = test_client.post(
         "/v1/videos",
@@ -1158,7 +1242,7 @@ def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: Moc
     final = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
     file_name = final["file_name"]
     assert file_name is not None
-    file_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, file_name)
+    file_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, video_id)
     assert os.path.exists(file_path)
 
     delete_resp = test_client.delete(f"/v1/videos/{video_id}")
@@ -1167,6 +1251,30 @@ def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: Moc
     assert delete_resp.json()["deleted"] is True
     assert delete_resp.json()["object"] == "video.deleted"
     assert not os.path.exists(file_path)
+
+
+def test_download_completed_job_uses_storage_open_and_download_name(test_client, mocker: MockerFixture):
+    video_bytes = b"stored-video-data"
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=video_bytes,
+    )
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Download this video"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+
+    final = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    file_name = final["file_name"]
+    assert file_name == f"{video_id}.mp4"
+
+    storage_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, video_id)
+    assert os.path.exists(storage_path)
+
+    response = test_client.get(f"/v1/videos/{video_id}/content")
+    assert response.status_code == 200
+    assert response.content == video_bytes
+    assert response.headers["content-type"] == "video/mp4"
+    assert file_name in response.headers["content-disposition"]
 
 
 def test_delete_in_progress_job_cancels_task_and_removes_metadata(test_client):
@@ -1519,6 +1627,20 @@ def test_sync_generation_error_returns_500(test_client, mocker: MockerFixture):
     )
     assert response.status_code == 500
     assert "GPU exploded" in response.json()["detail"]
+
+
+def test_sync_guardrail_error_returns_400(test_client, mocker: MockerFixture):
+    mocker.patch.object(
+        OmniOpenAIServingVideo,
+        "generate_video_bytes",
+        side_effect=GuardrailViolationError("Input was blocked by Cosmos3 guardrails."),
+    )
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "blocked prompt"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Input was blocked by Cosmos3 guardrails."
 
 
 def test_sync_does_not_create_store_entry(test_client, mocker: MockerFixture):

@@ -78,7 +78,7 @@ class MossAudioTokenizerConfig(PretrainedConfig):
 
     @property
     def codebook_size(self) -> int:
-        return int(self.quantizer_kwargs.get("codebook_size", 4096))
+        return int(self.quantizer_kwargs.get("codebook_size", 1024))
 
     @property
     def frame_rate(self) -> float:

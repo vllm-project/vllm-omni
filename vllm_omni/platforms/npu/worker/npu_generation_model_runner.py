@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gc
 import time
+from collections.abc import Mapping
 from copy import copy, deepcopy
 
 import numpy as np
@@ -32,7 +33,7 @@ from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState
+from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 
 
@@ -426,33 +427,35 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             _batch_desc,
-            multimodal_outputs,  # Omni-Specific
+            multimodal_outputs_raw,  # Omni-Specific
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
 
         #  -------------------------------------- Omni-new -------------------------------------------------
-        pooler_output: list[object] = []
-        if isinstance(multimodal_outputs, torch.Tensor):
-            assert multimodal_outputs.shape[0] == 1, (
+        # Build per-request multimodal_outputs list (dedicated channel).
+        # pooler_output is no longer used for multimodal data.
+        multimodal_outputs: list[dict[str, object]] = []
+        if isinstance(multimodal_outputs_raw, torch.Tensor):
+            assert multimodal_outputs_raw.shape[0] == 1, (
                 "model should return a single tensor, to return multiple tensors, use a dict"
             )
-            assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
+            assert multimodal_outputs_raw.shape[0] == self.input_batch.num_reqs
             for i in range(self.input_batch.num_reqs):
-                pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
-        elif isinstance(multimodal_outputs, list):
-            assert len(multimodal_outputs) == 1, (
+                multimodal_outputs.append({"model_outputs": multimodal_outputs_raw[i].detach().to("cpu").contiguous()})
+        elif isinstance(multimodal_outputs_raw, list):
+            assert len(multimodal_outputs_raw) == 1, (
                 "model should return a single list, to return multiple lists, use a dict"
             )
-            for out in multimodal_outputs:
-                pooler_output.append(
+            for out in multimodal_outputs_raw:
+                multimodal_outputs.append(
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
-        elif isinstance(multimodal_outputs, dict):
+        elif isinstance(multimodal_outputs_raw, Mapping):
             num_reqs = self.input_batch.num_reqs
             for i in range(num_reqs):
                 mm_payload = {}
-                for key, out in multimodal_outputs.items():
+                for key, out in multimodal_outputs_raw.items():
                     if isinstance(out, list):
                         if len(out) != num_reqs:
                             raise ValueError(
@@ -464,7 +467,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                         mm_payload[key] = out.detach().to("cpu").contiguous()
                     else:
                         logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
-                pooler_output.append(mm_payload)
+                multimodal_outputs.append(_ensure_tensor_values(mm_payload))
         else:
             raise RuntimeError("Unsupported diffusion output type")
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
@@ -481,10 +484,12 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},
-            pooler_output=pooler_output,
+            pooler_output=None,
+            multimodal_outputs=multimodal_outputs,
             kv_connector_output=kv_connector_output,
-            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+            num_nans_in_logits={},
             cudagraph_stats=cudagraph_stats,
+            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
         )
         output.routed_experts = routed_experts_lists
         #  -------------------------------------- Omni-new -------------------------------------------------
