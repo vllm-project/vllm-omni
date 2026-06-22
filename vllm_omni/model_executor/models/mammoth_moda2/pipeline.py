@@ -33,7 +33,8 @@ MAMMOTH_MODA2_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=1,
             model_stage="dit",
-            execution_type=StageExecutionType.DIFFUSION,
+            # DiT runs as MammothModa2DiTPipeline on the generation worker (not DiffusionEngine).
+            execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
             final_output=True,
             final_output_type="image",
