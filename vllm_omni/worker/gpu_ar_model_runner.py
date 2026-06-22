@@ -1594,11 +1594,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     scheduler_output=scheduler_output,
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
                 )
-            else:
+            if combined_multimodal_outputs is None:
                 with record_function_or_nullcontext("omni_output_builder:build_mm_cpu"):
                     mm_cpu = build_mm_cpu(
                         flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
                     )
+
             with record_function_or_nullcontext("omni_output_builder:process_additional_information"):
                 if not postprocess_already_applied:
                     self._process_additional_information_updates(

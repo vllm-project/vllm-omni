@@ -433,3 +433,54 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
         output.multimodal_outputs[1]["hidden"],
         torch.tensor([[2.0, 20.0], [3.0, 30.0]]),
     )
+
+
+def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch):
+    """Tail-only prefix-cache models still need per-step mm passthrough (e.g. codes.audio)."""
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner.omni_prefix_cache = object()
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("latent", req_ids),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: {"codes.audio"})
+    monkeypatch.setattr(GPUARModelRunner, "_stage_deferred_prefix_cache_mm_outputs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_prepare_prefix_cache_pooler_payload_sources",
+        lambda *args, **kwargs: (None, None, None),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    codes = torch.tensor([[11.0, 12.0], [21.0, 22.0]], dtype=torch.float32)
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=2,
+            num_scheduled_tokens={"r1": 1, "r2": 1},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"codes.audio": codes},
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[], []],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        seq_len=2,
+        num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
+    )
+
+    assert torch.equal(output.multimodal_outputs[0]["codes.audio"], codes[0:1])
+    assert torch.equal(output.multimodal_outputs[1]["codes.audio"], codes[1:2])
