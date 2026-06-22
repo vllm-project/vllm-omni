@@ -888,7 +888,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
-        seq_len = hidden_states.shape[0]
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -1016,6 +1015,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
                 dtype=np.int32,
             )
+        seq_len = int(num_scheduled_tokens_np.sum())
         query_start_loc_cpu = self.query_start_loc.cpu
         if callable(query_start_loc_cpu):
             query_start_loc_cpu = query_start_loc_cpu()

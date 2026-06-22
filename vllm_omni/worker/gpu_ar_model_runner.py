@@ -623,7 +623,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # _compute_slot_mapping_kernel which only writes to .gpu). We must use .gpu and
             # sync back to CPU to get the correctly computed slot mapping.
             slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
-            slot_mapping_cpu = slot_mapping_gpu[:num_tokens_padded].cpu()
+            slot_mapping_cpu = slot_mapping_gpu[:num_tokens_unpadded].cpu()
             self.omni_prefix_cache.update_omni_tensor_prefix_cache(
                 hidden_states=hs_for_cache,
                 multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
@@ -1173,6 +1173,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # in that case; the legacy behavior is preserved.
                 if hs_for_cache is None:
                     hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
+                else:
+                    # Snapshot the hidden states to CPU before ``schedule_async_write``
+                    # so the merge path in ``sample_tokens`` has a stable CPU view
+                    # without a redundant D2H inside the critical path.
+                    hidden_states_cpu = hs_for_cache[:num_tokens_unpadded].detach().to("cpu").contiguous()
                 slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
                 self.omni_prefix_cache.schedule_async_write(
                     hidden_states_gpu=hs_for_cache,
@@ -1710,7 +1715,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             slot_mappings,  # OMNI: unpack slot_mappings for drafter
         ) = self.execute_model_state
         self.execute_model_state = None
-        seq_len = hidden_states.shape[0]
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -1856,6 +1860,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             staged_hidden_states_cpu=staged_hidden_states_cpu,
             multimodal_outputs=multimodal_outputs,
         )
+
+        seq_len = int(num_scheduled_tokens_np.sum())
 
         def output_builder() -> OmniModelRunnerOutput:
             if output_tensor_snapshot.async_payload is not None:

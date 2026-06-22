@@ -75,18 +75,33 @@ def to_payload_element(
             the total scheduled token count here so 1D (seq_len,) metadata
             that is intentionally not cached is still split per request.
     """
-    # Cached per-token tensors are merged elsewhere; here a first dim
-    # equal to seq_len means a per-request slice is required.
-    if seq_len is not None and isinstance(element, torch.Tensor) and element.shape[0] == seq_len:
+    # Per-token tensor: its first dim spans the batched token axis, so we
+    # return the request's [start:end] window.
+    #
+    # CUDA-graph padding can make the batched tensor's first dim
+    # (``num_tokens_padded``) larger than ``seq_len`` (the valid unpadded
+    # scheduled-token count).  The valid rows always live in the
+    # ``[:num_tokens_unpadded]`` prefix and ``start``/``end`` are unpadded
+    # indices, so a per-token tensor is one whose first dim covers the whole
+    # unpadded span (``shape[0] >= seq_len``) and contains the requested
+    # window (``end <= shape[0]``).  Anything shorter is request-invariant
+    # (e.g. a list-derived broadcast tensor) and must be cloned, not sliced.
+    if (
+        seq_len is not None
+        and isinstance(element, torch.Tensor)
+        and element.ndim >= 1
+        and element.shape[0] >= seq_len
+        and end <= element.shape[0]
+    ):
         return element[start:end].contiguous()
     # Every other case is shared between prefix cache (passthrough data)
     # and running a model without prefix caching.
-    elif isinstance(element, dict):
+    if isinstance(element, dict):
         return {
             sk: to_payload_element(sv, idx, start, end, pass_lists_through=pass_lists_through, seq_len=seq_len)
             for sk, sv in element.items()
         }
-    elif isinstance(element, list):
+    if isinstance(element, list):
         # For lists, clone tensors to avoid cross-request aliasing
         if pass_lists_through:
             return [elem.clone() if isinstance(elem, torch.Tensor) else elem for elem in element]
@@ -94,8 +109,9 @@ def to_payload_element(
         if isinstance(element, torch.Tensor):
             element = element.clone()
         return element
-    elif isinstance(element, torch.Tensor):
-        # List-derived tensor payloads are request-invariant; clone to
-        # avoid accidental cross-request aliasing on downstream mutation.
+    if isinstance(element, torch.Tensor):
+        # Request-invariant tensor (first dim does not span the token axis);
+        # clone to avoid accidental cross-request aliasing on downstream
+        # mutation.
         return element.clone()
     return element

@@ -428,6 +428,50 @@ def test_get_merged_hidden_states(num_tokens_padded, mocker):
     assert torch.all(req2_merged_states == req2_new_states)
 
 
+def test_get_merged_hidden_states_includes_partial_block():
+    """Prefix merge must include tokens in the trailing partial KV block."""
+    cache = get_omni_pcache()
+
+    orig_num_tokens_unpadded = 10
+    slot_offset = 8
+    orig_slot_mapping = torch.arange(slot_offset, slot_offset + orig_num_tokens_unpadded)
+    orig_hidden_states = torch.arange(
+        orig_num_tokens_unpadded * HIDDEN_SIZE,
+        dtype=DTYPE,
+    ).reshape(orig_num_tokens_unpadded, HIDDEN_SIZE)
+
+    cache.update_omni_tensor_prefix_cache(
+        hidden_states=orig_hidden_states,
+        multimodal_outputs=None,
+        num_tokens_unpadded=orig_num_tokens_unpadded,
+        slot_mapping=orig_slot_mapping,
+    )
+
+    num_new_toks_req1 = 3
+    cache.add_prefix_cached_new_req_id("req1")
+    num_scheduled_tokens = {"req1": num_new_toks_req1, "req2": 0}
+    new_hidden_states = torch.full((num_new_toks_req1, HIDDEN_SIZE), 99.0, dtype=DTYPE)
+
+    # 10 computed tokens span blocks 2, 3, and the first 2 rows of block 4.
+    block_table = torch.tensor([[2, 3, 4, 5], [6, 7, 8, 9]], dtype=torch.long)
+    input_batch = MockInputBatch(
+        num_computed_tokens_cpu=torch.tensor([orig_num_tokens_unpadded, 0], dtype=torch.long),
+        block_table=block_table,
+    )
+
+    merged_states = cache.get_merged_hidden_states(
+        query_start_loc=torch.tensor([0, num_new_toks_req1], dtype=torch.long),
+        input_batch=input_batch,
+        hidden_states=new_hidden_states,
+        num_scheduled_tokens=num_scheduled_tokens,
+    )
+
+    req1_merged_states = merged_states["req1"]
+    assert req1_merged_states.shape == torch.Size([orig_num_tokens_unpadded + num_new_toks_req1, HIDDEN_SIZE])
+    assert torch.equal(req1_merged_states[:orig_num_tokens_unpadded], orig_hidden_states)
+    assert torch.all(req1_merged_states[-num_new_toks_req1:] == 99.0)
+
+
 def test_get_merged_hidden_states_uses_precomputed_hidden_states_cpu(mocker):
     cache = get_omni_pcache()
 
@@ -596,3 +640,123 @@ def test_get_merged_multimodal_outputs(feat_dims, num_tokens_padded, mocker):
 
             assert req2_merged_mm_outputs.shape == torch.Size([num_new_toks_req2, curr_feat_dim])
             assert torch.all(req2_merged_mm_outputs == req2_new_mm_outputs)
+
+
+def test_maybe_init_registers_unpadded_length_mm_when_padded_gt_unpadded():
+    """CUDA-graph padding can leave per-token mm tensors at unpadded length."""
+    cache = get_omni_pcache()
+    unpadded = 8
+    padded = 16
+    mm_outputs = {"layer0": torch.rand((unpadded, 64), dtype=DTYPE)}
+    cache.maybe_init_missing_mm_cache_keys(
+        mm_outputs,
+        seq_len=padded,
+        num_valid_tokens=unpadded,
+    )
+    assert "layer0" in cache.mm_cache_keys
+
+
+def test_update_cache_with_padded_length_mm_tensor():
+    """Only the unpadded prefix of a padded-length tensor should be cached."""
+    cache = get_omni_pcache()
+    unpadded = 8
+    padded = 16
+    slot_offset = 4
+    slot_mapping = torch.arange(slot_offset, slot_offset + unpadded)
+    source = torch.arange(unpadded * HIDDEN_SIZE, dtype=DTYPE).reshape(unpadded, HIDDEN_SIZE)
+    padded_mm = torch.cat([source, torch.full((padded - unpadded, HIDDEN_SIZE), -1.0, dtype=DTYPE)], dim=0)
+    cache.maybe_init_missing_mm_cache_keys(
+        {"layer0": padded_mm},
+        seq_len=padded,
+        num_valid_tokens=unpadded,
+    )
+    cache.update_omni_tensor_prefix_cache(
+        hidden_states=None,
+        multimodal_outputs={"layer0": padded_mm},
+        num_tokens_unpadded=unpadded,
+        slot_mapping=slot_mapping,
+        num_tokens_padded=padded,
+    )
+    flat = cache.mm_outputs_cache["layer0"].view(-1, HIDDEN_SIZE)
+    cached = flat[slot_mapping]
+    assert torch.allclose(cached, source)
+
+
+def test_get_merged_hidden_states_flushes_pending_async_write_before_cache_read(mocker):
+    """Prefix-hit merge must not read omni cache until pending D2H is committed."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    cache = get_omni_pcache()
+    orig_num_tokens_unpadded = 8
+    slot_offset = 8
+    orig_slot_mapping = torch.arange(slot_offset, slot_offset + orig_num_tokens_unpadded)
+    orig_hidden_states = torch.arange(
+        orig_num_tokens_unpadded * HIDDEN_SIZE,
+        dtype=DTYPE,
+    ).reshape(orig_num_tokens_unpadded, HIDDEN_SIZE)
+
+    cache.update_omni_tensor_prefix_cache(
+        hidden_states=orig_hidden_states,
+        multimodal_outputs=None,
+        num_tokens_unpadded=orig_num_tokens_unpadded,
+        slot_mapping=orig_slot_mapping,
+    )
+
+    num_new_toks_req1 = 3
+    cache.add_prefix_cached_new_req_id("req1")
+    num_scheduled_tokens = {"req1": num_new_toks_req1, "req2": 0}
+    new_hidden_states = torch.full((num_new_toks_req1, HIDDEN_SIZE), 99.0, dtype=DTYPE)
+
+    block_table = torch.tensor([[2, 3, 4, 5], [6, 7, 8, 9]], dtype=torch.long)
+    input_batch = MockInputBatch(
+        num_computed_tokens_cpu=torch.tensor([orig_num_tokens_unpadded, 0], dtype=torch.long),
+        block_table=block_table,
+    )
+
+    pending_event = mocker.Mock()
+    pending_event.synchronize = mocker.Mock()
+    cache._pending_write = type(
+        "_Pending",
+        (),
+        {
+            "event": pending_event,
+            "num_tokens": 0,
+            "slots_cpu": torch.empty(0, dtype=torch.long),
+            "hidden_cpu": None,
+            "mm_cpu": {},
+        },
+    )()
+
+    flush_spy = mocker.spy(cache, "_flush_pending_writes_for_read")
+    merged_states = cache.get_merged_hidden_states(
+        query_start_loc=torch.tensor([0, num_new_toks_req1], dtype=torch.long),
+        input_batch=input_batch,
+        hidden_states=new_hidden_states,
+        num_scheduled_tokens=num_scheduled_tokens,
+    )
+
+    flush_spy.assert_called_once()
+    assert cache._pending_write is None
+    assert torch.equal(merged_states["req1"][:orig_num_tokens_unpadded], orig_hidden_states)
+
+
+def test_to_payload_element_slices_unpadded_tensor_when_seq_len_is_unpadded_total():
+    from vllm_omni.utils.mm_outputs import to_payload_element
+
+    unpadded = 8
+    padded = 16
+    batched = torch.arange(unpadded * 4, dtype=DTYPE).reshape(unpadded, 4)
+    padded_batched = torch.cat(
+        [batched, torch.full((padded - unpadded, 4), -1.0, dtype=DTYPE)],
+        dim=0,
+    )
+    # req0: [0:3), req1: [3:8)
+    req0 = to_payload_element(padded_batched, idx=0, start=0, end=3, seq_len=unpadded)
+    req1 = to_payload_element(padded_batched, idx=1, start=3, end=8, seq_len=unpadded)
+    assert torch.allclose(req0, batched[0:3])
+    assert torch.allclose(req1, batched[3:8])
+
+    # Unpadded-length batched tensor with unpadded seq_len must not clone all rows.
+    req1_unpadded_layout = to_payload_element(batched, idx=1, start=3, end=8, seq_len=unpadded)
+    assert torch.allclose(req1_unpadded_layout, batched[3:8])

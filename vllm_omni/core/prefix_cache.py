@@ -81,7 +81,46 @@ class OmniTensorPrefixCache:
         self._async_copy_stream: torch.cuda.Stream | None = None
         self._pending_write: _PendingAsyncWrite | None = None
 
-    def maybe_init_missing_mm_cache_keys(self, multimodal_outputs: dict, seq_len: int):
+    @staticmethod
+    def _resolve_mm_seq_len(
+        hidden_states_gpu: torch.Tensor | None,
+        multimodal_outputs_gpu: dict[str, torch.Tensor] | None,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+    ) -> int:
+        """Return the batched per-token tensor length seen on GPU this step.
+
+        CUDA-graph padding can make ``num_tokens_padded > num_tokens_unpadded``
+        while per-token tensors are either padded-length (valid rows in
+        ``[:num_tokens_unpadded]``) or unpadded-length.  Registration and
+        slicing must accept both layouts.
+        """
+        seq_len = max(num_tokens_unpadded, num_tokens_padded)
+        if hidden_states_gpu is not None and hidden_states_gpu.ndim >= 1:
+            seq_len = max(seq_len, int(hidden_states_gpu.shape[0]))
+        if multimodal_outputs_gpu:
+            for val in multimodal_outputs_gpu.values():
+                if isinstance(val, torch.Tensor) and val.ndim >= 2:
+                    seq_len = max(seq_len, int(val.shape[0]))
+        return seq_len
+
+    @staticmethod
+    def _is_per_token_mm_tensor(val: object, *, num_valid_tokens: int, seq_len: int) -> bool:
+        if not isinstance(val, torch.Tensor) or val.ndim < 2:
+            return False
+        rows = int(val.shape[0])
+        if rows < num_valid_tokens:
+            return False
+        # Accept either unpadded-length or padded-length batch tensors.
+        return rows == num_valid_tokens or rows == seq_len
+
+    def maybe_init_missing_mm_cache_keys(
+        self,
+        multimodal_outputs: dict,
+        seq_len: int,
+        *,
+        num_valid_tokens: int | None = None,
+    ):
         """Given multimodal outputs from executing the model, dynamically
         determine which multimodal outputs are tensors depending on sequence
         length and should be cached, and initialize the cache tensors
@@ -93,17 +132,23 @@ class OmniTensorPrefixCache:
 
         This will usually be called by the first forward pass, i.e.,
         determined by the warmup.
+
+        Args:
+            seq_len: Upper bound on per-token tensor first dim (padded batch
+                length when CUDA-graph padding is active).
+            num_valid_tokens: Number of valid (unpadded) token rows to cache;
+                defaults to ``seq_len`` when omitted.
         """
+        num_valid_tokens = num_valid_tokens if num_valid_tokens is not None else seq_len
         for key, val in multimodal_outputs.items():
-            # Only cache per-token feature tensors: 2D+ with first dim == seq_len.
-            # A 1D tensor of shape (seq_len,) is a broadcast scalar (per-request
-            # metadata such as ref_code_len / codec_streaming), not per-token data;
-            # caching it by slot causes a shape mismatch when a later request has a
-            # different scheduled seq length.
+            # Only cache per-token feature tensors: 2D+ with first dim covering
+            # the unpadded token span.  A 1D tensor of shape (seq_len,) is a
+            # broadcast scalar (per-request metadata such as ref_code_len /
+            # codec_streaming), not per-token data; caching it by slot causes a
+            # shape mismatch when a later request has a different scheduled
+            # seq length.
             if (
-                isinstance(val, torch.Tensor)
-                and val.ndim >= 2
-                and val.shape[0] == seq_len
+                self._is_per_token_mm_tensor(val, num_valid_tokens=num_valid_tokens, seq_len=seq_len)
                 and key not in self.mm_cache_keys
             ):
                 feat_dim = val.shape[-1]
@@ -195,16 +240,28 @@ class OmniTensorPrefixCache:
         # before scheduling the copies so the apply step has somewhere
         # to scatter into.
         skip = skip_mm_cache_keys or set()
+        mm_seq_len = self._resolve_mm_seq_len(
+            hidden_states_gpu,
+            multimodal_outputs_gpu,
+            num_tokens_unpadded,
+            num_tokens_padded,
+        )
         cacheable_mm_keys: list[str] = []
         if multimodal_outputs_gpu:
-            self.maybe_init_missing_mm_cache_keys(multimodal_outputs_gpu, seq_len=num_tokens_padded)
+            self.maybe_init_missing_mm_cache_keys(
+                multimodal_outputs_gpu,
+                seq_len=mm_seq_len,
+                num_valid_tokens=num_tokens_unpadded,
+            )
             for k in self.mm_cache_keys:
                 if k in skip:
                     continue
                 v = multimodal_outputs_gpu.get(k)
-                if not isinstance(v, torch.Tensor) or v.ndim < 2:
-                    continue
-                if v.shape[0] < num_tokens_unpadded:
+                if not self._is_per_token_mm_tensor(
+                    v,
+                    num_valid_tokens=num_tokens_unpadded,
+                    seq_len=mm_seq_len,
+                ):
                     continue
                 cacheable_mm_keys.append(k)
 
@@ -240,6 +297,20 @@ class OmniTensorPrefixCache:
             event = torch.cuda.Event()
             event.record()
 
+        # The D2H copies above run on ``copy_stream`` and read GPU source
+        # buffers that were produced on the compute stream. The caching
+        # allocator only tracks their use on the compute stream, so once the
+        # source tensors are freed it may hand the same memory back to the
+        # next forward step on the compute stream while this copy is still
+        # in flight -> torn/garbage rows in the cache (a timing-dependent,
+        # "occasional" corruption). ``record_stream`` tells the allocator the
+        # storage is also in use on ``copy_stream`` until ``event`` fires, so
+        # reuse is deferred until the copy completes.
+        if hidden_states_gpu is not None:
+            hidden_states_gpu.record_stream(copy_stream)
+        for k in cacheable_mm_keys:
+            multimodal_outputs_gpu[k].record_stream(copy_stream)
+
         # Step 3: stash for next step's consume.
         self._pending_write = _PendingAsyncWrite(
             event=event,
@@ -258,10 +329,30 @@ class OmniTensorPrefixCache:
         """
         if self._pending_write is None:
             return 0
-        if not self._pending_write.event.query():
-            return 0
+        # Order the upcoming compute-stream work (next forward, and in
+        # particular the in-place slot-mapping kernel that overwrites the
+        # persistent ``slot_mapping`` buffer copied from above) after the
+        # in-flight D2H copy. This is a cheap GPU-side wait — when the copy
+        # has already finished it is a no-op — and it closes the
+        # source-buffer reuse race for persistent buffers that
+        # ``record_stream`` cannot protect.
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().wait_event(self._pending_write.event)
+        # After ``wait_event``, the copy is complete; always consume so the
+        # CPU cache is visible to prefix-hit merge reads in this step.
         self._consume_pending_write()
         return 1
+
+    def _flush_pending_writes_for_read(self) -> None:
+        """Block until any in-flight async write is committed to the CPU cache.
+
+        Prefix-hit merge reads ``hidden_states_cache`` / ``mm_outputs_cache``
+        in ``sample_tokens``; those reads must not observe rows from a pending
+        D2H that has not been scattered yet.
+        """
+        if self._pending_write is None:
+            return
+        self._consume_pending_write()
 
     def _consume_pending_write(self) -> None:
         """Synchronize on the pending event and scatter the CPU tensors
@@ -368,6 +459,12 @@ class OmniTensorPrefixCache:
         unpadded_slot_mapping = slot_mapping[:num_tokens_unpadded]
         if num_tokens_padded is None:
             num_tokens_padded = num_tokens_unpadded
+        mm_seq_len = self._resolve_mm_seq_len(
+            hidden_states,
+            multimodal_outputs,
+            num_tokens_unpadded,
+            num_tokens_padded,
+        )
         skip_mm_cache_keys = skip_mm_cache_keys or set()
 
         if hidden_states is not None:
@@ -396,15 +493,23 @@ class OmniTensorPrefixCache:
             # We check against the padded token count since we haven't sliced yet
             self.maybe_init_missing_mm_cache_keys(
                 multimodal_outputs,
-                seq_len=num_tokens_padded,
+                seq_len=mm_seq_len,
+                num_valid_tokens=num_tokens_unpadded,
             )
 
             for mm_out_key, mm_cache in self.mm_outputs_cache.items():
                 if mm_out_key in multimodal_outputs:
                     if mm_out_key in skip_mm_cache_keys:
                         continue
+                    mm_val = multimodal_outputs[mm_out_key]
+                    if not self._is_per_token_mm_tensor(
+                        mm_val,
+                        num_valid_tokens=num_tokens_unpadded,
+                        seq_len=mm_seq_len,
+                    ):
+                        continue
                     # Slice to unpadded portion before caching
-                    mm_state = multimodal_outputs[mm_out_key][:num_tokens_unpadded]
+                    mm_state = mm_val[:num_tokens_unpadded]
                     mm_state = OmniTensorPrefixCache._coerce_to_cpu_tensor(mm_state)
                     flat_cache = mm_cache.view(-1, mm_cache.shape[-1])
                     slot_idx = unpadded_slot_mapping
@@ -693,6 +798,9 @@ class OmniTensorPrefixCache:
                 " have multiple kv groups; only the first group will be used!"
             )
 
+        if self._new_req_cache_hit_ids:
+            self._flush_pending_writes_for_read()
+
         combined_hidden_states = {}
         required_tokens = 0
         for req_id in input_batch.req_ids:
@@ -709,8 +817,7 @@ class OmniTensorPrefixCache:
             req_idx = input_batch.req_id_to_index[req_id]
 
             if req_id in self._new_req_cache_hit_ids:
-                block_ids = self._get_cached_block_ids(req_idx, input_batch)
-                cached_hs = cache[block_ids].reshape(-1, cache.shape[-1])
+                cached_hs = self._read_cached_prefix(req_idx, input_batch, cache)
 
                 # Slice the hidden states corresponding to this request;
                 # we do this by using the query start
@@ -726,12 +833,42 @@ class OmniTensorPrefixCache:
         return combined_hidden_states
 
     def _get_cached_block_ids(self, req_idx: int, input_batch: InputBatch) -> torch.Tensor:
-        """Given an input batch and request index in the batch (not ID), get the
-        block IDs corresponding to the cache hit.
-        """
-        num_computed = input_batch.num_computed_tokens_cpu[req_idx]
-        # NOTE: vLLM only caches full blocks
+        """Return block IDs for all *fully* computed blocks of a prefix hit."""
+        num_computed = int(input_batch.num_computed_tokens_cpu[req_idx])
         num_cached_blocks = num_computed // self.block_size
-        # Get the block IDs attached to this cache hit and reindex into
-        # the flattened cached hidden states (i.e., 1 row per token).
         return input_batch.block_table[0].block_table.cpu[req_idx, :num_cached_blocks]
+
+    def _read_cached_prefix(
+        self,
+        req_idx: int,
+        input_batch: InputBatch,
+        cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Read the cached per-token prefix rows for a KV prefix-cache hit.
+
+        vLLM's ``num_computed_tokens`` may end mid-block, but the omni cache
+        stores per-token rows for every computed token.  Merge must include the
+        trailing partial block; reading only ``num_computed // block_size`` full
+        blocks drops those rows and misaligns downstream talker conditioning.
+        """
+        num_computed = int(input_batch.num_computed_tokens_cpu[req_idx])
+        if num_computed <= 0:
+            return cache.new_empty((0, cache.shape[-1]))
+
+        num_full_blocks = num_computed // self.block_size
+        partial_len = num_computed % self.block_size
+
+        parts: list[torch.Tensor] = []
+        if num_full_blocks > 0:
+            full_block_ids = self._get_cached_block_ids(req_idx, input_batch)
+            parts.append(cache[full_block_ids].reshape(-1, cache.shape[-1]))
+        if partial_len > 0:
+            block_table = input_batch.block_table[0].block_table.cpu[req_idx]
+            partial_block_id = block_table[num_full_blocks]
+            parts.append(cache[partial_block_id, :partial_len].reshape(-1, cache.shape[-1]))
+
+        if not parts:
+            return cache.new_empty((0, cache.shape[-1]))
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=0)
