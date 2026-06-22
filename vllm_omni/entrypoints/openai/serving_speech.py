@@ -411,6 +411,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def __init__(self, *args, **kwargs):
         self.model_name = kwargs.pop("model_name", None)
+        self.forced_aligner_config: Any | None = kwargs.pop("forced_aligner_config", None)
         super().__init__(*args, **kwargs)
         self._init_speaker_storage()
 
@@ -2586,6 +2587,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         response_format: str = "pcm",
         raw_request: Request | None = None,
         request_start_s: float | None = None,
+        include_sample_rate: bool = False,
     ):
         """Generate audio chunks for streaming response.
 
@@ -2662,7 +2664,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if first_audio_chunk_s is None:
                         first_audio_chunk_s = time.perf_counter()
-                    yield self.create_audio(audio_obj).audio_data
+                    audio_bytes = self.create_audio(audio_obj).audio_data
+                    if include_sample_rate:
+                        yield audio_bytes, sample_rate_val
+                    else:
+                        yield audio_bytes
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
@@ -3508,13 +3514,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._track_ref_audio_artifact_warmup(request_id, qwen3_ref_audio_warmup_artifact_key)
         return request_id, generator, tts_params
 
-    async def _generate_pcm_chunks(self, generator, request_id: str):
+    async def _generate_pcm_chunks(self, generator, request_id: str, *, include_sample_rate: bool = False):
         """Yield raw PCM byte chunks from the engine generator.
 
         Delegates to ``_generate_audio_chunks`` with ``response_format="pcm"``.
         Used by the WebSocket streaming handler and ``_iter_pcm_audio_bytes``.
         """
-        async for chunk in self._generate_audio_chunks(generator, request_id, response_format="pcm"):
+        async for chunk in self._generate_audio_chunks(
+            generator,
+            request_id,
+            response_format="pcm",
+            include_sample_rate=include_sample_rate,
+        ):
             yield chunk
 
     async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
@@ -3810,6 +3821,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         try:
             if request.stream:
+                if request.word_timestamps:
+                    return self.create_error_response(
+                        "word_timestamps=true is currently supported by the WebSocket "
+                        "/v1/audio/speech/stream path. Use session.config with "
+                        "stream_audio=true and response_format='pcm'."
+                    )
+
                 # Determine response format and media type for streaming
                 response_format = (request.response_format or "wav").lower()
 

@@ -76,6 +76,10 @@ demo = [
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
 ]
 
+forced-aligner = [
+    "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
+]
+
 # Local-test-only extras
 local = [
     "FlagEmbedding",
@@ -304,3 +308,6 @@ CANN = "CANN"
 thi = "thi"
 ND = "ND"
 byt5 = "byt5"
+# "seeked" is the standard HTML media element DOM event name (fires when a
+# seek completes), used by the word-timestamps Gradio demo. Not a typo.
+seeked = "seeked"

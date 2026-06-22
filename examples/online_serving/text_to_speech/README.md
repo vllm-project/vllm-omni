@@ -504,6 +504,35 @@ python qwen3_tts/streaming_speech_client.py --text "Hello world. How are you? I 
 python qwen3_tts/streaming_speech_client.py --text "..." --simulate-stt --stt-delay 0.1
 ```
 
+To receive word-level timestamps, launch the server with a forced aligner:
+```bash
+vllm-omni serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --omni \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
+    --trust-remote-code \
+    --forced-aligner Qwen/Qwen3-ForcedAligner-0.6B
+```
+Then request PCM JSON sidecar chunks:
+```bash
+python qwen3_tts/streaming_speech_client.py \
+    --text "Hello world. How are you?" \
+    --stream-audio \
+    --response-format pcm \
+    --word-timestamps
+```
+The client writes one PCM file per sentence and a matching
+`sentence_XXX_timestamps.json` sidecar.
+
+To *see* the alignment instead of reading a JSON sidecar, run the
+word-timestamp Gradio demo (server must be launched with `--forced-aligner`):
+```bash
+python qwen3_tts/word_timestamps_demo.py --api-base http://localhost:8091
+```
+Each sentence's audio plays in an `<audio>` element while its text is rendered
+as inline word spans; the current word highlights as `audio.currentTime`
+crosses each `start_ms`. The **Stop (barge-in)** button cuts playback and
+reports the last-spoken word, useful for the voice-agent barge-in case.
+
 ### Gradio demos
 ```bash
 ./qwen3_tts/run_gradio_demo.sh                              # CustomVoice (default)
