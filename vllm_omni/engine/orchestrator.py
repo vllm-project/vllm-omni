@@ -657,41 +657,8 @@ class Orchestrator:
                         idle = False
                     else:
                         try:
-                            raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
-                            if raw_outputs is None:
-                                continue
-
-                            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
-                            for eco in raw_outputs.outputs:
-                                req_state = self.request_states.get(getattr(eco, "request_id", None))
-                                if req_state is None or not req_state.streaming.enabled:
-                                    continue
-                                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-                                req_state.streaming.new_prompt_len_snapshot = getattr(
-                                    eco,
-                                    "new_prompt_len_snapshot",
-                                    None,
-                                )
-                                if req_state.streaming.enabled:
-                                    await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
-                            # OmniSchedulerMixin.make_stats() already throttles
-                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
-                            # being non-None means this replica passed its own gate.
-                            # A second global throttle here would drop stats for
-                            # other (stage, replica) pairs in the same 1s window.
-                            record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
-                            iteration_stats = IterationStats() if record_stats else None
-                            raw_output = await pool.process_llm_raw_outputs(
-                                replica_id,
-                                raw_outputs,
-                                iteration_stats=iteration_stats,
-                            )
-                            if record_stats:
-                                self._stat_logger.record(
-                                    raw_outputs.scheduler_stats,
-                                    iteration_stats,
-                                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
-                                )
+                            if await self._drain_llm_replica_raw_outputs(stage_id, replica_id, pool):
+                                idle = False
                         except asyncio.CancelledError:
                             raise
                         except EngineDeadError as e:
@@ -734,13 +701,74 @@ class Orchestrator:
                             )
                             raise
 
-                        await self._handle_processed_outputs(stage_id, replica_id, raw_output)
-                        idle = False
-
             if idle:
                 await asyncio.sleep(0.001)
             else:
                 await asyncio.sleep(0)
+
+    # Upper bound on already-ready raw outputs drained from a single LLM replica
+    # per orchestration round. Draining more than one per round fixes the
+    # head-of-line blocking that inflates audio TTFP and E2E under queued
+    # concurrency (vllm-project/vllm-omni#4561); the bound preserves fairness so
+    # one hot replica cannot starve the other stages/replicas within a round.
+    _MAX_RAW_OUTPUTS_PER_DRAIN = 16
+
+    async def _drain_llm_replica_raw_outputs(self, stage_id: int, replica_id: int, pool: StagePool) -> bool:
+        """Drain ready raw outputs from one LLM replica without blocking.
+
+        Polls the replica non-blockingly and processes up to
+        ``_MAX_RAW_OUTPUTS_PER_DRAIN`` ready ``EngineCoreOutputs`` in a single
+        round, so a frontend-visible packet sitting behind non-user-visible raw
+        outputs is routed promptly instead of waiting one orchestration round per
+        queued item. Returns ``True`` if any output was processed and routed.
+        See vllm-project/vllm-omni#4561.
+        """
+        did_work = False
+        for _ in range(self._MAX_RAW_OUTPUTS_PER_DRAIN):
+            if self._shutdown_event.is_set():
+                break
+            raw_outputs = pool.poll_llm_raw_output_nowait(replica_id)
+            if raw_outputs is None:
+                # Replica queue is drained for this round.
+                break
+            if not raw_outputs.outputs:
+                # No engine outputs in this item; nothing to route, but more may
+                # be queued behind it, so keep draining within the budget.
+                continue
+
+            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+            for eco in raw_outputs.outputs:
+                req_state = self.request_states.get(getattr(eco, "request_id", None))
+                if req_state is None or not req_state.streaming.enabled:
+                    continue
+                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
+                req_state.streaming.new_prompt_len_snapshot = getattr(
+                    eco,
+                    "new_prompt_len_snapshot",
+                    None,
+                )
+                if req_state.streaming.enabled:
+                    await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
+            # OmniSchedulerMixin.make_stats() already throttles per-scheduler at
+            # 1 Hz, so raw_outputs.scheduler_stats being non-None means this
+            # replica passed its own gate. A second global throttle here would
+            # drop stats for other (stage, replica) pairs in the same 1s window.
+            record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
+            iteration_stats = IterationStats() if record_stats else None
+            raw_output = await pool.process_llm_raw_outputs(
+                replica_id,
+                raw_outputs,
+                iteration_stats=iteration_stats,
+            )
+            if record_stats:
+                self._stat_logger.record(
+                    raw_outputs.scheduler_stats,
+                    iteration_stats,
+                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                )
+            await self._handle_processed_outputs(stage_id, replica_id, raw_output)
+            did_work = True
+        return did_work
 
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
