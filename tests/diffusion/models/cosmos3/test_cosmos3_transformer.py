@@ -131,6 +131,38 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
 
 
+def test_forward_accepts_transfer_control_latents(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    hidden_states = torch.zeros(1, 2, 1, 2, 2)
+    output = model(
+        hidden_states=hidden_states,
+        timestep=torch.tensor([1.0]),
+        text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        video_shape=(1, 2, 2),
+        fps=24.0,
+        control_latents=[torch.ones_like(hidden_states), torch.full_like(hidden_states, 2.0)],
+    )
+
+    assert tuple(output.shape) == tuple(hidden_states.shape)
+    with pytest.raises(ValueError, match="control latent shape"):
+        model(
+            hidden_states=hidden_states,
+            timestep=torch.tensor([1.0]),
+            text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+            text_mask=torch.ones(1, 2, dtype=torch.long),
+            video_shape=(1, 2, 2),
+            fps=24.0,
+            control_latents=[torch.zeros(1, 2, 2, 2, 2)],
+        )
+
+
 def test_forward_gathers_gen_tokens_before_unpatchify(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
@@ -354,3 +386,33 @@ def test_compute_rope_freqs_places_text_video_action_and_sound_positions() -> No
     _, gen_pos = rotary.position_ids
     assert gen_pos.shape == (3, 1, 5)
     assert gen_pos[0, 0].tolist() == [102, 103, 103, 104, 102]
+
+    rotary.position_ids.clear()
+    model._compute_rope_freqs(
+        text_mask=torch.tensor([[1, 1]], dtype=torch.long),
+        t=2,
+        hp=1,
+        wp=1,
+        fps=24.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        num_vision_items=3,
+        share_vision_temporal_positions=True,
+    )
+    _, shared_gen_pos = rotary.position_ids
+    assert shared_gen_pos[0, 0].tolist() == [102, 103, 102, 103, 102, 103]
+
+    rotary.position_ids.clear()
+    model._compute_rope_freqs(
+        text_mask=torch.tensor([[1, 1]], dtype=torch.long),
+        t=2,
+        hp=1,
+        wp=1,
+        fps=24.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        num_vision_items=3,
+        share_vision_temporal_positions=False,
+    )
+    _, offset_gen_pos = rotary.position_ids
+    assert offset_gen_pos[0, 0].tolist() == [102, 103, 104, 105, 106, 107]

@@ -423,6 +423,7 @@ def test_decode_video_bytes_can_keep_last_frames():
     )
 
     assert len(frames) == 2
+    assert frames.fps == pytest.approx(8.0)
     red_means = [np.asarray(frame)[:, :, 0].mean() for frame in frames]
     assert red_means[0] > 100
     assert red_means[1] > red_means[0]
@@ -520,9 +521,47 @@ def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):
     engine = test_client.app.state.openai_serving_video._engine_client
     captured = engine.captured_sampling_params_list[0]
     assert captured.num_frames == 72
-    assert captured.fps == 24
-    assert captured.frame_rate == 24.0
+    # fps omitted -> sampling params carry None (the "not provided" signal); the 24
+    # default is applied only at output encoding.
+    assert captured.fps is None
+    assert captured.frame_rate is None
     assert fps_values == [24]
+
+
+def test_model_reported_fps_wins_when_request_fps_omitted(test_client, mocker: MockerFixture):
+    fps_values = []
+
+    def _fake_encode(video, fps, audio=None, audio_sample_rate=None, **kwargs):
+        del video, audio, audio_sample_rate, kwargs
+        fps_values.append(fps)
+        return b"fake-video"
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        side_effect=_fake_encode,
+    )
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        engine.captured_prompt = prompt
+        engine.captured_sampling_params_list = sampling_params_list
+        result = MockVideoResult([object()])
+        result.multimodal_output["fps"] = 8
+        yield result
+
+    engine.generate = _generate
+
+    response = test_client.post("/v1/videos", data={"prompt": "source fps"})
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    captured = engine.captured_sampling_params_list[0]
+    # fps omitted -> None on the sampling params; the model-reported fps (8) wins for output.
+    assert captured.fps is None
+    assert captured.frame_rate is None
+    assert fps_values == [8]
 
 
 def test_size_param_sets_width_height(test_client, mocker: MockerFixture):

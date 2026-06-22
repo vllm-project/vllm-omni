@@ -10,6 +10,7 @@ This example demonstrates how to deploy text-to-video models for online video ge
 | Wan2.1 T2V (14B) | `Wan-AI/Wan2.1-T2V-14B-Diffusers` |
 | Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
 | LTX-2 | `Lightricks/LTX-2` |
+| Helios (Base / Mid / Distilled) | `BestWishYsh/Helios-Base`, `Helios-Mid`, `Helios-Distilled` |
 
 ## Wan2.2 T2V
 
@@ -322,4 +323,46 @@ curl -sS -X POST http://localhost:8098/v1/videos \
   -F "num_inference_steps=20" \
   -F "guidance_scale=3.0" \
   -F "seed=42"
+```
+
+## Helios
+
+Helios ships three variants (`Helios-Base`, `Helios-Mid`, `Helios-Distilled`) that
+share the same server launch. Variant-specific knobs (declared in
+`vllm_omni/model_extras/helios.py`) are sent per request through the generic
+`extra_params` JSON form field — no per-model server flags required.
+
+### Start Server
+
+```bash
+vllm serve BestWishYsh/Helios-Base --omni --port 8098
+# or: MODEL=BestWishYsh/Helios-Mid bash run_server_helios.sh
+```
+
+### Send Requests (curl)
+
+```bash
+# Helios-Base (Stage 1 only)
+bash run_curl_helios.sh
+
+# Helios-Mid (Stage 2 pyramid + CFG-Zero*)
+PRESET=mid-stage2 MODEL=BestWishYsh/Helios-Mid bash run_curl_helios.sh
+
+# Helios-Distilled (Stage 2 pyramid + DMD, few-step)
+PRESET=distilled MODEL=BestWishYsh/Helios-Distilled bash run_curl_helios.sh
+```
+
+The `mid-stage2` and `distilled` presets attach an `extra_params` field, e.g. for Helios-Distilled:
+
+```bash
+curl -sS -X POST http://localhost:8098/v1/videos \
+  -H "Accept: application/json" \
+  -F "prompt=A dynamic time-lapse of scenery rushing past the window of a speeding train." \
+  -F "model=BestWishYsh/Helios-Distilled" \
+  -F "size=640x384" \
+  -F "num_frames=99" \
+  -F "fps=16" \
+  -F "guidance_scale=1.0" \
+  -F "seed=42" \
+  -F 'extra_params={"is_enable_stage2": true, "pyramid_num_inference_steps_list": [2, 2, 2], "is_amplify_first_chunk": true}'
 ```

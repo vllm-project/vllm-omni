@@ -18,7 +18,6 @@ nav:
     - Offline Inference:
       - BAGEL-7B-MoT: user_guide/examples/offline_inference/bagel.md
       - GLM-Image Multistage End-to-End Inference: user_guide/examples/offline_inference/glm_image.md
-      - Helios Video Generation: user_guide/examples/offline_inference/helios.md
       - HunyuanImage-3.0 Image-to-Text Inference: user_guide/examples/offline_inference/hunyuan_image3.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
