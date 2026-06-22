@@ -3,13 +3,8 @@
 """E2E offline inference test for MOSS-TTS-v1.5 (MossTTSDelay-8B).
 
 MOSS-TTS-v1.5 is a continued-training upgrade of MOSS-TTS 1.0 with the SAME
-``MossTTSDelay`` architecture and API, so it reuses the existing talker/codec
-path unchanged — this test just pins that the 8B v1.5 checkpoint loads and
-produces audio.
-
-The model is 8B, so this lives in its own file (one module-scoped engine per
-file, per skill invariant I4) and is gated behind an 80 GB GPU; the small-GPU
-MossTTSDelay coverage stays in ``test_moss_tts.py`` (1.7B VoiceGenerator).
+``MossTTSDelay`` architecture and API. The 8B checkpoint is H100-gated; small-GPU
+MossTTSDelay coverage stays in ``test_moss_tts_expansion.py``.
 """
 
 from __future__ import annotations
@@ -22,21 +17,27 @@ import torch
 from vllm import SamplingParams
 
 from tests.helpers.mark import hardware_test
-from vllm_omni import Omni
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 
-# H100-gated (8B). Picked up by the weekly "TTS · H100" job (-m "slow and H100 and tts");
-# the L4 MOSS-TTS tests land in the sibling L4 tts lane instead.
-pytestmark = [pytest.mark.slow, pytest.mark.tts]
+MODEL = "OpenMOSS-Team/MOSS-TTS-v1.5"
+DEPLOY_CONFIG = get_deploy_config_path("moss_tts.yaml")
+_OMNI_RUNNER_PARAM = (MODEL, DEPLOY_CONFIG, {"stage_init_timeout": 600})
+
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.tts,
+    pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
+]
 
 SAMPLE_RATE = 24_000
 REF_AUDIO_URL = "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/main/assets/audio/reference_zh_1.wav"
-_MODEL = "OpenMOSS-Team/MOSS-TTS-v1.5"
 
 _DEFAULT_SAMPLING = SamplingParams(
     temperature=1.7,
     top_p=0.8,
     top_k=25,
-    max_tokens=512,  # short for tests (~20 s at 24 kHz, ~12.5 tokens/s)
+    max_tokens=512,
     seed=42,
     detokenize=False,
 )
@@ -44,10 +45,6 @@ _DEFAULT_SAMPLING = SamplingParams(
 
 @pytest.fixture(scope="session")
 def ref_audio_path(tmp_path_factory) -> str:
-    """Download the upstream reference clip once per session.
-
-    Set ``MOSS_TTS_SKIP_ON_NET_FAIL=1`` to skip in air-gapped environments.
-    """
     target = tmp_path_factory.mktemp("moss_tts_v15_ref") / "zh_1.wav"
     try:
         with urllib.request.urlopen(REF_AUDIO_URL, timeout=30) as resp:
@@ -60,11 +57,6 @@ def ref_audio_path(tmp_path_factory) -> str:
     if not target.exists() or target.stat().st_size == 0:
         pytest.fail(f"Reference clip empty after download: {target}")
     return str(target)
-
-
-@pytest.fixture(scope="module")
-def v15_engine():
-    return Omni(model=_MODEL, stage_init_timeout=600)
 
 
 def _build_request(text: str, ref_audio_path: str) -> dict:
@@ -80,31 +72,42 @@ def _build_request(text: str, ref_audio_path: str) -> dict:
     }
 
 
-def _collect_audio(omni: Omni, request: dict) -> tuple[torch.Tensor, int]:
-    for stage_outputs in omni.generate(request, _DEFAULT_SAMPLING):
-        for req_output in stage_outputs.request_output:
-            mm = req_output.outputs[0].multimodal_output
-            assert mm is not None, "Expected non-None multimodal_output"
-            audio = mm.get("audio")
-            if audio is None:
-                audio = mm.get("model_outputs")
-            sr = mm.get("sr")
-            assert audio is not None, "Expected 'audio' or 'model_outputs' in multimodal_output"
-            if isinstance(audio, list):
-                audio = torch.cat(
-                    [t.reshape(-1) for t in audio if isinstance(t, torch.Tensor) and t.numel() > 0],
-                    dim=0,
-                )
-            assert isinstance(audio, torch.Tensor), f"Expected Tensor, got {type(audio)}"
-            return audio.reshape(-1).cpu(), int(sr.item()) if sr is not None else SAMPLE_RATE
+def _sampling_for(omni_runner: OmniRunner) -> SamplingParams | list[SamplingParams]:
+    omni = omni_runner.omni
+    if omni.num_stages == 1:
+        return _DEFAULT_SAMPLING
+    params = omni_runner.get_default_sampling_params_list()
+    params[0] = _DEFAULT_SAMPLING
+    return params
+
+
+def _collect_audio(omni_runner: OmniRunner, request: dict) -> tuple[torch.Tensor, int]:
+    for stage_outputs in omni_runner.omni.generate(request, _sampling_for(omni_runner)):
+        mm = stage_outputs.multimodal_output
+        if not mm:
+            continue
+        audio = mm.get("audio")
+        if audio is None:
+            audio = mm.get("model_outputs")
+        if audio is None:
+            continue
+        if isinstance(audio, list):
+            audio = torch.cat(
+                [t.reshape(-1) for t in audio if isinstance(t, torch.Tensor) and t.numel() > 0],
+                dim=0,
+            )
+        if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
+            continue
+        sr = mm.get("sr")
+        return audio.reshape(-1).cpu(), int(sr.item()) if sr is not None else SAMPLE_RATE
     raise AssertionError("No stage outputs received")
 
 
 @hardware_test(res={"cuda": "H100"})
-def test_moss_tts_v15_voice_clone(v15_engine, ref_audio_path):
+def test_moss_tts_v15_voice_clone(omni_runner: OmniRunner, ref_audio_path) -> None:
     """MOSS-TTS-v1.5 (8B): voice_clone produces non-empty 24 kHz audio."""
     req = _build_request("Hello, this is a MOSS-TTS v1.5 voice cloning test.", ref_audio_path)
-    audio, sr = _collect_audio(v15_engine, req)
+    audio, sr = _collect_audio(omni_runner, req)
 
     assert sr == SAMPLE_RATE, f"Expected {SAMPLE_RATE} Hz, got {sr}"
     assert audio.numel() > 0, "Audio tensor is empty"

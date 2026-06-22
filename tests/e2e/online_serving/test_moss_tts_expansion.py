@@ -3,8 +3,8 @@
 """
 E2E online tests for the full MOSS-TTS family via /v1/audio/speech.
 
-The offline suite (``tests/e2e/offline_inference/test_moss_tts.py`` and
-``test_moss_tts_v1_5.py``) covers the engine path; this file covers the
+The offline suite (``tests/e2e/offline_inference/test_moss_tts_*_expansion.py``)
+covers the engine path; this file covers the
 *serving* path (``serving_speech.py`` → ``_detect_moss_variant`` → the
 delay/realtime prompt builders), which the Nano online test does not exercise.
 
