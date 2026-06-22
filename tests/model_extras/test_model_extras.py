@@ -10,6 +10,7 @@ from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import (
     build_image_to_image_prompt,
+    build_image_to_video_prompt,
     build_text_to_image_prompt,
     get_extra_body_params,
     get_extra_output_params,
@@ -178,6 +179,14 @@ def test_helios_extra_registry_declares_request_and_response_params() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_vace_extra_registry_has_no_pipeline_params() -> None:
+    assert get_extra_body_params("WanVACEPipeline") == frozenset()
+    assert get_extra_output_params("WanVACEPipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("WanVACEPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_unknown_pipeline_has_empty_extra_registry() -> None:
     assert get_extra_body_params("UnknownPipeline") == frozenset()
     assert get_extra_output_params("UnknownPipeline") == frozenset()
@@ -251,6 +260,141 @@ def test_unknown_pipeline_uses_default_image_to_image_prompt() -> None:
         "prompt": "edit",
         "multi_modal_data": {"image": dummy_image},
     }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_unknown_pipeline_uses_default_image_to_video_prompt() -> None:
+    dummy_image = Image.new("RGB", (64, 64))
+    assert build_image_to_video_prompt(
+        "UnknownPipeline",
+        prompt="fly",
+        negative_prompt="",
+        media_inputs={"image": dummy_image},
+    ) == {
+        "prompt": "fly",
+        "negative_prompt": "",
+        "multi_modal_data": {"image": dummy_image},
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_default_image_to_video_prompt_rejects_auxiliary_media() -> None:
+    image = Image.new("RGB", (64, 64))
+    with pytest.raises(ValueError, match="only supports a single --image"):
+        build_image_to_video_prompt(
+            "UnknownPipeline",
+            prompt="fly",
+            negative_prompt=None,
+            media_inputs={"image": image, "last_image": image},
+        )
+
+
+def _build_vace_prompt(media_inputs: dict[str, object], *, num_frames: int = 5) -> dict:
+    return build_image_to_video_prompt(
+        "WanVACEPipeline",
+        prompt="a bird flying",
+        negative_prompt=None,
+        media_inputs=media_inputs,
+        height=16,
+        width=320,
+        num_frames=num_frames,
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("media_inputs", "fixed_indices", "fixed_colors"),
+    [
+        ({"image": Image.new("RGB", (320, 16), "red")}, [0], [(255, 0, 0)]),
+        ({"last_image": Image.new("RGB", (320, 16), "blue")}, [4], [(0, 0, 255)]),
+        (
+            {
+                "image": Image.new("RGB", (320, 16), "red"),
+                "last_image": Image.new("RGB", (320, 16), "blue"),
+            },
+            [0, 4],
+            [(255, 0, 0), (0, 0, 255)],
+        ),
+    ],
+    ids=["i2v", "v2lf", "flf2v"],
+)
+def test_vace_frame_conditioning(
+    media_inputs: dict[str, object],
+    fixed_indices: list[int],
+    fixed_colors: list[tuple[int, int, int]],
+) -> None:
+    multimodal_data = _build_vace_prompt(media_inputs)["multi_modal_data"]
+    video = multimodal_data["video"]
+    masks = multimodal_data["mask"]
+
+    assert len(video) == len(masks) == 5
+    assert [video[index].getpixel((0, 0)) for index in fixed_indices] == fixed_colors
+    assert [masks[index].getextrema() for index in fixed_indices] == [(0, 0)] * len(fixed_indices)
+    assert all(masks[index].getextrema() == (255, 255) for index in set(range(5)) - set(fixed_indices))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_vace_inpaint_conditioning() -> None:
+    source = Image.new("RGB", (320, 16), "red")
+    inpaint_mask = Image.new("L", (320, 16), 0)
+    inpaint_mask.paste(255, (80, 0, 240, 16))
+
+    multimodal_data = _build_vace_prompt({"image": source, "mask": inpaint_mask})["multi_modal_data"]
+    video = multimodal_data["video"]
+    masks = multimodal_data["mask"]
+
+    assert len(video) == len(masks) == 5
+    assert video[0].getpixel((0, 0)) == (255, 0, 0)
+    assert video[0].getpixel((160, 0)) == (128, 128, 128)
+    assert masks[0].getpixel((0, 0)) == 0
+    assert masks[0].getpixel((160, 0)) == 255
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_vace_reference_conditioning() -> None:
+    references = [Image.new("RGB", (64, 64), "red"), Image.new("RGB", (64, 64), "blue")]
+    result = _build_vace_prompt({"reference_images": references})
+    assert result["multi_modal_data"]["reference_images"] is references
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("media_inputs", "message"),
+    [
+        ({}, "requires a conditioning media input"),
+        ({"mask": Image.new("L", (320, 16))}, "mask input requires an image"),
+        (
+            {
+                "image": Image.new("RGB", (320, 16)),
+                "last_image": Image.new("RGB", (320, 16)),
+                "mask": Image.new("L", (320, 16)),
+            },
+            "mask and last_image inputs cannot be combined",
+        ),
+        (
+            {"image": Image.new("RGB", (320, 16)), "reference_images": [Image.new("RGB", (320, 16))]},
+            "reference images cannot be combined",
+        ),
+        ({"control_image": Image.new("RGB", (320, 16))}, "Unsupported VACE media input"),
+    ],
+)
+def test_vace_rejects_invalid_media_combinations(media_inputs: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        _build_vace_prompt(media_inputs)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_vace_first_last_conditioning_requires_two_frames() -> None:
+    image = Image.new("RGB", (320, 16))
+    with pytest.raises(ValueError, match="requires at least two frames"):
+        _build_vace_prompt({"image": image, "last_image": image}, num_frames=1)
 
 
 @pytest.mark.core_model
