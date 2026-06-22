@@ -30,10 +30,9 @@ from vllm_omni import Omni
 # Shared constants
 # ---------------------------------------------------------------------------
 
-# Selected by the nightly "TTS · Function Test" (-m "full_model and L4 and tts").
+# Selected by the weekly "TTS · L4" job (-m "slow and L4 and tts").
 # Without the tts + run-level marks these tests are collected but never run.
-# TODO: Fix this test
-# pytestmark = [pytest.mark.full_model, pytest.mark.tts]
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 SAMPLE_RATE = 24_000  # All MOSS-TTS full variants output 24 kHz
 

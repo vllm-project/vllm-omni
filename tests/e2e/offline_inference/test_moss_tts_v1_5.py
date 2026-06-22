@@ -24,11 +24,9 @@ from vllm import SamplingParams
 from tests.helpers.mark import hardware_test
 from vllm_omni import Omni
 
-# H100-gated (8B). Picked up by the nightly "TTS · Function Test with H100"
-# job (-m "full_model and H100 and tts"); the L4 MOSS-TTS tests land in the
-# sibling L4 tts lane instead.
-# TODO: Fix this test
-# pytestmark = [pytest.mark.full_model, pytest.mark.tts]
+# H100-gated (8B). Picked up by the weekly "TTS · H100" job (-m "slow and H100 and tts");
+# the L4 MOSS-TTS tests land in the sibling L4 tts lane instead.
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 SAMPLE_RATE = 24_000
 REF_AUDIO_URL = "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/main/assets/audio/reference_zh_1.wav"

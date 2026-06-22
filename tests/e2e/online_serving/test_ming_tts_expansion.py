@@ -15,7 +15,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.full_model, pytest.mark.tts]
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 MODEL = "inclusionAI/Ming-omni-tts-0.5B"
 DEPLOY_CONFIG = get_deploy_config_path("ming_tts.yaml")

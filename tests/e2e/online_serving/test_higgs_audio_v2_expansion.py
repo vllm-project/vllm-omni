@@ -31,7 +31,7 @@ from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.full_model, pytest.mark.tts]
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 MODEL = "bosonai/higgs-audio-v2-generation-3B-base"
 STAGE_CONFIG = get_deploy_config_path("higgs_audio_v2.yaml")

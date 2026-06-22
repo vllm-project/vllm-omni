@@ -32,7 +32,7 @@ TEST_TEXT = "我会一直在这里陪着你，直到你慢慢地沉入那个最�
 TEST_INSTRUCTION = "轻柔的ASMR耳语，慢速，贴近麦克风"
 MIN_AUDIO_SAMPLES = 1000
 
-pytestmark = [pytest.mark.full_model, pytest.mark.tts]
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 
 @pytest.fixture(scope="module")

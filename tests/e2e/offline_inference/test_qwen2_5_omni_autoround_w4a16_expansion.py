@@ -23,7 +23,7 @@ from tests.helpers.media import (
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.omni,
 ]
 

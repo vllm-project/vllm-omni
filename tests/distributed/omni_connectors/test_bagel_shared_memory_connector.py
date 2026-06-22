@@ -13,6 +13,7 @@ End-to-end tests for Bagel with shared memory connector: img2img and text2img.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+import socket
 from typing import Any
 
 import pytest
