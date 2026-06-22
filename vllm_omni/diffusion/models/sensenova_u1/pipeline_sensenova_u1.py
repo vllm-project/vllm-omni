@@ -504,30 +504,6 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
 
     support_image_input = True
 
-    # Model-specific parameters accepted via ``extra_body`` in the online
-    # serving API.  The serving layer reads this set and forwards matching
-    # keys from the request payload to ``OmniDiffusionSamplingParams.extra_args``.
-    EXTRA_BODY_PARAMS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "think",
-            "cfg_scale",
-            "cfg_norm",
-            "timestep_shift",
-            "t_eps",
-            "img_cfg_scale",
-            "max_tokens",
-        }
-    )
-
-    # Keys from ``DiffusionOutput.custom_output`` that should be surfaced in
-    # the API response ``metrics`` dict.  The serving layer reads this set and
-    # copies matching entries from ``custom_output`` into the response.
-    EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "think_text",
-        }
-    )
-
     # CPU-offload protocol: language_model carries the denoising blocks; the
     # vision and FM modules are lightweight encoders pinned on GPU during the
     # diffusion loop. There is no separate VAE.
@@ -558,6 +534,8 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             self.llm_cfg,
             prefix="language_model",
         )
+        # We define this for Cache DiT compatibility
+        self.transformer = self.language_model.model
 
         # Vision model (understanding branch)
         self.vision_model = NEOVisionModel(self.vis_cfg)

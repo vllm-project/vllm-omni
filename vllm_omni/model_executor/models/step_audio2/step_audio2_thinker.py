@@ -609,7 +609,7 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
     Architecture:
         AudioEncoder (6 layers, 512 hidden) →
         Adaptor (512 → LLM dim) →
-        Qwen2 LLM (vocab=64012)
+        Qwen2 LLM (vocab=158720)
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -868,31 +868,3 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
     def has_audio_output(token_ids: list[int], audio_start: int = DEFAULT_TOKEN_CONFIG.audio_start) -> bool:
         """Check if generated tokens contain audio tokens"""
         return any(tid >= audio_start for tid in token_ids)
-
-
-class StepAudio2OutputProcessor:
-    """Helper class to process Step-Audio2 outputs"""
-
-    @staticmethod
-    def process_output(output_ids: torch.Tensor, tokenizer, remove_audio_padding: bool = True) -> dict:
-        """Process model output and separate text/audio tokens"""
-        if isinstance(output_ids, torch.Tensor):
-            output_ids = output_ids.squeeze().tolist()
-
-        # Separate tokens
-        text_tokens, audio_tokens = StepAudio2ThinkerForConditionalGeneration.separate_tokens(output_ids)
-
-        # Remove audio padding if requested
-        if remove_audio_padding and audio_tokens:
-            audio_tokens = [t for t in audio_tokens if t < DEFAULT_TOKEN_CONFIG.audio_eos]
-
-        # Decode text
-        text = tokenizer.decode(text_tokens, skip_special_tokens=False)
-
-        return {
-            "text": text,
-            "text_tokens": text_tokens,
-            "audio_tokens": audio_tokens,
-            "has_audio": len(audio_tokens) > 0,
-            "all_tokens": output_ids,
-        }

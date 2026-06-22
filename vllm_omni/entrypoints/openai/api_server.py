@@ -137,13 +137,14 @@ from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
 )
-from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
+from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url, decode_input_reference
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 logger = init_logger(__name__)
@@ -473,6 +474,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         _register_omni_exception_handlers(app)
 
         await omni_init_app_state(engine_client, app.state, args)
+
+        # Start background processes
+        await STORAGE_MANAGER.start()
 
         # Conditionally register profiler endpoints based on stage YAML configs
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -1055,7 +1059,11 @@ async def omni_init_app_state(
     )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+        engine_client,
+        state.openai_serving_models,
+        request_logger=request_logger,
+        model_name=model_name,
+        forced_aligner_config=build_forced_aligner_config(args),
     )
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
@@ -1192,7 +1200,7 @@ _remove_route_from_router(router, "/v1/audio/speech", {"POST"})
     "/v1/audio/speech",
     dependencies=[Depends(validate_json_request)],
     responses={
-        HTTPStatus.OK.value: {"content": {"audio/*": {}}},
+        HTTPStatus.OK.value: {"content": {"audio/*": {}, "text/event-stream": {}}},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
@@ -2690,12 +2698,11 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
     )
 
 
-def _cleanup_video(video_id: str, output_path: str | None):
+async def _cleanup_video(video_id: str):
     try:
-        if output_path is not None:
-            os.remove(output_path)
-    except OSError:
-        logger.warning("Failed to cleanup partial video file '%s' for id=%s", output_path, video_id)
+        await STORAGE_MANAGER.delete(video_id)
+    except Exception:
+        logger.warning("Failed to cleanup partial video file '%s'", video_id)
 
 
 async def _run_video_generation_job(
@@ -2714,7 +2721,6 @@ async def _run_video_generation_job(
 
     await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
     started_at = time.perf_counter()
-    output_path = None
     try:
         video_bytes, stage_durations, peak_memory_mb, action = await handler.generate_video_bytes(
             request,
@@ -2724,27 +2730,27 @@ async def _run_video_generation_job(
             reference_audio=reference_audio,
         )
 
-        file_name = f"{video_id}.{job.file_extension}"
-        output_path = await STORAGE_MANAGER.save(video_bytes, file_name)
-        logger.info("Video request %s persisted %s output file.", video_id, output_path)
+        save_context = await STORAGE_MANAGER.save(video_bytes, video_id)
+        logger.info("Video request %s persisted %s output file.", video_id, save_context.key)
 
-        await VIDEO_STORE.update_fields(
-            video_id,
-            {
-                "status": VideoGenerationStatus.COMPLETED,
-                "progress": 100,
-                "file_name": file_name,
-                "completed_at": int(time.time()),
-                "inference_time_s": time.perf_counter() - started_at,
-                "stage_durations": stage_durations,
-                "peak_memory_mb": peak_memory_mb,
-                "action": action,
-            },
-        )
+        updated_fields = {
+            "status": VideoGenerationStatus.COMPLETED,
+            "progress": 100,
+            "file_name": f"{video_id}.{job.file_extension}",
+            "completed_at": save_context.created_at,
+            "inference_time_s": time.perf_counter() - started_at,
+            "stage_durations": stage_durations,
+            "peak_memory_mb": peak_memory_mb,
+            "action": action,
+        }
+        if save_context.expires_at is not None:
+            updated_fields["expires_at"] = save_context.expires_at
+
+        await VIDEO_STORE.update_fields(video_id, updated_fields)
     except (EngineGenerateError, EngineDeadError) as exc:
         logger.exception("Video generation failed (engine error) for id=%s", video_id)
 
-        _cleanup_video(video_id, output_path)
+        await _cleanup_video(video_id)
         await VIDEO_STORE.update_fields(
             video_id,
             {
@@ -2764,7 +2770,7 @@ async def _run_video_generation_job(
     except Exception as exc:
         logger.exception("Video generation failed for id=%s", video_id)
 
-        _cleanup_video(video_id, output_path)
+        await _cleanup_video(video_id)
         await VIDEO_STORE.update_fields(
             video_id,
             {
@@ -2775,7 +2781,7 @@ async def _run_video_generation_job(
             },
         )
     except asyncio.CancelledError:
-        _cleanup_video(video_id, output_path)
+        await _cleanup_video(video_id)
         await VIDEO_STORE.pop(video_id)
         raise
     finally:
@@ -3163,7 +3169,7 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
     elif job.status is VideoGenerationStatus.FAILED:
         if job.file_name is not None:
             try:
-                await STORAGE_MANAGER.delete(job.file_name)
+                await STORAGE_MANAGER.delete(video_id)
             except Exception:
                 logger.warning("Failed to delete stored artifact for failed video job %s", video_id, exc_info=True)
 
@@ -3173,13 +3179,13 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
     if job.file_name is None:
         raise HTTPException(status_code=409, detail="Video output not yet available. Please try again later.")
 
-    await STORAGE_MANAGER.delete(job.file_name)
+    await STORAGE_MANAGER.delete(video_id)
     await VIDEO_STORE.pop(video_id)
     return VideoDeleteResponse(id=job.id, deleted=True)
 
 
 @router.get("/v1/videos/{video_id}/content")
-async def download_video(video_id: str) -> FileResponse:
+async def download_video(video_id: str) -> Response:
     """Download the generated file for a completed video job.
 
     Args:
@@ -3202,11 +3208,19 @@ async def download_video(video_id: str) -> FileResponse:
     if not job.file_name:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
 
-    full_path = STORAGE_MANAGER.get_full_file_path(job.file_name)
-    if not os.path.exists(full_path):
+    file_handle = await STORAGE_MANAGER.open(video_id)
+    if file_handle is None:
         raise HTTPException(status_code=404, detail="Generated video file not found on disk")
 
-    return FileResponse(path=full_path, media_type=job.media_type, filename=job.file_name)
+    file_name = job.file_name or f"{video_id}.{job.file_extension}"
+    if isinstance(file_handle, FileStorageHandle):
+        response = FileResponse(path=file_handle.path, media_type=job.media_type, filename=file_name)
+    else:
+        raise HTTPException(
+            status_code=500, detail=f"Server generated an unsupported file storage handle for file id {video_id}"
+        )
+
+    return response
 
 
 @profiler_router.post("/start_profile")
@@ -3225,9 +3239,9 @@ async def start_profile(raw_request: Request, request: ProfileRequest | None = N
         stages = request.stages if request else None
         logger.info("Starting profiler for stages: %s", stages if stages else "all")
         engine_client = raw_request.app.state.engine_client
-        result = await engine_client.start_profile(stages=stages)
+        await engine_client.start_profile(stages=stages)
         logger.info("Profiler started.")
-        return JSONResponse(content=result)
+        return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:
         logger.exception("Failed to start profiler: %s", e)
         raise HTTPException(
@@ -3251,9 +3265,9 @@ async def stop_profile(raw_request: Request, request: ProfileRequest | None = No
         stages = request.stages if request else None
         logger.info("Stopping profiler for stages: %s", stages if stages else "all")
         engine_client = raw_request.app.state.engine_client
-        result = await engine_client.stop_profile(stages=stages)
+        await engine_client.stop_profile(stages=stages)
         logger.info("Profiler stopped.")
-        return JSONResponse(content=result)
+        return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:
         logger.exception("Failed to stop profiler: %s", e)
         raise HTTPException(
