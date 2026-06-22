@@ -153,6 +153,9 @@ async def stream_tts(
         current_sentence_text = ""
         current_chunks: list[bytes] = []
         current_timestamps: list[dict] = []
+        # Distinguish `null` (aligner failed) from `[]` (silence / no tokens):
+        # the sentence is a failure only if no frame ever carried timestamps.
+        alignment_frame_seen = False
 
         try:
             while True:
@@ -171,6 +174,7 @@ async def stream_tts(
                         current_sentence_text = msg.get("sentence_text", "")
                         current_chunks = []
                         current_timestamps = []
+                        alignment_frame_seen = False
                         print(f"  [sentence {msg['sentence_index']}] Generating: {current_sentence_text!r}")
                     elif msg_type == "audio.chunk":
                         audio = base64.b64decode(msg["audio_b64"])
@@ -210,6 +214,7 @@ async def stream_tts(
                                 f"{len(audio)} bytes, timestamps unavailable"
                             )
                         else:
+                            alignment_frame_seen = True
                             current_timestamps.extend(chunk_timestamps)
                             print(
                                 f"  [sentence {msg['sentence_index']}] chunk {msg['chunk_id']}: "
@@ -225,6 +230,8 @@ async def stream_tts(
                             current_chunks,
                         )
                         if word_timestamps:
+                            # `null` on failure, else the accumulated list (`[]` for silence).
+                            sentence_timestamps = current_timestamps if alignment_frame_seen else None
                             ts_filename = os.path.join(
                                 output_dir,
                                 f"sentence_{msg['sentence_index']:03d}_timestamps.json",
@@ -234,8 +241,8 @@ async def stream_tts(
                                     {
                                         "sentence_index": msg["sentence_index"],
                                         "sentence_text": current_sentence_text,
-                                        "covered_text": timestamp_words_text(current_timestamps),
-                                        "timestamps": current_timestamps,
+                                        "covered_text": timestamp_words_text(sentence_timestamps),
+                                        "timestamps": sentence_timestamps,
                                     },
                                     f,
                                     ensure_ascii=False,
@@ -251,6 +258,7 @@ async def stream_tts(
                             print(f"  [sentence {msg['sentence_index']}] Timestamps -> {ts_filename}")
                         current_chunks = []
                         current_timestamps = []
+                        alignment_frame_seen = False
                     elif msg_type == "session.done":
                         print(f"\nSession complete: {msg['total_sentences']} sentence(s) generated")
                         break
