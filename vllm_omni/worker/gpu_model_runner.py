@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
@@ -46,6 +47,30 @@ else:
     )
 
 logger = init_logger(__name__)
+
+
+def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return only M-RoPE kwargs accepted by the model implementation."""
+    method = getattr(model, "get_mrope_input_positions")
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return kwargs
+
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return kwargs
+
+    accepted = {
+        name
+        for name, param in signature.parameters.items()
+        if name not in {"self", "input_tokens"}
+        and param.kind
+        in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    }
+    return {key: value for key, value in kwargs.items() if key in accepted}
 
 
 class OmniGPUModelRunner(GPUModelRunner):
@@ -338,7 +363,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 kwargs["target_w"] = target_w
             req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
-                **kwargs,
+                **_filter_mrope_kwargs_for_model(self.model, kwargs),
             )
         else:
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(

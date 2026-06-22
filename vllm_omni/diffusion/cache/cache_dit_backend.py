@@ -10,11 +10,19 @@ pipelines in vllm-omni, supporting both single and dual-transformer architecture
 import functools
 from collections.abc import Callable
 from contextlib import ExitStack
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Optional, TypeAlias
 
 import cache_dit
 import torch
-from cache_dit import BlockAdapter, DBCacheConfig, ForwardPattern, ParamsModifier, TaylorSeerCalibratorConfig
+from cache_dit import (
+    BlockAdapter,
+    CalibratorConfig,
+    DBCacheConfig,
+    ForwardPattern,
+    ParamsModifier,
+    TaylorSeerCalibratorConfig,
+)
 from cache_dit.caching.block_adapters import FakeDiffusionPipeline
 from cache_dit.caching.cache_adapters.cache_adapter import CachedAdapter
 from cache_dit.caching.cache_blocks.pattern_0_1_2 import CachedBlocks_Pattern_0_1_2
@@ -25,9 +33,28 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig, OmniDiffusionConfig
-from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
 
 logger = init_logger(__name__)
+
+RefreshCacheContextFunc: TypeAlias = Callable[[Any, int, bool], None]
+
+
+@dataclass
+class CacheDiTAdapterConfig:
+    """Config for creating a Cache DiT's block adapter; to enable CacheDiT,
+    most models just need to define an instance of this class as a class
+    var in the DiT.
+    """
+
+    block_forward_patterns: dict[str, ForwardPattern]
+    has_separate_cfg: bool = False
+    cached_adapter_cls: type[CachedAdapter] | None = None
+    check_forward_pattern: bool = True
+
+
+# Registry of custom cache-dit enablers for specific models
+# Maps pipeline names to their cache-dit enablement functions
+CUSTOM_DIT_ENABLERS: dict[str, Callable] = {}
 
 
 # Small helper to centralize cache-dit summaries.
@@ -37,14 +64,60 @@ def cache_summary(pipeline: Any, details: bool = True) -> None:
         cache_dit.summary(pipeline.transformer_2, details=details)
 
 
-# Registry of custom cache-dit enablers for specific models
-# Maps pipeline names to their cache-dit enablement functions
-# Models in this registry require custom handling (e.g., dual-transformer architectures)
-# Will be populated after function definitions
-CUSTOM_DIT_ENABLERS: dict[str, Callable] = {}
+def default_get_pipeline_transformer(pipeline: Any) -> Any:
+    return pipeline.transformer
 
 
-def _build_db_cache_config(cache_config: Any) -> DBCacheConfig:
+def build_cache_context_refresh(
+    cache_config: DiffusionCacheConfig,
+    get_pipeline_transformer: Callable[[Any], Any] = default_get_pipeline_transformer,
+) -> RefreshCacheContextFunc:
+    """Build the cache context refresh func for a single Transformer."""
+
+    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        """Refresh cache context for the transformer with new num_inference_steps.
+
+        Args:
+            pipeline: The pipeline instance.
+            num_inference_steps: New number of inference steps.
+        """
+        transformer = get_pipeline_transformer(pipeline)
+
+        # Bypass SCM for step counts that don't support predefined masks (e.g., vLLM's 1-step dummy run)
+        scm_supported_steps = num_inference_steps >= 8 or num_inference_steps in (4, 6)
+
+        if cache_config.scm_steps_mask_policy is None or not scm_supported_steps:
+            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+        else:
+            cache_dit.refresh_context(
+                transformer,
+                cache_config=DBCacheConfig().reset(
+                    num_inference_steps=num_inference_steps,
+                    steps_computation_mask=cache_dit.steps_mask(
+                        mask_policy=cache_config.scm_steps_mask_policy,
+                        total_steps=num_inference_steps,
+                    ),
+                    steps_computation_policy=cache_config.scm_steps_policy,
+                ),
+                verbose=verbose,
+            )
+
+    return refresh_cache_context
+
+
+def _resolve_calibrator_config(cache_config: DiffusionCacheConfig) -> CalibratorConfig | None:
+    """Resolves the Calibrator subconfig For DiT cache."""
+    calibrator = None
+    if cache_config.enable_taylorseer:
+        taylorseer_order = cache_config.taylorseer_order
+        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+    # In the future, more calibrators will likely be added to DiT Cache,
+    # e.g., focal; handle them generically here.
+    return calibrator
+
+
+def _build_db_cache_config(cache_config: DiffusionCacheConfig) -> DBCacheConfig:
     """Build DBCacheConfig with optional SCM (Step Computation Masking) support.
 
     Args:
@@ -53,9 +126,8 @@ def _build_db_cache_config(cache_config: Any) -> DBCacheConfig:
     Returns:
         DBCacheConfig instance with SCM support if configured.
     """
-
     return DBCacheConfig(
-        # we will refresh the context when gets num_inference_steps in the first inference request
+        # we will refresh the context when we get num_inference_steps in the first inference request
         num_inference_steps=None,
         Fn_compute_blocks=cache_config.Fn_compute_blocks,
         Bn_compute_blocks=cache_config.Bn_compute_blocks,
@@ -68,7 +140,100 @@ def _build_db_cache_config(cache_config: Any) -> DBCacheConfig:
     )
 
 
-def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+def enable_cache_for_dit(
+    pipeline: Any,
+    cache_config: Any,
+    block_adapter: BlockAdapter | None = None,
+    adapter_cls: type[CachedAdapter] | None = None,
+) -> RefreshCacheContextFunc:
+    """Enable cache-dit for regular single-transformer DiT models.
+
+    Args:
+        pipeline: The diffusion pipeline instance.
+        cache_config: DiffusionCacheConfig instance with cache configuration.
+        block_adapter: Custom block adapters for specific model architectures.
+        adapter_cls: Custom cached adapter class for specific model architectures.
+
+    Returns:
+        A refresh function that can be called to update cache context with new num_inference_steps.
+    """
+    # Build DBCacheConfig with optional SCM support
+    db_cache_config = _build_db_cache_config(cache_config)
+
+    # Build calibrator config if TaylorSeer is enabled
+    calibrator_config = _resolve_calibrator_config(cache_config)
+
+    logger.info(
+        f"Enabling cache-dit on transformer: "
+        f"Fn={db_cache_config.Fn_compute_blocks}, "
+        f"Bn={db_cache_config.Bn_compute_blocks}, "
+        f"W={db_cache_config.max_warmup_steps}, "
+    )
+
+    # Enable cache-dit on the transformer
+    transformer = default_get_pipeline_transformer(pipeline)
+
+    # If we have a custom cached adapter subclass, call apply directly
+    if adapter_cls is not None:
+        adapter_cls.apply(
+            transformer if block_adapter is None else block_adapter,
+            cache_config=db_cache_config,
+            calibrator_config=calibrator_config,
+        )
+    else:
+        # Otherwise, call enable cache, which will call CachedAdapter.apply for us
+        cache_dit.enable_cache(
+            transformer if block_adapter is None else block_adapter,
+            cache_config=db_cache_config,
+            calibrator_config=calibrator_config,
+        )
+
+    return build_cache_context_refresh(cache_config)
+
+
+### Complex / custom enablers for DiT cache
+# NOTE (Alex): This case is rare; you should only really need to do this if you have a dual transformer
+# architecture, since it hasn't been handled generically yet, or if the model class has unique attributes
+# that it sets during Cache DiT enablement.
+#
+# For the vast majority of models, you should only need to add a _cache_dit_adapter_config attribute
+# to the Transformer class, which controls the forward pattern, whether or not we have separate CFG,
+# and so on.
+
+
+# from https://github.com/vipshop/cache-dit/pull/542
+def _split_wan22_inference_steps(pipeline, num_inference_steps: int) -> tuple[int, int]:
+    """Split inference steps into high-noise and low-noise steps for Wan2.2.
+
+    This is an internal helper function specific to Wan2.2's dual-transformer
+    architecture that uses boundary_ratio to determine the split point.
+
+    Args:
+        num_inference_steps: Total number of inference steps.
+
+    Returns:
+        A tuple of (num_high_noise_steps, num_low_noise_steps).
+    """
+    if pipeline.boundary_ratio is not None:
+        boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
+    else:
+        boundary_timestep = None
+
+    # Set timesteps to calculate the split
+    device = next(pipeline.transformer.parameters()).device
+    pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
+
+    timesteps = pipeline.scheduler.timesteps
+    num_high_noise_steps = 0  # high-noise steps for transformer
+    for t in timesteps:
+        if boundary_timestep is None or t >= boundary_timestep:
+            num_high_noise_steps += 1
+    # low-noise steps for transformer_2
+    num_low_noise_steps = num_inference_steps - num_high_noise_steps
+    return num_high_noise_steps, num_low_noise_steps
+
+
+def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheContextFunc:
     """Enable cache-dit for Wan2.2 single or dual-transformer architecture.
 
     Wan2.2 can use single or dual transformers (transformer and transformer_2) that need
@@ -81,10 +246,11 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
     Returns:
         A refresh function that can be called to update cache context with new num_inference_steps.
     """
+    # Build DBCacheConfig with optional SCM support
+    db_cache_config = _build_db_cache_config(cache_config)
 
     if getattr(pipeline, "transformer_2", None) is None:
         logger.info("transformer_2 not found, enabling cache-dit for single transformer mode")
-        db_cache_config = _build_db_cache_config(cache_config)
         cache_dit.enable_cache(
             BlockAdapter(
                 transformer=pipeline.transformer,
@@ -97,27 +263,7 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
             ),
             cache_config=db_cache_config,
         )
-
-        def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-            """Refresh cache context for single transformer."""
-            if cache_config.scm_steps_mask_policy is None:
-                cache_dit.refresh_context(
-                    pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose
-                )
-            else:
-                cache_dit.refresh_context(
-                    pipeline.transformer,
-                    cache_config=DBCacheConfig().reset(
-                        num_inference_steps=num_inference_steps,
-                        steps_computation_mask=cache_dit.steps_mask(
-                            mask_policy=cache_config.scm_steps_mask_policy, total_steps=num_inference_steps
-                        ),
-                        steps_computation_policy=cache_config.scm_steps_policy,
-                    ),
-                    verbose=verbose,
-                )
-
-        return refresh_cache_context
+        return build_cache_context_refresh(cache_config)
 
     cache_dit.enable_cache(
         BlockAdapter(
@@ -150,47 +296,11 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
             ],
             has_separate_cfg=True,
         ),
-        cache_config=DBCacheConfig(
-            Fn_compute_blocks=cache_config.Fn_compute_blocks,
-            Bn_compute_blocks=cache_config.Bn_compute_blocks,
-            max_warmup_steps=cache_config.max_warmup_steps,
-            max_cached_steps=cache_config.max_cached_steps,
-            max_continuous_cached_steps=cache_config.max_continuous_cached_steps,
-            residual_diff_threshold=cache_config.residual_diff_threshold,
-            num_inference_steps=None,
-        ),
+        cache_config=db_cache_config,
     )
 
-    # from https://github.com/vipshop/cache-dit/pull/542
-    def _split_inference_steps(num_inference_steps: int) -> tuple[int, int]:
-        """Split inference steps into high-noise and low-noise steps for Wan2.2.
-
-        This is an internal helper function specific to Wan2.2's dual-transformer
-        architecture that uses boundary_ratio to determine the split point.
-
-        Args:
-            num_inference_steps: Total number of inference steps.
-
-        Returns:
-            A tuple of (num_high_noise_steps, num_low_noise_steps).
-        """
-        if pipeline.boundary_ratio is not None:
-            boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
-        else:
-            boundary_timestep = None
-
-        # Set timesteps to calculate the split
-        device = next(pipeline.transformer.parameters()).device
-        pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
-
-        timesteps = pipeline.scheduler.timesteps
-        num_high_noise_steps = 0  # high-noise steps for transformer
-        for t in timesteps:
-            if boundary_timestep is None or t >= boundary_timestep:
-                num_high_noise_steps += 1
-        # low-noise steps for transformer_2
-        num_low_noise_steps = num_inference_steps - num_high_noise_steps
-        return num_high_noise_steps, num_low_noise_steps
+    refresh_trans_one = build_cache_context_refresh(cache_config)
+    refresh_trans_two = build_cache_context_refresh(cache_config, lambda pipeline: pipeline.transformer_2)
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context for both transformers with new num_inference_steps.
@@ -199,50 +309,14 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
             pipeline: The Wan2.2 pipeline instance.
             num_inference_steps: New number of inference steps.
         """
-
-        num_high_noise_steps, num_low_noise_steps = _split_inference_steps(num_inference_steps)
-        # Refresh context for high-noise transformer
-        if cache_config.scm_steps_mask_policy is None:
-            # cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_high_noise_steps, verbose=verbose)
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                num_inference_steps=num_high_noise_steps,
-                verbose=verbose,
-            )
-            cache_dit.refresh_context(
-                pipeline.transformer_2,
-                num_inference_steps=num_low_noise_steps,
-                verbose=verbose,
-            )
-        else:
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_high_noise_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy, total_steps=num_high_noise_steps
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-            cache_dit.refresh_context(
-                pipeline.transformer_2,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_low_noise_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy, total_steps=num_low_noise_steps
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
+        num_high_noise_steps, num_low_noise_steps = _split_wan22_inference_steps(pipeline, num_inference_steps)
+        refresh_trans_one(pipeline, num_high_noise_steps, verbose)
+        refresh_trans_two(pipeline, num_low_noise_steps, verbose)
 
     return refresh_cache_context
 
 
-def enable_cache_for_wan22_s2v(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+def enable_cache_for_wan22_s2v(pipeline: Any, cache_config: Any) -> RefreshCacheContextFunc:
     """Enable cache-dit for Wan2.2 S2V.
 
     S2V uses a single transformer, but unlike the other Wan2.2 variants its
@@ -302,557 +376,6 @@ def enable_cache_for_wan22_s2v(pipeline: Any, cache_config: Any) -> Callable[[in
         else:
             cache_dit.refresh_context(
                 pipeline.transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_longcat_image(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for LongCatImage pipeline.
-
-    Args:
-        pipeline: The LongCatImage pipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-    """
-    # Build DBCacheConfig for transformer
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    # Build ParamsModifier for transformer
-    modifier = ParamsModifier(
-        cache_config=db_cache_config,
-        calibrator_config=calibrator,
-    )
-
-    logger.info(
-        f"Enabling cache-dit on LongCatImage transformer with BlockAdapter: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    # Enable cache-dit using BlockAdapter for transformer
-    cache_dit.enable_cache(
-        (
-            BlockAdapter(
-                transformer=pipeline.transformer,
-                blocks=[
-                    pipeline.transformer.transformer_blocks,
-                    pipeline.transformer.single_transformer_blocks,
-                ],
-                forward_pattern=[ForwardPattern.Pattern_1, ForwardPattern.Pattern_1],
-                params_modifiers=[modifier],
-                has_separate_cfg=True,
-            )
-        ),
-        cache_config=db_cache_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        """Refresh cache context for the transformer with new num_inference_steps.
-
-        Args:
-            pipeline: The LongCatImage pipeline instance.
-            num_inference_steps: New number of inference steps.
-        """
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_flux(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for Flux.1-dev pipeline.
-
-    Args:
-        pipeline: The Flux pipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-    Returns:
-        A refresh function that can be called with a new ``num_inference_steps``
-        to update the cache context for the pipeline.
-    """
-    # Build DBCacheConfig for transformer
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    # Build ParamsModifier for transformer
-    modifier = ParamsModifier(
-        cache_config=db_cache_config,
-        calibrator_config=calibrator,
-    )
-
-    logger.info(
-        f"Enabling cache-dit on Flux transformer with BlockAdapter: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    # Enable cache-dit using BlockAdapter for transformer
-    cache_dit.enable_cache(
-        (
-            BlockAdapter(
-                transformer=pipeline.transformer,
-                blocks=[
-                    pipeline.transformer.transformer_blocks,
-                    pipeline.transformer.single_transformer_blocks,
-                ],
-                forward_pattern=[ForwardPattern.Pattern_1, ForwardPattern.Pattern_1],
-                params_modifiers=[modifier],
-            )
-        ),
-        cache_config=db_cache_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        """Refresh cache context for the transformer with new num_inference_steps.
-
-        Args:
-            pipeline: The Flux pipeline instance.
-            num_inference_steps: New number of inference steps.
-        """
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_flux2_klein(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for FLUX.2-klein-4B pipeline.
-
-    Args:
-        pipeline: The FLUX.2-klein-4B pipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-    Returns:
-        A refresh function that can be called with a new ``num_inference_steps``
-        to update the cache context for the pipeline.
-    """
-    # Build DBCacheConfig for transformer
-    db_cache_config = _build_db_cache_config(cache_config)
-    # The Fn_compute_blocks = 2 override is the most important decision here,
-    # and the rationale (quality degradation at Fn=1) only lives in flux2_klein.
-    db_cache_config.Fn_compute_blocks = 2
-
-    calibrator = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    # Build ParamsModifier for transformer
-    modifier = ParamsModifier(
-        cache_config=db_cache_config,
-        calibrator_config=calibrator,
-    )
-
-    logger.info(
-        f"Enabling cache-dit on Flux2-Klein transformer with BlockAdapter: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    # Enable cache-dit using BlockAdapter for transformer
-    cache_dit.enable_cache(
-        (
-            BlockAdapter(
-                transformer=pipeline.transformer,
-                blocks=[
-                    pipeline.transformer.transformer_blocks,
-                    pipeline.transformer.single_transformer_blocks,
-                ],
-                forward_pattern=[ForwardPattern.Pattern_1, ForwardPattern.Pattern_2],
-                params_modifiers=[modifier],
-            )
-        ),
-        cache_config=db_cache_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        """Refresh cache context for the transformer with new num_inference_steps.
-
-        Args:
-            pipeline: The FLUX.2-klein-4B pipeline instance.
-            num_inference_steps: New number of inference steps.
-        """
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    Fn_compute_blocks=db_cache_config.Fn_compute_blocks,
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_stable_audio_open(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for Stable Audio Open pipeline.
-
-    Args:
-        pipeline: The StableAudioPipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-
-    Returns:
-        A refresh function that can be called to update cache context with new num_inference_steps.
-    """
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator_config = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    # StableAudio is officially registered in CacheDiT as Pattern_3:
-    # https://github.com/vipshop/cache-dit/blob/69e82bd1/src/cache_dit/caching/block_adapters/__init__.py#L562
-    #
-    # Pattern_3 is required because StableAudioDiT uses cross-attention
-    # with static encoder_hidden_states that do not change inside the
-    # transformer block loop.
-    cache_dit.enable_cache(
-        BlockAdapter(
-            transformer=pipeline.transformer,
-            blocks=pipeline.transformer.transformer_blocks,
-            forward_pattern=ForwardPattern.Pattern_3,
-            params_modifiers=[
-                ParamsModifier(
-                    cache_config=db_cache_config,
-                    calibrator_config=calibrator_config,
-                )
-            ],
-        ),
-        cache_config=db_cache_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        """Refresh cache context for the transformer with new num_inference_steps.
-
-        Args:
-            pipeline: The StableAudioPipeline instance.
-            num_inference_steps: New number of inference steps.
-            verbose: Whether to log refresh operations.
-        """
-        # Bypass SCM for step counts that don't support predefined masks (e.g., vLLM's 1-step dummy run)
-        scm_supported_steps = num_inference_steps >= 8 or num_inference_steps in (4, 6)
-
-        if cache_config.scm_steps_mask_policy is None or not scm_supported_steps:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            updated_scm_config = DBCacheConfig().reset(
-                num_inference_steps=num_inference_steps,
-                steps_computation_mask=cache_dit.steps_mask(
-                    mask_policy=cache_config.scm_steps_mask_policy,
-                    total_steps=num_inference_steps,
-                ),
-                steps_computation_policy=cache_config.scm_steps_policy,
-            )
-
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                cache_config=updated_scm_config,
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_sd3(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for StableDiffusion3Pipeline.
-
-    Args:
-        pipeline: The StableDiffusion3 pipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-    """
-    # Build DBCacheConfig for transformer
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    # Build ParamsModifier for transformer
-    modifier = ParamsModifier(
-        cache_config=db_cache_config,
-        calibrator_config=calibrator,
-    )
-
-    logger.info(
-        f"Enabling cache-dit on StableDiffusion3 transformer with BlockAdapter: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    # Enable cache-dit using BlockAdapter for transformer
-    cache_dit.enable_cache(
-        (
-            BlockAdapter(
-                transformer=pipeline.transformer,
-                blocks=pipeline.transformer.transformer_blocks,
-                forward_pattern=ForwardPattern.Pattern_1,
-                params_modifiers=[modifier],
-            )
-        ),
-        cache_config=db_cache_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        """Refresh cache context for the transformer with new num_inference_steps.
-
-        Args:
-            pipeline: The LongCatImage pipeline instance.
-            num_inference_steps: New number of inference steps.
-        """
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_ltx2(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for LTX2 pipelines (audio-video transformer blocks)."""
-    transformer = get_transformer_from_pipeline(pipeline)
-
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator_config = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    blocks = transformer.transformer_blocks
-
-    logger.info(
-        f"Enabling cache-dit on LTX2 transformer: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    cache_dit.enable_cache(
-        BlockAdapter(
-            transformer=transformer,
-            blocks=blocks,
-            # LTX2 blocks return (hidden_states, audio_hidden_states)
-            forward_pattern=ForwardPattern.Pattern_0,
-            # Treat audio_hidden_states as encoder_hidden_states in Pattern_0
-            check_forward_pattern=False,
-            has_separate_cfg=True,
-        ),
-        cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        transformer = get_transformer_from_pipeline(pipeline)
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for regular single-transformer DiT models.
-
-    Args:
-        pipeline: The diffusion pipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-
-    Returns:
-        A refresh function that can be called to update cache context with new num_inference_steps.
-    """
-    # Build DBCacheConfig with optional SCM support
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    # Build calibrator config if TaylorSeer is enabled
-    calibrator_config = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    logger.info(
-        f"Enabling cache-dit on transformer: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    # Enable cache-dit on the transformer
-    transformer = get_transformer_from_pipeline(pipeline)
-    cache_dit.enable_cache(
-        transformer,
-        cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        """Refresh cache context for the transformer with new num_inference_steps.
-
-        Args:
-            pipeline: The diffusion pipeline instance.
-            num_inference_steps: New number of inference steps.
-        """
-        transformer = get_transformer_from_pipeline(pipeline)
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_hunyuan_image3(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for HunyuanImage3 pipeline.
-
-    HunyuanImage3 stores its main transformer stack at ``pipeline.model`` with
-    decoder blocks in ``pipeline.model.layers``.
-    """
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator_config = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    transformer = getattr(pipeline, "model", None)
-    if transformer is None or not hasattr(transformer, "layers"):
-        raise ValueError(
-            f"HunyuanImage3 cache-dit enabler expects pipeline.model.layers, got pipeline={pipeline.__class__.__name__}"
-        )
-
-    logger.info(
-        f"Enabling cache-dit on HunyuanImage3 model: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-    # HunyuanImage3 decoder layers are single-stream `hidden_states` blocks
-    # (`HunyuanImage3DecoderLayer.forward(hidden_states, ...)`) while caller
-    # still reads outputs as tuple (`layer_outputs[0]`). Pattern_4 matches this:
-    # hidden-only input with hidden-first tuple output.
-    modifier = ParamsModifier(
-        cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
-    )
-
-    cache_dit.enable_cache(
-        BlockAdapter(
-            transformer=transformer,
-            blocks=transformer.layers,
-            forward_pattern=ForwardPattern.Pattern_4,
-            params_modifiers=[modifier],
-            check_forward_pattern=False,
-        ),
-        cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        transformer = getattr(pipeline, "model", None)
-        if transformer is None:
-            raise ValueError("HunyuanImage3 cache-dit refresh expects pipeline.model to exist.")
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                transformer,
                 cache_config=DBCacheConfig().reset(
                     num_inference_steps=num_inference_steps,
                     steps_computation_mask=cache_dit.steps_mask(
@@ -1323,73 +846,6 @@ class BagelCachedAdapter(CachedAdapter):
         return total_cached_blocks
 
 
-def enable_cache_for_bagel(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for Bagel model (via OmniDiffusion pipeline).
-
-    Args:
-        pipeline: The OmniDiffusion pipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-
-    Returns:
-        A refresh function that can be called to update cache context with new num_inference_steps.
-    """
-    # Build DBCacheConfig
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    # Build calibrator config if TaylorSeer is enabled
-    calibrator_config = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    # Access the transformer: BagelPipeline -> Qwen2MoTForCausalLM -> Qwen2MoTModel
-    # BagelPipeline has self.language_model which is Qwen2MoTForCausalLM
-    # Qwen2MoTForCausalLM has self.model which is Qwen2MoTModel
-    transformer = pipeline.language_model.model
-
-    logger.info(
-        f"Enabling cache-dit on Bagel transformer: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    # Enable cache-dit on the transformer
-    # Pattern_0 corresponds to (hidden_states, encoder_hidden_states) input, output
-    # Custom adapter for Bagel to handle NaiveCache correctly
-    # from vllm_omni.diffusion.cache.bagel_cache_adapter import BagelCachedAdapter # No longer needed
-    BagelCachedAdapter.apply(
-        BlockAdapter(
-            transformer=transformer,
-            blocks=transformer.layers,
-            forward_pattern=ForwardPattern.Pattern_0,
-        ),
-        cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        transformer = pipeline.language_model.model
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
 class SensenovaCachedBlocks(CachedBlocks_Pattern_3_4_5):
     """
     Custom CachedBlocks for SenseNova-U1 that only caches image-token hidden
@@ -1477,474 +933,7 @@ class SensenovaCachedAdapter(CachedAdapter):
         return total_cached_blocks
 
 
-def enable_cache_for_sensenova_u1(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for SenseNova-U1 model.
-
-    Args:
-        pipeline: The SenseNova-U1 pipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-
-    Returns:
-        A refresh function that can be called to update cache context with new num_inference_steps.
-    """
-    transformer = getattr(getattr(pipeline, "language_model", None), "model", None)
-    if transformer is None or not hasattr(transformer, "layers"):
-        raise ValueError("SenseNovaU1Pipeline cache-dit expects pipeline.language_model.model.layers.")
-
-    # Build DBCacheConfig
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator_config = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    modifier = ParamsModifier(
-        cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
-    )
-
-    logger.info(
-        f"Enabling cache-dit on SenseNova-U1 decoder layers: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    SensenovaCachedAdapter.apply(
-        BlockAdapter(
-            transformer=transformer,
-            blocks=transformer.layers,
-            forward_pattern=ForwardPattern.Pattern_3,
-            params_modifiers=[modifier],
-            check_forward_pattern=True,
-            has_separate_cfg=True,
-        ),
-        cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        transformer = pipeline.language_model.model
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_flux2(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for Flux.2-dev pipeline.
-
-    Args:
-        pipeline: The Flux2 pipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-    Returns:
-        A refresh function that can be called with a new ``num_inference_steps``
-        to update the cache context for the pipeline.
-    """
-    # Build DBCacheConfig for transformer
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    # Build ParamsModifier for transformer
-    modifier = ParamsModifier(
-        cache_config=db_cache_config,
-        calibrator_config=calibrator,
-    )
-
-    logger.info(
-        f"Enabling cache-dit on Flux transformer with BlockAdapter: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    # Enable cache-dit using BlockAdapter for transformer
-    cache_dit.enable_cache(
-        (
-            BlockAdapter(
-                transformer=pipeline.transformer,
-                blocks=[
-                    pipeline.transformer.transformer_blocks,
-                    pipeline.transformer.single_transformer_blocks,
-                ],
-                forward_pattern=[ForwardPattern.Pattern_1, ForwardPattern.Pattern_2],
-                params_modifiers=[modifier],
-            )
-        ),
-        cache_config=db_cache_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        """Refresh cache context for the transformer with new num_inference_steps.
-
-        Args:
-            pipeline: The Flux2 pipeline instance.
-            num_inference_steps: New number of inference steps.
-        """
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_glm_image(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for GlmImage pipeline.
-
-    Args:
-        pipeline: The GlmImage pipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-    Returns:
-        A refresh function that can be called with a new ``num_inference_steps``
-        to update the cache context for the pipeline.
-    """
-    # Build DBCacheConfig for transformer
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    # Build ParamsModifier for transformer
-    modifier = ParamsModifier(
-        cache_config=db_cache_config,
-        calibrator_config=calibrator,
-    )
-
-    logger.info(
-        f"Enabling cache-dit on GlmImage transformer with BlockAdapter: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    # Enable cache-dit using BlockAdapter for transformer
-    # Note: We don't use patch_functor here because it's designed for diffusers' GlmImage,
-    # and our vllm-omni implementation has a different forward signature.
-    # We use ForwardPattern.Pattern_0 because our block returns (hidden_states, encoder_hidden_states)
-    cache_dit.enable_cache(
-        (
-            BlockAdapter(
-                transformer=pipeline.transformer,
-                blocks=pipeline.transformer.transformer_blocks,
-                forward_pattern=ForwardPattern.Pattern_0,
-                params_modifiers=[modifier],
-                patch_functor=None,
-                has_separate_cfg=True,
-            )
-        ),
-        cache_config=db_cache_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        """Refresh cache context for the transformer with new num_inference_steps.
-
-        Args:
-            pipeline: The GlmImage pipeline instance.
-            num_inference_steps: New number of inference steps.
-        """
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_dreamid_omni(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for DreamID-Omni fused pipeline.
-
-    Args:
-        pipeline: The DreamIDOmni pipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-
-    Returns:
-        A refresh function that can be called with a new ``num_inference_steps``
-        to update the cache context for the pipeline.
-    """
-    transformer = getattr(pipeline, "transformer", None)
-    fused_blocks = getattr(transformer, "fused_blocks", None)
-    if transformer is None or fused_blocks is None:
-        raise ValueError("DreamIDOmniPipeline cache-dit expects pipeline.transformer.fused_blocks.")
-
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    modifier = ParamsModifier(
-        cache_config=db_cache_config,
-        calibrator_config=calibrator,
-    )
-
-    logger.info(
-        f"Enabling cache-dit on DreamID-Omni fused blocks: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    cache_dit.enable_cache(
-        BlockAdapter(
-            transformer=transformer,
-            blocks=fused_blocks,
-            forward_pattern=ForwardPattern.Pattern_0,
-            params_modifiers=[modifier],
-            has_separate_cfg=True,
-        ),
-        cache_config=db_cache_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        transformer = pipeline.transformer
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_ernie_image(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for ERNIE-Image pipeline.
-
-    ERNIE-Image blocks have signature:
-        forward(x, rotary_pos_emb, temb, attention_mask) -> x
-
-    Where x is hidden_states (concatenated image + text tokens).
-    This matches Pattern_3 which expects:
-        - Input: hidden_states only
-        - Output: hidden_states only
-
-    Args:
-        pipeline: The ERNIE-Image pipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-    Returns:
-        A refresh function that can be called to update cache context with new num_inference_steps.
-    """
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator_config = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    logger.info(
-        f"Enabling cache-dit on ERNIE-Image transformer: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    cache_dit.enable_cache(
-        BlockAdapter(
-            transformer=pipeline.transformer,
-            blocks=pipeline.transformer.layers,
-            forward_pattern=ForwardPattern.Pattern_3,
-            check_forward_pattern=False,
-        ),
-        cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_helios(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for Helios pipeline.
-
-    Helios extends Wan2.2 with multi-term memory patches and guidance cross-attention.
-    Its transformer blocks have the same single-output signature as Wan2.2 blocks
-    (returns hidden_states only), so we use ForwardPattern.Pattern_2.
-
-    Args:
-        pipeline: The HeliosPipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-
-    Returns:
-        A refresh function that can be called to update cache context with new num_inference_steps.
-    """
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator_config = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    cache_dit.enable_cache(
-        BlockAdapter(
-            transformer=pipeline.transformer,
-            blocks=[pipeline.transformer.blocks],
-            forward_pattern=[ForwardPattern.Pattern_2],
-            params_modifiers=[
-                ParamsModifier(cache_config=db_cache_config, calibrator_config=calibrator_config),
-            ],
-            has_separate_cfg=True,
-        ),
-        cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
-    )
-
-    logger.info(
-        f"Enabling cache-dit on Helios transformer: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy, total_steps=num_inference_steps
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_hunyuan_video_15(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for HunyuanVideo 1.5 pipeline.
-
-    HunyuanVideo 1.5 uses a single transformer with has_separate_cfg=True
-    (separate conditional/unconditional forward passes). The _sp_plan scatter
-    is applied at the transformer input boundary (empty-string key), so CacheDiT
-    sees already-sharded hidden_states throughout transformer_blocks.
-    """
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator_config = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    logger.info(
-        f"Enabling cache-dit on HunyuanVideo15 transformer: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    cache_dit.enable_cache(
-        BlockAdapter(
-            transformer=pipeline.transformer,
-            blocks=pipeline.transformer.transformer_blocks,
-            forward_pattern=ForwardPattern.Pattern_0,
-            check_forward_pattern=True,
-            has_separate_cfg=True,
-        ),
-        cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
-    )
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def enable_cache_for_cosmos3(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+def enable_cache_for_cosmos3(pipeline: Any, cache_config: Any) -> RefreshCacheContextFunc:
     """Enable cache-dit for Cosmos3.
 
     Cosmos3 has a dual-pathway architecture (UND + GEN) but only the GEN
@@ -1959,41 +948,6 @@ def enable_cache_for_cosmos3(pipeline: Any, cache_config: Any) -> Callable[[int]
     Returns:
         A refresh function that can be called to update cache context with new num_inference_steps.
     """
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator_config = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    logger.info(
-        f"Enabling cache-dit on Cosmos3 gen_layers: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    cache_dit.enable_cache(
-        BlockAdapter(
-            transformer=pipeline.transformer,
-            blocks=[pipeline.transformer.gen_layers],
-            # Cosmos3 GEN blocks return only hidden_states.  Per-layer UND K/V
-            # conditioning uses the transformer's cache-dit fallback path.
-            forward_pattern=[ForwardPattern.Pattern_3],
-            params_modifiers=[
-                ParamsModifier(
-                    cache_config=db_cache_config,
-                    calibrator_config=calibrator_config,
-                ),
-            ],
-            check_forward_pattern=False,
-            has_separate_cfg=True,
-        ),
-        cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
-    )
-
     # The T2I denoising loop skips the unconditional forward outside the
     # guidance interval as a speed optimization. cache-dit distinguishes the
     # conditional vs unconditional passes purely by transformer-forward parity
@@ -2001,25 +955,8 @@ def enable_cache_for_cosmos3(pipeline: Any, cache_config: Any) -> Callable[[int]
     # step accounting. Still do both cond/uncond CFG steps when cache-dit is active.
     # CFG is instead neutralized via scale=1.0 outside the interval.
     pipeline._cache_dit_requires_paired_cfg = True
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                pipeline.transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
+    block_adapter = CacheDiTBackend.maybe_build_block_adapter(pipeline)
+    return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 
 
 # Register custom cache-dit enablers after function definitions
@@ -2027,29 +964,8 @@ CUSTOM_DIT_ENABLERS.update(
     {
         "Wan22Pipeline": enable_cache_for_wan22,
         "Wan22I2VPipeline": enable_cache_for_wan22,
+        "Wan22TI2VPipeline": enable_cache_for_wan22,
         "Wan22S2VPipeline": enable_cache_for_wan22_s2v,
-        "HunyuanImage3Pipeline": enable_cache_for_hunyuan_image3,
-        "FluxPipeline": enable_cache_for_flux,
-        "Flux2KleinPipeline": enable_cache_for_flux2_klein,
-        "LongCatImagePipeline": enable_cache_for_longcat_image,
-        "LongCatImageEditPipeline": enable_cache_for_longcat_image,
-        "StableAudioPipeline": enable_cache_for_stable_audio_open,
-        "StableDiffusion3Pipeline": enable_cache_for_sd3,
-        "LTX2Pipeline": enable_cache_for_ltx2,
-        "LTX2ImageToVideoPipeline": enable_cache_for_ltx2,
-        "LTX2TwoStagesPipeline": enable_cache_for_ltx2,
-        "LTX2ImageToVideoTwoStagesPipeline": enable_cache_for_ltx2,
-        "LTX23Pipeline": enable_cache_for_ltx2,
-        "LTX23ImageToVideoPipeline": enable_cache_for_ltx2,
-        "BagelPipeline": enable_cache_for_bagel,
-        "SenseNovaU1Pipeline": enable_cache_for_sensenova_u1,
-        "GlmImagePipeline": enable_cache_for_glm_image,
-        "Flux2Pipeline": enable_cache_for_flux2,
-        "DreamIDOmniPipeline": enable_cache_for_dreamid_omni,
-        "ErnieImagePipeline": enable_cache_for_ernie_image,
-        "HunyuanVideo15Pipeline": enable_cache_for_hunyuan_video_15,
-        "HunyuanVideo15I2VPipeline": enable_cache_for_hunyuan_video_15,
-        "HeliosPipeline": enable_cache_for_helios,
         "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
     }
 )
@@ -2092,6 +1008,43 @@ class CacheDiTBackend(CacheBackend):
         self._refresh_func: Callable[[Any, int, bool], None] | None = None
         self._last_num_inference_steps: int | None = None
 
+    @staticmethod
+    def maybe_build_block_adapter(pipeline) -> BlockAdapter | None:
+        """If a module defines `_cache_dit_adapter_config`, build the corresponding
+        block adapter.
+        """
+        transformer = default_get_pipeline_transformer(pipeline)
+
+        adapter_cfg: CacheDiTAdapterConfig | None = getattr(transformer, "_cache_dit_adapter_config", None)
+        if adapter_cfg is None:
+            return None
+
+        block_attrs, forward_pattern = zip(*(adapter_cfg.block_forward_patterns).items())
+        missing_attrs = [block_attr for block_attr in block_attrs if not hasattr(transformer, block_attr)]
+
+        if missing_attrs:
+            logger.warning("Missing Cache DiT block attributes: %s", missing_attrs)
+
+        block_adapter = BlockAdapter(
+            transformer=transformer,
+            blocks=[getattr(transformer, block_attr) for block_attr in block_attrs],
+            forward_pattern=list(forward_pattern),
+            has_separate_cfg=adapter_cfg.has_separate_cfg,
+            check_forward_pattern=adapter_cfg.check_forward_pattern,
+        )
+        return block_adapter
+
+    @staticmethod
+    def maybe_get_cached_adapter_cls(pipeline) -> type[CachedAdapter] | None:
+        """If a module has a custom cached adapter type registered, e.g., SenseNova, retrieve it
+        from the transformer's CacheDiTAdapterConfig."""
+        transformer = default_get_pipeline_transformer(pipeline)
+
+        adapter_cfg: CacheDiTAdapterConfig | None = getattr(transformer, "_cache_dit_adapter_config", None)
+        if adapter_cfg is None:
+            return None
+        return adapter_cfg.cached_adapter_cls
+
     def enable(self, pipeline: Any) -> None:
         """Enable cache-dit on the pipeline if configured.
 
@@ -2110,8 +1063,12 @@ class CacheDiTBackend(CacheBackend):
             logger.info(f"Using custom cache-dit enabler for model: {pipeline_name}")
             self._refresh_func = CUSTOM_DIT_ENABLERS[pipeline_name](pipeline, self.config)
         else:
-            # For regular single-transformer models
-            self._refresh_func = enable_cache_for_dit(pipeline, self.config)
+            # Common case; either the model doesn't explicitly support dit cache yet,
+            # Or it defines its _cache_dit_adapter_config, which describes how we should
+            # create its block adapter.
+            block_adapter = self.maybe_build_block_adapter(pipeline)
+            adapter_cls = self.maybe_get_cached_adapter_cls(pipeline)
+            self._refresh_func = enable_cache_for_dit(pipeline, self.config, block_adapter, adapter_cls)
 
         self.enabled = True
         logger.info(f"Cache-dit enabled successfully on {pipeline_name}")

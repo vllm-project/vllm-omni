@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -21,6 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -459,6 +461,12 @@ class ErnieImageAdaLNContinuous(nn.Module):
 
 
 class ErnieImageTransformer2DModel(nn.Module):
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "layers": ForwardPattern.Pattern_3,
+        },
+        check_forward_pattern=False,
+    )
     _repeated_blocks = ["ErnieImageSharedAdaLNBlock"]
     _layerwise_offload_blocks_attrs = ["layers"]
 

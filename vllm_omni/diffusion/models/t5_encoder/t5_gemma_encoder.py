@@ -157,7 +157,7 @@ class T5GemmaEncoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            rope_theta=config.rope_theta,
+            rope_theta=getattr(config, "rope_theta", 10000.0),
         )
         self.mlp = T5GemmaMLP(
             hidden_size=config.hidden_size,
