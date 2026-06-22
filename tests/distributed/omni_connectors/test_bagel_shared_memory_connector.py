@@ -29,7 +29,7 @@ pytestmark = [pytest.mark.usefixtures("clean_gpu_memory_between_tests")]
 BAGEL_CI_DEPLOY = get_deploy_config_path("ci/bagel.yaml")
 
 # Reference pixel data extracted from the known-good output image
-# Generated with seed=52, num_inference_steps=14,
+# Generated with seed=52, num_inference_steps=15,
 # prompt='Change the grass color to red',
 # input image: 2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg
 REFERENCE_PIXELS = [
@@ -47,7 +47,7 @@ REFERENCE_PIXELS = [
 
 
 # text2img reference pixels (aligned with offline `bagel/end2end.py` text2img, 15 steps)
-# "Generated with seed=52, num_inference_steps=14,
+# "Generated with seed=52, num_inference_steps=15,
 # prompt='A cute cat'"
 TEXT2IMG_REFERENCE_PIXELS = [
     {"position": (100, 100), "rgb": (115, 113, 94)},
@@ -78,7 +78,16 @@ def _load_input_image() -> Image.Image:
     return ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
 
 
-def _configure_sampling_params(omni: Omni, num_inference_steps: int = 14) -> list:
+def _find_free_port() -> int:
+    """Find and return a free ephemeral port by binding to port 0."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+    return port
+
+
+def _configure_sampling_params(omni: Omni, num_inference_steps: int = 15) -> list:
     """Configure sampling parameters for Bagel img2img generation.
 
     Args:
