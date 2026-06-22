@@ -4,22 +4,21 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from vllm_omni.config.composable_parallel import (
+    AxisTranslationError,
     Broadcast,
-    DuplicateAxisKindError,
     FanInByStage,
     MeshAxisSpec,
     PartitionByHash,
     PipelineMicrobatch,
     RouteByStage,
-    RoutingOwnershipError,
     StrategySpec,
     TakeRank,
     Union,
-    UnsupportedAxisKindError,
-    UnsupportedRoutingError,
     translate_strategy_stack,
 )
 from vllm_omni.config.composable_parallel.aggregation import StitchPipeline
@@ -111,25 +110,25 @@ def test_ep_mismatch_raises():
 
 
 def test_duplicate_kind_rejected():
-    with pytest.raises(DuplicateAxisKindError):
+    with pytest.raises(AxisTranslationError):
         translate_strategy_stack([_tp(2), _tp(2)])
 
 
 def test_unsupported_kind_rejected():
     spec = StrategySpec("sp", MeshAxisSpec("sp_ulysses", 2), Broadcast(), TakeRank())
-    with pytest.raises(UnsupportedAxisKindError):
+    with pytest.raises(AxisTranslationError):
         translate_strategy_stack([spec])
 
 
 def test_dp_hash_routing_rejected():
     spec = StrategySpec("dp", MeshAxisSpec("dp", 2), PartitionByHash(), Union())
-    with pytest.raises(UnsupportedRoutingError):
+    with pytest.raises(NotImplementedError):
         translate_strategy_stack([spec])
 
 
 def test_dp_invalid_routing_policy_rejected():
     spec = StrategySpec("dp", MeshAxisSpec("dp", 2), RouteByStage("bogus"), Union())
-    with pytest.raises(UnsupportedRoutingError):
+    with pytest.raises(NotImplementedError):
         translate_strategy_stack([spec])
 
 
@@ -143,7 +142,7 @@ def test_lb_policy_never_in_engine_kwargs_even_when_replicated():
 
 def test_stage_replica_hash_routing_rejected():
     spec = StrategySpec("sr", MeshAxisSpec("stage_replica", 2), RouteByStage("hash"), FanInByStage())
-    with pytest.raises(UnsupportedRoutingError):
+    with pytest.raises(NotImplementedError):
         translate_strategy_stack([spec])
 
 
@@ -155,7 +154,7 @@ def test_dp_wrong_owner_rejected():
         Union(),
         shard_extension={"l1_owner": "delegated"},
     )
-    with pytest.raises(RoutingOwnershipError):
+    with pytest.raises(AxisTranslationError):
         translate_strategy_stack([spec])
 
 
@@ -167,5 +166,30 @@ def test_stage_replica_wrong_owner_rejected():
         FanInByStage(),
         shard_extension={"l1_owner": "engine"},
     )
-    with pytest.raises(RoutingOwnershipError):
+    with pytest.raises(AxisTranslationError):
         translate_strategy_stack([spec])
+
+
+@pytest.mark.parametrize(
+    "specs",
+    [
+        [_tp(2)],
+        [_dp(2)],
+        [_tp(2), _dp(2)],
+        [_tp(2), _ep(2)],
+        [_tp(2), _stage_replica(2)],
+        [_pp(2)],
+    ],
+)
+def test_as_engine_kwargs_are_valid_omni_engine_args(specs):
+    # Guard against desync: every key emitted by as_engine_kwargs() must be a
+    # real OmniEngineArgs field, otherwise constructing the per-stage engine args
+    # would explode at runtime. Keep this CPU-only by checking field names rather
+    # than instantiating the engine.
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+
+    valid_fields = {f.name for f in dataclasses.fields(OmniEngineArgs)}
+    cfg = translate_strategy_stack(specs)
+    kwargs = cfg.as_engine_kwargs()
+    unknown = set(kwargs) - valid_fields
+    assert not unknown, f"as_engine_kwargs emitted non-OmniEngineArgs fields: {unknown}"

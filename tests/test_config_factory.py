@@ -1943,11 +1943,12 @@ class TestSentinelDefaultPrecedence:
             model_type,
             Q3_OMNI_ALL_STAGES_HF_CONFIG,
         )
-        return StageConfigFactory._create_from_registry(
+        stages, _ = StageConfigFactory._create_from_registry(
             "qwen3_omni_moe",
             pipeline_cfg,
             cli_overrides=cli_overrides,
         )
+        return stages
 
     def test_typed_kwarg_overrides_yaml(self):
         stages = self._stages({"max_num_seqs": 999})

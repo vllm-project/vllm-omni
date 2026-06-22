@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Load per-role parallel strategies from a ``strategy.yaml`` file.
+"""Load per-role parallel strategies from a strategy file.
 
-The strategy file is a small, optional companion to the deploy YAML. It maps a
+The strategy file is a small, optional companion to the deploy config. It maps a
 logical role (``model_stage``, e.g. ``thinker``) to a list of axis declarations,
-each of which becomes one :class:`StrategySpec`::
+each of which becomes one :class:`StrategySpec`. YAML is the only format wired up
+today, but the module/symbol names stay format-agnostic so a different source can
+be added without renaming the public surface::
 
     strategies:
       thinker:
@@ -56,12 +58,12 @@ from vllm_omni.config.composable_parallel.routing import (
 from vllm_omni.config.composable_parallel.spec import MeshAxisSpec, StrategySpec
 from vllm_omni.config.yaml_util import load_yaml_config, to_dict
 
-# Per-kind defaults for routing + aggregation, so the YAML only needs axis+size.
+# Per-kind defaults for routing + aggregation, so the file only needs axis+size.
 _ROUTING_POLICY_KINDS = frozenset({"dp", "stage_replica"})
 
 
-class StrategyYamlError(ValueError):
-    """Raised when a strategy YAML file is malformed."""
+class StrategyLoadError(ValueError):
+    """Raised when a strategy file is malformed."""
 
 
 def _default_routing(kind: str, routing_policy: str | None) -> RoutingPattern:
@@ -86,19 +88,19 @@ def _default_aggregation(kind: str) -> AggregationPattern:
 
 def _build_spec(role: str, entry: Mapping[str, Any]) -> StrategySpec:
     if "axis" not in entry:
-        raise StrategyYamlError(f"role {role!r}: each strategy entry needs an 'axis' field")
+        raise StrategyLoadError(f"role {role!r}: each strategy entry needs an 'axis' field")
     if "size" not in entry:
-        raise StrategyYamlError(f"role {role!r}: strategy entry for axis {entry['axis']!r} needs a 'size'")
+        raise StrategyLoadError(f"role {role!r}: strategy entry for axis {entry['axis']!r} needs a 'size'")
 
     kind = str(entry["axis"])
     try:
         size = int(entry["size"])
     except (TypeError, ValueError) as exc:
-        raise StrategyYamlError(f"role {role!r}: axis {kind!r} size must be an integer, got {entry['size']!r}") from exc
+        raise StrategyLoadError(f"role {role!r}: axis {kind!r} size must be an integer, got {entry['size']!r}") from exc
 
     routing_policy = entry.get("routing")
     if routing_policy is not None and kind not in _ROUTING_POLICY_KINDS:
-        raise StrategyYamlError(
+        raise StrategyLoadError(
             f"role {role!r}: axis {kind!r} does not accept a 'routing' policy (only {sorted(_ROUTING_POLICY_KINDS)} do)"
         )
 
@@ -120,18 +122,18 @@ def parse_strategy_specs(data: Mapping[str, Any]) -> dict[str, list[StrategySpec
     """Parse an already-loaded strategy mapping into per-role spec stacks."""
     strategies = data.get("strategies", data)
     if not isinstance(strategies, Mapping):
-        raise StrategyYamlError("strategy file must contain a 'strategies' mapping of role -> list of axes")
+        raise StrategyLoadError("strategy file must contain a 'strategies' mapping of role -> list of axes")
 
     result: dict[str, list[StrategySpec]] = {}
     for role, entries in strategies.items():
         if not isinstance(entries, (list, tuple)):
-            raise StrategyYamlError(
+            raise StrategyLoadError(
                 f"role {role!r}: expected a list of axis declarations, got {type(entries).__name__}"
             )
         specs: list[StrategySpec] = []
         for entry in entries:
             if not isinstance(entry, Mapping):
-                raise StrategyYamlError(
+                raise StrategyLoadError(
                     f"role {role!r}: each axis declaration must be a mapping, got {type(entry).__name__}"
                 )
             specs.append(_build_spec(str(role), dict(entry)))
@@ -140,8 +142,8 @@ def parse_strategy_specs(data: Mapping[str, Any]) -> dict[str, list[StrategySpec
 
 
 def load_strategy_specs(path: str) -> dict[str, list[StrategySpec]]:
-    """Load and parse a ``strategy.yaml`` file into per-role spec stacks."""
+    """Load and parse a strategy file into per-role spec stacks."""
     data = to_dict(load_yaml_config(path))
     if not isinstance(data, Mapping):
-        raise StrategyYamlError(f"strategy file {path!r} did not parse to a mapping")
+        raise StrategyLoadError(f"strategy file {path!r} did not parse to a mapping")
     return parse_strategy_specs(data)

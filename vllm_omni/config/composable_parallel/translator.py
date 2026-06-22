@@ -2,43 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Translate a ``StrategySpec`` stack into vLLM-Omni parallel sizing.
 
-We read a stack of strategy specs (one per mesh axis), work out the
-tensor/data/pipeline parallel sizes plus the number of stage replicas, and note
-who is responsible for each axis's request routing.
+Read a stack of strategy specs (one per mesh axis) and work out the
+tensor/data/pipeline parallel sizes, the dense-EP flag, and the number of stage
+replicas, plus who owns each axis's request routing. The result is a plain,
+CPU-computable sizing struct (:class:`OmniParallelConfig`) keyed by the real
+``OmniEngineArgs`` / ``EngineArgs`` field names, so the deploy layer can splat it
+onto a stage's engine args.
 
-vLLM-Omni has **two distinct data-distribution layers** (conflating them is the
-#1 risk):
-
-* **engine data parallelism** — upstream vLLM ``data_parallel_size`` inside a
-  *single* engine: one DP coordinator, one set of weights, vLLM's own DP load
-  balancer distributes requests across the DP ranks. This is the ``dp`` axis. It
-  is a true world dimension (``tp * dp * pp``) and is realized **intra-engine**
-  by vLLM, so its ``l1_owner`` is ``"engine"`` and it does NOT emit
-  ``omni_lb_policy`` (vLLM's internal DP LB is not omni's StagePool LB).
-* **omni stage replicas** — N *independent* engine replicas of one pipeline
-  stage, coordinated by the omni coordinator and balanced by a load balancer
-  over a StagePool (stateless policies only: random / round-robin /
-  least-queue-length). This is the ``stage_replica`` axis. Each replica is its
-  own world, so it is **not** a vLLM world dimension; it maps to the per-stage
-  ``num_replicas`` count plus the pipeline-level ``omni_lb_policy`` string. Its
-  ``l1_owner`` is ``"delegated"`` (omni's coordinator owns the routing).
-
-What we deliberately don't do yet: key-stable "send the same key to the same
-replica" routing (``PartitionByHash`` / ``RouteByStage("hash")``). Honoring that
-means running a dedicated load balancer, which is a later piece of work. Until
-then we reject it outright with a message that points the caller at the
-stateless alternative, rather than quietly routing at random and pretending the
-affinity held.
-
-The output is a plain sizing struct keyed by the real ``OmniEngineArgs`` /
-``EngineArgs`` field names, so this module runs on CPU and the deploy layer can
-splat the result into a stage's engine args.
+The distinction this module enforces — engine data parallelism (a true vLLM
+intra-engine world dimension) vs. omni stage replicas (independent engines fanned
+out by omni's coordinator) — is documented on the axis validators that depend on
+it (see :func:`_validate_dp` and :func:`_stage_replica_lb_policy`). Routing we do
+not support yet (key-stable / affinity routing) raises ``NotImplementedError``;
+any other invalid spec raises :class:`AxisTranslationError`.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Literal, NoReturn, cast, get_args
+
+from vllm.logger import init_logger
 
 from vllm_omni.config.composable_parallel.routing import (
     Broadcast,
@@ -48,6 +33,13 @@ from vllm_omni.config.composable_parallel.routing import (
     RoutingPattern,
 )
 from vllm_omni.config.composable_parallel.spec import MeshAxisKind, StrategySpec
+
+logger = init_logger(__name__)
+
+# Who owns an axis's request routing. A closed string type so an unexpected raw
+# value is caught statically and at runtime (``_VALID_L1_OWNERS`` is derived from
+# it, keeping one source of truth) rather than silently flowing through.
+L1Owner = Literal["delegated", "engine"]
 
 # DP, TP, PP, (dense) EP and stage_replica translate today. DP/TP/PP are true
 # world dimensions vLLM realizes intra-engine; dense EP is a flag over the
@@ -70,7 +62,7 @@ _AXIS_TO_ENGINE_FIELD: dict[MeshAxisKind, str] = {
 # Default L1 owner per axis kind. ``stage_replica`` is the only delegated axis:
 # omni's coordinator/StagePool owns routing across replicas. ``dp`` is engine
 # data parallelism, realized by vLLM's own intra-engine DP load balancer.
-_DEFAULT_L1_OWNER: dict[MeshAxisKind, str] = {
+_DEFAULT_L1_OWNER: dict[MeshAxisKind, L1Owner] = {
     "dp": "engine",
     "tp": "engine",
     "pp": "engine",
@@ -87,32 +79,33 @@ _STAGE_POLICY_TO_OMNI_LB: dict[str, str] = {
     "least_queue": "least-queue-length",
 }
 
-_VALID_L1_OWNERS = frozenset({"delegated", "engine"})
+_VALID_L1_OWNERS: frozenset[str] = frozenset(get_args(L1Owner))
 
 
 class AxisTranslationError(ValueError):
-    """Base error for spec->config translation problems."""
+    """Error for an invalid or unsupported strategy spec.
 
+    A single error type (rather than a tree of subclasses) keeps the public
+    surface small and consistent with the rest of the codebase; the specific
+    cause is in the message and is logged before the raise so it is visible even
+    when the type is unavailable to a caller (e.g. across a server boundary).
 
-class UnsupportedAxisKindError(AxisTranslationError):
-    """Raised when a spec axis kind cannot be translated at this stage."""
-
-
-class DuplicateAxisKindError(AxisTranslationError):
-    """Raised when the same axis kind appears more than once in the stack."""
-
-
-class RoutingOwnershipError(AxisTranslationError):
-    """Raised when an axis is assigned an owner that doesn't fit its kind."""
-
-
-class UnsupportedRoutingError(AxisTranslationError):
-    """Raised for routing we haven't built yet.
-
-    Today that means key-stable DP routing (``PartitionByHash`` or
-    ``RouteByStage("hash")``): honoring it needs a dedicated load balancer,
-    which is still on the to-do list.
+    Strategies that are *valid but not built yet* — key-stable / affinity routing
+    today — raise ``NotImplementedError`` instead, to distinguish "we haven't
+    implemented this" from "your config is wrong".
     """
+
+
+def _fail(msg: str) -> NoReturn:
+    """Log and raise :class:`AxisTranslationError` for an invalid/unsupported spec."""
+    logger.error("[composable_parallel] %s", msg)
+    raise AxisTranslationError(msg)
+
+
+def _not_implemented(msg: str) -> NoReturn:
+    """Log and raise ``NotImplementedError`` for a valid-but-unbuilt strategy."""
+    logger.error("[composable_parallel] %s", msg)
+    raise NotImplementedError(msg)
 
 
 @dataclass(frozen=True)
@@ -132,7 +125,7 @@ class OmniParallelConfig:
     # axis, if any. Only meaningful when ``stage_replica_size > 1``.
     omni_lb_policy: str | None = None
     # axis kind -> resolved L1 owner ("delegated" | "engine").
-    l1_owners: Mapping[MeshAxisKind, str] = field(default_factory=dict)
+    l1_owners: Mapping[MeshAxisKind, L1Owner] = field(default_factory=dict)
 
     @property
     def world_size(self) -> int:
@@ -177,19 +170,47 @@ def _is_affinity_dp_routing(routing: RoutingPattern) -> bool:
     return False
 
 
-def _resolve_l1_owner(spec: StrategySpec) -> str:
+def _resolve_l1_owner(spec: StrategySpec) -> L1Owner:
     kind = spec.mesh_axis.kind
-    owner = spec.shard_extension.get("l1_owner")
+    declared_owner = spec.shard_extension.get("l1_owner")
+    owner = declared_owner
     if owner is None:
         owner = _DEFAULT_L1_OWNER.get(kind, "engine")
+        if kind not in _DEFAULT_L1_OWNER:
+            logger.debug(
+                "[composable_parallel] axis %r has unknown kind %r with no default "
+                "l1_owner; falling back to %r",
+                spec.name,
+                kind,
+                owner,
+            )
+        else:
+            logger.debug(
+                "[composable_parallel] axis %r (kind %r) declared no l1_owner; using "
+                "default %r",
+                spec.name,
+                kind,
+                owner,
+            )
     if owner not in _VALID_L1_OWNERS:
-        raise AxisTranslationError(
-            f"axis {kind!r} has invalid l1_owner {owner!r}; expected one of {sorted(_VALID_L1_OWNERS)}"
+        # Distinguish a bad value supplied via shard_extension from a bad default
+        # indexed out of _DEFAULT_L1_OWNER, so the source of the invalid owner is
+        # debuggable rather than swallowed.
+        source = "shard_extension" if declared_owner is not None else "_DEFAULT_L1_OWNER"
+        logger.debug(
+            "[composable_parallel] axis %r (kind %r) resolved invalid l1_owner %r "
+            "from %s; valid owners are %s",
+            spec.name,
+            kind,
+            owner,
+            source,
+            sorted(_VALID_L1_OWNERS),
         )
-    return owner
+        _fail(f"axis {kind!r} has invalid l1_owner {owner!r}; expected one of {sorted(_VALID_L1_OWNERS)}")
+    return cast(L1Owner, owner)
 
 
-def _validate_dp(spec: StrategySpec, owner: str) -> None:
+def _validate_dp(spec: StrategySpec, owner: L1Owner) -> None:
     """Validate an engine data-parallel axis.
 
     DP is realized intra-engine by vLLM's own DP load balancer, so it is
@@ -199,107 +220,106 @@ def _validate_dp(spec: StrategySpec, owner: str) -> None:
     dropped.
     """
     if owner != "engine":
-        raise RoutingOwnershipError(
+        _fail(
             f"dp axis {spec.name!r} is engine data parallelism realized intra-engine by "
             f"vLLM's DP load balancer; l1_owner must be 'engine', got {owner!r}. For "
             "omni-coordinator-level request fan-out across independent replicas, use a "
             "'stage_replica' axis."
         )
     if _is_affinity_dp_routing(spec.routing):
-        raise UnsupportedRoutingError(
+        _not_implemented(
             f"dp axis {spec.name!r} requests key-stable (hash) routing, which vLLM's "
             "intra-engine DP load balancer does not guarantee — not supported yet. Use "
             "RouteByStage(random|round_robin|least_queue) for stateless DP balancing."
         )
     if not isinstance(spec.routing, RouteByStage):
-        raise AxisTranslationError(
+        _fail(
             f"dp axis {spec.name!r} expects RouteByStage(random|round_robin|least_queue) routing, "
             f"got {type(spec.routing).__name__}"
         )
     if spec.routing.routing_policy not in _STAGE_POLICY_TO_OMNI_LB:
-        raise UnsupportedRoutingError(
+        _not_implemented(
             f"dp axis {spec.name!r} has unsupported routing_policy "
             f"{spec.routing.routing_policy!r}; expected one of "
             f"{sorted(_STAGE_POLICY_TO_OMNI_LB)}."
         )
 
 
-def _stage_replica_lb_policy(spec: StrategySpec, owner: str) -> str:
-    """Return the omni StagePool LB policy for a delegated stage_replica axis."""
+def _stage_replica_lb_policy(spec: StrategySpec, owner: L1Owner) -> str:
+    """Return the omni StagePool LB policy for a delegated stage_replica axis.
+
+    A ``stage_replica`` axis is *not* a vLLM world dimension: it stands up N
+    independent engine replicas of one pipeline stage, coordinated by the omni
+    coordinator and balanced over a StagePool with stateless policies only
+    (random / round-robin / least-queue-length). It maps to the per-stage
+    ``num_replicas`` count plus the pipeline-level ``omni_lb_policy`` string, so
+    its ``l1_owner`` must be ``"delegated"`` (omni owns the routing). Key-stable
+    (hash) routing is rejected because omni has no key-stable balancer yet.
+    """
     if owner != "delegated":
-        raise RoutingOwnershipError(
+        _fail(
             f"stage_replica axis {spec.name!r} must be 'delegated' to omni's StagePool load "
             f"balancer; got owner {owner!r}. Replica routing is owned by omni's coordinator."
         )
 
     routing = spec.routing
     if _is_affinity_dp_routing(routing):
-        raise UnsupportedRoutingError(
+        _not_implemented(
             f"stage_replica axis {spec.name!r} requests key-stable (hash) routing, which needs a "
             "dedicated load balancer — not implemented yet. Use "
             "RouteByStage(random|round_robin|least_queue) to delegate to omni's load balancer."
         )
     if not isinstance(routing, RouteByStage):
-        raise AxisTranslationError(
+        _fail(
             f"stage_replica axis {spec.name!r} expects RouteByStage(random|round_robin|least_queue) "
             f"routing, got {type(routing).__name__}"
         )
     policy = _STAGE_POLICY_TO_OMNI_LB.get(routing.routing_policy)
     if policy is None:
-        raise UnsupportedRoutingError(
+        _not_implemented(
             f"stage_replica axis {spec.name!r} routing_policy {routing.routing_policy!r} has no omni LB policy"
         )
     return policy
 
 
-def _validate_tp(spec: StrategySpec, owner: str) -> None:
+def _validate_tp(spec: StrategySpec, owner: L1Owner) -> None:
     if not isinstance(spec.routing, Broadcast):
-        raise AxisTranslationError(
-            f"tp axis {spec.name!r} expects Broadcast routing, got {type(spec.routing).__name__}"
-        )
+        _fail(f"tp axis {spec.name!r} expects Broadcast routing, got {type(spec.routing).__name__}")
     if owner != "engine":
-        raise RoutingOwnershipError(
-            f"tp axis {spec.name!r} is realized intra-engine; l1_owner must be 'engine', got {owner!r}"
-        )
+        _fail(f"tp axis {spec.name!r} is realized intra-engine; l1_owner must be 'engine', got {owner!r}")
 
 
-def _validate_pp(spec: StrategySpec, owner: str) -> None:
+def _validate_pp(spec: StrategySpec, owner: L1Owner) -> None:
     if not isinstance(spec.routing, PipelineMicrobatch):
-        raise AxisTranslationError(
-            f"pp axis {spec.name!r} expects PipelineMicrobatch routing, got {type(spec.routing).__name__}"
-        )
+        _fail(f"pp axis {spec.name!r} expects PipelineMicrobatch routing, got {type(spec.routing).__name__}")
     if owner != "engine":
-        raise RoutingOwnershipError(
-            f"pp axis {spec.name!r} is realized intra-engine; l1_owner must be 'engine', got {owner!r}"
-        )
+        _fail(f"pp axis {spec.name!r} is realized intra-engine; l1_owner must be 'engine', got {owner!r}")
 
 
-def _validate_ep(spec: StrategySpec, owner: str) -> None:
+def _validate_ep(spec: StrategySpec, owner: L1Owner) -> None:
     # Dense EP: every rank still sees the whole batch, experts are sharded
     # across ranks inside the engine (sparse MoE all-to-all is a later stage).
     if not isinstance(spec.routing, Broadcast):
-        raise AxisTranslationError(
+        _fail(
             f"ep axis {spec.name!r} expects Broadcast routing (dense expert parallel), "
             f"got {type(spec.routing).__name__}"
         )
     if owner != "engine":
-        raise RoutingOwnershipError(
-            f"ep axis {spec.name!r} is realized intra-engine; l1_owner must be 'engine', got {owner!r}"
-        )
+        _fail(f"ep axis {spec.name!r} is realized intra-engine; l1_owner must be 'engine', got {owner!r}")
 
 
 def translate_strategy_stack(specs: Sequence[StrategySpec]) -> OmniParallelConfig:
     """Translate a spec stack into an ``OmniParallelConfig``.
 
     Supported kinds: dp (engine data parallel), tp, pp, (dense) ep, and
-    stage_replica (omni replicas). Raises ``UnsupportedAxisKindError`` for kinds not
-    yet translatable, ``DuplicateAxisKindError`` if a kind repeats,
-    ``UnsupportedRoutingError`` for deferred (affinity) routing, and
-    ``RoutingOwnershipError`` for an owner that is incompatible with the axis
-    kind. The EP degree must equal tensor_parallel_size * data_parallel_size.
+    stage_replica (omni replicas). Raises ``NotImplementedError`` for deferred
+    (affinity / key-stable) routing, and :class:`AxisTranslationError` for any
+    other invalid spec (a kind not yet translatable, a repeated kind, an owner
+    incompatible with the axis kind, or unsupported routing). The EP degree must
+    equal tensor_parallel_size * data_parallel_size.
     """
     sizes: dict[str, int] = {"tensor_parallel_size": 1, "data_parallel_size": 1, "pipeline_parallel_size": 1}
-    owners: dict[MeshAxisKind, str] = {}
+    owners: dict[MeshAxisKind, L1Owner] = {}
     omni_lb_policy: str | None = None
     stage_replica_size = 1
     enable_expert_parallel = False
@@ -308,12 +328,12 @@ def translate_strategy_stack(specs: Sequence[StrategySpec]) -> OmniParallelConfi
     for spec in specs:
         kind = spec.mesh_axis.kind
         if kind not in _SUPPORTED_KINDS:
-            raise UnsupportedAxisKindError(
+            _fail(
                 f"axis kind {kind!r} is not translatable yet (supported: {list(_SUPPORTED_KINDS)}); "
                 "it is designed-for and lands in a later stage"
             )
         if kind in owners:
-            raise DuplicateAxisKindError(f"axis kind {kind!r} appears more than once in the spec stack")
+            _fail(f"axis kind {kind!r} appears more than once in the spec stack")
 
         owner = _resolve_l1_owner(spec)
         if kind == "dp":
@@ -341,7 +361,7 @@ def translate_strategy_stack(specs: Sequence[StrategySpec]) -> OmniParallelConfi
         # still sets the flag; it is only valid when TP*DP == 1.
         ep_ranks = sizes["tensor_parallel_size"] * sizes["data_parallel_size"]
         if ep_size != ep_ranks:
-            raise AxisTranslationError(
+            _fail(
                 f"ep axis size {ep_size} must equal tensor_parallel_size*data_parallel_size "
                 f"(={ep_ranks}); dense expert parallelism shards experts across exactly those ranks"
             )

@@ -34,6 +34,16 @@ from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 logger = init_logger(__name__)
 
 
+# Default degree for any parallel axis / replica count that isn't set anywhere
+# (CLI, deploy YAML, or pipeline default): a single, un-parallelized rank.
+# TODO(composable_parallel): this "1" default and the per-axis device-layout
+# fallbacks are currently re-derived in the merge, apply, and reconcile layers.
+# Centralize them in one schema so the pre-spawn device guard and the engine-args
+# defaults can't drift apart. This is the light slice; the full device-layout
+# centralization is tracked as a follow-up.
+_DEFAULT_PARALLEL_DEGREE = 1
+
+
 class StageConfigFactory:
     """Factory that loads pipeline YAML and merges CLI overrides.
 
@@ -269,9 +279,8 @@ class StageConfigFactory:
         cli_overrides: dict[str, Any] | None = None,
         deploy_config_path: str | None = None,
         strategy_specs: Mapping[Any, Any] | None = None,
-        strategy_out: dict[str, Any] | None = None,
         **deprecated_kwargs: Any,
-    ) -> list[StageConfig] | None:
+    ) -> tuple[list[StageConfig] | None, str | None]:
         """Load pipeline + deploy config, merge with CLI overrides.
 
         Checks OMNI_PIPELINES first, since supported models should be explicitly
@@ -284,9 +293,12 @@ class StageConfigFactory:
         merged stages (see ``vllm_omni.config.composable_parallel``). This is
         opt-in: omitting it leaves the existing merge path untouched.
 
-        ``strategy_out`` is an optional mutable dict the caller can pass to
-        receive strategy-derived, pipeline-wide outputs that are *not* per-stage
-        config (currently ``omni_lb_policy``), so the engine can apply them.
+        Returns ``(stages, omni_lb_policy)``: the merged stages (``None`` when the
+        model is not in the pipeline registry and the caller should fall back to
+        the legacy YAML path) and the strategy-derived, pipeline-wide
+        ``omni_lb_policy`` (``None`` when no stage_replica axis set one). The
+        policy is returned rather than threaded through a mutable out-param so the
+        engine can apply it without every intermediate call carrying the dict.
         """
         if cli_overrides is None:
             cli_overrides = {}
@@ -303,9 +315,8 @@ class StageConfigFactory:
                 cli_overrides,
                 deploy_config_path,
                 strategy_specs=strategy_specs,
-                strategy_out=strategy_out,
             )
-        return None
+        return None, None
 
     @classmethod
     def _create_from_registry(
@@ -315,13 +326,16 @@ class StageConfigFactory:
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None = None,
         strategy_specs: Mapping[Any, Any] | None = None,
-        strategy_out: dict[str, Any] | None = None,
         **deprecated_kwargs: Any,
-    ) -> list[StageConfig]:
+    ) -> tuple[list[StageConfig], str | None]:
         """Create StageConfigs from pipeline registry + deploy YAML.
 
         Precedence: caller-typed (non-None) value > deploy YAML >
         StageDeployConfig dataclass default.
+
+        Returns ``(stages, omni_lb_policy)`` — the strategy-derived pipeline-wide
+        load-balancer policy (``None`` when no strategy set one) travels with the
+        stages instead of through a mutable out-param.
         """
         # Resolve deploy config path
         if deploy_config_path is None:
@@ -355,7 +369,7 @@ class StageConfigFactory:
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 
         # Overlay declarative parallel strategies (opt-in) before CLI overrides.
-        applied = cls._apply_strategy_specs(stages, strategy_specs, strategy_out)
+        applied = cls._apply_strategy_specs(stages, strategy_specs)
 
         explicit_overrides = {k: v for k, v in cli_overrides.items() if v is not None}
 
@@ -365,23 +379,24 @@ class StageConfigFactory:
         # Re-validate the resolved layout now that CLI overrides are on top.
         cls._reconcile_strategy_with_cli(stages, applied)
 
-        return stages
+        omni_lb_policy = applied.omni_lb_policy if applied is not None else None
+        return stages, omni_lb_policy
 
     @staticmethod
     def _apply_strategy_specs(
         stages: list[StageConfig],
         strategy_specs: Mapping[Any, Any] | None,
-        strategy_out: dict[str, Any] | None = None,
     ) -> Any:
         """Overlay derived parallel sizing onto merged stages (opt-in).
 
         ``omni_lb_policy`` cannot be set from stage configs (omni reads it once
-        at engine construction), so a derived non-default policy is surfaced via
-        ``strategy_out`` (when provided) for the engine to apply, and logged.
+        at engine construction), so a derived non-default policy is logged here
+        and carried on the returned ``StrategyApplyResult`` for the caller to
+        hand to the engine.
 
         Returns the ``StrategyApplyResult`` (or ``None`` when no strategy was
         supplied) so the caller can re-validate the resolved layout once CLI
-        overrides have been merged on top.
+        overrides have been merged on top, and read its ``omni_lb_policy``.
         """
         if not strategy_specs:
             return None
@@ -389,8 +404,6 @@ class StageConfigFactory:
 
         applied = apply_strategy_specs(stages, strategy_specs)
         if applied.omni_lb_policy is not None:
-            if strategy_out is not None:
-                strategy_out["omni_lb_policy"] = applied.omni_lb_policy
             logger.info(
                 "[composable_parallel] strategy derived omni_lb_policy=%r; it will be applied "
                 "to the engine unless an explicit --omni-lb-policy was given.",
@@ -461,18 +474,19 @@ class StageConfigFactory:
                 val = overrides.get(field_name)
                 return val if val is not None else fallback
 
+            def _eff_degree(field_name: str, source: dict[str, Any]) -> int:
+                # Single place the per-axis "default to 1" fallback is applied,
+                # for both the override and the YAML-default sides (see the
+                # _DEFAULT_PARALLEL_DEGREE TODO).
+                value = _eff(field_name, source.get(field_name, _DEFAULT_PARALLEL_DEGREE))
+                return int(value or _DEFAULT_PARALLEL_DEGREE)
+
             check_device_layout(
                 _eff("devices", stage.yaml_runtime.get("devices")),
-                tensor_parallel_size=int(
-                    _eff("tensor_parallel_size", stage.yaml_engine_args.get("tensor_parallel_size", 1)) or 1
-                ),
-                data_parallel_size=int(
-                    _eff("data_parallel_size", stage.yaml_engine_args.get("data_parallel_size", 1)) or 1
-                ),
-                pipeline_parallel_size=int(
-                    _eff("pipeline_parallel_size", stage.yaml_engine_args.get("pipeline_parallel_size", 1)) or 1
-                ),
-                num_replicas=int(_eff("num_replicas", stage.yaml_runtime.get("num_replicas", 1)) or 1),
+                tensor_parallel_size=_eff_degree("tensor_parallel_size", stage.yaml_engine_args),
+                data_parallel_size=_eff_degree("data_parallel_size", stage.yaml_engine_args),
+                pipeline_parallel_size=_eff_degree("pipeline_parallel_size", stage.yaml_engine_args),
+                num_replicas=_eff_degree("num_replicas", stage.yaml_runtime),
                 role=stage.model_stage,
             )
 

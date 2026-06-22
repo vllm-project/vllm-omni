@@ -569,6 +569,17 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--stage-overrides",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON of per-stage overrides applied on top of the default "
+            "deploy config, e.g. '{\"0\": {\"devices\": \"0,1\"}}' to give the "
+            "thinker a 2-GPU pool. Lets you run a strategy on the bundled default "
+            "deploy config without writing a bespoke deploy YAML."
+        ),
+    )
+    parser.add_argument(
         "--omni-lb-policy",
         type=str,
         default=None,

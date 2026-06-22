@@ -1184,8 +1184,7 @@ class AsyncOmniEngine:
             else:
                 stage_overrides = stage_overrides_json
 
-        strategy_out: dict[str, Any] = {}
-        config_path, stage_configs = load_and_resolve_stage_configs(
+        config_path, stage_configs, strategy_lb_policy = load_and_resolve_stage_configs(
             model,
             stage_configs_path,
             base_kwargs,
@@ -1193,13 +1192,12 @@ class AsyncOmniEngine:
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
-            strategy_out=strategy_out,
         )
 
         # A strategy.yaml may derive a pipeline-wide load-balancer policy. It is
         # an engine-level knob (read once at construction), so apply it here
         # rather than as a per-stage config field.
-        self._apply_strategy_lb_policy(strategy_out.get("omni_lb_policy"), kwargs)
+        self._apply_strategy_lb_policy(strategy_lb_policy, kwargs)
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
         for cfg in stage_configs:

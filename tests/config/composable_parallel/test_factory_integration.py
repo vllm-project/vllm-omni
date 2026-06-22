@@ -14,7 +14,7 @@ from vllm_omni.config.composable_parallel import (
     FanInByStage,
     MeshAxisSpec,
     RouteByStage,
-    StrategyDeviceMismatchError,
+    StrategyApplyError,
     StrategySpec,
     TakeRank,
     apply_strategy_specs,
@@ -64,7 +64,7 @@ def test_device_guard_rejects_tp_on_single_gpu_deploy():
     # The bundled deploy pins the thinker to a single GPU, so the pre-spawn
     # device check must refuse a TP=2 strategy on it.
     stages = _qwen_stages()
-    with pytest.raises(StrategyDeviceMismatchError):
+    with pytest.raises(StrategyApplyError):
         apply_strategy_specs(stages, {"thinker": [_tp(2)]})
 
 
@@ -105,7 +105,7 @@ def test_device_check_survives_cli_override():
     # Strategy replicates the talker (1-GPU template -> valid at apply time),
     # but a CLI --stage_1_devices with 3 ids must NOT slip past the device
     # guard: effective world=1, replicas=2 admits only 1 or 2 device ids.
-    with pytest.raises(StrategyDeviceMismatchError):
+    with pytest.raises(StrategyApplyError):
         StageConfigFactory._create_from_registry(
             "qwen2_5_omni",
             {"stage_1_devices": "0,1,2"},
@@ -132,7 +132,7 @@ def test_cli_overrides_strategy_with_warning():
     handler = _Capture(level=logging.WARNING)
     log.addHandler(handler)
     try:
-        stages = StageConfigFactory._create_from_registry(
+        stages, _ = StageConfigFactory._create_from_registry(
             "qwen2_5_omni",
             {"stage_1_num_replicas": 3},
             strategy_specs={"talker": [_stage_replica(2, "round_robin")]},

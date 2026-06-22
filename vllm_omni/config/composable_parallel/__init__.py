@@ -28,9 +28,6 @@ from vllm_omni.config.composable_parallel.aggregation import (
 from vllm_omni.config.composable_parallel.apply import (
     StrategyApplyError,
     StrategyApplyResult,
-    StrategyConflictError,
-    StrategyDeviceMismatchError,
-    StrategyRoleError,
     apply_strategy_specs,
     check_device_layout,
 )
@@ -58,11 +55,7 @@ from vllm_omni.config.composable_parallel.spec import (
 )
 from vllm_omni.config.composable_parallel.translator import (
     AxisTranslationError,
-    DuplicateAxisKindError,
     OmniParallelConfig,
-    RoutingOwnershipError,
-    UnsupportedAxisKindError,
-    UnsupportedRoutingError,
     translate_strategy_stack,
 )
 
@@ -103,16 +96,9 @@ __all__ = [
     "OmniParallelConfig",
     "translate_strategy_stack",
     "AxisTranslationError",
-    "UnsupportedAxisKindError",
-    "DuplicateAxisKindError",
-    "RoutingOwnershipError",
-    "UnsupportedRoutingError",
     # apply
     "apply_strategy_specs",
     "StrategyApplyResult",
     "check_device_layout",
     "StrategyApplyError",
-    "StrategyRoleError",
-    "StrategyConflictError",
-    "StrategyDeviceMismatchError",
 ]

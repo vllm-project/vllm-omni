@@ -100,7 +100,7 @@ def test_run_headless_raises_when_stage_id_not_in_configs(mocker: MockerFixture)
     other_stage = SimpleNamespace(stage_id=99)
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [other_stage]),
+        return_value=("/fake/stages.yaml", [other_stage], None),
     )
 
     args = _make_headless_args(stage_id=0)
@@ -148,7 +148,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
 
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg]),
+        return_value=("/fake/stages.yaml", [stage_cfg], None),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -224,7 +224,7 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
 
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg]),
+        return_value=("/fake/stages.yaml", [stage_cfg], None),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -283,7 +283,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
 
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg]),
+        return_value=("/fake/stages.yaml", [stage_cfg], None),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -363,7 +363,7 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
 
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg]),
+        return_value=("/fake/stages.yaml", [stage_cfg], None),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)

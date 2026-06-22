@@ -14,7 +14,7 @@ describe. Only a subset is wired end-to-end today (see ``translator.py``):
 * **Wired** (translatable now): ``tp``, ``dp``, ``pp``, ``ep``,
   ``stage_replica``.
 * **Reserved** (declared in the type system but not yet translatable — the
-  translator raises ``UnsupportedAxisKindError`` for them): ``sp_ulysses``,
+  translator raises ``AxisTranslationError`` for them): ``sp_ulysses``,
   ``sp_ring``, ``cfg``, ``vae_pp``, ``hsdp``, ``stage_pp``, ``cp``.
 
 Reserved kinds fail fast at translation time rather than silently doing nothing,
@@ -25,40 +25,40 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Literal
 
 from vllm_omni.config.composable_parallel.aggregation import AggregationPattern
 from vllm_omni.config.composable_parallel.routing import RoutingPattern
 
-MeshAxisKind = Literal[
-    "tp",
-    "dp",
-    "pp",
-    "ep",
-    "sp_ulysses",
-    "sp_ring",
-    "cfg",
-    "vae_pp",
-    "hsdp",
-    "stage_pp",
-    "stage_replica",
-    "cp",
-]
 
-MESH_AXIS_KINDS: tuple[MeshAxisKind, ...] = (
-    "tp",
-    "dp",
-    "pp",
-    "ep",
-    "sp_ulysses",
-    "sp_ring",
-    "cfg",
-    "vae_pp",
-    "hsdp",
-    "stage_pp",
-    "stage_replica",
-    "cp",
-)
+class MeshAxisKind(str, Enum):
+    """Enumerates every parallelism dimension the strategy contract can describe.
+
+    Subclassing ``str`` keeps existing string comparisons and dict keys working
+    (``MeshAxisKind.TP == "tp"`` and both hash the same), while making the type
+    refactor-safe: a typo'd kind is an ``AttributeError`` on the enum rather than
+    a silently-wrong bare string.
+    """
+
+    TP = "tp"
+    DP = "dp"
+    PP = "pp"
+    EP = "ep"
+    SP_ULYSSES = "sp_ulysses"
+    SP_RING = "sp_ring"
+    CFG = "cfg"
+    VAE_PP = "vae_pp"
+    HSDP = "hsdp"
+    STAGE_PP = "stage_pp"
+    STAGE_REPLICA = "stage_replica"
+    CP = "cp"
+
+
+# Bare string values, kept as a plain tuple so membership checks and error
+# messages read as the kind names (``"tp"``) rather than enum reprs. ``str``-enum
+# equality means both ``"tp"`` and ``MeshAxisKind.TP`` satisfy ``in`` checks.
+MESH_AXIS_KINDS: tuple[str, ...] = tuple(k.value for k in MeshAxisKind)
 
 HookCategory = Literal[
     "linear",

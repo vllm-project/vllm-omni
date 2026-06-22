@@ -30,13 +30,17 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NoReturn
+
+from vllm.logger import init_logger
 
 from vllm_omni.config.composable_parallel.spec import StrategySpec
 from vllm_omni.config.composable_parallel.translator import (
     OmniParallelConfig,
     translate_strategy_stack,
 )
+
+logger = init_logger(__name__)
 
 # Role key -> the StageConfig fields each declared axis writes.
 _ENGINE_FIELD_BY_KIND: dict[str, str] = {
@@ -49,19 +53,21 @@ RoleKey = str | int
 
 
 class StrategyApplyError(ValueError):
-    """Base error for applying a strategy onto stage configs."""
+    """Error for applying a strategy onto stage configs.
+
+    A single error type (rather than per-cause subclasses) keeps the public
+    surface small and consistent with the rest of the codebase; the specific
+    cause — an unmatched role, a conflict with an explicit deploy value, or a
+    device-count mismatch — is in the message and is logged before the raise so
+    it stays visible even when the type is unavailable to a caller (e.g. across a
+    server boundary).
+    """
 
 
-class StrategyRoleError(StrategyApplyError):
-    """Raised when a strategy role cannot be matched to exactly one stage."""
-
-
-class StrategyConflictError(StrategyApplyError):
-    """Raised when a strategy value conflicts with an explicitly-set deploy value."""
-
-
-class StrategyDeviceMismatchError(StrategyApplyError):
-    """Raised when a stage's device count is inconsistent with its world size."""
+def _fail(msg: str) -> NoReturn:
+    """Log and raise :class:`StrategyApplyError`."""
+    logger.error("[composable_parallel] %s", msg)
+    raise StrategyApplyError(msg)
 
 
 @dataclass
@@ -87,9 +93,24 @@ class StrategyApplyResult:
 
 
 def _resolve_stage(stages: Sequence[Any], key: RoleKey) -> Any:
-    """Find the single stage matching ``key`` (by ``model_stage`` or ``stage_id``)."""
+    """Find the single stage matching ``key`` (by ``model_stage`` or ``stage_id``).
+
+    A strategy role key is intentionally matched on *one* of two stage attributes,
+    chosen by the key's runtime type — never both at once:
+
+    * a ``str`` key (e.g. ``"thinker"``) is a human-readable ``model_stage`` name,
+      which is how strategy.yaml authors naturally refer to a stage;
+    * an ``int`` key (e.g. ``1``) is the positional ``stage_id``, used by callers
+      that don't know/care about role names (programmatic overlays, tests).
+
+    Supporting both is a deliberate ergonomics choice, not a fallback chain: the
+    key's type unambiguously selects the lookup field, so there is no precedence
+    to reason about and no risk of a name accidentally matching an id. The
+    ``bool`` guard below exists only because ``bool`` is an ``int`` subclass and
+    would otherwise be silently treated as a stage_id.
+    """
     if isinstance(key, bool):  # guard: bool is an int subclass
-        raise StrategyRoleError(f"strategy role key must be str or int, got bool {key!r}")
+        _fail(f"strategy role key must be str or int, got bool {key!r}")
 
     if isinstance(key, int):
         matches = [s for s in stages if getattr(s, "stage_id", None) == key]
@@ -100,17 +121,24 @@ def _resolve_stage(stages: Sequence[Any], key: RoleKey) -> Any:
 
     if not matches:
         available = ", ".join(f"{getattr(s, 'model_stage', '?')!r}(id={getattr(s, 'stage_id', '?')})" for s in stages)
-        raise StrategyRoleError(f"strategy role {descriptor} did not match any stage; available stages: {available}")
+        _fail(f"strategy role {descriptor} did not match any stage; available stages: {available}")
     if len(matches) > 1:
-        raise StrategyRoleError(f"strategy role {descriptor} is ambiguous; it matched {len(matches)} stages")
+        _fail(f"strategy role {descriptor} is ambiguous; it matched {len(matches)} stages")
     return matches[0]
 
 
 def _set_explicit(engine_args: dict[str, Any], field_name: str, value: Any, *, role: RoleKey) -> None:
-    """Write ``field_name`` with conflict-on-explicit semantics."""
-    existing = engine_args.get(field_name)
-    if existing is not None and existing != value:
-        raise StrategyConflictError(
+    """Write ``field_name`` with conflict-on-explicit semantics.
+
+    ``engine_args`` is the raw mapping loaded straight from the deploy YAML
+    (before the engine-args dataclass is constructed), so a key is *present* only
+    when the YAML set it explicitly. We therefore key off membership rather than
+    ``.get``: an explicit ``None`` in the YAML is a real, present value and must
+    not be conflated with a key miss (which ``.get`` would report as ``None``).
+    """
+    if field_name in engine_args and engine_args[field_name] != value:
+        existing = engine_args[field_name]
+        _fail(
             f"role {role!r}: strategy derives {field_name}={value} but the deploy config already "
             f"set {field_name}={existing}. Remove one of them (the strategy is the single writer "
             "for the axes it declares)."
@@ -122,7 +150,7 @@ def _set_num_replicas(runtime: dict[str, Any], value: int, *, role: RoleKey) -> 
     """Write ``num_replicas`` with conflict-on-explicit (treating 1 as unset)."""
     existing = runtime.get("num_replicas", 1)
     if existing not in (1, value):
-        raise StrategyConflictError(
+        _fail(
             f"role {role!r}: strategy derives num_replicas={value} but the deploy config already "
             f"set num_replicas={existing}. Remove one of them."
         )
@@ -152,10 +180,10 @@ def check_device_layout(
 ) -> None:
     """Validate a stage's device count against its world size (× replicas in pool mode).
 
-    Raises :class:`StrategyDeviceMismatchError` when the declared ``devices``
-    count is neither the per-replica world size nor the full ``num_replicas``
-    pool. Exposed publicly so the resolved (post-CLI) layout can be re-checked
-    after later override layers, not just the strategy-derived snapshot.
+    Raises :class:`StrategyApplyError` when the declared ``devices`` count is
+    neither the per-replica world size nor the full ``num_replicas`` pool.
+    Exposed publicly so the resolved (post-CLI) layout can be re-checked after
+    later override layers, not just the strategy-derived snapshot.
     """
     count = _parse_device_count(devices)
     if count is None:
@@ -167,7 +195,7 @@ def check_device_layout(
     # per-replica device splitter.
     valid = {world, replicas * world}
     if count not in valid:
-        raise StrategyDeviceMismatchError(
+        _fail(
             f"role {role!r}: declared {count} device id(s) but the strategy world size is {world} "
             f"(tp={tensor_parallel_size} * dp={data_parallel_size} * pp={pipeline_parallel_size}). "
             f"Provide either {world} (per-replica template) or {replicas * world} "
@@ -220,11 +248,12 @@ def apply_strategy_specs(
         pipeline-wide ``omni_lb_policy`` (if any stage_replica axis set one).
 
     Raises:
-        StrategyRoleError: a role matched zero or multiple stages.
-        StrategyConflictError: a derived value conflicts with an explicit deploy
-            value, or two roles derive different ``omni_lb_policy`` values.
-        StrategyDeviceMismatchError: a stage's device count is inconsistent.
-        AxisTranslationError (and subclasses): the spec stack is not translatable.
+        StrategyApplyError: a role matched zero or multiple stages, a derived
+            value conflicts with an explicit deploy value (including two roles
+            deriving different ``omni_lb_policy`` values), or a stage's device
+            count is inconsistent with its world size.
+        AxisTranslationError: the spec stack is invalid/unsupported.
+        NotImplementedError: the spec stack requests routing not built yet.
     """
     result = StrategyApplyResult(stages=stages)
     lb_policy: str | None = None
@@ -241,7 +270,7 @@ def apply_strategy_specs(
 
         if cfg.stage_replica_size > 1 and cfg.omni_lb_policy is not None:
             if lb_policy is not None and lb_policy != cfg.omni_lb_policy:
-                raise StrategyConflictError(
+                _fail(
                     f"role {key!r} derives omni_lb_policy={cfg.omni_lb_policy!r} but role "
                     f"{lb_owner!r} already derived {lb_policy!r}. The load-balancer policy is "
                     "pipeline-wide; only one value is allowed."

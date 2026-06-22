@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for parsing/loading strategy.yaml files."""
+"""Tests for parsing/loading strategy files."""
 
 from __future__ import annotations
 
 import pytest
 
 from vllm_omni.config.composable_parallel.routing import Broadcast, RouteByStage
-from vllm_omni.config.composable_parallel.strategy_yaml import (
-    StrategyYamlError,
+from vllm_omni.config.composable_parallel.strategy_loader import (
+    StrategyLoadError,
     load_strategy_specs,
     parse_strategy_specs,
 )
@@ -49,34 +49,34 @@ def test_l1_owner_goes_to_shard_extension():
 
 
 def test_missing_axis_raises():
-    with pytest.raises(StrategyYamlError):
+    with pytest.raises(StrategyLoadError):
         parse_strategy_specs({"thinker": [{"size": 2}]})
 
 
 def test_missing_size_raises():
-    with pytest.raises(StrategyYamlError):
+    with pytest.raises(StrategyLoadError):
         parse_strategy_specs({"thinker": [{"axis": "tp"}]})
 
 
 def test_routing_on_non_policy_axis_raises():
-    with pytest.raises(StrategyYamlError):
+    with pytest.raises(StrategyLoadError):
         parse_strategy_specs({"thinker": [{"axis": "tp", "size": 2, "routing": "random"}]})
 
 
 def test_bad_size_raises():
-    with pytest.raises(StrategyYamlError):
+    with pytest.raises(StrategyLoadError):
         parse_strategy_specs({"thinker": [{"axis": "tp", "size": "two"}]})
 
 
 def test_entries_must_be_list():
-    with pytest.raises(StrategyYamlError):
+    with pytest.raises(StrategyLoadError):
         parse_strategy_specs({"thinker": {"axis": "tp", "size": 2}})
 
 
 def test_non_mapping_entry_raises():
     # A list whose elements are not mappings (e.g. a bare string) must raise a
-    # StrategyYamlError, not an opaque TypeError from dict(entry).
-    with pytest.raises(StrategyYamlError):
+    # StrategyLoadError, not an opaque TypeError from dict(entry).
+    with pytest.raises(StrategyLoadError):
         parse_strategy_specs({"thinker": ["tp"]})
 
 

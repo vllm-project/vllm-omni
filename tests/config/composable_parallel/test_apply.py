@@ -11,9 +11,7 @@ from vllm_omni.config.composable_parallel import (
     FanInByStage,
     MeshAxisSpec,
     RouteByStage,
-    StrategyConflictError,
-    StrategyDeviceMismatchError,
-    StrategyRoleError,
+    StrategyApplyError,
     StrategySpec,
     TakeRank,
     apply_strategy_specs,
@@ -79,7 +77,7 @@ def test_only_declared_axes_are_written():
 def test_conflict_on_explicit_tp():
     stages = _qwen_stages()
     stages[0].yaml_engine_args["tensor_parallel_size"] = 4
-    with pytest.raises(StrategyConflictError):
+    with pytest.raises(StrategyApplyError):
         apply_strategy_specs(stages, {"thinker": [_tp(2)]})
 
 
@@ -90,10 +88,29 @@ def test_equal_explicit_value_is_noop():
     assert stages[0].yaml_engine_args["tensor_parallel_size"] == 2
 
 
+def test_explicit_none_conflicts_with_derived_value():
+    # An explicit YAML ``null`` (``tensor_parallel_size: null``) is a *present*
+    # value, not a missing key, so a strategy deriving a non-None size must raise
+    # rather than silently clobber the explicit None.
+    stages = _qwen_stages()
+    stages[0].yaml_engine_args["tensor_parallel_size"] = None
+    with pytest.raises(StrategyApplyError):
+        apply_strategy_specs(stages, {"thinker": [_tp(2)]})
+
+
+def test_missing_key_is_filled_without_conflict():
+    # A genuinely absent key (never set in the YAML) is filled by the strategy
+    # and must NOT raise — the contrast case to an explicit None.
+    stages = _qwen_stages()
+    assert "tensor_parallel_size" not in stages[0].yaml_engine_args
+    apply_strategy_specs(stages, {"thinker": [_tp(2)]})
+    assert stages[0].yaml_engine_args["tensor_parallel_size"] == 2
+
+
 def test_num_replicas_conflict():
     stages = _qwen_stages()
     stages[1].yaml_runtime["num_replicas"] = 3
-    with pytest.raises(StrategyConflictError):
+    with pytest.raises(StrategyApplyError):
         apply_strategy_specs(stages, {"talker": [_stage_replica(2)]})
 
 
@@ -115,19 +132,19 @@ def test_device_count_ok_pool():
 def test_device_count_mismatch():
     stages = _qwen_stages()
     stages[0].yaml_runtime["devices"] = "0,1,2"
-    with pytest.raises(StrategyDeviceMismatchError):
+    with pytest.raises(StrategyApplyError):
         apply_strategy_specs(stages, {"thinker": [_tp(2)]})
 
 
 def test_unknown_role_raises():
     stages = _qwen_stages()
-    with pytest.raises(StrategyRoleError):
+    with pytest.raises(StrategyApplyError):
         apply_strategy_specs(stages, {"nonexistent": [_tp(2)]})
 
 
 def test_conflicting_lb_policy_across_roles():
     stages = _qwen_stages()
-    with pytest.raises(StrategyConflictError):
+    with pytest.raises(StrategyApplyError):
         apply_strategy_specs(
             stages,
             {
