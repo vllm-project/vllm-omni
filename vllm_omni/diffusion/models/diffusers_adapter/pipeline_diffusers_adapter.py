@@ -19,6 +19,7 @@ import re
 from typing import Any, cast
 
 import torch
+from diffusers.models.modeling_utils import ModelMixin
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from torch import nn
 
@@ -50,10 +51,14 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, device: torch.device | None = None):
         super().__init__()
+        self.is_initialized = False
         self._pipeline: DiffusionPipeline
+        self._transformer: ModelMixin | None
+        self._transformer_2: ModelMixin | None
         self._accept_call_kwargs: set[str] | None = None  # None to accept all kwargs
         self.od_config = od_config
         self.device = device
+
         self._capabilities: dict[str, Any] = {}
         self._pipeline_utils: BasePipelineUtils = BasePipelineUtils()
         self._raise_unsupported_features()
@@ -66,10 +71,66 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             logger.info("Profiling enabled for DiffusersAdapterPipeline. Only 'forward' is supported.")
 
     # ------------------------------------------------------------------
+    # Common components that can be leveraged after loading
+    # ------------------------------------------------------------------
+
+    @property
+    def pipeline(self) -> DiffusionPipeline:
+        if not self.is_initialized:
+            raise RuntimeError("pipeline can't be accessed before .load_weights()")
+        return self._pipeline
+
+    @property
+    def transformer(self) -> ModelMixin | None:
+        if not self.is_initialized:
+            raise RuntimeError("transformer can't be accessed before .load_weights()")
+        return self._transformer
+
+    @property
+    def transformer_2(self) -> ModelMixin | None:
+        if not self.is_initialized:
+            raise RuntimeError("transformer_2 can't be accessed before .load_weights()")
+        return self._transformer_2
+
+    @staticmethod
+    def _build_hsdp_condition(modulelist_names: set[str]):
+        """Best effort check for determining HSDP shardable modules;
+        Currently we say that something is HSDP shardable if its a ModuleList
+        with depth 2, since most cases are things like transformer.blocks.<int>
+        etc.
+        """
+
+        def should_shard(name: str, module: nn.Module):
+            parts = name.split(".")
+            return len(parts) == 2 and parts[0] in modulelist_names and parts[-1].isdigit()
+
+        return should_shard
+
+    @staticmethod
+    def _maybe_set_module_hsdp_conditions(maybe_module: nn.Module | None):
+        """Best effort check for determining HSDP shardable modules."""
+        if maybe_module is None:
+            return
+        modulelist_names = {name for name, m in maybe_module.named_children() if isinstance(m, nn.ModuleList)}
+        condition = DiffusersAdapterPipeline._build_hsdp_condition(modulelist_names)
+        setattr(maybe_module, "_hsdp_shard_conditions", [condition])
+
+    def _set_dit_hsdp_conditions(self):
+        """Set the HSDP conditions for all encapsulated components currently supported for HSDP.
+
+        NOTE: Currently this only checks DiT related components. We should also support components
+        like U-net as we add HSDP support outside the Diffusers backend.
+        """
+        if self.transformer is None and self.transformer_2 is None:
+            raise RuntimeError("HSDP requires an encapsulated DiT, but one was not found")
+        self._maybe_set_module_hsdp_conditions(self.transformer)
+        self._maybe_set_module_hsdp_conditions(self.transformer_2)
+
+    # ------------------------------------------------------------------
     # Weight loading
     # ------------------------------------------------------------------
 
-    def load_weights(self) -> None:
+    def load_weights(self, *args, **kwargs) -> None:
         """Load the diffusers pipeline via ``DiffusionPipeline.from_pretrained()``."""
 
         model_id = self.od_config.model
@@ -86,38 +147,48 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self._pipeline_utils = get_pipeline_utils(pipeline_class_name)
         self._pipeline_utils.update_load_kwargs(self.od_config, load_kwargs)
 
-        self._pipeline = DiffusionPipeline.from_pretrained(model_id, **load_kwargs)
-        self._pipeline_utils.apply_post_load_updates(self._pipeline, self.od_config)
-
-        self._pipeline.to(self.device)
+        pipe = DiffusionPipeline.from_pretrained(model_id, **load_kwargs)
+        self._pipeline_utils.apply_post_load_updates(pipe, self.od_config)
 
         # Cache __call__kwargs signature introspection for later input validation
-        self._accept_call_kwargs = set(inspect.signature(self._pipeline.__call__).parameters.keys())
+        self._accept_call_kwargs = set(inspect.signature(pipe.__call__).parameters.keys())
 
         # CPU offloading
+        # NOTE: Currently group offload in Diffusers isn't supported because vLLM Omni
+        # does not have an analogous setting, and it can't be enabled through kwargs in
+        # from_pretrained and .__call__(); when/if we add a similar mechanism in vLLM
+        # Omni, we should also expose it here.
         if self.od_config.enable_layerwise_offload:
-            self._pipeline.enable_sequential_cpu_offload()
+            pipe.enable_sequential_cpu_offload()
         elif self.od_config.enable_cpu_offload:
-            self._pipeline.enable_model_cpu_offload()
+            pipe.enable_model_cpu_offload()
+        else:
+            # Only move to device if we don't enable offloading
+            pipe.to(self.device)
 
         # VAE slicing and tiling: try-catch because not all models have VAE
         if self.od_config.vae_use_slicing:
             try:
-                self._pipeline.enable_vae_slicing()
+                pipe.enable_vae_slicing()
             except Exception as e:
-                logger.warning(
-                    f"Failed to enable VAE slicing for diffusers pipeline {self._pipeline.__class__.__name__}: {e}"
-                )
+                logger.warning(f"Failed to enable VAE slicing for diffusers pipeline {pipe.__class__.__name__}: {e}")
         if self.od_config.vae_use_tiling:
             try:
-                self._pipeline.enable_vae_tiling()
+                pipe.enable_vae_tiling()
             except Exception as e:
-                logger.warning(
-                    f"Failed to enable VAE tiling for diffusers pipeline {self._pipeline.__class__.__name__}: {e}"
-                )
+                logger.warning(f"Failed to enable VAE tiling for diffusers pipeline {pipe.__class__.__name__}: {e}")
 
-        # Attention backend
-        self._set_attention_backend()
+        # Mark as initialized so that we can access component properties
+        self._transformer = getattr(pipe, "transformer", None)
+        self._transformer_2 = getattr(pipe, "transformer_2", None)
+        self._pipeline = pipe
+        self.is_initialized = True
+
+        # Handle attention backend after we've set the .transformer if we have one
+        self._set_attention_backend(self.transformer)
+        self._set_attention_backend(self.transformer_2)
+        if self.od_config.parallel_config.use_hsdp:
+            self._set_dit_hsdp_conditions()
 
     # ------------------------------------------------------------------
     # Step-wise execution — explicitly rejected
@@ -157,8 +228,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         kwargs = self._build_call_kwargs(req)
         logger.debug(f"Calling diffusers pipeline with kwargs: {kwargs}")
 
-        with torch.inference_mode():
-            output = self._pipeline(**kwargs)  # pyright: ignore[reportCallIssue]
+        output = self.pipeline(**kwargs)  # pyright: ignore[reportCallIssue]
 
         return self._wrap_output(output)
 
@@ -185,11 +255,6 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 "with the diffusers backend. TeaCache/Cache-DiT require hooking "
                 "into individual transformer blocks."
             )
-        if self.od_config.enforce_eager:
-            raise NotImplementedError(
-                "Eager execution is not supported with the diffusers backend. "
-                "Use a native pipeline for continuous batching mode."
-            )
         if self.od_config.quantization_config is not None:
             raise NotImplementedError(
                 "Quantization is not supported with the diffusers backend. Use a native pipeline for quantization."
@@ -199,15 +264,14 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     # Wrap settings, inputs, and outputs
     # ------------------------------------------------------------------
 
-    def _set_attention_backend(self) -> None:
+    def _set_attention_backend(self, maybe_transformer: ModelMixin | None) -> None:
         """Set the attention backend.
 
         Roughly follow the logic in vllm_omni/diffusion/attention/backends/utils/fa.py,
         But also consider the available attention backends in diffusers.
         (See: https://huggingface.co/docs/diffusers/optimization/attention_backends)
         """
-        if not hasattr(self._pipeline, "transformer"):
-            logging.info("No transformer found in diffusers pipeline. Skipping attention backend setting.")
+        if maybe_transformer is None:
             return
 
         default_spec = self.od_config.diffusion_attention_config.default
@@ -252,7 +316,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         set_backend: str | None = None
         for backend in attention_backend_attempts:
             try:
-                self._pipeline.transformer.set_attention_backend(backend)
+                maybe_transformer.set_attention_backend(backend)
                 set_backend = backend
                 break
             except Exception as e:
@@ -260,7 +324,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # If all attempts fail, fallback to SDPA and warn the user about the failures
         if len(attempt_errors) == len(attention_backend_attempts):
-            self._pipeline.transformer.set_attention_backend("native")
+            maybe_transformer.set_attention_backend("native")
             logger.warning(
                 f"Failed to set attention backend '{attention_backend_config}' for "
                 f"diffusers pipeline {self._pipeline.__class__.__name__}. "

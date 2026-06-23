@@ -648,8 +648,6 @@ class DiffusersPipelineLoader:
         # directly on GPU, HSDP needs weights on CPU first so they can be redistributed
         # across GPUs by apply_hsdp_to_model. The model's load_weights handles weight
         # mapping (QKV fusion, etc.).
-        if load_format == "diffusers":
-            raise ValueError("HSDP is not supported with the diffusers adapter load format")
         model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
         self.load_weights(model)
 
@@ -671,6 +669,9 @@ class DiffusersPipelineLoader:
 
         # Collect all transformers to shard (some models have transformer_2 for MoE)
         transformers_to_shard = []
+
+        # NOTE: In the case of DiffusersAdapterPipeline, this .transformer unwraps
+        # the transformer attribute on the encapsulated pipeline for now.
         transformer = getattr(model, "transformer", None)
         if transformer is None:
             raise ValueError("Model has no transformer attribute for HSDP")
@@ -686,9 +687,13 @@ class DiffusersPipelineLoader:
             logger.debug("Applying HSDP to %s", name)
             apply_hsdp_to_model(trans, hsdp_config, target_device=target_device)
 
-        # # HSDP only shards transformer modules. All other runtime modules must
-        # # be placed on the execution device explicitly after sharding.
-        discovered_modules = ModuleDiscovery.discover(model)
+        # If we are trying to run HSDP on a DiffusersAdapterPipeline, unwrap the
+        # adapter prior to module discovery, since we want to run it on the pipeline module
+        pipeline = model.pipeline if isinstance(model, DiffusersAdapterPipeline) else model
+
+        # HSDP only shards transformer modules. All other runtime modules must
+        # be placed on the execution device explicitly after sharding.
+        discovered_modules = ModuleDiscovery.discover(pipeline)
         modules_to_move: list[nn.Module] = []
         if discovered_modules.vaes is not None:
             modules_to_move.extend(discovered_modules.vaes)

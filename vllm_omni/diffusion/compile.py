@@ -40,6 +40,9 @@ def regionally_compile(model: nn.Module, *compile_args: Any, **compile_kwargs: A
         The same model instance (modified in-place)
     """
     # Get the list of repeated blocks from the model
+    # NOTE: _repeated_blocks is also the attribute name used for repeating blocks
+    # in Diffusers for the purpose of regional compile, so no special handling is
+    # needed for the Diffusers Backend case once we have the transformer.
     repeated_blocks = getattr(model, "_repeated_blocks", None)
 
     if not repeated_blocks:

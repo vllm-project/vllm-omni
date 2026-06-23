@@ -179,6 +179,7 @@ def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
         "--diffusion-load-format",
         "diffusers",
         # "--enable-diffusion-pipeline-profiler",
+        "--enforce-eager",
     ]
     with OmniServer(model, server_args, use_omni=True) as omni_server:
         start_time = time.perf_counter()
