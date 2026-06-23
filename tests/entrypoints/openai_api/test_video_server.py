@@ -1334,7 +1334,7 @@ def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture)
     extra_params = {
         "is_enable_stage2": True,
         "pyramid_num_stages": 3,
-        "pyramid_num_inference_steps_list": [20, 20, 20],
+        "pyramid_num_inference_steps_list": [1, 1, 1],
         "use_cfg_zero_star": True,
     }
     response = test_client.post(
@@ -1352,7 +1352,7 @@ def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture)
     captured = engine.captured_sampling_params_list[0]
     assert captured.extra_args["is_enable_stage2"] is True
     assert captured.extra_args["pyramid_num_stages"] == 3
-    assert captured.extra_args["pyramid_num_inference_steps_list"] == [20, 20, 20]
+    assert captured.extra_args["pyramid_num_inference_steps_list"] == [1, 1, 1]
     assert captured.extra_args["use_cfg_zero_star"] is True
 
 

@@ -21,6 +21,7 @@ from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
 from vllm_omni.diffusion.sched import RequestScheduler
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -49,7 +50,7 @@ def _make_executor(num_gpus: int = 1):
 
     Returns ``(executor, request_queue, result_queue)``.
     """
-    od_cfg = SimpleNamespace(num_gpus=num_gpus)
+    od_cfg = SimpleNamespace(num_gpus=num_gpus, streaming_output=False)
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(MultiprocDiffusionExecutor, "_init_executor", lambda self: None)
     executor = MultiprocDiffusionExecutor(od_cfg)
@@ -75,6 +76,7 @@ def _make_engine(num_gpus: int = 1):
     """Create a lightweight ``DiffusionEngine`` wired to mocked executor."""
     executor, req_q, res_q = _make_executor(num_gpus)
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(streaming_output=False)
     sched = RequestScheduler()
     sched.initialize(SimpleNamespace())
     engine.scheduler = sched
@@ -579,6 +581,58 @@ class TestMultiprocExecutorRaisesEngineDeadError:
                 unique_reply_rank=0,
                 exec_all_ranks=True,
             )
+
+
+class TestMultiprocExecutorStepStreamingOutput:
+    """Streaming output uses step execution and one worker reply per step."""
+
+    def test_execute_step_allows_streaming_output_mode(self):
+        executor, req_q, res_q = _make_executor()
+        executor.od_config = SimpleNamespace(streaming_output=True)  # pyright: ignore[reportAttributeAccessIssue]
+        runner_outputs = [
+            RunnerOutput(
+                request_id="sched-stream",
+                step_index=1,
+                finished=False,
+                result=DiffusionOutput(output={"chunk": 0}, finished=False, chunk_index=0, total_chunks=2),
+            ),
+            RunnerOutput(
+                request_id="sched-stream",
+                step_index=2,
+                finished=True,
+                result=DiffusionOutput(output={"chunk": 1}, finished=True, chunk_index=1, total_chunks=2),
+            ),
+        ]
+        scheduler_output = SimpleNamespace(
+            scheduled_request_ids=["sched-stream"],
+        )
+
+        def _worker():
+            for runner_output in runner_outputs:
+                req_q.get(timeout=10)
+                res_q.put(runner_output)
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+
+        first: RunnerOutput = MultiprocDiffusionExecutor.execute_step(  # pyright: ignore[reportAssignmentType]
+            executor,
+            scheduler_output,  # pyright: ignore[reportArgumentType]
+        )
+        second: RunnerOutput = MultiprocDiffusionExecutor.execute_step(  # pyright: ignore[reportAssignmentType]
+            executor,
+            scheduler_output,  # pyright: ignore[reportArgumentType]
+        )
+
+        assert first is runner_outputs[0]
+        assert first.result is not None
+        assert first.result.output == {"chunk": 0}
+        assert first.finished is False
+        assert second is runner_outputs[1]
+        assert second.result is not None
+        assert second.result.output == {"chunk": 1}
+        assert second.finished is True
+        thread.join(timeout=2)
 
 
 class TestDiffusionEngineDeadErrorPassthrough:

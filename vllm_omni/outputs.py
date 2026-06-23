@@ -178,6 +178,7 @@ class OmniRequestOutput:
         final_output_type: str = "image",
         stage_durations: dict[str, float] | None = None,
         peak_memory_mb: float = 0.0,
+        finished: bool = True,
     ) -> "OmniRequestOutput":
         """Create output from diffusion model.
 
@@ -214,7 +215,7 @@ class OmniRequestOutput:
             _custom_output=custom_output or {},
             stage_durations=stage_durations or {},
             peak_memory_mb=peak_memory_mb,
-            finished=True,
+            finished=finished,
         )
 
     @property
