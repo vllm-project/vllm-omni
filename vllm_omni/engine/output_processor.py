@@ -250,6 +250,7 @@ class OmniRequestState(RequestState):
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
+        routed_experts: Any = None,
     ) -> OmniRequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
 
@@ -263,6 +264,8 @@ class OmniRequestState(RequestState):
             finish_reason: Optional finish reason indicating why generation stopped
             stop_reason: Optional stop reason (token ID or stop string)
             kv_transfer_params: Optional KV cache transfer parameters
+            routed_experts: Optional MoE routed-expert ids for this step,
+                attached to the completion output for generation stages
 
         Returns:
             OmniRequestOutput or PoolingRequestOutput if output should be
@@ -310,7 +313,7 @@ class OmniRequestState(RequestState):
 
         external_req_id = self.external_req_id
 
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
+        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, routed_experts)
 
         if self.parent_req is None:
             outputs = [output]
@@ -332,6 +335,7 @@ class OmniRequestState(RequestState):
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
+        routed_experts: Any = None,
     ) -> MultimodalCompletionOutput | CompletionOutput:
         """Create a completion output with multimodal data attached.
 
@@ -352,6 +356,7 @@ class OmniRequestState(RequestState):
                 cumulative_logprob=None,
                 finish_reason=str(finish_reason) if finished else None,
                 stop_reason=stop_reason if finished else None,
+                routed_experts=routed_experts,
             )
         else:
             base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
