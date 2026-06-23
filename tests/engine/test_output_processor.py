@@ -209,3 +209,64 @@ def test_cumulative_token_ids_is_a_copy():
     s = _make_state(RequestOutputKind.DELTA)
     out = s._new_completion_output([42], None, None)
     assert out.cumulative_token_ids is not _DETOK.output_token_ids
+
+
+# ---------------------------------------------------------------------------
+# No-detokenizer regression tests (Concern 2)
+# ---------------------------------------------------------------------------
+
+_NO_DETOK_STATE_KWARGS = {
+    **_DEFAULT_STATE_KWARGS,
+    "detokenizer": None,
+    "logprobs_processor": None,
+}
+
+
+def _make_no_detok_state(output_kind: RequestOutputKind):
+    return OmniRequestState(**_NO_DETOK_STATE_KWARGS, output_kind=output_kind)
+
+
+def test_no_detokenizer_completion_output():
+    """_new_completion_output works when detokenizer is None (generation stages)."""
+    s = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor(torch.randn(10), mm_type=AUDIO)
+    out = s._new_completion_output([1, 2], None, None)
+    # Should still produce output with empty text and the token_ids as-is
+    assert out.text == ""
+    assert list(out.token_ids) == [1, 2]
+    assert hasattr(out, "cumulative_token_ids")
+    assert list(out.cumulative_token_ids) == [1, 2]
+    # Multimodal data should be attached
+    assert AUDIO in out.multimodal_output
+
+
+def test_no_detokenizer_make_request_output():
+    """make_request_output works without detokenizer when multimodal data is present."""
+    s = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor(torch.randn(10), mm_type=AUDIO)
+    result = s.make_request_output([], None, FinishReason.STOP, None)
+    assert result is not None
+    assert not isinstance(result, PoolingRequestOutput)
+    assert AUDIO in result.outputs[0].multimodal_output
+
+
+def test_no_detokenizer_stream_interval_skipped():
+    """stream_interval > 1 does not crash when detokenizer is None."""
+    kwargs = {**_NO_DETOK_STATE_KWARGS, "stream_interval": 5}
+    s = OmniRequestState(**kwargs, output_kind=RequestOutputKind.DELTA)
+    s.add_multimodal_tensor(torch.randn(10), mm_type=AUDIO)
+    # Should not assert; stream_interval logic is simply skipped
+    result = s.make_request_output([], None, FinishReason.STOP, None)
+    assert result is not None
+
+
+def test_no_detokenizer_final_only():
+    """FINAL_ONLY with no detokenizer returns None until finish."""
+    s = _make_no_detok_state(RequestOutputKind.FINAL_ONLY)
+    s.add_multimodal_tensor(torch.randn(10), mm_type=AUDIO)
+    # Non-finish step should return None
+    assert s.make_request_output([], None, None, None) is None
+    # Finish step should return output
+    result = s.make_request_output([], None, FinishReason.STOP, None)
+    assert result is not None
+    assert AUDIO in result.outputs[0].multimodal_output

@@ -13,6 +13,8 @@ Main cache backend implementations:
    the cache-dit library. Inherits from CacheBackend. Used via cache_backend="cache_dit".
 2. TeaCacheBackend: Hook-based backend for TeaCache acceleration. Inherits from
    CacheBackend. Used via cache_backend="tea_cache".
+3. StepCacheBackend: Velocity cosine step-skipping for DreamZero. Inherits from
+   CacheBackend. Used via cache_backend="step_cache".
 
 All backends implement the same interface:
 - enable(pipeline): Enable cache on the pipeline

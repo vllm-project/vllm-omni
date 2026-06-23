@@ -21,6 +21,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
+from vllm_omni.errors import client_error_metadata
 from vllm_omni.quantization import build_quant_config
 
 if TYPE_CHECKING:
@@ -128,6 +129,14 @@ class DiffusionParallelConfig:
 
     use_hsdp: bool = False
     """Enable Hybrid Sharded Data Parallel (HSDP) for model weight sharding."""
+
+    mask_sp_padding: bool = False
+    """If True, generate a boolean attention mask for zero-padded SP tokens
+    when sequence length is not divisible by the SP world size. The mask
+    routes attention through the varlen path (unpad→kernel→repad), which is
+    correct but carries additional overhead. When False (default), padding
+    tokens are left unmasked; since _shard_with_auto_pad always pads with
+    zeros, their contribution to attention output is negligible."""
 
     hsdp_shard_size: int = -1
     """Number of GPUs to shard weights across within each replica group. -1 means auto-calculate."""
@@ -293,6 +302,8 @@ class DiffusionCacheConfig:
                     scm_steps_mask_policy, scm_steps_policy
         - MagCache: mag_threshold, mag_max_skip_steps, mag_retention_ratio,
                     mag_ratios, mag_calibrate
+        - step_cache: step_cache_dit_enabled, velocity_sim_thresholds,
+                          velocity_skip_countdowns, step_cache_dit_min_history
 
     Example:
         >>> # From dict (user-facing API) - partial config uses defaults for missing keys
@@ -366,6 +377,13 @@ class DiffusionCacheConfig:
     # "repeat" refreshes every force_refresh_step_hint steps.
     force_refresh_step_policy: str = "once"
 
+    # step_cache parameters [step_cache only] — DreamZero velocity schedule
+    step_cache_dit_enabled: bool = True
+    velocity_sim_thresholds: list[float] = field(default_factory=lambda: [0.95, 0.93])
+    velocity_skip_countdowns: list[int] = field(default_factory=lambda: [4, 2])
+    step_cache_dit_min_history: int = 2
+    step_cache_dit_max_history: int = 2
+
     # Additional parameters that may be passed but not explicitly defined
     _extra_params: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -412,6 +430,67 @@ class DiffusionCacheConfig:
             return extra[item]
 
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{item}'")
+
+
+def resolve_model_class_name(model: str | None, diffusion_load_format: str = "default") -> str | None:
+    """Resolve the diffusion pipeline class name from the model config.
+
+    Read-only counterpart of ``OmniDiffusionConfig.enrich_config``, safe to call
+    client-side. Returns ``None`` if the pipeline can't be determined.
+    """
+    from vllm.transformers_utils.config import get_hf_file_to_dict
+
+    if not model:
+        return None
+
+    is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
+
+    # Diffusers models: read _class_name from model_index.json.
+    try:
+        model_index = get_hf_file_to_dict("model_index.json", model)
+    except Exception:
+        model_index = None
+    if model_index is not None:
+        return model_index.get("_class_name")
+    if diffusion_load_format == "diffusers":
+        return "DiffusersAdapterPipeline"
+
+    # Other models: map model_type / architecture from config.json.
+    try:
+        cfg = get_hf_file_to_dict("config.json", model) or {}
+    except Exception:
+        cfg = {}
+    model_type = cfg.get("model_type")
+    architectures = cfg.get("architectures") or []
+
+    if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+        return "BagelPipeline"
+    if (
+        model_type == "lance"
+        or "LancePipeline" in architectures
+        or cfg.get("model_name") == "Lance"
+        or is_lance_subfolder
+    ):
+        return "LancePipeline"
+    if model_type == "neo_chat":
+        return "SenseNovaU1Pipeline"
+    if "BailingMM2NativeForConditionalGeneration" in architectures or model_type in (
+        "bailingmm_moe_v2_lite",
+        "ming_flash_omni",
+        "ming_flash_omni_thinker",
+    ):
+        return "MingImagePipeline"
+    if model_type == "nextstep":
+        return "NextStep11Pipeline"
+    if model_type == "s2v":
+        return "WanS2VPipeline"
+    if model_type == "vla":
+        from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
+
+        return "DreamZeroPipeline" if _looks_like_dreamzero(model) else None
+    if len(architectures) == 1:
+        return architectures[0]
+    return None
 
 
 @dataclass
@@ -609,9 +688,6 @@ class OmniDiffusionConfig:
 
     # Step mode settings
     step_execution: bool = False
-
-    # sleep mode
-    enable_sleep_mode: bool = False
 
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
@@ -847,6 +923,21 @@ class OmniDiffusionConfig:
         self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
 
+    @staticmethod
+    def _looks_like_lance_subfolder(model: str | None) -> bool:
+        """Return True when ``--model`` points at a Lance per-component subfolder.
+
+        Lance's HF repo bundles ``Lance_3B/``, ``Lance_3B_Video/`` and
+        ``Qwen2.5-VL-ViT/`` under a single top-level ``config.json``; users may
+        reasonably hand the AR-style sub-checkpoint path directly.  The
+        ``LancePipeline`` constructor knows to walk up to the repo root from
+        either subfolder name.
+        """
+        if not model:
+            return False
+        base = os.path.basename(str(model).rstrip("/"))
+        return base in {"Lance_3B", "Lance_3B_Video"}
+
     def enrich_config(self) -> None:
         """Load model metadata from HuggingFace and populate config fields.
 
@@ -882,7 +973,12 @@ class OmniDiffusionConfig:
                         )
                 else:
                     tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
-                    self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
+                    if tf_config_dict is None:
+                        tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model)
+                    if tf_config_dict is not None:
+                        self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
+                    else:
+                        self.set_tf_model_config(TransformerConfig())
             else:
                 raise FileNotFoundError("model_index.json not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
@@ -900,6 +996,15 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model)
                 if cfg is None:
+                    # Lance ships its top-level config.json one directory above
+                    # the per-checkpoint subfolders (``Lance_3B/`` or
+                    # ``Lance_3B_Video/``).  Try to recover that case before
+                    # raising.
+                    if self._looks_like_lance_subfolder(self.model):
+                        self.model_class_name = "LancePipeline"
+                        self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                        return
                     raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
 
                 self.set_tf_model_config(TransformerConfig.from_dict(cfg))
@@ -908,6 +1013,19 @@ class OmniDiffusionConfig:
 
                 if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                     self.model_class_name = "BagelPipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif (
+                    model_type == "lance"
+                    or "LancePipeline" in architectures
+                    or cfg.get("model_name") == "Lance"
+                    or self._looks_like_lance_subfolder(self.model)
+                ):
+                    # Lance ships a non-HF top-level config.json (model_name only)
+                    # plus per-component subfolders; resolve to the Lance pipeline.
+                    # Also accept --model pointing directly at the ``Lance_3B`` or
+                    # ``Lance_3B_Video`` subfolder by walking up to the repo root.
+                    self.model_class_name = "LancePipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif model_type == "neo_chat":
@@ -935,8 +1053,28 @@ class OmniDiffusionConfig:
                         self.model_class_name = "WanS2VPipeline"
                     self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
+                elif model_type == "Gr00tN1d7" or "Gr00tN1d7" in architectures:
+                    self.model_class_name = "Gr00tN1d7Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif model_type == "vla":
+                    from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
+
+                    if _looks_like_dreamzero(self.model):
+                        self.model_class_name = "DreamZeroPipeline"
+                        self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                    else:
+                        raise
                 elif architectures and len(architectures) == 1:
-                    self.model_class_name = architectures[0]
+                    architecture = architectures[0]
+                    from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+                    if (
+                        self.model_class_name is None
+                        or DiffusionModelRegistry._try_load_model_cls(architecture) is not None
+                    ):
+                        self.model_class_name = architecture
                 else:
                     raise
 
@@ -1006,12 +1144,14 @@ class DiffusionOutput:
     """
 
     # Fields may be replaced with SHM handle dicts by ipc.pack_diffusion_output_shm
-    output: torch.Tensor | dict | None = None
-    trajectory_timesteps: torch.Tensor | dict | None = None
-    trajectory_latents: torch.Tensor | dict | None = None
-    trajectory_log_probs: torch.Tensor | dict | None = None
+    output: torch.Tensor | tuple[Any, ...] | dict[str, Any] | None = None
+    trajectory_timesteps: torch.Tensor | dict[str, Any] | None = None
+    trajectory_latents: torch.Tensor | dict[str, Any] | None = None
+    trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
     error: str | None = None
+    error_status_code: int | None = None
+    error_type: str | None = None
     aborted: bool = False
     abort_message: str | None = None
 
@@ -1051,6 +1191,15 @@ class DiffusionOutput:
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
         if self.custom_output:
             self.custom_output = {k: _maybe_to_cpu(v) for k, v in self.custom_output.items()}
+
+    @classmethod
+    def from_exception(cls, exc: BaseException) -> "DiffusionOutput":
+        status_code, error_type = client_error_metadata(exc)
+        return cls(
+            error=str(exc),
+            error_status_code=status_code,
+            error_type=error_type,
+        )
 
 
 class DiffusionRequestAbortedError(RuntimeError):

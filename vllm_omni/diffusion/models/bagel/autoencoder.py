@@ -14,6 +14,16 @@ from dataclasses import dataclass
 import torch
 from einops import rearrange
 from torch import Tensor, nn
+from vllm.logger import init_logger
+
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
+    DistributedOperator,
+    DistributedVaeMixin,
+    GridSpec,
+    TileTask,
+)
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -322,3 +332,229 @@ class AutoEncoder(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.decode(self.encode(x))
+
+
+class DistributedAutoEncoder(AutoEncoder, DistributedVaeMixin):
+    def __init__(self, params: AutoEncoderParams):
+        super().__init__(params)
+        self.init_distributed()
+
+        self.use_tiling = False
+        self.tile_sample_min_height = 512
+        self.tile_sample_min_width = 512
+        self.tile_sample_stride_height = 448
+        self.tile_sample_stride_width = 448
+        self.spatial_compression_ratio = params.downsample
+
+    def blend_v(self, above: Tensor, current: Tensor, blend_extent: int) -> Tensor:
+        blend_extent = min(above.shape[-2], current.shape[-2], blend_extent)
+        if blend_extent <= 0:
+            return current
+
+        for y in range(blend_extent):
+            alpha = y / blend_extent
+            current[:, :, y, :] = above[:, :, -blend_extent + y, :] * (1 - alpha) + current[:, :, y, :] * alpha
+        return current
+
+    def blend_h(self, left: Tensor, current: Tensor, blend_extent: int) -> Tensor:
+        blend_extent = min(left.shape[-1], current.shape[-1], blend_extent)
+        if blend_extent <= 0:
+            return current
+
+        for x in range(blend_extent):
+            alpha = x / blend_extent
+            current[:, :, :, x] = left[:, :, :, -blend_extent + x] * (1 - alpha) + current[:, :, :, x] * alpha
+        return current
+
+    def decode_tile_split(self, z: Tensor) -> tuple[list[TileTask], GridSpec]:
+        _, _, latent_height, latent_width = z.shape
+
+        sample_height = latent_height * self.spatial_compression_ratio
+        sample_width = latent_width * self.spatial_compression_ratio
+
+        tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
+        tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
+        tile_latent_stride_height = self.tile_sample_stride_height // self.spatial_compression_ratio
+        tile_latent_stride_width = self.tile_sample_stride_width // self.spatial_compression_ratio
+
+        blend_height = self.tile_sample_min_height - self.tile_sample_stride_height
+        blend_width = self.tile_sample_min_width - self.tile_sample_stride_width
+
+        tiletask_list = []
+        for i in range(0, latent_height, tile_latent_stride_height):
+            for j in range(0, latent_width, tile_latent_stride_width):
+                tile = z[
+                    :,
+                    :,
+                    i : i + tile_latent_min_height,
+                    j : j + tile_latent_min_width,
+                ]
+                tiletask_list.append(
+                    TileTask(
+                        tile_id=len(tiletask_list),
+                        grid_coord=(i // tile_latent_stride_height, j // tile_latent_stride_width),
+                        tensor=tile,
+                        workload=tile.shape[-2] * tile.shape[-1],
+                    )
+                )
+        grid_spec = GridSpec(
+            split_dims=(2, 3),
+            grid_shape=(tiletask_list[-1].grid_coord[0] + 1, tiletask_list[-1].grid_coord[1] + 1),
+            tile_spec={
+                "sample_height": sample_height,
+                "sample_width": sample_width,
+                "blend_height": blend_height,
+                "blend_width": blend_width,
+            },
+            output_dtype=z.dtype,
+        )
+        return tiletask_list, grid_spec
+
+    def decode_tile_exec(self, task: TileTask) -> Tensor:
+        tile = task.tensor
+        tile = tile / self.scale_factor + self.shift_factor
+        return self.decoder(tile)
+
+    def decode_tile_merge(self, coord_tensor_map: dict[tuple[int, ...], Tensor], grid_spec: GridSpec) -> Tensor:
+        grid_h, grid_w = grid_spec.grid_shape
+        result_rows = []
+
+        for i in range(grid_h):
+            result_row = []
+            for j in range(grid_w):
+                tile = coord_tensor_map[(i, j)]
+                if i > 0:
+                    tile = self.blend_v(coord_tensor_map[(i - 1, j)], tile, grid_spec.tile_spec["blend_height"])
+                if j > 0:
+                    tile = self.blend_h(coord_tensor_map[(i, j - 1)], tile, grid_spec.tile_spec["blend_width"])
+
+                result_row.append(
+                    tile[
+                        :,
+                        :,
+                        : self.tile_sample_stride_height,
+                        : self.tile_sample_stride_width,
+                    ]
+                )
+            result_rows.append(torch.cat(result_row, dim=-1))
+
+        dec = torch.cat(result_rows, dim=-2)[
+            :,
+            :,
+            : grid_spec.tile_spec["sample_height"],
+            : grid_spec.tile_spec["sample_width"],
+        ]
+        return dec
+
+    def decode(self, z: Tensor) -> Tensor:
+        if not self.is_distributed_enabled():
+            return super().decode(z)
+
+        logger.debug("Bagel VAE decode running with distributed executor")
+        return self.distributed_executor.execute(
+            z,
+            DistributedOperator(
+                split=self.decode_tile_split,
+                exec=self.decode_tile_exec,
+                merge=self.decode_tile_merge,
+            ),
+            broadcast_result=True,
+        )
+
+    def encode_tile_split(self, x: Tensor) -> tuple[list[TileTask], GridSpec]:
+        _, _, height, width = x.shape
+
+        latent_height = height // self.spatial_compression_ratio
+        latent_width = width // self.spatial_compression_ratio
+
+        tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
+        tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
+
+        tile_latent_stride_height = self.tile_sample_stride_height // self.spatial_compression_ratio
+        tile_latent_stride_width = self.tile_sample_stride_width // self.spatial_compression_ratio
+
+        blend_height = tile_latent_min_height - tile_latent_stride_height
+        blend_width = tile_latent_min_width - tile_latent_stride_width
+
+        tiletask_list = []
+        for i in range(0, height, self.tile_sample_stride_height):
+            for j in range(0, width, self.tile_sample_stride_width):
+                tile = x[
+                    :,
+                    :,
+                    i : i + self.tile_sample_min_height,
+                    j : j + self.tile_sample_min_width,
+                ]
+                tiletask_list.append(
+                    TileTask(
+                        tile_id=len(tiletask_list),
+                        grid_coord=(i // self.tile_sample_stride_height, j // self.tile_sample_stride_width),
+                        tensor=tile,
+                        workload=tile.shape[-2] * tile.shape[-1],
+                    )
+                )
+        grid_spec = GridSpec(
+            split_dims=(2, 3),
+            grid_shape=(tiletask_list[-1].grid_coord[0] + 1, tiletask_list[-1].grid_coord[1] + 1),
+            tile_spec={
+                "latent_height": latent_height,
+                "latent_width": latent_width,
+                "blend_height": blend_height,
+                "blend_width": blend_width,
+                "tile_latent_stride_height": tile_latent_stride_height,
+                "tile_latent_stride_width": tile_latent_stride_width,
+            },
+            output_dtype=next(self.parameters()).dtype,
+        )
+        return tiletask_list, grid_spec
+
+    def encode_tile_exec(self, task: TileTask) -> Tensor:
+        tile = task.tensor
+        z = self.reg(self.encoder(tile))
+        z = self.scale_factor * (z - self.shift_factor)
+        return z
+
+    def encode_tile_merge(self, coord_tensor_map: dict[tuple[int, ...], Tensor], grid_spec: GridSpec) -> Tensor:
+        grid_h, grid_w = grid_spec.grid_shape
+        result_rows = []
+
+        for i in range(grid_h):
+            result_row = []
+            for j in range(grid_w):
+                tile = coord_tensor_map[(i, j)]
+                if i > 0:
+                    tile = self.blend_v(coord_tensor_map[(i - 1, j)], tile, grid_spec.tile_spec["blend_height"])
+                if j > 0:
+                    tile = self.blend_h(coord_tensor_map[(i, j - 1)], tile, grid_spec.tile_spec["blend_width"])
+
+                result_row.append(
+                    tile[
+                        :,
+                        :,
+                        : grid_spec.tile_spec["tile_latent_stride_height"],
+                        : grid_spec.tile_spec["tile_latent_stride_width"],
+                    ]
+                )
+            result_rows.append(torch.cat(result_row, dim=-1))
+
+        enc = torch.cat(result_rows, dim=-2)[
+            :,
+            :,
+            : grid_spec.tile_spec["latent_height"],
+            : grid_spec.tile_spec["latent_width"],
+        ]
+        return enc
+
+    def encode(self, x: Tensor) -> Tensor:
+        if not self.is_distributed_enabled():
+            return super().encode(x)
+        logger.debug("Bagel VAE encode running with distributed executor")
+        return self.distributed_executor.execute(
+            x,
+            DistributedOperator(
+                split=self.encode_tile_split,
+                exec=self.encode_tile_exec,
+                merge=self.encode_tile_merge,
+            ),
+            broadcast_result=True,
+        )

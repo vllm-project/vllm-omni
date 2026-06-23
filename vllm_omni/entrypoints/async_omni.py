@@ -33,6 +33,7 @@ from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
 )
+from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -160,6 +161,20 @@ class AsyncOmni(EngineClient, OmniBase):
                 renderer = renderer_from_config(vllm_config)
             self.io_processor = get_io_processor(vllm_config, renderer, io_processor_plugin)
 
+    def _resolve_transfer_replica(self, stage_id: int, request_id: str) -> int | None:
+        """Look up the sticky-routed replica for (stage_id, request_id).
+
+        Used as the ``replica_resolver`` callback by ``OrchestratorAggregator``
+        to label transfer_* metrics without plumbing replica ids through
+        ``TransferEdgeStats`` / ``StageRequestStats`` / connector adapters.
+        Returns None when stage_id is out of range or the request hasn't been
+        bound to a replica yet — the metric emit then defensive-skips.
+        """
+        pools = getattr(self.engine, "stage_pools", None)
+        if pools is None or not (0 <= stage_id < len(pools)):
+            return None
+        return pools[stage_id].get_bound_replica_id(request_id)
+
     def _get_comprehension_stage_index(self) -> int | None:
         fallback_idx: int | None = None
         for idx, stage_client in enumerate(self.engine.stage_clients):
@@ -247,6 +262,7 @@ class AsyncOmni(EngineClient, OmniBase):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        arrival_time: float | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -295,6 +311,15 @@ class AsyncOmni(EngineClient, OmniBase):
             # Start final output dispatcher on the first call to generate()
             self._final_output_handler()
 
+            # Forward bare sampling_params (e.g. from /v1/completions) as the stage-0 entry.
+            if sampling_params_list is None and sampling_params is not None:
+                if self.num_stages == 1:
+                    sampling_params_list = [sampling_params]
+                else:
+                    default = list(self.default_sampling_params_list)
+                    default[0] = sampling_params
+                    sampling_params_list = default
+
             # Expand sampling params for PD disaggregation (user may provide N-1 params)
             if (
                 sampling_params_list is not None
@@ -311,17 +336,20 @@ class AsyncOmni(EngineClient, OmniBase):
             )
 
             # Track per-request metrics
-            wall_start_ts = time.time()
+            wall_start_ts = float(arrival_time) if arrival_time is not None else time.time()
             req_start_ts: dict[str, float] = {}
 
             # Determine the final stage for E2E stats
             final_stage_id_for_e2e = self._compute_final_stage_id(output_modalities)
+            final_output_stage_ids = self._compute_final_output_stage_ids(output_modalities) or [final_stage_id_for_e2e]
 
             metrics = OrchestratorMetrics(
                 self.num_stages,
                 self.log_stats,
                 wall_start_ts,
                 final_stage_id_for_e2e,
+                transfer_emitter=getattr(self, "transfer_metrics", None),
+                replica_resolver=self._resolve_transfer_replica,
             )
 
             req_state = ClientRequestState(
@@ -329,6 +357,7 @@ class AsyncOmni(EngineClient, OmniBase):
                 external_request_id=external_request_id,
             )
             req_state.metrics = metrics
+            req_state.request_arrival_ts = wall_start_ts
             self.request_states[request_id] = req_state
 
             # PD disaggregation: modify prefill-stage sampling params per request
@@ -346,6 +375,8 @@ class AsyncOmni(EngineClient, OmniBase):
                     input_stream=prompt,
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
+                    final_output_stage_ids=final_output_stage_ids,
+                    arrival_time=wall_start_ts,
                 )
             else:
                 await self.engine.add_request_async(
@@ -353,6 +384,8 @@ class AsyncOmni(EngineClient, OmniBase):
                     prompt=prompt,
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
+                    final_output_stage_ids=final_output_stage_ids,
+                    arrival_time=wall_start_ts,
                 )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
@@ -378,10 +411,12 @@ class AsyncOmni(EngineClient, OmniBase):
         except (asyncio.CancelledError, GeneratorExit):
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
+            self._fire_failure_counter_if_alive(request_id)
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
+            self._fire_failure_counter_if_alive(request_id)
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
@@ -393,6 +428,8 @@ class AsyncOmni(EngineClient, OmniBase):
         input_stream: AsyncGenerator[StreamingInput, None],
         sampling_params_list: Sequence[OmniSamplingParams],
         final_stage_id: int,
+        final_output_stage_ids: Sequence[int],
+        arrival_time: float,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -428,6 +465,8 @@ class AsyncOmni(EngineClient, OmniBase):
                             prompt_text=prompt_text,
                             sampling_params_list=chunk_sampling_params_list,
                             final_stage_id=final_stage_id,
+                            final_output_stage_ids=final_output_stage_ids,
+                            arrival_time=arrival_time,
                             resumable=True,
                         )
                         has_submitted_first_chunk = True
@@ -438,15 +477,20 @@ class AsyncOmni(EngineClient, OmniBase):
                             prompt_text=prompt_text,
                             sampling_params_list=chunk_sampling_params_list,
                             final_stage_id=final_stage_id,
+                            final_output_stage_ids=final_output_stage_ids,
+                            arrival_time=arrival_time,
                             resumable=True,
                         )
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
+                status_code, error_type = client_error_metadata(error)
                 await req_state.queue.put(
                     ErrorMessage(
                         request_id=request_id,
                         error=str(error),
+                        status_code=status_code,
+                        error_type=error_type,
                     )
                 )
             finally:
@@ -464,6 +508,8 @@ class AsyncOmni(EngineClient, OmniBase):
                             prompt_text=None,
                             sampling_params_list=final_sampling_params_list,
                             final_stage_id=final_stage_id,
+                            final_output_stage_ids=final_output_stage_ids,
+                            arrival_time=arrival_time,
                             resumable=False,
                         )
                     else:
@@ -473,6 +519,8 @@ class AsyncOmni(EngineClient, OmniBase):
                             prompt_text=None,
                             sampling_params_list=final_sampling_params_list,
                             final_stage_id=final_stage_id,
+                            final_output_stage_ids=final_output_stage_ids,
+                            arrival_time=arrival_time,
                             resumable=False,
                         )
 
@@ -545,7 +593,7 @@ class AsyncOmni(EngineClient, OmniBase):
                         result.error,
                         error_stage_id=result.stage_id,
                     )
-                raise RuntimeError(result.error)
+                self._raise_nonfatal_error_message(result)
 
             if not isinstance(result, OutputMessage):
                 logger.warning("[AsyncOmni] Dropping unexpected per-request message %r", result)
@@ -616,6 +664,18 @@ class AsyncOmni(EngineClient, OmniBase):
                         tid = getattr(msg, "task_id")
                         logger.info(f"[{self._name}] Intercepted task-ID object: {tid}")
                         await self.event_resolver.resolve(msg)
+                        continue
+
+                    if isinstance(msg, ErrorMessage) and not msg.fatal:
+                        req_state = self.request_states.get(msg.request_id)
+                        if req_state is not None:
+                            await req_state.queue.put(msg)
+                        else:
+                            logger.warning(
+                                "[%s] dropping non-fatal error for unknown req %s",
+                                self._name,
+                                msg.request_id,
+                            )
                         continue
 
                     should_continue, _, stage_id, req_state = self._handle_output_message(msg)
@@ -919,8 +979,14 @@ class AsyncOmni(EngineClient, OmniBase):
         for result in results:
             if isinstance(result, dict) and result.get("todo"):
                 continue
-            if isinstance(result, list):
-                merged.update(result)
+            if isinstance(result, (list, set)):
+                for item in result:
+                    if isinstance(item, (list, set)):
+                        merged.update(item)
+                    elif isinstance(item, int):
+                        merged.add(item)
+            elif isinstance(result, int):
+                merged.add(result)
         return sorted(merged)
 
     async def pin_lora(self, adapter_id: int) -> bool:

@@ -1,4 +1,4 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from functools import cached_property
 from pathlib import Path
@@ -159,6 +159,13 @@ class VoxtralTTSForConditionalGeneration(
             raise ValueError("Invalid model stage")
 
     # -------------------- CUDA Graph for acoustic transformer --------------------
+
+    def get_language_model(self) -> "nn.Module":
+        """Return the language model for upstream MoE detection."""
+        if hasattr(self.model, "get_language_model"):
+            return self.model.get_language_model()
+        return self.model
+
     def _enable_acoustic_transformer_cudagraph(self):
         """Initialize and capture CUDA graphs for compute_mm_logits."""
         if self.model_stage != "audio_generation" or not hasattr(self, "_vllm_config"):
@@ -213,7 +220,7 @@ class VoxtralTTSForConditionalGeneration(
 
     def tts_postprocess(self, hidden_states: torch.Tensor, multimodal_outputs: object, **info_dict: object | None):
         update_dict = {}
-        if isinstance(multimodal_outputs, dict) and "audio" in multimodal_outputs:
+        if isinstance(multimodal_outputs, Mapping) and "audio" in multimodal_outputs:
             assert self.post_process_idx < len(multimodal_outputs["audio"]), (
                 f"Expect {self.post_process_idx=} < {len(multimodal_outputs['audio'])=}"
             )
@@ -236,9 +243,6 @@ class VoxtralTTSForConditionalGeneration(
     def embed_multimodal(self, **kwargs):
         # Delegate to generation model for multimodal processing
         return self.model.embed_multimodal(**kwargs)
-
-    def last_index_of(self, list, value):
-        return len(list) - 1 - list[::-1].index(value)
 
     def forward(
         self,

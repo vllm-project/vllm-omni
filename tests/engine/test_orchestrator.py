@@ -11,11 +11,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import janus
-import psutil
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
-from vllm.v1.engine.core_client import AsyncMPClient
 
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -26,8 +24,12 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
-from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
-from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+from vllm_omni.engine.orchestrator import (
+    Orchestrator,
+    OrchestratorRequestState,
+    _build_terminal_empty_output,
+    _infer_stage_audio_sample_rate,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -138,6 +140,20 @@ class FakeStageClient:
         self._diffusion_outputs.put_nowait(output)
 
 
+def test_terminal_empty_audio_output_uses_stage_sample_rate() -> None:
+    final_stage = FakeStageClient(final_output=True, final_output_type="audio")
+    final_stage.sample_rate = 44100
+    final_pool = SimpleNamespace(stage_client=final_stage, _stage_vllm_config=None)
+
+    terminal_output = _build_terminal_empty_output(
+        "req-1",
+        final_output_type="audio",
+        audio_sample_rate=_infer_stage_audio_sample_rate(final_pool),
+    )
+
+    assert terminal_output.outputs[0].multimodal_output["sr"] == 44100
+
+
 class FakeCollectiveRpcStageClient(FakeStageClient):
     def __init__(self, *args, rpc_result: Any = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -178,42 +194,6 @@ class FakeOutputProcessor:
 
     def update_scheduler_stats(self, _scheduler_stats) -> None:
         return None
-
-
-class _FakeProc:
-    pid = 1234
-
-    def __init__(self):
-        self.terminated = False
-        self.killed = False
-        self.join_calls = []
-
-    def is_alive(self):
-        return not self.terminated and not self.killed
-
-    def terminate(self):
-        self.terminated = True
-
-    def kill(self):
-        self.killed = True
-
-    def join(self, timeout=None):
-        self.join_calls.append(timeout)
-
-
-class _FakeChildProc:
-    def __init__(self):
-        self.terminated = False
-        self.killed = False
-
-    def is_running(self):
-        return not self.terminated and not self.killed
-
-    def terminate(self):
-        self.terminated = True
-
-    def kill(self):
-        self.killed = True
 
 
 def _sampling_params(max_tokens: int = 4) -> SamplingParams:
@@ -427,6 +407,7 @@ async def _enqueue_add_request(
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
             preprocess_ms=0.0,
+            request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
         )
     )
@@ -434,61 +415,6 @@ async def _enqueue_add_request(
 
 async def _enqueue_abort_request(orchestrator_fixture: OrchestratorFixture, request_ids: list[str]) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=request_ids))
-
-
-def test_stage_engine_core_client_shutdown_cleans_children_if_base_shutdown_fails(monkeypatch):
-    fake_proc = _FakeProc()
-    fake_child = _FakeChildProc()
-
-    class FakePsutilProcess:
-        def __init__(self, pid):
-            assert pid == fake_proc.pid
-
-        def children(self, recursive=True):
-            assert recursive
-            return [fake_child]
-
-    def fail_base_shutdown(self, **kwargs):
-        raise RuntimeError("base shutdown failed")
-
-    monkeypatch.setattr(psutil, "Process", FakePsutilProcess)
-    monkeypatch.setattr(psutil, "wait_procs", lambda procs, timeout: (list(procs), []))
-    monkeypatch.setattr(AsyncMPClient, "shutdown", fail_base_shutdown)
-
-    client = object.__new__(StageEngineCoreClient)
-    client._proc = fake_proc
-
-    with pytest.raises(RuntimeError, match="base shutdown failed"):
-        client.shutdown()
-
-    assert fake_proc.terminated
-    assert fake_proc.join_calls == [5]
-    assert fake_child.terminated
-
-
-def test_stage_engine_core_client_shutdown_kills_stubborn_children(monkeypatch):
-    fake_proc = _FakeProc()
-    fake_child = _FakeChildProc()
-
-    class FakePsutilProcess:
-        def __init__(self, pid):
-            assert pid == fake_proc.pid
-
-        def children(self, recursive=True):
-            assert recursive
-            return [fake_child]
-
-    monkeypatch.setattr(psutil, "Process", FakePsutilProcess)
-    monkeypatch.setattr(psutil, "wait_procs", lambda procs, timeout: ([], list(procs)))
-    monkeypatch.setattr(AsyncMPClient, "shutdown", lambda self, **kwargs: None)
-
-    client = object.__new__(StageEngineCoreClient)
-    client._proc = fake_proc
-
-    client.shutdown()
-
-    assert fake_child.terminated
-    assert fake_child.killed
 
 
 @pytest.fixture
@@ -964,6 +890,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
 
     pool = RecordingPool()
     orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = False
     orchestrator.request_states = {
         "req-stream": OrchestratorRequestState(
             request_id="req-stream",
@@ -983,6 +910,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
             sampling_params_list=[_sampling_params()],
             final_stage_id=0,
             preprocess_ms=0.0,
+            request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
         )
     )
@@ -1156,3 +1084,37 @@ async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator
         assert stage0_r1.add_request_calls[1][0].request_id == "parent-neg"
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+def test_orchestrator_does_not_re_introduce_global_stats_throttle() -> None:
+    """Regression: each (stage, replica) must independently publish its wrapped
+    vllm:* stats when its scheduler emits non-None scheduler_stats.
+
+    A previous version of Orchestrator carried a global self._last_stats_ts /
+    _stats_interval_s gate around _stat_logger.record(). Because
+    OmniSchedulerMixin.make_stats() already throttles at 1 Hz per scheduler
+    (one per (stage, replica)), the extra global gate starved every replica
+    other than the first to emit within each second — their {stage, replica}
+    gauges/counters went stale.
+
+    The fix removed the global gate entirely; the only signal needed is
+    'this replica's scheduler emitted non-None scheduler_stats'. This test
+    fails loudly if someone reintroduces the global throttle.
+    """
+    import inspect
+
+    from vllm_omni.engine.orchestrator import Orchestrator
+
+    source = inspect.getsource(Orchestrator)
+    assert "_last_stats_ts" not in source, (
+        "Orchestrator must not gate stat recording on a global timestamp. "
+        "OmniSchedulerMixin.make_stats() already throttles per scheduler "
+        "(per (stage, replica)); an outer global gate starves all but the "
+        "first replica to emit within each 1s window."
+    )
+    assert "_stats_interval_s" not in source
+    assert "raw_outputs.scheduler_stats is not None" in source, (
+        "Orchestrator must gate stat recording solely on "
+        "raw_outputs.scheduler_stats being non-None — the per-scheduler 1Hz "
+        "throttle in OmniSchedulerMixin.make_stats() is the only gate needed."
+    )

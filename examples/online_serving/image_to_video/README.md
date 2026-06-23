@@ -120,14 +120,17 @@ Use `/v1/videos/sync` if you want to write the MP4 directly to a file. `POST /v1
 Generated video files are stored on local disk by the async video API.
 Local file storage behavior can be controlled via the following environment variables:
 
-- `VLLM_OMNI_STORAGE_PATH`: directory used for generated files (default: `/tmp/storage`)
-- `VLLM_OMNI_STORAGE_MAX_CONCURRENCY`: max concurrent save/delete operations (default: `4`)
+- `VLLM_OMNI_SERVER_STORAGE__PATH`: directory used for generated files (default: `/tmp/storage`)
+- `VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY`: max concurrent save/delete operations (default: `4`)
+
+`VLLM_OMNI_STORAGE_PATH` and `VLLM_OMNI_STORAGE_MAX_CONCURRENCY` are deprecated and will be
+removed in a future release; use the names above instead.
 
 Example:
 
 ```bash
-export VLLM_OMNI_STORAGE_PATH=/var/tmp/vllm-omni-videos
-export VLLM_OMNI_STORAGE_MAX_CONCURRENCY=8
+export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY=8
 ```
 
 ## API Calls

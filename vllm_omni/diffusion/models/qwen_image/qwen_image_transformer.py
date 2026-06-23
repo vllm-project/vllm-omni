@@ -17,7 +17,6 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 from vllm.logger import init_logger
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -538,8 +537,8 @@ class QwenImageCrossAttention(nn.Module):
         self.query_num_heads = self.to_qkv.num_heads
         self.kv_num_heads = self.to_qkv.num_kv_heads
 
-        self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q = nn.RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = nn.RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
         self.inner_dim = out_dim if out_dim is not None else head_dim * self.total_num_heads
 
@@ -576,8 +575,8 @@ class QwenImageCrossAttention(nn.Module):
             prefix=_join_prefix(prefix, "to_out"),
         )
 
-        self.norm_added_q = RMSNorm(head_dim, eps=eps)
-        self.norm_added_k = RMSNorm(head_dim, eps=eps)
+        self.norm_added_q = nn.RMSNorm(head_dim, eps=eps)
+        self.norm_added_k = nn.RMSNorm(head_dim, eps=eps)
 
         self.attn = Attention(
             num_heads=self.query_num_heads,
@@ -992,7 +991,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
             quant_config=quant_config,
         )
 
-        self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
+        self.txt_norm = nn.RMSNorm(joint_attention_dim, eps=1e-6)
 
         # Entry projections (image/text) are kept full precision —
         # small sensitive layers at the network boundary (see #2728).
@@ -1138,24 +1137,44 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Check for SP auto_pad: create attention mask dynamically if padding was applied
         # In Ulysses mode, attention is computed on the FULL sequence (after All-to-All)
         hidden_states_mask = None  # default
-        if self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1:
-            ctx = get_forward_context()
-            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
-                # Create mask for the full (padded) sequence
-                # valid positions = True, padding positions = False
-                batch_size = hidden_states.shape[0]
-                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
-                hidden_states_mask = torch.ones(
-                    batch_size,
-                    padded_seq_len,
-                    dtype=torch.bool,
-                    device=hidden_states.device,
-                )
-                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+        ctx = get_forward_context()
+        if (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            # Create mask for the full (padded) sequence
+            # valid positions = True, padding positions = False
+            batch_size = hidden_states.shape[0]
+            padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+            hidden_states_mask = torch.ones(
+                batch_size,
+                padded_seq_len,
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+            if hidden_states_mask.all():
+                hidden_states_mask = None
+        elif (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and not self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            logger.warning_once(
+                "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
+                "Padding tokens are not masked from attention (mask_sp_padding=False), "
+                "which avoids the varlen attention path but may produce minor numerical differences. "
+                "Set parallel_config.mask_sp_padding=True to restore strict masking.",
+                ctx.sp_padding_size,
+                ctx.sp_original_seq_len,
+                self.parallel_config.sequence_parallel_size,
+            )
 
-        # if mask is all true, set it to None
-        if hidden_states_mask is not None and hidden_states_mask.all():
-            hidden_states_mask = None
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None
 

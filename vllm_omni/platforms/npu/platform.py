@@ -31,6 +31,16 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     _omni_enum = OmniPlatformEnum.NPU
     dist_backend: str = "hccl"
 
+    # conv2d convolution operator in the code2wav module of Qwen3-TTS not being able to run on Aclnn
+    def __init__(self) -> None:
+        from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
+        from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
+            apply_qwen3_tts_code2wav_patch,
+        )
+
+        apply_qwen3_tts_code2wav_patch()
+        apply_310p_patches()
+
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         super().set_device(device)
@@ -153,3 +163,27 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def get_profiler_cls(cls) -> str:
         return "vllm_omni.platforms.npu.profiler.NPUTorchProfilerWrapper"
+
+    @classmethod
+    def get_graph_wrapper_cls(cls) -> type:
+        from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+        return ACLGraphWrapper
+
+    @classmethod
+    def set_forward_context(
+        cls,
+        attn_metadata,
+        vllm_config,
+        *,
+        cudagraph_runtime_mode,
+        batch_descriptor,
+    ):
+        from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+
+        return set_ascend_forward_context(
+            attn_metadata,
+            vllm_config,
+            aclgraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
+        )

@@ -7,6 +7,43 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator, model_vali
 _MAX_EMBEDDING_DIM = 8192
 
 
+def _normalize_ref_audio_value(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        items = []
+        for item in value:
+            if not isinstance(item, str):
+                raise TypeError("'ref_audio' list entries must be strings")
+            items.append(item)
+        if not items:
+            raise ValueError("'ref_audio' list cannot be empty")
+        return items
+    raise TypeError("'ref_audio' must be a string or list of strings")
+
+
+def _normalize_speaker_embedding_value(value):
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("'speaker_embedding' must be a list of numbers or list of embedding vectors")
+    if not value:
+        return []
+
+    first = value[0]
+    if isinstance(first, (list, tuple)):
+        embeddings = []
+        for item in value:
+            if not isinstance(item, (list, tuple)):
+                raise TypeError("'speaker_embedding' must not mix flat and nested values")
+            embeddings.append([float(x) for x in item])
+        return embeddings
+
+    return [float(x) for x in value]
+
+
 class OpenAICreateSpeechRequest(BaseModel):
     input: str
     model: str | None = None
@@ -28,12 +65,18 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0.25,
         le=4.0,
     )
-    stream_format: Literal["sse", "audio"] | None = "audio"
+    stream_format: Literal["sse", "audio"] | None = Field(
+        default=None,
+        description=(
+            "Streaming output format. 'audio' streams raw pcm/wav bytes; "
+            "'sse' streams OpenAI speech.audio.* SSE events. Omit for non-streaming."
+        ),
+    )
     stream: bool = Field(
         default=False,
         description=(
-            "If true, stream raw PCM audio chunks as they are decoded. "
-            "Requires response_format='pcm'. Speed adjustment is not supported when streaming."
+            "Legacy streaming switch; equivalent to stream_format='audio'. "
+            "Requires response_format='pcm' or 'wav'. Speed adjustment is not supported when streaming."
         ),
     )
 
@@ -46,7 +89,7 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Language code (e.g., 'Chinese', 'English', 'Auto')",
     )
-    ref_audio: str | None = Field(
+    ref_audio: str | list[str] | None = Field(
         default=None,
         description="Reference audio for voice cloning (Base task). URL, base64, or file URI.",
     )
@@ -54,11 +97,26 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Transcript of reference audio for voice cloning (Base task)",
     )
+    ref_audio_2: str | None = Field(
+        default=None,
+        description="Second reference audio for two-speaker dialogue (MOSS-TTSD). "
+        "URL, base64, or file URI. Ignored by single-speaker models.",
+    )
+    ambient_sound: str | None = Field(
+        default=None,
+        description="Sound description for ambient/effect synthesis (MOSS-SoundEffect). "
+        "Natural language, e.g. 'ocean waves crashing on a rocky beach'.",
+    )
+    duration_seconds: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Target audio duration in seconds (MOSS-SoundEffect). Converted to ~12.5 frames/s internally.",
+    )
     x_vector_only_mode: bool | None = Field(
         default=None,
         description="Use speaker embedding only without in-context learning (Base task)",
     )
-    speaker_embedding: list[float] | None = Field(
+    speaker_embedding: list[float] | list[list[float]] | None = Field(
         default=None,
         max_length=_MAX_EMBEDDING_DIM,
         description="Pre-computed speaker embedding vector (1024-dim for 0.6B, "
@@ -81,24 +139,106 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
+    non_streaming_mode: bool | None = Field(
+        default=None,
+        description=(
+            "Qwen3-TTS prompt construction mode override. This does not "
+            "control HTTP response streaming or async-chunk pipelining. "
+            "When null, use model defaults: Base=False, CustomVoice/VoiceDesign=True."
+        ),
+    )
     extra_params: dict[str, Any] | None = Field(
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
+    )
+    word_timestamps: bool = Field(
+        default=False,
+        description=(
+            "When true, the server runs a shared forced aligner alongside the streamed "
+            "audio and emits per-chunk word timestamps. Requires the server to be "
+            "launched with --forced-aligner pointing at an aligner model. No effect "
+            "when streaming is off."
+        ),
     )
 
     @field_validator("stream_format")
     @classmethod
     def validate_stream_format(cls, v: str) -> str:
-        if v == "sse":
-            raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
         return v
+
+    @field_validator("ref_audio", mode="before")
+    @classmethod
+    def normalize_ref_audio(cls, v):
+        return _normalize_ref_audio_value(v)
 
     @field_validator("speaker_embedding")
     @classmethod
-    def validate_speaker_embedding(cls, v: list[float] | None) -> list[float] | None:
-        if v is not None and not all(math.isfinite(x) for x in v):
+    def validate_speaker_embedding(
+        cls, v: list[float] | list[list[float]] | None
+    ) -> list[float] | list[list[float]] | None:
+        v = _normalize_speaker_embedding_value(v)
+        if v is None:
+            return None
+        if not v:
+            return []
+        if isinstance(v[0], list):
+            for item in v:
+                if not item:
+                    raise ValueError("'speaker_embedding' nested vectors must be non-empty")
+                if not all(math.isfinite(x) for x in item):
+                    raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
+            return v
+        if not all(math.isfinite(x) for x in v):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_references_alias(cls, data):
+        """Map the BosonAI Higgs Audio v3 cookbook ``references`` array onto ``ref_audio`` / ``ref_text``.
+
+        Upstream Higgs Audio v3 examples and the boson.ai cookbook send voice
+        clones as::
+
+            {"references": [{"audio_path": str, "text": str}]}
+
+        vllm-omni's existing convention is ``ref_audio`` + ``ref_text``.
+        Without this alias pydantic silently drops the unknown ``references``
+        field and the request falls through to zero-shot synthesis with no
+        error, which is hard to debug from the client side. The normalizer
+        translates a single reference and rejects multi-reference payloads
+        (vllm-omni does not yet support multi-shot voice clone) or conflicts
+        with the explicit ``ref_audio`` / ``ref_text`` fields.
+        """
+        if not isinstance(data, dict):
+            return data
+        refs = data.get("references")
+        if refs is None:
+            return data
+        if not isinstance(refs, list) or len(refs) == 0:
+            raise ValueError("'references' must be a non-empty array of {audio_path, text} objects")
+        if len(refs) > 1:
+            raise ValueError("'references' only supports a single reference; multi-shot voice clone is not supported")
+        first = refs[0]
+        if not isinstance(first, dict):
+            raise ValueError("'references[0]' must be an object with 'audio_path' and optional 'text'")
+        audio_path = first.get("audio_path")
+        if not isinstance(audio_path, str) or not audio_path:
+            raise ValueError(
+                "'references[0].audio_path' is required and must be a string (URL, data: URI, or file path)"
+            )
+        existing_ref_audio = data.get("ref_audio")
+        if existing_ref_audio and existing_ref_audio != audio_path:
+            raise ValueError("'references' and 'ref_audio' are mutually exclusive")
+        data["ref_audio"] = audio_path
+        text = first.get("text")
+        if isinstance(text, str) and text.strip():
+            existing_ref_text = data.get("ref_text")
+            if existing_ref_text and existing_ref_text != text:
+                raise ValueError("'references[0].text' and 'ref_text' conflict; supply only one")
+            data["ref_text"] = text
+        data.pop("references", None)
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -147,24 +287,32 @@ class OpenAICreateSpeechRequest(BaseModel):
     @model_validator(mode="after")
     def validate_embedding_constraints(self) -> "OpenAICreateSpeechRequest":
         if self.speaker_embedding is not None:
-            if self.ref_audio is not None:
+            if self.ref_audio is not None and not isinstance(self.ref_audio, list):
                 raise ValueError("'speaker_embedding' and 'ref_audio' are mutually exclusive")
         return self
 
+    def is_raw_audio_stream(self) -> bool:
+        return self.stream or self.stream_format == "audio"
+
+    def is_sse_stream(self) -> bool:
+        return self.stream_format == "sse" and not self.is_raw_audio_stream()
+
+    def is_streaming(self) -> bool:
+        return self.is_raw_audio_stream() or self.stream_format == "sse"
+
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "OpenAICreateSpeechRequest":
-        if self.stream:
+        if self.is_streaming():
             if self.response_format not in ("pcm", "wav"):
                 raise ValueError(
-                    "Streaming (stream=true) requires response_format='pcm' or 'wav'. "
+                    "Streaming (stream=true, stream_format='audio', or stream_format='sse') "
+                    "requires response_format='pcm' or 'wav'. "
                     f"Got response_format='{self.response_format}'."
                 )
             if self.speed is None:
                 self.speed = 1.0
             elif self.speed != 1.0:
-                raise ValueError(
-                    "Speed adjustment is not supported when streaming (stream=true). Set speed=1.0 or omit it."
-                )
+                raise ValueError("Speed adjustment is not supported when streaming. Set speed=1.0 or omit it.")
         return self
 
 
@@ -220,7 +368,6 @@ class CreateAudio(BaseModel):
     sample_rate: int = 24000
     response_format: str = "wav"
     speed: float = 1.0
-    stream_format: Literal["sse", "audio"] | None = "audio"
     base64_encode: bool = True
 
     class Config:
@@ -251,6 +398,7 @@ class SpeechBatchItem(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    non_streaming_mode: bool | None = None
 
 
 class BatchSpeechRequest(BaseModel):
@@ -270,6 +418,7 @@ class BatchSpeechRequest(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    non_streaming_mode: bool | None = None
 
 
 class SpeechBatchItemResult(BaseModel):
@@ -304,6 +453,14 @@ class StreamingSpeechSessionConfig(BaseModel):
         ge=0,
         description="Initial chunk size for reduced TTFA. Overrides stage config for this session.",
     )
+    non_streaming_mode: bool | None = Field(
+        default=None,
+        description=(
+            "Qwen3-TTS prompt construction mode override. This does not "
+            "control WebSocket audio streaming or async-chunk pipelining. "
+            "When null, use model defaults: Base=False, CustomVoice/VoiceDesign=True."
+        ),
+    )
     ref_audio: str | None = None
     ref_text: str | None = None
     x_vector_only_mode: bool | None = None
@@ -324,6 +481,15 @@ class StreamingSpeechSessionConfig(BaseModel):
         description=(
             "Text splitting granularity: 'sentence' splits on .!?。！？, "
             "'clause' also splits on CJK commas ， and semicolons ；."
+        ),
+    )
+    word_timestamps: bool = Field(
+        default=False,
+        description=(
+            "When true, audio chunks are wrapped in JSON 'audio.chunk' frames carrying "
+            "base64-encoded PCM plus aligned word timestamps. Requires the server to be "
+            "launched with --forced-aligner. When false, audio is sent as raw binary "
+            "frames (existing behavior)."
         ),
     )
 

@@ -26,6 +26,14 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 def _get_diffusion_feature_cases(model: str):
     return [
         pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=["--enable-cpu-offload"],
+            ),
+            id="cpu_offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
             OmniServerParams(model=model, server_args=["--step-execution"]),
             id="step_execution",
             marks=SINGLE_CARD_FEATURE_MARKS,
@@ -97,7 +105,7 @@ def _get_diffusion_feature_cases(model: str):
                     "--vae-patch-parallel-size",
                     "2",
                     "--vae-use-tiling",
-                    "--quantization-config",
+                    "--diffusion-quantization-config",
                     '{"method":"fp8"}',
                 ],
             ),

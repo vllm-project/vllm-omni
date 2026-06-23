@@ -329,6 +329,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         self._tts_pad_embed_buffer = tts_pad_embed
         self._encode_ref_audio_batch_fn = encode_ref_audio_batch
         self._speaker_cache = speaker_cache
+        self._embedding_dtype = torch.bfloat16
 
         self._text_tokenizer: Any | None = None
 
@@ -598,7 +599,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         if isinstance(ref_code, torch.Tensor):
             entry["ref_code"] = ref_code.detach().to("cpu", dtype=torch.long).contiguous()
         if isinstance(ref_spk_embedding, torch.Tensor):
-            entry["ref_spk_embedding"] = ref_spk_embedding.detach().to("cpu", dtype=torch.bfloat16).reshape(-1)
+            entry["ref_spk_embedding"] = ref_spk_embedding.detach().to("cpu", dtype=self._embedding_dtype).reshape(-1)
         if not entry:
             return
         self._ref_audio_artifact_cache[cache_key] = entry
@@ -613,10 +614,11 @@ class Qwen3TTSPromptEmbedsBuilder:
         # CUDA. Ensure the speaker encoder is on the same device/dtype as the
         # main model before running it.
         dev = self._device()
+        dtype = self._embedding_dtype
         try:
             spk_param = next(self._speaker_encoder.parameters())
-            if spk_param.device != dev or spk_param.dtype != torch.bfloat16:
-                self._speaker_encoder.to(device=dev, dtype=torch.bfloat16)
+            if spk_param.device != dev or spk_param.dtype != dtype:
+                self._speaker_encoder.to(device=dev, dtype=dtype)
         except StopIteration:
             pass
 
@@ -641,8 +643,8 @@ class Qwen3TTSPromptEmbedsBuilder:
             fmin=0,
             fmax=12000,
         ).transpose(1, 2)
-        spk = self._speaker_encoder(mels.to(dtype=torch.bfloat16))[0]
-        return spk.to(dtype=torch.bfloat16)
+        spk = self._speaker_encoder(mels.to(dtype=dtype))[0]
+        return spk.to(dtype=dtype)
 
     def encode_ref_audio_batch(
         self,
@@ -757,6 +759,14 @@ class Qwen3TTSPromptEmbedsBuilder:
             ref_audio_list = info_dict.get("ref_audio")
             if not isinstance(ref_audio_list, list) or not ref_audio_list:
                 continue
+            cache_key_from_serving = first_value(info_dict.get(REF_AUDIO_CACHE_KEY))
+            if isinstance(cache_key_from_serving, str) and cache_key_from_serving:
+                cached = self.get_ref_audio_artifacts(cache_key_from_serving)
+                if cached is not None:
+                    cached_ref_code = coerce_ref_code_tensor(cached.get("ref_code"), device=device)
+                    if isinstance(cached_ref_code, torch.Tensor):
+                        info_dict.setdefault("codes", {})[PRECOMPUTED_REF_CODE_KEY] = cached_ref_code
+                        continue
             try:
                 wav, sr = self.normalize_ref_audio(ref_audio_list[0])
             except Exception:
@@ -893,12 +903,12 @@ class Qwen3TTSPromptEmbedsBuilder:
 
             * ``talker_prompt``: ``[prompt_len, hidden]`` prefill embedding.
             * ``trailing_text_hidden``: ``[T, hidden]`` queue of text-side
-              embeddings consumed one-per-decode-step (streaming mode) or a
-              single pad row (non-streaming).
+                    embeddings consumed one-per-decode-step (streaming mode)
+                    or a single pad row (non-streaming).
             * ``ref_code_len``: Number of ref codec frames consumed when the
-              Base task ran in in-context mode (``None`` otherwise).
+                    Base task ran in in-context mode (``None`` otherwise).
             * ``ref_code``: The ``[T, Q]`` ref codec tensor used for ICL
-              (``None`` outside Base / ICL).
+                    (``None`` outside Base / ICL).
         """
         config = self._config
         talker_config = self._talker_config
@@ -1029,6 +1039,19 @@ class Qwen3TTSPromptEmbedsBuilder:
             xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
             in_context_mode = not xvec_only
             voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
+            if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
+                icl_flag = _as_singleton(voice_clone_prompt.get("icl_mode"))
+                if isinstance(icl_flag, bool):
+                    in_context_mode = icl_flag
+                    xvec_only = not in_context_mode
+            prompt_has_ref_code = voice_clone_prompt is not None and self._has_ref_code_like(
+                voice_clone_prompt.get("ref_code")
+            )
+            prompt_spk = voice_clone_prompt.get("ref_spk_embedding") if voice_clone_prompt is not None else None
+            prompt_has_speaker = isinstance(prompt_spk, torch.Tensor) or (
+                isinstance(prompt_spk, (list, np.ndarray)) and len(prompt_spk) > 0
+            )
+            needs_ref_audio_cache_key = not (prompt_has_speaker and (not in_context_mode or prompt_has_ref_code))
             ref_audio_wav: np.ndarray | None = None
             ref_audio_sr: int | None = None
 
@@ -1056,7 +1079,8 @@ class Qwen3TTSPromptEmbedsBuilder:
             # from ref_audio: x_vector_only_mode, precomputed ref_code
             # with no ref_spk_embedding, voice_clone_prompt.icl_mode=False.
             ref_audio_cache_key = info_dict.pop(REF_AUDIO_CACHE_KEY, None)
-            if not (isinstance(ref_audio_cache_key, str) and ref_audio_cache_key):
+            ref_audio_cache_key = first_value(ref_audio_cache_key)
+            if needs_ref_audio_cache_key and not (isinstance(ref_audio_cache_key, str) and ref_audio_cache_key):
                 normalized = info_dict.get(NORMALIZED_REF_AUDIO_KEY)
                 wav_peek: np.ndarray | None = None
                 sr_peek: int | None = None
@@ -1075,13 +1099,25 @@ class Qwen3TTSPromptEmbedsBuilder:
             cached_artifacts = None
             if isinstance(ref_audio_cache_key, str) and ref_audio_cache_key:
                 cached_artifacts = self.get_ref_audio_artifacts(ref_audio_cache_key)
+            ref_audio_list = info_dict.get("ref_audio")
+            has_ref_audio_payload = isinstance(ref_audio_list, list) and bool(ref_audio_list)
+            artifact_only = (
+                isinstance(ref_audio_cache_key, str) and bool(ref_audio_cache_key) and not has_ref_audio_payload
+            )
+            if artifact_only and cached_artifacts is None:
+                raise RuntimeError(
+                    "Qwen3-TTS ref_audio artifact cache miss for artifact-only request; "
+                    "retry with ref_audio or precompute a custom voice profile."
+                )
 
             # Speaker cache: only for uploaded (named) speakers
             _speaker_cache_key = None
+            _cache_lookup_voice = None
             if voice_clone_prompt is None and self._speaker_cache is not None:
                 _speaker_list = info_dict.get("speaker")
                 if isinstance(_speaker_list, list) and _speaker_list:
                     _voice_name = str(_speaker_list[0]).lower()
+                    _cache_lookup_voice = _voice_name
                     # Per-mode namespace — xvec and icl produce different artifacts
                     # for the same voice, so they must not share a cache slot.
                     _mode = "xvec" if xvec_only else "icl"
@@ -1103,15 +1139,18 @@ class Qwen3TTSPromptEmbedsBuilder:
                             "ref_code": ref_code_cached,
                             "ref_spk_embedding": ref_spk_embed_cached,
                             "icl_mode": _cached.get("icl_mode"),
+                            "ref_text": _cached.get("ref_text"),
                         }
                         _speaker_cache_key = None  # hit → don't store again
 
-            # Official implementation may pass `voice_clone_prompt.icl_mode`.
-            if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
-                icl_flag = _as_singleton(voice_clone_prompt.get("icl_mode"))
-                if isinstance(icl_flag, bool):
-                    in_context_mode = icl_flag
-                    xvec_only = not in_context_mode
+            if voice_clone_prompt is None and _speaker_cache_key is not None:
+                ref_audio_list = info_dict.get("ref_audio")
+                if not isinstance(ref_audio_list, list) or not ref_audio_list:
+                    raise ValueError(
+                        f"Qwen3-TTS speaker '{_cache_lookup_voice}' was requested without ref_audio, "
+                        "but no precomputed cache entry was loaded"
+                    )
+
             ref_code = None
             if voice_clone_prompt is not None:
                 ref_code = _as_singleton(voice_clone_prompt.get("ref_code"))
@@ -1136,6 +1175,8 @@ class Qwen3TTSPromptEmbedsBuilder:
                 if isinstance(cached_ref_code, torch.Tensor):
                     ref_code_t = cached_ref_code
                     ref_code_len = int(ref_code_t.shape[0])
+            if ref_code_t is None and in_context_mode and artifact_only:
+                raise RuntimeError("Qwen3-TTS ref_audio artifact cache entry is missing ref_code.")
             if ref_code_t is None and in_context_mode:
                 # Compute ref_code from ref_audio if not provided.
                 wav_np, sr = _get_ref_audio()
@@ -1148,19 +1189,22 @@ class Qwen3TTSPromptEmbedsBuilder:
             # NOTE: Do NOT use _as_singleton here — the embedding may be a plain
             # float list (from API via msgspec IPC) that _as_singleton would
             # destructively unwrap to a single scalar.
+            speaker_dtype = self._embedding_dtype
             spk = None
             if voice_clone_prompt is not None:
                 spk = voice_clone_prompt.get("ref_spk_embedding")
             if isinstance(spk, torch.Tensor):
-                speaker_embed = spk.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
+                speaker_embed = spk.to(device=input_ids.device, dtype=speaker_dtype).view(1, 1, -1)
             elif isinstance(spk, (list, np.ndarray)):
-                speaker_embed = torch.tensor(spk, dtype=torch.bfloat16, device=input_ids.device).view(1, 1, -1)
+                speaker_embed = torch.tensor(spk, dtype=speaker_dtype, device=input_ids.device).view(1, 1, -1)
             elif cached_artifacts is not None and isinstance(cached_artifacts.get("ref_spk_embedding"), torch.Tensor):
                 speaker_embed = (
                     cached_artifacts["ref_spk_embedding"]
-                    .to(device=input_ids.device, dtype=torch.bfloat16)
+                    .to(device=input_ids.device, dtype=speaker_dtype)
                     .view(1, 1, -1)
                 )
+            elif artifact_only:
+                raise RuntimeError("Qwen3-TTS ref_audio artifact cache entry is missing ref_spk_embedding.")
             else:
                 wav_np, sr = _get_ref_audio()
                 speaker_embed = self.extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
@@ -1207,6 +1251,8 @@ class Qwen3TTSPromptEmbedsBuilder:
                     )
                 if ref_ids is None:
                     ref_text = _as_singleton(info_dict.get("ref_text"))
+                    if (not isinstance(ref_text, str) or not ref_text.strip()) and voice_clone_prompt is not None:
+                        ref_text = _as_singleton(voice_clone_prompt.get("ref_text"))
                     if isinstance(ref_text, str) and ref_text.strip():
                         ref_ids = tok(
                             build_ref_text(ref_text),
@@ -1274,9 +1320,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
             spk_tensor = torch.tensor([spk_id], device=input_ids.device, dtype=torch.long)
             spk_embed = codec_embed(spk_tensor)
-            if spk_embed.ndim == 1:
-                spk_embed = spk_embed.view(1, 1, -1)
-            elif spk_embed.ndim == 2:
+            if spk_embed.ndim in (1, 2):
                 spk_embed = spk_embed.view(1, 1, -1)
             speaker_embed = spk_embed
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
@@ -1477,9 +1521,7 @@ class Qwen3TTSPromptEmbedsBuilder:
 
                 ref_code_len: int | None = None
                 if isinstance(ref_code, list):
-                    if ref_code and isinstance(ref_code[0], list):
-                        ref_code_len = len(ref_code)
-                    elif ref_code:
+                    if ref_code:
                         ref_code_len = len(ref_code)
                 elif hasattr(ref_code, "shape"):
                     try:
@@ -1489,6 +1531,13 @@ class Qwen3TTSPromptEmbedsBuilder:
                     except Exception:
                         ref_code_len = None
 
+                if ref_code_len is None:
+                    ref_code_length = _first(info.get("ref_code_length"), None)
+                    try:
+                        if ref_code_length is not None:
+                            ref_code_len = int(ref_code_length)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        ref_code_len = None
                 if ref_code_len is None and estimate_ref_code_len is not None:
                     ref_code_len = estimate_ref_code_len(info.get("ref_audio"))
                 if ref_code_len is None:
@@ -1511,6 +1560,10 @@ class Qwen3TTSPromptEmbedsBuilder:
 
                     if ref_ids is None:
                         ref_text = _first(info.get("ref_text"), "")
+                        if (not isinstance(ref_text, str) or not ref_text.strip()) and isinstance(
+                            voice_clone_prompt, dict
+                        ):
+                            ref_text = _first(voice_clone_prompt.get("ref_text"), "")
                         if not isinstance(ref_text, str) or not ref_text.strip():
                             raise ValueError(
                                 "Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`."
