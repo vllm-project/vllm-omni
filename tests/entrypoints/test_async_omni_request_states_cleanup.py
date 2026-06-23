@@ -100,9 +100,7 @@ async def test_request_states_cleaned_on_stage_error(async_omni):
                 pass
 
     # Core assertion: request_states must be empty after error
-    assert request_id not in async_omni.request_states, (
-        "request_states leaked after stage error - memory leak!"
-    )
+    assert request_id not in async_omni.request_states, "request_states leaked after stage error - memory leak!"
 
 
 @pytest.mark.asyncio
@@ -128,9 +126,7 @@ async def test_request_states_cleaned_on_normal_completion(async_omni):
             outputs.append(out)
 
     assert len(outputs) == 1
-    assert request_id not in async_omni.request_states, (
-        "request_states leaked after normal completion!"
-    )
+    assert request_id not in async_omni.request_states, "request_states leaked after normal completion!"
 
 
 @pytest.mark.asyncio
@@ -160,9 +156,7 @@ async def test_request_states_cleaned_on_cancellation(async_omni):
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert request_id not in async_omni.request_states, (
-        "request_states leaked after cancellation!"
-    )
+    assert request_id not in async_omni.request_states, "request_states leaked after cancellation!"
 
 
 @pytest.mark.asyncio
