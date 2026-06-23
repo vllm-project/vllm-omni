@@ -155,6 +155,7 @@ def _generate_sensenova_u1_img2img(
 
 @pytest.mark.slow
 @pytest.mark.diffusion
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4636")
 @hardware_test(res={"cuda": "H100"})
 def test_sensenova_u1_img2img(run_level):
     """Test SenseNova-U1 img2img (single-stage diffusion, no deploy YAML)."""
