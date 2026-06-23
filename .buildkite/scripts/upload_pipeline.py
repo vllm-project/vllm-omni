@@ -13,13 +13,16 @@ Test pipeline mode (e.g. test-merge.yml):
     recognize this uploader-only key).
 
 Usage:
-  python3 upload_pipeline.py [--upload] <pipeline.yml>
+  python3 upload_pipeline.py [--upload] [--all] <pipeline.yml>
 
   # Bootstrap (replaces upload_pipeline_with_skip_ci.sh):
   python3 upload_pipeline.py --upload .buildkite/pipeline.yml
 
   # Test pipeline (replaces upload_test_pipeline_with_diff_skip.py):
   python3 upload_pipeline.py --upload .buildkite/test-merge.yml
+
+  # Full suite (rebase pipeline): keep all steps, still strip the uploader-only key:
+  python3 upload_pipeline.py --upload --all .buildkite/test-merge.yml
 """
 
 from __future__ import annotations
@@ -437,10 +440,16 @@ def resolve_pipeline_path(arg: str) -> Path:
     return ROOT / path
 
 
-def render_pipeline(path: Path) -> str:
+def render_pipeline(path: Path, *, force_all: bool = False) -> str:
     text = path.read_text(encoding="utf-8")
     diff_range = resolve_diff_range()
     changed_files = resolve_changed_files()
+
+    # ``--all`` forces the keep-all-steps path (no diff-aware skipping) while still
+    # stripping ``source_file_dependencies``. Used by the rebase pipeline so main builds
+    # run the full e2e suite (see .buildkite/rebase-pipeline.yaml).
+    if force_all:
+        changed_files = None
 
     if BOOTSTRAP_MARKER in text:
         rendered = render_bootstrap_pipeline(
@@ -480,6 +489,11 @@ def main() -> int:
         action="store_true",
         help="Pipe rendered YAML to buildkite-agent pipeline upload",
     )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Keep all steps (disable diff-aware skipping); still strips source_file_dependencies",
+    )
     args = parser.parse_args()
 
     path = resolve_pipeline_path(args.pipeline)
@@ -487,7 +501,7 @@ def main() -> int:
         _log(f"missing pipeline file: {path}")
         return 1
 
-    rendered = render_pipeline(path)
+    rendered = render_pipeline(path, force_all=args.all)
     if args.upload:
         upload_to_buildkite(rendered)
     else:

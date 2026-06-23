@@ -11,8 +11,10 @@ import numpy as np
 import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras import get_extra_body_params, get_model_class_name
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -35,13 +37,36 @@ _MODEL_PRESETS = {
         "fps": 24,
         "output": "hunyuan_video_15_output.mp4",
     },
+    "cosmos": {
+        "height": 720,
+        "width": 1280,
+        "num_frames": 189,
+        "num_inference_steps": 35,
+        "guidance_scale": 6.0,
+        "fps": 24,
+        "flow_shift": 10.0,
+        "output": "cosmos3_t2v_output.mp4",
+    },
+    "helios": {
+        "height": 384,
+        "width": 640,
+        "num_frames": 99,
+        "num_inference_steps": 50,
+        "guidance_scale": 5.0,
+        "fps": 16,
+        "output": "helios_output.mp4",
+    },
 }
 
 
 def _detect_preset(model: str) -> dict:
     model_lower = model.lower()
+    if "cosmos" in model_lower:
+        return _MODEL_PRESETS["cosmos"]
     if "hunyuan" in model_lower:
         return _MODEL_PRESETS["hunyuan"]
+    if "helios" in model_lower:
+        return _MODEL_PRESETS["helios"]
     return _MODEL_PRESETS["wan"]
 
 
@@ -55,10 +80,26 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
     return config
 
 
+def parse_extra_body(value: str) -> dict[str, Any]:
+    """Parse a JSON object of model-specific extra_body params.
+
+    Pipeline-declared knobs (see vllm_omni/model_extras/) are merged into
+    OmniDiffusionSamplingParams.extra_args, so a single generic example can
+    drive model-specific behaviour without bespoke per-model flags.
+    """
+    try:
+        body = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--extra-body must be valid JSON: {e}") from e
+    if not isinstance(body, dict):
+        raise argparse.ArgumentTypeError("--extra-body must be a JSON object")
+    return body
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a video from a text prompt. "
-        "Supports Wan2.2, HunyuanVideo-1.5, and other text-to-video models."
+        "Supports Wan2.2, HunyuanVideo-1.5, Helios, and other text-to-video models."
     )
     parser.add_argument(
         "--model",
@@ -74,6 +115,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
+    parser.add_argument(
+        "--extra-body",
+        type=parse_extra_body,
+        default=None,
+        help="JSON dict of model-specific extra_body params (declared in vllm_omni/model_extras/), "
+        "merged into sampling extra_args. Unknown keys for the chosen model are dropped. "
+        'Cosmos3 example: \'{"flow_shift": 10.0, "max_sequence_length": 4096, "guardrails": false, '
+        '"use_resolution_template": false, "use_duration_template": false}\' '
+        '(add "generate_sound": true and optional "sound_duration" for synchronized audio). '
+        'Helios-Distilled example: \'{"is_enable_stage2": true, '
+        '"pyramid_num_inference_steps_list": [2, 2, 2], "is_amplify_first_chunk": true}\'.',
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
     parser.add_argument(
@@ -322,7 +375,14 @@ def main():
         omni_kwargs["cache_config"] = cache_config
         omni_kwargs["enable_cache_dit_summary"] = args.enable_cache_dit_summary
 
+    # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
+    # gate is an engine-level config (offline analog of the server's --no-guardrails).
+    if args.extra_body and "guardrails" in args.extra_body:
+        omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
+
     omni = Omni(**omni_kwargs)
+    model_class_name = get_model_class_name(omni)
+    declared_extra_body_params = get_extra_body_params(model_class_name)
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
@@ -358,10 +418,21 @@ def main():
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
 
+    sampling_params = OmniDiffusionSamplingParams(**sampling_kwargs)
+
+    # Route model-specific knobs through extra_body, filtered against the model's
+    # declared extra_body_params. Models without a declaration only forward explicit
+    # --extra-body JSON (preserving the generic flags' legacy behavior).
+    extra_body = dict(args.extra_body or {})
+    if declared_extra_body_params:
+        apply_declared_extra_args(sampling_params, declared_extra_body_params, extra_body)
+    elif extra_body:
+        sampling_params.extra_args.update({k: v for k, v in extra_body.items() if v is not None})
+
     generation_start = time.perf_counter()
     frames = omni.generate(
         prompt_dict,
-        OmniDiffusionSamplingParams(**sampling_kwargs),
+        sampling_params,
     )
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
