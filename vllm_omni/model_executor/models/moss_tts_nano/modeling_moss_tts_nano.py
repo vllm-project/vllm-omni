@@ -38,6 +38,7 @@ from vllm_omni.model_executor.models.utils import (
     reinit_rotary_inv_freq,
     transformers_keys_to_ignore_compat,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -182,7 +183,7 @@ class MossTTSNanoForGeneration(nn.Module):
         # Eager construction (not in load_weights) -- see module docstring.
         _patch_torchaudio_load()
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = current_omni_platform.get_torch_device()
         self._device: torch.device = device
 
         if device.type == "cuda" and torch.cuda.is_bf16_supported():
