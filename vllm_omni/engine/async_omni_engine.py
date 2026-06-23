@@ -1532,6 +1532,28 @@ class AsyncOmniEngine:
         except Exception:
             pass
 
+        # ── Release CuMem allocator memory pool ──────────────────────────────
+        # When enable_sleep_mode is in use, the CuMem (CUDA Virtual Memory
+        # Management) allocator holds model weights in a singleton memory pool
+        # that lives in the parent process.  Killing the engine-core subprocess
+        # does NOT release this pool — the weights stay resident on the GPU
+        # and can cause CUDA OOM for subsequent engine instances (especially
+        # large models like BAGEL-7B-MoT whose weights alone consume ~134 GiB).
+        #
+        # Discard mode (level=2) is correct at shutdown: there is no benefit to
+        # keeping a CPU backup when the engine is being torn down.
+        try:
+            from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+
+            if cumem_available:
+                allocator = CuMemAllocator.get_instance()
+                # Sleep at level 2 discards all pool memory from the GPU
+                # without creating CPU backups — cheapest and fastest.
+                allocator.sleep()
+                logger.debug("[AsyncOmniEngine] Released CuMem memory pool during shutdown")
+        except Exception:
+            pass
+
     def _try_shutdown(self, *args, **kwargs) -> None:
         try:
             self.shutdown()

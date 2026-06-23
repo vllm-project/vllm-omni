@@ -550,6 +550,15 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
             assert ab is not None, "Expected audio bytes when min_audio_bytes is set"
             assert len(ab) > n, f"Audio payload too small: {len(ab)} bytes, expected more than {n} (min_audio_bytes)"
 
+    # Optional floor on decoded audio size (models with very short clips may use a lower value).
+    min_audio = request_config.get("min_audio_bytes")
+    if min_audio is not None:
+        n = int(min_audio)
+        if n > 0:
+            ab = response.audio_bytes
+            assert ab is not None, "Expected audio bytes when min_audio_bytes is set"
+            assert len(ab) > n, f"Audio payload too small: {len(ab)} bytes, expected more than {n} (min_audio_bytes)"
+
     req_fmt = request_config.get("response_format")
     if req_fmt == "pcm" and response.audio_bytes:
         min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))

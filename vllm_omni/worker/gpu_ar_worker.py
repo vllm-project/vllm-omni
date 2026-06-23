@@ -19,6 +19,8 @@ from vllm_omni.worker.mixins import OmniWorkerMixin
 
 logger = init_logger(__name__)
 
+VLLM_OMNI_USE_V2_RUNNER = bool(int(os.environ.get("VLLM_OMNI_USE_V2_RUNNER", "0")))
+
 
 class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     """GPU worker for autoregressive omni model stages.
@@ -59,7 +61,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
                     f"({visible_device_count})."
                 )
             self.device = torch.device(f"cuda:{self.local_rank}")
-            torch.accelerator.set_device_index(self.device)
+            current_platform.set_device(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
@@ -94,17 +96,62 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
-        if self.use_v2_model_runner:
-            # OMNI: v2 model runner does not yet include omni hooks.
-            logger.warning("OMNI GPUARWorker forces v1 model runner for omni hooks.")
-            self.use_v2_model_runner = False
+        if VLLM_OMNI_USE_V2_RUNNER or self.use_v2_model_runner:
+            from vllm_omni.worker_v2.omni_ar_model_runner import (
+                OmniARModelRunner,
+            )
 
-        # Construct the model runner
-        self.model_runner = GPUARModelRunner(self.vllm_config, self.device)
+            logger.info("Using MR v2 OmniARModelRunner for omni AR stage.")
+            self.use_v2_model_runner = True
+            self.model_runner = OmniARModelRunner(self.vllm_config, self.device)
+        else:
+            self.model_runner = GPUARModelRunner(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    @instrument(span_name="Compile/warmup")
+    def compile_or_warm_up_model(self) -> float:
+        """Skip warmup_kernels for V2 Omni AR models.
+
+        Upstream ``compile_or_warm_up_model`` calls ``warmup_kernels()``
+        only for V2 model runners.  ``warmup_kernels`` creates fake
+        requests with hardcoded block_ids that bypass KVCacheManager
+        and runs real (non-dummy) execute_model + sample_tokens.  For
+        Omni AR models with preprocess, this pollutes model-internal
+        state and produces incorrect logits for subsequent real
+        requests (observed 30x more decode steps than V1).
+
+        This override runs the parent implementation but patches out
+        the ``warmup_kernels`` call, matching V1 behavior.
+        """
+        if not self.use_v2_model_runner:
+            return super().compile_or_warm_up_model()
+
+        # Temporarily disable warmup_kernels during parent call.
+        # Must patch both the module attribute AND the local name in
+        # gpu_worker (from-import creates a local binding).
+        import vllm.v1.worker.gpu_worker as _gw
+
+        _orig = _gw.warmup_kernels
+
+        def _noop(*a, **kw):
+            return None
+
+        _gw.warmup_kernels = _noop
+        # Also patch the module where it was originally defined
+        import vllm.v1.worker.gpu.warmup as _wm
+
+        _orig_wm = _wm.warmup_kernels
+        _wm.warmup_kernels = _noop
+        try:
+            result = super().compile_or_warm_up_model()
+        finally:
+            _gw.warmup_kernels = _orig
+            _wm.warmup_kernels = _orig_wm
+        logger.info("compile_or_warm_up_model: skipped warmup_kernels for Omni AR V2")
+        return result
 
     def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK:
         """

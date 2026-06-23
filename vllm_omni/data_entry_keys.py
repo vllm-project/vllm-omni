@@ -338,18 +338,31 @@ def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
     from vllm_omni.engine import AdditionalInformationEntry
 
     t_cpu = t.detach().to("cpu").contiguous()
+    try:
+        tensor_data = t_cpu.numpy().tobytes()
+    except TypeError:
+        # numpy has no equivalent for some torch dtypes (bfloat16, float8_*).
+        # Fall back to a raw byte view; _deserialize_tensor reconstructs via torch.
+        tensor_data = t_cpu.view(torch.uint8).numpy().tobytes()
     return AdditionalInformationEntry(
-        tensor_data=t_cpu.numpy().tobytes(),
+        tensor_data=tensor_data,
         tensor_shape=list(t_cpu.shape),
         tensor_dtype=_dtype_to_name(t_cpu.dtype),
     )
 
 
 def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
-    dt = np.dtype(entry.tensor_dtype or "float32")
-    arr = np.frombuffer(entry.tensor_data, dtype=dt)  # type: ignore[arg-type]
-    arr = arr.reshape(entry.tensor_shape)
-    return torch.from_numpy(arr.copy())
+    name = entry.tensor_dtype or "float32"
+    try:
+        dt = np.dtype(name)
+        arr = np.frombuffer(entry.tensor_data, dtype=dt)  # type: ignore[arg-type]
+        return torch.from_numpy(arr.copy().reshape(entry.tensor_shape))
+    except TypeError:
+        # numpy can't represent this dtype (bfloat16, float8_*): reconstruct from
+        # the raw byte view written by _serialize_tensor.
+        torch_dtype = getattr(torch, name)
+        flat = torch.frombuffer(bytearray(entry.tensor_data), dtype=torch_dtype)
+        return flat.reshape(entry.tensor_shape).clone()
 
 
 def serialize_payload(

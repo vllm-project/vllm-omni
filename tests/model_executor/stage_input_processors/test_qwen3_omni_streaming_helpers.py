@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
@@ -74,6 +75,26 @@ def test_get_streaming_codec_delta_len_increments_and_finishes(_streaming_contex
     assert d3 == 1
     state = q3._get_qwen3_streaming_state("c1", _streaming_context)
     assert state.talker2code2wav_last_seq_len == 0
+
+
+def test_talker2code2wav_async_chunk_emits_eof_marker_when_finished_empty() -> None:
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 25, "codec_left_context_frames": 25}}),
+    )
+    request = SimpleNamespace(external_req_id="r1", is_finished=lambda: True)
+
+    for multimodal_output in (None, {"codes": {"audio": torch.empty((0,), dtype=torch.long)}}):
+        payload = q3.talker2code2wav_async_chunk(
+            transfer_manager=transfer_manager,
+            multimodal_output=multimodal_output,
+            request=request,
+            is_finished=True,
+        )
+
+        assert payload["codes"] == {"audio": []}
+        assert payload["meta"]["left_context_size"] == 0
+        assert payload["meta"]["finished"].item() is True
 
 
 def test_streaming_input_prefill_chunk_is_cached() -> None:
