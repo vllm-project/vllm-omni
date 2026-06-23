@@ -379,13 +379,12 @@ class OmniVoiceModel(
         target_ids = torch.full((num_codebooks, target_len), mask_id, dtype=torch.long, device=device)
 
         # Conditional: [text] [ref_audio?] [target_mask]
+        cond_audio_start = text_ids.shape[1]
         if ref_audio_tokens is not None:
             ref_tokens = ref_audio_tokens.to(device)  # [8, T_ref]
             cond_ids = torch.cat([text_ids, ref_tokens, target_ids], dim=1)
-            cond_audio_start = text_ids.shape[1]
         else:
             cond_ids = torch.cat([text_ids, target_ids], dim=1)
-            cond_audio_start = text_ids.shape[1]
 
         cond_len = cond_ids.shape[1]
 

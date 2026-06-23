@@ -1,11 +1,12 @@
-# Document 1: Buildkite loads only this block on first parse. The next step resolves docs-only skip-ci
-# from git diff, then uploads document 2. When docs-only skip applies, image-build still runs for the nightly
-# exception in upload_pipeline.py (nightly-test label or main NIGHTLY=1); otherwise upload-nightly
-# can be skipped together with test-ready/test-merge. Weekly uploads also depend on image-build.
+# Document 1: Buildkite loads only this block on first parse. The next step resolves docs-only,
+# pytest skip-mark-only, or combined skip-ci from git diff, then uploads document 2. When skip-ci
+# applies, image-build still runs for the nightly exception in upload_pipeline.py (nightly-test
+# label or main NIGHTLY=1); otherwise upload-nightly can be skipped together with test-ready/test-merge.
+# Weekly uploads also depend on image-build.
 
 # Document 2: appended after `---`; same file, read by upload_pipeline.py (not evaluated as a second pipeline by Buildkite). Child uploads include test-ready.yml, test-merge.yml, test-nightly.yml, and test-weekly.yml.
 steps:
-  - label: ":github: Resolve skip-ci & upload pipeline"
+  - label: ":github: Resolve skip-ci (docs / skip marks) & upload pipeline"
     key: upload-ci-pipeline
     commands:
       - "python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/pipeline.yml"

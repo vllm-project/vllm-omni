@@ -85,6 +85,7 @@ _HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
 _HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _STEP_AUDIO2_TTS_MODEL_STAGES = {"step_audio2_thinker"}
+_INDEXTTS2_TTS_MODEL_STAGES = {"indextts2_talker"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -100,6 +101,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _MOSS_TTS_FULL_MODEL_STAGES
     | _GLM_TTS_MODEL_STAGES
     | _STEP_AUDIO2_TTS_MODEL_STAGES
+    | _INDEXTTS2_TTS_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "fish_tts",
@@ -109,6 +111,7 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "voxcpm2",
     "higgs_audio_v2",
     "higgs_audio_v3",
+    "indextts2",
 }
 _TTS_LANGUAGES = frozenset(
     {
@@ -411,6 +414,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def __init__(self, *args, **kwargs):
         self.model_name = kwargs.pop("model_name", None)
+        self.forced_aligner_config: Any | None = kwargs.pop("forced_aligner_config", None)
         super().__init__(*args, **kwargs)
         self._init_speaker_storage()
 
@@ -672,7 +676,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if model_stage in _OMNIVOICE_TTS_MODEL_STAGES:
             return "omnivoice"
         if model_stage in _COVO_AUDIO_MODEL_STAGES:
-            model_arch = getattr(self._tts_stage.engine_args, "model_arch", None)
             if model_arch and "CovoAudio" in model_arch:
                 return "covo_audio"
         if model_stage in _VOXCPM2_TTS_MODEL_STAGES:
@@ -693,6 +696,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "glm_tts"
         if model_stage in _STEP_AUDIO2_TTS_MODEL_STAGES:
             return "step_audio2"
+        if model_stage in _INDEXTTS2_TTS_MODEL_STAGES:
+            return "indextts2"
         return None
 
     def _get_custom_voice_dir(self) -> str | None:
@@ -2587,6 +2592,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         response_format: str = "pcm",
         raw_request: Request | None = None,
         request_start_s: float | None = None,
+        include_sample_rate: bool = False,
     ):
         """Generate audio chunks for streaming response.
 
@@ -2658,12 +2664,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         sample_rate=sample_rate_val,
                         response_format="pcm",
                         speed=1.0,
-                        stream_format="audio",
                         base64_encode=False,
                     )
                     if first_audio_chunk_s is None:
                         first_audio_chunk_s = time.perf_counter()
-                    yield self.create_audio(audio_obj).audio_data
+                    audio_bytes = self.create_audio(audio_obj).audio_data
+                    if include_sample_rate:
+                        yield audio_bytes, sample_rate_val
+                    else:
+                        yield audio_bytes
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
@@ -2722,6 +2731,53 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         finally:
             if not artifact_ready:
                 self._discard_ref_audio_artifact_warmup(request_id)
+
+    async def _generate_audio_sse_events(
+        self,
+        generator,
+        request_id: str,
+        response_format: str = "pcm",
+        raw_request: Request | None = None,
+        request_start_s: float | None = None,
+    ):
+        """Generate OpenAI-style SSE events with base64 audio deltas.
+
+        Field naming follows the OpenAI ``speech.audio.delta`` schema, which
+        carries the base64 chunk in ``audio`` (not ``delta`` — that is the
+        Realtime API ``response.audio.delta`` convention, a different event).
+        See https://platform.openai.com/docs/api-reference/audio-streaming.
+        """
+        try:
+            async for chunk in self._generate_audio_chunks(
+                generator,
+                request_id,
+                response_format,
+                raw_request=raw_request,
+                request_start_s=request_start_s,
+            ):
+                payload = {
+                    "type": "speech.audio.delta",
+                    "audio": base64.b64encode(chunk).decode("ascii"),
+                    "response_format": response_format,
+                }
+                data = json.dumps(payload, separators=(",", ":"))
+                yield f"event: speech.audio.delta\ndata: {data}\n\n"
+            done = json.dumps({"type": "speech.audio.done"}, separators=(",", ":"))
+            yield f"event: speech.audio.done\ndata: {done}\n\n"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            payload = {
+                "type": "speech.audio.error",
+                "error": {
+                    "message": str(e),
+                    "type": "server_error",
+                    "param": None,
+                    "code": HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                },
+            }
+            data = json.dumps(payload, separators=(",", ":"))
+            yield f"event: speech.audio.error\ndata: {data}\n\n"
 
     @staticmethod
     def _extract_audio_output(res) -> tuple[dict | None, str | None]:
@@ -3300,7 +3356,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # we don't emit redundant MM data & drain after emitting.
         # list() makes a copy to avoid mutating the params.
         sampling_params_list = list(self.engine_client.default_sampling_params_list)
-        sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
+        is_streaming_request = request.is_streaming()
+        sampling_params_list = coerce_param_message_types(sampling_params_list, is_streaming_request)
 
         # Build prompt + tts_params via the per-model adapter (RFC #4327). Every
         # dedicated TTS model resolves to an adapter that owns its validation,
@@ -3377,6 +3434,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "higgs_audio_v2"
         elif self._tts_model_type == "glm_tts":
             model_type = "glm_tts"
+        elif self._tts_model_type == "indextts2":
+            model_type = "indextts2"
         elif self._is_tts:
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:
@@ -3509,13 +3568,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._track_ref_audio_artifact_warmup(request_id, qwen3_ref_audio_warmup_artifact_key)
         return request_id, generator, tts_params
 
-    async def _generate_pcm_chunks(self, generator, request_id: str):
+    async def _generate_pcm_chunks(self, generator, request_id: str, *, include_sample_rate: bool = False):
         """Yield raw PCM byte chunks from the engine generator.
 
         Delegates to ``_generate_audio_chunks`` with ``response_format="pcm"``.
         Used by the WebSocket streaming handler and ``_iter_pcm_audio_bytes``.
         """
-        async for chunk in self._generate_audio_chunks(generator, request_id, response_format="pcm"):
+        async for chunk in self._generate_audio_chunks(
+            generator,
+            request_id,
+            response_format="pcm",
+            include_sample_rate=include_sample_rate,
+        ):
             yield chunk
 
     async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
@@ -3626,7 +3690,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 sample_rate=sample_rate,
                 response_format=request.response_format or "wav",
                 speed=request.speed or 1.0,
-                stream_format=request.stream_format,
                 base64_encode=base64_encode,
             )
             audio_response: AudioResponse = self.create_audio(audio_obj)
@@ -3739,7 +3802,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 sample_rate=sample_rate,
                 response_format=request.response_format or "wav",
                 speed=request.speed or 1.0,
-                stream_format=request.stream_format,
                 base64_encode=False,
             )
             audio_response: AudioResponse = self.create_audio(audio_obj)
@@ -3769,6 +3831,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         error_body = json.dumps({"error": {"message": message, "type": err_type, "param": None, "code": status_code}})
         return Response(content=error_body, media_type="application/json", status_code=status_code)
 
+    def _validate_speech_streaming_request(
+        self,
+        request: OpenAICreateSpeechRequest,
+        *,
+        mode_label: str,
+    ) -> tuple[str, Response | None]:
+        """Validate pcm/wav + speed constraints for streaming speech responses."""
+        response_format = (request.response_format or "wav").lower()
+        if response_format not in ("pcm", "wav"):
+            return response_format, self.create_error_response(
+                f"{mode_label} is only supported for 'pcm' and 'wav' formats. Got '{response_format}'."
+            )
+        if request.speed is not None and request.speed != 1.0:
+            return response_format, self.create_error_response(
+                f"{mode_label} is not supported with speed adjustment. "
+                "Use a non-streaming request or remove the speed parameter."
+            )
+        return response_format, None
+
     async def create_speech(
         self,
         request: OpenAICreateSpeechRequest,
@@ -3790,7 +3871,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         - ref_text: Transcript of reference audio (Base task)
         - x_vector_only_mode: Use speaker embedding only (Base task)
 
-        Streaming is supported via stream=True with response_format='pcm' or 'wav'.
+        Streaming is supported via ``stream_format='audio'`` or the legacy
+        ``stream=True`` switch, with ``response_format='pcm'`` or ``'wav'``.
+        ``stream_format='sse'`` returns OpenAI ``speech.audio.*`` SSE events instead.
         Each Code2Wav chunk is yielded as raw audio bytes as soon as it is decoded.
         For WAV format, a header with placeholder size values is emitted first.
         """
@@ -3810,23 +3893,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
         try:
-            if request.stream:
-                # Determine response format and media type for streaming
-                response_format = (request.response_format or "wav").lower()
-
-                # Only pcm and wav support streaming without post-processing
-                if response_format not in ["pcm", "wav"]:
+            if request.is_raw_audio_stream():
+                if request.word_timestamps:
                     return self.create_error_response(
-                        f"Streaming is only supported for 'pcm' and 'wav' formats. "
-                        f"Got '{response_format}'. For other formats, use stream=False."
+                        "word_timestamps=true is currently supported by the WebSocket "
+                        "/v1/audio/speech/stream path. Use session.config with "
+                        "stream_audio=true and response_format='pcm'."
                     )
 
-                # Check if speed adjustment is requested (not compatible with streaming)
-                if request.speed is not None and request.speed != 1.0:
-                    return self.create_error_response(
-                        "Streaming is not supported with speed adjustment. "
-                        "Use stream=False or remove the speed parameter."
-                    )
+                response_format, error = self._validate_speech_streaming_request(
+                    request,
+                    mode_label="Streaming",
+                )
+                if error is not None:
+                    return error
 
                 media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
                 _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
@@ -3839,6 +3919,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         request_start_s=request_start_s,
                     ),
                     media_type=media_type,
+                )
+
+            if request.is_sse_stream():
+                response_format, error = self._validate_speech_streaming_request(
+                    request,
+                    mode_label="SSE streaming",
+                )
+                if error is not None:
+                    return error
+
+                _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+                return StreamingResponse(
+                    self._generate_audio_sse_events(
+                        generator,
+                        request_id,
+                        response_format,
+                        raw_request=raw_request,
+                        request_start_s=request_start_s,
+                    ),
+                    media_type="text/event-stream",
                 )
 
             audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)

@@ -11,11 +11,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import janus
-import psutil
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
-from vllm.v1.engine.core_client import AsyncMPClient
 
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -26,8 +24,12 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
-from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
-from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+from vllm_omni.engine.orchestrator import (
+    Orchestrator,
+    OrchestratorRequestState,
+    _build_terminal_empty_output,
+    _infer_stage_audio_sample_rate,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -138,6 +140,20 @@ class FakeStageClient:
         self._diffusion_outputs.put_nowait(output)
 
 
+def test_terminal_empty_audio_output_uses_stage_sample_rate() -> None:
+    final_stage = FakeStageClient(final_output=True, final_output_type="audio")
+    final_stage.sample_rate = 44100
+    final_pool = SimpleNamespace(stage_client=final_stage, _stage_vllm_config=None)
+
+    terminal_output = _build_terminal_empty_output(
+        "req-1",
+        final_output_type="audio",
+        audio_sample_rate=_infer_stage_audio_sample_rate(final_pool),
+    )
+
+    assert terminal_output.outputs[0].multimodal_output["sr"] == 44100
+
+
 class FakeCollectiveRpcStageClient(FakeStageClient):
     def __init__(self, *args, rpc_result: Any = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -178,42 +194,6 @@ class FakeOutputProcessor:
 
     def update_scheduler_stats(self, _scheduler_stats) -> None:
         return None
-
-
-class _FakeProc:
-    pid = 1234
-
-    def __init__(self):
-        self.terminated = False
-        self.killed = False
-        self.join_calls = []
-
-    def is_alive(self):
-        return not self.terminated and not self.killed
-
-    def terminate(self):
-        self.terminated = True
-
-    def kill(self):
-        self.killed = True
-
-    def join(self, timeout=None):
-        self.join_calls.append(timeout)
-
-
-class _FakeChildProc:
-    def __init__(self):
-        self.terminated = False
-        self.killed = False
-
-    def is_running(self):
-        return not self.terminated and not self.killed
-
-    def terminate(self):
-        self.terminated = True
-
-    def kill(self):
-        self.killed = True
 
 
 def _sampling_params(max_tokens: int = 4) -> SamplingParams:
@@ -435,61 +415,6 @@ async def _enqueue_add_request(
 
 async def _enqueue_abort_request(orchestrator_fixture: OrchestratorFixture, request_ids: list[str]) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=request_ids))
-
-
-def test_stage_engine_core_client_shutdown_cleans_children_if_base_shutdown_fails(monkeypatch):
-    fake_proc = _FakeProc()
-    fake_child = _FakeChildProc()
-
-    class FakePsutilProcess:
-        def __init__(self, pid):
-            assert pid == fake_proc.pid
-
-        def children(self, recursive=True):
-            assert recursive
-            return [fake_child]
-
-    def fail_base_shutdown(self, **kwargs):
-        raise RuntimeError("base shutdown failed")
-
-    monkeypatch.setattr(psutil, "Process", FakePsutilProcess)
-    monkeypatch.setattr(psutil, "wait_procs", lambda procs, timeout: (list(procs), []))
-    monkeypatch.setattr(AsyncMPClient, "shutdown", fail_base_shutdown)
-
-    client = object.__new__(StageEngineCoreClient)
-    client._proc = fake_proc
-
-    with pytest.raises(RuntimeError, match="base shutdown failed"):
-        client.shutdown()
-
-    assert fake_proc.terminated
-    assert fake_proc.join_calls == [5]
-    assert fake_child.terminated
-
-
-def test_stage_engine_core_client_shutdown_kills_stubborn_children(monkeypatch):
-    fake_proc = _FakeProc()
-    fake_child = _FakeChildProc()
-
-    class FakePsutilProcess:
-        def __init__(self, pid):
-            assert pid == fake_proc.pid
-
-        def children(self, recursive=True):
-            assert recursive
-            return [fake_child]
-
-    monkeypatch.setattr(psutil, "Process", FakePsutilProcess)
-    monkeypatch.setattr(psutil, "wait_procs", lambda procs, timeout: ([], list(procs)))
-    monkeypatch.setattr(AsyncMPClient, "shutdown", lambda self, **kwargs: None)
-
-    client = object.__new__(StageEngineCoreClient)
-    client._proc = fake_proc
-
-    client.shutdown()
-
-    assert fake_child.terminated
-    assert fake_child.killed
 
 
 @pytest.fixture

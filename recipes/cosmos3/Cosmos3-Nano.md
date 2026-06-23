@@ -6,7 +6,7 @@
 
 - Vendor: NVIDIA
 - Model: `nvidia/Cosmos3-Nano`
-- Task: Text-to-image (T2I), text-to-video (T2V), image-to-video (I2V), and video-to-video (V2V) generation, with optional synchronized audio (video + sound), action policy
+- Task: Text-to-image (T2I), text-to-video (T2V), image-to-video (I2V), and video-to-video (V2V) generation, with optional transfer controls, synchronized audio (video + sound), action policy
 - Mode: Online serving with the OpenAI-compatible image/video APIs, plus offline generation via the `Omni` API
 - Maintainer: Community
 
@@ -25,6 +25,9 @@ mode is selected per request:
   reference-video latent frames; use `extra_params.condition_frame_indexes_vision`
   and `extra_params.condition_video_keep` to choose which prefix/tail frames guide
   generation.
+- **Transfer V2V** — pass one or more transfer hints in `extra_params`
+  (`edge`, `blur`, `depth`, `seg`, `wsm`) to guide generation with control
+  frames. Transfer mode is video-only and cannot be combined with sound or action.
 - **T2VS / I2VS** — add `generate_sound=true` (and optional `sound_duration`) to a
   T2V/I2V `/v1/videos/sync` request to also generate synchronized audio, muxed into
   the mp4 as AAC 48 kHz stereo. See the official model card's "Video + Audio" examples.
@@ -46,6 +49,10 @@ mode is selected per request:
   `forward_dynamics` also pass the `action` array. The dedicated policy checkpoint
   **`nvidia/Cosmos3-Nano-Policy-DROID`** is served the same way
   (`domain_name=droid_lerobot`).
+
+- **DROID OpenPI policy server** — serve `nvidia/Cosmos3-Nano-Policy-DROID` and
+  connect an OpenPI-compatible websocket client to `/v1/realtime/robot/openpi`.
+  This path returns action chunks directly instead of an mp4.
 
   Action requests can use `input_reference` or `video_reference` for video input.
   `policy` and `forward_dynamics` can also use an image reference; `inverse_dynamics`
@@ -101,7 +108,10 @@ vllm serve nvidia/Cosmos3-Nano \
 To run **without** guardrails (you are responsible for license compliance),
 add `--no-guardrails` (no token/`cosmos-guardrail` needed). For extra GPUs use
 `--ulysses-degree N` (context parallel) or `--tensor-parallel-size N`;
-`--enable-layerwise-offload` reduces VRAM on smaller GPUs. The pipeline
+`--enable-layerwise-offload` reduces VRAM on smaller GPUs;
+`--quantization fp8` (online, no calibration) cuts peak VRAM for 720p video
+generation from ~50 GB to ~36 GB with BF16-level quality (T2V composition can
+shift at the same seed). The pipeline
 auto-resolves from `model_index.json`; pass
 `--model-class-name Cosmos3OmniDiffusersPipeline` to force it explicitly.
 
@@ -183,6 +193,18 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -F 'video_reference={"video_url":"https://example.com/reference.mp4"}' \
   -o cosmos3_v2v_from_url.mp4
 
+# Transfer V2V with a precomputed depth control video. `control_path` can point
+# to a local image/video; edge and blur can also be computed from `input_reference`
+# by passing `"edge":true` or `"blur":true`.
+curl -sS -X POST http://localhost:8000/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Nano" \
+  -F "prompt=Generate a realistic scene following the provided control video." \
+  -F "size=1280x720" -F "num_frames=121" \
+  -F "num_inference_steps=50" -F "seed=125" \
+  -F 'extra_params={"depth":{"control_path":"/path/to/depth_control.mp4"},"max_frames":121,"resolution":"720","num_video_frames_per_chunk":121}' \
+  -o cosmos3_transfer_depth.mp4
+
 # Text-to-video-with-sound
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -H "Accept: video/mp4" \
@@ -245,6 +267,39 @@ VIDEO_ID=$(curl -sS -X POST http://localhost:8000/v1/videos \
 # poll until status == completed, then:
 curl -sS "http://localhost:8000/v1/videos/$VIDEO_ID" | jq '.action | {shape, dtype, raw_action_dim, domain_id}'
 curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_inverse_dynamics.mp4
+
+# DROID OpenPI policy server (websocket action serving).
+# Requires cosmos_framework on PYTHONPATH because the pipeline reuses the
+# reference RoboLab action transforms. If your checkpoint config already
+# includes policy_server_config, omit the stage_overrides file and flag.
+cat > cosmos3_droid_openpi_stage_overrides.json <<'JSON'
+{
+  "0": {
+    "model_config": {
+      "policy_server_config": {
+        "image_resolution": [540, 640],
+        "n_external_cameras": 2,
+        "needs_wrist_camera": true,
+        "needs_stereo_camera": false,
+        "needs_session_id": true,
+        "action_space": "joint_position"
+      }
+    }
+  }
+}
+JSON
+
+vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
+  --omni \
+  --host 0.0.0.0 --port 8000 \
+  --model-class-name Cosmos3OmniDiffusersPipeline \
+  --no-guardrails \
+  --stage-overrides "$(cat cosmos3_droid_openpi_stage_overrides.json)"
+
+# Point an OpenPI websocket client at:
+#   ws://localhost:8000/v1/realtime/robot/openpi
+# The first server message is policy_server_config. Each infer request sends a
+# msgpack-numpy observation dict and receives a writable float32 action array.
 ```
 
 #### Notes
@@ -272,6 +327,24 @@ curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_inver
   For V2V, `condition_frame_indexes_vision` selects the clean conditioned latent
   frame indexes (default `[0, 1]`), and `condition_video_keep` selects whether the
   API decodes the first or last needed reference frames (`"first"` by default).
+- **Transfer controls:** `extra_params` may include `edge`, `blur`, `depth`,
+  `seg`, or `wsm`. Each hint accepts `true`, a path string, or an object such as
+  `{"control_path": "/path/to/control.mp4"}`; `edge` also accepts
+  `preset_edge_threshold` and `blur` accepts `preset_blur_strength`.
+  Transfer-level options include `control_guidance`,
+  `control_guidance_interval`, `num_video_frames_per_chunk` (default `93`,
+  `101` for WSM), `num_conditional_frames` (default `1`),
+  `num_first_chunk_conditional_frames`, `max_frames`,
+  `show_control_condition`, `show_input`, and
+  `share_vision_temporal_positions`. Non-WSM transfer preserves the input video
+  fps when available; WSM defaults to 10 fps unless `fps` is supplied.
+- **DROID OpenPI observations:** include a string `prompt`, either
+  `observation/image` or the three-view DROID camera keys
+  (`observation/wrist_image_left`, `observation/exterior_image_1_left`,
+  `observation/exterior_image_2_left`), plus `observation/gripper_position` and
+  `observation/joint_position`. Optional extra params include `history_length`,
+  `conditioning_fps`, `action_chunk_size`, `raw_action_dim`, `deterministic_seed`,
+  and `session_id`.
 - **Known limitations:**
   - Guardrails-on requires `cosmos-guardrail` **and** access to the gated
     `nvidia/Cosmos-1.0-Guardrail` repo (accept license + `HF_TOKEN`); otherwise

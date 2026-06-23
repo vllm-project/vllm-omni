@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -28,6 +28,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -66,7 +67,13 @@ def get_flux_post_process_func(
     return post_process_func
 
 
-class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipelineProfilerMixin):
+class FluxPipeline(
+    nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     def __init__(
         self,
         *,

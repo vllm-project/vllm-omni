@@ -194,6 +194,3 @@ __all__ = [
     "SpeechServingContext",
     "TTSModelAdapter",
 ]
-
-# Type alias kept for readability in adapter signatures.
-NormalizeFn = Callable[["OpenAICreateSpeechRequest"], None]

@@ -71,6 +71,7 @@ def _assert_cot_structural_markers(cot_text: str, label: str) -> None:
 
 
 os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
+os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 

@@ -128,6 +128,8 @@ class OmniOpenAIServingVideo:
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail="Provide either an image reference or a video reference, not both.",
             )
+        provided_fields = request.model_fields_set
+        fps_provided = self._request_fps_provided(request)
         vp = request.resolve_video_params()
         if input_image is not None and vp.width is not None and vp.height is not None:
             target_size = (vp.width, vp.height)
@@ -147,10 +149,10 @@ class OmniOpenAIServingVideo:
             gen_params.height = vp.height
         if vp.num_frames is not None:
             gen_params.num_frames = vp.num_frames
-        if vp.fps is not None:
+        # Leave fps/frame_rate as None when the user did not provide fps.
+        if fps_provided and vp.fps is not None:
             gen_params.fps = vp.fps
             gen_params.frame_rate = float(vp.fps)
-        provided_fields = request.model_fields_set
         if "enable_frame_interpolation" in provided_fields:
             gen_params.enable_frame_interpolation = request.enable_frame_interpolation
         if "frame_interpolation_exp" in provided_fields:
@@ -195,18 +197,21 @@ class OmniOpenAIServingVideo:
             # Merge extra_params into extra_args
             gen_params.extra_args.update(request.extra_params)
 
-            # Redact the inline ``action`` array (hundreds of floats) when
-            # logging so it doesn't flood the logs; everything else is logged
-            # verbatim.
+            # Redact inline arrays when logging so RoboLab policy requests do
+            # not flood the server log with image/state payloads.
             loggable = request.extra_params
-            action_val = loggable.get("action")
-            if action_val is not None:
-                summary = (
-                    f"<{type(action_val).__name__} len={len(action_val)}>"
-                    if hasattr(action_val, "__len__")
-                    else f"<{type(action_val).__name__}>"
+            redacted = {}
+            for key in ("action", "robot_obs", "observation"):
+                value = loggable.get(key)
+                if value is None:
+                    continue
+                redacted[key] = (
+                    f"<{type(value).__name__} len={len(value)}>"
+                    if hasattr(value, "__len__")
+                    else f"<{type(value).__name__}>"
                 )
-                loggable = {**loggable, "action": summary}
+            if redacted:
+                loggable = {**loggable, **redacted}
             logger.info("Applied extra_params: %s", loggable)
 
         self._apply_lora(request.lora, gen_params)
@@ -220,11 +225,15 @@ class OmniOpenAIServingVideo:
         )
 
         result = await self._run_generation(prompt, gen_params, reference_id)
-        videos = self._extract_video_outputs(result)
+        custom_output = self._extract_custom_output(result)
+        action_only = isinstance(custom_output, dict) and bool(custom_output.get("action_only_output"))
+        videos = [{"action_only_output": True}] if action_only else self._extract_video_outputs(result)
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
         actions = self._extract_action_outputs(result, expected_count=len(videos))
         audio_sample_rate = self._resolve_audio_sample_rate(result)
-        output_fps = (vp.fps or self._resolve_fps(result) or 24) * self._resolve_video_fps_multiplier(result)
+        model_fps = self._resolve_fps(result)
+        output_fps_base = (vp.fps if fps_provided else None) or model_fps or vp.fps or 24
+        output_fps = output_fps_base * self._resolve_video_fps_multiplier(result)
         return VideoGenerationArtifacts(
             videos=videos,
             audios=audios,
@@ -314,6 +323,11 @@ class OmniOpenAIServingVideo:
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
 
+        action = artifacts.actions[0]
+        if action is not None and isinstance(artifacts.videos[0], dict):
+            logger.info("Action-only video request %s completed; skipping MP4 encoding.", reference_id)
+            return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action
+
         _t_encode_start = time.perf_counter()
         video_bytes = _encode_video_bytes(
             artifacts.videos[0],
@@ -333,6 +347,15 @@ class OmniOpenAIServingVideo:
             if multiplier is not None:
                 return int(multiplier)
         return 1
+
+    @staticmethod
+    def _request_fps_provided(request: VideoGenerationRequest) -> bool:
+        if "fps" in request.model_fields_set and request.fps is not None:
+            return True
+        video_params = request.video_params
+        if video_params is None or "video_params" not in request.model_fields_set:
+            return False
+        return "fps" in video_params.model_fields_set and video_params.fps is not None
 
     def _resolve_default_sampling_params(self) -> OmniDiffusionSamplingParams:
         default_sampling_params_list = getattr(self._engine_client, "default_sampling_params_list", None)
@@ -510,7 +533,8 @@ class OmniOpenAIServingVideo:
         if not custom_output or "action" not in custom_output:
             return [None] * expected_count
 
-        action_items = cls._split_action_payload(custom_output["action"], expected_count)
+        action_payload = custom_output.get("actions", custom_output["action"])
+        action_items = cls._split_action_payload(action_payload, expected_count)
         return [
             cls._make_video_action(action_item, custom_output) if action_item is not None else None
             for action_item in action_items
