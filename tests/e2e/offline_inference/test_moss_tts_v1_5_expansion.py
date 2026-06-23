@@ -25,6 +25,7 @@ DEPLOY_CONFIG = get_deploy_config_path("moss_tts.yaml")
 _OMNI_RUNNER_PARAM = (MODEL, DEPLOY_CONFIG, {"stage_init_timeout": 600})
 
 pytestmark = [
+    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4643"),
     pytest.mark.slow,
     pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),

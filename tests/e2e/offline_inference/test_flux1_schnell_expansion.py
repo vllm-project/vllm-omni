@@ -20,7 +20,7 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_flux_schnell_text_to_image(omni_runner_handler: OmniRunnerHandler):
     """Test FLUX.1-schnell text-to-image generation."""
     request_config = {

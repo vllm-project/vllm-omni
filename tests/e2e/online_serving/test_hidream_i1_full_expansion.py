@@ -46,6 +46,7 @@ def _get_hidream_i1_image_feature_cases(model: str):
     _get_hidream_i1_image_feature_cases(MODEL),
     indirect=True,
 )
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4662")
 def test_hidream_i1_image(
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,
