@@ -37,10 +37,12 @@ stage_args:
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
-      temperature: 1.0
-      top_k: 50
-      top_p: 0.95
+      # See tada_tts.yaml: TADA walks the text (fixed length), sampled token discarded.
+      temperature: 0.0
+      top_k: -1
+      top_p: 1.0
       max_tokens: 4096
+      ignore_eos: true
       seed: 42
       detokenize: false
       repetition_penalty: 1.0

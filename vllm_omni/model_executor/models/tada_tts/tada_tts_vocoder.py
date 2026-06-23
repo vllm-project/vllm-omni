@@ -1,9 +1,13 @@
-"""TADA TTS -- Stage 1: Vocoder (acoustic features → waveform @ 44.1 kHz).
+"""TADA TTS -- Stage 1: Vocoder (acoustic features → waveform @ 24 kHz).
 
-Wraps HumeAI/tada-codec/decoder.  Receives acoustic_features [B, T, 512] and
-text_token_mask [B, T] via runtime_additional_information.  input_ids carries
-dummy token IDs (one per frame) for vLLM-Omni sequence-length bookkeeping.
-Upsample factor: 4 × 4 × 5 × 6 = 480.
+Wraps HumeAI/tada-codec/decoder.  Receives acoustic_features [T, 512], per-token
+durations time_before [T], and text_token_mask [T] via
+runtime_additional_information.  Before codec decode it (1) de-normalises the
+acoustic features (× acoustic_std + acoustic_mean) and (2) expands the frame
+sequence by each token's duration, inserting zero (silence) frames — mirroring
+upstream ``TadaForCausalLM._decode_wav``.  input_ids carries dummy token IDs (one
+per frame) for vLLM-Omni sequence-length bookkeeping.
+Codec upsample factor: 4 × 4 × 5 × 6 = 480 → 50 Hz frames × 480 = 24 000 Hz.
 """
 
 from __future__ import annotations
@@ -21,10 +25,15 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
-# Codec sample rate (fixed by HumeAI/tada-codec)
-TADA_CODEC_SAMPLE_RATE = 44_100
+# Codec sample rate: 50 Hz acoustic frames × 480 upsample = 24 000 Hz.
+TADA_CODEC_SAMPLE_RATE = 24_000
 # Upsampling factor: strides [4, 4, 5, 6]
 TADA_CODEC_UPSAMPLE = 4 * 4 * 5 * 6  # 480
+# Frames-per-second of the acoustic token stream (used for leading-silence trim).
+TADA_CODEC_FRAME_RATE = 50
+# The codec decoder's local-attention RoPE / precomputed-mask buffers are sized for
+# this many frames (LocalAttentionEncoder max_seq_len); longer inputs overflow them.
+DECODER_MAX_SEQ_LEN = 8192
 
 
 class TadaVocoder(nn.Module):
@@ -43,25 +52,48 @@ class TadaVocoder(nn.Module):
         self.vllm_config = vllm_config
         self.model_path = vllm_config.model_config.model
 
+        cfg = vllm_config.model_config.hf_config
+        # Acoustic features are generated in normalised space; de-normalise before
+        # the codec (upstream generate(): feat * acoustic_std + acoustic_mean).
+        self.acoustic_mean = float(getattr(cfg, "acoustic_mean", 0.0))
+        self.acoustic_std = float(getattr(cfg, "acoustic_std", 1.5))
+        self.acoustic_features_dim = int(getattr(cfg, "acoustic_dim", 512))
+
         self._decoder: nn.Module | None = None
+        self._codec_path = self._resolve_codec_path()
         self._output_sample_rate = TADA_CODEC_SAMPLE_RATE
         self._upsample = TADA_CODEC_UPSAMPLE
+        self._frame_rate = TADA_CODEC_FRAME_RATE
         self._logged_stats = False
+
+    def _resolve_codec_path(self) -> str:
+        """Resolve the tada-codec source. Priority: ``TADA_CODEC_PATH`` env →
+        config attr → sibling ``tada-codec`` dir of the model path → HF hub id."""
+        env = os.environ.get("TADA_CODEC_PATH")
+        if env:
+            return env
+        cfg = self.vllm_config.model_config.hf_config
+        cfg_path = getattr(cfg, "codec_model_name_or_path", None) or getattr(cfg, "codec_path", None)
+        if cfg_path:
+            return str(cfg_path)
+        # Sibling of the AR model dir (e.g. models/tada-1b → models/tada-codec).
+        try:
+            parent = os.path.dirname(os.path.abspath(self.model_path))
+            sibling = os.path.join(parent, "tada-codec")
+            if os.path.isdir(os.path.join(sibling, "decoder")):
+                return sibling
+        except Exception:
+            pass
+        return "HumeAI/tada-codec"
 
     def _ensure_decoder_loaded(self) -> None:
         if self._decoder is not None:
             return
 
-        try:
-            from tada.modules.decoder import Decoder
-        except ImportError as e:
-            raise ImportError(
-                "hume-tada package is required for TadaVocoder. "
-                "Install with: pip install hume-tada"
-            ) from e
+        from .codec import Decoder
 
-        logger.info("Loading TADA codec decoder from HumeAI/tada-codec …")
-        decoder = Decoder.from_pretrained("HumeAI/tada-codec", subfolder="decoder")
+        logger.info("Loading TADA codec decoder from %s (subfolder=decoder) …", self._codec_path)
+        decoder = Decoder.from_pretrained(self._codec_path, subfolder="decoder")
         device = self.vllm_config.device_config.device
         decoder = decoder.to(device=device, dtype=torch.float32)
         decoder.eval()
@@ -109,7 +141,20 @@ class TadaVocoder(nn.Module):
                 continue
 
             af = info.get("acoustic_features")
-            tm = info.get("text_token_mask")
+            tb = info.get("time_before")
+            # Async-chunk path packs both signals into a single 2-D ``codes.audio`` tensor
+            # ([T, 513]: 512 acoustic + 1 duration) — the only field the receive side keeps
+            # in the vocoder's request info (see ar2vocoder_async_chunk).
+            if af is None or (isinstance(af, torch.Tensor) and af.numel() == 0):
+                codes = info.get("codes")
+                packed = codes.get("audio") if isinstance(codes, dict) else None
+                if isinstance(packed, torch.Tensor) and packed.numel() > 0:
+                    packed = packed.reshape(-1, packed.shape[-1])
+                    if packed.shape[-1] == self.acoustic_features_dim + 1:
+                        af = packed[:, : self.acoustic_features_dim]
+                        tb = packed[:, self.acoustic_features_dim].round().to(torch.long)
+                    else:
+                        af = packed
 
             if af is None or not isinstance(af, torch.Tensor) or af.numel() == 0:
                 audios.append(empty)
@@ -120,26 +165,43 @@ class TadaVocoder(nn.Module):
                 af = af.to(device=device, dtype=torch.float32)
                 T = af.shape[0]
 
-                if isinstance(tm, torch.Tensor) and tm.numel() == T:
-                    token_mask = tm.to(device=device, dtype=torch.long)
-                else:
-                    token_mask = torch.ones(T, device=device, dtype=torch.long)
+                # De-normalise: the diffusion head generates in normalised space.
+                af = af * self.acoustic_std + self.acoustic_mean
 
-                af_b = af.unsqueeze(0)           # [1, T, 512]
-                tm_b = token_mask.unsqueeze(0)   # [1, T]
+                # Per-token durations (frames). Without them the timing cannot be
+                # reconstructed; fall back to 1 frame/token (wrong, but avoids crash).
+                if isinstance(tb, torch.Tensor) and tb.numel() >= T:
+                    time_before = tb.to(device=device, dtype=torch.long).reshape(-1)
+                else:
+                    logger.warning_once(
+                        "TadaVocoder: time_before missing/short; using 1 frame/token "
+                        "(audio timing will be wrong)"
+                    )
+                    time_before = torch.ones(T, device=device, dtype=torch.long)
 
                 if not self._logged_stats:
                     self._logged_stats = True
+                    total_frames = int(time_before[:T].clamp(min=1).sum().item())
+                    tb_view = time_before[:T].float()
                     logger.info(
-                        "TadaVocoder: T=%d frames, upsample=%d → ~%.2f s @%d Hz",
-                        T, self._upsample,
-                        T * self._upsample / self._output_sample_rate,
+                        "TadaVocoder: %d tokens → ~%d expanded frames, upsample=%d → ~%.2f s @%d Hz "
+                        "| time_before[min/mean/max]=%d/%.1f/%d | acoustic[mean/std/absmax]=%.3f/%.3f/%.3f",
+                        T, total_frames, self._upsample,
+                        total_frames * self._upsample / self._output_sample_rate,
                         self._output_sample_rate,
+                        int(tb_view.min().item()), float(tb_view.mean().item()), int(tb_view.max().item()),
+                        float(af.mean().item()), float(af.std().item()), float(af.abs().max().item()),
                     )
 
-                wav = self._decoder(af_b, tm_b)  # [1, 1, wav_len]
-                wav = wav.squeeze(0).squeeze(0).to(dtype=torch.float32).reshape(-1)
-                audios.append(wav.cpu())
+                wav = self._decode_wav(af, time_before)  # [wav_len]
+
+                # Trim leading silence: the first token's duration worth of samples
+                # (upstream generate(): wav[int(sr * time_before[0] / frame_rate):]).
+                lead = int(self._output_sample_rate * int(time_before[0].item()) / self._frame_rate)
+                if 0 < lead < wav.shape[0]:
+                    wav = wav[lead:]
+
+                audios.append(wav.to(dtype=torch.float32).cpu())
 
             except Exception:
                 logger.exception("TadaVocoder: error decoding request; returning empty audio")
@@ -151,6 +213,50 @@ class TadaVocoder(nn.Module):
             text_hidden_states=None,
             multimodal_outputs={"model_outputs": audios, "sr": srs},
         )
+
+    def _decode_wav(self, encoded: torch.Tensor, time_before: torch.Tensor) -> torch.Tensor:
+        """Expand acoustic frames by per-token duration, then run the codec decoder.
+
+        Mirrors upstream ``TadaForCausalLM._decode_wav``: insert
+        ``(time_before[pos] - 1)`` zero (silence) frames before each acoustic frame,
+        append ``time_before[-1]`` trailing zero frames, then decode.  ``token_masks``
+        marks the real (non-zero) frames and drives the decoder's v2 block attention.
+        """
+        device = encoded.device
+        T = encoded.shape[0]
+        feat_dim = encoded.shape[-1]
+        tb = time_before.reshape(-1).to(device=device, dtype=torch.long)
+        tb = tb[: T + 1]
+        if tb.numel() == 0 or T == 0:
+            return torch.zeros(0, device=device)
+
+        parts: list[torch.Tensor] = []
+        for pos in range(T):
+            n_zero = int((tb[pos] - 1).clamp(min=0).item())
+            if n_zero > 0:
+                parts.append(torch.zeros(n_zero, feat_dim, device=device, dtype=encoded.dtype))
+            parts.append(encoded[pos].unsqueeze(0))
+        n_tail = int(tb[-1].clamp(min=0).item())
+        if n_tail > 0:
+            parts.append(torch.zeros(n_tail, feat_dim, device=device, dtype=encoded.dtype))
+
+        expanded = torch.cat(parts, dim=0).unsqueeze(0)  # [1, T_exp, 512]
+        # The codec decoder's local-attention RoPE/precomputed-mask buffers are sized
+        # for DECODER_MAX_SEQ_LEN frames; longer inputs overflow them. This only
+        # happens with runaway AR generation (no EOS) — cap with a loud warning
+        # rather than crash the whole pipeline.
+        if expanded.shape[1] > DECODER_MAX_SEQ_LEN:
+            logger.warning(
+                "TadaVocoder: expanded sequence %d > decoder max %d frames; truncating. "
+                "This indicates the AR stage did not stop (check EOS / max_tokens).",
+                expanded.shape[1], DECODER_MAX_SEQ_LEN,
+            )
+            expanded = expanded[:, :DECODER_MAX_SEQ_LEN]
+        decoder_dtype = next(self._decoder.parameters()).dtype
+        expanded = expanded.to(decoder_dtype)
+        token_masks = (torch.norm(expanded, dim=-1) != 0).long()  # [1, T_exp]
+        wav = self._decoder(expanded, token_masks)  # [1, 1, wav_len]
+        return wav.squeeze(0).squeeze(0).to(dtype=torch.float32).reshape(-1)
 
     def make_omni_output(
         self, model_outputs: torch.Tensor | OmniOutput, **_: Any

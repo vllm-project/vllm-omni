@@ -30,18 +30,21 @@ class TadaTTSConfig(PretrainedConfig):
         rope_scaling: dict | None = None,
         # Acoustic / diffusion dims
         acoustic_dim: int = 512,
-        num_time_classes: int = 1024,
+        num_time_classes: int = 256,
         shift_acoustic: int = 5,
         acoustic_from_nth_hidden_state: int = -1,
+        # Acoustic feature (de)normalisation (diffusion runs in normalised space)
+        acoustic_mean: float = 0.0,
+        acoustic_std: float = 1.5,
         # Diffusion head
-        head_layers: int = 4,
-        head_ffn_ratio: float = 3.0,
+        head_layers: int = 6,
+        head_ffn_ratio: float = 4.0,
         diffusion_head_type: str = "vibevoice",
         bottleneck_dim: int | None = None,
         # Tokenizer
         tokenizer_name: str = "meta-llama/Llama-3.2-1B",
-        # Output sample rate (set by the codec)
-        output_sample_rate: int = 44100,
+        # Output sample rate (set by the codec: 50 Hz frames × 480 upsample)
+        output_sample_rate: int = 24000,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -59,6 +62,8 @@ class TadaTTSConfig(PretrainedConfig):
         self.num_time_classes = num_time_classes
         self.shift_acoustic = shift_acoustic
         self.acoustic_from_nth_hidden_state = acoustic_from_nth_hidden_state
+        self.acoustic_mean = acoustic_mean
+        self.acoustic_std = acoustic_std
         self.head_layers = head_layers
         self.head_ffn_ratio = head_ffn_ratio
         self.diffusion_head_type = diffusion_head_type
