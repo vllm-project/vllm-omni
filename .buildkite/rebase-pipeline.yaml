@@ -14,7 +14,7 @@ steps:
     depends_on: image-build
     key: upload-ready-pipeline
     commands:
-      - python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/test-ready.yml
+      - python3 .buildkite/scripts/upload_pipeline.py --upload --all .buildkite/test-ready.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -23,7 +23,7 @@ steps:
     depends_on: image-build
     key: upload-merge-pipeline
     commands:
-      - python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/test-merge.yml
+      - python3 .buildkite/scripts/upload_pipeline.py --upload --all .buildkite/test-merge.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -33,6 +33,6 @@ steps:
     key: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-nightly.yml
+      - python3 .buildkite/scripts/upload_pipeline.py --upload --all .buildkite/test-nightly.yml
     agents:
       queue: "cpu_queue_premerge"

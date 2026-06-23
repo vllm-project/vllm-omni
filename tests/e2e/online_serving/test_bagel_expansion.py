@@ -65,6 +65,17 @@ def _get_diffusion_feature_cases(model: str):
     """
 
     return [
+        # CPU offload (single-card)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-cpu-offload",
+                ],
+            ),
+            id="single_card_cpu_offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
         # TeaCache (single-card)
         pytest.param(
             OmniServerParams(

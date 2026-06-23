@@ -9,6 +9,13 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 
 See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, and MOSS-TTS-Nano.
 
+!!! tip "Deployment recipes"
+    TTS deployment recipes are published at
+    [recipes.vllm.ai](https://recipes.vllm.ai) (e.g.
+    [Qwen3-TTS](https://recipes.vllm.ai/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice),
+    [Higgs-Audio v3](https://recipes.vllm.ai/bosonai/higgs-audio-v3-tts-4b)).
+    The in-repo runbooks live under [`recipes/`](https://github.com/vllm-project/vllm-omni/tree/main/recipes).
+
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
 ## Quick Start

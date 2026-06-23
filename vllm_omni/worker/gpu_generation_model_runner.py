@@ -64,6 +64,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             "Qwen3TTSCode2Wav",
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
+            "IndexTTS2S2MelDecoder",
         }
         if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(
@@ -718,6 +719,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
                 cum_num_tokens = self._get_cumsum_and_arange(num_scheduled_tokens, self.query_pos.np)
                 self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+                self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1].fill(cum_num_tokens[-1])
                 self.query_start_loc.copy_to_gpu()
 
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)

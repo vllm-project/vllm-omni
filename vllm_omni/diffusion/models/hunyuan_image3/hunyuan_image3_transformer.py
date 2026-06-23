@@ -11,6 +11,7 @@ from typing import Any, cast
 import numpy as np
 import regex as re
 import torch
+from cache_dit import ForwardPattern
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -59,6 +60,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -1065,9 +1067,10 @@ class ImageKVCacheManager:
         assert self.image_kv_cache_lens is not None
         if position_ids is not None:
             assert position_ids.shape == (bs, q_len)
-            assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens), (
-                "The first current position must immediately follow each sample's cached prompt KV."
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens.to(position_ids.device)), (
+                    "The first current position must immediately follow each sample's cached prompt KV."
+                )
         new_key = torch.cat([cached_key, key], dim=1)
         new_value = torch.cat([cached_value, value], dim=1)
         return new_key.contiguous(), new_value.contiguous()
@@ -2017,6 +2020,13 @@ class HunyuanImagePostprocessor(nn.Module):
 
 
 class HunyuanImage3Model(nn.Module):
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "layers": ForwardPattern.Pattern_4,
+        },
+        check_forward_pattern=False,
+    )
+
     _sp_plan = {
         # Split custom_pos_emb tuple elements (cos, sin) at model forward input
         "pre_processor": {

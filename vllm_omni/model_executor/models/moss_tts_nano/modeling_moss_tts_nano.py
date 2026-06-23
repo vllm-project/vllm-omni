@@ -21,6 +21,7 @@ to avoid OOM from vLLM's post-init KV-cache profiling. Mirrors qwen3_tts
 
 from __future__ import annotations
 
+import contextlib
 import tempfile
 import threading
 from collections.abc import Iterable
@@ -33,9 +34,46 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.model_executor.models.utils import reinit_rotary_inv_freq
+from vllm_omni.model_executor.models.utils import (
+    reinit_rotary_inv_freq,
+    transformers_keys_to_ignore_compat,
+)
 
 logger = init_logger(__name__)
+
+
+@contextlib.contextmanager
+def _hf_load_without_tp_warmup():
+    """Work around a transformers 5.8.x crash loading some trust_remote_code LMs.
+
+    ``caching_allocator_warmup`` does ``len(model._tp_plan)`` when
+    ``torch.distributed`` is initialized, but the MOSS-TTS-Nano remote model
+    leaves ``_tp_plan`` as ``None`` (it survives ``PreTrainedModel.__init__``),
+    so the warmup raises ``TypeError: object of type 'NoneType' has no len()``.
+    vLLM initializes ``torch.distributed`` even at TP=1, so the crash fires.
+
+    MOSS-TTS-Nano runs single-GPU (no tensor parallelism), so forcing the
+    warmup down its non-distributed branch is byte-for-byte equivalent and
+    sidesteps the ``None`` plan. Scoped to the wrapped ``from_pretrained`` call.
+
+    Targets the private ``transformers.modeling_utils._is_torch_distributed_initialized``.
+    Guarded by ``hasattr`` so that if a future transformers renames or removes it
+    (and presumably the crash with it), we no-op instead of raising AttributeError.
+    """
+    import transformers.modeling_utils as _tmu
+
+    if not hasattr(_tmu, "_is_torch_distributed_initialized"):
+        # Internal hook gone (transformers refactor); assume the upstream crash
+        # is gone too and run the load unpatched.
+        yield
+        return
+
+    original = _tmu._is_torch_distributed_initialized
+    _tmu._is_torch_distributed_initialized = lambda: False
+    try:
+        yield
+    finally:
+        _tmu._is_torch_distributed_initialized = original
 
 
 def _patch_torchaudio_load() -> None:
@@ -134,7 +172,6 @@ class MossTTSNanoForGeneration(nn.Module):
     has_preprocess = False
     has_postprocess = False
     enable_update_additional_information = True
-    inject_omni_request_id_into_runtime_info = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -156,13 +193,21 @@ class MossTTSNanoForGeneration(nn.Module):
             tts_dtype = torch.float32
 
         logger.info("Loading MOSS-TTS-Nano LM from %s (dtype=%s)", self.model_path, tts_dtype)
-        from transformers import AutoModelForCausalLM
+        from transformers import AutoModelForCausalLM, PreTrainedModel
 
-        lm = AutoModelForCausalLM.from_pretrained(
-            self.model_path,
-            trust_remote_code=True,
-            torch_dtype=tts_dtype,
-        )
+        # Shim _tp_plan to prevent TypeError in transformers when loading remote-code models
+        if getattr(PreTrainedModel, "_tp_plan", None) is None:
+            PreTrainedModel._tp_plan = {}
+
+        # Two orthogonal trust_remote_code transformers fixes:
+        #  - _hf_load_without_tp_warmup: tp_plan=None warmup crash (transformers 5.8.x)
+        #  - transformers_keys_to_ignore_compat: keys list-vs-set (transformers 5.9)
+        with _hf_load_without_tp_warmup(), transformers_keys_to_ignore_compat():
+            lm = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                trust_remote_code=True,
+                torch_dtype=tts_dtype,
+            )
         if device.type == "cuda":
             try:
                 import flash_attn  # noqa: F401
@@ -197,11 +242,15 @@ class MossTTSNanoForGeneration(nn.Module):
         logger.info("Loading MOSS-Audio-Tokenizer-Nano from %s", codec_path)
         from transformers import AutoModel
 
-        audio_tokenizer = AutoModel.from_pretrained(
-            codec_path,
-            trust_remote_code=True,
-            torch_dtype=torch.float32,
-        )
+        # Two orthogonal trust_remote_code transformers fixes:
+        #  - _hf_load_without_tp_warmup: tp_plan=None warmup crash (transformers 5.8.x)
+        #  - transformers_keys_to_ignore_compat: keys list-vs-set (transformers 5.9)
+        with _hf_load_without_tp_warmup(), transformers_keys_to_ignore_compat():
+            audio_tokenizer = AutoModel.from_pretrained(
+                codec_path,
+                trust_remote_code=True,
+                torch_dtype=torch.float32,
+            )
         audio_tokenizer.to(device=device)
         audio_tokenizer.eval()
         self._audio_tokenizer: nn.Module = audio_tokenizer

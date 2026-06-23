@@ -27,7 +27,7 @@ class Qwen3TTSSpeakerEncoderConfig(PretrainedConfig):
     Args:
         mel_dim (`int`, *optional*, defaults to 128):
             The dimension of the input mel-spectrogram.
-        enc_dim (`int`, *optional*, defaults to 192):
+        enc_dim (`int`, *optional*, defaults to 1024):
             The dimension of the final speaker embedding.
         enc_channels (`list[int]`, *optional*, defaults to `[512, 512, 512, 512, 1536]`):
             A list of output channels for each TDNN/SERes2Net layer in the encoder.
@@ -80,11 +80,11 @@ class Qwen3TTSTalkerCodePredictorConfig(PretrainedConfig):
 
 
     Args:
-        vocab_size (`int`, *optional*, defaults to 151936):
+        vocab_size (`int`, *optional*, defaults to 2048):
             Vocabulary size of the Qwen3TTSTalkerCodePredictor model.
             Defines the number of different tokens that can be represented by the
             `inputs_ids` passed when calling [`Qwen3TTSTalkerCodePredictorModel`]
-        hidden_size (`int`, *optional*, defaults to 4096):
+        hidden_size (`int`, *optional*, defaults to 1024):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 22016):
             Dimension of the MLP representations.
@@ -271,11 +271,11 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
 
 
     Args:
-        vocab_size (`int`, *optional*, defaults to 151936):
+        vocab_size (`int`, *optional*, defaults to 3072):
             Vocabulary size of the Qwen3TTSTalker model.
             Defines the number of different tokens that can be represented by the
             `inputs_ids` passed when calling [`Qwen3TTSTalkerModel`]
-        hidden_size (`int`, *optional*, defaults to 2048):
+        hidden_size (`int`, *optional*, defaults to 1024):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 6144):
             Dimension of the MLP representations.
@@ -436,7 +436,6 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
         if code_predictor_config is None:
-            code_predictor_config = {}
             self.code_predictor_config = Qwen3TTSTalkerCodePredictorConfig()
             logger.info("code_predictor_config is None. Initializing code_predictor model with default values")
         elif isinstance(code_predictor_config, Qwen3TTSTalkerCodePredictorConfig):

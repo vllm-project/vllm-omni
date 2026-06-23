@@ -143,7 +143,6 @@ class MingWhisperFeatureExtractor(FeatureExtractionMixin):
         #      (conv1 has stride=1 and does not change T)
         #   2. AudioProjector Conv1d: kernel=3, stride=2, padding=1
         # Combined: T → ((T-1)//2 + 1 - 1)//2 + 1
-        # See also: AudioProjector.compute_output_length()
         encoder_feats_lengths = ((audio_feats_lengths - 3 + 2 * 1) // 2 + 1 - 3 + 2 * 1) // 2 + 1
         audio_feats = torch.cat(audio_feat_list, dim=0).unsqueeze(0)  # [1, T_total, n_mels]
 

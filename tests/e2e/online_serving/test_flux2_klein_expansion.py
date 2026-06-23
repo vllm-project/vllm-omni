@@ -30,6 +30,13 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                server_args=["--tensor-parallel-size", "2", "--enable-cpu-offload"],
+            ),
+            id="tp2_cpu_offload",
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
                 server_args=["--tensor-parallel-size", "2"],
             ),
             id="tp2_basic",
