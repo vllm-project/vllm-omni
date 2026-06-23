@@ -21,6 +21,8 @@
 #   function — label has neither "Perf Test" nor "Accuracy Test" (incl. Doc, Multi-Replica, etc.)
 #   stability— fixed dfx stability scripts under tests/dfx/stability/scripts/ (see below)
 #   local    — pytest -sv -m "<MODEL_TYPE markers> and local_model" from repo root (no YAML step extract)
+#              When LABEL_SUBSTR is set, only test files under tests/ whose *filename* contains it
+#              are passed to pytest (e.g. LABEL_SUBSTR=test_hunyuan_image3 → test_hunyuan_image3.py).
 #   all      — no test-kind filter for YAML steps (any leaf step with pytest in test-nightly.yml)
 #
 # Model area (--model-type / MODEL_TYPE), multiple allowed (OR semantics):
@@ -36,6 +38,7 @@
 #   local (when included in TEST_TYPE):
 #     From repo root: pytest -sv -m "<markers> and local_model" (markers from MODEL_TYPE: omni, tts,
 #     diffusion; all → "(omni or tts or diffusion) and local_model"). Not filtered by nightly YAML.
+#     LABEL_SUBSTR: if set, restrict to tests/**/test_*.py files whose basename contains the substring.
 #
 #   stability (when included in TEST_TYPE):
 #     From repo root: pytest -s -v tests/dfx/stability/scripts/test_stability_*.py
@@ -62,7 +65,8 @@
 #                   per-job *.log plus timing_summary.log after the run
 #   TEST_TYPE     - comma-separated and/or repeated flags (default: all); see above
 #   MODEL_TYPE    - comma-separated and/or repeated flags (default: all); see above
-#   LABEL_SUBSTR  - YAML mode: substring of Buildkite step label; stability: substring of path/key/filename
+#   LABEL_SUBSTR  - YAML mode: substring of Buildkite step label; stability: substring of path/key/filename;
+#                   local: substring of test file basename under tests/ (test_*.py only)
 #   DRY_RUN=1     - print extracted commands only; do not write scripts or run pytest
 #
 set -euo pipefail
@@ -322,6 +326,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import stat
 import sys
 from pathlib import Path
@@ -557,14 +562,47 @@ def local_pytest_marker_expr(model_types: list[str]) -> str:
     return f"({' or '.join(families)}) and local_model"
 
 
+def local_test_files_by_filename(substr: str) -> list[str]:
+    """Return repo-relative posix paths under tests/ whose basename contains substr."""
+    tests_root = REPO_ROOT / "tests"
+    if not tests_root.is_dir():
+        return []
+    matches: list[str] = []
+    for path in sorted(tests_root.rglob("test_*.py")):
+        if substr in path.name:
+            matches.append(path.relative_to(REPO_ROOT).as_posix())
+    return matches
+
+
 def run_local_mode(jobs_dir: Path, model_types: list[str]) -> int:
-    """Single job: pytest -sv -m '<model markers> and local_model' (testpaths from pytest config)."""
+    """pytest -sv -m '<model markers> and local_model'; optional LABEL_SUBSTR filename filter."""
     marker_expr = local_pytest_marker_expr(model_types)
-    key = "local_pytest"
-    pytest_line = f'pytest -sv -m "{marker_expr}"'
+    rel_paths: list[str] = []
+    if LABEL_SUBSTR:
+        rel_paths = local_test_files_by_filename(LABEL_SUBSTR)
+        if not rel_paths:
+            print(
+                f"# skip local: no tests/**/test_*.py filename matches "
+                f"LABEL_SUBSTR={LABEL_SUBSTR!r}",
+                file=sys.stderr,
+            )
+            return 0
+        paths_arg = " ".join(shlex.quote(p) for p in rel_paths)
+        pytest_line = f'pytest -sv -m "{marker_expr}" {paths_arg}'
+        slug = re.sub(r"[^\w\-.]+", "_", LABEL_SUBSTR, flags=re.UNICODE)
+        slug = re.sub(r"_+", "_", slug).strip("_") or "filter"
+        key = f"local_pytest_{slug}"
+        header = (
+            f"# Local marker tests — MODEL_TYPE={','.join(model_types)}, "
+            f"LABEL_SUBSTR={LABEL_SUBSTR!r} (filename), files: {', '.join(rel_paths)}"
+        )
+    else:
+        pytest_line = f'pytest -sv -m "{marker_expr}"'
+        key = "local_pytest"
+        header = f"# Local marker tests — MODEL_TYPE={','.join(model_types)}"
     script_lines = [
         "#!/usr/bin/env bash",
-        f"# Local marker tests — MODEL_TYPE={','.join(model_types)}",
+        header,
         "set -euo pipefail",
         f'cd "{REPO_ROOT}"',
         pytest_line,
@@ -618,6 +656,7 @@ def main() -> None:
 
     matched_stability = 0
     matched_yaml = 0
+    matched_local = 0
     perf_job_keys: list[str] = []
     job_timeouts: dict[str, int] = {}
 
@@ -625,7 +664,7 @@ def main() -> None:
         matched_stability = run_stability_mode(jobs_dir, model_types)
 
     if want_local:
-        run_local_mode(jobs_dir, model_types)
+        matched_local = run_local_mode(jobs_dir, model_types)
 
     if needs_yaml:
         if not YML.is_file():
@@ -683,6 +722,16 @@ def main() -> None:
             f"No stability jobs matched TEST_TYPE={test_types!r} MODEL_TYPE={model_types!r} "
             f"LABEL_SUBSTR={LABEL_SUBSTR!r} under {REPO_ROOT}"
         )
+    if want_local and matched_local == 0:
+        if LABEL_SUBSTR:
+            errs.append(
+                f"No local test files matched filename LABEL_SUBSTR={LABEL_SUBSTR!r} "
+                f"under {REPO_ROOT / 'tests'}"
+            )
+        else:
+            errs.append(
+                f"Local mode produced no jobs TEST_TYPE={test_types!r} MODEL_TYPE={model_types!r}"
+            )
     if needs_yaml and matched_yaml == 0:
         errs.append(
             f"No YAML steps matched TEST_TYPE={test_types!r} MODEL_TYPE={model_types!r} "
