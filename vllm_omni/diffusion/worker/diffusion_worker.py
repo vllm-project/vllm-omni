@@ -255,6 +255,7 @@ class DiffusionWorker:
             "Final IR op priority after setting vLLM-Omni overrides: %s", vllm_config.kernel_config.ir_op_priority
         )
         self.vllm_config = vllm_config
+        current_omni_platform.init_diffusion_worker_vllm_config(vllm_config)
 
         # Initialize distributed environment
         with (

@@ -29,6 +29,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm_omni.platforms import current_omni_platform
+
 __all__ = [
     "UnsupportedInputError",
     "MULTI_SPEAKER_TAG_PATTERN",
@@ -239,7 +241,7 @@ def _load_audio_tokenizer():
             allow_patterns=[f"{_K2_OMNIVOICE_SUBDIR}/*"],
         )
         audio_tokenizer_dir = os.path.join(repo_path, _K2_OMNIVOICE_SUBDIR)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = current_omni_platform.get_torch_device()
     model = HiggsAudioV2TokenizerModel.from_pretrained(audio_tokenizer_dir).to(device)
     return model.eval()
 

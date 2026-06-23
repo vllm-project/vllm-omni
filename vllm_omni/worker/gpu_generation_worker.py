@@ -11,6 +11,7 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 from vllm.v1.worker.workspace import init_workspace_manager
 
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
 from vllm_omni.worker.memory_utils import request_memory_tolerant
@@ -57,7 +58,7 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
                     f"be less than or equal to the number of visible devices "
                     f"({visible_device_count})."
                 )
-            self.device = torch.device(f"cuda:{self.local_rank}")
+            self.device = current_omni_platform.get_torch_device(self.local_rank)
             torch.accelerator.set_device_index(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)

@@ -689,6 +689,9 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
+    # Streaming mode settings
+    streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
+
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
@@ -1163,6 +1166,11 @@ class DiffusionOutput:
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
+
+    # Streaming info (the defaults should make sense for non-streaming mode)
+    finished: bool = True
+    chunk_index: int = 0
+    total_chunks: int = 1
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
