@@ -81,7 +81,9 @@ class DiffusionPipelineProfilerMixin:
     _PROFILER_TARGETS = ["vae.encode", "vae.decode", "diffuse", "text_encoder.forward", "tokenizer.forward"]
 
     def setup_diffusion_pipeline_profiler(
-        self, profiler_targets: list[str] | None = None, enable_diffusion_pipeline_profiler: bool = False
+        self,
+        profiler_targets: list[str] | None = None,
+        enable_diffusion_pipeline_profiler: bool = False,
     ) -> None:
         self.enable_diffusion_pipeline_profiler = enable_diffusion_pipeline_profiler
         if not enable_diffusion_pipeline_profiler:
