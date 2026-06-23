@@ -109,6 +109,44 @@ By default, AURA responses are passed to Qwen3-TTS as text. Set
 to Qwen3-TTS instead. The processor still uses AURA token ids, when available,
 to estimate the Talker prompt length in the default text path.
 
+## Split Services
+
+`aura_omni` can also be served as three independent HTTP services:
+
+```text
+ASR service -> AURA service -> TTS service
+```
+
+The TTS service remains the native Qwen3-TTS `Talker -> Code2Wav` pipeline and
+uses `async_chunk: true` in `vllm_omni/deploy/aura_tts_service.yaml`. This keeps
+the text-to-speech streaming path enabled without prewarming TTS inside the
+ASR/AURA pipeline.
+
+Start all three services with the helper script:
+
+```bash
+bash /data/yrr/rein_test/start_aura_split_services.sh
+```
+
+The split-services client defaults to CustomVoice mode:
+
+```text
+task_type=CustomVoice, language=Chinese, speaker=Vivian
+```
+
+Run it with local OmniInteract media:
+
+```bash
+python examples/online_serving/aura_omni/split_services_client.py \
+  --audio-path /data/models/datasets/OmniInteract/data/1q1a/audios/0038_2.wav \
+  --video-path /data/models/datasets/OmniInteract/data/1q1a/videos/0038.mp4 \
+  --output-dir output_aura_split_services
+```
+
+For the full workflow, sequence diagram, Base-mode override, and replica
+coordination notes, see
+`docs/user_guide/examples/online_serving/aura_split_services.md`.
+
 ## Curl
 
 ```bash

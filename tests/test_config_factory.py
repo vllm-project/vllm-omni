@@ -1569,6 +1569,43 @@ class TestAuraOmniDeploy:
         assert stages[2].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"
         assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
 
+    @pytest.mark.parametrize(
+        ("deploy_name", "expected_model_stage", "expected_model_arch"),
+        [
+            ("aura_asr_service.yaml", "asr", "Qwen3ASRForConditionalGeneration"),
+            ("aura_vl_service.yaml", "aura", "AuraQwen3VLForConditionalGeneration"),
+        ],
+    )
+    def test_aura_split_single_stage_deploys(self, deploy_name, expected_model_stage, expected_model_arch):
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / deploy_name
+        stages = StageConfigFactory._create_from_registry(
+            "qwen3_tts",
+            cli_overrides={},
+            deploy_config_path=str(deploy_path),
+        )
+
+        assert len(stages) == 1
+        assert stages[0].model_stage == expected_model_stage
+        assert stages[0].final_output is True
+        assert stages[0].final_output_type == "text"
+        assert stages[0].yaml_engine_args["model_arch"] == expected_model_arch
+
+    def test_aura_split_tts_deploy_keeps_async_chunk(self):
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_tts_service.yaml"
+        stages = StageConfigFactory._create_from_registry(
+            "qwen3_tts",
+            cli_overrides={},
+            deploy_config_path=str(deploy_path),
+        )
+
+        assert [stage.model_stage for stage in stages] == ["qwen3_tts", "code2wav"]
+        assert stages[0].yaml_engine_args["async_chunk"] is True
+        assert (
+            stages[0]
+            .yaml_engine_args["custom_process_next_stage_input_func"]
+            .endswith("talker2code2wav_async_chunk")
+        )
+
 
 class TestSentinelDefaultPrecedence:
     """Caller-typed (non-None) values win over YAML; None values fall through
