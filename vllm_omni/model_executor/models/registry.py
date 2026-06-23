@@ -281,6 +281,17 @@ _OMNI_MODELS = {
         "modeling_moss_tts_nano",
         "MossTTSNanoForGeneration",
     ),
+    ## SongGeneration v2-large / LeVo 2
+    "SongGenerationV2LeLMForConditionalGeneration": (
+        "songgeneration_v2",
+        "songgeneration_v2_lelm",
+        "SongGenerationV2LeLMForConditionalGeneration",
+    ),
+    "SongGenerationV2Flow1dVAESeparateDecoder": (
+        "songgeneration_v2",
+        "songgeneration_v2_flow1dvae",
+        "SongGenerationV2Flow1dVAESeparateDecoder",
+    ),
     ## MOSS-TTS (full variants: Delay + Realtime)
     # MossTTSDelayModel: MOSS-TTS (8B), MOSS-TTSD (8B), MOSS-SoundEffect (8B), MOSS-VoiceGenerator (1.7B)
     "MossTTSDelayModel": (

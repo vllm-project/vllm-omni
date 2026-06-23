@@ -1,0 +1,55 @@
+# SongGeneration v2-large (LeVo 2) deploy: 2-stage LeLM AR -> Flow1dVAE diffusion.
+#
+# Stage 0 (LeLM): lyrics + style -> [B, 3, T] mixed/vocal/bgm codec tokens.
+# Stage 1 (Flow1dVAE): vocal+bgm codec tokens -> 48 kHz stereo waveform via
+#   CFM diffusion + Stable Audio VAE.
+#
+# Baseline mode is synchronous (full token sequence before Stage 1 decoding).
+# Verified on 1x L40S 48GB (both stages on GPU 0).
+# Memory footprint: ~10 GB weights + KV cache headroom.
+async_chunk: false
+enable_chunked_prefill: false
+trust_remote_code: true
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.50
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 5000
+    max_model_len: 5000
+    devices: "0"
+    output_connectors: {}
+    default_sampling_params:
+      temperature: 0.8
+      top_k: 5000
+      top_p: 1.0
+      max_tokens: 4500
+      seed: 42
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    trust_remote_code: true
+    # Stage 1 reads codec ints only; skip tokenizer init (else it would try
+    # to load a tokenizer from the tokenizer-less repo root and fail).
+    skip_tokenizer_init: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 32768
+    max_model_len: 32768
+    devices: "0"
+    input_connectors: {}
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 32768
+      seed: 42
+      repetition_penalty: 1.0

@@ -22,6 +22,9 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
     "CosyVoice3Config": "vllm_omni.transformers_utils.configs.cosyvoice3",
     "OmniVoiceConfig": "vllm_omni.transformers_utils.configs.omnivoice",
+    "SongGenerationV2Config": "vllm_omni.transformers_utils.configs.songgeneration_v2",
+    "SongGenerationV2Flow1dVAESeparateConfig": "vllm_omni.transformers_utils.configs.songgeneration_v2",
+    "SongGenerationV2LeLMConfig": "vllm_omni.transformers_utils.configs.songgeneration_v2",
     "BailingMoeV2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "BailingMM2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "MingImageGenConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
@@ -43,6 +46,9 @@ __all__ = [
     "VoxtralTTSConfig",
     "CosyVoice3Config",
     "OmniVoiceConfig",
+    "SongGenerationV2Config",
+    "SongGenerationV2Flow1dVAESeparateConfig",
+    "SongGenerationV2LeLMConfig",
     "BailingMoeV2Config",
     "BailingMM2Config",
     "MingImageGenConfig",
@@ -73,5 +79,6 @@ from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F4
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import songgeneration_v2 as _songgeneration_v2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402

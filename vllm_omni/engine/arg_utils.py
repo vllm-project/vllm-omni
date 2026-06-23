@@ -23,6 +23,8 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "IndexTTS2S2MelDecoder": "indextts2",
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
     "OmniVoiceModel": "omnivoice",
+    "SongGenerationV2Flow1dVAESeparateDecoder": "songgeneration_v2",
+    "SongGenerationV2LeLMForConditionalGeneration": "songgeneration_v2",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
 
@@ -47,6 +49,11 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
+        from vllm_omni.transformers_utils.configs.songgeneration_v2 import (
+            SongGenerationV2Config,
+            SongGenerationV2Flow1dVAESeparateConfig,
+            SongGenerationV2LeLMConfig,
+        )
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
@@ -67,6 +74,9 @@ def _register_omni_hf_configs() -> None:
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
+        ("songgeneration_v2", SongGenerationV2Config),
+        ("songgeneration_v2_lelm", SongGenerationV2LeLMConfig),
+        ("songgeneration_v2_flow1dvae", SongGenerationV2Flow1dVAESeparateConfig),
         ("voxcpm2", VoxCPM2Config),
     ]:
         try:
