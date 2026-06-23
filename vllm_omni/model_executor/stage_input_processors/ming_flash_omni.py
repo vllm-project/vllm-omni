@@ -336,6 +336,8 @@ def _extract_byte5_from_sampling_params(sampling_params: Any) -> list[str] | Non
     if not isinstance(extra, dict):
         return None
     texts = extra.get("byte5_text")
+    if isinstance(texts, str):
+        texts = [texts]
     if isinstance(texts, list) and texts:
         return [t for t in texts if isinstance(t, str)]
     return None
