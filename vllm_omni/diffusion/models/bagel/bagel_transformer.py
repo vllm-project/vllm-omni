@@ -2152,8 +2152,8 @@ class Bagel(nn.Module):
         compute = True
         if self._tc_cnt > 0 and self._tc_prev_mod is not None and cache_shape_ok:
             rel_dist = (
-                (cur_mod - self._tc_prev_mod).abs().mean() / (self._tc_prev_mod.abs().mean() + 1e-8)
-            ).cpu().item()
+                ((cur_mod - self._tc_prev_mod).abs().mean() / (self._tc_prev_mod.abs().mean() + 1e-8)).cpu().item()
+            )
             self._tc_acc += abs(float(self._tc_rescale(rel_dist)))
             if self._tc_acc < tc_cfg.rel_l1_thresh:
                 compute = False
@@ -2327,10 +2327,7 @@ class Bagel(nn.Module):
         if tc_cfg is not None:
             need_text = use_cfg
             need_img = (
-                use_cfg
-                and cfg_img_scale > 1.0
-                and cfg_branches is not None
-                and len(cfg_branches.get("caches", [])) > 2
+                use_cfg and cfg_img_scale > 1.0 and cfg_branches is not None and len(cfg_branches.get("caches", [])) > 2
             )
             # Decide on the full packed sequence (text + timestep + latent
             # embeds) — the same modulated input the Bagel TeaCache

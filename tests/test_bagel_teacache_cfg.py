@@ -79,8 +79,8 @@ def test_stable_input_reuses_cache():
     stub = _stub(thresh=0.2)
     stub._tc_prev_pred = (torch.ones(4, 8), torch.ones(4, 8), None)  # text-only layout
     x = torch.ones(4, 8)
-    assert _decide(stub, x) is True                 # first step computes
-    assert _decide(stub, x.clone()) is False        # no change -> reuse cache
+    assert _decide(stub, x) is True  # first step computes
+    assert _decide(stub, x.clone()) is False  # no change -> reuse cache
 
 
 def test_large_change_forces_compute():
