@@ -13,7 +13,7 @@ import copy
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, TypeAlias, TypedDict, cast
 
 from pydantic import ConfigDict, Field
 from vllm.config.utils import config
@@ -231,7 +231,7 @@ def _resolve_deploy_path(model_type: str, deploy_config_path: str | None = None)
 
 
 @config
-class ModelConfig:
+class OmniStageModelConfig:
     """Per-stage model behavior."""
 
     active_stream_window: int = Field(default=0, ge=0)
@@ -251,7 +251,7 @@ class ModelConfig:
 
 
 @config
-class LoadConfig:
+class OmniStageLoadConfig:
     """Per-stage loading behavior."""
 
     load_format: str = "auto"
@@ -261,10 +261,10 @@ class LoadConfig:
 
 
 @config
-class CacheConfig:
+class OmniStageCacheConfig:
     """Per-stage engine cache and memory behavior.
 
-    This is separate from ``DiffusionConfig.cache_config``, which configures
+    This is separate from ``_DiffusionConfigProjection.cache_config``, which configures
     vLLM-Omni diffusion-specific cache backends such as TeaCache and Cache-DiT.
     """
 
@@ -275,7 +275,7 @@ class CacheConfig:
 
 
 @config
-class SchedulerConfig:
+class OmniStageSchedulerConfig:
     """Per-stage request scheduling behavior."""
 
     max_num_seqs: int = Field(default=128, ge=1)
@@ -292,7 +292,7 @@ class SchedulerConfig:
 
 
 @config
-class ConnectorConfig:
+class OmniStageConnectorConfig:
     """Per-stage inter-stage connector wiring."""
 
     stage_connector: dict[str, Any] = field(
@@ -306,7 +306,7 @@ class ConnectorConfig:
 
 
 @config
-class RuntimeConfig:
+class OmniStageRuntimeConfig:
     """Per-stage process placement and runtime behavior."""
 
     devices: str | None = None
@@ -319,7 +319,7 @@ class RuntimeConfig:
 
 
 @config
-class ParallelConfig:
+class OmniStageParallelConfig:
     """Per-stage distributed parallelism behavior."""
 
     pipeline_parallel_size: int = Field(default=1, ge=1)
@@ -389,7 +389,7 @@ class ParallelConfig:
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
-class DiffusionConfig:
+class _DiffusionConfigProjection:
     """Diffusion-specific per-stage settings.
 
     Shared AR/diffusion fields are projected into the other sub-configs.  This
@@ -466,7 +466,7 @@ class DiffusionConfig:
     extras: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_kwargs(cls, **kwargs: Any) -> DiffusionConfig:
+    def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
         from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
 
         normalized_kwargs = normalize_omni_diffusion_kwargs(kwargs)
@@ -615,7 +615,7 @@ class DiffusionConfig:
                 setattr(self, name, _copy_value(getattr(omni_diffusion_config, name)))
 
 
-_DIFFUSION_CONFIG_FIELDS = frozenset(f.name for f in fields(DiffusionConfig))
+_DIFFUSION_CONFIG_FIELDS = frozenset(f.name for f in fields(_DiffusionConfigProjection))
 
 # Current OmniDiffusionConfig still contains a flat mix of shared engine,
 # runtime, parallel, and diffusion-specific knobs. Keep this classification
@@ -768,7 +768,7 @@ def _stage_sampling_params(
 
 def _orchestrator_cli_overrides(cli_overrides: Mapping[str, Any]) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
-    for config_field in fields(OrchestratorConfig):
+    for config_field in fields(VllmOmniOrchestratorConfig):
         name = config_field.name
         if name == "deploy_config_path":
             continue
@@ -778,7 +778,7 @@ def _orchestrator_cli_overrides(cli_overrides: Mapping[str, Any]) -> dict[str, A
 
 
 @config
-class OrchestratorConfig:
+class VllmOmniOrchestratorConfig:
     """Configuration consumed by the orchestrator process only."""
 
     stage_init_timeout: int = Field(default=300, ge=1)
@@ -796,19 +796,17 @@ class OrchestratorConfig:
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
-class VllmOmniStageConfig:
-    """Structured config for one Omni stage."""
+class BaseVllmOmniStageConfig:
+    """Common structured config contract shared by all Omni stage realizations."""
 
     stage_pipeline_config: StagePipelineConfig
-    model_config: ModelConfig = field(default_factory=ModelConfig)
-    load_config: LoadConfig = field(default_factory=LoadConfig)
-    cache_config: CacheConfig = field(default_factory=CacheConfig)
-    scheduler_config: SchedulerConfig = field(default_factory=SchedulerConfig)
-    connector_config: ConnectorConfig = field(default_factory=ConnectorConfig)
-    runtime_config: RuntimeConfig = field(default_factory=RuntimeConfig)
-    parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
-    # Only populated for stages whose execution type is DIFFUSION.
-    diffusion_config: DiffusionConfig | None = None
+    model_config: OmniStageModelConfig = field(default_factory=OmniStageModelConfig)
+    load_config: OmniStageLoadConfig = field(default_factory=OmniStageLoadConfig)
+    cache_config: OmniStageCacheConfig = field(default_factory=OmniStageCacheConfig)
+    scheduler_config: OmniStageSchedulerConfig = field(default_factory=OmniStageSchedulerConfig)
+    connector_config: OmniStageConnectorConfig = field(default_factory=OmniStageConnectorConfig)
+    runtime_config: OmniStageRuntimeConfig = field(default_factory=OmniStageRuntimeConfig)
+    parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
     quantization_config: Any = None
 
     @property
@@ -889,6 +887,153 @@ class VllmOmniStageConfig:
         return self.stage_pipeline_config.cfg_kv_collect_func
 
 
+@config(config=ConfigDict(arbitrary_types_allowed=True))
+class VllmOmniARStageConfig(BaseVllmOmniStageConfig):
+    """Structured config for autoregressive LLM stages."""
+
+
+@config(config=ConfigDict(arbitrary_types_allowed=True))
+class VllmOmniGenerationStageConfig(BaseVllmOmniStageConfig):
+    """Structured config for generation LLM stages."""
+
+
+@config(config=ConfigDict(arbitrary_types_allowed=True))
+class VllmOmniDiffusionStageConfig(BaseVllmOmniStageConfig):
+    """Structured config for diffusion stages."""
+
+    diffusion_config: _DiffusionConfigProjection = field(default_factory=_DiffusionConfigProjection)
+
+
+StageConfigLike: TypeAlias = VllmOmniARStageConfig | VllmOmniGenerationStageConfig | VllmOmniDiffusionStageConfig
+
+
+def _build_common_stage_config_kwargs(
+    deploy: DeployConfig,
+    topology: StagePipelineConfig,
+    stage_deploy: StageDeployConfig | None,
+    engine: _StageEngineValues,
+) -> tuple[dict[str, Any], str | None, str | None]:
+    input_proc, next_stage_proc = _select_processor_funcs(topology, bool(deploy.async_chunk))
+    quantization_config = _build_quantization_config(deploy, engine.quantization)
+    parallel_config = _build_parallel_config(deploy, engine.parallel)
+
+    return (
+        {
+            "stage_pipeline_config": topology,
+            "model_config": _build_model_config(topology, stage_deploy, engine.model),
+            "load_config": _build_load_config(engine.load),
+            "cache_config": _build_cache_config(deploy, engine.cache),
+            "scheduler_config": _build_scheduler_config(deploy, engine.scheduler),
+            "connector_config": _build_connector_config(stage_deploy),
+            "runtime_config": _build_runtime_config(stage_deploy, engine.runtime, parallel_config),
+            "parallel_config": parallel_config,
+            "quantization_config": _copy_value(quantization_config),
+        },
+        input_proc,
+        next_stage_proc,
+    )
+
+
+def _with_resolved_processors(
+    stage_config: StageConfigLike,
+    input_proc: str | None,
+    next_stage_proc: str | None,
+) -> StageConfigLike:
+    stage_config._resolved_custom_process_input_func = input_proc
+    stage_config._resolved_custom_process_next_stage_input_func = next_stage_proc
+    return stage_config
+
+
+def _build_ar_stage_config(
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+    topology: StagePipelineConfig,
+    stage_deploy: StageDeployConfig | None,
+    engine: _StageEngineValues,
+    *,
+    model: str | None,
+) -> VllmOmniARStageConfig:
+    common_kwargs, input_proc, next_stage_proc = _build_common_stage_config_kwargs(
+        deploy,
+        topology,
+        stage_deploy,
+        engine,
+    )
+    return cast(
+        VllmOmniARStageConfig,
+        _with_resolved_processors(
+            VllmOmniARStageConfig(**common_kwargs),
+            input_proc,
+            next_stage_proc,
+        ),
+    )
+
+
+def _build_generation_stage_config(
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+    topology: StagePipelineConfig,
+    stage_deploy: StageDeployConfig | None,
+    engine: _StageEngineValues,
+    *,
+    model: str | None,
+) -> VllmOmniGenerationStageConfig:
+    common_kwargs, input_proc, next_stage_proc = _build_common_stage_config_kwargs(
+        deploy,
+        topology,
+        stage_deploy,
+        engine,
+    )
+    return cast(
+        VllmOmniGenerationStageConfig,
+        _with_resolved_processors(
+            VllmOmniGenerationStageConfig(**common_kwargs),
+            input_proc,
+            next_stage_proc,
+        ),
+    )
+
+
+def _build_diffusion_stage_config(
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+    topology: StagePipelineConfig,
+    stage_deploy: StageDeployConfig | None,
+    engine: _StageEngineValues,
+    *,
+    model: str | None,
+) -> VllmOmniDiffusionStageConfig:
+    common_kwargs, input_proc, next_stage_proc = _build_common_stage_config_kwargs(
+        deploy,
+        topology,
+        stage_deploy,
+        engine,
+    )
+    common_kwargs["diffusion_config"] = _build_diffusion_config_projection(
+        pipeline,
+        deploy,
+        topology,
+        engine.diffusion,
+        model=model,
+        quantization_config=common_kwargs["quantization_config"],
+    )
+    return cast(
+        VllmOmniDiffusionStageConfig,
+        _with_resolved_processors(
+            VllmOmniDiffusionStageConfig(**common_kwargs),
+            input_proc,
+            next_stage_proc,
+        ),
+    )
+
+
+_STAGE_CONFIG_BUILDERS = {
+    StageExecutionType.LLM_AR: _build_ar_stage_config,
+    StageExecutionType.LLM_GENERATION: _build_generation_stage_config,
+    StageExecutionType.DIFFUSION: _build_diffusion_stage_config,
+}
+
+
 def _build_stage_config(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
@@ -897,33 +1042,19 @@ def _build_stage_config(
     engine: _StageEngineValues,
     *,
     model: str | None,
-) -> VllmOmniStageConfig:
-    input_proc, next_stage_proc = _select_processor_funcs(topology, bool(deploy.async_chunk))
-    quantization_config = _build_quantization_config(deploy, engine.quantization)
-    parallel_config = _build_parallel_config(deploy, engine.parallel)
-
-    stage_config = VllmOmniStageConfig(
-        stage_pipeline_config=topology,
-        model_config=_build_model_config(topology, stage_deploy, engine.model),
-        load_config=_build_load_config(engine.load),
-        cache_config=_build_cache_config(deploy, engine.cache),
-        scheduler_config=_build_scheduler_config(deploy, engine.scheduler),
-        connector_config=_build_connector_config(stage_deploy),
-        runtime_config=_build_runtime_config(stage_deploy, engine.runtime),
-        parallel_config=parallel_config,
-        diffusion_config=_build_diffusion_config(
-            pipeline,
-            deploy,
-            topology,
-            engine.diffusion,
-            model=model,
-            quantization_config=quantization_config,
-        ),
-        quantization_config=_copy_value(quantization_config),
+) -> StageConfigLike:
+    try:
+        builder = _STAGE_CONFIG_BUILDERS[topology.execution_type]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported stage execution type: {topology.execution_type!r}") from exc
+    return builder(
+        pipeline,
+        deploy,
+        topology,
+        stage_deploy,
+        engine,
+        model=model,
     )
-    stage_config._resolved_custom_process_input_func = input_proc
-    stage_config._resolved_custom_process_next_stage_input_func = next_stage_proc
-    return stage_config
 
 
 def _build_quantization_config(deploy: DeployConfig, engine: _QuantizationEngineOverrides) -> Any:
@@ -938,51 +1069,55 @@ def _build_model_config(
     topology: StagePipelineConfig,
     stage_deploy: StageDeployConfig | None,
     engine: _ModelEngineOverrides,
-) -> ModelConfig:
+) -> OmniStageModelConfig:
     default_sampling_params = _stage_sampling_params(stage_deploy, topology)
     kwargs = _config_kwargs(engine)
     if "has_sampling_extra_args" not in kwargs:
         kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))
-    return ModelConfig(
+    return OmniStageModelConfig(
         default_sampling_params=default_sampling_params,
         **kwargs,
     )
 
 
-def _build_load_config(engine: _LoadEngineOverrides) -> LoadConfig:
-    return LoadConfig(**_config_kwargs(engine))
+def _build_load_config(engine: _LoadEngineOverrides) -> OmniStageLoadConfig:
+    return OmniStageLoadConfig(**_config_kwargs(engine))
 
 
 def _build_cache_config(
     deploy: DeployConfig,
     engine: _CacheEngineOverrides,
-) -> CacheConfig:
+) -> OmniStageCacheConfig:
     kwargs = _config_kwargs(engine)
     if "enable_prefix_caching" not in kwargs and deploy.enable_prefix_caching is not None:
         kwargs["enable_prefix_caching"] = _copy_value(deploy.enable_prefix_caching)
-    return CacheConfig(**kwargs)
+    return OmniStageCacheConfig(**kwargs)
 
 
 def _build_scheduler_config(
     deploy: DeployConfig,
     engine: _SchedulerEngineOverrides,
-) -> SchedulerConfig:
+) -> OmniStageSchedulerConfig:
     kwargs = _config_kwargs(engine)
     if "enable_chunked_prefill" not in kwargs and deploy.enable_chunked_prefill is not None:
         kwargs["enable_chunked_prefill"] = _copy_value(deploy.enable_chunked_prefill)
-    return SchedulerConfig(**kwargs)
+    return OmniStageSchedulerConfig(**kwargs)
 
 
-def _build_connector_config(stage_deploy: StageDeployConfig | None) -> ConnectorConfig:
+def _build_connector_config(stage_deploy: StageDeployConfig | None) -> OmniStageConnectorConfig:
     output_connectors = stage_deploy.output_connectors if stage_deploy is not None else None
     input_connectors = stage_deploy.input_connectors if stage_deploy is not None else None
-    return ConnectorConfig(
+    return OmniStageConnectorConfig(
         output_connectors=_copy_value(output_connectors) if output_connectors else None,
         input_connectors=_copy_value(input_connectors) if input_connectors else None,
     )
 
 
-def _build_runtime_config(stage_deploy: StageDeployConfig | None, engine: _RuntimeEngineOverrides) -> RuntimeConfig:
+def _build_runtime_config(
+    stage_deploy: StageDeployConfig | None,
+    engine: _RuntimeEngineOverrides,
+    parallel_config: OmniStageParallelConfig,
+) -> OmniStageRuntimeConfig:
     kwargs = _config_kwargs(engine)
     if "devices" not in kwargs and stage_deploy is not None and stage_deploy.devices is not None:
         kwargs["devices"] = _copy_value(stage_deploy.devices)
@@ -990,13 +1125,14 @@ def _build_runtime_config(stage_deploy: StageDeployConfig | None, engine: _Runti
         kwargs["num_replicas"] = stage_deploy.num_replicas
     if "env" not in kwargs and stage_deploy is not None and stage_deploy.env is not None:
         kwargs["env"] = _copy_value(stage_deploy.env)
-    return RuntimeConfig(**kwargs)
+    kwargs["num_gpus"] = parallel_config.world_size
+    return OmniStageRuntimeConfig(**kwargs)
 
 
 def _build_parallel_config(
     deploy: DeployConfig,
     engine: _ParallelEngineOverrides,
-) -> ParallelConfig:
+) -> OmniStageParallelConfig:
     parallel_config = _mapping_or_empty(engine.get("parallel_config"))
     kwargs = {
         name: _copy_value(value) for name in _PARALLEL_CONFIG_ENGINE_FIELDS if (value := engine.get(name)) is not None
@@ -1007,14 +1143,14 @@ def _build_parallel_config(
     if "data_parallel_size" not in kwargs and deploy.data_parallel_size is not None:
         kwargs["data_parallel_size"] = _copy_value(deploy.data_parallel_size)
     if "sequence_parallel_size" not in kwargs and ("ulysses_degree" in kwargs or "ring_degree" in kwargs):
-        base_parallel = ParallelConfig()
+        base_parallel = OmniStageParallelConfig()
         kwargs["sequence_parallel_size"] = kwargs.get("ulysses_degree", base_parallel.ulysses_degree) * kwargs.get(
             "ring_degree", base_parallel.ring_degree
         )
-    return ParallelConfig(**kwargs)
+    return OmniStageParallelConfig(**kwargs)
 
 
-def _build_diffusion_config(
+def _build_diffusion_config_projection(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
     topology: StagePipelineConfig,
@@ -1022,9 +1158,7 @@ def _build_diffusion_config(
     *,
     model: str | None,
     quantization_config: Any,
-) -> DiffusionConfig | None:
-    if topology.execution_type != StageExecutionType.DIFFUSION:
-        return None
+) -> _DiffusionConfigProjection:
     diffusion_kwargs = engine.to_kwargs()
     diffusion_kwargs["stage_id"] = topology.stage_id
     diffusion_kwargs["model_arch"] = _first_defined(
@@ -1043,7 +1177,7 @@ def _build_diffusion_config(
     if quantization_config is not None:
         diffusion_kwargs["quantization_config"] = _copy_value(quantization_config)
 
-    return DiffusionConfig.from_kwargs(**{k: v for k, v in diffusion_kwargs.items() if v is not None})
+    return _DiffusionConfigProjection.from_kwargs(**{k: v for k, v in diffusion_kwargs.items() if v is not None})
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -1051,10 +1185,10 @@ class VllmOmniConfig:
     """Top-level structured Omni config built once from registry inputs."""
 
     pipeline_config: PipelineConfig
-    stage_configs: tuple[VllmOmniStageConfig, ...]
-    orchestrator_config: OrchestratorConfig = field(default_factory=OrchestratorConfig)
+    stage_configs: tuple[StageConfigLike, ...]
+    orchestrator_config: VllmOmniOrchestratorConfig = field(default_factory=VllmOmniOrchestratorConfig)
 
-    def stage_by_id(self, stage_id: int) -> VllmOmniStageConfig:
+    def stage_by_id(self, stage_id: int) -> StageConfigLike:
         for stage in self.stage_configs:
             if stage.stage_id == stage_id:
                 return stage
@@ -1114,7 +1248,7 @@ class VllmOmniConfig:
             for topology in pipeline.stages
         )
 
-        orchestrator_config = OrchestratorConfig(
+        orchestrator_config = VllmOmniOrchestratorConfig(
             deploy_config_path=loaded_deploy_config_path,
             **_orchestrator_cli_overrides(cli_overrides),
         )
@@ -1126,15 +1260,18 @@ class VllmOmniConfig:
 
 
 __all__ = [
-    "CacheConfig",
-    "ConnectorConfig",
-    "DiffusionConfig",
-    "LoadConfig",
-    "ModelConfig",
-    "OrchestratorConfig",
-    "ParallelConfig",
-    "RuntimeConfig",
-    "SchedulerConfig",
+    "OmniStageCacheConfig",
+    "OmniStageConnectorConfig",
+    "BaseVllmOmniStageConfig",
+    "OmniStageLoadConfig",
+    "OmniStageModelConfig",
+    "VllmOmniOrchestratorConfig",
+    "OmniStageParallelConfig",
+    "OmniStageRuntimeConfig",
+    "OmniStageSchedulerConfig",
+    "StageConfigLike",
+    "VllmOmniARStageConfig",
     "VllmOmniConfig",
-    "VllmOmniStageConfig",
+    "VllmOmniDiffusionStageConfig",
+    "VllmOmniGenerationStageConfig",
 ]

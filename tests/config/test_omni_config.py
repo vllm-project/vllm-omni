@@ -12,16 +12,18 @@ from pydantic import ValidationError
 
 from vllm_omni.config import omni_config as omni_config_module
 from vllm_omni.config.omni_config import (
-    CacheConfig,
-    ConnectorConfig,
-    DiffusionConfig,
-    LoadConfig,
-    ModelConfig,
-    ParallelConfig,
-    RuntimeConfig,
-    SchedulerConfig,
+    BaseVllmOmniStageConfig,
+    OmniStageCacheConfig,
+    OmniStageConnectorConfig,
+    OmniStageLoadConfig,
+    OmniStageModelConfig,
+    OmniStageParallelConfig,
+    OmniStageRuntimeConfig,
+    OmniStageSchedulerConfig,
+    VllmOmniARStageConfig,
     VllmOmniConfig,
-    VllmOmniStageConfig,
+    VllmOmniDiffusionStageConfig,
+    VllmOmniGenerationStageConfig,
 )
 from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
@@ -94,11 +96,16 @@ def test_vllm_omni_config_from_registry_matches_merge_pipeline_deploy(model_type
         )
 
         if omni_stage.stage_pipeline_config.execution_type == StageExecutionType.DIFFUSION:
+            assert isinstance(omni_stage, VllmOmniDiffusionStageConfig)
             assert omni_stage.diffusion_config is not None
             assert omni_stage.diffusion_config.stage_id == legacy_stage.stage_id
             assert omni_stage.diffusion_config.model_arch == engine_args.get("model_arch")
+        elif omni_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR:
+            assert isinstance(omni_stage, VllmOmniARStageConfig)
+            assert not hasattr(omni_stage, "diffusion_config")
         else:
-            assert omni_stage.diffusion_config is None
+            assert isinstance(omni_stage, VllmOmniGenerationStageConfig)
+            assert not hasattr(omni_stage, "diffusion_config")
 
 
 def test_stage_by_id_raises_for_unknown_stage():
@@ -128,9 +135,9 @@ def test_from_registry_normalizes_stage_engine_extras_without_expanding_stage_de
 
     stage = VllmOmniConfig.from_registry("dreamzero", deploy_config_path="dreamzero_tp1_cfg2").stage_by_id(0)
 
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.parallel_config.tensor_parallel_size == 1
     assert stage.parallel_config.cfg_parallel_size == 2
-    assert stage.diffusion_config is not None
     assert stage.diffusion_config.model_config["default_robot_embodiment"] == "roboarena"
 
 
@@ -148,6 +155,29 @@ def test_from_registry_applies_cli_overrides_without_stage_config_runtime_bridge
 
     assert stage0.scheduler_config.max_num_seqs == 7
     assert stage1.parallel_config.tensor_parallel_size == 2
+    assert stage1.runtime_config.num_gpus == stage1.parallel_config.world_size
+
+
+def test_runtime_num_gpus_is_derived_from_parallel_world_size():
+    omni_config = VllmOmniConfig.from_registry("hunyuan_image3_dit")
+    stage = omni_config.stage_by_id(0)
+
+    assert stage.parallel_config.tensor_parallel_size == 4
+    assert stage.parallel_config.world_size == 4
+    assert stage.runtime_config.num_gpus == 4
+
+
+def test_runtime_num_gpus_ignores_stale_runtime_override():
+    omni_config = VllmOmniConfig.from_registry(
+        "hunyuan_image3_dit",
+        cli_overrides={
+            "stage_0_num_gpus": 1,
+        },
+    )
+    stage = omni_config.stage_by_id(0)
+
+    assert stage.parallel_config.world_size == 4
+    assert stage.runtime_config.num_gpus == 4
 
 
 def test_from_registry_does_not_route_server_cli_keys_to_diffusion_stage():
@@ -165,7 +195,7 @@ def test_from_registry_does_not_route_server_cli_keys_to_diffusion_stage():
 
     stage = omni_config.stage_by_id(0)
 
-    assert stage.diffusion_config is not None
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.diffusion_config.host == "127.0.0.1"
     assert stage.diffusion_config.port == 23456
     assert not hasattr(stage.diffusion_config, "api_key")
@@ -197,11 +227,39 @@ def test_stage_deploy_engine_fields_reuse_legacy_stage_deploy_fields():
     assert "stage_id" not in omni_config_module._STAGE_DEPLOY_ENGINE_FIELDS
 
 
+def test_public_config_exports_use_stage_specific_sub_config_names():
+    import vllm_omni.config as config_pkg
+
+    generic_names = {
+        "CacheConfig",
+        "ConnectorConfig",
+        "LoadConfig",
+        "ModelConfig",
+        "OrchestratorConfig",
+        "ParallelConfig",
+        "RuntimeConfig",
+        "SchedulerConfig",
+    }
+
+    assert generic_names.isdisjoint(config_pkg.__all__)
+    assert {
+        "OmniStageCacheConfig",
+        "OmniStageConnectorConfig",
+        "OmniStageLoadConfig",
+        "OmniStageModelConfig",
+        "VllmOmniOrchestratorConfig",
+        "OmniStageParallelConfig",
+        "OmniStageRuntimeConfig",
+        "OmniStageSchedulerConfig",
+    }.issubset(config_pkg.__all__)
+
+
 def test_from_registry_keeps_worker_backend_separate_from_distributed_executor_backend():
     omni_config = VllmOmniConfig.from_registry("dreamzero", deploy_config_path="dreamzero_tp1_cfg2")
 
-    assert omni_config.stage_by_id(0).diffusion_config is not None
-    assert omni_config.stage_by_id(0).diffusion_config.distributed_executor_backend == "mp"
+    stage = omni_config.stage_by_id(0)
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.diffusion_config.distributed_executor_backend == "mp"
     assert omni_config.orchestrator_config.worker_backend == "multi_process"
 
 
@@ -259,11 +317,11 @@ def test_from_registry_dispatches_async_chunk_processors_without_mutating_topolo
     assert pipeline.get_stage(1).custom_process_input_func is None
 
 
-def test_vllm_omni_stage_config_public_fields_match_rfc_container_shape():
-    assert not hasattr(VllmOmniStageConfig, "from_stage_config")
-    assert not hasattr(VllmOmniStageConfig, "to_legacy_stage_config")
+def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
+    assert not hasattr(BaseVllmOmniStageConfig, "from_stage_config")
+    assert not hasattr(BaseVllmOmniStageConfig, "to_legacy_stage_config")
 
-    public_fields = {f.name for f in fields(VllmOmniStageConfig)}
+    public_fields = {f.name for f in fields(BaseVllmOmniStageConfig)}
 
     assert public_fields == {
         "stage_pipeline_config",
@@ -274,13 +332,16 @@ def test_vllm_omni_stage_config_public_fields_match_rfc_container_shape():
         "connector_config",
         "runtime_config",
         "parallel_config",
-        "diffusion_config",
         "quantization_config",
     }
+    assert "diffusion_config" not in public_fields
+    assert {f.name for f in fields(VllmOmniDiffusionStageConfig)} == public_fields | {"diffusion_config"}
+    assert {f.name for f in fields(VllmOmniARStageConfig)} == public_fields
+    assert {f.name for f in fields(VllmOmniGenerationStageConfig)} == public_fields
 
 
 def test_runtime_config_fields_match_rfc_runtime_scope():
-    assert {f.name for f in fields(RuntimeConfig)} == {
+    assert {f.name for f in fields(OmniStageRuntimeConfig)} == {
         "devices",
         "num_replicas",
         "env",
@@ -292,7 +353,7 @@ def test_runtime_config_fields_match_rfc_runtime_scope():
 
 
 def test_sub_config_fields_match_rfc_scopes():
-    assert {f.name for f in fields(ModelConfig)} == {
+    assert {f.name for f in fields(OmniStageModelConfig)} == {
         "active_stream_window",
         "enable_sleep_mode",
         "default_sampling_params",
@@ -308,31 +369,31 @@ def test_sub_config_fields_match_rfc_scopes():
         "num_weight_load_threads",
         "disable_autocast",
     }
-    assert {f.name for f in fields(LoadConfig)} == {
+    assert {f.name for f in fields(OmniStageLoadConfig)} == {
         "load_format",
         "tokenizer_mode",
         "config_format",
         "skip_mm_profiling",
     }
-    assert {f.name for f in fields(CacheConfig)} == {
+    assert {f.name for f in fields(OmniStageCacheConfig)} == {
         "gpu_memory_utilization",
         "enable_prefix_caching",
         "disable_hybrid_kv_cache_manager",
         "mm_processor_cache_gb",
     }
-    assert {f.name for f in fields(SchedulerConfig)} == {
+    assert {f.name for f in fields(OmniStageSchedulerConfig)} == {
         "max_num_seqs",
         "max_num_batched_tokens",
         "max_model_len",
         "enable_chunked_prefill",
         "async_scheduling",
     }
-    assert {f.name for f in fields(ConnectorConfig)} == {
+    assert {f.name for f in fields(OmniStageConnectorConfig)} == {
         "stage_connector",
         "output_connectors",
         "input_connectors",
     }
-    assert {f.name for f in fields(ParallelConfig)} == {
+    assert {f.name for f in fields(OmniStageParallelConfig)} == {
         "pipeline_parallel_size",
         "data_parallel_size",
         "tensor_parallel_size",
@@ -351,7 +412,7 @@ def test_sub_config_fields_match_rfc_scopes():
 
 
 def test_parallel_config_keeps_current_diffusion_parallel_surface():
-    cfg = ParallelConfig(
+    cfg = OmniStageParallelConfig(
         pipeline_parallel_size=2,
         data_parallel_size=3,
         tensor_parallel_size=4,
@@ -365,7 +426,7 @@ def test_parallel_config_keeps_current_diffusion_parallel_surface():
 
 
 def test_parallel_config_matches_diffusion_parallel_world_size_for_vae_patch_parallel():
-    cfg = ParallelConfig(
+    cfg = OmniStageParallelConfig(
         tensor_parallel_size=2,
         cfg_parallel_size=2,
         vae_patch_parallel_size=4,
@@ -376,7 +437,7 @@ def test_parallel_config_matches_diffusion_parallel_world_size_for_vae_patch_par
 
 
 def test_parallel_config_supports_diffusion_hsdp_auto_sharding():
-    cfg = ParallelConfig(
+    cfg = OmniStageParallelConfig(
         pipeline_parallel_size=2,
         sequence_parallel_size=2,
         ulysses_degree=2,
@@ -391,10 +452,10 @@ def test_parallel_config_supports_diffusion_hsdp_auto_sharding():
 
 def test_parallel_config_rejects_diffusion_hsdp_with_tp_or_dp():
     with pytest.raises(ValueError, match="cannot be used with TP or DP"):
-        ParallelConfig(tensor_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
+        OmniStageParallelConfig(tensor_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
 
     with pytest.raises(ValueError, match="cannot be used with TP or DP"):
-        ParallelConfig(data_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
+        OmniStageParallelConfig(data_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
 
 
 def test_from_registry_preserves_legacy_pp_dp_for_world_size():
@@ -408,7 +469,7 @@ def test_from_registry_preserves_legacy_pp_dp_for_world_size():
 
 def test_parallel_config_rejects_cfg_parallel_size_outside_current_bound():
     with pytest.raises(ValidationError):
-        ParallelConfig(cfg_parallel_size=4)
+        OmniStageParallelConfig(cfg_parallel_size=4)
 
 
 def test_from_registry_matches_stage_config_to_omegaconf_behavior_for_representative_stage():
@@ -493,7 +554,7 @@ def test_diffusion_config_preserves_existing_coercion_hooks():
 
     from vllm_omni.diffusion.data import AttentionConfig, DiffusionCacheConfig
 
-    cfg = DiffusionConfig(
+    cfg = omni_config_module._DiffusionConfigProjection(
         dtype="float32",
         cache_config={"rel_l1_thresh": 0.3},
         diffusion_attention_config={"default": "flash_attn"},
@@ -513,7 +574,7 @@ def test_diffusion_config_preserves_existing_coercion_hooks():
 def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     monkeypatch.setenv("DIFFUSION_CACHE_BACKEND", "TEA_CACHE")
 
-    cfg = DiffusionConfig.from_kwargs(
+    cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
         diffusion_attention_backend="flash_attn",
         kv_cache_dtype="fp8",
         kv_cache_skip_steps="0-1",
@@ -552,7 +613,7 @@ def test_from_registry_normalizes_diffusion_config_aliases_from_engine_args(tmp_
         deploy_config_path=str(deploy_path),
     ).stage_by_id(0)
 
-    assert stage.diffusion_config is not None
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.diffusion_config.diffusion_attention_config.default.backend == "flash_attn"
 
 
@@ -564,7 +625,7 @@ def test_diffusion_config_field_classification_covers_current_fields():
         | omni_config_module._DIFFUSION_ONLY_CONFIG_FIELDS
     )
 
-    assert classified_fields == {f.name for f in fields(DiffusionConfig)}
+    assert classified_fields == {f.name for f in fields(omni_config_module._DiffusionConfigProjection)}
     assert {
         "enable_prompt_embed_cache",
         "prompt_embed_cache_size",
