@@ -1688,6 +1688,7 @@ class Bagel(nn.Module):
         # positions are never updated and get ``timestep=0``.
         frame_condition_token_indexes: torch.LongTensor | None = None,
     ):
+        self._tea_cache_reset()
         x_t = packed_init_noises
         # Snapshot the pinned subtensor BEFORE the denoise loop touches
         # x_t; the cond positions in packed_init_noises hold the
@@ -2119,6 +2120,49 @@ class Bagel(nn.Module):
 
         return v_t
 
+    def _tea_cache_reset(self) -> None:
+        """Reset TeaCache running state at the start of a denoise loop."""
+        if getattr(self, "_tea_cache_config", None) is None:
+            return
+        if not hasattr(self, "_tc_rescale"):
+            self._tc_rescale = np.poly1d(self._tea_cache_config.coefficients)
+        self._tc_acc = 0.0
+        self._tc_prev_mod = None
+        self._tc_prev_pred = None
+        self._tc_cnt = 0
+
+    def _tea_cache_should_compute(self, cur_mod: torch.Tensor, need_text: bool, need_img: bool) -> bool:
+        """TeaCache decision: run the full branch forwards (True) or reuse the
+        cached per-branch velocities (False).
+
+        Implements the standard TeaCache rule — rescaled relative-L1 distance of
+        the modulated input, accumulated against ``rel_l1_thresh``. A cached
+        prediction is only eligible for reuse when its branch layout matches the
+        current step's needs (``cfg_interval`` can toggle CFG mid-loop), and the
+        first step of a generation always computes. Updates running state.
+        """
+        tc_cfg = getattr(self, "_tea_cache_config", None)
+        if tc_cfg is None:
+            return True
+        cache_shape_ok = (
+            self._tc_prev_pred is not None
+            and (self._tc_prev_pred[1] is not None) == need_text
+            and (self._tc_prev_pred[2] is not None) == need_img
+        )
+        compute = True
+        if self._tc_cnt > 0 and self._tc_prev_mod is not None and cache_shape_ok:
+            rel_dist = (
+                (cur_mod - self._tc_prev_mod).abs().mean() / (self._tc_prev_mod.abs().mean() + 1e-8)
+            ).cpu().item()
+            self._tc_acc += abs(float(self._tc_rescale(rel_dist)))
+            if self._tc_acc < tc_cfg.rel_l1_thresh:
+                compute = False
+            else:
+                self._tc_acc = 0.0
+        self._tc_prev_mod = cur_mod.detach()
+        self._tc_cnt += 1
+        return compute
+
     def forward_single_branch(
         self,
         x_t: torch.Tensor,
@@ -2271,7 +2315,32 @@ class Bagel(nn.Module):
         cfg_text_v_t = None
         cfg_img_v_t = None
 
-        if use_cfg and cfg_branches is not None:
+        # ── TeaCache (direct, CFG-preserving) ──
+        # Bagel is an LLM + KV-cache model whose CFG fan-out and combination
+        # live inside this forward, so the generic hidden-residual hook can
+        # only wrap it by dropping CFG entirely.  Instead we cache the raw
+        # per-branch velocities (the prediction *before* guidance) and reuse
+        # them on low-change steps, always running ``_combine_cfg`` afterward
+        # — mirroring the HunyuanImage3 direct-caching path.
+        tc_cfg = getattr(self, "_tea_cache_config", None)
+        tc_compute = True
+        if tc_cfg is not None:
+            need_text = use_cfg
+            need_img = (
+                use_cfg
+                and cfg_img_scale > 1.0
+                and cfg_branches is not None
+                and len(cfg_branches.get("caches", [])) > 2
+            )
+            # Decide on the full packed sequence (text + timestep + latent
+            # embeds) — the same modulated input the Bagel TeaCache
+            # coefficients are calibrated for.
+            tc_compute = self._tea_cache_should_compute(packed_sequence, need_text, need_img)
+
+        if not tc_compute:
+            # Fast path: reuse cached per-branch velocities.
+            v_t, cfg_text_v_t, cfg_img_v_t = self._tc_prev_pred
+        elif use_cfg and cfg_branches is not None:
             # Sequential per-branch CFG forwards (matches upstream lance.py).
             # The previous batched path concatenated cond + cfg into one LLM
             # forward, but the block-diagonal attention mask was lost when
@@ -2308,6 +2377,14 @@ class Bagel(nn.Module):
                 **extra_inputs,
             )
             v_t = self.llm2vae(output.packed_query_sequence)[packed_vae_token_indexes]
+
+        # Cache freshly computed per-branch velocities for later reuse.
+        if tc_cfg is not None and tc_compute:
+            self._tc_prev_pred = (
+                v_t.detach(),
+                cfg_text_v_t.detach() if cfg_text_v_t is not None else None,
+                cfg_img_v_t.detach() if cfg_img_v_t is not None else None,
+            )
 
         # ── CFG combination ──
         if use_cfg:
