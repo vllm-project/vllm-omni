@@ -1,6 +1,8 @@
 # Image-To-Video
 
-This example demonstrates how to generate videos from images using Wan2.2 Image-to-Video models with vLLM-Omni's offline inference API.
+This example demonstrates how to generate videos from images (image-to-video)
+using Wan2.2, LTX2, HunyuanVideo-1.5, and Cosmos3 with vLLM-Omni's offline
+inference API.
 
 ## Local CLI Usage
 
@@ -48,19 +50,35 @@ python image_to_video.py \
   --output i2v_output.mp4
 ```
 
+### Cosmos3
+
+```bash
+# Cosmos3 bundles example frames under assets/ (any RGB image works too):
+python image_to_video.py \
+  --model nvidia/Cosmos3-Nano \
+  --image /path/to/Cosmos3-Nano/assets/example_i2v_input.jpg \
+  --prompt "The scene comes to life with smooth, natural motion." \
+  --negative-prompt "blurry, distorted, low quality" \
+  --height 720 --width 1280 --num-frames 189 --fps 24 \
+  --num-inference-steps 35 --guidance-scale 6.0 \
+  --extra-body '{"flow_shift": 10.0, "max_sequence_length": 4096, "guardrails": false}' \
+  --output cosmos3_i2v.mp4
+```
+
 Key arguments:
 
 - `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V).
 - `--image`: Path to input image (required).
+- `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3.
 - `--prompt`: Text description of desired motion/animation.
 - `--height/--width`: Output resolution (auto-calculated from image if not set). Dimensions should be multiples of 16.
-- `--num-frames`: Number of frames (default 81).
+- `--num-frames`: Number of frames (default: model-specific — Wan 81, LTX2 121, Cosmos3 189).
 - `--guidance-scale` and `--guidance-scale-high`: CFG scale (applied to low/high-noise stages for MoE).
 - `--negative-prompt`: Optional list of artifacts to suppress.
 - `--boundary-ratio`: Boundary split ratio for two-stage MoE models.
-- `--flow-shift`: Scheduler flow shift (5.0 for 720p, 12.0 for 480p).
+- `--flow-shift`: Scheduler flow shift (default: model-specific — Wan/LTX2 5.0, Cosmos3 10.0).
 - `--sample-solver`: Wan2.2 sampling solver. Use `unipc` for the default multistep solver, or `euler` for Lightning/Distill checkpoints.
-- `--num-inference-steps`: Number of denoising steps (default 50).
+- `--num-inference-steps`: Number of denoising steps (default: model-specific — Wan 50, LTX2 40, Cosmos3 35).
 - `--fps`: Frames per second for the saved MP4 (requires `diffusers` export_to_video).
 - `--output`: Path to save the generated video.
 - `--vae-use-slicing`: Enable VAE slicing for memory optimization.
