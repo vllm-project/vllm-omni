@@ -85,6 +85,7 @@ _HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
 _HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _STEP_AUDIO2_TTS_MODEL_STAGES = {"step_audio2_thinker"}
+_INDEXTTS2_TTS_MODEL_STAGES = {"indextts2_talker"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -100,6 +101,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _MOSS_TTS_FULL_MODEL_STAGES
     | _GLM_TTS_MODEL_STAGES
     | _STEP_AUDIO2_TTS_MODEL_STAGES
+    | _INDEXTTS2_TTS_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "fish_tts",
@@ -109,6 +111,7 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "voxcpm2",
     "higgs_audio_v2",
     "higgs_audio_v3",
+    "indextts2",
 }
 _TTS_LANGUAGES = frozenset(
     {
@@ -693,6 +696,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "glm_tts"
         if model_stage in _STEP_AUDIO2_TTS_MODEL_STAGES:
             return "step_audio2"
+        if model_stage in _INDEXTTS2_TTS_MODEL_STAGES:
+            return "indextts2"
         return None
 
     def _get_custom_voice_dir(self) -> str | None:
@@ -3429,6 +3434,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "higgs_audio_v2"
         elif self._tts_model_type == "glm_tts":
             model_type = "glm_tts"
+        elif self._tts_model_type == "indextts2":
+            model_type = "indextts2"
         elif self._is_tts:
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:
