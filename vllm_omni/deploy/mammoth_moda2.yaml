@@ -1,6 +1,7 @@
 # MammothModa2 AR→DiT (text-to-image).
 
 async_chunk: false
+pipeline: mammoth_moda2
 
 stages:
   - stage_id: 0

@@ -12,7 +12,7 @@ hf bytedance-research/MammothModa2-Preview --local-dir ./MammothModa2-Preview
 ```bash
 python examples/offline_inference/mammothmodal2_preview/run_mammothmoda2_t2i.py \
   --model ./MammothModa2-Preview \
-  --stage-config ./vllm_omni/model_executor/stage_configs/mammoth_moda2.yaml \
+  --deploy-config ./vllm_omni/deploy/mammoth_moda2.yaml \
   --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
   --height 1024 \
   --width 1024 \

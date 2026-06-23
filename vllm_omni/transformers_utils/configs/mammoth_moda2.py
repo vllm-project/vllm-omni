@@ -229,8 +229,8 @@ class Mammothmoda2Config(PretrainedConfig):
         architectures: list[str] | None = None,
         **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
         self.llm_config = AutoConfig.for_model(**llm_config) if llm_config is not None else None
+        super().__init__(**kwargs)
         self.gen_vae_config = gen_vae_config
         self.gen_dit_config = gen_dit_config
 
@@ -244,7 +244,9 @@ class Mammothmoda2Config(PretrainedConfig):
         self.architectures = ["Mammothmoda2Model"]
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
-        return self.llm_config
+        if self.llm_config is None:
+            return self
+        return self.llm_config.text_config
 
     def _require_llm_config(self) -> PretrainedConfig:
         if self.llm_config is None:

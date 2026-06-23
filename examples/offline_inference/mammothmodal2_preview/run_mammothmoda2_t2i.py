@@ -10,7 +10,7 @@ Workflow:
 Example Usage:
     uv run python examples/offline_inference/run_mammothmoda2_t2i.py \
         --model path/to/MammothModa2-Preview \
-        --stage-config vllm_omni/model_executor/stage_configs/mammoth_moda2.yaml \
+        --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
         --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
         --out output.png
 """
@@ -92,7 +92,7 @@ def load_t2i_generation_config(model_dir: str) -> T2IGenConfig:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run MammothModa2 T2I (AR -> DiT) with vLLM-Omni.")
     p.add_argument("--model", type=str, required=True, help="Path to the model directory.")
-    p.add_argument("--stage-config", type=str, required=True, help="Path to the multi-stage YAML configuration.")
+    p.add_argument("--deploy-config", type=str, required=True, help="Path to the deploy YAML configuration.")
     p.add_argument(
         "--prompt",
         type=str,
@@ -196,7 +196,7 @@ def main() -> None:
     expected_grid_tokens = ar_height * (ar_width + 1)
 
     logger.info("Initializing Omni pipeline...")
-    omni = Omni(model=args.model, stage_configs_path=args.stage_config, trust_remote_code=args.trust_remote_code)
+    omni = Omni(model=args.model, deploy_config=args.deploy_config, trust_remote_code=args.trust_remote_code)
     try:
         ar_sampling = SamplingParams(
             temperature=1.0,

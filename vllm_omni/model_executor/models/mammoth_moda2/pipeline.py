@@ -19,6 +19,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.mammoth_moda2"
 MAMMOTH_MODA2_PIPELINE = PipelineConfig(
     model_type="mammoth_moda2",
     model_arch="MammothModa2ForConditionalGeneration",
+    hf_architectures=("Mammothmoda2Model", "MammothModa2ForConditionalGeneration"),
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -33,7 +34,7 @@ MAMMOTH_MODA2_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=1,
             model_stage="dit",
-            execution_type=StageExecutionType.DIFFUSION,
+            execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
             final_output=True,
             final_output_type="image",

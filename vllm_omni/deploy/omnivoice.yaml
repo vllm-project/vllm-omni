@@ -2,6 +2,7 @@
 # Text → iterative unmasking → codebook tokens → DAC decode → 24kHz audio.
 
 async_chunk: false
+pipeline: omnivoice
 
 stages:
   - stage_id: 0

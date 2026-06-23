@@ -15,9 +15,12 @@ def ar2dit(
 ) -> list[OmniTokensPrompt]:
     """Convert AR stage outputs to DiT stage inputs."""
     ar_outputs = source_outputs
+    prompt_list = prompts if isinstance(prompts, list) else [prompts]
 
     dit_inputs: list[OmniTokensPrompt] = []
-    for ar_output, prompt in zip(ar_outputs, prompts):
+    for ar_output, prompt in zip(ar_outputs, prompt_list):
+        if not isinstance(prompt, dict):
+            raise TypeError(f"Expected MammothModa2 prompt dict, got {type(prompt).__name__}")
         addi_info = prompt["additional_information"]
         image_height = addi_info["image_height"][0]
         image_width = addi_info["image_width"][0]
