@@ -44,6 +44,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.qwen3_omni.pipeline",
         "QWEN3_OMNI_PIPELINE",
     ),
+    "aura_omni": (
+        "vllm_omni.model_executor.models.aura_omni.pipeline",
+        "AURA_OMNI_PIPELINE",
+    ),
     "qwen3_tts": (
         "vllm_omni.model_executor.models.qwen3_tts.pipeline",
         "QWEN3_TTS_PIPELINE",
@@ -164,5 +168,9 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "dynin_omni": (
         "vllm_omni.model_executor.models.dynin_omni.pipeline",
         "DYNIN_OMNI_PIPELINE",
+    ),
+    "indextts2": (
+        "vllm_omni.model_executor.models.indextts2.pipeline",
+        "INDEXTTS2_PIPELINE",
     ),
 }

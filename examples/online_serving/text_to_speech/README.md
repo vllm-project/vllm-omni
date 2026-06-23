@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 |---|---|---|---|---|---|
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
+| IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✓ (`ref_audio` or uploaded `voice`) | compat only, non-chunk | uploaded audio voice only; no presets | — |
 | Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | ✓ (`ref_audio` / `speaker_embedding`) | ✓ (PCM stream) | IP labels + structured `instructions` | — |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
@@ -34,7 +35,7 @@ Launch the server (defaults shown — adjust `--port`, `--gpu-memory-utilization
 vllm serve <hf-repo-or-local-path> --omni --port 8091
 ```
 
-Send a TTS request via curl:
+Send a TTS request via curl. These generic snippets assume a model with a preset/default voice; voice-cloning-only models such as IndexTTS-2 require `ref_audio` or an uploaded audio `voice` (see model-specific sections below).
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -90,7 +91,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
 
-Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 24 kHz for the others).
+Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for IndexTTS-2, and 24 kHz for many others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
 
@@ -132,6 +133,40 @@ bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
 - Output: 24 kHz mono WAV via HiFT vocoder.
 - `ref_audio` + `ref_text` are **required** together on every request. Reference audio should be 3-10 seconds.
 - Voice cloning feature extraction (WhisperVQ, CampPlus, mel) runs on the model side — no external dependency on the serving layer.
+
+---
+
+## IndexTTS-2
+
+2-stage TTS (GPT AR + S2Mel CFM DiT + BigVGAN) at 22.05 kHz. Requests use `ref_audio` for voice cloning, or an uploaded audio `voice` from `/v1/audio/voices`. Supports emotion conditioning via `emo_audio`, `emo_text`, or `emo_vector` passed in `extra_params`.
+
+### Launch
+```bash
+vllm serve IndexTeam/IndexTTS-2 --omni --trust-remote-code --port 8092
+# or, to pass the bundled deploy config explicitly:
+bash examples/online_serving/text_to_speech/indextts2/run_server.sh
+```
+
+### Sending requests
+```bash
+# Voice cloning (ref_audio required)
+python examples/online_serving/text_to_speech/indextts2/speech_client.py \
+    --text "你好，世界！" \
+    --ref-audio /path/to/reference.wav
+
+# With emotion audio
+python examples/online_serving/text_to_speech/indextts2/speech_client.py \
+    --text "今天心情很好！" \
+    --ref-audio /path/to/ref.wav \
+    --emo-audio /path/to/happy.wav
+```
+
+### Notes
+- Output: 22.05 kHz mono WAV.
+- Provide `ref_audio` on the documented raw request path, or pass `voice` only when it names an uploaded audio voice; IndexTTS-2 does not provide a built-in text-only preset voice.
+- Emotion params (`emo_audio`, `emo_text`, `emo_vector`, `emo_alpha`, `use_emo_text`, `use_random`) are passed via the `extra_params` field. Official precedence is `use_emo_text` > `emo_vector` > `emo_audio` > same emotion as the speaker reference.
+- `stream=true` is accepted as an OpenAI-compatible response path, but IndexTTS-2 is not async-chunk streaming; audio is produced after S2Mel receives the full mel-code sequence.
+- Deploy config: `vllm_omni/deploy/indextts2.yaml` (auto-loaded).
 
 ---
 
@@ -503,6 +538,35 @@ The `/v1/audio/speech/stream` endpoint accepts text incrementally, splits it at 
 python qwen3_tts/streaming_speech_client.py --text "Hello world. How are you? I am fine."
 python qwen3_tts/streaming_speech_client.py --text "..." --simulate-stt --stt-delay 0.1
 ```
+
+To receive word-level timestamps, launch the server with a forced aligner:
+```bash
+vllm-omni serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --omni \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
+    --trust-remote-code \
+    --forced-aligner Qwen/Qwen3-ForcedAligner-0.6B
+```
+Then request PCM JSON sidecar chunks:
+```bash
+python qwen3_tts/streaming_speech_client.py \
+    --text "Hello world. How are you?" \
+    --stream-audio \
+    --response-format pcm \
+    --word-timestamps
+```
+The client writes one PCM file per sentence and a matching
+`sentence_XXX_timestamps.json` sidecar.
+
+To *see* the alignment instead of reading a JSON sidecar, run the
+word-timestamp Gradio demo (server must be launched with `--forced-aligner`):
+```bash
+python qwen3_tts/word_timestamps_demo.py --api-base http://localhost:8091
+```
+Each sentence's audio plays in an `<audio>` element while its text is rendered
+as inline word spans; the current word highlights as `audio.currentTime`
+crosses each `start_ms`. The **Stop (barge-in)** button cuts playback and
+reports the last-spoken word, useful for the voice-agent barge-in case.
 
 ### Gradio demos
 ```bash

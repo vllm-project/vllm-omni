@@ -58,6 +58,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         return "vllm_omni.platforms.npu.worker.npu_generation_worker.NPUGenerationWorker"
 
     @classmethod
+    def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
+        from vllm_ascend.ascend_config import init_ascend_config
+
+        init_ascend_config(vllm_config)
+
+    @classmethod
     def get_default_stage_config_path(cls) -> str:
         return "vllm_omni/platforms/npu/stage_configs"
 

@@ -466,11 +466,18 @@ class TestCFGParallelForwardPath:
     """Test the LTX-2.3 CFG-parallel denoising path without loading model weights."""
 
     @pytest.mark.parametrize(("cfg_rank", "expected_prompt_value"), [(0, 1.0), (1, 0.0)])
+    @pytest.mark.parametrize(
+        ("frame_rate_input", "audio_sampling_rate", "expected_frame_rate"),
+        [(1.0, 1, 1.0), (None, 24, 24.0)],
+    )
     def test_forward_cfg_parallel_steps_video_and_audio_scheduler(
         self,
         monkeypatch,
         cfg_rank,
         expected_prompt_value,
+        frame_rate_input,
+        audio_sampling_rate,
+        expected_frame_rate,
     ):
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -484,7 +491,7 @@ class TestCFGParallelForwardPath:
         pipe.vae_temporal_compression_ratio = 1
         pipe.transformer_spatial_patch_size = 1
         pipe.transformer_temporal_patch_size = 1
-        pipe.audio_sampling_rate = 1
+        pipe.audio_sampling_rate = audio_sampling_rate
         pipe.audio_hop_length = 1
         pipe.audio_vae_temporal_compression_ratio = 1
         pipe.audio_vae_mel_compression_ratio = 1
@@ -553,8 +560,11 @@ class TestCFGParallelForwardPath:
                 assert prompt_embeds.shape[0] == 2
                 return prompt_embeds, prompt_embeds, prompt_attention_mask
 
+        rope_video_fps: list[float] = []
+
         class FakeRope:
             def prepare_video_coords(self, batch_size, num_frames, height, width, device, fps):
+                rope_video_fps.append(fps)
                 return torch.zeros(batch_size, num_frames * height * width, 3, device=device)
 
             def prepare_audio_coords(self, batch_size, num_frames, device):
@@ -611,7 +621,7 @@ class TestCFGParallelForwardPath:
                 height=32,
                 width=32,
                 num_frames=1,
-                frame_rate=1.0,
+                frame_rate=frame_rate_input,
                 num_inference_steps=2,
                 guidance_scale=4.0,
                 latents=video_latents,
@@ -650,6 +660,11 @@ class TestCFGParallelForwardPath:
         video_out, audio_out = output.output
         torch.testing.assert_close(video_out, (video_latents - 2 * expected_video_noise).reshape(1, 2, 1, 1, 1))
         torch.testing.assert_close(audio_out, (audio_latents - 2 * expected_audio_noise).reshape(1, 1, 1, 2))
+
+        # fps regression guard: an omitted request fps (frame_rate_input=None) must resolve
+        # to the model's own 24.0 default, not crash on None; a provided rate is passed through.
+        assert rope_video_fps
+        assert all(fps == expected_frame_rate for fps in rope_video_fps)
 
 
 class TestRegistryIntegration:
