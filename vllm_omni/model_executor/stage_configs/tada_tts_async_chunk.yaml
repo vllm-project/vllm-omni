@@ -94,6 +94,15 @@ runtime:
         connector_get_sleep_s: 0.01
         connector_get_max_wait_first_chunk: 3000
         connector_get_max_wait: 300
+        # Chunked audio streaming geometry (frames @ 50 Hz), read by
+        # ar2vocoder_async_chunk. Overlap verified offline: a windowed codec
+        # decode with this left context + right lookahead matches a full decode
+        # to rel ~0.003 (inaudible). Right lookahead is required (TADA's codec is
+        # non-causal) and sets the first-audio latency floor (~RCTX*20 ms).
+        codec_streaming: true
+        tada_chunk_frames: 50
+        tada_left_context_frames: 128
+        tada_right_context_frames: 32
 
   edges:
     - from: 0

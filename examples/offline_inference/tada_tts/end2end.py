@@ -317,8 +317,11 @@ async def main_streaming(args):
         sampling_params_list = _stage0_sampling_params(omni, walk_len)
         t_start = time.perf_counter()
         chunk_idx = 0
-        audio_chunks: list = []
+        consumed = 0                 # list case: chunks already taken
+        audio_chunks: list = []      # list case: collected new chunks
+        latest_audio = None          # tensor case: cumulative waveform-so-far
         sr = TADA_CODEC_SR
+        first_audio_ts = None
 
         async for stage_output in omni.generate(
             prompt, request_id=request_id, sampling_params_list=sampling_params_list
@@ -330,17 +333,39 @@ async def main_streaming(args):
             output = stage_output.request_output
             comp = output.outputs[0] if output.outputs else None
             mm = getattr(comp, "multimodal_output", None) or {}
-            audio_data = mm.get("model_outputs") or mm.get("audio")
-            if audio_data is not None:
+
+            # The output processor remaps model_outputs -> "audio" and CONCAT_LAST-accumulates
+            # it. In practice each audio yield delivers the request's CUMULATIVE waveform as a
+            # growing Tensor; keep the latest. (Handle a chunk-list delivery too, via a cursor.)
+            audio_data = mm.get("audio")
+            if audio_data is None:
+                audio_data = mm.get("model_outputs")
+            got = False
+            if isinstance(audio_data, torch.Tensor) and audio_data.numel() > 0:
+                latest_audio = audio_data
+                got = True
+            elif isinstance(audio_data, list):
+                new = audio_data[consumed:]
+                if new:
+                    audio_chunks.extend(new)
+                    consumed = len(audio_data)
+                    got = True
+            if got:
                 chunk_idx += 1
-                audio_chunks.extend(audio_data if isinstance(audio_data, list) else [audio_data])
+                if first_audio_ts is None:
+                    first_audio_ts = time.perf_counter() - t_start
                 sr_raw = mm.get("sr", sr)
                 sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
                 sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
-            if stage_output.finished:
-                elapsed = time.perf_counter() - t_start
-                logger.info("Request %s done in %.2f s (chunks=%d)", request_id, elapsed, chunk_idx)
-                _save_wav(args.output_dir, request_id, {"model_outputs": audio_chunks, "sr": sr})
+
+        elapsed = time.perf_counter() - t_start
+        logger.info(
+            "Request %s done in %.2f s (chunks=%d, first audio @ %.2fs)",
+            request_id, elapsed, chunk_idx,
+            first_audio_ts if first_audio_ts is not None else -1.0,
+        )
+        final = [latest_audio] if latest_audio is not None else audio_chunks
+        _save_wav(args.output_dir, request_id, {"model_outputs": final, "sr": sr})
 
 
 # ---------------------------------------------------------------------------

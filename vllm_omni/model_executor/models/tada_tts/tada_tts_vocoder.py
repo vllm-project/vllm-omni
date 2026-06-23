@@ -140,21 +140,33 @@ class TadaVocoder(nn.Module):
                 srs.append(sr_tensor)
                 continue
 
+            # Streaming (async-chunk) path: ``codes.audio`` is a pre-expanded window of
+            # frames [W, 512]; decode it and keep only the interior, dropping the left
+            # context and right lookahead frames (see ar2vocoder_async_chunk). Detected by
+            # the drop-count meta fields, which distinguish it from the batch path.
+            codes = info.get("codes")
+            window = codes.get("audio") if isinstance(codes, dict) else None
+            meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
+            if (
+                isinstance(window, torch.Tensor) and window.dim() == 2
+                and window.shape[-1] == self.acoustic_features_dim
+                and ("left_context_size" in meta or "right_holdback_size" in meta)
+            ):
+                try:
+                    wav = self._decode_window(
+                        window.to(device=device, dtype=torch.float32),
+                        int(meta.get("left_context_size", 0) or 0),
+                        int(meta.get("right_holdback_size", 0) or 0),
+                    )
+                    audios.append(wav.to(dtype=torch.float32).cpu())
+                except Exception:
+                    logger.exception("TadaVocoder: error decoding streaming window; empty audio")
+                    audios.append(empty)
+                srs.append(sr_tensor)
+                continue
+
             af = info.get("acoustic_features")
             tb = info.get("time_before")
-            # Async-chunk path packs both signals into a single 2-D ``codes.audio`` tensor
-            # ([T, 513]: 512 acoustic + 1 duration) — the only field the receive side keeps
-            # in the vocoder's request info (see ar2vocoder_async_chunk).
-            if af is None or (isinstance(af, torch.Tensor) and af.numel() == 0):
-                codes = info.get("codes")
-                packed = codes.get("audio") if isinstance(codes, dict) else None
-                if isinstance(packed, torch.Tensor) and packed.numel() > 0:
-                    packed = packed.reshape(-1, packed.shape[-1])
-                    if packed.shape[-1] == self.acoustic_features_dim + 1:
-                        af = packed[:, : self.acoustic_features_dim]
-                        tb = packed[:, self.acoustic_features_dim].round().to(torch.long)
-                    else:
-                        af = packed
 
             if af is None or not isinstance(af, torch.Tensor) or af.numel() == 0:
                 audios.append(empty)
@@ -213,6 +225,37 @@ class TadaVocoder(nn.Module):
             text_hidden_states=None,
             multimodal_outputs={"model_outputs": audios, "sr": srs},
         )
+
+    def _decode_window(self, window: torch.Tensor, left_drop: int, right_drop: int) -> torch.Tensor:
+        """Decode one pre-expanded streaming window [W, 512] and keep its interior.
+
+        The window already contains expanded (duration-inserted) frames with ``left_drop``
+        left-context frames and ``right_drop`` right-lookahead frames around the emitted
+        region. We denormalise, decode the whole window through the codec (so its
+        attention/conv see full context), then return only the emitted region's samples —
+        dropping the context whose sole purpose is to make the seam match a full decode
+        (verified offline to rel ~0.003). The codec's constant conv edge deficit is shared
+        by every window, so fixed slicing stays seamless across chunks.
+        """
+        device = window.device
+        W = window.shape[0]
+        if W == 0:
+            return torch.zeros(0, device=device)
+        af = window * self.acoustic_std + self.acoustic_mean
+        expanded = af.unsqueeze(0)
+        if expanded.shape[1] > DECODER_MAX_SEQ_LEN:
+            expanded = expanded[:, :DECODER_MAX_SEQ_LEN]
+            W = DECODER_MAX_SEQ_LEN
+        decoder_dtype = next(self._decoder.parameters()).dtype
+        expanded = expanded.to(decoder_dtype)
+        token_masks = (torch.norm(expanded, dim=-1) != 0).long()
+        wav = self._decoder(expanded, token_masks).squeeze(0).squeeze(0).to(torch.float32).reshape(-1)
+        up = self._upsample
+        start = left_drop * up
+        end = wav.shape[0] - right_drop * up
+        if start >= end:
+            return torch.zeros(0, device=device)
+        return wav[start:end]
 
     def _decode_wav(self, encoded: torch.Tensor, time_before: torch.Tensor) -> torch.Tensor:
         """Expand acoustic frames by per-token duration, then run the codec decoder.
