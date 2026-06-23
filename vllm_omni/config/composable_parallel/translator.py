@@ -178,16 +178,14 @@ def _resolve_l1_owner(spec: StrategySpec) -> L1Owner:
         owner = _DEFAULT_L1_OWNER.get(kind, "engine")
         if kind not in _DEFAULT_L1_OWNER:
             logger.debug(
-                "[composable_parallel] axis %r has unknown kind %r with no default "
-                "l1_owner; falling back to %r",
+                "[composable_parallel] axis %r has unknown kind %r with no default l1_owner; falling back to %r",
                 spec.name,
                 kind,
                 owner,
             )
         else:
             logger.debug(
-                "[composable_parallel] axis %r (kind %r) declared no l1_owner; using "
-                "default %r",
+                "[composable_parallel] axis %r (kind %r) declared no l1_owner; using default %r",
                 spec.name,
                 kind,
                 owner,
@@ -198,8 +196,7 @@ def _resolve_l1_owner(spec: StrategySpec) -> L1Owner:
         # debuggable rather than swallowed.
         source = "shard_extension" if declared_owner is not None else "_DEFAULT_L1_OWNER"
         logger.debug(
-            "[composable_parallel] axis %r (kind %r) resolved invalid l1_owner %r "
-            "from %s; valid owners are %s",
+            "[composable_parallel] axis %r (kind %r) resolved invalid l1_owner %r from %s; valid owners are %s",
             spec.name,
             kind,
             owner,
