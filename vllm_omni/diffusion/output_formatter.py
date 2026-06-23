@@ -70,7 +70,11 @@ def normalize_diffusion_postprocess_output(
     )
 
 
-def format_empty_diffusion_outputs(request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
+def format_empty_diffusion_outputs(
+    request: OmniDiffusionRequest,
+    *,
+    finished: bool = True,
+) -> list[OmniRequestOutput]:
     return [
         OmniRequestOutput.from_diffusion(
             request_id=request.request_id,
@@ -78,6 +82,7 @@ def format_empty_diffusion_outputs(request: OmniDiffusionRequest) -> list[OmniRe
             prompt=prompt,
             metrics={},
             latents=None,
+            finished=finished,
         )
         for prompt in request.prompts
     ]
@@ -125,6 +130,7 @@ def format_diffusion_outputs(
             is_text_output=is_text_output,
             is_audio_output=is_audio_output,
             audio_sample_rate=audio_sample_rate,
+            finished=diffusion_output.finished,
         )
 
     return _format_multi_prompt_outputs(
@@ -135,6 +141,7 @@ def format_diffusion_outputs(
         postprocess_output=postprocess_output,
         is_audio_output=is_audio_output,
         audio_sample_rate=audio_sample_rate,
+        finished=diffusion_output.finished,
     )
 
 
@@ -185,6 +192,7 @@ def _format_single_prompt_output(
     is_text_output: bool,
     is_audio_output: bool,
     audio_sample_rate: int | None,
+    finished: bool = True,
 ) -> list[OmniRequestOutput]:
     prompt = request.prompts[0]
     request_id = request.request_id
@@ -202,6 +210,7 @@ def _format_single_prompt_output(
                 final_output_type="text",
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
+                finished=finished,
             ),
         ]
 
@@ -227,6 +236,7 @@ def _format_single_prompt_output(
                 final_output_type="audio",
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
+                finished=finished,
             ),
         ]
 
@@ -245,6 +255,7 @@ def _format_single_prompt_output(
             multimodal_output=mm_output,
             stage_durations=diffusion_output.stage_durations,
             peak_memory_mb=diffusion_output.peak_memory_mb,
+            finished=finished,
         ),
     ]
 
@@ -258,6 +269,7 @@ def _format_multi_prompt_outputs(
     postprocess_output: DiffusionPostprocessOutput,
     is_audio_output: bool,
     audio_sample_rate: int | None,
+    finished: bool = True,
 ) -> list[OmniRequestOutput]:
     results = []
     output_idx = 0
@@ -298,6 +310,7 @@ def _format_multi_prompt_outputs(
                     final_output_type="audio",
                     stage_durations=diffusion_output.stage_durations,
                     peak_memory_mb=diffusion_output.peak_memory_mb,
+                    finished=finished,
                 ),
             )
             continue
@@ -337,6 +350,7 @@ def _format_multi_prompt_outputs(
                 multimodal_output=mm_output,
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
+                finished=finished,
             ),
         )
 
