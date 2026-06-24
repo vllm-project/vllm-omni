@@ -375,6 +375,22 @@ def test_malformed_codec_length_warning_is_rate_limited():
     assert out2.multimodal_outputs["model_outputs"][0].numel() == 0
 
 
+def test_forward_emits_zero_samples_for_empty_codec_payload():
+    """Consumer side of #4463.
+
+    The empty-but-finished payload that ``talker2code2wav_full_payload`` now
+    returns on a degenerate take carries a zero-length ``codes.audio``. Code2Wav
+    must turn that into a 0-sample output (finishing the request) so the Stage-1
+    wait gate releases, rather than stalling the pipeline to the connector
+    timeout.
+    """
+    model = _make_model()
+
+    out = model.forward(input_ids=torch.zeros(0, dtype=torch.long))
+
+    assert out.multimodal_outputs["model_outputs"][0].numel() == 0
+
+
 def test_forward_batches_equal_length_requests_in_one_decoder_call():
     model = _make_model()
 

@@ -29,6 +29,7 @@ from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
     CreateAudio,
+    OpenAICreateAudioGenerateRequest,
     OpenAICreateSpeechRequest,
     SpeechBatchItem,
     StreamingSpeechSessionConfig,
@@ -1826,14 +1827,26 @@ class TestFileValidationFunctions:
 
 
 class TestStreamingProtocolValidation:
-    """Unit tests for the stream field validators in OpenAICreateSpeechRequest."""
+    """Unit tests for streaming validators in OpenAICreateSpeechRequest."""
+
+    def test_default_is_non_streaming(self):
+        req = OpenAICreateSpeechRequest(input="Hello")
+        assert req.stream is False
+        assert req.stream_format is None
+        assert req.is_streaming() is False
 
     def test_stream_validation_errors(self):
-        """stream=True requires response_format not in ('pcm', 'wav') and speed=1.0."""
+        """stream=True requires response_format in ('pcm', 'wav') and speed=1.0."""
         with pytest.raises(ValidationError, match="requires response_format='pcm' or 'wav'"):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="mp3")
         with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
+
+    def test_stream_format_audio_validation_errors(self):
+        with pytest.raises(ValidationError, match="requires response_format='pcm' or 'wav'"):
+            OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="mp3")
+        with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
+            OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="pcm", speed=2.0)
 
     def test_stream_valid(self):
         """stream=True + response_format in ('pcm', 'wav') + speed=1.0 is accepted."""
@@ -1843,10 +1856,17 @@ class TestStreamingProtocolValidation:
         req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="wav")
         assert req.stream is True
 
-    def test_sse_stream_format_is_blocked(self):
-        """stream_format='sse' is blocked."""
-        with pytest.raises(ValidationError, match="sse"):
-            OpenAICreateSpeechRequest(input="Hello", stream_format="sse")
+    def test_stream_format_audio_is_valid(self):
+        req = OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="pcm")
+        assert req.stream_format == "audio"
+        assert req.is_raw_audio_stream() is True
+
+    def test_sse_stream_format_is_valid(self):
+        """stream_format='sse' is accepted for /audio/speech."""
+        req = OpenAICreateSpeechRequest(input="Hello", stream_format="sse")
+
+        assert req.stream_format == "sse"
+        assert req.is_sse_stream() is True
 
 
 class TestStreamingResponse:
@@ -1926,6 +1946,146 @@ class TestStreamingResponse:
         assert response.status_code == 200
         assert "audio/pcm" in response.headers["content-type"]
         assert len(response.content) > 0
+
+    def test_stream_format_audio_streaming(self, streaming_app):
+        """stream_format=audio without stream=True returns raw audio/pcm chunks."""
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "audio", "response_format": "pcm"},
+        )
+        assert response.status_code == 200
+        assert "audio/pcm" in response.headers["content-type"]
+        assert "text/event-stream" not in response.headers["content-type"]
+        assert len(response.content) > 0
+
+    def test_sse_streaming(self, streaming_app):
+        """stream_format=sse without stream=True returns audio deltas as SSE."""
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "sse", "response_format": "pcm"},
+        )
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        body = response.text
+        assert "event: speech.audio.delta" in body
+        assert "event: speech.audio.done" in body
+        data_line = next(line for line in body.splitlines() if line.startswith("data: "))
+        payload = json.loads(data_line.removeprefix("data: "))
+        assert payload["type"] == "speech.audio.delta"
+        assert payload["response_format"] == "pcm"
+        assert base64.b64decode(payload["audio"])
+
+    def test_stream_true_prefers_raw_audio_over_sse(self, streaming_app):
+        """stream=True keeps the existing raw audio stream behavior even with stream_format=sse."""
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "stream_format": "sse", "response_format": "pcm"},
+        )
+
+        assert response.status_code == 200
+        assert "audio/pcm" in response.headers["content-type"]
+        assert "text/event-stream" not in response.headers["content-type"]
+        assert len(response.content) > 0
+
+    def test_sse_rejects_unsupported_response_format(self, streaming_app):
+        """stream_format=sse with a non-pcm/wav format must fail before streaming starts."""
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "sse", "response_format": "mp3"},
+        )
+
+        assert response.status_code in (400, 422)
+        assert "text/event-stream" not in response.headers.get("content-type", "")
+
+    def test_sse_rejects_speed_adjustment(self, streaming_app):
+        """stream_format=sse with speed != 1.0 must fail before streaming starts."""
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "sse", "response_format": "pcm", "speed": 2.0},
+        )
+
+        assert response.status_code in (400, 422)
+        assert "text/event-stream" not in response.headers.get("content-type", "")
+
+    def test_stream_format_audio_rejects_unsupported_response_format(self, streaming_app):
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "audio", "response_format": "mp3"},
+        )
+
+        assert response.status_code in (400, 422)
+        assert "audio/" not in response.headers.get("content-type", "")
+
+    def test_stream_format_audio_rejects_speed_adjustment(self, streaming_app):
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "audio", "response_format": "pcm", "speed": 2.0},
+        )
+
+        assert response.status_code in (400, 422)
+        assert "audio/" not in response.headers.get("content-type", "")
+
+    @pytest.fixture
+    def erroring_streaming_app(self, mocker: MockerFixture):
+        """Test app whose mock engine raises mid-stream, to exercise the SSE error event."""
+
+        async def mock_generate_streaming(*args, **kwargs):
+            raise RuntimeError("boom: simulated engine failure")
+            yield  # pragma: no cover - generator marker, unreachable
+
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
+        mock_engine_client.default_sampling_params_list = [{}]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        speech_server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+
+        original_create_speech = speech_server.create_speech
+        sig = signature(original_create_speech)
+        new_parameters = [p for name, p in sig.parameters.items() if name != "raw_request"]
+        new_sig = Signature(parameters=new_parameters, return_annotation=sig.return_annotation)
+
+        async def awaitable_create_speech(*args, **kwargs):
+            return await original_create_speech(*args, **kwargs)
+
+        awaitable_create_speech.__signature__ = new_sig
+        speech_server.create_speech = awaitable_create_speech
+
+        app = FastAPI()
+        app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
+        return app
+
+    def test_sse_emits_error_event_on_generator_failure(self, erroring_streaming_app):
+        """An exception inside the SSE generator must surface as a speech.audio.error event."""
+        client = TestClient(erroring_streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "sse", "response_format": "pcm"},
+        )
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        body = response.text
+        assert "event: speech.audio.error" in body
+        error_line = next(line for line in body.splitlines() if line.startswith("data: "))
+        payload = json.loads(error_line.removeprefix("data: "))
+        assert payload["type"] == "speech.audio.error"
+        assert "error" in payload
+        assert payload["error"]["message"]
 
     def test_non_streaming_unchanged(self, streaming_app):
         """Non-streaming path must still return audio/wav."""
@@ -2133,26 +2293,260 @@ def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixt
         )
     )
 
+    raw_request = _make_api_server_request(handler, path="/v1/audio/speech")
+    request = OpenAICreateSpeechRequest(input="Hello")
+
+    response = asyncio.run(api_server_module.create_speech(request, raw_request))
+
+    _assert_openai_error_response(response, status_code=400, message="bad request")
+
+
+def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/audio/voices") -> Request:
     app = FastAPI()
     app.state.openai_serving_speech = handler
     scope = {
         "type": "http",
         "app": app,
-        "method": "POST",
-        "path": "/v1/audio/speech",
+        "method": method,
+        "path": path,
         "headers": [],
         "query_string": b"",
         "client": ("127.0.0.1", 12345),
         "server": ("testserver", 80),
         "scheme": "http",
     }
-    raw_request = Request(scope)
+    return Request(scope)
+
+
+def _patch_api_server_base(mocker: MockerFixture):
+    def _fake_create_error_response(message, err_type="BadRequestError", status_code=400, param=None):
+        return ErrorResponse(
+            error=ErrorInfo(
+                message=message,
+                type=err_type,
+                param=param,
+                code=getattr(status_code, "value", status_code),
+            )
+        )
+
+    fake_base = mocker.MagicMock()
+    fake_base.create_error_response.side_effect = _fake_create_error_response
+    mocker.patch.object(api_server_module, "base", return_value=fake_base)
+    return fake_base
+
+
+def _assert_openai_error_response(
+    response: JSONResponse,
+    *,
+    status_code: int,
+    message: str,
+    err_type: str = "BadRequestError",
+) -> None:
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == status_code
+    body = json.loads(response.body)
+    assert body["error"]["code"] == status_code
+    assert body["error"]["type"] == err_type
+    assert message in body["error"]["message"]
+
+
+def test_api_server_list_voices_without_speech_handler_returns_404(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(None, method="GET")
+
+    response = asyncio.run(api_server_module.list_voices(raw_request))
+
+    _assert_openai_error_response(
+        response, status_code=404, message="does not support Speech API", err_type="NotFoundError"
+    )
+
+
+def test_api_server_upload_voice_value_error_returns_400(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    handler = mocker.MagicMock()
+    handler.upload_voice = mocker.AsyncMock(side_effect=ValueError("Unsupported MIME type: audio/x-m4a"))
+    raw_request = _make_api_server_request(handler)
+
+    response = asyncio.run(
+        api_server_module.upload_voice(
+            raw_request,
+            audio_sample=mocker.MagicMock(),
+            speaker_embedding=None,
+            consent="cons_test",
+            name="probe",
+        )
+    )
+
+    _assert_openai_error_response(response, status_code=400, message="Unsupported MIME type")
+
+
+def test_api_server_upload_voice_without_speech_handler_returns_404(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(None)
+
+    response = asyncio.run(
+        api_server_module.upload_voice(
+            raw_request,
+            consent="cons_test",
+            name="probe",
+        )
+    )
+
+    _assert_openai_error_response(
+        response, status_code=404, message="does not support Speech API", err_type="NotFoundError"
+    )
+
+
+def test_api_server_upload_voice_without_input_returns_400(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(mocker.MagicMock())
+
+    response = asyncio.run(
+        api_server_module.upload_voice(
+            raw_request,
+            audio_sample=None,
+            speaker_embedding=None,
+            consent="cons_test",
+            name="probe",
+        )
+    )
+
+    _assert_openai_error_response(response, status_code=400, message="must be provided")
+
+
+def test_api_server_upload_voice_with_audio_and_embedding_returns_400(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(mocker.MagicMock())
+
+    response = asyncio.run(
+        api_server_module.upload_voice(
+            raw_request,
+            audio_sample=mocker.MagicMock(),
+            speaker_embedding="[0.1]",
+            consent="cons_test",
+            name="probe",
+        )
+    )
+
+    _assert_openai_error_response(response, status_code=400, message="mutually exclusive")
+
+
+def test_api_server_upload_voice_exception_returns_500(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    handler = mocker.MagicMock()
+    handler.upload_voice = mocker.AsyncMock(side_effect=RuntimeError("disk failed"))
+    raw_request = _make_api_server_request(handler)
+
+    response = asyncio.run(
+        api_server_module.upload_voice(
+            raw_request,
+            audio_sample=mocker.MagicMock(),
+            speaker_embedding=None,
+            consent="cons_test",
+            name="probe",
+        )
+    )
+
+    _assert_openai_error_response(
+        response,
+        status_code=500,
+        message="Failed to upload voice",
+        err_type="InternalServerError",
+    )
+
+
+def test_api_server_delete_voice_without_speech_handler_returns_404(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(None, method="DELETE", path="/v1/audio/voices/probe")
+
+    response = asyncio.run(api_server_module.delete_voice("probe", raw_request))
+
+    _assert_openai_error_response(
+        response, status_code=404, message="does not support Speech API", err_type="NotFoundError"
+    )
+
+
+def test_api_server_delete_voice_value_error_returns_400(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    handler = mocker.MagicMock()
+    handler.delete_voice = mocker.AsyncMock(side_effect=ValueError("Invalid voice name"))
+    raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/probe")
+
+    response = asyncio.run(api_server_module.delete_voice("probe", raw_request))
+
+    _assert_openai_error_response(response, status_code=400, message="Invalid voice name")
+
+
+def test_api_server_delete_voice_not_found_returns_404(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    handler = mocker.MagicMock()
+    handler.delete_voice = mocker.AsyncMock(return_value=False)
+    raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/missing")
+
+    response = asyncio.run(api_server_module.delete_voice("missing", raw_request))
+
+    _assert_openai_error_response(
+        response,
+        status_code=404,
+        message="Voice 'missing' not found",
+        err_type="NotFoundError",
+    )
+
+
+def test_api_server_delete_voice_exception_returns_500(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    handler = mocker.MagicMock()
+    handler.delete_voice = mocker.AsyncMock(side_effect=RuntimeError("disk failed"))
+    raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/probe")
+
+    response = asyncio.run(api_server_module.delete_voice("probe", raw_request))
+
+    _assert_openai_error_response(
+        response,
+        status_code=500,
+        message="Failed to delete voice",
+        err_type="InternalServerError",
+    )
+
+
+def test_api_server_create_speech_without_handler_returns_404(mocker: MockerFixture):
+    fake_base = _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(None, path="/v1/audio/speech")
+    raw_request.app.state.openai_serving_tokenization = fake_base
     request = OpenAICreateSpeechRequest(input="Hello")
 
     response = asyncio.run(api_server_module.create_speech(request, raw_request))
 
-    assert isinstance(response, JSONResponse)
-    assert response.status_code == 400
+    _assert_openai_error_response(
+        response, status_code=404, message="does not support Speech API", err_type="NotFoundError"
+    )
+
+
+def test_api_server_create_speech_batch_without_handler_returns_404(mocker: MockerFixture):
+    fake_base = _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(None, path="/v1/audio/speech/batch")
+    raw_request.app.state.openai_serving_tokenization = fake_base
+    request = BatchSpeechRequest(items=[SpeechBatchItem(input="hi")])
+
+    response = asyncio.run(api_server_module.create_speech_batch(request, raw_request))
+
+    _assert_openai_error_response(
+        response, status_code=404, message="does not support Speech API", err_type="NotFoundError"
+    )
+
+
+def test_api_server_create_audio_generate_without_handler_returns_404(mocker: MockerFixture):
+    fake_base = _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(None, path="/v1/audio/generate")
+    raw_request.app.state.openai_serving_audio_generate = None
+    raw_request.app.state.openai_serving_tokenization = fake_base
+    request = OpenAICreateAudioGenerateRequest(input="a bird singing")
+
+    response = asyncio.run(api_server_module.create_audio_generate(request, raw_request))
+
+    _assert_openai_error_response(
+        response, status_code=404, message="does not support Audio Generate API", err_type="NotFoundError"
+    )
 
 
 def test_api_server_create_speech_engine_error_response_includes_request_and_stage_id(mocker: MockerFixture):
@@ -2166,26 +2560,13 @@ def test_api_server_create_speech_engine_error_response_includes_request_and_sta
 
     terminate_mock = mocker.patch.object(api_server_module, "terminate_if_errored")
 
-    app = FastAPI()
-    app.state.args = SimpleNamespace(log_error_stack=False)
-    app.state.openai_serving_speech = handler
-    app.state.engine_client = SimpleNamespace(
+    raw_request = _make_api_server_request(handler, path="/v1/audio/speech")
+    raw_request.app.state.args = SimpleNamespace(log_error_stack=False)
+    raw_request.app.state.engine_client = SimpleNamespace(
         engine=SimpleNamespace(is_alive=lambda: False),
         errored=True,
     )
-    app.state.server = SimpleNamespace()
-    scope = {
-        "type": "http",
-        "app": app,
-        "method": "POST",
-        "path": "/v1/audio/speech",
-        "headers": [],
-        "query_string": b"",
-        "client": ("127.0.0.1", 12345),
-        "server": ("testserver", 80),
-        "scheme": "http",
-    }
-    raw_request = Request(scope)
+    raw_request.app.state.server = SimpleNamespace()
     raw_request.state.request_metadata = SimpleNamespace(request_id="speech-req-1")
     request = OpenAICreateSpeechRequest(input="Hello")
 
@@ -2882,6 +3263,40 @@ class TestTTSAsyncOffloading:
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
+
+    def test_prepare_speech_generation_treats_sse_as_streaming(self, qwen3_tts_server, mocker: MockerFixture):
+        """stream_format=sse should request delta-style multimodal outputs."""
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+        mock_coerce = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
+            return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
+        )
+        request = OpenAICreateSpeechRequest(input="hello", stream_format="sse")
+
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        mock_coerce.assert_called_once_with(qwen3_tts_server.engine_client.default_sampling_params_list, True)
+
+    def test_prepare_speech_generation_treats_audio_as_streaming(self, qwen3_tts_server, mocker: MockerFixture):
+        """stream_format=audio should request delta-style multimodal outputs."""
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+        mock_coerce = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
+            return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
+        )
+        request = OpenAICreateSpeechRequest(input="hello", stream_format="audio", response_format="pcm")
+
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        mock_coerce.assert_called_once_with(qwen3_tts_server.engine_client.default_sampling_params_list, True)
 
     def test_prepare_speech_generation_qwen3_voicedesign_non_streaming_mode_false(
         self, qwen3_tts_server, mocker: MockerFixture

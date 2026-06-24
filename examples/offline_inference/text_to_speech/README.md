@@ -23,6 +23,7 @@ list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
+| IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
 
 ## Common Quick Start
@@ -369,6 +370,20 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
 ```
 Streaming requires `async_chunk: true` in the stage config.
 
+### Word Timestamps
+Generate a WAV offline and a JSON sidecar with word-level timestamps from
+`Qwen/Qwen3-ForcedAligner-0.6B`:
+```bash
+python examples/offline_inference/text_to_speech/qwen3_tts/word_timestamps.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --forced-aligner Qwen/Qwen3-ForcedAligner-0.6B \
+    --text "Hello world." \
+    --output-dir /tmp/qwen3_tts_timestamps
+```
+The script writes `qwen3_tts_word_timestamps.wav` and
+`qwen3_tts_word_timestamps.json`. On machines without a local CUDA toolkit,
+set `VLLM_USE_FLASHINFER_SAMPLER=0` to avoid FlashInfer sampler JIT.
+
 ### Batched decoding
 The Code2Wav stage supports batched decoding through the SpeechTokenizer. Pass multiple prompts via `--txt-prompts` and set `--batch-size` accordingly. To raise `max_num_seqs` on either stage, point `--stage-configs-path` at a stage configs YAML with the desired values (see `vllm_omni/model_executor/stage_configs/` for templates):
 ```bash
@@ -419,6 +434,50 @@ Streaming is exposed through the online OpenAI Speech API (`stream=true`). See [
 ### Notes
 - Output: 48 kHz mono WAV.
 - Deploy config: `vllm_omni/deploy/voxcpm2.yaml` (auto-loaded by HF `model_type`).
+
+---
+
+## IndexTTS-2
+
+2-stage TTS pipeline (GPT AR talker + S2Mel CFM DiT + BigVGAN vocoder) at 22.05 kHz. Every request requires reference audio for zero-shot voice cloning. Supports emotion conditioning via audio, text, or 8-dim vector.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/indextts2/end2end.py \
+    --model IndexTeam/IndexTTS-2 \
+    --text "你好，这是一个语音合成测试。" \
+    --ref-audio /path/to/reference.wav
+```
+
+### Emotion control
+```bash
+# Emotion from reference audio
+python examples/offline_inference/text_to_speech/indextts2/end2end.py \
+    --model IndexTeam/IndexTTS-2 \
+    --text "今天天气真好！" \
+    --ref-audio /path/to/ref.wav \
+    --emo-audio /path/to/happy.wav
+
+# Emotion from 8-dim vector (happy angry sad afraid disgusted melancholy surprised calm)
+python examples/offline_inference/text_to_speech/indextts2/end2end.py \
+    --model IndexTeam/IndexTTS-2 \
+    --text "今天天气真好！" \
+    --ref-audio /path/to/ref.wav \
+    --emo-vector 1.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+
+# Emotion from text description
+python examples/offline_inference/text_to_speech/indextts2/end2end.py \
+    --model IndexTeam/IndexTTS-2 \
+    --text "今天天气真好！" \
+    --ref-audio /path/to/ref.wav \
+    --emo-text "happy and excited"
+```
+
+### Notes
+- `--ref-audio` is **required** — IndexTTS-2 does not support text-only synthesis.
+- Stage 0 (AR Talker): GPT-2 generates mel codes from text + reference audio.
+- Stage 1 (S2Mel + BigVGAN): CFM DiT converts mel codes to waveform at 22.05 kHz.
+- Deploy config: `vllm_omni/deploy/indextts2.yaml`. Stage 1 runs with `enforce_eager: true` (DiT has dynamic shapes).
 
 ---
 

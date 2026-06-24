@@ -115,6 +115,11 @@ def assert_video_diffusion_response(
     expected_height = _maybe_int(form_data.get("height"))
     expected_fps = _maybe_int(form_data.get("fps"))
 
+    # Skip num_frames assertion for Helios models because they round up frames
+    model = request_config.get("model", "")
+    if "Helios" in model:
+        expected_frames = None
+
     for vid_bytes in response.videos:
         assert_video_valid(
             vid_bytes,
