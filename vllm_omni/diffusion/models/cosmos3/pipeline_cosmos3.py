@@ -733,16 +733,11 @@ class Cosmos3OmniDiffusersPipeline(
             subfolder="scheduler",
             local_files_only=local_files_only,
         )
-        init_flow_shift = (
-            od_config.flow_shift
-            if od_config.flow_shift is not None
-            else getattr(self.scheduler.config, "flow_shift", 1.0)
-        )
-        self.scheduler = UniPCMultistepScheduler.from_config(
-            self.scheduler.config,
-            flow_shift=init_flow_shift,
-            use_karras_sigmas=False,
-        )
+        if od_config.flow_shift is not None:
+            self.scheduler = UniPCMultistepScheduler.from_config(
+                self.scheduler.config,
+                flow_shift=od_config.flow_shift,
+            )
         self._cpu_scheduler_state()
 
         # --- Video processor for post-decode ---
@@ -766,6 +761,8 @@ class Cosmos3OmniDiffusersPipeline(
         self._base_scheduler_config = self.scheduler.config
         self._engine_init_flow_shift = float(getattr(self.scheduler.config, "flow_shift", 1.0) or 1.0)
         self._current_flow_shift = self._engine_init_flow_shift
+        self._base_scheduler_use_karras_sigmas = self._scheduler_use_karras_sigmas(self.scheduler.config)
+        self._current_scheduler_use_karras_sigmas = self._base_scheduler_use_karras_sigmas
 
         self._guidance_scale = None
         self._num_timesteps = None
@@ -1406,24 +1403,38 @@ class Cosmos3OmniDiffusersPipeline(
             raise ValueError(f"Incorrect modality value in {modalities}, expected one of {accepted_modalities}.")
         return "image" in modalities
 
-    def _set_flow_shift(self, target_shift: float) -> None:
-        """Set the UniPC ``flow_shift`` to a concrete target value.
+    @staticmethod
+    def _scheduler_use_karras_sigmas(config: Any) -> bool | None:
+        value = getattr(config, "use_karras_sigmas", None)
+        return None if value is None else bool(value)
+
+    def _set_flow_shift(self, target_shift: float, *, use_karras_sigmas: bool | None = None) -> None:
+        """Set UniPC scheduler mode for a concrete request.
 
         The scheduler is rebuilt from the saved base config if
-        the target differs from the current shift.  Tracking
-        ``self._current_flow_shift`` explicitly is required because the
-        previous mode may have rebuilt the scheduler - we cannot rely on
-        ``self.scheduler.config.flow_shift`` reflecting the last requested
-        target if a rebuild was skipped via the equality check.
+        the target differs from the current shift or Karras-sigma mode.
+        Tracking explicit scheduler state is required because the previous
+        mode may have rebuilt the scheduler - we cannot rely on
+        ``self.scheduler.config`` reflecting the last requested target if a
+        rebuild was skipped via the equality check.
         """
         target = float(target_shift)
-        if target == float(self._current_flow_shift):
-            return
-        self.scheduler = UniPCMultistepScheduler.from_config(
-            self._base_scheduler_config, flow_shift=target, use_karras_sigmas=False
+        target_use_karras_sigmas = (
+            self._base_scheduler_use_karras_sigmas if use_karras_sigmas is None else bool(use_karras_sigmas)
         )
+        if (
+            target == float(self._current_flow_shift)
+            and target_use_karras_sigmas == self._current_scheduler_use_karras_sigmas
+        ):
+            return
+
+        scheduler_kwargs: dict[str, Any] = {"flow_shift": target}
+        if use_karras_sigmas is not None:
+            scheduler_kwargs["use_karras_sigmas"] = bool(use_karras_sigmas)
+        self.scheduler = UniPCMultistepScheduler.from_config(self._base_scheduler_config, **scheduler_kwargs)
         self._cpu_scheduler_state()
         self._current_flow_shift = target
+        self._current_scheduler_use_karras_sigmas = self._scheduler_use_karras_sigmas(self.scheduler.config)
 
     def _cpu_scheduler_state(self) -> None:
         # We need to move scheduler tensors to CPU, as unipc from diffusers assumes they are on CPU.
@@ -2619,7 +2630,7 @@ class Cosmos3OmniDiffusersPipeline(
 
         self._guidance_scale = guidance_scale
         self._num_timesteps = num_inference_steps
-        self._set_flow_shift(flow_shift_target)
+        self._set_flow_shift(flow_shift_target, use_karras_sigmas=False)
 
         generator = sp.generator
         if generator is None:
@@ -2918,7 +2929,7 @@ class Cosmos3OmniDiffusersPipeline(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
             or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", not action_enabled))
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", is_v2v))
 
         if action_enabled and action_video_tensor is None:
             extra_action_video = self._get_sp_param(sp, "action_video", None)
@@ -2942,7 +2953,7 @@ class Cosmos3OmniDiffusersPipeline(
 
         # Always resolve to a concrete target shift for this request, then
         # update the shared Diffusers scheduler.
-        self._set_flow_shift(flow_shift_target)
+        self._set_flow_shift(flow_shift_target, use_karras_sigmas=False if is_v2v else None)
 
         generator = sp.generator
         if generator is None:

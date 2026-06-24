@@ -110,6 +110,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
     ImageGenerationResponse,
+    ResponseFormat,
 )
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
@@ -1706,6 +1707,7 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
 @router.post(
     "/v1/images/generations",
     dependencies=[Depends(validate_json_request)],
+    response_model=None,
     responses={
         HTTPStatus.OK.value: {"model": ImageGenerationResponse},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
@@ -1714,7 +1716,9 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
     },
 )
 @with_cancellation
-async def generate_images(request: ImageGenerationRequest, raw_request: Request):
+async def generate_images(
+    request: ImageGenerationRequest, raw_request: Request
+) -> ImageGenerationResponse | StreamingResponse:
     """Generate images from text prompts using diffusion models.
 
     OpenAI DALL-E compatible endpoint for text-to-image generation.
@@ -1906,7 +1910,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         }
         if request.size:
             response_kwargs["size"] = size_str
-        return ImageGenerationResponse(**response_kwargs)
+        response = ImageGenerationResponse(**response_kwargs)
+        if request.response_format != ResponseFormat.FILE:
+            return response
+        return response.stream_response()
 
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
