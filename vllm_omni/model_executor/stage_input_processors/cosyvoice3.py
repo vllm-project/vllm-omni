@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any
 
@@ -162,7 +163,7 @@ def text2flow(
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any] | None,
+    multimodal_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -198,12 +199,14 @@ def talker2code2wav_async_chunk(
                     value = _to_cpu_tensor(info_embed.get(key))
                     if value is not None:
                         prompt_payload[key] = value
-                if isinstance(pooling_output, dict):
-                    po_embed = pooling_output.get("embed", {}) if isinstance(pooling_output.get("embed"), dict) else {}
+                if isinstance(multimodal_output, Mapping):
+                    mm_embed = multimodal_output.get("embed", {})
+                    if not isinstance(mm_embed, Mapping):
+                        mm_embed = multimodal_output
                     for key in cond_keys:
                         if key in prompt_payload:
                             continue
-                        value = _to_cpu_tensor(po_embed.get(key))
+                        value = _to_cpu_tensor(mm_embed.get(key))
                         if value is not None:
                             prompt_payload[key] = value
                 # Drop any right-padding carried from batched talker emission so

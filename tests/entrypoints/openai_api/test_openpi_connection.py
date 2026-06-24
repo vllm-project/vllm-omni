@@ -1,9 +1,7 @@
 import asyncio
-import builtins
-import sys
-import types
 from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
 import pytest
 
 from vllm_omni.entrypoints.openpi import connection as openpi_connection
@@ -52,48 +50,97 @@ def _serving_mock():
     return serving
 
 
-def test_pack_reports_clear_error_when_openpi_client_is_missing(monkeypatch):
-    real_import = builtins.__import__
+def test_pack_and_unpack_round_trip_numpy_values():
+    payload = {
+        "image": np.arange(6, dtype=np.uint8).reshape(2, 3),
+        "action": np.asarray([[1.0, 2.0]], dtype=np.float32),
+        "scalar": np.float32(3.5),
+        "nested": [{"done": np.bool_(True)}],
+    }
 
-    def import_without_openpi_client(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "openpi_client":
-            raise ModuleNotFoundError("No module named 'openpi_client'", name="openpi_client")
-        return real_import(name, globals, locals, fromlist, level)
+    decoded = openpi_connection._unpack(openpi_connection._pack(payload))
 
-    monkeypatch.setattr(builtins, "__import__", import_without_openpi_client)
-
-    with pytest.raises(ImportError) as exc_info:
-        openpi_connection._pack({"prompt": "pick up the object"})
-
-    message = str(exc_info.value)
-    assert "/v1/realtime/robot/openpi" in message
-    assert "pip install openpi-client" in message
+    np.testing.assert_array_equal(decoded["image"], payload["image"])
+    np.testing.assert_allclose(decoded["action"], payload["action"])
+    assert decoded["image"].dtype == np.uint8
+    assert decoded["action"].dtype == np.float32
+    assert decoded["scalar"] == np.float32(3.5)
+    assert decoded["nested"][0]["done"] == np.bool_(True)
 
 
-def test_pack_and_unpack_delegate_to_openpi_msgpack_numpy(monkeypatch):
-    calls = []
+def test_unpack_accepts_msgpack_numpy_marker_dicts():
+    action = np.asarray([[1.0, 2.0]], dtype=np.float32)
+    payload = {
+        b"actions": {
+            b"nd": True,
+            b"type": action.dtype.str,
+            b"kind": action.dtype.kind,
+            b"shape": action.shape,
+            b"data": action.tobytes(),
+        }
+    }
 
-    class FakeMsgpackNumpy:
-        @staticmethod
-        def packb(obj):
-            calls.append(("packb", obj))
-            return b"packed"
+    decoded = openpi_connection._unpack_numpy(payload)
 
-        @staticmethod
-        def unpackb(data):
-            calls.append(("unpackb", data))
-            return {"unpacked": data}
+    np.testing.assert_allclose(decoded[b"actions"], action)
+    assert decoded[b"actions"].flags.writeable is True
+    decoded[b"actions"][:, -1] = 0.0
+    np.testing.assert_allclose(decoded[b"actions"], np.asarray([[1.0, 0.0]], dtype=np.float32))
 
-    fake_openpi_client = types.ModuleType("openpi_client")
-    fake_openpi_client.msgpack_numpy = FakeMsgpackNumpy
-    monkeypatch.setitem(sys.modules, "openpi_client", fake_openpi_client)
 
-    assert openpi_connection._pack({"x": 1}) == b"packed"
-    assert openpi_connection._unpack(b"payload") == {"unpacked": b"payload"}
-    assert calls == [
-        ("packb", {"x": 1}),
-        ("unpackb", b"payload"),
-    ]
+def test_unpack_accepts_openpi_client_ndarray_markers():
+    image = np.arange(6, dtype=np.uint8).reshape(2, 3)
+    payload = {
+        "observation/exterior_image_0_left": {
+            b"__ndarray__": True,
+            b"dtype": image.dtype.str,
+            b"shape": image.shape,
+            b"data": image.tobytes(),
+        }
+    }
+
+    decoded = openpi_connection._unpack_numpy(payload)
+
+    np.testing.assert_array_equal(decoded["observation/exterior_image_0_left"], image)
+    assert decoded["observation/exterior_image_0_left"].dtype == np.uint8
+
+
+def test_unpack_openpi_client_packed_observation():
+    openpi_msgpack = pytest.importorskip("openpi_client.msgpack_numpy")
+    image = np.zeros((180, 320, 3), dtype=np.uint8)
+    obs = {
+        "observation/exterior_image_0_left": image,
+        "observation/joint_position": np.zeros(7, dtype=np.float32),
+    }
+
+    decoded = openpi_connection._unpack(openpi_msgpack.packb(obs))
+
+    np.testing.assert_array_equal(decoded["observation/exterior_image_0_left"], image)
+    np.testing.assert_allclose(decoded["observation/joint_position"], obs["observation/joint_position"])
+
+
+def test_pack_uses_openpi_client_ndarray_markers():
+    openpi_msgpack = pytest.importorskip("openpi_client.msgpack_numpy")
+    actions = np.asarray([[1.0, 2.0]], dtype=np.float32)
+
+    packed = openpi_connection._pack(actions)
+    decoded = openpi_msgpack.unpackb(packed)
+
+    np.testing.assert_allclose(decoded, actions)
+
+
+def test_unpack_leaves_user_dict_without_numpy_kind_marker_unchanged():
+    payload = {
+        "metadata": {
+            "nd": True,
+            "type": "<f4",
+            "data": b"user payload",
+        }
+    }
+
+    decoded = openpi_connection._unpack_numpy(payload)
+
+    assert decoded == payload
 
 
 def test_handle_connection_returns_structured_error_for_invalid_payload(monkeypatch):

@@ -26,14 +26,12 @@ from vllm_omni.config.stage_config import (
     DeployConfig,
     PipelineConfig,
     StageConfig,
-    StageConfigFactory,
     StageDeployConfig,
     StageExecutionType,
     StagePipelineConfig,
     StageType,
     load_deploy_config,
     merge_pipeline_deploy,
-    register_pipeline,
 )
 from vllm_omni.config.yaml_util import (
     create_config,
@@ -70,6 +68,7 @@ __all__ = [
     "StageConfig",
     "StageConfigFactory",
     "StageDeployConfig",
+    "StageType",
     "StageExecutionType",
     "StagePipelineConfig",
     "StageType",

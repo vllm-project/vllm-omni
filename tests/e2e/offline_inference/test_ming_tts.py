@@ -5,6 +5,8 @@
 
 import asyncio
 import uuid
+from collections.abc import Mapping
+from typing import Any
 
 import numpy as np
 import pytest
@@ -102,8 +104,8 @@ def _flatten_audio(audio) -> torch.Tensor:
     return torch.as_tensor(audio, dtype=torch.float32).reshape(-1).cpu()
 
 
-def _extract_audio(multimodal_output: dict) -> torch.Tensor:
-    assert isinstance(multimodal_output, dict), f"Expected dict, got {type(multimodal_output)}"
+def _extract_audio(multimodal_output: Mapping[str, Any]) -> torch.Tensor:
+    assert isinstance(multimodal_output, Mapping), f"Expected Mapping, got {type(multimodal_output)}"
     audio = multimodal_output.get("audio", multimodal_output.get("model_outputs"))
     assert audio is not None, f"No audio output found, keys={list(multimodal_output.keys())}"
     waveform = _flatten_audio(audio)
@@ -112,7 +114,7 @@ def _extract_audio(multimodal_output: dict) -> torch.Tensor:
     return waveform
 
 
-def _extract_sample_rate(multimodal_output: dict) -> int:
+def _extract_sample_rate(multimodal_output: Mapping[str, Any]) -> int:
     sample_rate = multimodal_output.get("sr")
     if sample_rate is None:
         raise RuntimeError("Expected multimodal_output['sr']")
@@ -133,29 +135,29 @@ def _extract_final_audio_outputs(outputs):
         if request_output is None:
             continue
         multimodal_output = getattr(request_output, "multimodal_output", None)
-        if isinstance(multimodal_output, dict):
+        if isinstance(multimodal_output, Mapping):
             final_outputs.append(item)
             continue
         completions = getattr(request_output, "outputs", None) or []
-        if any(isinstance(getattr(completion, "multimodal_output", None), dict) for completion in completions):
+        if any(isinstance(getattr(completion, "multimodal_output", None), Mapping) for completion in completions):
             final_outputs.append(item)
     return final_outputs
 
 
-def _extract_multimodal_output(output) -> dict:
+def _extract_multimodal_output(output) -> Mapping[str, Any]:
     multimodal_output = getattr(output, "multimodal_output", None)
-    if isinstance(multimodal_output, dict):
+    if isinstance(multimodal_output, Mapping):
         return multimodal_output
 
     request_output = getattr(output, "request_output", None)
     if request_output is not None:
         multimodal_output = getattr(request_output, "multimodal_output", None)
-        if isinstance(multimodal_output, dict):
+        if isinstance(multimodal_output, Mapping):
             return multimodal_output
         completions = getattr(request_output, "outputs", None) or []
         for completion in completions:
             multimodal_output = getattr(completion, "multimodal_output", None)
-            if isinstance(multimodal_output, dict):
+            if isinstance(multimodal_output, Mapping):
                 return multimodal_output
 
     raise AssertionError("No multimodal audio output found in Ming generate results")

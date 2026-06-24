@@ -67,6 +67,5 @@ class CovoAudioCode2WavConfig(PretrainedConfig):
         self.inference = {
             "s_steps": 10,
             "cfg_alpha": 1.0,
-            "dynamic_the": False,
             "rescale_logits": False,
         }
