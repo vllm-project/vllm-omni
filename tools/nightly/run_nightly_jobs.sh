@@ -21,6 +21,8 @@
 #   function — label has neither "Perf Test" nor "Accuracy Test" (incl. Doc, Multi-Replica, etc.)
 #   stability— fixed dfx stability scripts under tests/dfx/stability/scripts/ (see below)
 #   local    — pytest -sv -m "<MODEL_TYPE markers> and local_model" from repo root (no YAML step extract)
+#              When LABEL_SUBSTR is set, also runs matching tests/**/test_*.py and perf JSON configs under
+#              tests/dfx/perf/tests/*.json via run_benchmark.py / run_diffusion_benchmark.py.
 #   all      — no test-kind filter for YAML steps (any leaf step with pytest in test-nightly.yml)
 #
 # Model area (--model-type / MODEL_TYPE), multiple allowed (OR semantics):
@@ -36,6 +38,8 @@
 #   local (when included in TEST_TYPE):
 #     From repo root: pytest -sv -m "<markers> and local_model" (markers from MODEL_TYPE: omni, tts,
 #     diffusion; all → "(omni or tts or diffusion) and local_model"). Not filtered by nightly YAML.
+#     LABEL_SUBSTR: if set, restrict to tests/**/test_*.py basenames and tests/dfx/perf/tests/*.json
+#                   whose filename contains the substring (benchmark runner chosen by JSON family).
 #
 #   stability (when included in TEST_TYPE):
 #     From repo root: pytest -s -v tests/dfx/stability/scripts/test_stability_*.py
@@ -58,10 +62,12 @@
 # Optional environment:
 #   REPO_ROOT     - vllm-omni root (working directory for pytest); see above
 #   YML           - path to test-nightly.yml (default: $REPO_ROOT/.buildkite/test-nightly.yml)
-#   LOG_DIR       - logs + generated job scripts (default: $REPO_ROOT/logs/nightly_jobs)
+#   LOG_DIR       - logs + generated job scripts (default: $REPO_ROOT/logs/nightly_jobs);
+#                   per-job *.log plus timing_summary.log after the run
 #   TEST_TYPE     - comma-separated and/or repeated flags (default: all); see above
 #   MODEL_TYPE    - comma-separated and/or repeated flags (default: all); see above
-#   LABEL_SUBSTR  - YAML mode: substring of Buildkite step label; stability: substring of path/key/filename
+#   LABEL_SUBSTR  - YAML mode: substring of Buildkite step label; stability: substring of path/key/filename;
+#                   local: substring of test_*.py basename or tests/dfx/perf/tests/*.json filename
 #   DRY_RUN=1     - print extracted commands only; do not write scripts or run pytest
 #
 set -euo pipefail
@@ -310,6 +316,7 @@ if [[ "${DRY_RUN}" != "1" ]]; then
     rm -f "${_stale_logs[@]}"
   fi
   rm -f "${LOG_DIR}/jobs/.perf_job_keys"
+  rm -f "${LOG_DIR}/jobs/.job_timeouts"
   rm -f "${REPO_ROOT}/logs/nightly_perf_manual.xlsx"
   rm -f "${LOG_DIR}/nightly_perf_manual.xlsx"
 fi
@@ -320,6 +327,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import stat
 import sys
 from pathlib import Path
@@ -491,6 +499,28 @@ def job_key_from_step(step: dict, label: str) -> str:
     return slug
 
 
+def step_timeout_minutes(step: dict) -> int | None:
+    raw = step.get("timeout_in_minutes")
+    if raw is None:
+        return None
+    try:
+        minutes = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return minutes if minutes > 0 else None
+
+
+def _write_job_timeouts_manifest(jobs_dir: Path, job_timeouts: dict[str, int]) -> None:
+    manifest_path = jobs_dir / ".job_timeouts"
+    if job_timeouts:
+        manifest_path.write_text(
+            "\n".join(f"{k}={v}" for k, v in sorted(job_timeouts.items())) + "\n",
+            encoding="utf-8",
+        )
+    elif manifest_path.is_file():
+        manifest_path.unlink()
+
+
 # Fixed stability scripts (when stability is selected); MODEL_TYPES narrows which run.
 STABILITY_CASES: list[tuple[str, str, tuple[str, ...]]] = [
     ("stability_qwen3_omni", "tests/dfx/stability/scripts/test_stability_qwen3_omni.py", ("omni",)),
@@ -533,14 +563,148 @@ def local_pytest_marker_expr(model_types: list[str]) -> str:
     return f"({' or '.join(families)}) and local_model"
 
 
-def run_local_mode(jobs_dir: Path, model_types: list[str]) -> int:
-    """Single job: pytest -sv -m '<model markers> and local_model' (testpaths from pytest config)."""
+def local_test_files_by_filename(substr: str) -> list[str]:
+    """Return repo-relative posix paths under tests/ whose basename contains substr."""
+    tests_root = REPO_ROOT / "tests"
+    if not tests_root.is_dir():
+        return []
+    matches: list[str] = []
+    for path in sorted(tests_root.rglob("test_*.py")):
+        if substr in path.name:
+            matches.append(path.relative_to(REPO_ROOT).as_posix())
+    return matches
+
+
+PERF_TESTS_REL = Path("tests/dfx/perf/tests")
+RUN_BENCHMARK_REL = Path("tests/dfx/perf/scripts/run_benchmark.py")
+RUN_DIFFUSION_BENCHMARK_REL = Path("tests/dfx/perf/scripts/run_diffusion_benchmark.py")
+TTS_PERF_JSON_HINTS = ("test_tts", "voxcpm", "higgs_audio")
+
+
+def perf_json_model_family(json_basename: str) -> str:
+    """Classify a perf JSON config as omni, tts, or diffusion (mirrors nightly YAML runners)."""
+    name = json_basename.lower()
+    if name.startswith("test_qwen3_omni"):
+        return "omni"
+    if any(hint in name for hint in TTS_PERF_JSON_HINTS):
+        return "tts"
+    return "diffusion"
+
+
+def perf_json_runner(json_basename: str) -> Path:
+    if perf_json_model_family(json_basename) in ("omni", "tts"):
+        return RUN_BENCHMARK_REL
+    return RUN_DIFFUSION_BENCHMARK_REL
+
+
+def perf_json_matches_model_type(json_basename: str, model_types: list[str]) -> bool:
+    if "all" in model_types:
+        return True
+    return perf_json_model_family(json_basename) in model_types
+
+
+def local_perf_json_configs(substr: str, model_types: list[str]) -> list[tuple[str, str]]:
+    """Return (json_rel_posix, runner_rel_posix) for perf configs whose filename contains substr."""
+    perf_dir = REPO_ROOT / PERF_TESTS_REL
+    if not perf_dir.is_dir():
+        return []
+    matches: list[tuple[str, str]] = []
+    for path in sorted(perf_dir.glob("*.json")):
+        if substr not in path.name:
+            continue
+        if not perf_json_matches_model_type(path.name, model_types):
+            continue
+        runner = perf_json_runner(path.name)
+        if not (REPO_ROOT / runner).is_file():
+            print(f"# skip (missing runner): {runner}", file=sys.stderr)
+            continue
+        matches.append(
+            (
+                path.relative_to(REPO_ROOT).as_posix(),
+                runner.as_posix(),
+            )
+        )
+    return matches
+
+
+def _local_job_slug(label: str) -> str:
+    slug = re.sub(r"[^\w\-.]+", "_", label, flags=re.UNICODE)
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    return slug or "filter"
+
+
+def run_local_mode(
+    jobs_dir: Path,
+    model_types: list[str],
+    perf_job_keys: list[str],
+) -> int:
+    """pytest -sv -m '<model markers> and local_model'; optional LABEL_SUBSTR filters."""
     marker_expr = local_pytest_marker_expr(model_types)
-    key = "local_pytest"
+    matched = 0
+
+    if LABEL_SUBSTR:
+        rel_paths = local_test_files_by_filename(LABEL_SUBSTR)
+        perf_pairs = local_perf_json_configs(LABEL_SUBSTR, model_types)
+
+        if rel_paths:
+            paths_arg = " ".join(shlex.quote(p) for p in rel_paths)
+            pytest_line = f'pytest -sv -m "{marker_expr}" {paths_arg}'
+            slug = _local_job_slug(LABEL_SUBSTR)
+            key = f"local_pytest_{slug}"
+            header = (
+                f"# Local marker tests — MODEL_TYPE={','.join(model_types)}, "
+                f"LABEL_SUBSTR={LABEL_SUBSTR!r} (test_*.py), files: {', '.join(rel_paths)}"
+            )
+            script_lines = [
+                "#!/usr/bin/env bash",
+                header,
+                "set -euo pipefail",
+                f'cd "{REPO_ROOT}"',
+                pytest_line,
+            ]
+            _write_job_script(key, script_lines, jobs_dir)
+            matched += 1
+
+        for json_rel, runner_rel in perf_pairs:
+            json_name = Path(json_rel).name
+            pytest_line = (
+                f'pytest -s -v -m "{marker_expr}" '
+                f"{shlex.quote(runner_rel)} "
+                f"--test-config-file {shlex.quote(json_rel)}"
+            )
+            slug = _local_job_slug(Path(json_rel).stem)
+            key = f"local_perf_{slug}"
+            header = (
+                f"# Local perf benchmark — MODEL_TYPE={','.join(model_types)}, "
+                f"config={json_name!r}, runner={Path(runner_rel).name}"
+            )
+            script_lines = [
+                "#!/usr/bin/env bash",
+                header,
+                "set -euo pipefail",
+                f'cd "{REPO_ROOT}"',
+                pytest_line,
+            ]
+            _write_job_script(key, script_lines, jobs_dir)
+            if key not in perf_job_keys:
+                perf_job_keys.append(key)
+            matched += 1
+
+        if matched == 0:
+            print(
+                f"# skip local: no tests/**/test_*.py or "
+                f"tests/dfx/perf/tests/*.json filename matches "
+                f"LABEL_SUBSTR={LABEL_SUBSTR!r}",
+                file=sys.stderr,
+            )
+        return matched
+
     pytest_line = f'pytest -sv -m "{marker_expr}"'
+    key = "local_pytest"
+    header = f"# Local marker tests — MODEL_TYPE={','.join(model_types)}"
     script_lines = [
         "#!/usr/bin/env bash",
-        f"# Local marker tests — MODEL_TYPE={','.join(model_types)}",
+        header,
         "set -euo pipefail",
         f'cd "{REPO_ROOT}"',
         pytest_line,
@@ -594,13 +758,15 @@ def main() -> None:
 
     matched_stability = 0
     matched_yaml = 0
+    matched_local = 0
     perf_job_keys: list[str] = []
+    job_timeouts: dict[str, int] = {}
 
     if want_stability:
         matched_stability = run_stability_mode(jobs_dir, model_types)
 
     if want_local:
-        run_local_mode(jobs_dir, model_types)
+        matched_local = run_local_mode(jobs_dir, model_types, perf_job_keys)
 
     if needs_yaml:
         if not YML.is_file():
@@ -634,6 +800,10 @@ def main() -> None:
                 "set -euo pipefail",
                 f'cd "{REPO_ROOT}"',
             ]
+            timeout_min = step_timeout_minutes(step)
+            if timeout_min is not None:
+                script_lines.append(f"# Buildkite timeout_in_minutes: {timeout_min}")
+                job_timeouts[key] = timeout_min
             script_lines.extend(exports)
             script_lines.extend(pys)
             _write_job_script(key, script_lines, jobs_dir)
@@ -646,6 +816,7 @@ def main() -> None:
             manifest_path.write_text("\n".join(perf_job_keys) + "\n", encoding="utf-8")
         elif manifest_path.is_file():
             manifest_path.unlink()
+        _write_job_timeouts_manifest(jobs_dir, job_timeouts)
 
     errs: list[str] = []
     if want_stability and matched_stability == 0:
@@ -653,6 +824,17 @@ def main() -> None:
             f"No stability jobs matched TEST_TYPE={test_types!r} MODEL_TYPE={model_types!r} "
             f"LABEL_SUBSTR={LABEL_SUBSTR!r} under {REPO_ROOT}"
         )
+    if want_local and matched_local == 0:
+        if LABEL_SUBSTR:
+            errs.append(
+                f"No local jobs matched LABEL_SUBSTR={LABEL_SUBSTR!r} "
+                f"(tests/**/test_*.py or tests/dfx/perf/tests/*.json) "
+                f"under {REPO_ROOT}"
+            )
+        else:
+            errs.append(
+                f"Local mode produced no jobs TEST_TYPE={test_types!r} MODEL_TYPE={model_types!r}"
+            )
     if needs_yaml and matched_yaml == 0:
         errs.append(
             f"No YAML steps matched TEST_TYPE={test_types!r} MODEL_TYPE={model_types!r} "
@@ -671,28 +853,23 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   exit 0
 fi
 
+# shellcheck source=tools/run_jobs_common.sh
+source "${SCRIPT_DIR}/../run_jobs_common.sh"
+
 # Run jobs: YAML perf steps first (if manifest exists), then generate Excel (always when
 # manifest non-empty, even if some perf jobs failed; Excel uses whatever JSON exists on disk),
 # then remaining jobs. Paths align with nightly Buildkite (tests/dfx/perf/results).
 run_generated_jobs_with_tee() {
   set -o pipefail
   local any_fail=0
+  local _run_start
   local perf_list="${LOG_DIR}/jobs/.perf_job_keys"
   local -a perf_keys=()
+  _run_jobs_reset_timing
+  _run_start="$(_run_jobs_epoch_seconds)"
   if [[ -f "${perf_list}" ]] && [[ -s "${perf_list}" ]]; then
     mapfile -t perf_keys < "${perf_list}"
   fi
-
-  _run_one_job() {
-    local _job="$1"
-    local base out job_status
-    base="$(basename "${_job}" .sh)"
-    out="${LOG_DIR}/${base}.log"
-    echo "==> ${_job}  (tee ${out})" >&2
-    (cd "${REPO_ROOT}" && bash "${_job}") 2>&1 | tee "${out}"
-    job_status="${PIPESTATUS[0]}"
-    return "${job_status}"
-  }
 
   local k
   for k in "${perf_keys[@]}"; do
@@ -702,11 +879,11 @@ run_generated_jobs_with_tee() {
       any_fail=1
       continue
     fi
-    _run_one_job "${LOG_DIR}/jobs/${k}.sh" || any_fail=1
+    _run_one_job_with_timing "${LOG_DIR}/jobs/${k}.sh" || any_fail=1
   done
 
   if ((${#perf_keys[@]})); then
-    local excel_out excel_log excel_status excel_repo_logs
+    local excel_out excel_log excel_status excel_repo_logs excel_start excel_end excel_elapsed
     excel_repo_logs="${REPO_ROOT}/logs"
     mkdir -p "${excel_repo_logs}"
     excel_out="${excel_repo_logs}/nightly_perf_$(date -u +%Y%m%d-%H%M%S).xlsx"
@@ -716,6 +893,7 @@ run_generated_jobs_with_tee() {
         "(report reflects JSON already under tests/dfx/perf/results)." >&2
     fi
     echo "==> python3 tools/nightly/generate_nightly_perf_excel.py -> ${excel_out}  (tee ${excel_log})" >&2
+    excel_start="$(_run_jobs_epoch_seconds)"
     (
       cd "${REPO_ROOT}" && python3 tools/nightly/generate_nightly_perf_excel.py \
         --input-dir "${REPO_ROOT}/tests/dfx/perf/results" \
@@ -723,7 +901,13 @@ run_generated_jobs_with_tee() {
         --output-file "${excel_out}"
     ) 2>&1 | tee "${excel_log}"
     excel_status="${PIPESTATUS[0]}"
-    if [[ "${excel_status}" -ne 0 ]]; then
+    excel_end="$(_run_jobs_epoch_seconds)"
+    excel_elapsed=$((excel_end - excel_start))
+    _run_jobs_record_timing "generate_nightly_perf_excel" "${excel_elapsed}" "${excel_status}"
+    if [[ "${excel_status}" -eq 0 ]]; then
+      echo "    finished in $(_run_jobs_format_duration "${excel_elapsed}")" >&2
+    else
+      echo "    failed after $(_run_jobs_format_duration "${excel_elapsed}") (exit ${excel_status})" >&2
       any_fail=1
       echo "generate_nightly_perf_excel.py failed (exit ${excel_status}). See ${excel_log}" >&2
     fi
@@ -739,15 +923,14 @@ run_generated_jobs_with_tee() {
   for _job in "${LOG_DIR}/jobs"/*.sh; do
     base="$(basename "${_job}" .sh)"
     [[ ${_perf_done["${base}"]+isset} ]] && continue
-    _run_one_job "${_job}" || any_fail=1
+    _run_one_job_with_timing "${_job}" || any_fail=1
   done
   shopt -u nullglob
 
+  _run_jobs_print_timing_summary "${_run_start}" "${any_fail}"
   if [[ "${any_fail}" -ne 0 ]]; then
-    echo "One or more selected jobs failed. See logs under ${LOG_DIR}." >&2
     return 1
   fi
-  echo "All selected jobs finished OK. Logs: ${LOG_DIR}/*.log" >&2
   return 0
 }
 
