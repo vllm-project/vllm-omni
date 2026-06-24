@@ -253,11 +253,14 @@ python end2end.py \
 - `--base-model-dir`: optional local LongCat-Video base model directory for tokenizer, text encoder, and VAE components. Omit it to download the base components from Hugging Face.
 
 > By default, this example builds large Avatar components on CPU before moving
-> them to GPU to reduce model-loading peak VRAM. On the official 93-frame AI2V
-> example, GPU component build used about 56.8 GiB peak VRAM and loaded in
-> about 33s, while CPU component build used about 41.0 GiB peak VRAM and loaded
-> in about 130s.
-> Denoising still runs on GPU after loading. Use `--build-components-on-gpu`
-> only if startup speed is more important and your GPU has enough memory.
+> them to GPU to reduce model-loading peak VRAM. Observed on Modal H100 with
+> the official 93-frame AI2V example, `use_int8=True`, `use_distill=True`, and
+> 8 inference steps: GPU component build used about 56.8 GiB peak VRAM and
+> loaded in about 33s, while CPU component build used about 41.0 GiB peak VRAM
+> and loaded in about 130s. Denoising still runs on GPU after loading.
+>
+> These numbers are intended as memory guidance rather than a benchmark. Use
+> `--build-components-on-gpu` only if startup speed is more important and your
+> GPU has enough memory.
 
 The script saves an mp4 file with the generated frames muxed with the input audio.
