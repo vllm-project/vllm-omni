@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import torch
 import torchaudio
-from transformers import AutoTokenizer, Wav2Vec2Config, Wav2Vec2ForCTC
+from transformers import Wav2Vec2Config, Wav2Vec2ForCTC
 
 
 def _align_text_tokens(probs: torch.Tensor, text_tokens: torch.Tensor) -> list[int]:

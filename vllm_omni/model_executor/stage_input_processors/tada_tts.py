@@ -126,8 +126,9 @@ def ar2vocoder_async_chunk(
     st = getattr(transfer_manager, "_tada_stream", None)
     if st is None:
         st = transfer_manager._tada_stream = {}
-    s = st.setdefault(request_id, {"buf": torch.zeros(0, 512, dtype=torch.float32),
-                                   "emit": 0, "started": False, "last_tb": 1})
+    s = st.setdefault(
+        request_id, {"buf": torch.zeros(0, 512, dtype=torch.float32), "emit": 0, "started": False, "last_tb": 1}
+    )
 
     # Append newly generated tokens to the expanded frame buffer (row-indexed [N, 512]).
     if isinstance(multimodal_output, dict):
@@ -135,9 +136,11 @@ def ar2vocoder_async_chunk(
         if isinstance(af, torch.Tensor) and af.numel() > 0:
             af = af.detach().cpu().reshape(-1, 512)
             tbv = multimodal_output.get("time_before")
-            tbv = (tbv.detach().cpu().reshape(-1).to(torch.long)
-                   if isinstance(tbv, torch.Tensor) and tbv.numel() >= af.shape[0]
-                   else torch.ones(af.shape[0], dtype=torch.long))
+            tbv = (
+                tbv.detach().cpu().reshape(-1).to(torch.long)
+                if isinstance(tbv, torch.Tensor) and tbv.numel() >= af.shape[0]
+                else torch.ones(af.shape[0], dtype=torch.long)
+            )
             new_parts: list[torch.Tensor] = []
             for i in range(af.shape[0]):
                 tb_i = int(tbv[i].item())

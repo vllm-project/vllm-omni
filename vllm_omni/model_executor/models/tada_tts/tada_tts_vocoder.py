@@ -148,7 +148,8 @@ class TadaVocoder(nn.Module):
             window = codes.get("audio") if isinstance(codes, dict) else None
             meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
             if (
-                isinstance(window, torch.Tensor) and window.dim() == 2
+                isinstance(window, torch.Tensor)
+                and window.dim() == 2
                 and window.shape[-1] == self.acoustic_features_dim
                 and ("left_context_size" in meta or "right_holdback_size" in meta)
             ):
@@ -186,8 +187,7 @@ class TadaVocoder(nn.Module):
                     time_before = tb.to(device=device, dtype=torch.long).reshape(-1)
                 else:
                     logger.warning_once(
-                        "TadaVocoder: time_before missing/short; using 1 frame/token "
-                        "(audio timing will be wrong)"
+                        "TadaVocoder: time_before missing/short; using 1 frame/token (audio timing will be wrong)"
                     )
                     time_before = torch.ones(T, device=device, dtype=torch.long)
 
@@ -198,11 +198,17 @@ class TadaVocoder(nn.Module):
                     logger.info(
                         "TadaVocoder: %d tokens → ~%d expanded frames, upsample=%d → ~%.2f s @%d Hz "
                         "| time_before[min/mean/max]=%d/%.1f/%d | acoustic[mean/std/absmax]=%.3f/%.3f/%.3f",
-                        T, total_frames, self._upsample,
+                        T,
+                        total_frames,
+                        self._upsample,
                         total_frames * self._upsample / self._output_sample_rate,
                         self._output_sample_rate,
-                        int(tb_view.min().item()), float(tb_view.mean().item()), int(tb_view.max().item()),
-                        float(af.mean().item()), float(af.std().item()), float(af.abs().max().item()),
+                        int(tb_view.min().item()),
+                        float(tb_view.mean().item()),
+                        int(tb_view.max().item()),
+                        float(af.mean().item()),
+                        float(af.std().item()),
+                        float(af.abs().max().item()),
                     )
 
                 wav = self._decode_wav(af, time_before)  # [wav_len]
@@ -292,7 +298,8 @@ class TadaVocoder(nn.Module):
             logger.warning(
                 "TadaVocoder: expanded sequence %d > decoder max %d frames; truncating. "
                 "This indicates the AR stage did not stop (check EOS / max_tokens).",
-                expanded.shape[1], DECODER_MAX_SEQ_LEN,
+                expanded.shape[1],
+                DECODER_MAX_SEQ_LEN,
             )
             expanded = expanded[:, :DECODER_MAX_SEQ_LEN]
         decoder_dtype = next(self._decoder.parameters()).dtype
@@ -301,16 +308,15 @@ class TadaVocoder(nn.Module):
         wav = self._decoder(expanded, token_masks)  # [1, 1, wav_len]
         return wav.squeeze(0).squeeze(0).to(dtype=torch.float32).reshape(-1)
 
-    def make_omni_output(
-        self, model_outputs: torch.Tensor | OmniOutput, **_: Any
-    ) -> OmniOutput:
+    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **_: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": [model_outputs], "sr": [
-                torch.tensor(self._output_sample_rate, dtype=torch.int32)
-            ]},
+            multimodal_outputs={
+                "model_outputs": [model_outputs],
+                "sr": [torch.tensor(self._output_sample_rate, dtype=torch.int32)],
+            },
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

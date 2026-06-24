@@ -49,8 +49,7 @@ _DEFAULT_PROMPTS = [
     "Hello! I'm TADA, a text-to-speech model by Hume AI. "
     "I generate speech with natural prosody by combining language modeling "
     "with continuous acoustic feature synthesis.",
-    "The quick brown fox jumps over the lazy dog. "
-    "This sentence contains every letter of the English alphabet.",
+    "The quick brown fox jumps over the lazy dog. This sentence contains every letter of the English alphabet.",
 ]
 
 
@@ -150,8 +149,9 @@ def _get_encoder(codec_path: str, model_name: str, _cache: dict = {}):
     return _cache["enc"]
 
 
-def _build_ref_prompt(text: str, ref_audio: str, ref_text: str, model_name: str,
-                      num_transition_steps: int = 5) -> tuple[dict, int]:
+def _build_ref_prompt(
+    text: str, ref_audio: str, ref_text: str, model_name: str, num_transition_steps: int = 5
+) -> tuple[dict, int]:
     """Build a Level-2 voice-cloning prompt from a reference wav + its transcript.
 
     Encodes the reference audio to per-token acoustic features + a token→frame alignment
@@ -261,7 +261,10 @@ def _make_prompt(text: str, args, model_name: str) -> tuple[dict, int]:
         if not args.ref_text:
             raise ValueError("--ref-audio requires --ref-text (the reference transcript).")
         return _build_ref_prompt(
-            text, args.ref_audio, args.ref_text, model_name,
+            text,
+            args.ref_audio,
+            args.ref_text,
+            model_name,
             num_transition_steps=args.num_transition_steps,
         )
     return _build_prompt(text, model_name)
@@ -317,9 +320,9 @@ async def main_streaming(args):
         sampling_params_list = _stage0_sampling_params(omni, walk_len)
         t_start = time.perf_counter()
         chunk_idx = 0
-        consumed = 0                 # list case: chunks already taken
-        audio_chunks: list = []      # list case: collected new chunks
-        latest_audio = None          # tensor case: cumulative waveform-so-far
+        consumed = 0  # list case: chunks already taken
+        audio_chunks: list = []  # list case: collected new chunks
+        latest_audio = None  # tensor case: cumulative waveform-so-far
         sr = TADA_CODEC_SR
         first_audio_ts = None
 
@@ -361,7 +364,9 @@ async def main_streaming(args):
         elapsed = time.perf_counter() - t_start
         logger.info(
             "Request %s done in %.2f s (chunks=%d, first audio @ %.2fs)",
-            request_id, elapsed, chunk_idx,
+            request_id,
+            elapsed,
+            chunk_idx,
             first_audio_ts if first_audio_ts is not None else -1.0,
         )
         final = [latest_audio] if latest_audio is not None else audio_chunks
@@ -421,7 +426,7 @@ def parse_args():
         type=int,
         default=5,
         help="Level 2: transcript-tail tokens walked (and dropped) to smooth the "
-             "prompt→synthesis boundary (upstream default 5).",
+        "prompt→synthesis boundary (upstream default 5).",
     )
     parser.add_argument(
         "--streaming",

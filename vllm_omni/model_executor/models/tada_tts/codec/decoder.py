@@ -145,7 +145,6 @@ class DecoderConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-
 class Decoder(PreTrainedModel):
     config_class = DecoderConfig
 
@@ -172,7 +171,6 @@ class Decoder(PreTrainedModel):
         # used during from_pretrained). Upstream hume-tada omits it because it
         # predates that requirement.
         self.post_init()
-
 
     def forward(self, encoded_expanded: torch.Tensor, token_masks: torch.Tensor):
         decoder_input = self.decoder_proj(encoded_expanded)

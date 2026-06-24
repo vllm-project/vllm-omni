@@ -170,14 +170,18 @@ class LocalSelfAttention(torch.nn.Module):
 
 
 class LocalAttentionEncoderLayer(torch.nn.Module):
-    def __init__(self, d_model: int, num_heads: int = 8, d_ff: int | None = None, dropout: float = 0.1,
-                 max_seq_len: int = 8192):
+    def __init__(
+        self, d_model: int, num_heads: int = 8, d_ff: int | None = None, dropout: float = 0.1, max_seq_len: int = 8192
+    ):
         super().__init__()
         d_ff = d_ff or 4 * d_model
         self.self_attn = LocalSelfAttention(d_model, num_heads=num_heads, dropout=dropout, max_seq_len=max_seq_len)
         self.ffn = torch.nn.Sequential(
-            torch.nn.Linear(d_model, d_ff), torch.nn.GELU(), torch.nn.Dropout(dropout),
-            torch.nn.Linear(d_ff, d_model), torch.nn.Dropout(dropout),
+            torch.nn.Linear(d_model, d_ff),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(d_ff, d_model),
+            torch.nn.Dropout(dropout),
         )
         self.norm = torch.nn.LayerNorm(d_model)
 
@@ -187,16 +191,29 @@ class LocalAttentionEncoderLayer(torch.nn.Module):
 
 
 class LocalAttentionEncoder(torch.nn.Module):
-    def __init__(self, d_model: int, num_layers: int = 4, num_heads: int = 8, d_ff: int | None = None,
-                 dropout: float = 0.1, max_seq_len: int = 8192, d_input: int | None = None):
+    def __init__(
+        self,
+        d_model: int,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        d_ff: int | None = None,
+        dropout: float = 0.1,
+        max_seq_len: int = 8192,
+        d_input: int | None = None,
+    ):
         super().__init__()
-        self.layers = torch.nn.ModuleList([
-            LocalAttentionEncoderLayer(d_model, num_heads=num_heads, d_ff=d_ff, dropout=dropout, max_seq_len=max_seq_len)
-            for _ in range(num_layers)
-        ])
+        self.layers = torch.nn.ModuleList(
+            [
+                LocalAttentionEncoderLayer(
+                    d_model, num_heads=num_heads, d_ff=d_ff, dropout=dropout, max_seq_len=max_seq_len
+                )
+                for _ in range(num_layers)
+            ]
+        )
         self.final_norm = torch.nn.LayerNorm(d_model)
-        self.input_proj = (torch.nn.Linear(d_input, d_model) if d_input is not None and d_input != d_model
-                           else torch.nn.Identity())
+        self.input_proj = (
+            torch.nn.Linear(d_input, d_model) if d_input is not None and d_input != d_model else torch.nn.Identity()
+        )
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         x = self.input_proj(x)
@@ -248,8 +265,11 @@ class Encoder(torch.nn.Module):
             dropout=config.attn_dropout,
             max_seq_len=8192,
         )
-        self.hidden_linear = (torch.nn.Linear(config.hidden_dim, config.embed_dim)
-                              if config.hidden_dim != config.embed_dim else torch.nn.Identity())
+        self.hidden_linear = (
+            torch.nn.Linear(config.hidden_dim, config.embed_dim)
+            if config.hidden_dim != config.embed_dim
+            else torch.nn.Identity()
+        )
         self.pos_emb = torch.nn.Embedding(2, config.hidden_dim)
         self._aligner = aligner
 
@@ -258,8 +278,9 @@ class Encoder(torch.nn.Module):
         return self._aligner.tokenizer
 
     @classmethod
-    def from_local(cls, codec_path: str, tokenizer_path: str,
-                   device: torch.device | str = "cpu", dtype=torch.float32) -> "Encoder":
+    def from_local(
+        cls, codec_path: str, tokenizer_path: str, device: torch.device | str = "cpu", dtype=torch.float32
+    ) -> Encoder:
         """Build encoder + aligner and load weights from local ``<codec_path>``."""
         from safetensors.torch import load_file
         from transformers import AutoTokenizer
@@ -285,8 +306,9 @@ class Encoder(torch.nn.Module):
         return enc_out, padded_token_masks
 
     @torch.no_grad()
-    def forward(self, audio: torch.Tensor, text: list[str] | str, sample_rate: int = 24000,
-                sample: bool = False) -> EncoderOutput:
+    def forward(
+        self, audio: torch.Tensor, text: list[str] | str, sample_rate: int = 24000, sample: bool = False
+    ) -> EncoderOutput:
         if isinstance(text, str):
             text = [text]
         device = audio.device
@@ -304,12 +326,16 @@ class Encoder(torch.nn.Module):
         align = self._aligner(audio, text_tokens=text_tokens, audio_length=audio_length, sample_rate=sample_rate)
         token_positions, token_masks = align.token_positions, align.token_masks
 
-        enc_out, token_masks = self.get_encoder_outputs(audio.to(self.hidden_linear.weight.dtype
-                                                                  if isinstance(self.hidden_linear, torch.nn.Linear)
-                                                                  else audio.dtype), token_masks)
+        enc_out, token_masks = self.get_encoder_outputs(
+            audio.to(
+                self.hidden_linear.weight.dtype if isinstance(self.hidden_linear, torch.nn.Linear) else audio.dtype
+            ),
+            token_masks,
+        )
         encoded_expanded = torch.where(token_masks.unsqueeze(-1) == 0, torch.zeros_like(enc_out), enc_out)
         token_values = torch.gather(
-            encoded_expanded, 1,
+            encoded_expanded,
+            1,
             (token_positions - 1).clamp(min=0).unsqueeze(-1).expand(-1, -1, encoded_expanded.shape[-1]),
         )
         token_values = (token_values - self.config.acoustic_mean) / self.config.acoustic_std
