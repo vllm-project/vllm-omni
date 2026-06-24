@@ -71,5 +71,5 @@ def denormalize_latents(
     """Denormalize VAE latents using per-channel mean/std from VAE config."""
     z_dim = latents.shape[1]
     mean = latents_mean.view(1, z_dim, 1, 1, 1).to(latents.device, latents.dtype)
-    std = (1.0 / latents_std).view(1, z_dim, 1, 1, 1).to(latents.device, latents.dtype)
+    std = latents_std.view(1, z_dim, 1, 1, 1).to(latents.device, latents.dtype)
     return latents * std + mean
