@@ -46,9 +46,11 @@ _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str |
 
 _PIPELINE_DEPLOY_CLI_FIELDS = PIPELINE_WIDE_ENGINE_FIELDS
 
+_QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any] | None
+
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
-    quantization_config: Any
+    quantization_config: _QuantizationConfigType
     quantization: str
 
 
@@ -111,6 +113,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     cfg_parallel_size: int
     vae_patch_parallel_size: int
     use_hsdp: bool
+    mask_sp_padding: bool
     hsdp_shard_size: int
     hsdp_replicate_size: int
     enable_expert_parallel: bool
@@ -320,29 +323,35 @@ class OmniStageRuntimeConfig:
 
 @config
 class OmniStageParallelConfig:
-    """Per-stage distributed parallelism behavior."""
+    """Common per-stage distributed parallelism behavior."""
 
     pipeline_parallel_size: int = Field(default=1, ge=1)
     data_parallel_size: int = Field(default=1, ge=1)
     tensor_parallel_size: int = Field(default=1, ge=1)
-    sequence_parallel_size: int = Field(default=1, ge=1)
+    enable_expert_parallel: bool = False
+    world_size: int = Field(default=1, ge=1, init=False)
+
+    def __post_init__(self) -> None:
+        self.world_size = self.pipeline_parallel_size * self.data_parallel_size * self.tensor_parallel_size
+
+
+@config
+class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
+    """Diffusion-stage distributed parallelism behavior."""
+
+    sequence_parallel_size: int = Field(default=1, ge=1, init=False)
     ulysses_degree: int = Field(default=1, ge=1)
     ring_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
     cfg_parallel_size: int = Field(default=1, ge=1, le=3)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     use_hsdp: bool = False
+    mask_sp_padding: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = Field(default=1, ge=1)
-    enable_expert_parallel: bool = False
-    world_size: int = Field(default=1, ge=1)
 
     def __post_init__(self) -> None:
-        if self.sequence_parallel_size != self.ulysses_degree * self.ring_degree:
-            raise ValueError(
-                f"sequence_parallel_size ({self.sequence_parallel_size}) must equal "
-                f"ulysses_degree * ring_degree ({self.ulysses_degree * self.ring_degree})"
-            )
+        self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
 
@@ -462,7 +471,7 @@ class _DiffusionConfigProjection:
     additional_config: dict[str, Any] = field(default_factory=dict)
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
-    quantization_config: Any = None
+    quantization_config: _QuantizationConfigType = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -807,7 +816,7 @@ class BaseVllmOmniStageConfig:
     connector_config: OmniStageConnectorConfig = field(default_factory=OmniStageConnectorConfig)
     runtime_config: OmniStageRuntimeConfig = field(default_factory=OmniStageRuntimeConfig)
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
-    quantization_config: Any = None
+    quantization_config: _QuantizationConfigType = None
 
     @property
     def stage_id(self) -> int:
@@ -901,10 +910,11 @@ class VllmOmniGenerationStageConfig(BaseVllmOmniStageConfig):
 class VllmOmniDiffusionStageConfig(BaseVllmOmniStageConfig):
     """Structured config for diffusion stages."""
 
+    parallel_config: OmniStageDiffusionParallelConfig = field(default_factory=OmniStageDiffusionParallelConfig)
     diffusion_config: _DiffusionConfigProjection = field(default_factory=_DiffusionConfigProjection)
 
 
-StageConfigLike: TypeAlias = VllmOmniARStageConfig | VllmOmniGenerationStageConfig | VllmOmniDiffusionStageConfig
+StageConfigType: TypeAlias = VllmOmniARStageConfig | VllmOmniGenerationStageConfig | VllmOmniDiffusionStageConfig
 
 
 def _build_common_stage_config_kwargs(
@@ -912,10 +922,11 @@ def _build_common_stage_config_kwargs(
     topology: StagePipelineConfig,
     stage_deploy: StageDeployConfig | None,
     engine: _StageEngineValues,
+    parallel_config_cls: type[OmniStageParallelConfig] = OmniStageParallelConfig,
 ) -> tuple[dict[str, Any], str | None, str | None]:
     input_proc, next_stage_proc = _select_processor_funcs(topology, bool(deploy.async_chunk))
     quantization_config = _build_quantization_config(deploy, engine.quantization)
-    parallel_config = _build_parallel_config(deploy, engine.parallel)
+    parallel_config = _build_parallel_config(deploy, engine.parallel, parallel_config_cls)
 
     return (
         {
@@ -935,10 +946,10 @@ def _build_common_stage_config_kwargs(
 
 
 def _with_resolved_processors(
-    stage_config: StageConfigLike,
+    stage_config: StageConfigType,
     input_proc: str | None,
     next_stage_proc: str | None,
-) -> StageConfigLike:
+) -> StageConfigType:
     stage_config._resolved_custom_process_input_func = input_proc
     stage_config._resolved_custom_process_next_stage_input_func = next_stage_proc
     return stage_config
@@ -1008,6 +1019,7 @@ def _build_diffusion_stage_config(
         topology,
         stage_deploy,
         engine,
+        OmniStageDiffusionParallelConfig,
     )
     common_kwargs["diffusion_config"] = _build_diffusion_config_projection(
         pipeline,
@@ -1042,7 +1054,7 @@ def _build_stage_config(
     engine: _StageEngineValues,
     *,
     model: str | None,
-) -> StageConfigLike:
+) -> StageConfigType:
     try:
         builder = _STAGE_CONFIG_BUILDERS[topology.execution_type]
     except KeyError as exc:
@@ -1057,7 +1069,10 @@ def _build_stage_config(
     )
 
 
-def _build_quantization_config(deploy: DeployConfig, engine: _QuantizationEngineOverrides) -> Any:
+def _build_quantization_config(
+    deploy: DeployConfig,
+    engine: _QuantizationEngineOverrides,
+) -> _QuantizationConfigType:
     return _first_defined(
         engine.get("quantization_config"),
         engine.get("quantization"),
@@ -1132,22 +1147,24 @@ def _build_runtime_config(
 def _build_parallel_config(
     deploy: DeployConfig,
     engine: _ParallelEngineOverrides,
+    config_cls: type[OmniStageParallelConfig] = OmniStageParallelConfig,
 ) -> OmniStageParallelConfig:
     parallel_config = _mapping_or_empty(engine.get("parallel_config"))
+    config_fields = {
+        config_field.name
+        for config_field in fields(config_cls)
+        if getattr(config_field.default, "init", None) is not False
+    }
     kwargs = {
         name: _copy_value(value) for name in _PARALLEL_CONFIG_ENGINE_FIELDS if (value := engine.get(name)) is not None
     }
-    kwargs.update(_config_kwargs(parallel_config))
+    kwargs = {name: value for name, value in kwargs.items() if name in config_fields}
+    kwargs.update({name: value for name, value in _config_kwargs(parallel_config).items() if name in config_fields})
     if "pipeline_parallel_size" not in kwargs and deploy.pipeline_parallel_size is not None:
         kwargs["pipeline_parallel_size"] = _copy_value(deploy.pipeline_parallel_size)
     if "data_parallel_size" not in kwargs and deploy.data_parallel_size is not None:
         kwargs["data_parallel_size"] = _copy_value(deploy.data_parallel_size)
-    if "sequence_parallel_size" not in kwargs and ("ulysses_degree" in kwargs or "ring_degree" in kwargs):
-        base_parallel = OmniStageParallelConfig()
-        kwargs["sequence_parallel_size"] = kwargs.get("ulysses_degree", base_parallel.ulysses_degree) * kwargs.get(
-            "ring_degree", base_parallel.ring_degree
-        )
-    return OmniStageParallelConfig(**kwargs)
+    return config_cls(**kwargs)
 
 
 def _build_diffusion_config_projection(
@@ -1157,7 +1174,7 @@ def _build_diffusion_config_projection(
     engine: _DiffusionEngineOverrides,
     *,
     model: str | None,
-    quantization_config: Any,
+    quantization_config: _QuantizationConfigType,
 ) -> _DiffusionConfigProjection:
     diffusion_kwargs = engine.to_kwargs()
     diffusion_kwargs["stage_id"] = topology.stage_id
@@ -1185,10 +1202,10 @@ class VllmOmniConfig:
     """Top-level structured Omni config built once from registry inputs."""
 
     pipeline_config: PipelineConfig
-    stage_configs: tuple[StageConfigLike, ...]
+    stage_configs: tuple[StageConfigType, ...]
     orchestrator_config: VllmOmniOrchestratorConfig = field(default_factory=VllmOmniOrchestratorConfig)
 
-    def stage_by_id(self, stage_id: int) -> StageConfigLike:
+    def stage_by_id(self, stage_id: int) -> StageConfigType:
         for stage in self.stage_configs:
             if stage.stage_id == stage_id:
                 return stage
@@ -1266,10 +1283,11 @@ __all__ = [
     "OmniStageLoadConfig",
     "OmniStageModelConfig",
     "VllmOmniOrchestratorConfig",
+    "OmniStageDiffusionParallelConfig",
     "OmniStageParallelConfig",
     "OmniStageRuntimeConfig",
     "OmniStageSchedulerConfig",
-    "StageConfigLike",
+    "StageConfigType",
     "VllmOmniARStageConfig",
     "VllmOmniConfig",
     "VllmOmniDiffusionStageConfig",

@@ -15,6 +15,7 @@ from vllm_omni.config.omni_config import (
     BaseVllmOmniStageConfig,
     OmniStageCacheConfig,
     OmniStageConnectorConfig,
+    OmniStageDiffusionParallelConfig,
     OmniStageLoadConfig,
     OmniStageModelConfig,
     OmniStageParallelConfig,
@@ -245,12 +246,14 @@ def test_public_config_exports_use_stage_specific_sub_config_names():
     assert {
         "OmniStageCacheConfig",
         "OmniStageConnectorConfig",
+        "OmniStageDiffusionParallelConfig",
         "OmniStageLoadConfig",
         "OmniStageModelConfig",
         "VllmOmniOrchestratorConfig",
         "OmniStageParallelConfig",
         "OmniStageRuntimeConfig",
         "OmniStageSchedulerConfig",
+        "StageConfigType",
     }.issubset(config_pkg.__all__)
 
 
@@ -397,6 +400,13 @@ def test_sub_config_fields_match_rfc_scopes():
         "pipeline_parallel_size",
         "data_parallel_size",
         "tensor_parallel_size",
+        "enable_expert_parallel",
+        "world_size",
+    }
+    assert {f.name for f in fields(OmniStageDiffusionParallelConfig)} == {
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "tensor_parallel_size",
         "sequence_parallel_size",
         "ulysses_degree",
         "ring_degree",
@@ -404,6 +414,7 @@ def test_sub_config_fields_match_rfc_scopes():
         "cfg_parallel_size",
         "vae_patch_parallel_size",
         "use_hsdp",
+        "mask_sp_padding",
         "hsdp_shard_size",
         "hsdp_replicate_size",
         "enable_expert_parallel",
@@ -411,22 +422,46 @@ def test_sub_config_fields_match_rfc_scopes():
     }
 
 
-def test_parallel_config_keeps_current_diffusion_parallel_surface():
-    cfg = OmniStageParallelConfig(
+def test_diffusion_parallel_config_fields_cover_legacy_surface():
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+    legacy_fields = {f.name for f in fields(DiffusionParallelConfig)}
+    structured_fields = {f.name for f in fields(OmniStageDiffusionParallelConfig)}
+    expected_upstream_fields = {"mask_sp_padding"}
+
+    assert legacy_fields | expected_upstream_fields <= structured_fields
+    assert structured_fields - legacy_fields - expected_upstream_fields == {"world_size"}
+
+
+def test_diffusion_parallel_config_keeps_current_diffusion_parallel_surface():
+    cfg = OmniStageDiffusionParallelConfig(
         pipeline_parallel_size=2,
         data_parallel_size=3,
         tensor_parallel_size=4,
         cfg_parallel_size=3,
+        mask_sp_padding=True,
     )
 
     assert cfg.pipeline_parallel_size == 2
     assert cfg.data_parallel_size == 3
     assert cfg.cfg_parallel_size == 3
+    assert cfg.mask_sp_padding is True
     assert cfg.world_size == 72
 
 
-def test_parallel_config_matches_diffusion_parallel_world_size_for_vae_patch_parallel():
-    cfg = OmniStageParallelConfig(
+def test_parallel_config_derived_fields_are_not_init_inputs():
+    with pytest.raises(ValidationError):
+        OmniStageParallelConfig(world_size=4)
+
+    with pytest.raises(ValidationError):
+        OmniStageDiffusionParallelConfig(world_size=4)
+
+    with pytest.raises(ValidationError):
+        OmniStageDiffusionParallelConfig(sequence_parallel_size=2)
+
+
+def test_diffusion_parallel_config_matches_diffusion_parallel_world_size_for_vae_patch_parallel():
+    cfg = OmniStageDiffusionParallelConfig(
         tensor_parallel_size=2,
         cfg_parallel_size=2,
         vae_patch_parallel_size=4,
@@ -436,10 +471,9 @@ def test_parallel_config_matches_diffusion_parallel_world_size_for_vae_patch_par
     assert cfg.world_size == 4
 
 
-def test_parallel_config_supports_diffusion_hsdp_auto_sharding():
-    cfg = OmniStageParallelConfig(
+def test_diffusion_parallel_config_supports_diffusion_hsdp_auto_sharding():
+    cfg = OmniStageDiffusionParallelConfig(
         pipeline_parallel_size=2,
-        sequence_parallel_size=2,
         ulysses_degree=2,
         use_hsdp=True,
         hsdp_shard_size=-1,
@@ -450,12 +484,12 @@ def test_parallel_config_supports_diffusion_hsdp_auto_sharding():
     assert cfg.world_size == 4
 
 
-def test_parallel_config_rejects_diffusion_hsdp_with_tp_or_dp():
+def test_diffusion_parallel_config_rejects_hsdp_with_tp_or_dp():
     with pytest.raises(ValueError, match="cannot be used with TP or DP"):
-        OmniStageParallelConfig(tensor_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
+        OmniStageDiffusionParallelConfig(tensor_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
 
     with pytest.raises(ValueError, match="cannot be used with TP or DP"):
-        OmniStageParallelConfig(data_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
+        OmniStageDiffusionParallelConfig(data_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
 
 
 def test_from_registry_preserves_legacy_pp_dp_for_world_size():
@@ -467,9 +501,79 @@ def test_from_registry_preserves_legacy_pp_dp_for_world_size():
     assert cfg.world_size == 4
 
 
-def test_parallel_config_rejects_cfg_parallel_size_outside_current_bound():
+def test_from_registry_derives_sequence_parallel_size_from_degrees(tmp_path):
+    deploy_path = tmp_path / "dreamzero_derived_parallel.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    parallel_config:",
+                "      sequence_parallel_size: 99",
+                "      ulysses_degree: 2",
+                "      ring_degree: 3",
+            ]
+        )
+    )
+
+    stage = VllmOmniConfig.from_registry("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.parallel_config.sequence_parallel_size == 6
+    assert stage.parallel_config.world_size == 6
+
+
+def test_diffusion_parallel_config_rejects_cfg_parallel_size_outside_current_bound():
     with pytest.raises(ValidationError):
-        OmniStageParallelConfig(cfg_parallel_size=4)
+        OmniStageDiffusionParallelConfig(cfg_parallel_size=4)
+
+
+def test_stage_realizations_use_stage_specific_parallel_config_types():
+    qwen_config = VllmOmniConfig.from_registry("qwen3_tts")
+    ar_stage = qwen_config.stage_by_id(0)
+    generation_stage = qwen_config.stage_by_id(1)
+    diffusion_stage = VllmOmniConfig.from_registry("hunyuan_image3_dit").stage_by_id(0)
+
+    assert isinstance(ar_stage, VllmOmniARStageConfig)
+    assert type(ar_stage.parallel_config) is OmniStageParallelConfig
+    assert not hasattr(ar_stage.parallel_config, "cfg_parallel_size")
+    assert not hasattr(ar_stage.parallel_config, "sequence_parallel_size")
+    assert not hasattr(ar_stage.parallel_config, "ulysses_degree")
+
+    assert isinstance(generation_stage, VllmOmniGenerationStageConfig)
+    assert type(generation_stage.parallel_config) is OmniStageParallelConfig
+    assert not hasattr(generation_stage.parallel_config, "cfg_parallel_size")
+    assert not hasattr(generation_stage.parallel_config, "sequence_parallel_size")
+    assert not hasattr(generation_stage.parallel_config, "ulysses_degree")
+
+    assert isinstance(diffusion_stage, VllmOmniDiffusionStageConfig)
+    assert isinstance(diffusion_stage.parallel_config, OmniStageDiffusionParallelConfig)
+    assert diffusion_stage.parallel_config.cfg_parallel_size == 1
+    assert diffusion_stage.parallel_config.sequence_parallel_size == 1
+    assert diffusion_stage.parallel_config.ulysses_degree == 1
+
+
+def test_from_registry_preserves_diffusion_parallel_mask_sp_padding(tmp_path):
+    deploy_path = tmp_path / "dreamzero_mask_sp_padding.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    parallel_config:",
+                "      mask_sp_padding: true",
+            ]
+        )
+    )
+
+    stage = VllmOmniConfig.from_registry("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.parallel_config.mask_sp_padding is True
 
 
 def test_from_registry_matches_stage_config_to_omegaconf_behavior_for_representative_stage():
