@@ -635,6 +635,7 @@ def test_transformer_from_config_file_loads_checkpoint_config(tmp_path):
     assert transformer.num_attention_heads == 4
     assert transformer.num_layers == 1
     assert transformer.text_dim == 16
+    assert transformer.theta == 256
     assert len(transformer.double_blocks) == 1
 
 

@@ -199,7 +199,7 @@ class JoyImageAttention(nn.Module):
             tuple[torch.Tensor, torch.Tensor] | None,
         ]
         | None = None,
-        encoder_hidden_states_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         img_query, img_key, img_value = self._stream_qkv(
             self.img_attn_qkv,
@@ -224,17 +224,6 @@ class JoyImageAttention(nn.Module):
         joint_query = torch.cat([img_query, txt_query], dim=1)
         joint_key = torch.cat([img_key, txt_key], dim=1)
         joint_value = torch.cat([img_value, txt_value], dim=1)
-
-        attention_mask = None
-        if encoder_hidden_states_mask is not None:
-            image_mask = torch.ones(
-                hidden_states.shape[0],
-                hidden_states.shape[1],
-                device=encoder_hidden_states_mask.device,
-                dtype=encoder_hidden_states_mask.dtype,
-            )
-            valid_mask = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)
-            attention_mask = valid_mask[:, None, None, :].to(device=joint_query.device, dtype=torch.bool)
 
         joint_hidden_states = F.scaled_dot_product_attention(
             joint_query.transpose(1, 2),
@@ -290,7 +279,7 @@ class JoyImageTransformerBlock(nn.Module):
             tuple[torch.Tensor, torch.Tensor] | None,
             tuple[torch.Tensor, torch.Tensor] | None,
         ],
-        encoder_hidden_states_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         (
             img_mod1_shift,
@@ -317,7 +306,7 @@ class JoyImageTransformerBlock(nn.Module):
             hidden_states=img_modulated,
             encoder_hidden_states=txt_modulated,
             image_rotary_emb=image_rotary_emb,
-            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            attention_mask=attention_mask,
         )
 
         hidden_states = hidden_states + img_attn * img_mod1_gate.unsqueeze(1)
@@ -390,7 +379,7 @@ class JoyImageEditTransformer3DModel(nn.Module):
         num_layers: int = 40,
         rope_dim_list: list[int] | tuple[int, ...] | None = None,
         rope_type: str = "rope",
-        theta: int = 10000,
+        theta: int = 256,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -586,8 +575,16 @@ class JoyImageEditTransformer3DModel(nn.Module):
         if txt_freqs is not None:
             txt_freqs = tuple(item.to(hidden_states.device) for item in txt_freqs)
 
+        attention_mask = None
         if encoder_hidden_states_mask is not None:
-            encoder_hidden_states_mask = encoder_hidden_states_mask.to(device=hidden_states.device)
+            encoder_hidden_states_mask = encoder_hidden_states_mask.to(device=hidden_states.device, dtype=torch.bool)
+            image_mask = torch.ones(
+                batch_size,
+                image_tokens.shape[1],
+                device=hidden_states.device,
+                dtype=torch.bool,
+            )
+            attention_mask = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)[:, None, None, :]
 
         for block in self.double_blocks:
             image_tokens, text_tokens = block(
@@ -595,7 +592,7 @@ class JoyImageEditTransformer3DModel(nn.Module):
                 encoder_hidden_states=text_tokens,
                 temb=vector_embedding,
                 image_rotary_emb=(vis_freqs, txt_freqs),
-                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                attention_mask=attention_mask,
             )
 
         image_tokens = self.proj_out(self.norm_out(image_tokens))
