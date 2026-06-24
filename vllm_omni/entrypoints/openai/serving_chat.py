@@ -2153,7 +2153,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Collect modality outputs to merge into a single choice
         text_choices: list[ChatCompletionResponseChoice] = []
-        audio_obj: OpenAIChatCompletionAudio | None = None
+        audio_choices: list[ChatCompletionResponseChoice] = []
         image_choices: list[ChatCompletionResponseChoice] = []
 
         for omni_outputs in final_outputs:
@@ -2199,9 +2199,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                     )
             elif omni_outputs.final_output_type == "audio":
-                audio_choices = self._create_audio_choice(omni_outputs, role, request, stream=False)
-                if audio_choices:
-                    audio_obj = audio_choices[0].message.audio
+                audio_choices.extend(self._create_audio_choice(omni_outputs, role, request, stream=False))
             elif omni_outputs.final_output_type == "image":
                 image_choices.extend(self._create_image_choice(omni_outputs, role, request, stream=False))
             else:
@@ -2221,38 +2219,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Merge text and audio into a single choice per the OpenAI spec
         choices: list[ChatCompletionResponseChoice] = []
-        if text_choices and audio_obj:
+        if text_choices and audio_choices:
+            audio_obj = audio_choices[0].message.audio
             for tc in text_choices:
-                merged_message = ChatMessage(
-                    role=tc.message.role,
-                    content=tc.message.content,
-                    audio=audio_obj,
-                    reasoning=tc.message.reasoning,
-                    refusal=tc.message.refusal,
-                    function_call=tc.message.function_call,
-                    tool_calls=tc.message.tool_calls,
-                )
-                choices.append(
-                    ChatCompletionResponseChoice(
-                        index=tc.index,
-                        message=merged_message,
-                        logprobs=tc.logprobs,
-                        finish_reason=tc.finish_reason,
-                        stop_reason=tc.stop_reason,
-                    )
-                )
+                tc.message.audio = audio_obj
+            choices.extend(text_choices)
         elif text_choices:
             choices.extend(text_choices)
-        elif audio_obj:
-            choices.append(
-                ChatCompletionResponseChoice(
-                    index=0,
-                    message=ChatMessage(role=role, audio=audio_obj),
-                    logprobs=None,
-                    finish_reason="stop",
-                    stop_reason=None,
-                )
-            )
+        elif audio_choices:
+            choices.extend(audio_choices)
         choices.extend(image_choices)
 
         response_metrics = self._filter_stage_metrics_detail(response_metrics, request)
