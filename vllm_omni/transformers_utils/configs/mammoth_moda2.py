@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import ClassVar, Literal
 
-from transformers import AutoConfig, PretrainedConfig
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLTextConfig,
     Qwen2_5_VLVisionConfig,
 )
+
+from vllm_omni.tokenizers.mammoth_moda2_tokenizer import MammothUTokenizer
 
 __all__ = [
     "Mammothmoda2Config",
@@ -281,3 +283,6 @@ AutoConfig.register(Mammothmoda2Config.model_type, Mammothmoda2Config)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLConfig.model_type, Mammothmoda2Qwen2_5_VLConfig)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLTextConfig.model_type, Mammothmoda2Qwen2_5_VLTextConfig)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLVisionConfig.model_type, Mammothmoda2Qwen2_5_VLVisionConfig)
+# Register tokenizer_type -> the configs & AutoTokenizer
+AutoTokenizer.register(config_class=Mammothmoda2Config, slow_tokenizer_class=MammothUTokenizer)
+AutoTokenizer.register(config_class=Mammothmoda2Qwen2_5_VLConfig, slow_tokenizer_class=MammothUTokenizer)
