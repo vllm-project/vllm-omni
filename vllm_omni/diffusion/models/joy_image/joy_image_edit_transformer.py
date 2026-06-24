@@ -16,10 +16,13 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+logger = init_logger(__name__)
 
 
 def _as_3tuple(value: int | list[int] | tuple[int, int, int]) -> tuple[int, int, int]:
@@ -623,6 +626,13 @@ class JoyImageEditTransformer3DModel(nn.Module):
             mapped_name = self._map_weight_name(name)
             param = params.get(mapped_name)
             if param is None:
+                logger.warning(
+                    "Skipping JoyAI-Image-Edit transformer weight %s mapped to "
+                    "%s -- not found in model parameters. This may indicate an "
+                    "incomplete implementation or checkpoint mismatch.",
+                    name,
+                    mapped_name,
+                )
                 continue
             default_weight_loader(param, loaded_weight)
             loaded.add(mapped_name)

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -661,6 +662,25 @@ def test_transformer_load_weights_maps_diffusers_prefix():
 
     assert loaded == {"condition_embedder.text_embedder.linear_1.weight"}
     assert torch.equal(transformer.condition_embedder.text_embedder.linear_1.weight, text_weight)
+
+
+def test_transformer_load_weights_warns_for_unknown_weight(caplog):
+    transformer = JoyImageEditTransformer3DModel(
+        in_channels=4,
+        out_channels=4,
+        hidden_size=32,
+        text_dim=16,
+        num_layers=1,
+        num_attention_heads=4,
+        patch_size=(1, 2, 2),
+    )
+
+    caplog.set_level(logging.WARNING)
+    loaded = transformer.load_weights([("transformer.unmapped.weight", torch.empty(1))])
+
+    assert loaded == set()
+    assert "Skipping JoyAI-Image-Edit transformer weight transformer.unmapped.weight" in caplog.text
+    assert "checkpoint mismatch" in caplog.text
 
 
 def test_latent_normalization_round_trip():
