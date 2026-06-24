@@ -52,7 +52,8 @@ class CFMSampler(nn.Module):
             pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
             flow = (pred + (pred - null_pred) * sde_args[0]).float()
             y0 = y0 + flow * dt
-            y0 = y0 + sde_args[1] * (sde_args[2] ** 0.5) * (dt.abs() ** 0.5) * sde_rnd[step]
+            if step < self.steps - 1:
+                y0 = y0 + sde_args[1] * (sde_args[2] ** 0.5) * (dt.abs() ** 0.5) * sde_rnd[step]
         return y0
 
 
