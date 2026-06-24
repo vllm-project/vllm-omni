@@ -545,6 +545,34 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
+      - label: "TTS · SoulX-Singer Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/test_soulxsinger.py
+          - vllm_omni/diffusion/models/soulx_singer/
+          - vllm_omni/deploy/soulxsinger_svc.yaml
+          - vllm_omni/deploy/soulxsinger_svs.yaml
+        timeout_in_minutes: 30
+        commands:
+          - |
+            timeout 30m bash -c "
+              export VLLM_LOGGING_LEVEL=DEBUG
+              export VLLM_WORKER_MULTIPROC_METHOD=spawn
+              pytest -s -v tests/e2e/offline_inference/test_soulxsinger.py -k 'svc or precomputed' -m 'advanced_model and cuda' --run-level 'advanced_model'
+            "
+        agents:
+          queue: "gpu_1_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
       - label: "Diffusion · Qwen Image Edit Test"
         source_file_dependencies:
           - tests/e2e/online_serving/test_qwen_image_edit.py

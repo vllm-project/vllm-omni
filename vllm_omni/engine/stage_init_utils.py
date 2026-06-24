@@ -530,23 +530,24 @@ def get_stage_tp_size(stage_cfg: Any) -> int:
 
 def get_stage_devices_per_replica(stage_cfg: Any) -> int:
     """Return the number of devices consumed by one replica of *stage_cfg*."""
-    if getattr(stage_cfg, "stage_type", "llm") != "diffusion":
-        return get_stage_tp_size(stage_cfg)
+    engine_args = getattr(stage_cfg, "engine_args", {})
+    if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
+        parallel_config = _get_attr_or_item(engine_args, "parallel_config")
+        if parallel_config is None:
+            return 1
 
-    parallel_config = _get_attr_or_item(getattr(stage_cfg, "engine_args", {}), "parallel_config")
-    if parallel_config is None:
-        return 1
+        world_size = _get_attr_or_item(parallel_config, "world_size")
+        if world_size is not None:
+            return max(1, int(world_size))
 
-    world_size = _get_attr_or_item(parallel_config, "world_size")
-    if world_size is not None:
-        return max(1, int(world_size))
+        try:
+            from vllm_omni.diffusion.data import DiffusionParallelConfig
 
-    try:
-        from vllm_omni.diffusion.data import DiffusionParallelConfig
+            return max(1, int(DiffusionParallelConfig.from_dict(_to_dict(parallel_config)).world_size))
+        except Exception:
+            return 1
 
-        return max(1, int(DiffusionParallelConfig.from_dict(_to_dict(parallel_config)).world_size))
-    except Exception:
-        return 1
+    return get_stage_tp_size(stage_cfg)
 
 
 def compute_replica_layout(
