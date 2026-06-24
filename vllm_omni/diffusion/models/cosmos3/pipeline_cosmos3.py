@@ -733,16 +733,11 @@ class Cosmos3OmniDiffusersPipeline(
             subfolder="scheduler",
             local_files_only=local_files_only,
         )
-        init_flow_shift = (
-            od_config.flow_shift
-            if od_config.flow_shift is not None
-            else getattr(self.scheduler.config, "flow_shift", 1.0)
-        )
-        self.scheduler = UniPCMultistepScheduler.from_config(
-            self.scheduler.config,
-            flow_shift=init_flow_shift,
-            use_karras_sigmas=False,
-        )
+        if od_config.flow_shift is not None:
+            self.scheduler = UniPCMultistepScheduler.from_config(
+                self.scheduler.config,
+                flow_shift=od_config.flow_shift,
+            )
         self._cpu_scheduler_state()
 
         # --- Video processor for post-decode ---
@@ -766,6 +761,8 @@ class Cosmos3OmniDiffusersPipeline(
         self._base_scheduler_config = self.scheduler.config
         self._engine_init_flow_shift = float(getattr(self.scheduler.config, "flow_shift", 1.0) or 1.0)
         self._current_flow_shift = self._engine_init_flow_shift
+        self._base_scheduler_use_karras_sigmas = self._scheduler_use_karras_sigmas(self.scheduler.config)
+        self._current_scheduler_use_karras_sigmas = self._base_scheduler_use_karras_sigmas
 
         self._guidance_scale = None
         self._num_timesteps = None
@@ -1406,24 +1403,38 @@ class Cosmos3OmniDiffusersPipeline(
             raise ValueError(f"Incorrect modality value in {modalities}, expected one of {accepted_modalities}.")
         return "image" in modalities
 
-    def _set_flow_shift(self, target_shift: float) -> None:
-        """Set the UniPC ``flow_shift`` to a concrete target value.
+    @staticmethod
+    def _scheduler_use_karras_sigmas(config: Any) -> bool | None:
+        value = getattr(config, "use_karras_sigmas", None)
+        return None if value is None else bool(value)
+
+    def _set_flow_shift(self, target_shift: float, *, use_karras_sigmas: bool | None = None) -> None:
+        """Set UniPC scheduler mode for a concrete request.
 
         The scheduler is rebuilt from the saved base config if
-        the target differs from the current shift.  Tracking
-        ``self._current_flow_shift`` explicitly is required because the
-        previous mode may have rebuilt the scheduler - we cannot rely on
-        ``self.scheduler.config.flow_shift`` reflecting the last requested
-        target if a rebuild was skipped via the equality check.
+        the target differs from the current shift or Karras-sigma mode.
+        Tracking explicit scheduler state is required because the previous
+        mode may have rebuilt the scheduler - we cannot rely on
+        ``self.scheduler.config`` reflecting the last requested target if a
+        rebuild was skipped via the equality check.
         """
         target = float(target_shift)
-        if target == float(self._current_flow_shift):
-            return
-        self.scheduler = UniPCMultistepScheduler.from_config(
-            self._base_scheduler_config, flow_shift=target, use_karras_sigmas=False
+        target_use_karras_sigmas = (
+            self._base_scheduler_use_karras_sigmas if use_karras_sigmas is None else bool(use_karras_sigmas)
         )
+        if (
+            target == float(self._current_flow_shift)
+            and target_use_karras_sigmas == self._current_scheduler_use_karras_sigmas
+        ):
+            return
+
+        scheduler_kwargs: dict[str, Any] = {"flow_shift": target}
+        if use_karras_sigmas is not None:
+            scheduler_kwargs["use_karras_sigmas"] = bool(use_karras_sigmas)
+        self.scheduler = UniPCMultistepScheduler.from_config(self._base_scheduler_config, **scheduler_kwargs)
         self._cpu_scheduler_state()
         self._current_flow_shift = target
+        self._current_scheduler_use_karras_sigmas = self._scheduler_use_karras_sigmas(self.scheduler.config)
 
     def _cpu_scheduler_state(self) -> None:
         # We need to move scheduler tensors to CPU, as unipc from diffusers assumes they are on CPU.
@@ -1644,18 +1655,36 @@ class Cosmos3OmniDiffusersPipeline(
 
     # -- VAE decode ----------------------------------------------------------
 
+    def _get_latents_mean_std(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        cached = getattr(self, "_latents_mean_std", None)
+        if cached is not None:
+            latents_mean, latents_std = cached
+            if latents_mean.device == device and latents_mean.dtype == dtype:
+                return latents_mean, latents_std
+
+        latents_mean = torch.as_tensor(self.vae.config.latents_mean, device=device, dtype=dtype).view(1, -1, 1, 1, 1)
+        latents_std = torch.as_tensor(self.vae.config.latents_std, device=device, dtype=dtype).view(1, -1, 1, 1, 1)
+        self._latents_mean_std = (latents_mean, latents_std)
+        return latents_mean, latents_std
+
+    def _to_vae_device(self, tensor: torch.Tensor, *, pin_cpu: bool = False) -> torch.Tensor:
+        if tensor.device == self.device and tensor.dtype == self.vae.dtype:
+            return tensor
+
+        non_blocking = False
+        if tensor.device.type == "cpu" and self.device.type == "cuda":
+            if pin_cpu and not tensor.is_pinned():
+                tensor = tensor.pin_memory()
+            non_blocking = tensor.is_pinned()
+
+        return tensor.to(device=self.device, dtype=self.vae.dtype, non_blocking=non_blocking)
+
     def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         latents = latents.to(self.vae.dtype)
 
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            if not hasattr(self, "_latents_mean"):
-                self._latents_mean = (
-                    torch.tensor(self.vae.config.latents_mean).view(1, -1, 1, 1, 1).to(self.device, self.vae.dtype)
-                )
-                self._latents_std = (
-                    torch.tensor(self.vae.config.latents_std).view(1, -1, 1, 1, 1).to(self.device, self.vae.dtype)
-                )
-            latents = (latents * self._latents_std) + self._latents_mean
+            latents_mean, latents_std = self._get_latents_mean_std(latents.device, latents.dtype)
+            latents = (latents * latents_std) + latents_mean
         else:
             scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
             latents = latents / scaling_factor
@@ -1753,40 +1782,28 @@ class Cosmos3OmniDiffusersPipeline(
 
     # -- I2V latent preparation ---------------------------------------------
 
-    def _encode_conditioning_video(
-        self,
-        image_tensor: torch.Tensor,
-        num_frames: int,
-        height: int,
-        width: int,
-    ) -> torch.Tensor:
-        """VAE-encode a conditioning image as a full-length video.
-
-        The WAN VAE has temporal compression (factor 4), so encoding a single
-        frame produces degenerate temporal features.  We fill the entire
-        pixel-space video with the conditioning image (repeating it across all
-        frames) so the temporal encoder sees plausible content everywhere.
-        The caller keeps only the conditioned latent frame(s) and replaces
-        the rest with noise.
-        """
-        # image_tensor: [1, 3, H, W] -> [1, 3, num_frames, H, W]
-        video = image_tensor.unsqueeze(2).expand(-1, -1, num_frames, -1, -1).contiguous()
-        video = video.to(device=self.device, dtype=self.vae.dtype)
-
-        latent = self.vae.encode(video).latent_dist.mode()
-
-        # Normalize (inverse of _decode_latents denormalization)
+    def _normalize_vae_latent(self, latent: torch.Tensor) -> torch.Tensor:
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latent.device, latent.dtype)
-            )
-            latents_std = torch.tensor(self.vae.config.latents_std).view(1, -1, 1, 1, 1).to(latent.device, latent.dtype)
+            latents_mean, latents_std = self._get_latents_mean_std(latent.device, latent.dtype)
             latent = (latent - latents_mean) / latents_std
         else:
             scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
             latent = latent * scaling_factor
 
-        return latent.to(self.dtype)
+        return latent
+
+    def _encode_conditioning_image_latent(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        """VAE-encode the first I2V conditioning frame.
+
+        I2V only consumes the first conditioning latent frame.  Encoding the
+        input image as a one-frame video keeps that latent while avoiding VAE
+        work for repeated frames that are later replaced by noise.
+        """
+        image_tensor = self._to_vae_device(image_tensor, pin_cpu=True)
+        video = image_tensor.unsqueeze(2)
+        latent = self.vae.encode(video).latent_dist.mode()
+        latent = self._normalize_vae_latent(latent)
+        return latent[:, :, 0:1, :, :].to(self.dtype)
 
     def _latent_hw_from_image_size(self, image_size: Any | None) -> tuple[int, int] | None:
         if image_size is None:
@@ -1818,19 +1835,9 @@ class Cosmos3OmniDiffusersPipeline(
         if video_tensor.shape[0] != 1 or video_tensor.shape[1] != 3:
             raise ValueError(f"Cosmos3 video tensor must have shape [1, 3, T, H, W], got {tuple(video_tensor.shape)}.")
 
-        video = video_tensor.to(device=self.device, dtype=self.vae.dtype)
+        video = self._to_vae_device(video_tensor)
         latent = self.vae.encode(video).latent_dist.mode()
-
-        if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latent.device, latent.dtype)
-            )
-            latents_std = torch.tensor(self.vae.config.latents_std).view(1, -1, 1, 1, 1).to(latent.device, latent.dtype)
-            latent = (latent - latents_mean) / latents_std
-        else:
-            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
-            latent = latent * scaling_factor
-
+        latent = self._normalize_vae_latent(latent)
         latent = self._crop_latent_to_image_size(latent, image_size)
         return latent.to(self.dtype)
 
@@ -1861,13 +1868,12 @@ class Cosmos3OmniDiffusersPipeline(
             dtype=self.dtype,
         )
 
-        cond_latent = self._encode_conditioning_video(image_tensor, num_frames, height, width)
-        image_latent = cond_latent[:, :, 0:1, :, :]
+        image_latent = self._encode_conditioning_image_latent(image_tensor)
+        latents = noise
+        latents[:, :, 0:1, :, :] = image_latent
 
-        condition_mask = torch.zeros(1, 1, T_lat, 1, 1, device=self.device, dtype=self.dtype)
-        condition_mask[:, :, 0, :, :] = 1.0
-        latents = condition_mask * cond_latent + (1.0 - condition_mask) * noise
-        velocity_mask = 1.0 - condition_mask
+        velocity_mask = torch.ones(1, 1, T_lat, 1, 1, device=self.device, dtype=self.dtype)
+        velocity_mask[:, :, 0, :, :] = 0.0
         return latents, velocity_mask, image_latent
 
     def _prepare_latents_v2v(
@@ -2177,7 +2183,10 @@ class Cosmos3OmniDiffusersPipeline(
         ) -> torch.Tensor | tuple[torch.Tensor, ...]:
             video_pred, action_pred, sound_pred = _split_noise_pred(noise_pred)
             if velocity_mask is not None:
-                video_pred = video_pred * velocity_mask
+                if image_latent is not None and condition_latents is None:
+                    video_pred[:, :, 0:1, :, :] = 0
+                else:
+                    video_pred = video_pred * velocity_mask
             if action_pred is not None and action_velocity_mask is not None:
                 action_pred = action_pred * action_velocity_mask
                 if raw_action_dim is not None and 0 < raw_action_dim < action_pred.shape[-1]:
@@ -2621,7 +2630,7 @@ class Cosmos3OmniDiffusersPipeline(
 
         self._guidance_scale = guidance_scale
         self._num_timesteps = num_inference_steps
-        self._set_flow_shift(flow_shift_target)
+        self._set_flow_shift(flow_shift_target, use_karras_sigmas=False)
 
         generator = sp.generator
         if generator is None:
@@ -2920,7 +2929,7 @@ class Cosmos3OmniDiffusersPipeline(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
             or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", not action_enabled))
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", is_v2v))
 
         if action_enabled and action_video_tensor is None:
             extra_action_video = self._get_sp_param(sp, "action_video", None)
@@ -2944,7 +2953,7 @@ class Cosmos3OmniDiffusersPipeline(
 
         # Always resolve to a concrete target shift for this request, then
         # update the shared Diffusers scheduler.
-        self._set_flow_shift(flow_shift_target)
+        self._set_flow_shift(flow_shift_target, use_karras_sigmas=False if is_v2v else None)
 
         generator = sp.generator
         if generator is None:

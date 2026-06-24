@@ -59,6 +59,95 @@ def test_sensenova_extra_registry_declares_request_and_response_params() -> None
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_cosmos3_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("Cosmos3OmniDiffusersPipeline") == frozenset(
+        {
+            "flow_shift",
+            "max_sequence_length",
+            "use_resolution_template",
+            "use_duration_template",
+            "use_system_prompt",
+            "system_prompt",
+            "negative_prompt",
+            "guardrails",
+            "condition_frame_indexes_vision",
+            "condition_video_keep",
+            "generate_sound",
+            "sound_gen",
+            "sound_duration",
+            "audio_duration",
+            "action_mode",
+            "action",
+            "domain_name",
+            "domain_id",
+            "raw_action_dim",
+            "action_chunk_size",
+            "action_space",
+            "action_fps",
+            "image_height",
+            "image_width",
+            "history_length",
+            "conditioning_fps",
+            "resolution",
+            "image_size",
+            "use_state",
+            "observation",
+            "robot_obs",
+            "deterministic_seed",
+            "session_id",
+        }
+    )
+    assert get_extra_output_params("Cosmos3OmniDiffusersPipeline") == frozenset(
+        {
+            "action",
+            "raw_action_dim",
+            "domain_id",
+            "action_mode",
+        }
+    )
+    assert should_init_extra_args_for_non_diffusion_stages("Cosmos3OmniDiffusersPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_magi_human_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("MagiHumanPipeline") == frozenset(
+        {
+            "seconds",
+            "audio_path",
+            "image_path",
+            "sr_height",
+            "sr_width",
+            "sr_num_inference_steps",
+        }
+    )
+    assert get_extra_output_params("MagiHumanPipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("MagiHumanPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_cosmos3_text_to_image_prompt_builder_selects_image_modality() -> None:
+    assert build_text_to_image_prompt(
+        "Cosmos3OmniDiffusersPipeline",
+        prompt="a red sports car at golden hour",
+        negative_prompt="blurry, distorted",
+        height=1024,
+        width=1024,
+    ) == {
+        "prompt": "a red sports car at golden hour",
+        "modalities": ["image"],
+        "negative_prompt": "blurry, distorted",
+    }
+    assert build_text_to_image_prompt(
+        "Cosmos3OmniDiffusersPipeline",
+        prompt="a red sports car",
+        negative_prompt=None,
+    ) == {"prompt": "a red sports car", "modalities": ["image"]}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_helios_extra_registry_declares_request_and_response_params() -> None:
     expected_body = frozenset(
         {

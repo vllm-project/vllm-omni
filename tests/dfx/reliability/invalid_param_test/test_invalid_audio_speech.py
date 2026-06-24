@@ -122,9 +122,6 @@ def test_speech_missing_required_fields(omni_server: OmniServer, openai_client: 
             {"response_format": "mpeg"}, ("response_format", "literal_error", "wav"), id="response_format_invalid"
         ),
         pytest.param({"stream_format": 1}, ("stream_format", "literal_error", "audio"), id="stream_format_wrong_type"),
-        pytest.param(
-            {"stream_format": "sse"}, ("stream_format", "value_error", "audio"), id="stream_format_sse_blocked"
-        ),
         pytest.param({"stream": "wrong_type"}, ("stream", "bool_parsing", "validation error"), id="stream_wrong_type"),
         pytest.param(
             {
@@ -624,7 +621,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             {"consent": "c1", "name": "v1"},
             ("audio_sample", "speaker_embedding", "provided"),
             id="neither_audio_nor_embedding",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_ok",
@@ -676,7 +672,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             {"consent": "consent_ok", "name": "evil/name"},
             ("voice name", "invalid voice name"),
             id="invalid_name_path_sep",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_ok",
@@ -701,21 +696,18 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             {"consent": "consent_ok", "name": "v_bad_mime_{uuid}"},
             ("mime", "unsupported", "audio/mp4"),
             id="audio_unsupported_mime",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_short",
             {"consent": "consent_ok", "name": "v_short_{uuid}"},
             ("too short", "reference audio"),
             id="audio_too_short",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_bad_body",
             {"consent": "consent_ok", "name": "v_bad_wav_{uuid}"},
             ("decode", "audio", "Format not recognised"),
             id="audio_decode_error",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             None,
@@ -726,7 +718,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             },
             ("speaker_embedding", "valid JSON"),
             id="speaker_embedding_invalid_json",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             None,
@@ -737,7 +728,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             },
             ("speaker_embedding", "non-empty"),
             id="speaker_embedding_empty",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             None,
@@ -748,7 +738,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             },
             ("speaker_embedding", "finite"),
             id="speaker_embedding_nan",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             None,
@@ -759,7 +748,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             },
             ("expected", "dimensions", "1024"),
             id="speaker_embedding_wrong_dim",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_ok",
@@ -770,7 +758,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             },
             ("mutually exclusive", "audio_sample", "speaker_embedding"),
             id="audio_and_embedding_mutually_exclusive",
-            marks=_SKIP_ISSUE_3649,
         ),
     ],
 )
