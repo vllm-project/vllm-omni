@@ -14,7 +14,7 @@ def ar2vocoder(
     _requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
 ) -> list[Any]:
-    """Batch mode: pass accumulated acoustic_features [T, 512] + durations to TadaVocoder."""
+    """Batch mode: pass accumulated acoustic features and durations to the vocoder."""
     from vllm_omni.inputs.data import OmniTokensPrompt
 
     vocoder_inputs: list[OmniTokensPrompt] = []
@@ -67,26 +67,28 @@ def ar2vocoder(
     return vocoder_inputs
 
 
-# Default chunk geometry (frames @ 50 Hz) if the connector config omits them.
+# Acoustic feature dimension produced by the AR stage.
+ACOUSTIC_DIM = 512
+
+# Default streaming chunk geometry (in 50 Hz frames) when the connector config omits them.
 _DEFAULT_CHUNK_FRAMES = 50
 _DEFAULT_LEFT_CTX_FRAMES = 128
 _DEFAULT_RIGHT_CTX_FRAMES = 32
 
 
 def _expand_token(acoustic: torch.Tensor, tb: int, *, lead: bool) -> list[torch.Tensor]:
-    """Expand one token to frames: ``(tb-1)`` leading zero (silence) frames + the frame
-    (mirrors upstream ``_decode_wav``). ``lead=False`` (first token) skips the leading
-    zeros to drop the initial silence (upstream trims ``time_before[0]`` frames)."""
+    """Expand one token into frames: ``tb - 1`` leading silence frames followed by the
+    acoustic frame. The first token (``lead=False``) drops its leading silence."""
     parts: list[torch.Tensor] = []
     nz = max(0, int(tb) - 1)
     if lead and nz > 0:
-        parts.append(torch.zeros(nz, 512, dtype=torch.float32))
-    parts.append(acoustic.reshape(1, 512).to(torch.float32))
+        parts.append(torch.zeros(nz, ACOUSTIC_DIM, dtype=torch.float32))
+    parts.append(acoustic.reshape(1, ACOUSTIC_DIM).to(torch.float32))
     return parts
 
 
 def _stream_chunk_cfg(transfer_manager: Any) -> tuple[int, int, int]:
-    """Read chunk geometry from the connector's ``extra`` config (qwen3 pattern)."""
+    """Read the chunk/left/right frame counts from the connector's ``extra`` config."""
     connector = getattr(transfer_manager, "connector", None)
     raw = getattr(connector, "config", {}) or {}
     cfg = raw.get("extra", raw) if isinstance(raw, dict) else {}
@@ -102,20 +104,16 @@ def ar2vocoder_async_chunk(
     request: Any = None,
     is_finished: bool = False,
 ) -> Any:
-    """Async-chunk mode: stream audio in overlapping codec-decode windows (qwen3 template).
+    """Stream audio as overlapping decode windows.
 
-    Called per AR step with the stage's per-step ``multimodal_output`` (acoustic_features +
-    time_before, already trimmed of prompt/transition by make_omni_output). We expand each new
-    token's duration into a running frame buffer and, once ``CHUNK + RIGHT_CTX`` new frames are
-    available, emit ONE overlapping window ``buf[emit-LEFT_CTX : emit+CHUNK+RIGHT_CTX]`` as a 2-D
-    ``codes.audio`` tensor [W, 512]. ``meta.left_context_size`` / ``meta.right_holdback_size`` tell
-    the vocoder how many frames to drop from each end (left context + right lookahead); it keeps the
-    ``[emit, emit+CHUNK)`` region. The 2-D ``codes.audio`` makes the non-AR receiver REPLACE the
-    prior chunk and run exactly one vocoder forward per chunk; the framework CONCAT_LAST-accumulates
-    each chunk's audio into the cumulative output. At finish the tail is flushed (no right lookahead).
-
-    TADA's codec is non-causal, so RIGHT lookahead is required (unlike qwen3/glm) — verified offline
-    to match a full decode to rel ~0.003.
+    Called once per AR step with that step's ``acoustic_features`` and ``time_before``.
+    Each token's duration is expanded into a running frame buffer. Once a chunk's worth of
+    new frames plus the right-lookahead margin is available, one window
+    ``buffer[emit - left : emit + chunk + right]`` is emitted as a 2-D ``codes.audio`` tensor.
+    ``meta.left_context_size`` / ``meta.right_holdback_size`` tell the vocoder how many frames
+    to trim from each end so only the new ``[emit, emit + chunk)`` region reaches the output.
+    The codec needs both left context and right lookahead to make a windowed decode match a
+    full decode. At finish the remaining tail is flushed without right lookahead.
     """
     from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 
@@ -123,18 +121,19 @@ def ar2vocoder_async_chunk(
     finished = bool(is_finished or request.is_finished())
     chunk_frames, left_ctx, right_ctx = _stream_chunk_cfg(transfer_manager)
 
-    st = getattr(transfer_manager, "_tada_stream", None)
-    if st is None:
-        st = transfer_manager._tada_stream = {}
-    s = st.setdefault(
-        request_id, {"buf": torch.zeros(0, 512, dtype=torch.float32), "emit": 0, "started": False, "last_tb": 1}
+    streams = getattr(transfer_manager, "_tada_stream", None)
+    if streams is None:
+        streams = transfer_manager._tada_stream = {}
+    state = streams.setdefault(
+        request_id,
+        {"buf": torch.zeros(0, ACOUSTIC_DIM, dtype=torch.float32), "emit": 0, "started": False, "last_tb": 1},
     )
 
-    # Append newly generated tokens to the expanded frame buffer (row-indexed [N, 512]).
+    # Append the new step's frames to the running buffer (shape [num_frames, ACOUSTIC_DIM]).
     if isinstance(multimodal_output, dict):
         af = multimodal_output.get("acoustic_features")
         if isinstance(af, torch.Tensor) and af.numel() > 0:
-            af = af.detach().cpu().reshape(-1, 512)
+            af = af.detach().cpu().reshape(-1, ACOUSTIC_DIM)
             tbv = multimodal_output.get("time_before")
             tbv = (
                 tbv.detach().cpu().reshape(-1).to(torch.long)
@@ -144,17 +143,16 @@ def ar2vocoder_async_chunk(
             new_parts: list[torch.Tensor] = []
             for i in range(af.shape[0]):
                 tb_i = int(tbv[i].item())
-                first = not s["started"]
-                new_parts.extend(_expand_token(af[i], tb_i, lead=not first))
-                if first:
-                    s["started"] = True  # drop the initial leading silence at the source
-                s["last_tb"] = tb_i
+                # First token drops its leading silence; later tokens keep the inter-token gap.
+                new_parts.extend(_expand_token(af[i], tb_i, lead=state["started"]))
+                state["started"] = True
+                state["last_tb"] = tb_i
             if new_parts:
-                s["buf"] = torch.cat([s["buf"], *new_parts], dim=0)
+                state["buf"] = torch.cat([state["buf"], *new_parts], dim=0)
 
     def _emit(window: torch.Tensor, left_drop: int, right_drop: int, fin: bool) -> Any:
         return OmniPayloadStruct(
-            codes=CodesStruct(audio=window.contiguous()),  # [W, 512] pre-expanded frames (2-D)
+            codes=CodesStruct(audio=window.contiguous()),
             meta=MetaStruct(
                 left_context_size=int(left_drop),
                 right_holdback_size=int(right_drop),
@@ -162,29 +160,30 @@ def ar2vocoder_async_chunk(
             ),
         )
 
-    buf = s["buf"]
-    emit = s["emit"]
-    E = buf.shape[0]
+    buf = state["buf"]
+    emit = state["emit"]
+    total = buf.shape[0]
 
     if not finished:
-        # Emit one chunk once CHUNK new frames + the right lookahead are buffered.
-        if E - emit >= chunk_frames + right_ctx:
-            start = max(0, emit - left_ctx)
-            window = buf[start : emit + chunk_frames + right_ctx]
-            payload = _emit(window, emit - start, right_ctx, fin=False)
-            s["emit"] = emit + chunk_frames
-            return payload
-        return None
+        # Wait until a full chunk plus the right-lookahead margin is buffered.
+        if total - emit < chunk_frames + right_ctx:
+            return None
+        start = max(0, emit - left_ctx)
+        window = buf[start : emit + chunk_frames + right_ctx]
+        payload = _emit(window, emit - start, right_ctx, fin=False)
+        state["emit"] = emit + chunk_frames
+        return payload
 
-    # Finish: append the trailing silence (upstream appends time_before[-1] zero frames),
-    # then flush everything remaining as one final window (no right lookahead).
-    if s["last_tb"] > 0:
-        buf = s["buf"] = torch.cat([buf, torch.zeros(int(s["last_tb"]), 512, dtype=torch.float32)], dim=0)
-        E = buf.shape[0]
-    if emit >= E:
-        return _emit(torch.zeros(0, 512, dtype=torch.float32), 0, 0, fin=True)
+    # Finish: append the trailing silence, then flush the remaining frames as the final window.
+    if state["last_tb"] > 0:
+        buf = state["buf"] = torch.cat(
+            [buf, torch.zeros(int(state["last_tb"]), ACOUSTIC_DIM, dtype=torch.float32)], dim=0
+        )
+        total = buf.shape[0]
+    if emit >= total:
+        return _emit(torch.zeros(0, ACOUSTIC_DIM, dtype=torch.float32), 0, 0, fin=True)
     start = max(0, emit - left_ctx)
-    payload = _emit(buf[start:E], emit - start, 0, fin=True)
-    s["emit"] = E
-    st.pop(request_id, None)
+    payload = _emit(buf[start:total], emit - start, 0, fin=True)
+    state["emit"] = total
+    streams.pop(request_id, None)
     return payload

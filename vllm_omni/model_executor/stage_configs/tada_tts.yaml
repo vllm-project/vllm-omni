@@ -1,12 +1,11 @@
 # TADA TTS -- batch (non-streaming) mode.
 #
 # Stage 0: TadaARStageForConditionalGeneration (AR + per-token flow-matching diffusion)
-# Stage 1: TadaVocoder  (TADA codec decoder: acoustic features → waveform @ 44 100 Hz)
+# Stage 1: TadaVocoder  (codec decoder: acoustic features → waveform @ 24 kHz)
 #
 # Prerequisites:
-#   pip install hume-tada
 #   HuggingFace model: HumeAI/tada-1b  or  HumeAI/tada-3b-ml
-#   Codec decoder is loaded lazily from HumeAI/tada-codec.
+#   Codec decoder is loaded from HumeAI/tada-codec.
 async_chunk: false
 stage_args:
   - stage_id: 0

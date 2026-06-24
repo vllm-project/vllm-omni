@@ -42,8 +42,7 @@ def _decode_gray_code(bits: torch.Tensor) -> torch.Tensor:
 
 
 def _build_time_schedule(num_steps: int, schedule: str, device: torch.device) -> torch.Tensor:
-    """ODE time discretisation in [0, 1]. Verbatim from upstream
-    ``TadaForCausalLM._build_time_schedule`` (tada/modules/tada.py)."""
+    """Build the ODE time discretisation in [0, 1] for the given schedule."""
     if schedule == "cosine":
         u = torch.linspace(0, 1, num_steps + 1, device=device)
         return 0.5 * (1 - torch.cos(math.pi * u))
@@ -58,8 +57,7 @@ def _build_time_schedule(num_steps: int, schedule: str, device: torch.device) ->
 
 
 def _scheduled_cfg(base_scale: float, t: float, schedule: str) -> float:
-    """Effective CFG scale at ODE timestep t. Verbatim from upstream
-    ``TadaForCausalLM._scheduled_cfg`` (tada/modules/tada.py)."""
+    """Return the effective CFG scale at ODE timestep t for the given schedule."""
     if schedule == "constant" or base_scale == 1.0:
         return base_scale
     if schedule == "linear":
@@ -95,17 +93,15 @@ def _get_vibevoice_head(
 class TadaARStageForConditionalGeneration(nn.Module):
     """Stage 0: AR text generation + per-token flow-matching acoustic synthesis."""
 
-    # TADA is fixed-length: it WALKS the input text (one acoustic frame per token),
-    # it does NOT free-generate. preprocess() forces each decode step to consume the
-    # next known text token and rebuilds the TADA input embedding with 1-step
-    # acoustic/time feedback (= upstream forward_one_step).
+    # The stage walks the input text one token per step, producing one acoustic frame each;
+    # it does not free-generate. preprocess() forces each decode step to the next text token
+    # and rebuilds the input embedding with one-step acoustic/time feedback.
     has_preprocess = True
     has_postprocess = True
     have_multimodal_outputs = True
 
-    # NOTE: flat buffer keys are stored on CPU by the runner regardless of this set
-    # (only nested (type_key, qualifier) tuples stay GPU-resident); preprocess moves
-    # the feedback frame back to GPU. Kept for documentation of the per-step state.
+    # Per-request feedback state lives in the runner's intermediate buffer; preprocess moves
+    # the feedback frame back to the device each step.
     gpu_resident_buffer_keys: set[str] = set()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -143,8 +139,7 @@ class TadaARStageForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(int(cfg.vocab_size))
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
-        # Upstream TadaForCausalLM uses nn.Linear(acoustic_dim, hidden) *with* bias,
-        # and the checkpoint ships ``acoustic_proj.bias``. bias=False silently drops it.
+        # acoustic_proj uses a bias term (the checkpoint ships ``acoustic_proj.bias``).
         self.acoustic_proj = nn.Linear(self.acoustic_dim, self.hidden_size, bias=True)
         # 0 = no acoustic (prompt), 1 = real acoustic
         self.acoustic_mask_emb = nn.Embedding(2, self.hidden_size)
@@ -166,17 +161,15 @@ class TadaARStageForConditionalGeneration(nn.Module):
             bottleneck_dim=self.bottleneck_dim,
         )
 
-        # Flow-matching hyperparameters — match upstream InferenceOptions defaults
-        # (tada/modules/tada.py InferenceOptions).
-        self.num_flow_steps: int = 10
-        self.acoustic_cfg_scale: float = 1.6
-        self.duration_cfg_scale: float = 1.0  # time/duration dims: no CFG amplification
-        self.noise_temperature: float = 0.9
-        self.cfg_schedule: str = "cosine"  # CFG decays base->1.0 over ODE steps
-        self.time_schedule: str = "logsnr"  # ODE timesteps denser near t=0
+        # Flow-matching hyperparameters (overridable via the model config).
+        self.num_flow_steps: int = int(getattr(cfg, "num_flow_matching_steps", 10))
+        self.acoustic_cfg_scale: float = float(getattr(cfg, "acoustic_cfg_scale", 1.6))
+        self.duration_cfg_scale: float = float(getattr(cfg, "duration_cfg_scale", 1.0))
+        self.noise_temperature: float = float(getattr(cfg, "noise_temperature", 0.9))
+        self.cfg_schedule: str = str(getattr(cfg, "cfg_schedule", "cosine"))
+        self.time_schedule: str = str(getattr(cfg, "time_schedule", "logsnr"))
 
-        # Acoustic feature (de)normalisation — diffusion runs in normalised space;
-        # features must be de-normalised before the codec (done in the vocoder).
+        # Diffusion runs in normalised space; features are de-normalised before decoding.
         self.acoustic_mean: float = float(getattr(cfg, "acoustic_mean", 0.0))
         self.acoustic_std: float = float(getattr(cfg, "acoustic_std", 1.5))
 
@@ -190,42 +183,39 @@ class TadaARStageForConditionalGeneration(nn.Module):
         input_embeds: torch.Tensor | None = None,
         **kw: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Drive the AR to *walk the input text*, one acoustic frame per token.
+        """Walk the input text, producing one acoustic frame per token.
 
-        TADA is fixed-length and teacher-forced on the text (upstream ``_generate``):
-        it never samples its own text. On **prefill** we build the prompt-region
-        embeddings ([BOS] + chat-template headers, plus — Level 2 — the known
-        reference-audio acoustic features). On each **decode** step we pop the next
-        known text id from ``tada_walk_ids`` and rebuild the TADA input embedding with
-        1-step acoustic/time feedback, exactly mirroring ``forward_one_step``:
+        On **prefill** this builds the prompt-region embeddings (``[BOS]`` + chat-template
+        headers, plus the optional reference-audio acoustic features for voice cloning). On
+        each **decode** step it takes the next text id from ``tada_walk_ids`` and rebuilds the
+        input embedding with one-step acoustic/time feedback:
         ``embed_tokens(id) + acoustic_proj(prev_feat) + acoustic_mask_emb(mask)
         + time_start_embed(time_before) + time_end_embed(time_after)``.
 
-        Returns ``(req_input_ids, req_embeds, update_dict)``; the runner writes both
-        back into the flat ``input_ids``/``inputs_embeds`` for this request's span and
-        merges ``update_dict`` into the per-request buffer. The sampled token is
-        discarded (the LM text logits are unused); fixed length is enforced by
-        ``max_tokens`` in the request's sampling params.
+        Returns ``(req_input_ids, req_embeds, update_dict)``; the runner writes both back into
+        the flat ``input_ids``/``inputs_embeds`` for this request's span and merges
+        ``update_dict`` into the per-request buffer. The sampled token is unused; the fixed
+        length is enforced by ``max_tokens`` in the request's sampling params.
         """
         is_prefill = bool(kw.get("_omni_is_prefill", False))
         base = self.model.embed_tokens(input_ids)  # [span, H]
         device, dtype = base.device, base.dtype
 
         if is_prefill:
-            # Level 2: substitute the known reference-audio acoustic features over the
-            # prompt region (handled in _add_prompt_acoustic_embeds; no-op for Level 1).
+            # Substitute known reference-audio acoustic features over the prompt region for
+            # voice cloning (no-op when no reference is provided).
             prompt_ac = kw.get("tada_prompt_acoustic")
             if isinstance(prompt_ac, torch.Tensor) and prompt_ac.numel() > 0:
                 base = self._add_prompt_acoustic_embeds(base, kw, device, dtype)
             return input_ids, base, {}
 
-        # ---- decode: one forced text token + 1-step feedback ----
+        # ---- decode: one forced text token + one-step feedback ----
         walk_ids = kw.get("tada_walk_ids") or []
         offset = int(kw.get("tada_offset", 0))
         if offset < len(walk_ids):
             tok_id = int(walk_ids[offset])
         elif walk_ids:
-            tok_id = int(walk_ids[-1])  # safety: should not happen (max_tokens bounds the walk)
+            tok_id = int(walk_ids[-1])  # bounded by max_tokens; reached only as a safety fallback
         else:
             tok_id = int(input_ids.reshape(-1)[-1].item())
         tok = torch.tensor([tok_id], device=device, dtype=input_ids.dtype)
@@ -234,7 +224,7 @@ class TadaARStageForConditionalGeneration(nn.Module):
         af = kw.get("acoustic_feat_last")
         zeros_t = torch.zeros(1, dtype=torch.long, device=device)
         if isinstance(af, torch.Tensor) and af.numel() > 0:
-            # Real 1-step feedback: previous step's acoustic frame + predicted durations.
+            # Feedback from the previous step's acoustic frame + predicted durations.
             af = af.to(device=device, dtype=dtype).reshape(1, -1)
             tb = kw.get("time_before_last")
             ta = kw.get("time_after_last")
@@ -256,8 +246,7 @@ class TadaARStageForConditionalGeneration(nn.Module):
                 + self.time_end_embed(ta_i)
             )
         else:
-            # Warmup row (no previous frame yet): acoustic=0, mask=0, time=0 — matches
-            # the reference's first `shift_acoustic` steps (forward_one_step with zeros).
+            # Warm-up step (no previous frame yet): acoustic, mask and time are all zero.
             zeros_ac = torch.zeros(1, self.acoustic_dim, device=device, dtype=dtype)
             emb = (
                 emb
@@ -272,15 +261,11 @@ class TadaARStageForConditionalGeneration(nn.Module):
     def _add_prompt_acoustic_embeds(
         self, base: torch.Tensor, kw: dict[str, Any], device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
-        """Level 2 — substitute the known reference-audio acoustic features over the
-        prompt (transcript) region during prefill, putting the reference voice into the
-        KV cache. Verbatim port of upstream ``_build_prompt_inputs_embeds`` (tada.py):
-        full-sequence position ``t`` is conditioned on ``prompt_acoustic[t-shift-1]``
-        (acoustic lags text by ``shift_acoustic``).
-
-        Assumes the prompt region arrives in a single prefill chunk (true for the short
-        prompts here; ``max_num_batched_tokens`` >> prompt length). ``base`` is the token
-        embedding for the whole prefill span [P, H].
+        """Add the reference-audio acoustic features over the prompt region during prefill,
+        putting the reference voice into the KV cache. Position ``t`` is conditioned on
+        ``prompt_acoustic[t - shift - 1]`` (the acoustic stream lags the text by
+        ``shift_acoustic``). Assumes the prompt arrives in a single prefill chunk. ``base`` is
+        the token embedding for the whole prefill span [P, H].
         """
         pa = kw.get("tada_prompt_acoustic")
         if not (isinstance(pa, torch.Tensor) and pa.numel() > 0):
@@ -360,14 +345,12 @@ class TadaARStageForConditionalGeneration(nn.Module):
         request_token_spans: list[tuple[int, int]] | None = None,
         **_: Any,
     ) -> OmniOutput:
-        """Emit previous step's acoustic features for output processor accumulation.
+        """Emit the per-step acoustic features for the output processor to accumulate.
 
-        Output is laid out on the token-aligned leading dimension
-        (``[total_tokens, 512]``) so the runner's ``to_payload_element`` slices
-        each request's own rows via ``request_token_spans``. Emitting one row per
-        request (``[num_reqs, 512]``) would only match in pure single-token decode
-        steps; in mixed prefill/decode steps the leading dim must equal the total
-        scheduled token count or the features are dropped before the vocoder.
+        Output is laid out on the token-aligned leading dimension (``[total_tokens, feat_dim]``)
+        so the runner slices each request's own rows via ``request_token_spans``. The leading
+        dimension must equal the total scheduled token count, otherwise the features are dropped
+        before the vocoder in mixed prefill/decode steps.
         """
         hidden = model_outputs
         if isinstance(model_outputs, OmniOutput):
@@ -389,8 +372,7 @@ class TadaARStageForConditionalGeneration(nn.Module):
 
         acoustic_feats = torch.zeros(total_tokens, self.acoustic_dim, dtype=torch.float32)
         text_token_mask = torch.zeros(total_tokens, dtype=torch.long)
-        # Per-token predicted duration (frames). Needed by the vocoder to expand the
-        # acoustic sequence before codec decode (upstream _decode_wav).
+        # Per-token predicted duration (frames), used by the vocoder to expand the sequence.
         time_before = torch.zeros(total_tokens, dtype=torch.long)
         have_feats = False
 
@@ -404,11 +386,9 @@ class TadaARStageForConditionalGeneration(nn.Module):
             # runner slices it back to the right request.
             if request_token_spans is not None and i < len(request_token_spans):
                 row_start, row_end = request_token_spans[i]
-                # Emit ONLY for decode steps (one token). The prompt/prefill region
-                # (BOS + chat-template headers, and the Level-2 reference-audio prompt)
-                # is processed in a multi-token span; its frames are warmup/prompt and
-                # must NOT enter the audio — upstream trims exactly this region. Skipping
-                # them here keeps the emitted stream aligned to the walked text tokens.
+                # Emit only for single-token decode steps. The prompt/prefill region is
+                # processed in a multi-token span; its frames are warm-up/prompt and must not
+                # enter the audio, keeping the emitted stream aligned to the walked text tokens.
                 if int(row_end) - int(row_start) > 1:
                     continue
                 row = min(int(row_end), total_tokens) - 1
@@ -416,10 +396,9 @@ class TadaARStageForConditionalGeneration(nn.Module):
                 row = i
             if row < 0 or row >= total_tokens:
                 continue
-            # Level-2 transition smoothing: the first ``tada_trim_lead`` decode steps walk
-            # the tail of the reference transcript to ease the prompt→synthesis boundary
-            # (upstream ``num_transition_steps``). Those frames are fed back but must NOT
-            # be emitted (they are transcript continuation, not the requested text).
+            # Skip the first ``tada_trim_lead`` decode steps: they walk the reference
+            # transcript tail to smooth the prompt→synthesis boundary and are fed back but
+            # not emitted (they are transcript continuation, not the requested text).
             trim_lead = int(buf.get("tada_trim_lead", 0) or 0)
             if trim_lead and int(buf.get("tada_offset", 0) or 0) <= trim_lead:
                 continue
@@ -436,7 +415,7 @@ class TadaARStageForConditionalGeneration(nn.Module):
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs={
-                "acoustic_features": acoustic_feats,  # [total_tokens, 512]
+                "acoustic_features": acoustic_feats,  # [total_tokens, feat_dim]
                 "text_token_mask": text_token_mask,  # [total_tokens]
                 "time_before": time_before,  # [total_tokens]
             },
@@ -451,14 +430,12 @@ class TadaARStageForConditionalGeneration(nn.Module):
     ) -> dict[str, Any]:
         """Run flow-matching diffusion on the last token's hidden state.
 
-        Returns acoustic_feat_last [1, 512], time_before_last [1], time_after_last [1].
+        Returns the acoustic feature and the before/after durations for this step.
         """
         if hidden_states_slice is None or hidden_states_slice.numel() == 0:
             return {}
 
-        # Run flow-matching in the diffusion head's dtype. Upstream solves the ODE
-        # in model dtype (typically bf16); forcing fp32 here would mismatch the bf16
-        # prediction-head weights at matmul time.
+        # Run flow-matching in the diffusion head's dtype to avoid a matmul dtype mismatch.
         pdtype = next(self.prediction_head.parameters()).dtype
         last_h = hidden_states_slice[-1:].to(pdtype)  # [1, H]
         device = last_h.device
@@ -467,7 +444,7 @@ class TadaARStageForConditionalGeneration(nn.Module):
         total_dim = self.acoustic_dim + self.time_dim
         speech = torch.randn(1, total_dim, device=device, dtype=pdtype) * self.noise_temperature
 
-        # logsnr ODE schedule + per-step cosine CFG decay (upstream _solve_flow_matching).
+        # ODE time schedule + per-step CFG decay.
         t_span = _build_time_schedule(self.num_flow_steps, self.time_schedule, device)
         neg_cond = torch.zeros_like(cond)
 
@@ -489,7 +466,7 @@ class TadaARStageForConditionalGeneration(nn.Module):
         time_after = _decode_gray_code(bits_a).clamp(0, self.num_time_classes - 1)  # [1]
 
         return {
-            "acoustic_feat_last": acoustic_feat,  # kept on GPU via gpu_resident_buffer_keys
+            "acoustic_feat_last": acoustic_feat,
             "time_before_last": time_before,
             "time_after_last": time_after,
         }
@@ -505,9 +482,8 @@ class TadaARStageForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         """CFG-scaled flow-matching velocity.
 
-        ``acoustic_cfg`` guides the acoustic dims; ``duration_cfg`` (default 1.0,
-        i.e. no amplification) guides the time/duration dims. Matches upstream
-        ``TadaForCausalLM._compute_velocity``. ``cond`` is already bottleneck-projected.
+        ``acoustic_cfg`` guides the acoustic dimensions and ``duration_cfg`` the time/duration
+        dimensions. ``cond`` is already bottleneck-projected.
         """
         t_scalar = t.reshape(1).to(speech)
         if acoustic_cfg != 1.0:

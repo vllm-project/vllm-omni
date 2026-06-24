@@ -1,12 +1,10 @@
 """TADA TTS -- Stage 1: Vocoder (acoustic features → waveform @ 24 kHz).
 
-Wraps HumeAI/tada-codec/decoder.  Receives acoustic_features [T, 512], per-token
-durations time_before [T], and text_token_mask [T] via
-runtime_additional_information.  Before codec decode it (1) de-normalises the
-acoustic features (× acoustic_std + acoustic_mean) and (2) expands the frame
-sequence by each token's duration, inserting zero (silence) frames — mirroring
-upstream ``TadaForCausalLM._decode_wav``.  input_ids carries dummy token IDs (one
-per frame) for vLLM-Omni sequence-length bookkeeping.
+Receives acoustic features [T, feat_dim], per-token durations time_before [T], and
+text_token_mask [T] via runtime_additional_information. Before decoding it (1)
+de-normalises the acoustic features (× acoustic_std + acoustic_mean) and (2) expands the
+frame sequence by each token's duration, inserting silence frames. input_ids carries dummy
+token IDs (one per frame) for sequence-length bookkeeping.
 Codec upsample factor: 4 × 4 × 5 × 6 = 480 → 50 Hz frames × 480 = 24 000 Hz.
 """
 
@@ -53,8 +51,7 @@ class TadaVocoder(nn.Module):
         self.model_path = vllm_config.model_config.model
 
         cfg = vllm_config.model_config.hf_config
-        # Acoustic features are generated in normalised space; de-normalise before
-        # the codec (upstream generate(): feat * acoustic_std + acoustic_mean).
+        # Acoustic features are generated in normalised space; de-normalise before decoding.
         self.acoustic_mean = float(getattr(cfg, "acoustic_mean", 0.0))
         self.acoustic_std = float(getattr(cfg, "acoustic_std", 1.5))
         self.acoustic_features_dim = int(getattr(cfg, "acoustic_dim", 512))
@@ -140,10 +137,9 @@ class TadaVocoder(nn.Module):
                 srs.append(sr_tensor)
                 continue
 
-            # Streaming (async-chunk) path: ``codes.audio`` is a pre-expanded window of
-            # frames [W, 512]; decode it and keep only the interior, dropping the left
-            # context and right lookahead frames (see ar2vocoder_async_chunk). Detected by
-            # the drop-count meta fields, which distinguish it from the batch path.
+            # Streaming path: ``codes.audio`` is a pre-expanded window of frames; decode it
+            # and keep only the interior, dropping the left-context and right-lookahead frames
+            # given by the meta drop counts. The presence of those counts selects this path.
             codes = info.get("codes")
             window = codes.get("audio") if isinstance(codes, dict) else None
             meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
@@ -213,8 +209,7 @@ class TadaVocoder(nn.Module):
 
                 wav = self._decode_wav(af, time_before)  # [wav_len]
 
-                # Trim leading silence: the first token's duration worth of samples
-                # (upstream generate(): wav[int(sr * time_before[0] / frame_rate):]).
+                # Trim the leading silence: the first token's duration worth of samples.
                 lead = int(self._output_sample_rate * int(time_before[0].item()) / self._frame_rate)
                 if 0 < lead < wav.shape[0]:
                     wav = wav[lead:]
@@ -233,15 +228,13 @@ class TadaVocoder(nn.Module):
         )
 
     def _decode_window(self, window: torch.Tensor, left_drop: int, right_drop: int) -> torch.Tensor:
-        """Decode one pre-expanded streaming window [W, 512] and keep its interior.
+        """Decode one pre-expanded streaming window and return only its interior.
 
-        The window already contains expanded (duration-inserted) frames with ``left_drop``
-        left-context frames and ``right_drop`` right-lookahead frames around the emitted
-        region. We denormalise, decode the whole window through the codec (so its
-        attention/conv see full context), then return only the emitted region's samples —
-        dropping the context whose sole purpose is to make the seam match a full decode
-        (verified offline to rel ~0.003). The codec's constant conv edge deficit is shared
-        by every window, so fixed slicing stays seamless across chunks.
+        The window holds duration-expanded frames with ``left_drop`` context frames and
+        ``right_drop`` lookahead frames around the emitted region. Decode the whole window so
+        the codec sees full context, then return only the emitted region's samples. The codec's
+        constant convolutional edge offset is shared by every window, so fixed slicing stays
+        continuous across chunks.
         """
         device = window.device
         W = window.shape[0]
@@ -266,10 +259,9 @@ class TadaVocoder(nn.Module):
     def _decode_wav(self, encoded: torch.Tensor, time_before: torch.Tensor) -> torch.Tensor:
         """Expand acoustic frames by per-token duration, then run the codec decoder.
 
-        Mirrors upstream ``TadaForCausalLM._decode_wav``: insert
-        ``(time_before[pos] - 1)`` zero (silence) frames before each acoustic frame,
-        append ``time_before[-1]`` trailing zero frames, then decode.  ``token_masks``
-        marks the real (non-zero) frames and drives the decoder's v2 block attention.
+        Insert ``time_before[pos] - 1`` silence frames before each acoustic frame, append
+        ``time_before[-1]`` trailing silence frames, then decode. ``token_masks`` marks the
+        real (non-zero) frames and drives the decoder's block attention.
         """
         device = encoded.device
         T = encoded.shape[0]

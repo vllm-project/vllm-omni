@@ -3,22 +3,23 @@
 TADA (Text-Acoustic Dual-Aligned) is a two-stage TTS model by HumeAI:
   Stage 0: Llama-3.2 AR backbone generates 512-dim acoustic features via
            per-token flow-matching diffusion (HumeAI/tada-1b or tada-3b-ml).
-  Stage 1: TADA codec decoder converts acoustic features to waveform at
-           44 100 Hz (HumeAI/tada-codec, loaded lazily from HuggingFace).
+  Stage 1: codec decoder converts acoustic features to a 24 kHz waveform
+           (HumeAI/tada-codec).
 
 Usage (batch mode, requires tada_tts.yaml):
   python end2end.py \\
     --model HumeAI/tada-1b \\
-    --stage-configs-path path/to/vllm_omni/model_executor/stage_configs/tada_tts.yaml
+    --stage-configs-path path/to/vllm_omni/model_executor/stage_configs/tada_tts.yaml \\
+    --ref-audio ref.wav --ref-text "<transcript of ref.wav>"
 
-Usage (async-chunk mode, requires tada_tts_async_chunk.yaml):
+Usage (async-chunk streaming mode, requires tada_tts_async_chunk.yaml):
   python end2end.py \\
     --model HumeAI/tada-1b \\
     --stage-configs-path path/to/vllm_omni/model_executor/stage_configs/tada_tts_async_chunk.yaml \\
-    --streaming
+    --streaming --ref-audio ref.wav --ref-text "<transcript of ref.wav>"
 
 Prerequisites:
-  pip install hume-tada soundfile
+  pip install soundfile
 """
 
 import asyncio
@@ -74,8 +75,8 @@ def _model_shift_acoustic(model_name: str, _cache: dict = {}) -> int:
 
 
 def _prefix_text(system_prompt: str = "", user_turn: str | None = None) -> str:
-    """Chat-template prefix mirroring upstream ``tada.generate()`` (system/user/assistant
-    headers). Zero-shot uses an empty system prompt and no user turn."""
+    """Build the chat-template prefix (system/user/assistant headers). Zero-shot uses an
+    empty system prompt and no user turn."""
     prefix = f"<|start_header_id|>system<|end_header_id|>{system_prompt}<|eot_id|>"
     if user_turn:
         prefix += f"<|start_header_id|>user<|end_header_id|>{user_turn}<|eot_id|>"
@@ -84,17 +85,15 @@ def _prefix_text(system_prompt: str = "", user_turn: str | None = None) -> str:
 
 
 def _build_prompt(text: str, model_name: str) -> tuple[dict, int]:
-    """Build a vLLM-Omni prompt for TADA TTS, returning ``(prompt_dict, walk_len)``.
+    """Build a prompt for TADA TTS, returning ``(prompt_dict, walk_len)``.
 
-    TADA is fixed-length and teacher-forced on the text — it walks the input tokens
-    one per step, emitting one acoustic frame each (it does NOT free-generate). So we
-    split the structured sequence:
+    The model walks the input text one token per step, emitting one acoustic frame each, so
+    the sequence is split into:
       * ``prompt_token_ids`` = ``[BOS] + tokenize(chat-template headers)`` — prefilled.
-      * ``tada_walk_ids``    = ``tokenize(text) + [<|eot_id|>] * shift_acoustic`` — forced
-        one-per-decode-step by the AR stage's ``preprocess``. The trailing eot tokens
-        flush the final frames (upstream's fixed-length "stop at EOS").
-    ``walk_len`` is used to set ``max_tokens`` so generation stops exactly on consuming
-    the last walk token.
+      * ``tada_walk_ids``    = ``tokenize(text) + [<|eot_id|>] * shift_acoustic`` — forced one
+        per decode step by the AR stage's ``preprocess``. The trailing eot tokens flush the
+        final frames.
+    ``walk_len`` sets ``max_tokens`` so generation stops on consuming the last walk token.
     """
     tok = _get_tokenizer(model_name)
     shift = _model_shift_acoustic(model_name)
@@ -152,18 +151,17 @@ def _get_encoder(codec_path: str, model_name: str, _cache: dict = {}):
 def _build_ref_prompt(
     text: str, ref_audio: str, ref_text: str, model_name: str, num_transition_steps: int = 5
 ) -> tuple[dict, int]:
-    """Build a Level-2 voice-cloning prompt from a reference wav + its transcript.
+    """Build a voice-cloning prompt from a reference wav and its transcript.
 
     Encodes the reference audio to per-token acoustic features + a token→frame alignment
-    (durations), then constructs (mirroring upstream ``tada.generate()``):
+    (durations), then constructs:
       * ``prompt_token_ids`` = ``[BOS] + headers + transcript[:-N]`` — prefilled with the
-        known reference acoustic substituted over the transcript region (the voice goes
-        into the KV cache); see ``TadaAR..._add_prompt_acoustic_embeds``.
+        reference acoustic substituted over the transcript region so the voice enters the KV
+        cache; see ``_add_prompt_acoustic_embeds`` in the AR stage.
       * ``tada_walk_ids``    = ``transcript[-N:] + tokenize(text) + [<|eot_id|>]*shift`` —
-        walked in decode. The first ``N`` walked tokens (transcript tail) are a
-        *transition* that smooths the prompt→synthesis boundary; their frames are fed
-        back but dropped from the output (``tada_trim_lead``), matching upstream's
-        ``num_transition_steps``.
+        walked in decode. The first ``N`` walked tokens (transcript tail) form a transition
+        that smooths the prompt→synthesis boundary; their frames are fed back but dropped from
+        the output (``tada_trim_lead``).
     """
     import numpy as np
     import soundfile as sf
@@ -181,10 +179,10 @@ def _build_ref_prompt(
     wav, sr = sf.read(ref_audio)
     wav_t = torch.tensor(np.asarray(wav), dtype=torch.float32).reshape(1, -1)
     out = enc(wav_t, text=ref_text, sample_rate=sr)
-    token_values = out.token_values[0]  # [Tp, 512] (normalised)
+    token_values = out.token_values[0]  # [Tp, feat_dim] (normalised)
     token_positions = out.token_positions[0].long()  # [Tp]
 
-    # Per-token durations from the alignment positions (upstream tada.generate()).
+    # Per-token durations from the alignment positions.
     sel = token_positions.float()
     prev = Fnn.pad(sel, (1, 0), value=1)[:-1]
     time_gaps = Fnn.pad((sel - prev).clamp(0, ntc - 1), (1, 0), value=0)  # [Tp+1]
@@ -214,12 +212,11 @@ def _build_ref_prompt(
         "prompt_token_ids": prefill_ids,
         "additional_information": {
             "tada_walk_ids": walk_ids,
-            # Drop the leading frames that are NOT the requested text: the acoustic stream
-            # lags the text by ``shift_acoustic`` (the model emits a token's audio ~shift
-            # steps later), so the first ``shift`` decode frames carry the prompt-transcript
-            # tail; the next ``n_trans`` carry the transition tokens. Both must be cut.
+            # Drop the leading frames that are not the requested text: the acoustic stream
+            # lags the text by ``shift_acoustic``, so the first ``shift`` decode frames carry
+            # the prompt-transcript tail and the next ``n_trans`` carry the transition tokens.
             "tada_trim_lead": n_trans + shift,
-            # Prefix-padded prompt arrays (BOS-less, matching upstream _generate inputs).
+            # Prefix-padded prompt arrays (without BOS).
             "tada_prompt_acoustic": Fnn.pad(token_values[:n_prompt], (0, 0, prefix_len, 0)).contiguous(),
             "tada_prompt_masks": Fnn.pad(torch.ones(n_prompt, dtype=torch.long), (prefix_len, 0)).contiguous(),
             "tada_prompt_tb": Fnn.pad(tb[:n_prompt], (prefix_len, 0)).contiguous(),
@@ -255,8 +252,7 @@ def _save_wav(output_dir: str, request_id: str, mm: dict) -> None:
 
 
 def _make_prompt(text: str, args, model_name: str) -> tuple[dict, int]:
-    """Build a prompt for ``text`` per CLI args: Level 2 (voice clone) if --ref-audio
-    is given, else Level 1 (zero-shot)."""
+    """Build a prompt for ``text``: voice cloning when --ref-audio is given, else zero-shot."""
     if args.ref_audio:
         if not args.ref_text:
             raise ValueError("--ref-audio requires --ref-text (the reference transcript).")
@@ -413,7 +409,7 @@ def parse_args():
         "--ref-audio",
         type=str,
         default=None,
-        help="Reference audio WAV for voice cloning (Level 2). Requires --ref-text.",
+        help="Reference audio WAV for voice cloning. Requires --ref-text.",
     )
     parser.add_argument(
         "--ref-text",
@@ -425,8 +421,8 @@ def parse_args():
         "--num-transition-steps",
         type=int,
         default=5,
-        help="Level 2: transcript-tail tokens walked (and dropped) to smooth the "
-        "prompt→synthesis boundary (upstream default 5).",
+        help="Voice cloning: number of transcript-tail tokens walked (and dropped) to smooth "
+        "the prompt→synthesis boundary.",
     )
     parser.add_argument(
         "--streaming",
